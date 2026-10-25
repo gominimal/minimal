@@ -13,7 +13,7 @@
 //! outside the VM, and it decides an undeclared destination against the DNS
 //! replies the box's own lookups received — filled from the same answers,
 //! held to the same intersection and the same numbers, all of them read
-//! from the one place both legs hold them, [`sessions::core::egress`] — so
+//! from the one place both legs hold them, [`boxes::core::egress`] — so
 //! nothing inside the VM, not even a relay replaced with a hostile one,
 //! can widen a box's destinations. This gate is then the *precision* copy
 //! inside the VM: it still intercepts the box's queries, answers the
@@ -26,7 +26,7 @@
 //! * **Pinning** (NET-066) — every DNS reply from the box's own resolver
 //!   (the switch gateway, NET-079's carve-out address) that answers a query
 //!   for a name the box's `egress.allow_dns_hosts` declared is split by the
-//!   pure rebinding intersection ([`sessions::core::egress`]): the answers
+//!   pure rebinding intersection ([`boxes::core::egress`]): the answers
 //!   that survive the box's denies and the infrastructure deny set are
 //!   admitted into a per-box table for [`ADMISSION_WINDOW`], capped at
 //!   [`MAX_ADDRESSES_PER_NAME`] addresses per name per family (design
@@ -59,7 +59,7 @@
 //!   them differently.
 //! * **REFUSED for a deny-all box's names outside the zone** (NET-141) —
 //!   when the box's egress is the deny-all shape (every `allow_*` dimension
-//!   present and empty, the shape `sessions::EgressPolicy::deny_all`
+//!   present and empty, the shape `boxes::EgressPolicy::deny_all`
 //!   materializes and the classifier places under `deny`), a query toward
 //!   this box's resolver that asks for any name outside the box zone, of
 //!   any record type, is answered REFUSED (rcode 5) by the relay itself and
@@ -226,7 +226,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 
 use super::policy::PolicyWarnLimiter;
 use super::switch::L4Packet;
-use sessions::core::egress::{self, EgressRules, InfrastructureDenySet};
+use boxes::core::egress::{self, EgressRules, InfrastructureDenySet};
 
 /// The port DNS is served on: the resolver's destination port on the query
 /// leg and its source port on the reply leg.
@@ -257,9 +257,9 @@ const COMPONENT: &str = "dns-gate";
 ///
 /// This leg does not own the number: both admission tables hold the same
 /// window, and both read it from the one place it lives,
-/// [`sessions::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
+/// [`boxes::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
 /// outlive its window on one leg while it lives on in the other.
-pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISSION_WINDOW;
+pub(crate) const ADMISSION_WINDOW: Duration = boxes::core::egress::DNS_ADMISSION_WINDOW;
 
 /// Design §5.3's cap on a name's admitted addresses: at most this many per
 /// name per family, fail closed. A reply whose A records run past the cap
@@ -273,8 +273,8 @@ pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISS
 /// half of the cap is the IPv4 half alone.
 ///
 /// Both admission tables hold the same cap, read from
-/// [`sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
-const MAX_ADDRESSES_PER_NAME: usize = sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
+/// [`boxes::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
+const MAX_ADDRESSES_PER_NAME: usize = boxes::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
 
 /// Sweep expired admissions once the table crosses this many entries — the
 /// per-box backstop behind the per-name cap, bounding memory without a
@@ -302,8 +302,8 @@ const TCP_RST: u8 = 0x04;
 /// table anyway.
 ///
 /// Both admission tables hold the same retention cap, read from
-/// [`sessions::core::egress::DNS_FLOW_IDLE_CAP`].
-const FLOW_IDLE_CAP: Duration = sessions::core::egress::DNS_FLOW_IDLE_CAP;
+/// [`boxes::core::egress::DNS_FLOW_IDLE_CAP`].
+const FLOW_IDLE_CAP: Duration = boxes::core::egress::DNS_FLOW_IDLE_CAP;
 
 /// Sweep idle flows once the table crosses this many entries: the bound's
 /// *memory* half, reclaiming entries no frame ever comes back to look up.
@@ -342,7 +342,7 @@ struct FlowKey {
 }
 
 /// One box's DNS-pinned admission state, built at attach and shared between
-/// the relay's two legs through the [`super::switch::SessionGate`]: the
+/// the relay's two legs through the [`super::switch::BoxGate`]: the
 /// egress leg asks it what an undeclared-destination drop may be lifted for
 /// and hands it the box's queries, the ingress leg hands it the resolver's
 /// replies.
@@ -352,7 +352,7 @@ pub(crate) struct DnsGate {
     /// names, which pins nothing (see the module doc).
     names: Option<HashSet<String>>,
     /// Whether the box's egress is the deny-all shape
-    /// ([`sessions::EgressPolicy::admits_nothing`]): every query it sends for a
+    /// ([`boxes::EgressPolicy::admits_nothing`]): every query it sends for a
     /// name outside the box zone is answered REFUSED here and never
     /// forwarded (NET-141).
     deny_all: bool,
@@ -397,7 +397,31 @@ pub(crate) struct DnsGate {
     /// alone, this gate's refusals by rule and name
     /// ([`PolicyWarnLimiter::warn_dns_refusal`]).
     limiter: Arc<PolicyWarnLimiter>,
+    /// The names this box's queries are steered to the Box Egress Proxy for
+    /// (BEP-062, BEP-078), or `None` when the box's steering is not `dns`
+    /// or `both`. Set by [`Self::with_steering`].
+    steering: Option<Steered>,
 }
+
+/// One box's DNS steering: the credentialed names, the proxy's address on
+/// the box's switch, and the proxy's listener state.
+struct Steered {
+    /// The credentialed names, normalized as [`normalized`] writes them.
+    names: HashSet<String>,
+    /// The proxy's address, the one A answer a steered name gets.
+    proxy: Ipv4Addr,
+    /// Whether the proxy's listener is live: a steered A lookup while it is
+    /// down is answered SERVFAIL, never forwarded (BEP-062).
+    listener: super::dns::ProxyListenerState,
+}
+
+/// The TTL of the A answer a steered name gets. Short, so a box's resolver
+/// stack asks again soon and a listener that went down fails closed at the
+/// next lookup.
+const STEERED_TTL: u32 = 30;
+
+/// The rate-limit key prefix of the SERVFAIL warning for a steered name.
+const STEERED_SERVFAIL_RULE: &str = "bep-steered-servfail";
 
 /// A DNS wire name in the form the allowlist matches: ASCII-lowercased,
 /// with the root dot stripped — `github.com` for `GitHub.com.`.
@@ -413,7 +437,7 @@ fn normalized(name: &str) -> String {
 /// presentation form, so it forwards `x.MIN.INTERNAL` and the apex itself
 /// upstream; both are refused here. The case of the labels below the zone
 /// does not matter, and a label holding an escaped dot is one label.
-fn answered_on_the_switch(name: &Name) -> bool {
+pub(crate) fn answered_on_the_switch(name: &Name) -> bool {
     Name::from_ascii(super::dns::HOSTNAME_SUFFIX)
         .is_ok_and(|zone| zone.zone_of_case(name) && name.num_labels() > zone.num_labels())
 }
@@ -439,7 +463,7 @@ impl DnsGate {
     /// and the session's shared limiter.
     pub(crate) fn new(
         label: &str,
-        policy: Option<&sessions::EgressPolicy>,
+        policy: Option<&boxes::EgressPolicy>,
         rules: EgressRules,
         infrastructure: InfrastructureDenySet,
         host_alias: [u8; 4],
@@ -449,7 +473,7 @@ impl DnsGate {
             names: policy
                 .and_then(|policy| policy.allow_dns_hosts.as_ref())
                 .map(|hosts| hosts.iter().map(|host| normalized(host)).collect()),
-            deny_all: policy.is_some_and(sessions::EgressPolicy::admits_nothing),
+            deny_all: policy.is_some_and(boxes::EgressPolicy::admits_nothing),
             rules,
             infrastructure,
             host_alias,
@@ -459,7 +483,52 @@ impl DnsGate {
             flow_idle_cap: FLOW_IDLE_CAP,
             label: label.to_string(),
             limiter,
+            steering: None,
         }
+    }
+
+    /// Steers this box's lookups of the credentialed names to the Box Egress
+    /// Proxy (BEP-062, BEP-078), when `policy` declares a credentialed
+    /// upstream and its steering resolves to `dns` or `both`. Any other box
+    /// is returned unchanged.
+    ///
+    /// `module_hosts` is the credential module's host set, `proxy` the
+    /// proxy's address on the box's switch, and `listener` the proxy's
+    /// listener state the switch shares. A steered name is answered here and
+    /// never forwarded: an A lookup gets `proxy` while the listener is live
+    /// and SERVFAIL while it is down, and every other record type gets
+    /// NODATA.
+    // Interim until https://github.com/gominimal/minimal/issues/2523: no
+    // production code calls this yet. Remove the allow when
+    // BoxGate::for_session calls it with a shared ProxyListenerState.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn with_steering(
+        mut self,
+        policy: &boxes::BoxPolicy,
+        module_hosts: &[&str],
+        proxy: Ipv4Addr,
+        listener: super::dns::ProxyListenerState,
+    ) -> Self {
+        let steered = policy
+            .credentialed_upstream
+            .as_ref()
+            .is_some_and(|upstream| upstream.bep.resolved_steering().needs_resolver());
+        self.steering = steered.then(|| Steered {
+            names: module_hosts.iter().map(|host| normalized(host)).collect(),
+            proxy,
+            listener,
+        });
+        self
+    }
+
+    /// Whether `question` asks for a name this box's lookups are steered for.
+    fn steers(&self, question: &Query) -> bool {
+        self.steering.as_ref().is_some_and(|steering| {
+            steering
+                .names
+                .contains(&normalized(&question.name().to_lowercase().to_string()))
+        })
     }
 
     /// Shrinks the admission window. A test hook for the one proof that
@@ -507,7 +576,9 @@ impl DnsGate {
     /// zone suffix not in exact lowercase — is answered NXDOMAIN (NET-006).
     /// Then a query is answered NODATA when any question is an AAAA, HTTPS
     /// or SVCB (NET-136), or a zone name of any type but A (NET-006), since
-    /// the switch answers only a zone A itself.
+    /// the switch answers only a zone A itself. A query that holds a steered
+    /// A question skips that NODATA rule and goes to the steered rule
+    /// (BEP-062), so its A question is never answered NODATA.
     ///
     /// `None` is also the answer for anything that does not parse as a
     /// standard query: forwarding stays the default on every failure, so a
@@ -541,10 +612,83 @@ impl DnsGate {
         if query.metadata.message_type != MessageType::Query {
             return None;
         }
-        let (question, rcode) = self.decide(&query)?;
+        if let Some((question, rcode)) = self.decide(&query) {
+            // A steered A question outranks the NODATA rule (BEP-062): the
+            // query goes to the steered rule, so the A fails closed while the
+            // proxy is down. REFUSED and NXDOMAIN still come first.
+            let steered_a = rcode == ResponseCode::NoError
+                && query
+                    .queries
+                    .iter()
+                    .any(|q| q.query_type() == RecordType::A && self.steers(q));
+            if !steered_a {
+                let name = normalized(&question.name().to_lowercase().to_string());
+                let rtype = question.query_type();
+                return self.answer(query, rcode, &name, rtype);
+            }
+        }
+        self.answer_steered(query)
+    }
+
+    /// The reply for a query that asks for a steered name (BEP-062), or
+    /// `None` when no question in it does. Read after [`Self::decide`], so
+    /// its REFUSED and NXDOMAIN rules come first. Its NODATA rule also comes
+    /// first, except for a query that holds a steered A question: a query of
+    /// only AAAA, HTTPS or SVCB questions of steered names is answered
+    /// NODATA there (BEP-078).
+    ///
+    /// A steered query is never forwarded. While the proxy's listener is
+    /// down it is answered SERVFAIL, and a rate-limited warning names the
+    /// name and the box. While the listener is live, each steered A question
+    /// is answered with the proxy's address, and a steered question of any
+    /// other type gets no answer. A query that mixes a steered question with
+    /// an unsteered one is answered SERVFAIL: forwarding it would send the
+    /// steered name to real DNS, and a partial answer would leave the other
+    /// question unanswered with no error.
+    fn answer_steered(&self, query: Message) -> Option<Vec<u8>> {
+        let steering = self.steering.as_ref()?;
+        let question = query.queries.iter().find(|q| self.steers(q))?.clone();
         let name = normalized(&question.name().to_lowercase().to_string());
-        let rtype = question.query_type();
-        self.answer(query, rcode, &name, rtype)
+        if query.queries.iter().any(|q| !self.steers(q)) {
+            return self.answer(query, ResponseCode::ServFail, &name, question.query_type());
+        }
+        if !steering.listener.is_live() {
+            let key = format!("{STEERED_SERVFAIL_RULE}:{name}");
+            if self
+                .limiter
+                .should_warn_at(&self.label, &key, Instant::now())
+            {
+                tracing::warn!(
+                    component = COMPONENT,
+                    session_id = %self.label,
+                    name = %name,
+                    "answered SERVFAIL for a steered name: the Box Egress Proxy is not listening"
+                );
+            }
+            return self.answer(query, ResponseCode::ServFail, &name, question.query_type());
+        }
+        let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+        reply.metadata = Metadata::response_from_request(&query.metadata);
+        reply.metadata.response_code = ResponseCode::NoError;
+        for q in query.queries.iter().filter(|q| self.steers(q)) {
+            if q.query_type() == RecordType::A {
+                reply.add_answer(hickory_proto::rr::Record::from_rdata(
+                    q.name().clone(),
+                    STEERED_TTL,
+                    RData::A(hickory_proto::rr::rdata::A(steering.proxy)),
+                ));
+            }
+        }
+        reply.add_queries(query.queries);
+        tracing::debug!(
+            component = COMPONENT,
+            switch_addr = %self.label,
+            name,
+            query_type = ?question.query_type(),
+            proxy = %steering.proxy,
+            "answered a steered lookup with the Box Egress Proxy's address"
+        );
+        reply.to_vec().ok()
     }
 
     /// The answer the relay writes itself for `query`, with the question
@@ -945,16 +1089,17 @@ pub(crate) mod tests {
 
     /// The box that allows `github.com` and, by address, nothing else: TCP
     /// declared, no subnets, the one name — the proof sentence's box.
-    fn github_only_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn github_only_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 deny_subnets: None,
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -966,13 +1111,13 @@ pub(crate) mod tests {
     /// verdict carves out UDP/53 to the resolver before it checks protocol
     /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
     /// resolve every allowed name.
-    fn toolchain_hosts_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn toolchain_hosts_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(
-                    sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+                    boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
                         .iter()
                         .map(|h| (*h).to_string())
                         .collect(),
@@ -981,6 +1126,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -989,16 +1135,17 @@ pub(crate) mod tests {
     /// — the idle-bound proofs' box, since a UDP flow is the one that carries
     /// no close signal for the gate to read and so can only ever be released
     /// by idleness.
-    fn github_udp_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Udp]),
+    fn github_udp_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Udp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 deny_subnets: None,
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -1006,16 +1153,17 @@ pub(crate) mod tests {
     /// denied-range refusal's box (NET-067). Two names, because the refusal
     /// log's requirement is the *name* and the answer — the log proof
     /// refuses each of them inside the limiter's interval and must hear both.
-    fn denied_range_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    fn denied_range_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["example.com".to_string(), "other.example".to_string()]),
                 deny_subnets: Some(vec!["10.9.9.0/24".to_string()]),
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -1112,12 +1260,12 @@ pub(crate) mod tests {
     /// A fresh gate over `policy`, on the default switch's resolver and
     /// infrastructure set and host alias, for the unit tests that drive the
     /// gate directly.
-    fn gate_for(policy: &sessions::SessionPolicy) -> DnsGate {
+    fn gate_for(policy: &boxes::BoxPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
             &label,
             policy.egress.as_ref(),
-            sessions::core::egress::EgressRules::from_policy(
+            boxes::core::egress::EgressRules::from_policy(
                 policy.egress.as_ref(),
                 RESOLVER.octets(),
                 LEASE.octets(),
@@ -1143,15 +1291,16 @@ pub(crate) mod tests {
     /// the cap.
     #[test]
     fn admitted_addresses_are_capped_per_name() {
-        let two_names = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
-                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let two_names = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string(), "second.example".to_string()]),
                 deny_subnets: None,
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let gate = gate_for(&two_names);
         let now = Instant::now();
@@ -1395,7 +1544,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             exercised,
-            sessions::NET068_TOOLCHAIN_EGRESS_HOSTS,
+            boxes::NET068_TOOLCHAIN_EGRESS_HOSTS,
             "every NET-068 toolchain host is exercised, in the constant's order"
         );
         for (index, (name, address)) in toolchain.iter().enumerate() {
@@ -1965,7 +2114,7 @@ pub(crate) mod tests {
     /// refusal of the box's own deny range is proved where its effect lives,
     /// by the log line `denied_range_resolution_logged` asserts carries
     /// `dns-rebinding-denied-subnet`, and by the pure intersection's own
-    /// proofs in `sessions::core::egress`.
+    /// proofs in `boxes::core::egress`.
     #[tokio::test]
     async fn denied_range_resolution_refused() {
         let mut harness = spawn_test_relay(&denied_range_egress());
@@ -2646,13 +2795,14 @@ pub(crate) mod tests {
     }
 
     /// The deny-all box: every `allow_*` dimension present and empty, the
-    /// section `sessions::EgressPolicy::deny_all` materializes for
+    /// section `boxes::EgressPolicy::deny_all` materializes for
     /// `EffectiveEgress::DenyAll` (NET-141's deny-all case).
-    fn deny_all_egress() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy::deny_all()),
+    fn deny_all_egress() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -2997,10 +3147,11 @@ pub(crate) mod tests {
     /// but NET-136's, which they keep answering NODATA.
     #[test]
     fn allow_list_and_allow_all_boxes_keep_forwarding() {
-        let allow_all = sessions::SessionPolicy {
+        let allow_all = boxes::BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         for policy in [github_only_egress(), allow_all] {
             let gate = gate_for(&policy);
@@ -3116,10 +3267,11 @@ pub(crate) mod tests {
     fn forwarding_gates() -> [DnsGate; 2] {
         [
             test_gate(),
-            gate_for(&sessions::SessionPolicy {
+            gate_for(&boxes::BoxPolicy {
                 egress: None,
                 ingress: None,
                 credentialed_upstream: None,
+                quic443: None,
             }),
         ]
     }
@@ -3308,8 +3460,8 @@ pub(crate) mod tests {
     async fn undeclared_names_and_hosts_pin_nothing() {
         // The address-deny-all declaration of the existing egress proofs,
         // with no name list: resolving must not open it.
-        let policy = sessions::SessionPolicy {
-            egress: Some(sessions::EgressPolicy {
+        let policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
                 allow_protocols: None,
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: None,
@@ -3317,6 +3469,7 @@ pub(crate) mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3404,5 +3557,231 @@ pub(crate) mod tests {
             !gate.admits_destination([198, 51, 100, 9], now),
             "a reply with no question to match pins nothing"
         );
+    }
+
+    /// The GitHub module's host set, as the caller hands it to
+    /// [`DnsGate::with_steering`].
+    const STEERED_HOSTS: &[&str] = &[
+        "github.com",
+        "api.github.com",
+        "uploads.github.com",
+        "codeload.github.com",
+    ];
+
+    /// The Box Egress Proxy's address on the default switch.
+    fn proxy_address() -> Ipv4Addr {
+        ::switch::SwitchSubnet::default().box_egress_proxy_address()
+    }
+
+    /// A box that allows the GitHub hosts and declares a credentialed
+    /// upstream with `steering`, or with no steering (which resolves to
+    /// `dns`) when it is `None`.
+    fn steered_policy(steering: Option<boxes::core::bep::Steering>) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(STEERED_HOSTS.iter().map(|h| (*h).to_string()).collect()),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: Some(boxes::CredentialedUpstream {
+                bep: boxes::core::bep::BepSettings {
+                    steering,
+                    ..Default::default()
+                },
+                secrets: Default::default(),
+            }),
+            quic443: None,
+        }
+    }
+
+    /// A gate over `policy`, steered with `listener`.
+    fn steered_gate(
+        policy: &boxes::BoxPolicy,
+        listener: &crate::net::dns::ProxyListenerState,
+    ) -> DnsGate {
+        gate_for(policy).with_steering(policy, STEERED_HOSTS, proxy_address(), listener.clone())
+    }
+
+    /// The gate's reply to a `name` query of `rtype`, parsed, or `None` when
+    /// the gate forwards it.
+    fn steered_reply(gate: &DnsGate, name: &str, rtype: RecordType) -> Option<Message> {
+        let query = dns_query(name, rtype);
+        let id = Message::from_vec(&query).unwrap().metadata.id;
+        let reply = gate.intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query)?;
+        let reply = Message::from_vec(&reply).expect("the gate's reply parses");
+        assert_eq!(reply.metadata.id, id, "the reply echoes the query's id");
+        assert_eq!(reply.metadata.message_type, MessageType::Response);
+        assert_eq!(reply.queries.first().unwrap().query_type(), rtype);
+        Some(reply)
+    }
+
+    /// BEP-062: while the proxy's listener is down, a `dns` or `both` box's
+    /// A lookup of a credentialed name is answered SERVFAIL by the relay and
+    /// never forwarded to real DNS. The warning names the name and the box,
+    /// once per name per minute. Once the listener is live, the same lookup
+    /// gets the proxy's address. A `proxy_env` or `off` box is not steered.
+    #[test]
+    fn steered_name_servfail_while_proxy_down() {
+        let capture = captured_log();
+        let listener = crate::net::dns::ProxyListenerState::down();
+        for steering in [
+            None,
+            Some(boxes::core::bep::Steering::Dns),
+            Some(boxes::core::bep::Steering::Both),
+        ] {
+            let gate = steered_gate(&steered_policy(steering), &listener);
+            for name in ["github.com.", "API.GitHub.com.", "codeload.github.com"] {
+                let reply = steered_reply(&gate, name, RecordType::A)
+                    .unwrap_or_else(|| panic!("{steering:?}: {name} is answered, not forwarded"));
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::ServFail,
+                    "{steering:?}: {name} fails closed while the proxy is down"
+                );
+                assert!(reply.answers.is_empty(), "SERVFAIL carries no address");
+            }
+            // A name outside the credentialed set still forwards.
+            assert!(steered_reply(&gate, "example.com.", RecordType::A).is_none());
+        }
+        let logged = capture.contents();
+        for expected in [
+            "answered SERVFAIL for a steered name",
+            "name=github.com",
+            "name=api.github.com",
+            &format!("session_id={LEASE}"),
+        ] {
+            assert!(
+                logged.contains(expected),
+                "the warning carries {expected:?}: {logged}"
+            );
+        }
+        // The warning is rate-limited per name: one more lookup adds no line.
+        let before = logged
+            .matches("answered SERVFAIL for a steered name")
+            .count();
+        let gate = steered_gate(&steered_policy(None), &listener);
+        steered_reply(&gate, "github.com.", RecordType::A);
+        steered_reply(&gate, "github.com.", RecordType::A);
+        let after = capture
+            .contents()
+            .matches("answered SERVFAIL for a steered name")
+            .count();
+        assert_eq!(after, before + 1, "one warning per name per minute per box");
+
+        // Live: the steered A lookup answers the proxy's address.
+        assert!(listener.set_live(true), "down to live is a change");
+        assert!(
+            capture
+                .contents()
+                .contains("the Box Egress Proxy's listener is live"),
+            "the listener's return writes one info line"
+        );
+        let reply = steered_reply(&gate, "github.com.", RecordType::A).expect("answered here");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let addresses: Vec<_> = reply
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addresses, vec![proxy_address()]);
+
+        // A query mixing a steered and an unsteered question is SERVFAIL,
+        // neither forwarded nor half answered.
+        let mut query = Message::query();
+        query.add_query(Query::query(
+            Name::from_utf8("github.com.").unwrap(),
+            RecordType::A,
+        ));
+        query.add_query(Query::query(
+            Name::from_utf8("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let reply = gate
+            .intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query.to_vec().unwrap())
+            .expect("a mixed query is answered at the gate");
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert!(reply.answers.is_empty(), "a mixed query gets no address");
+
+        // Down again: SERVFAIL again, never the real address.
+        assert!(listener.set_live(false));
+        let reply = steered_reply(&gate, "github.com.", RecordType::A).expect("answered here");
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        // A steered A question beside an AAAA, HTTPS or SVCB question is
+        // SERVFAIL while the proxy is down, never NODATA. While the proxy is
+        // live, the A question gets the proxy's address.
+        for other in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+            let mut query = Message::query();
+            query.add_query(Query::query(
+                Name::from_utf8("github.com.").unwrap(),
+                RecordType::A,
+            ));
+            query.add_query(Query::query(Name::from_utf8("github.com.").unwrap(), other));
+            let bytes = query.to_vec().unwrap();
+            for live in [false, true] {
+                listener.set_live(live);
+                let reply = gate
+                    .intercept_query(&SocketAddrV4::new(RESOLVER, 53), &bytes)
+                    .expect("a mixed-type steered query is answered at the gate");
+                let reply = Message::from_vec(&reply).unwrap();
+                if live {
+                    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                    assert_eq!(reply.answers.len(), 1, "{other:?}: only the A is answered");
+                } else {
+                    assert_eq!(
+                        reply.metadata.response_code,
+                        ResponseCode::ServFail,
+                        "{other:?}: the steered A fails closed"
+                    );
+                    assert!(reply.answers.is_empty());
+                }
+            }
+        }
+        listener.set_live(false);
+
+        // A box whose steering does not use DNS is not steered here.
+        for steering in [
+            boxes::core::bep::Steering::ProxyEnv,
+            boxes::core::bep::Steering::Off,
+        ] {
+            let gate = steered_gate(&steered_policy(Some(steering)), &listener);
+            assert!(
+                steered_reply(&gate, "github.com.", RecordType::A).is_none(),
+                "{steering:?}: the lookup is forwarded"
+            );
+        }
+    }
+
+    /// BEP-078: a `dns` or `both` box's AAAA, HTTPS and SVCB lookups of a
+    /// steered name are answered NODATA, whether the proxy's listener is
+    /// live or down, and never forwarded.
+    #[test]
+    fn steered_name_aaaa_https_svcb_are_nodata() {
+        let listener = crate::net::dns::ProxyListenerState::down();
+        for live in [false, true] {
+            listener.set_live(live);
+            for steering in [None, Some(boxes::core::bep::Steering::Both)] {
+                let gate = steered_gate(&steered_policy(steering), &listener);
+                for name in STEERED_HOSTS {
+                    for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+                        let reply = steered_reply(&gate, name, rtype).unwrap_or_else(|| {
+                            panic!("live={live} {steering:?}: {rtype:?} {name} is answered here")
+                        });
+                        assert_eq!(
+                            reply.metadata.response_code,
+                            ResponseCode::NoError,
+                            "NODATA is NOERROR"
+                        );
+                        assert!(reply.answers.is_empty(), "NODATA answers nothing");
+                    }
+                }
+            }
+        }
     }
 }

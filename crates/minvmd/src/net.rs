@@ -15,10 +15,11 @@
 //! Ethernet frames framed with a 2-byte little-endian length prefix (the
 //! HyperKit protocol). `minvmd`'s role is to write the gvproxy `-config` YAML
 //! carrying the subnet, gateway, NAT alias, and `dhcpStaticLeases`
-//! ([`render_gvproxy_config`]) — the subnet is YAML-only (gvproxy v0.8.9 has no
-//! `-subnet` CLI flag). Opening the per-PTask tap and running the TAP↔gvproxy
-//! relay happen in the guest `minimald` over the vsock shuttle (see the
-//! `shuttle` module); this module owns only the switch process.
+//! ([`render_gvproxy_config`]) — the NAT alias, DNS zone and leases are
+//! YAML-only, so the subnet travels in the same file. Opening the per-PTask
+//! tap and running the TAP↔gvproxy relay happen in the guest `minimald` over
+//! the vsock shuttle (see the `shuttle` module); this module owns only the
+//! switch process.
 //!
 //! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
 //! sequence the vmm child uses ([`GvproxySupervisor::stop`], R1.4) and runs a
@@ -76,6 +77,7 @@ use std::time::Duration;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
 use minimald_rpc::IpProto;
+use tracing::Instrument as _;
 // gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
 // `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
 pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
@@ -83,6 +85,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 pub(crate) mod dns_pins;
+pub(crate) mod drop_limiter;
 pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
@@ -140,7 +143,8 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "gvproxy switch socket {} did not appear within {timeout:?}: {e}",
+                        "the VM's network helper (gvproxy) was not accepting connections on its \
+                         socket {} after {timeout:?}: {e}",
                         sock.display()
                     ),
                 ));
@@ -373,12 +377,23 @@ impl GvproxySupervisor {
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let (exit_tx, exit_rx) = oneshot::channel();
-        let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
-        let datapath_monitor = tokio::spawn(monitor_switch_datapath(
-            switch_socket.clone(),
-            datapath_check_interval,
-            Arc::clone(&stopping),
-        ));
+        // Each in a span of its own that follows from this one (the guard
+        // test in `telemetry` holds that every spawn is instrumented): both
+        // live as long as the switch, and a task that kept this
+        // `net.switch.start` span would keep the supervisor's start phase
+        // open with it (`telemetry::vm_task`).
+        let supervisor = tokio::spawn(
+            supervise_switch(child, pid, Arc::clone(&stopping), exit_tx)
+                .instrument(crate::telemetry::vm_task("net.switch.supervise")),
+        );
+        let datapath_monitor = tokio::spawn(
+            monitor_switch_datapath(
+                switch_socket.clone(),
+                datapath_check_interval,
+                Arc::clone(&stopping),
+            )
+            .instrument(crate::telemetry::vm_task("net.switch.monitor")),
+        );
         let switch = Self {
             pid,
             #[cfg(target_os = "linux")]
@@ -719,7 +734,34 @@ impl HostGvproxy {
     /// Returns the I/O error if the runtime cannot be built, the config cannot
     /// be written, the gate socket cannot be bound, or the gvproxy binary
     /// cannot be launched.
+    #[tracing::instrument(name = "net.switch.start", skip_all, fields(otel.status_code = tracing::field::Empty))]
     pub fn spawn(
+        binary: PathBuf,
+        switch_sock: PathBuf,
+        datapath_check_interval: Duration,
+        registry: &crate::box_registry::BoxRegistry,
+        wire: BepWire,
+        boxes: Arc<dyn BepBoxSource>,
+    ) -> io::Result<Self> {
+        // A switch that fails to start exports its span with an error status
+        // (TEL-035), as `vm.boot` does.
+        let span = tracing::Span::current();
+        let failed = crate::telemetry::ErrorUnlessOk::new(&span);
+        let started = Self::spawn_inner(
+            binary,
+            switch_sock,
+            datapath_check_interval,
+            registry,
+            wire,
+            boxes,
+        );
+        if started.is_ok() {
+            failed.ok();
+        }
+        started
+    }
+
+    fn spawn_inner(
         binary: PathBuf,
         switch_sock: PathBuf,
         datapath_check_interval: Duration,
@@ -884,7 +926,7 @@ impl HostGvproxy {
             Err(_) => {
                 let _ = thread.join();
                 Err(io::Error::other(
-                    "host gvproxy supervisor thread exited before reporting readiness",
+                    "the VM's network helper (gvproxy) stopped before it was ready",
                 ))
             }
         }
@@ -1124,6 +1166,11 @@ mod tests {
             .expect("write config");
         let body = std::fs::read_to_string(cfg.config_path()).expect("read config");
         assert!(body.contains("100.64.0.0/16"));
+        // The file the host switch reads carries the raised outbound TCP
+        // bounds, so a burst of connections from a box is not held to the
+        // switch's built-in number of dials in flight.
+        assert!(body.contains("\n  tcpMaxInFlight: 512\n"), "{body}");
+        assert!(body.contains("\n  tcpConnectTimeout: 30\n"), "{body}");
     }
 
     fn supervise_sleep() -> (GvproxySupervisor, SwitchExit) {

@@ -4,9 +4,8 @@
 #
 # versions/<semver>/ rows are staged by the release workflow on tag push — a
 # convention this repo adopted mid-stream, so no release shipped before it has
-# one. Downstream packaging (publish-aur.sh, package-nfpm.sh, the brew
-# formula's bucket fetches) keys on the semver row, so the one release in that
-# gap needs a row built by hand. This fetches the release's artifacts from its
+# one. `install.sh --version <semver>` keys on the semver row, so the one
+# release in that gap needs a row built by hand. This fetches the release's artifacts from its
 # sha-keyed row (the row that shipped it) and hands them to stage-release.sh,
 # so the semver row is written by the same script and cache headers as every
 # other staging write — never by an ad-hoc gcloud call here.
@@ -16,7 +15,7 @@
 # minvmd-linux-arm64 before the static-musl build) are omitted with a warning
 # (--allow-missing), and files the table copies from the checkout (the
 # AppArmor set) come from the current tree. A backfilled row is therefore a
-# packaging-addressable restatement of the release, not a byte-identical
+# semver-addressable restatement of the release, not a byte-identical
 # clone; channels keep pointing at the sha row, which is untouched.
 #
 # Usage:

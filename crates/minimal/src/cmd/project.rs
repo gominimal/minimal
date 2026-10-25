@@ -157,7 +157,7 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 /// callers publish it on different streams: `min init` puts the line on
 /// stdout — it is that command's whole scriptable result — while
 /// `min activate`'s scaffold offer keeps it on stderr, where stdout carries
-/// only the session id (see [`activate_session`]).
+/// only the session id (see [`activate_box`]).
 pub(crate) enum InitOutcome {
     /// The operator declined the confirmation; nothing was written.
     Declined,
@@ -332,8 +332,8 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
             .await?;
     } else {
         eprintln!(
-            "Note: not warming the host cache; the session daemon fetches the \
-             closure into its own cache on the next `min session activate`."
+            "Note: packages are not downloaded now; they are downloaded the \
+             next time you run `min session activate`."
         );
     }
 
@@ -400,8 +400,8 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
         ctx.download_if_available(&graph, ensure_pkgs).await?;
     } else {
         eprintln!(
-            "Note: not warming the host cache; the session daemon fetches the \
-             closure into its own cache on the next `min session activate`."
+            "Note: packages are not downloaded now; they are downloaded the \
+             next time you run `min session activate`."
         );
     }
 

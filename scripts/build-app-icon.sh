@@ -4,9 +4,9 @@
 #
 # WHY: macOS shows a Background Items row (System Settings > General > Login
 # Items & Extensions) with the icon of the app bundle its launchd job belongs
-# to, and nothing at all for a bare program. The answerer service `min net
-# setup` installs is a bare program today (gominimal/inbox#1039), so the mark
-# has to ship as an .icns inside an app bundle for the row to carry it. This
+# to, and nothing at all for a bare program. The box-name service `min
+# finalize-install` installs ships in an app bundle for that reason
+# (scripts/build-app-bundle.sh), and this .icns is the icon the bundle carries. This
 # script is the one way that file is made: the .icns is committed beside its
 # source so every host sees the same bytes, and a change to the source is
 # re-rendered here, never edited by hand.

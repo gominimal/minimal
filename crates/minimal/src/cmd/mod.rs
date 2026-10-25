@@ -8,8 +8,8 @@ use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
-// so the dashboard's activation path (`minimal-tui`, which cannot depend on
-// this crate) gates on the same wording and the same override.
+// so the dashboard's activation path (`minimal::dash`) gates on the same wording
+// and the same override.
 // `ensure_version_reported` asserts a build a reply already carried;
 // `ensure_version_match` is the round-trip form, for paths with no first RPC
 // of their own to carry it.
@@ -18,35 +18,183 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod auth;
+mod box_audit;
+mod box_spec;
+// `boxes.rs` is mounted under another name: see its module docs.
+#[path = "boxes.rs"]
+mod box_verbs;
 mod finalize_install;
 mod list;
 mod net;
 mod project;
+mod secret;
 mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the provider-kind rule its gate keys on.
-pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
+pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
+pub use box_audit::AuditSelfUnsupportedUnenrolled;
+pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
 pub use project::*;
+pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
-    use tracing::Instrument as _;
-    let ctx = minimal_client::trace_context();
     let root = tracing::info_span!(
         "cmd",
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
     );
+    // A caller may run `min` inside its own trace (a CI job, a test
+    // harness, or a script in a session, whose daemon put the exec's
+    // `TRACEPARENT` there on opt-in): adopt it as the parent. Adopting is
+    // not exporting. When this process exports, the context goes on to
+    // this command's daemon RPCs; when it does not, the daemon is told
+    // the command opted out and gets no `TRACEPARENT` (below), and the ids
+    // only join this process's own log lines to the caller's trace. A
+    // `min` inside a box is the in-box helper, not this binary: it hands
+    // the box's `TRACEPARENT` to the daemon itself (TEL-025, minimald's
+    // `channel_request_span`).
+    let inbound = inbound_parent(std::env::var(minimald_rpc::trace::TRACEPARENT_ENV).ok());
+    let ctx = root_context(&root, inbound.as_ref());
+    minimal_client::init_trace_context(ctx);
+    // With telemetry off (not opted in, `DO_NOT_TRACK`, `OTEL_SDK_DISABLED`,
+    // or traces off: whatever left no tracer installed) the daemon is told
+    // so on every channel and given no `TRACEPARENT`, so it records nothing
+    // of this command's requests either. The ids above still join this
+    // process's own log lines.
+    minimal_client::set_telemetry_opted_out(!mlog::otel::exporting());
+    let ctx = minimal_client::trace_context();
+    root.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    root.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    if let Some(p) = &inbound {
+        root.record("parent_span_id", tracing::field::display(p.span_id_hex()));
+    }
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
-    Box::pin(run_command(cli)).instrument(root).await
+    match run_in_root(root, Box::pin(run_command(cli))).await? {
+        None => Ok(()),
+        Some(handoff) => Err(handoff.finish()),
+    }
+}
+
+/// What a command leaves for the process to do after its `cmd` span has
+/// ended: exit with ssh's status, or die of the signal that stopped it.
+///
+/// Neither returns, so neither can run inside the span: the span would never
+/// end, and every span under it (the client's and the daemon's) would parent
+/// to one the collector never sees. A command returns this as its error
+/// ([`box_via_ssh`]); [`run`] takes it back out once the span has ended
+/// and finishes it there. It is the [`crate::task::TaskExit`] pattern: a
+/// status carried on the error path, never printed.
+#[derive(Debug)]
+pub(crate) enum Handoff {
+    /// Exit with this status (`min session exec` / `run` once ssh has exited
+    /// or been taken down, an interactive attach after ssh has exited and the
+    /// terminal has been put back).
+    Exit(i32),
+    /// Die of this signal, as if nothing had caught it (`min net forward`,
+    /// stopped by SIGTERM or SIGHUP once its relays are down).
+    Raise(nix::sys::signal::Signal),
+}
+
+impl std::fmt::Display for Handoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only seen if a hand-off escapes [`run`], which takes every one back.
+        match self {
+            Self::Exit(code) => write!(f, "unfinished hand-off: exit {code}"),
+            Self::Raise(signal) => write!(f, "unfinished hand-off: raise {signal}"),
+        }
+    }
+}
+
+impl std::error::Error for Handoff {}
+
+impl Handoff {
+    /// Flush exported telemetry, then exit or raise. Never returns.
+    ///
+    /// The flush has the bound of the normal exit path
+    /// ([`mlog::otel::CLI_EXIT_FLUSH`]); with telemetry off it returns at
+    /// once, so the hand-off is what it was before. On the exit path the
+    /// `atexit` hook finds the flush done and returns.
+    fn finish(self) -> anyhow::Error {
+        mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+        match self {
+            Self::Exit(code) => std::process::exit(code),
+            Self::Raise(signal) => die_of(signal),
+        }
+    }
+}
+
+/// End the process by `signal` as an uncaught one would: restore its default
+/// action, then raise it, so a parent sees the same wait status (killed by
+/// that signal, no core) as when no handler was installed.
+///
+/// Exits with the shell's `128 + signal` only if the signal does not end the
+/// process: its default action could not be restored, or it does not
+/// terminate.
+fn die_of(signal: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{SigHandler, raise};
+    // SAFETY: SIG_DFL installs no handler, so no code of ours can run in
+    // signal context; the handler it replaces (tokio's) is never needed again
+    // because the process ends here.
+    let restored = unsafe { nix::sys::signal::signal(signal, SigHandler::SigDfl) };
+    // raise() delivers to this thread before it returns, so with the default
+    // action restored a terminating signal never comes back here.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a failure to restore or raise falls through to the exit below"
+    )]
+    let _ = restored.and_then(|_| raise(signal));
+    std::process::exit(128_i32.saturating_add(signal as i32))
+}
+
+/// Run `command` inside `root`, end `root`, and return the command's
+/// [`Handoff`], if it made one. Any other error is returned as is.
+///
+/// `root` ends when the instrumented future is dropped, at the end of the
+/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// finishes the hand-off.
+async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
+where
+    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    use tracing::Instrument as _;
+    match command.instrument(root).await {
+        Ok(()) => Ok(None),
+        Err(e) => match e.downcast::<Handoff>() {
+            Ok(handoff) => Ok(Some(handoff)),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// The caller's trace context from a `TRACEPARENT` value, read whether or not
+/// this process exports (TEL-021: forwarding is not exporting).
+fn inbound_parent(raw: Option<String>) -> Option<minimald_rpc::trace::TraceContext> {
+    raw.and_then(|v| minimald_rpc::trace::TraceContext::parse_traceparent(&v))
+}
+
+/// The command's root context: the exported span's ids when exporting,
+/// otherwise a child of `inbound` (or a fresh trace when there is none).
+fn root_context(
+    root: &tracing::Span,
+    inbound: Option<&minimald_rpc::trace::TraceContext>,
+) -> minimald_rpc::trace::TraceContext {
+    use minimald_rpc::trace::TraceContext;
+    match mlog::otel::align(root, inbound.map(TraceContext::parts)) {
+        Some((t, s, f)) => TraceContext::from_parts(t, s, f),
+        None => inbound.map_or_else(TraceContext::mint, TraceContext::child),
+    }
 }
 
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
@@ -81,6 +229,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
+            BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
+        },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
@@ -99,6 +251,16 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
+        Some(Command::Auth(AuthArgs { command })) => match command {
+            AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
+            AuthCommand::Status => cmd_auth_status(&cli.global_args),
+            AuthCommand::Logout => cmd_auth_logout(&cli.global_args).await,
+        },
+        Some(Command::Secret(SecretArgs { command })) => match command {
+            SecretCommand::Set(args) => cmd_secret_set(&cli.global_args, args),
+            SecretCommand::List(args) => cmd_secret_list(&cli.global_args, args),
+            SecretCommand::Rm(args) => cmd_secret_rm(&cli.global_args, args),
+        },
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
         }
@@ -106,6 +268,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
+        #[cfg(debug_assertions)]
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         #[cfg(debug_assertions)]
         Some(Command::DebugAnswererCommand) => {
@@ -138,8 +301,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 // The autogen session name and its collision retry are the client
 // library's, shared with `min dash`.
 #[cfg(test)]
-pub(crate) use minimal_client::session_name::AUTOGEN_NAME_RETRIES;
-pub(crate) use minimal_client::session_name::{
+pub(crate) use minimal_client::box_name::AUTOGEN_NAME_RETRIES;
+pub(crate) use minimal_client::box_name::{
     autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
 };
 
@@ -182,7 +345,7 @@ pub(crate) async fn connect_daemon_unchecked(
 /// [`get_session_record`]. Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
 pub(crate) enum SessionLookup {
-    Id(sessions::SessionId),
+    Id(boxes::SessionId),
     Name(String),
 }
 
@@ -190,7 +353,7 @@ impl SessionLookup {
     /// Parse a user-supplied session string. If it parses as a UUID,
     /// the lookup is by ID; otherwise by name.
     pub(crate) fn parse(s: &str) -> Self {
-        match sessions::SessionId::parse_str(s) {
+        match boxes::SessionId::parse_str(s) {
             Ok(id) => Self::Id(id),
             Err(_) => Self::Name(s.to_string()),
         }
@@ -234,7 +397,7 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     let resp = get_session_record(client, session).await?;
     named_record(resp.record, session)
 }
@@ -252,7 +415,7 @@ pub(crate) async fn resolve_session(
 pub(crate) async fn resolve_session_version_gated(
     client: &mut client::Client,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     let resp = get_session_record(client, session).await?;
     ensure_version_reported(resp.daemon_version.as_deref())?;
     named_record(resp.record, session)
@@ -309,7 +472,7 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
-) -> Result<Option<sessions::SessionId>, anyhow::Error> {
+) -> Result<Option<boxes::SessionId>, anyhow::Error> {
     if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
         return Ok(Some(entry.id));
     }
@@ -386,9 +549,9 @@ impl std::error::Error for AmbiguousIdPrefix {}
 
 /// Unwrap a looked-up record, naming what was asked for when nothing matched.
 pub(crate) fn named_record(
-    record: Option<sessions::Record>,
+    record: Option<boxes::Record>,
     session: &str,
-) -> Result<sessions::Record, anyhow::Error> {
+) -> Result<boxes::Record, anyhow::Error> {
     record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
 }
 
@@ -455,7 +618,7 @@ pub(crate) fn can_prompt_interactively() -> bool {
 /// policy after any hook mutations). Does NOT talk to the daemon —
 /// the caller decides whether to actually submit or abort.
 ///
-/// `policy` is the user's own [`UserPolicy`](sessions::core::policy::UserPolicy)
+/// `policy` is the user's own [`UserPolicy`](boxes::core::policy::UserPolicy)
 /// loaded from `user_policy.toml`; daemon-side pending items
 /// (packages, projects) are gated against it here on the client.
 /// `hooks` decides what happens when the policy can't auto-decide an
@@ -468,18 +631,18 @@ pub(crate) fn can_prompt_interactively() -> bool {
 /// submitted"; otherwise a `--no-prompt` run would submit a bogus
 /// approval on the wire.
 pub(crate) fn compute_verdict(
-    response: sessions::wire::request::ContributionResponse,
-    policy: sessions::core::policy::UserPolicy,
-    options: sessions::core::compose::ComposeOptions,
-    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    response: boxes::wire::request::ContributionResponse,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
 ) -> Result<
     (
-        sessions::wire::request::ContributionVerdict,
-        sessions::core::policy::UserPolicy,
+        boxes::wire::request::ContributionVerdict,
+        boxes::core::policy::UserPolicy,
     ),
-    sessions::core::compose::ComposeError,
+    boxes::core::compose::ComposeError,
 > {
-    sessions::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
+    boxes::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
         std::env::var(name)
     })
 }
@@ -489,11 +652,11 @@ pub(crate) fn compute_verdict(
 /// parked in `Draft{pending}` and leaks the session slot otherwise.
 pub(crate) async fn submit_verdict_and_wait(
     client: &mut client::Client,
-    session_id: sessions::SessionId,
-    verdict: sessions::wire::request::ContributionVerdict,
-) -> Result<sessions::SessionId, anyhow::Error> {
+    session_id: boxes::SessionId,
+    verdict: boxes::wire::request::ContributionVerdict,
+) -> Result<boxes::SessionId, anyhow::Error> {
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::SubmitVerdict;
-    use sessions::wire::request::SessionStep;
 
     let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
         Ok(r) => r,
@@ -510,8 +673,8 @@ pub(crate) async fn submit_verdict_and_wait(
         }
     };
     match step {
-        SessionStep::Materialized { id } => Ok(id),
-        SessionStep::Fault { error } => {
+        BoxStep::Materialized { id } => Ok(id),
+        BoxStep::Fault { error } => {
             send_abort(client, session_id).await;
             bail!("{error}");
         }
@@ -527,15 +690,15 @@ pub(crate) async fn submit_verdict_and_wait(
 /// daemon-side session before propagating.
 pub(crate) async fn drive_pending_to_active(
     client: &mut client::Client,
-    response: sessions::wire::request::ContributionResponse,
-    policy: sessions::core::policy::UserPolicy,
-    options: sessions::core::compose::ComposeOptions,
-    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    response: boxes::wire::request::ContributionResponse,
+    policy: boxes::core::policy::UserPolicy,
+    options: boxes::core::compose::ComposeOptions,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
     project_dir: &camino::Utf8Path,
 ) -> Result<
     (
-        sessions::SessionId,
-        sessions::core::policy::UserPolicy,
+        boxes::SessionId,
+        boxes::core::policy::UserPolicy,
         Vec<(std::path::PathBuf, paths::SandboxRelPath)>,
     ),
     anyhow::Error,
@@ -547,7 +710,7 @@ pub(crate) async fn drive_pending_to_active(
             send_abort(client, session_id).await;
             // Declining at the prompt is not a broken project: only a
             // genuine compose failure gets the directory-led message.
-            use sessions::core::compose::ComposeError;
+            use boxes::core::compose::ComposeError;
             match e {
                 ComposeError::Aborted | ComposeError::Denied { .. } => bail!("{e}"),
                 _ => bail!(composition_failure_message(project_dir, &e.to_string())),
@@ -568,10 +731,10 @@ pub(crate) async fn drive_pending_to_active(
 /// now needs to upload. `Ignored`/`Denied` verdicts contribute
 /// nothing to the composition, so they're not uploaded.
 pub(crate) fn approved_patches_from_verdict(
-    verdict: &sessions::wire::request::ContributionVerdict,
+    verdict: &boxes::wire::request::ContributionVerdict,
 ) -> impl Iterator<Item = (std::path::PathBuf, paths::SandboxRelPath)> + '_ {
     verdict.patches.iter().filter_map(|v| match v {
-        sessions::wire::policy::WirePatchVerdict::Approved {
+        boxes::wire::policy::WirePatchVerdict::Approved {
             host_path,
             destination,
             ..
@@ -579,14 +742,14 @@ pub(crate) fn approved_patches_from_verdict(
             host_path.as_utf8_path().as_std_path().to_path_buf(),
             destination.clone(),
         )),
-        sessions::wire::policy::WirePatchVerdict::Ignored { .. }
-        | sessions::wire::policy::WirePatchVerdict::Denied { .. } => None,
+        boxes::wire::policy::WirePatchVerdict::Ignored { .. }
+        | boxes::wire::policy::WirePatchVerdict::Denied { .. } => None,
     })
 }
 
 /// Fire an `AbortSession` at the daemon for a `Pending` session the
 /// client has decided not to finalize. A best-effort teardown.
-pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId) {
+pub(crate) async fn send_abort(client: &mut client::Client, session_id: boxes::SessionId) {
     use minimald_rpc::AbortSession;
     match client
         .oneshot_rpc::<AbortSession>(minimald_rpc::AbortSessionRequest { id: session_id })
@@ -594,10 +757,16 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions
     {
         Ok(minimald_rpc::Errorable::Ok(_)) => {}
         Ok(minimald_rpc::Errorable::Err { error }) => {
-            eprintln!("AbortSession failed: {error}");
+            eprintln!(
+                "warning: could not cancel the unfinished session {session_id}: {error}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
         Err(e) => {
-            eprintln!("AbortSession RPC failed: {e}");
+            eprintln!(
+                "warning: could not cancel the unfinished session {session_id}: {e}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
     }
 }
@@ -614,31 +783,159 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions
 /// make the RPC hang indefinitely, which would swallow the
 /// operator-visible primary error we're supposed to be racing
 /// back to `cmd_activate`.
+///
+/// With `only_if_unfinalized` (the cleanup after an activation the client
+/// gave up on) the daemon keeps a session that finished after all
+/// (inbox#690), and the answer says which it did: see
+/// [`cleanup_after_failed_finalize`], which waits for that answer.
 pub(crate) async fn best_effort_destroy(
     client: &mut client::Client,
-    session_id: sessions::SessionId,
-) {
+    session_id: boxes::SessionId,
+    only_if_unfinalized: bool,
+) -> minimal_client::box_registration::CleanupOutcome {
+    use minimal_client::box_registration::CleanupOutcome;
+    if only_if_unfinalized {
+        return cleanup_after_failed_finalize(client, session_id).await;
+    }
     /// Ceiling on how long we let a cleanup RPC run. Chosen well
     /// above a healthy `DestroySession` (single-digit milliseconds
     /// on a UDS) so the timeout only fires against pathologies.
     const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     use minimald_rpc::DestroySession;
-    let call = client
-        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
+    let call = client.oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest {
+        id: session_id,
+        only_if_unfinalized: false,
+    });
     match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
-        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
+        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => return CleanupOutcome::Destroyed,
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
-            eprintln!("DestroySession failed while cleaning up: {error}");
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {error}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
         Ok(Err(e)) => {
-            eprintln!("DestroySession RPC failed while cleaning up: {e}");
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {e}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
         Err(_) => {
             eprintln!(
-                "DestroySession timed out after {DESTROY_TIMEOUT:?} while cleaning up \
-                 session {session_id}; the session may still be present on the daemon \
-                 (run `min session destroy {session_id}` to clean up manually)",
+                "warning: could not remove the unfinished session {session_id}: the \
+                 daemon did not answer within {DESTROY_TIMEOUT:?}; the session may \
+                 still exist; run `min session destroy {session_id}` to remove it",
             );
+        }
+    }
+    CleanupOutcome::Unknown
+}
+
+/// The cleanup after an activation the client gave up on (inbox#690): a
+/// conditional destroy, waited for until the daemon answers. It waits in the
+/// session's mailbox behind any finalize still running, which a stalled
+/// fetch can hold for minutes, and only its answer says whether a box is
+/// live behind the registration's row. A timer would have to guess, and a
+/// wrong guess either withdraws a live box's row or leaves a removed
+/// session's row published with nothing able to withdraw it (the session is
+/// gone, so `min session destroy` no longer finds it). So past
+/// `NOTE_AFTER` the client says what it is waiting for, and waits on.
+///
+/// A Ctrl-C stops the wait, not the destroy: the daemon has it in hand and
+/// finishes it, keeping the session if its activation completed and removing
+/// it otherwise. Nothing the client can read then says which, since a
+/// session a destroy is in flight for is hidden from reads, so the outcome
+/// is [`Unknown`](CleanupOutcome::Unknown): the row stays, for a box that
+/// may be live, and the user is told how to see what became of it.
+async fn cleanup_after_failed_finalize(
+    client: &mut client::Client,
+    session_id: boxes::SessionId,
+) -> minimal_client::box_registration::CleanupOutcome {
+    use minimal_client::box_registration::CleanupOutcome;
+    use minimald_rpc::DestroySession;
+    const NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The call's own deadline. The daemon bounds neither the finalize this
+    /// destroy waits behind nor the destroy, and a client RPC's usual 60 s
+    /// would turn a finalize still running into "unknown" and keep a row
+    /// the daemon may then orphan. The user's Ctrl-C is the bound; this only
+    /// keeps the timer finite.
+    const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    /// With no terminal on stdin (CI, a script) nobody presses Ctrl-C, so
+    /// the wait is bounded here instead and ends unknown: the row stays, the
+    /// daemon still settles the session, and the warning says how to see
+    /// what became of it.
+    const UNATTENDED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let deadline = if std::io::stdin().is_terminal() {
+        CLEANUP_DEADLINE
+    } else {
+        UNATTENDED_DEADLINE
+    };
+    let answer = {
+        let call = client.oneshot_rpc_with_deadline::<DestroySession>(
+            minimald_rpc::DestroySessionRequest {
+                id: session_id,
+                only_if_unfinalized: true,
+            },
+            deadline,
+        );
+        tokio::pin!(call);
+        let note = tokio::time::sleep(NOTE_AFTER);
+        tokio::pin!(note);
+        let mut noted = false;
+        loop {
+            tokio::select! {
+                answer = &mut call => break Some(answer),
+                () = &mut note, if !noted => {
+                    noted = true;
+                    eprintln!(
+                        "note: waiting for the daemon to finish or remove session {session_id}: \
+                         its activation is still running. Press Ctrl-C to stop waiting; the \
+                         daemon still finishes or removes the session on its own"
+                    );
+                }
+                _ = tokio::signal::ctrl_c() => break None,
+            }
+        }
+    };
+    match answer {
+        Some(Ok(minimald_rpc::Errorable::Ok(resp))) if resp.kept => {
+            eprintln!(
+                "note: the session {session_id} finished activating after this client gave \
+                 up on it, so it was kept: it is live (`min ls`)"
+            );
+            CleanupOutcome::Kept
+        }
+        Some(Ok(minimald_rpc::Errorable::Ok(_))) => CleanupOutcome::Destroyed,
+        // Already gone: a concurrent `min session destroy` removed it first,
+        // and nothing runs behind the row, so the row goes as for a destroy
+        // this client made. Kept, it could never be removed: the session the
+        // destroy command would look for no longer exists.
+        Some(Ok(minimald_rpc::Errorable::Err { error }))
+            if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) =>
+        {
+            CleanupOutcome::Destroyed
+        }
+        Some(Ok(minimald_rpc::Errorable::Err { error })) => {
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {error}; \
+                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+            );
+            CleanupOutcome::Unknown
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {e}; \
+                 check `min ls`, and run `min session destroy {session_id}` to remove it"
+            );
+            CleanupOutcome::Unknown
+        }
+        None => {
+            eprintln!(
+                "warning: stopped waiting for session {session_id}; the daemon is still \
+                 finishing or removing it. `min ls` shows which once it is done, and `min \
+                 session destroy {session_id}` removes it if it is still there"
+            );
+            CleanupOutcome::Unknown
         }
     }
 }
@@ -647,9 +944,9 @@ pub(crate) async fn best_effort_destroy(
 /// because another box at the same shared loopback address holds it.
 fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
     format!(
-        "warning: port {} is already held by {}; this session will not \
-         forward it (first-come on the shared address); recreate one of them \
-         with a different external port, e.g. --ingress <other>:<internal>",
+        "warning: port {} is already used by {}, so this box does not \
+         get it. To use the port, create one of the two boxes again \
+         with a different external port, e.g. --ingress <other>:<internal>.",
         collision.port, collision.held_by
     )
 }
@@ -671,9 +968,9 @@ fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) 
 /// base RPC timeout is not cut short.
 pub(crate) async fn upload_and_finalize(
     client: &mut client::Client,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
-    hook_scripts: &[sessions::client::hookscripts::StagedScript],
+    hook_scripts: &[boxes::client::hookscripts::StagedScript],
     hook_budget: std::time::Duration,
 ) -> Result<(), anyhow::Error> {
     client
@@ -719,9 +1016,11 @@ pub(crate) async fn upload_and_finalize(
             }
             if ok.package_check_skipped {
                 eprintln!(
-                    "warning: the session package check was skipped (the package graph \
-                     did not resolve in time or could not be evaluated; see the daemon \
-                     log); unknown package names will surface at first exec"
+                    "warning: this project's package names were not checked (the \
+                     check timed out or could not run; the daemon log says \
+                     which). The box was created; an \
+                     unknown package name shows up as an error the first time a \
+                     command runs in it."
                 );
             }
             // First-come on a shared loopback address: another box at the
@@ -774,7 +1073,7 @@ impl Drop for ActivationInterrupt {
 
 pub(crate) fn arm_activation_interrupt(
     global: &GlobalArgs,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
@@ -846,8 +1145,220 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
     )
 }
 
+/// The text for a session-creating RPC that failed because the daemon was
+/// shutting down at that moment — the `min stop` race: an activation sent
+/// while the daemon tears down loses that race, and the raw chain beneath
+/// (a refused RPC, the daemon-side refusal, "shutting down") reads like an
+/// internal error rather than the lost race it is. The daemon marks its
+/// shutdown refusals with a single constant the client can match on, so the
+/// race is named here in plain language. The wire carries no structured
+/// refusal, only the daemon's stderr text, so the match is exact: the
+/// error must be the client's daemon-side failure for this very RPC whose
+/// whole daemon message is the refusal. An error that merely ends with the
+/// same words, or wraps them in other causes, is not reworded. The plain
+/// line stands alone, without the RPC's name, which means nothing to the
+/// reader (the debug log keeps the raw error). Any other failure keeps the
+/// chain, wrapped exactly as before.
+pub(crate) fn session_rpc_failed(rpc: SessionRpc, error: anyhow::Error) -> anyhow::Error {
+    if error.chain().count() == 1 && error.to_string() == shutdown_refusal_text(rpc) {
+        tracing::debug!(rpc = rpc.name(), error = %format!("{error:#}"), "refused: the daemon is shutting down");
+        return anyhow::anyhow!(rpc.shutdown_race_message());
+    }
+    error.context(format!("{} RPC failed", rpc.display_name()))
+}
+
+// The client's refusal test compares against text assembled from the
+// authoritative `minimald-rpc` constants (`SessionRpc::name` defers to the
+// same `OneshotSshRpc::NAME` values `oneshot_rpc_within`'s `bail!` uses),
+// so a rename or prefix change in the wire contract breaks the equality
+// loudly here — at compile time for the name, at test time for the
+// assembled string — instead of silently failing to match and letting the
+// raw RPC chain resurface. A structured refusal code (a field carried
+// alongside the payload) was considered and declined: the oneshot RPC
+// wire carries only the daemon's stderr text — no refusal field, no
+// error-code channel — so exact text is the whole contract this
+// boundary has. The match is accordingly total equality on the
+// client's own rendering of this RPC's daemon-side failure, never a
+// suffix or substring scan of the chain, so an unrelated error that
+// merely ends with the refusal phrase is never reworded and never
+// masks its real cause.
+
+/// The exact error `minimal_client`'s oneshot RPC raises when the daemon
+/// refuses `rpc` because it is shutting down: the client's daemon-side
+/// prefix, then the daemon's `ConnectionError::Internal` rendering of
+/// [`minimald_rpc::SHUTDOWN_REFUSAL`].
+fn shutdown_refusal_text(rpc: SessionRpc) -> String {
+    format!(
+        "{} RPC failed on the daemon side: Internal error: {}",
+        rpc.name(),
+        minimald_rpc::SHUTDOWN_REFUSAL
+    )
+}
+
+/// The two session-creating RPCs [`session_rpc_failed`] words a failure of.
+/// They differ in what the lost race leaves behind: a refused
+/// `CreateSession` created nothing, while a refused `ConfigureLoadout`
+/// leaves the session it follows created but never started, in a state the
+/// daemon deletes when it starts again.
+#[derive(Clone, Copy)]
+pub(crate) enum SessionRpc {
+    CreateSession,
+    ConfigureLoadout,
+}
+
+impl SessionRpc {
+    /// The wire name of this RPC, from the same
+    /// [`minimald_rpc::OneshotSshRpc::NAME`] constant the client's
+    /// `oneshot_rpc_within` uses in its `bail!`, so the refusal match in
+    /// [`shutdown_refusal_text`] cannot drift from what the client
+    /// actually sends: an RPC renamed in `minimald-rpc` breaks the match
+    /// here loudly, not silently.
+    fn name(self) -> &'static str {
+        match self {
+            SessionRpc::CreateSession => {
+                <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME
+            }
+            SessionRpc::ConfigureLoadout => {
+                <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME
+            }
+        }
+    }
+
+    /// The bare name for user-facing wrapping (`"… RPC failed"`), which
+    /// omits the subsystem prefix the wire name carries. Derived from
+    /// [`SessionRpc::name`], so a rename reaches the copy too and the
+    /// tests that pin it fail rather than let stale text ship.
+    fn display_name(self) -> &'static str {
+        self.name()
+            .strip_prefix(minimald_rpc::RPC_SUBSYSTEM_PREFIX)
+            .unwrap_or(self.name())
+    }
+
+    /// What [`session_rpc_failed`] prints for an activation that lost the
+    /// race with a daemon shutdown at this step.
+    fn shutdown_race_message(self) -> &'static str {
+        match self {
+            SessionRpc::CreateSession => {
+                "The daemon was shutting down, so no session was created. \
+                 Run the command again once the daemon is running."
+            }
+            SessionRpc::ConfigureLoadout => {
+                "The daemon was shutting down, so the session was created but not \
+                 started; the daemon removes it when it starts again. \
+                 Run the command again once the daemon is running."
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::{SessionRpc, session_rpc_failed};
+
+    /// An RPC refused because the daemon was shutting down — the `min stop`
+    /// race — surfaces as plain language, not the raw RPC chain. The
+    /// refusal reaches the client as the daemon-side stderr text, wrapped in
+    /// the transport failure, so the test builds that chain and checks the
+    /// mapping keys on the refusal marker rather than the wrapping. A refused
+    /// `CreateSession` created nothing. The input is assembled from the same
+    /// `OneshotSshRpc::NAME` constant `oneshot_rpc_within`'s `bail!` uses, so
+    /// a wire-contract rename fails here instead of drifting silently.
+    #[test]
+    fn a_shutdown_raced_create_names_the_lost_race() {
+        let raw = anyhow::anyhow!(
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
+        assert_eq!(
+            error.to_string(),
+            "The daemon was shutting down, so no session was created. \
+             Run the command again once the daemon is running."
+        );
+        // The plain line stands alone: no RPC name reaches the user.
+        assert!(error.source().is_none());
+        assert!(!format!("{error:#}").contains("RPC"));
+    }
+
+    /// A refused `ConfigureLoadout` follows a `CreateSession` that worked, so
+    /// the text says the session exists but was not started, and that the
+    /// daemon deletes it when it starts again, rather than that nothing was
+    /// created.
+    #[test]
+    fn a_shutdown_raced_configure_says_the_session_was_not_started() {
+        let raw = anyhow::anyhow!(
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME,
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::ConfigureLoadout, raw);
+        assert_eq!(
+            error.to_string(),
+            "The daemon was shutting down, so the session was created but not \
+             started; the daemon removes it when it starts again. \
+             Run the command again once the daemon is running."
+        );
+    }
+
+    /// An unrelated error whose text merely ends with the marker is not the
+    /// shutdown refusal: it is not the daemon-side failure of this RPC, so
+    /// it keeps its chain. Nor is the refusal of another RPC, or the refusal
+    /// wrapped in other context.
+    #[test]
+    fn an_unrelated_error_ending_with_the_marker_is_not_reworded() {
+        let unrelated = anyhow::anyhow!(
+            "upload workspace: peer said {}",
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, unrelated);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+
+        let other_rpc = anyhow::anyhow!(
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::ConfigureLoadout as minimald_rpc::OneshotSshRpc>::NAME,
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, other_rpc);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+
+        let wrapped = anyhow::anyhow!(
+            "{} RPC failed on the daemon side: Internal error: {}",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
+            minimald_rpc::SHUTDOWN_REFUSAL
+        )
+        .context("something else failed");
+        let error = session_rpc_failed(SessionRpc::CreateSession, wrapped);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+    }
+
+    /// A failure that merely mentions the marker inside other text is not
+    /// the shutdown refusal either, and keeps its chain.
+    #[test]
+    fn the_shutdown_marker_inside_other_text_is_not_the_refusal() {
+        let raw = anyhow::anyhow!(
+            "{} RPC failed on the daemon side: Internal error: {} \
+             was not expected here",
+            <minimald_rpc::CreateSession as minimald_rpc::OneshotSshRpc>::NAME,
+            minimald_rpc::SHUTDOWN_REFUSAL
+        );
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+    }
+
+    /// Any other RPC failure keeps its chain, wrapped exactly as before:
+    /// only the shutdown race is reworded.
+    #[test]
+    fn an_ordinary_rpc_failure_keeps_its_chain() {
+        let raw = anyhow::anyhow!("the daemon exploded");
+        let error = session_rpc_failed(SessionRpc::CreateSession, raw);
+        assert_eq!(error.to_string(), "CreateSession RPC failed");
+        assert_eq!(
+            error.source().map(|source| source.to_string()),
+            Some("the daemon exploded".to_string())
+        );
+    }
+
     /// NET-129: the activate warning for a yielded shared-address port is a
     /// `warning:` line naming the port, the box that holds it, and the way
     /// out of the collision: a different external port, since the check keys
@@ -860,10 +1371,195 @@ mod tests {
         });
         assert_eq!(
             line,
-            "warning: port 18080 is already held by first.min.internal; this session \
-             will not forward it (first-come on the shared address); recreate one \
-             of them with a different external port, e.g. --ingress \
-             <other>:<internal>"
+            "warning: port 18080 is already used by first.min.internal, so this \
+             box does not get it. To use the port, create one of the two boxes \
+             again with a different external port, e.g. --ingress \
+             <other>:<internal>."
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_forward_tests {
+    use super::{inbound_parent, root_context};
+
+    /// With telemetry off (no exporter installed), an inbound `TRACEPARENT`
+    /// still parents the command, so this process's own log lines carry
+    /// the caller's trace id, and nothing is installed to export. The
+    /// daemon is not told the context then: an opted-out command sends the
+    /// opt-out marker instead (`minimal_client::set_telemetry_opted_out`).
+    /// A `min` inside a box joins the outer trace by the in-box helper's
+    /// route instead (TEL-025, minimald's
+    /// `a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix`).
+    #[test]
+    fn adopts_an_inbound_traceparent_without_exporting() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let parent = inbound_parent(Some(tp.to_string())).expect("valid traceparent");
+        let root = tracing::info_span!("cmd");
+        let ctx = root_context(&root, Some(&parent));
+        assert!(
+            !mlog::otel::exporting(),
+            "the test must not install an exporter"
+        );
+        assert_eq!(ctx.trace_id_hex(), parent.trace_id_hex());
+        assert_ne!(ctx.span_id_hex(), parent.span_id_hex());
+        assert!(
+            ctx.traceparent()
+                .contains("0af7651916cd43dd8448eb211c80319c")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_traceparent_starts_a_fresh_trace() {
+        assert!(inbound_parent(None).is_none());
+        assert!(inbound_parent(Some("junk".into())).is_none());
+        let root = tracing::info_span!("cmd");
+        let a = root_context(&root, None);
+        assert_ne!(a.trace_id_hex(), "0af7651916cd43dd8448eb211c80319c");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::{Handoff, die_of, run_in_root};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+
+    /// Records the name of every span that closes, in the order they close.
+    #[derive(Clone, Default)]
+    struct Closed(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for Closed
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+            if let Some(span) = ctx.span(&id) {
+                self.0.lock().unwrap().push(span.name());
+            }
+        }
+    }
+
+    fn closed_names(closed: &Closed) -> Vec<&'static str> {
+        closed.0.lock().unwrap().clone()
+    }
+
+    /// The TEL-031 contract: by the time `run` holds a hand-off (and so before
+    /// it flushes and exits or raises), the `cmd` span and the spans under it
+    /// have closed, which is what puts them in the exporter and the spool.
+    #[tokio::test]
+    async fn the_cmd_span_ends_before_a_handoff_is_finished() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let root = tracing::info_span!("cmd");
+        let handoff = run_in_root(root, async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Exit(0).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(0))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// The attach's exit status comes back unchanged, after the span ends.
+    #[tokio::test]
+    async fn an_exit_handoff_keeps_its_status() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            Err(Handoff::Exit(130).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(130))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["cmd"]);
+    }
+
+    /// A SIGTERM'd `min net forward` hands back the signal after `cmd` ends.
+    #[tokio::test]
+    async fn a_raise_handoff_comes_back_after_the_span_ends() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Raise(nix::sys::signal::Signal::SIGTERM).into())
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                handoff,
+                Some(Handoff::Raise(nix::sys::signal::Signal::SIGTERM))
+            ),
+            "{handoff:?}"
+        );
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// Set in the child [`die_of_ends_the_process_by_the_signal`] spawns, to
+    /// the number of the signal the child dies of.
+    const DIE_OF_CHILD: &str = "MINIMAL_TEST_DIE_OF_CHILD";
+
+    /// `die_of` kills the process by the signal even though a handler for it
+    /// is installed (tokio's, as in the forward), so a parent sees the wait
+    /// status an uncaught SIGTERM or SIGHUP gave it before the handler
+    /// existed. Runs itself in a child process, since passing means the
+    /// process dies.
+    #[test]
+    fn die_of_ends_the_process_by_the_signal() {
+        use nix::sys::signal::Signal;
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(raw) = std::env::var_os(DIE_OF_CHILD) {
+            let signal = Signal::try_from(raw.to_str().unwrap().parse::<i32>().unwrap()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _handler = rt
+                .block_on(async {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
+                        signal as i32,
+                    ))
+                })
+                .unwrap();
+            die_of(signal);
+        }
+        for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd::handoff_tests::die_of_ends_the_process_by_the_signal",
+                    "--test-threads=1",
+                ])
+                .env(DIE_OF_CHILD, (signal as i32).to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.signal(), Some(signal as i32), "{signal}: {status:?}");
+            assert!(!status.core_dumped(), "{signal}: {status:?}");
+        }
+    }
+
+    /// A command that returns, or fails, hands nothing off: its error comes
+    /// back as it was, and the span still ends.
+    #[tokio::test]
+    async fn ordinary_outcomes_pass_through() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let ok = run_in_root(tracing::info_span!("cmd"), async { Ok(()) }).await;
+        assert!(matches!(ok, Ok(None)));
+        let err = run_in_root(tracing::info_span!("cmd"), async {
+            Err(anyhow::anyhow!("no session found"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(format!("{err:#}"), "no session found");
+        assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
     }
 }

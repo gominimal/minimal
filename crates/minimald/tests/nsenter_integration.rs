@@ -10,7 +10,7 @@
 //! difference directly: the injected process's PID namespace must match the
 //! session program's and must *not* match the supervisor's.
 //!
-//! The container is built the way `sandbox2::new_container` builds one, minus
+//! The container is built the way `sandbox::new_container` builds one, minus
 //! the network isolation — the proof is about process structure, and a netns
 //! would drag the switch wiring in with it.
 //!
@@ -46,7 +46,7 @@ fn shim() -> PathBuf {
 
 /// A sandbox holding a long-lived program, shaped like a session's.
 ///
-/// `isolate_network` mirrors the choice `sandbox2::new_container` makes from the
+/// `isolate_network` mirrors the choice `sandbox::new_container` makes from the
 /// session's network mode: a `HostNet` session stays in the daemon's network
 /// namespace, a `NoNet`/`OwnIp` one gets its own.
 fn sandbox(isolate_network: bool) -> hakoniwa::Child {
@@ -57,8 +57,8 @@ fn sandbox(isolate_network: bool) -> hakoniwa::Child {
         // The box uid and gid, mapped as `new_container` maps them: the shim
         // takes them on before it execs, which fails with EINVAL in a user
         // namespace that does not map them.
-        .uidmap(sandbox2::config::BOX_UID)
-        .gidmap(sandbox2::config::BOX_GID)
+        .uidmap(sandbox::config::BOX_UID)
+        .gidmap(sandbox::config::BOX_GID)
         .devfsmount("/dev")
         .tmpfsmount("/tmp")
         .unshare(hakoniwa::Namespace::Cgroup)

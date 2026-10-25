@@ -158,6 +158,23 @@ impl FileCache {
 
     /// Drives the given response to read bytes and write them into the cache with the given filename
     /// and hash.
+    ///
+    /// The bytes go to a uniquely named temp file in the same directory, which is renamed onto the
+    /// content-addressed path only after its SHA-256 matches. A failed or mismatched download
+    /// therefore never appears under the hash, and concurrent readers see either nothing or the
+    /// whole verified file.
+    ///
+    /// Returns the cached path, replacing any existing entry on success. `sha256` must match the
+    /// lowercase hexadecimal digest of the response bytes. Updates `op` with bytes received, using
+    /// the response's content length, when available, as the progress total only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Either::Right` for response stream errors. Returns `Either::Left` for
+    /// [FileCacheError::BadSha] if `sha256` contains `/`, [FileCacheError::HashMismatch] if the
+    /// digest differs, or [FileCacheError::IO] if accessing or creating the cache directory,
+    /// creating the temporary file, writing or syncing it, or persisting it fails. Failure to sync
+    /// the directory after publication does not prevent a successful return.
     pub async fn write_through<R>(
         &self,
         filename: &str,
@@ -168,12 +185,24 @@ impl FileCache {
     where
         R: fetchers::FetchResponse,
     {
-        let cached_path = self.sha_dir(sha256).map_err(Either::Left)?.join(filename);
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = self.sha_dir(sha256).map_err(Either::Left)?;
+        let cached_path = dir.join(filename);
+
+        // Dropping `tmp` on any early return removes the temp file. The prefix is fixed rather than
+        // derived from `filename`, so a filename near NAME_MAX still fits.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".dl.")
+            .suffix(".part")
+            .permissions(fs::Permissions::from_mode(0o666))
+            .tempfile_in(&dir)
+            .map_err(|e| Either::Left(e.into()))?;
 
         let mut hasher = super::HashWriter(Sha256::new());
         {
-            let mut f = fs::File::create(&cached_path).map_err(|e| Either::Left(e.into()))?;
-            let mut w = Tee::new(&mut f, &mut hasher);
+            let f = tmp.as_file_mut();
+            let mut w = Tee::new(&mut *f, &mut hasher);
 
             if let Some(size) = response.content_length() {
                 op.set_length(size);
@@ -182,7 +211,7 @@ impl FileCache {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
                         op.increment(chunk.len() as u64);
-                        w.write_all(&chunk).unwrap();
+                        w.write_all(&chunk).map_err(|e| Either::Left(e.into()))?;
                     }
                     Ok(None) => {
                         break;
@@ -200,14 +229,22 @@ impl FileCache {
         let computed_hex = hex::encode(computed_hash);
 
         if computed_hex != sha256 {
-            fs::remove_file(&cached_path).ok(); // ignore error, best effort
-            Err(Either::Left(FileCacheError::HashMismatch {
+            return Err(Either::Left(FileCacheError::HashMismatch {
                 want: sha256.to_string(),
                 got: computed_hex,
-            }))
-        } else {
-            Ok(cached_path)
+            }));
         }
+
+        // Renaming over an existing entry is fine: it holds the same verified bytes.
+        tmp.persist(&cached_path)
+            .map_err(|e| Either::Left(e.error.into()))?;
+        // Fsync the directory so the rename itself survives a crash. This buys durability, not
+        // integrity (`read_cached` re-hashes every read), so a failure only warns: some
+        // filesystems refuse a directory fsync.
+        if let Err(e) = fs::File::open(&dir).and_then(|d| d.sync_all()) {
+            tracing::warn!("could not fsync cache directory {}: {e}", dir.display());
+        }
+        Ok(cached_path)
     }
 }
 
@@ -348,6 +385,177 @@ mod tests {
             !cached.exists(),
             "file should be removed after hash mismatch"
         );
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut h = sha2::Sha256::new();
+        sha2::Digest::update(&mut h, data);
+        hex::encode(h.finalize())
+    }
+
+    /// A [FetchResponse] that yields one chunk, waits for `resume` to be
+    /// notified, then yields `tail` (or fails if `tail` is `Err`).
+    #[derive(Debug)]
+    struct PausingResponse {
+        head: Option<Bytes>,
+        tail: Option<Result<Bytes, String>>,
+        paused: std::sync::Arc<tokio::sync::Notify>,
+        resume: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl fetchers::FetchResponse for PausingResponse {
+        type Error = String;
+
+        fn error_for_status(self) -> Result<Self, Self::Error> {
+            Ok(self)
+        }
+        fn is_success(&self) -> bool {
+            true
+        }
+        fn status_code(&self) -> usize {
+            200
+        }
+        fn content_length(&self) -> Option<u64> {
+            None
+        }
+        async fn bytes(self) -> Result<Bytes, Self::Error> {
+            unimplemented!("write_through streams via chunk()")
+        }
+        async fn chunk(&mut self) -> Result<Option<Bytes>, Self::Error> {
+            if let Some(head) = self.head.take() {
+                return Ok(Some(head));
+            }
+            match self.tail.take() {
+                Some(tail) => {
+                    self.paused.notify_one();
+                    self.resume.notified().await;
+                    tail.map(Some)
+                }
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Lists the entries of a cache sha directory.
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A stream that fails part-way through must leave nothing at the
+    /// content-addressed path, and no temp file behind either.
+    #[tokio::test]
+    async fn write_through_stream_error_leaves_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let sha = sha256_hex(b"partial-and-the-rest");
+
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        resume.notify_one(); // do not actually pause
+        let mut resp = PausingResponse {
+            head: Some(Bytes::from_static(b"partial-")),
+            tail: Some(Err("connection reset".into())),
+            paused: std::sync::Arc::new(tokio::sync::Notify::new()),
+            resume,
+        };
+
+        let err = cache
+            .write_through("src.tar.gz", &sha, &mut resp, &op)
+            .await
+            .unwrap_err();
+        assert_eq!(err.unwrap_right(), "connection reset");
+
+        let dir = cache.sha_dir(&sha).unwrap();
+        assert!(
+            !dir.join("src.tar.gz").exists(),
+            "a failed stream must not leave a file under the pinned hash"
+        );
+        assert_eq!(dir_entries(&dir), Vec::<String>::new(), "temp file leaked");
+    }
+
+    /// While a download is in flight, a concurrent reader must never see a
+    /// partial file at the content-addressed path; once it completes, the
+    /// whole verified file appears.
+    #[tokio::test]
+    async fn write_through_in_flight_is_invisible_to_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let content = b"first-half|second-half";
+        let sha = sha256_hex(content);
+
+        let paused = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut resp = PausingResponse {
+            head: Some(Bytes::copy_from_slice(&content[..11])),
+            tail: Some(Ok(Bytes::copy_from_slice(&content[11..]))),
+            paused: paused.clone(),
+            resume: resume.clone(),
+        };
+
+        let writer = {
+            let cache = cache.clone();
+            let sha = sha.clone();
+            tokio::spawn(async move {
+                cache
+                    .write_through("src.tar.gz", &sha, &mut resp, &op)
+                    .await
+                    .map_err(|e| format!("{e:?}"))
+            })
+        };
+
+        // The writer has written the first chunk and is blocked mid-stream.
+        paused.notified().await;
+        let final_path = cache.sha_dir(&sha).unwrap().join("src.tar.gz");
+        assert!(
+            !final_path.exists(),
+            "a partial download must not be visible under the pinned hash"
+        );
+        assert_eq!(cache.read_cached("src.tar.gz", &sha).unwrap(), None);
+
+        resume.notify_one();
+        let path = writer.await.unwrap().expect("download should succeed");
+        assert_eq!(path, final_path);
+        assert_eq!(fs::read(&path).unwrap(), content);
+        assert_eq!(
+            dir_entries(path.parent().unwrap()),
+            vec!["src.tar.gz".to_string()],
+            "only the final file should remain"
+        );
+    }
+
+    /// A filename close to NAME_MAX (255) must still cache: the temp file
+    /// name must not grow with the filename.
+    #[tokio::test]
+    async fn write_through_accepts_filename_near_name_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let content = b"long-name";
+        let sha = sha256_hex(content);
+        let filename = format!("{}.tar.gz", "a".repeat(247));
+        assert_eq!(filename.len(), 254);
+
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        resume.notify_one();
+        let mut resp = PausingResponse {
+            head: Some(Bytes::from_static(content)),
+            tail: None,
+            paused: std::sync::Arc::new(tokio::sync::Notify::new()),
+            resume,
+        };
+
+        let path = cache
+            .write_through(&filename, &sha, &mut resp, &op)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .expect("a 254-byte filename should cache");
+        assert_eq!(fs::read(&path).unwrap(), content);
     }
 
     /// A fake URL whose filename is whatever the test sets.

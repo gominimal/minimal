@@ -50,10 +50,17 @@
 //! on its own, with nothing to observe.
 //!
 //! None ever touches a host's own install: a tree at
-//! [`sandbox2::classifier::TREE_ROOT`], or an already-loaded
+//! [`sandbox::classifier::TREE_ROOT`], or an already-loaded
 //! `minimal_class` table, is that host's, and a proof that found one would
 //! be a proof run over something it must not replace.
 #![cfg(target_os = "linux")]
+// An integration test has no `crate::traced` to route its spawns through,
+// and nothing it spawns is in a daemon request's trace; the crate's clippy
+// `disallowed-methods` (see clippy.toml) is for the daemon's own sources.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an integration test cannot reach crate::traced, and traces nothing"
+)]
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -62,17 +69,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use boxes::SessionId;
 use minimald::net::classifier::{
     Family, Observed, Reading, decide_now, read_filter, record_node_plane_fetch,
 };
 use minimald::net::dns::HostnameRegistry;
 use minimald::net::proxy::{Router, serve};
 use minimald::net::switch::proxied_request_verdict;
-use sandbox2::classifier::{
+use sandbox::classifier::{
     self, DAEMON_LEAF as THE_DAEMON_LEAF, create_box_leaf, daemon_leaf, place_pid, remove_box_leaf,
 };
-use sandbox2::config::{ALLOW_DIR, DENY_DIR, Verdict};
-use sessions::SessionId;
+use sandbox::config::{ALLOW_DIR, DENY_DIR, Verdict};
 
 /// The loaded table's name, the installer's spelling of it: the daemon
 /// reads only its marker, so this is the proof's own name for what it

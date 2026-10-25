@@ -180,6 +180,13 @@ pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
         .arg("--detach")
         .arg("--timeout")
         .arg(timeout_secs.to_string());
+    // The CLI's trace context, so the minvmd it starts (and, through the
+    // supervisor and the guest boot line, the VM it boots) joins this
+    // invocation's trace. minvmd adopts it only with telemetry on.
+    cmd.env(
+        minimald_rpc::trace::TRACEPARENT_ENV,
+        minimal_client::trace_context().traceparent(),
+    );
 
     // `minvmd run --detach` blocks until the VM is serving (or times out): a
     // cold first boot can sit here for up to ~1 min. Run it on a thread (so

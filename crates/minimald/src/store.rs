@@ -1,8 +1,8 @@
-use paths::DaemonAbsPath;
-use sessions::{
+use boxes::{
     Record, SessionId,
-    store::{DiskLoader, DiskSession, DiskSessionKey, Loader as _, SessionKey, SessionObject},
+    store::{BoxKey, BoxObject, DiskBox, DiskBoxKey, DiskLoader, Loader as _},
 };
+use paths::DaemonAbsPath;
 
 use std::fmt;
 use tokio::sync::{mpsc, oneshot};
@@ -24,44 +24,38 @@ impl fmt::Display for RecordPredicate {
 }
 
 enum StoreMessage {
-    Handles(oneshot::Sender<Result<Vec<SessionRecordHandle>, std::io::Error>>),
+    Handles(oneshot::Sender<Result<Vec<BoxRecordHandle>, std::io::Error>>),
     Create(
         Box<Record>,
-        oneshot::Sender<Result<SessionRecordHandle, std::io::Error>>,
+        oneshot::Sender<Result<BoxRecordHandle, std::io::Error>>,
     ),
     Find(
         RecordPredicate,
-        oneshot::Sender<Result<Option<SessionRecordHandle>, std::io::Error>>,
+        oneshot::Sender<Result<Option<BoxRecordHandle>, std::io::Error>>,
     ),
-    SessionGet(
-        DiskSessionKey,
-        oneshot::Sender<Result<Record, std::io::Error>>,
-    ),
-    SessionObject(
-        DiskSessionKey,
-        oneshot::Sender<Result<DiskSession, std::io::Error>>,
-    ),
+    SessionGet(DiskBoxKey, oneshot::Sender<Result<Record, std::io::Error>>),
+    BoxObject(DiskBoxKey, oneshot::Sender<Result<DiskBox, std::io::Error>>),
     SessionWrite(
-        DiskSessionKey,
+        DiskBoxKey,
         Box<Record>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
-    SessionDelete(DiskSessionKey, oneshot::Sender<Result<(), std::io::Error>>),
+    SessionDelete(DiskBoxKey, oneshot::Sender<Result<(), std::io::Error>>),
     CompositionLoad(
-        DiskSessionKey,
-        oneshot::Sender<Result<Option<sessions::core::compose::Composition>, std::io::Error>>,
+        DiskBoxKey,
+        oneshot::Sender<Result<Option<boxes::core::compose::Composition>, std::io::Error>>,
     ),
     CompositionStore(
-        DiskSessionKey,
-        std::sync::Arc<sessions::core::compose::Composition>,
+        DiskBoxKey,
+        std::sync::Arc<boxes::core::compose::Composition>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
     DeltaBaselineLoad(
-        DiskSessionKey,
+        DiskBoxKey,
         oneshot::Sender<Result<Option<Vec<u8>>, std::io::Error>>,
     ),
     DeltaBaselineStore(
-        DiskSessionKey,
+        DiskBoxKey,
         Vec<u8>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
@@ -90,7 +84,8 @@ impl Store {
             store: l,
         };
 
-        tokio::spawn(store.mainloop());
+        // Lives for the daemon: a root of its own (see `traced::spawn_detached`).
+        crate::traced::spawn_detached(tracing::info_span!(parent: None, "store"), store.mainloop());
         Ok(handle)
     }
 }
@@ -103,7 +98,7 @@ impl Store {
     }
 
     /// Resolves a predicate to a key, if a matching record exists.
-    fn resolve(&self, pred: &RecordPredicate) -> Result<Option<DiskSessionKey>, std::io::Error> {
+    fn resolve(&self, pred: &RecordPredicate) -> Result<Option<DiskBoxKey>, std::io::Error> {
         match pred {
             RecordPredicate::Id(id) => self.store.find_by_id(id),
             RecordPredicate::Name(name) => self.store.find_by_name(name),
@@ -112,8 +107,8 @@ impl Store {
 
     /// Wraps a key in a record handle. The caller awaiting this message holds a
     /// strong [`StoreHandle`], so the upgrade always succeeds.
-    fn handle_for(&self, k: DiskSessionKey) -> SessionRecordHandle {
-        SessionRecordHandle {
+    fn handle_for(&self, k: DiskBoxKey) -> BoxRecordHandle {
+        BoxRecordHandle {
             h: self
                 .weak_self
                 .upgrade()
@@ -141,7 +136,7 @@ impl Store {
             StoreMessage::SessionGet(k, r) => {
                 let _ = r.send(self.store.get(&k).map(|o| o.record().clone()));
             }
-            StoreMessage::SessionObject(k, r) => {
+            StoreMessage::BoxObject(k, r) => {
                 let _ = r.send(self.store.get(&k));
             }
             StoreMessage::SessionWrite(k, v, r) => {
@@ -182,7 +177,7 @@ impl StoreHandle {
     }
 
     /// Returns a handle to every session record known to this store.
-    pub async fn handles(&self) -> Result<Vec<SessionRecordHandle>, std::io::Error> {
+    pub async fn handles(&self) -> Result<Vec<BoxRecordHandle>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(StoreMessage::Handles(send)).await;
@@ -191,7 +186,7 @@ impl StoreHandle {
 
     /// Creates a record, returning a handle to it. The record's `id` is
     /// ignored — the store allocates the real one.
-    pub async fn create(&self, record: Record) -> Result<SessionRecordHandle, std::io::Error> {
+    pub async fn create(&self, record: Record) -> Result<BoxRecordHandle, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -205,7 +200,7 @@ impl StoreHandle {
     pub async fn find(
         &self,
         record: RecordPredicate,
-    ) -> Result<Option<SessionRecordHandle>, std::io::Error> {
+    ) -> Result<Option<BoxRecordHandle>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(StoreMessage::Find(record, send)).await;
@@ -216,12 +211,12 @@ impl StoreHandle {
 /// A handle to read or write a specific session record. All mutations to
 /// a specific record are mediated through one of these handles.
 #[derive(Debug, Clone)]
-pub struct SessionRecordHandle {
+pub struct BoxRecordHandle {
     h: StoreHandle,
-    k: DiskSessionKey,
+    k: DiskBoxKey,
 }
 
-impl SessionRecordHandle {
+impl BoxRecordHandle {
     /// Returns the session ID this handle corresponds to.
     pub fn id(&self) -> &SessionId {
         self.k.id()
@@ -229,13 +224,13 @@ impl SessionRecordHandle {
 
     /// Returns the full session object (record plus its on-disk paths), for
     /// callers that need the workspace/home/cache layout to spawn a session.
-    pub async fn object(&self) -> Result<DiskSession, std::io::Error> {
+    pub async fn object(&self) -> Result<DiskBox, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .h
             .sender
-            .send(StoreMessage::SessionObject(self.k.clone(), send))
+            .send(StoreMessage::BoxObject(self.k.clone(), send))
             .await;
         recv.await.expect("corresponding store is dead")
     }
@@ -287,7 +282,7 @@ impl SessionRecordHandle {
     /// and fall back to baseline.
     pub async fn load_composition(
         &self,
-    ) -> Result<Option<sessions::core::compose::Composition>, std::io::Error> {
+    ) -> Result<Option<boxes::core::compose::Composition>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
             .h
@@ -303,7 +298,7 @@ impl SessionRecordHandle {
     /// `min session activate` time.
     pub async fn store_composition(
         &self,
-        composition: &sessions::core::compose::Composition,
+        composition: &boxes::core::compose::Composition,
     ) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
@@ -372,8 +367,8 @@ impl WeakStoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::{BoxState, NetworkMode};
     use paths::HostAbsPath;
-    use sessions::{NetworkMode, SessionStatus};
     use std::collections::BTreeSet;
     use std::io::ErrorKind;
     use tempfile::TempDir;
@@ -394,12 +389,15 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: None,
             hooks_enabled: true,
-            status: SessionStatus::default(),
+            status: BoxState::default(),
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: Default::default(),
         }
     }
@@ -420,7 +418,7 @@ mod tests {
     }
 
     /// Resolve a handle to a record expected to exist.
-    async fn open(store: &StoreHandle, pred: RecordPredicate) -> SessionRecordHandle {
+    async fn open(store: &StoreHandle, pred: RecordPredicate) -> BoxRecordHandle {
         store
             .find(pred)
             .await

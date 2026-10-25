@@ -73,7 +73,7 @@ pub enum VmError {
 
     /// A `vm_egress` `allow_subnets` entry is not a syntactically valid CIDR
     /// prefix (R2.5). Validated at config time — mirroring the per-`PTask`
-    /// egress check in `sessions::Record::validate_policy` — so a misconfigured
+    /// egress check in `boxes::Record::validate_policy` — so a misconfigured
     /// subnet is named where it can be fixed, rather than surfacing opaquely
     /// when #553's egress-enforcement layer parses it. `cidr` is the offending
     /// entry.

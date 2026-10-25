@@ -32,7 +32,7 @@
 //! deployment's to say, and neither category is ever dropped from the
 //! enumeration by saying it.
 
-use sessions::core::egress::{EgressRules, Ipv4Cidr};
+use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use switch::SwitchSubnet;
 
 /// A category of the node-plane baseline enumeration: one of the design's
@@ -345,7 +345,7 @@ impl NodePlaneBaseline {
 #[cfg(test)]
 mod tests {
     use super::{BaselineCategory, BaselineEntry, NodePlaneBaseline};
-    use sessions::core::egress::{FrameVerdict, summarize, verdict};
+    use boxes::core::egress::{FrameVerdict, summarize, verdict};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use switch::SwitchSubnet;

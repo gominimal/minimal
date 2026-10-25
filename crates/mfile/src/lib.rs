@@ -415,7 +415,7 @@ impl Eq for Stack {}
 
 /// Per-project session block. Contributes to sessions activated on
 /// this project — same primitives as
-/// [`sessions::core::loadout::Loadout`] (packages, vars, patches,
+/// [`boxes::core::loadout::Loadout`] (packages, vars, patches,
 /// lifecycle hooks), scoped to the project rather than the user.
 ///
 /// Where a loadout says "what this developer wants everywhere"
@@ -429,7 +429,7 @@ impl Eq for Stack {}
 /// Unlike a loadout, a session block has no name or description:
 /// there's at most one per mfile and it's identified by the project
 /// path. Contribution semantics (source tagging as
-/// [`sessions::core::source::Source::Project`], policy gating) land
+/// [`boxes::core::source::Source::Project`], policy gating) land
 /// with the `ProjectComposable` that will consume this in a later
 /// step.
 ///
@@ -466,27 +466,54 @@ pub struct Session {
     pub packages: Vec<String>,
     /// Variables with POSIX-shaped names — the common case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars:
-        BTreeMap<sessions::core::primitives::StrictVarName, sessions::core::primitives::VarValue>,
+    pub vars: BTreeMap<boxes::core::primitives::StrictVarName, boxes::core::primitives::VarValue>,
     /// Variables with Linux-permissive names — explicit opt-in for
     /// the rare case a non-POSIX name is necessary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub vars_lenient: Vec<sessions::core::primitives::LenientVarEntry>,
+    pub vars_lenient: Vec<boxes::core::primitives::LenientVarEntry>,
     /// Patches contributed by this project.
     #[serde(
         default,
-        skip_serializing_if = "sessions::core::primitives::Patches::is_empty"
+        skip_serializing_if = "boxes::core::primitives::Patches::is_empty"
     )]
-    pub patches: sessions::core::primitives::Patches,
+    pub patches: boxes::core::primitives::Patches,
     /// Scripts run at session-level transition points, in
     /// declaration order (concatenated with any hooks from the
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
+    pub lifecycle_hooks: Vec<boxes::core::lifecyclehook::LifecycleHook>,
+    /// `[session.network]`: the box's network settings this file owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SessionNetwork>,
+    /// `[session.secrets.<VAR>]`: the credential grants, by the environment
+    /// variable each one lands in. A project cannot set
+    /// `acknowledge_full_breadth_unenrolled` here: the reader ignores it with
+    /// a warning, because only the client configuration accepts full
+    /// breadth (BEP-057).
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "boxes::core::bep::deserialize_project_secrets"
+    )]
+    pub secrets: boxes::core::bep::SecretGrants,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
+}
+
+/// The `[session.network]` table: the UDP 443 stance and the Box Egress
+/// Proxy settings.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionNetwork {
+    /// `[session.network] quic443`: the box's stance on UDP to port 443.
+    /// `None` reads as `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic443: Option<boxes::core::bep::Quic443>,
+    /// `[session.network.bep]`: steering, `proxy_env`, `no_proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bep: Option<boxes::core::bep::BepSettings>,
 }
 
 // No `impl Eq for Session`: the `extra: HashMap<String, toml::Value>`
@@ -518,6 +545,10 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            // Proxy settings and grants are box policy, not composition
+            // primitives: the client carries them on the box's policy.
+            network: _,
+            secrets: _,
             extra: _,
         } = self;
         packages.is_empty()
@@ -1116,8 +1147,15 @@ impl File {
             // A key that is valid at another nesting level is not really
             // unknown; point at the correct path instead of the generic
             // upgrade hint, which cannot fix it.
+            // BEP-037: a project cannot set secret-store rules. The table is
+            // ignored with its own warning, not the generic unknown-field one.
+            boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
             let mut unknown = Vec::new();
-            for key in self.extra.keys() {
+            for key in self
+                .extra
+                .keys()
+                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+            {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
                         "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
@@ -1161,12 +1199,21 @@ impl File {
         if let Some(session) = &self.session
             && !session.extra.is_empty()
         {
-            tracing::warn!(
-                "unknown fields in [session] section of {}: {}",
-                MFILE_NAME,
-                session.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
-            was_unknown_fields = true;
+            boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
+            let unknown: Vec<&str> = session
+                .extra
+                .keys()
+                .map(String::as_str)
+                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
+                .collect();
+            if !unknown.is_empty() {
+                tracing::warn!(
+                    "unknown fields in [session] section of {}: {}",
+                    MFILE_NAME,
+                    unknown.join(",")
+                );
+                was_unknown_fields = true;
+            }
         }
 
         for (task_name, task) in &self.tasks {
@@ -2291,7 +2338,7 @@ mod tests {
     /// content is deliberately project-flavored (build toolchain,
     /// in-repo config paths, uniform build env) to reflect the
     /// intended use, but the assertions only check shape. Vars-
-    /// lenient coverage lives in the sessions crate's loadout tests
+    /// lenient coverage lives in the `boxes` crate's loadout tests
     /// since the wire form is identical.
     #[test]
     fn session_populated_block_parses_every_primitive() {
@@ -2339,6 +2386,53 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    /// `quic443` is a `[session.network]` setting: it loads there, and the
+    /// `[session.network.bep]` table refuses it as an unknown field.
+    #[test]
+    fn session_network_quic443_loads() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.network]
+            quic443 = "auto"
+            "#
+        })
+        .unwrap();
+        let network = mf
+            .session
+            .and_then(|session| session.network)
+            .expect("network table parses");
+        assert_eq!(network.quic443, Some(boxes::core::bep::Quic443::Auto));
+        assert!(network.bep.is_none());
+
+        let err = toml::from_str::<File>(indoc! {
+            r#"
+            [session.network.bep]
+            quic443 = "auto"
+            "#
+        })
+        .expect_err("quic443 is not a [network.bep] field");
+        assert!(err.to_string().contains("quic443"), "{err}");
+    }
+
+    /// BEP-057: a project's `[session.secrets]` acknowledgement loads, is
+    /// dropped, and leaves the grants beside it intact.
+    #[test]
+    fn session_secrets_drop_project_acknowledgement() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.secrets]
+            acknowledge_full_breadth_unenrolled = true
+
+            [session.secrets.GH_TOKEN]
+            source = "broker"
+            scopes = ["github:repo:read"]
+            "#
+        })
+        .unwrap();
+        let secrets = mf.session.expect("session parses").secrets;
+        assert_eq!(secrets.keys().collect::<Vec<_>>(), ["GH_TOKEN"]);
     }
 
     #[test]
@@ -2494,7 +2588,7 @@ mod tests {
         );
     }
 
-    /// The demo project under `crates/sessions/example_project` must
+    /// The demo project under `crates/boxes/example_project` must
     /// stay parseable as a real `File`, hooks and all.
     ///
     /// It is documentation people copy from, and nothing else reads it,
@@ -2506,7 +2600,7 @@ mod tests {
     fn example_project_parses_with_its_lifecycle_hooks() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../sessions/example_project/minimal.toml"
+            "/../boxes/example_project/minimal.toml"
         );
         let src = std::fs::read_to_string(path).expect("example project is readable");
         let file: File = toml::from_str(&src).expect("example project must parse as an mfile");
@@ -2657,6 +2751,34 @@ mod tests {
             let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
             file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
             assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
+    }
+
+    /// BEP-037: a project's `[secret-store-rules]` table, at the top level
+    /// or under `[session]`, is ignored with its own warning, not the
+    /// generic unknown-field one.
+    #[test]
+    fn project_store_rules_are_ignored_with_warning() {
+        for body in [
+            "[secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\nheader = \"x-api-key\"\n",
+            "[session.secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\n",
+        ] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), body).unwrap();
+            let capture = CaptureWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            File::from_dir(dir.path()).expect("the file still reads");
+            drop(guard);
+            let out = capture.contents();
+            assert!(
+                out.contains(boxes::core::bep::PROJECT_STORE_RULES_IGNORED),
+                "{body}: {out}"
+            );
+            assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
         }
     }
 

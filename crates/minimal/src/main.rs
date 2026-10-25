@@ -67,7 +67,18 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let registry = tracing_subscriber::registry().with(filter);
+    // OTel export (opt-in: MINIMAL_TELEMETRY=1 plus an OTLP endpoint; see
+    // mlog::otel): the layers are None when off and carry their own
+    // info-level filter when on; the console keeps its own filter, with the
+    // OTel SDK's errors silenced.
+    mlog::otel::init("minimal-cli");
+    // A CLI lives for one command: its exit flush is short, so a collector
+    // that is down or silent never shows in a command's wall time.
+    mlog::otel::set_exit_flush(mlog::otel::CLI_EXIT_FLUSH);
+    let filter = mlog::otel::quiet(filter);
+    let registry = tracing_subscriber::registry()
+        .with(mlog::otel::span_layer())
+        .with(mlog::otel::log_layer());
     // `min dash` owns the terminal (alternate screen); a log line landing on
     // stdout/stderr would corrupt the frame. Log to <state>/dash.log
     // instead, discarding if the state dir can't be written.
@@ -97,25 +108,37 @@ async fn run() -> ExitCode {
             }
         };
         registry
-            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .with(
+                fmt::layer()
+                    .with_writer(log)
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .init();
     } else if stdout_is_data_contract(&cli.command) {
         registry
-            .with(console_layer(
-                std::io::stderr,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    std::io::stderr,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     } else {
         registry
-            .with(console_layer(
-                ot::StderrWriter::new,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    ot::StderrWriter::new,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     }
+    mlog::otel::report_init();
 
     // The output mode the run is under, read before the CLI is consumed:
     // the error path keys on it (below), so a machine-output run answers a
@@ -126,7 +149,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
-    if let Err(e) = minimal::run(cli).await {
+    let result = minimal::run(cli).await;
+    // Flush exported telemetry (bounded; a no-op when export is off). What
+    // the bound cuts off is in the spool already.
+    mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+    if let Err(e) = result {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
         // (the git-remote helper's ExitCode precedent).
@@ -142,7 +169,7 @@ async fn run() -> ExitCode {
         // downcasts. The object is the contract, so there is no second,
         // plain-text line to print for the same failure, only the non-zero
         // status.
-        if output_mode.is_some() {
+        if output_mode {
             match machine_mode_answer(&e) {
                 MachineModeAnswer::Quiet => return ExitCode::from(141),
                 MachineModeAnswer::Object(failure) => {
@@ -163,13 +190,28 @@ async fn run() -> ExitCode {
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
-/// codes ("Exit codes"): 7 when the VM host could not be reached to
-/// register or resume an own-address box's row (provider/host
+/// codes ("Exit codes"): 3 when the activation refused the box spec
+/// (`boxes::core::bep::ActivationRefused`) or found the project's
+/// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
+/// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
+/// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
 /// of addresses (insufficient resources), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
+    // BEP-008/009/010/017/056: a box spec refused at activation.
+    if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
+        return refused.exit_code();
+    }
+    // An invalid project `minimal.toml` refuses the activation with exit 3.
+    if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
+        return 3;
+    }
+    // BEP-007: a GitHub grant the box cannot receive in its environment.
+    if e.downcast_ref::<minimal::GrantNotDelivered>().is_some() {
+        return 3;
+    }
     if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
         .is_some()
     {
@@ -241,6 +283,13 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             "the VM host has no address left for another box; destroy a session you no \
              longer need and try again"
                 .to_string(),
+        ));
+    }
+    if let Some(refused) = e.downcast_ref::<minimal::AuditSelfUnsupportedUnenrolled>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            refused.code(),
+            format!("{e:#}"),
+            "on the host, run `min box audit <box>`".to_string(),
         ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
@@ -372,20 +421,25 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
-/// The machine output mode a run is under: the command's `-o`, the flag the
-/// architecture's machine-output contract hangs on — `json` for
-/// `min session policy -o json`, the one command that takes it today.
-/// `None` for every text run, and for a command that has not taken `-o
-/// json` yet, which is the same thing to the error path: its failure is a
-/// plain-text line. Both gates below key on this, so a command joins the
-/// machine mode by growing an `output` flag, and nothing else about its
+/// Whether a run is under the machine output mode: the command's `-o`, the
+/// flag the architecture's machine-output contract hangs on — `json` for
+/// `min session policy -o json` and `jsonl` for `min box audit -o jsonl`.
+/// `false` for every text run, and for a command that has not taken a
+/// machine `-o` yet, which is the same thing to the error path: its failure
+/// is a plain-text line. The error path keys on this, so a command joins
+/// the machine mode by growing an `output` flag, and nothing else about its
 /// error path changes.
-fn machine_output_mode(cli: &minimal::Cli) -> Option<PolicyOutputFormat> {
+fn machine_output_mode(cli: &minimal::Cli) -> bool {
     match &cli.command {
         Some(minimal::Command::Session(minimal::SessionArgs {
             command: minimal::SessionCommand::Policy(PolicyArgs { output, .. }),
-        })) => *output,
-        _ => None,
+        })) => output.is_some(),
+        // Architecture line 379: a `-o jsonl` failure is one `min/v1/error`
+        // object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Audit(args),
+        })) => args.output == Some(minimal::BoxAuditOutputFormat::Jsonl),
+        _ => false,
     }
 }
 
@@ -682,7 +736,7 @@ mod tests {
                 }),
             })),
         };
-        assert_eq!(machine_output_mode(&cli), Some(PolicyOutputFormat::Json));
+        assert!(machine_output_mode(&cli));
 
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
@@ -693,13 +747,40 @@ mod tests {
                 }),
             })),
         };
-        assert_eq!(machine_output_mode(&cli), None);
+        assert!(!machine_output_mode(&cli));
 
         let cli = minimal::Cli {
             global_args: minimal::GlobalArgs::default(),
             command: None,
         };
-        assert_eq!(machine_output_mode(&cli), None);
+        assert!(!machine_output_mode(&cli));
+
+        // `min box audit -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxAuditOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Audit(minimal::BoxAuditArgs {
+                        target: Some("self".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // Its defined refusal answers with its own code.
+        match machine_mode_answer(&anyhow::Error::new(minimal::AuditSelfUnsupportedUnenrolled)) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "audit_self_unsupported_unenrolled");
+            }
+            other => panic!("the refusal answers with its code, got {other:?}"),
+        }
     }
 
     /// The one object a machine-output failure answers with: a
@@ -778,6 +859,50 @@ mod tests {
             MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
             MachineModeAnswer::Quiet => panic!("a refusal is an error object"),
         }
+    }
+
+    /// BEP-008: a box spec the activation refused ends the run with exit 3,
+    /// through the context the activation adds over it, and the message
+    /// names each missing host. `cmd::session`'s test of the same name
+    /// proves the refusal comes before the create.
+    #[test]
+    fn activation_refuses_grant_before_create_with_exit_3() {
+        let refused = boxes::core::bep::ActivationRefused {
+            refusals: vec![boxes::core::bep::BepRefusal::HostsOutsideEgress {
+                missing: vec!["uploads.github.com".into(), "codeload.github.com".into()],
+            }],
+        };
+        let e = anyhow::Error::new(refused).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+        let text = format!("{:#}", e.root_cause());
+        assert!(
+            text.contains("does not allow: uploads.github.com, codeload.github.com."),
+            "{text}"
+        );
+    }
+
+    /// BEP-007: a GitHub grant the box cannot receive ends the run with
+    /// exit 3, through the context the activation adds over it.
+    #[test]
+    fn an_undeliverable_grant_ends_with_exit_3() {
+        let refused = minimal::GrantNotDelivered::NotSealed {
+            grant: "GH_TOKEN".into(),
+        };
+        let e = anyhow::Error::new(refused).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// Exit codes: an invalid project `minimal.toml` ends the run with
+    /// exit 3, through the context the activation adds over it.
+    /// `cmd::session`'s test of the same name proves the refusal comes
+    /// before the create and carries this type.
+    #[test]
+    fn activation_refuses_unloadable_project_file_before_create() {
+        let invalid = minimal::ProjectFileInvalid {
+            error: mfile::Error::HarnessTable(None),
+        };
+        let e = anyhow::Error::new(invalid).context("activating the session");
+        assert_eq!(failure_exit_code(&e), 3);
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

@@ -36,9 +36,9 @@ pub(crate) const WAITING: &str = "waiting on a daemon";
 /// The `--show --json` document's schema.
 pub(crate) const SCHEMA: &str = "min/v1/finalize-install";
 
-/// The names item's cause when no daemon reports an answerer port to
-/// point the resolver at.
-const NO_PORT: &str = "no daemon is reachable to report its answerer port";
+/// The names item's cause when no daemon reports the DNS service's port
+/// to point the resolver at.
+const NO_PORT: &str = "no daemon is reachable to report the port its DNS service listens on";
 
 /// How long the names item waits on the daemons for a port before it
 /// reports itself waiting: one bounded read, so a probe from the installer
@@ -74,6 +74,10 @@ pub(crate) struct Item {
     pub state: ItemState,
     /// What the operator loses today, while the item is missing.
     pub today: Option<String>,
+    /// `today` as separate lines, when it is a list: the summary sets one
+    /// under the other, and the JSON keeps `today`'s single line.
+    #[serde(skip)]
+    today_list: Vec<String>,
     /// What the step changes, when it runs.
     pub step: Option<String>,
     /// Why no script can fix it, when none can.
@@ -90,6 +94,7 @@ impl Item {
             label,
             state: ItemState::Done,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: None,
             script: None,
@@ -108,6 +113,7 @@ impl Item {
             label,
             state: ItemState::Missing,
             today: Some(today),
+            today_list: Vec::new(),
             step: Some(step),
             cause: None,
             script: Some(script),
@@ -120,6 +126,7 @@ impl Item {
             label,
             state: ItemState::Cannot,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: Some(cause),
             script: None,
@@ -132,6 +139,7 @@ impl Item {
             label,
             state: ItemState::Waiting,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: Some(cause),
             script: None,
@@ -236,8 +244,19 @@ impl Plan {
                 )),
                 _ => {
                     out.push_str(&format!("  ✗ {}\n", item.label));
-                    if let Some(today) = &item.today {
-                        out.push_str(&format!("      today: {today}\n"));
+                    match (&item.today, item.today_list.as_slice()) {
+                        (Some(today), []) => out.push_str(&format!("      today: {today}\n")),
+                        (Some(_), list) => {
+                            out.push_str(&format!(
+                                "      today: {} thing{} to fix:\n",
+                                list.len(),
+                                if list.len() == 1 { "" } else { "s" }
+                            ));
+                            for line in list {
+                                out.push_str(&format!("        - {line}\n"));
+                            }
+                        }
+                        (None, _) => {}
                     }
                     if let Some(step) = &item.step {
                         out.push_str(&format!("      this step: {step}\n"));
@@ -527,7 +546,8 @@ pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver
 
 /// The names item's id and label.
 const NAMES_ID: &str = "names";
-const NAMES_LABEL: &str = "box names for every host program";
+const NAMES_LABEL: &str =
+    "DNS names for boxes (<box>.min.internal) in every program on this machine";
 
 /// The names item from its verdict: done, missing with the facts the
 /// advisory names and the step that installs them, or blocked by the
@@ -544,26 +564,46 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
                 .to_string(),
         ),
         NamesVerdict::Missing { facts, install } => {
-            let service = if install.is_some() {
-                " and installs the Minimal box-name service"
-            } else {
-                ""
-            };
-            let range = if cfg!(target_os = "macos") {
-                ", and reserves the local range on this host's loopback"
-            } else {
-                ""
-            };
-            Item::missing(
-                NAMES_ID,
-                NAMES_LABEL,
-                facts,
+            let zone = crate::resolver::ZONE;
+            // The range clause closes the macOS list, so the service
+            // clause joins with a comma there and with "and" on Linux,
+            // where it is the last one.
+            let step = if cfg!(target_os = "macos") {
                 format!(
-                    "points this host's resolver at the box-zone answerer on \
-                     127.0.0.1:{port}{service}{range}"
-                ),
-                crate::resolver::names_steps(port, install.as_ref()),
-            )
+                    "sends *.{zone} lookups to Minimal's DNS service on \
+                     127.0.0.1:{port}{}, and reserves the box IPs ({}) on this \
+                     machine's loopback at every boot",
+                    if install.is_some() {
+                        ", installs that service"
+                    } else {
+                        ""
+                    },
+                    crate::resolver::range_text()
+                )
+            } else {
+                format!(
+                    "configures this machine's DNS (systemd-resolved) to send \
+                     *.{zone} lookups to Minimal's DNS service on \
+                     127.0.0.1:{port}{}",
+                    if install.is_some() {
+                        " and installs that service"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            // The JSON's `today` is the facts on one line; the list, its
+            // count and its indentation are the summary's alone.
+            Item {
+                today_list: facts.clone(),
+                ..Item::missing(
+                    NAMES_ID,
+                    NAMES_LABEL,
+                    facts.join("; "),
+                    step,
+                    crate::resolver::names_steps(port, install.as_ref()),
+                )
+            }
         }
     }
 }
@@ -672,7 +712,8 @@ pub(crate) mod linux {
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
     pub(crate) const CLASSIFIER_ID: &str = "classifier";
-    const CLASSIFIER_LABEL: &str = "per-box egress limits for host-address boxes";
+    const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
+     machine's address (--network host_ip with --deny-all-egress)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
 
     /// The profile the step installs, the very file the checkout ships.
@@ -958,9 +999,9 @@ pub(crate) mod linux {
                 CLASSIFIER_ID,
                 CLASSIFIER_LABEL,
                 format!(
-                    "the classifier tree at {CLASSIFIER_TREE_ROOT} is installed for another \
-                     account (uid {uid}); running this step would replace their delegation, \
-                     so that account removes it with `min finalize-install --undo` first"
+                    "egress enforcement at {CLASSIFIER_TREE_ROOT} is installed for another \
+                     account (uid {uid}), and this step would replace it; that account must \
+                     run `min finalize-install --undo` first"
                 ),
             );
         }
@@ -968,9 +1009,9 @@ pub(crate) mod linux {
             return Item::cannot(
                 CLASSIFIER_ID,
                 CLASSIFIER_LABEL,
-                "this command runs as root, but the classifier is installed for the account \
-                 whose daemon it places and watches that account's socket: run it as that \
-                 account (it asks for sudo itself)"
+                "this command runs as root, but this step is installed for the account \
+                 that runs the Minimal daemon: run it as that account (it asks for sudo \
+                 itself)"
                     .to_string(),
             );
         }
@@ -979,12 +1020,12 @@ pub(crate) mod linux {
         }
         let cause = match facts.mount {
             Cgroup2Mount::Absent => {
-                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which the classifier \
-                 tree lives in"
+                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which egress \
+                 enforcement needs"
             }
             Cgroup2Mount::WithoutNsdelegate => {
-                "cgroup2 is mounted without nsdelegate, so a box's cgroup is no boundary it \
-                 cannot leave"
+                "cgroup2 is mounted without nsdelegate, which egress enforcement needs to \
+                 keep a box inside its own cgroup"
             }
             // The two names ride in a shell single-quoted word, in a unit
             // file (systemd expands `%` specifiers everywhere and `$` in
@@ -996,45 +1037,48 @@ pub(crate) mod linux {
             // that never finds the daemon.
             Cgroup2Mount::Delegated => {
                 if operator.is_empty() {
-                    "this process's user name did not read, so there is no account to \
-                     delegate the classifier tree to"
+                    "could not read this process's user name, so there is no account to \
+                     install this step for"
                 } else if !operator
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
                 {
                     "this process's user name carries a character outside [A-Za-z0-9._-], \
-                     which the step's shell word and unit file cannot take"
+                     which the install script and its systemd units cannot handle"
                 } else if socket.is_empty() {
-                    "this host's daemon socket path did not resolve, so there is nothing \
-                     for the placement unit to watch"
+                    "could not work out this machine's daemon socket path, which the \
+                     step's systemd unit watches"
                 } else if !socket
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
                 {
-                    "this host's daemon socket path carries a character outside \
-                     [A-Za-z0-9._/-], which the step's shell word, unit file and socket \
-                     table lookup cannot take"
+                    "this machine's daemon socket path carries a character outside \
+                     [A-Za-z0-9._/-], which the install script and its systemd units \
+                     cannot handle"
                 } else {
                     return Item::missing(
                         CLASSIFIER_ID,
                         CLASSIFIER_LABEL,
                         if !facts.table_present {
-                            "host-address boxes run unenforced: the classifier's privileged \
-                             step is not installed, or did not finish, so no box's egress \
-                             verdict is decided per box"
+                            "deny-all egress is not enforced for boxes that share this \
+                             machine's address: the step that enforces it is not \
+                             installed, or did not finish"
                         } else if !facts.copy_current {
-                            "the root-owned copy of the classifier's privileged step is not \
-                             this build's, so the placement unit runs a stale step"
+                            "the installed copy of the step that enforces deny-all egress \
+                             is missing or out of date, so this version of min's step is \
+                             not what runs at boot or at daemon start"
                         } else {
-                            "the classifier is installed but its systemd units are not, so a \
-                             daemon restart runs unplaced and a reboot loses the tree"
+                            "the step that enforces deny-all egress is installed but its \
+                             systemd units are missing or not enabled, so a daemon restart \
+                             can leave deny-all boxes refused, and a reboot can leave \
+                             deny-all egress not enforced"
                         }
                         .to_string(),
                         format!(
-                            "installs the classifier's cgroup tree and packet filter for \
-                             {operator}'s daemon, a boot unit that re-installs them, and a \
-                             systemd path unit that places the daemon's listener in its leaf \
-                             on every daemon start"
+                            "installs the cgroup tree and packet filter that enforce \
+                             deny-all egress for {operator}'s daemon, and systemd units \
+                             that restore them at boot and place the daemon under them on \
+                             every daemon start"
                         ),
                         classifier_steps(operator, socket),
                     );
@@ -1220,8 +1264,8 @@ pub(crate) mod linux {
                     return Item::cannot(
                         KVM_ID,
                         KVM_LABEL,
-                        "this process's user name did not read, so there is no account to \
-                         add to the kvm group"
+                        "could not read this process's user name, so there is no account \
+                         to add to the kvm group"
                             .to_string(),
                     );
                 }
@@ -1653,7 +1697,7 @@ mod tests {
         );
         let missing = names_item(
             NamesVerdict::Missing {
-                facts: "the resolver is not configured".to_string(),
+                facts: vec!["the resolver is not configured".to_string()],
                 install: None,
             },
             15353,
@@ -1664,10 +1708,88 @@ mod tests {
             missing.today.as_deref(),
             Some("the resolver is not configured")
         );
-        assert!(missing.step.as_deref().unwrap().contains("127.0.0.1:15353"));
+        let expected_step = if cfg!(target_os = "macos") {
+            "sends *.min.internal lookups to Minimal's DNS service on 127.0.0.1:15353, and \
+             reserves the box IPs (127.0.64.0/24) on this machine's loopback at every boot"
+        } else {
+            "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups \
+             to Minimal's DNS service on 127.0.0.1:15353"
+        };
+        assert_eq!(missing.step.as_deref(), Some(expected_step));
+        assert!(NAMES_LABEL.contains(crate::resolver::ZONE), "{NAMES_LABEL}");
+        let summary = Plan {
+            items: vec![missing.clone()],
+        }
+        .summary();
+        assert!(
+            summary.contains(
+                "      today: 1 thing to fix:\n        - the resolver is not configured\n      \
+                 this step: "
+            ),
+            "{summary}"
+        );
         let script = missing.script.unwrap();
         assert!(script.starts_with("# The resolver: "), "{script}");
         assert!(!script.contains("#!/bin/sh"), "{script}");
+    }
+
+    /// The names item's facts are a list in the summary and one line in
+    /// the JSON, which carries no layout; a carried service step joins the
+    /// step text as this platform's list reads.
+    #[test]
+    fn names_item_lists_its_facts_in_the_summary_only() {
+        use crate::resolver::{AnswererInstall, NamesVerdict};
+        let item = names_item(
+            NamesVerdict::Missing {
+                facts: vec![
+                    "the resolver is not configured".to_string(),
+                    "the DNS service is not installed; this step installs it".to_string(),
+                ],
+                install: Some(AnswererInstall {
+                    operator: "op".to_string(),
+                    operator_uid: 1000,
+                    channel: "/run/min/zone.sock".to_string(),
+                    channel_dir: "/run/min".to_string(),
+                    source: "/usr/local/bin/minzoned".to_string(),
+                    sha256: "0".repeat(64),
+                    bundle: Vec::new(),
+                    requirement: None,
+                    controls: Vec::new(),
+                }),
+            },
+            15353,
+        );
+        let step = item.step.as_deref().unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(
+                step.contains(
+                    "on 127.0.0.1:15353, installs that service, and reserves the box IPs"
+                ),
+                "{step}"
+            );
+        } else {
+            assert!(
+                step.ends_with("on 127.0.0.1:15353 and installs that service"),
+                "{step}"
+            );
+        }
+        let plan = Plan { items: vec![item] };
+        let summary = plan.summary();
+        assert!(
+            summary.contains(
+                "      today: 2 things to fix:\n        - the resolver is not configured\n        \
+                 - the DNS service is not installed; this step installs it\n      this step: "
+            ),
+            "{summary}"
+        );
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&plan.json()).unwrap();
+        let names = &value["items"][0];
+        assert_eq!(
+            names["today"],
+            "the resolver is not configured; the DNS service is not installed; this step \
+             installs it"
+        );
+        assert!(names.get("today_list").is_none(), "{names}");
     }
 
     /// The user-namespace item's table: not an item where the kernel does
@@ -1940,13 +2062,18 @@ mod tests {
                 sock,
                 "without nsdelegate",
             ),
-            (bare, "", sock, "user name did not read"),
+            (bare, "", sock, "could not read this process's user name"),
             (bare, "al ice", sock, outside),
             (bare, "al'ice", sock, outside),
             (bare, "al%ice", sock, outside),
             (bare, "al$ice", sock, outside),
             (bare, "al\\ice", sock, outside),
-            (bare, "alice", "", "socket path did not resolve"),
+            (
+                bare,
+                "alice",
+                "",
+                "could not work out this machine's daemon socket path",
+            ),
             (bare, "alice", "/run/it's.sock", outside),
             (bare, "alice", "/run/my dir/ssh.sock", outside),
             (bare, "alice", "/run/my\tdir/ssh.sock", outside),
@@ -1962,7 +2089,13 @@ mod tests {
         }
         let item = classifier_item_over(&bare, "alice", sock);
         assert_eq!(item.state, ItemState::Missing, "{item:?}");
-        assert!(item.today.as_deref().unwrap().contains("unenforced"));
+        assert!(item.today.as_deref().unwrap().contains("is not enforced"));
+        // The label prints after a done mark too, so it names the thing, not a state.
+        assert_eq!(
+            item.label,
+            "deny-all egress enforcement for boxes that share this machine's address \
+             (--network host_ip with --deny-all-egress)"
+        );
         assert!(item.step.as_deref().unwrap().contains("every daemon start"));
         // The marker over a stale copy: the step is there, but the one the
         // units run is not this build's, so it is missing again and the
@@ -1979,7 +2112,11 @@ mod tests {
         );
         assert_eq!(stale.state, ItemState::Missing, "{stale:?}");
         assert!(
-            stale.today.as_deref().unwrap().contains("stale step"),
+            stale
+                .today
+                .as_deref()
+                .unwrap()
+                .contains("missing or out of date"),
             "{stale:?}"
         );
         assert_eq!(
@@ -1997,10 +2134,17 @@ mod tests {
             sock,
         );
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        assert!(
-            unitless.today.as_deref().unwrap().contains("units are not"),
-            "{unitless:?}"
-        );
+        // An unplaced daemon refuses a deny-all box (the probe cannot read
+        // the table); only the reboot, which loses the tree, runs it unenforced.
+        // Any one missing unit or link lands here, so the sentence says "can".
+        let today = unitless.today.as_deref().unwrap();
+        for words in [
+            "units are missing or not enabled",
+            "a daemon restart can leave deny-all boxes refused",
+            "a reboot can leave deny-all egress not enforced",
+        ] {
+            assert!(today.contains(words), "{unitless:?}");
+        }
         // A stale copy on a mount the tree cannot live in is still the mount's fault.
         assert_eq!(
             classifier_item_over(
@@ -2185,7 +2329,12 @@ mod tests {
         assert!(absent.cause.unwrap().contains("/dev/kvm is not there"));
         let unnamed = kvm_item_over(denied(), "", false);
         assert_eq!(unnamed.state, ItemState::Cannot);
-        assert!(unnamed.cause.unwrap().contains("did not read"));
+        assert!(
+            unnamed
+                .cause
+                .unwrap()
+                .contains("could not read this process's user name")
+        );
         let unquotable = kvm_item_over(denied(), "al ice", false);
         assert_eq!(unquotable.state, ItemState::Cannot);
         assert!(

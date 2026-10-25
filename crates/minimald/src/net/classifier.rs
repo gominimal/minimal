@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::fetchers::AnyUrl;
-use sandbox2::config::Verdict;
+use sandbox::config::Verdict;
 
 /// The loopback address the box zone's answerer serves at — the one
 /// destination a deny-all host-address box's connections are admitted to
@@ -81,7 +81,7 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
-/// shape `sessions::EgressPolicy::deny_all` materializes, every `allow_*`
+/// shape `boxes::EgressPolicy::deny_all` materializes, every `allow_*`
 /// dimension present and empty — and nothing else. A box that declares
 /// anything it can reach is placed under `allow`, where the cohort's
 /// identity is carried and nothing is refused on its behalf: the
@@ -89,8 +89,8 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// declaration that admits anything is not that. An absent section is the
 /// default's to decide, never a deny-all here — the deny-all default is an
 /// own-address box's (NET-074).
-pub(crate) fn verdict_of(declaration: Option<&sessions::EgressPolicy>) -> Verdict {
-    if declaration.is_some_and(sessions::EgressPolicy::admits_nothing) {
+pub(crate) fn verdict_of(declaration: Option<&boxes::EgressPolicy>) -> Verdict {
+    if declaration.is_some_and(boxes::EgressPolicy::admits_nothing) {
         return Verdict::Deny;
     }
     Verdict::Allow
@@ -154,7 +154,7 @@ impl UnenforceableRule {
 /// about the host — [`refuses_unenforceable_declaration`] is the half that
 /// folds the host in.
 pub(crate) fn unenforceable_rules(
-    declaration: Option<&sessions::EgressPolicy>,
+    declaration: Option<&boxes::EgressPolicy>,
 ) -> Vec<UnenforceableRule> {
     let Some(section) = declaration else {
         return Vec::new();
@@ -198,11 +198,11 @@ pub(crate) fn unenforceable_rules(
 /// such, never refused on this ground — and `None` for any declaration the
 /// classifier can enforce, whatever the host.
 pub(crate) fn refuses_unenforceable_declaration(
-    network_mode: sessions::NetworkMode,
+    network_mode: boxes::NetworkMode,
     can_decide_per_box: bool,
-    declaration: Option<&sessions::EgressPolicy>,
+    declaration: Option<&boxes::EgressPolicy>,
 ) -> Option<Vec<UnenforceableRule>> {
-    if !matches!(network_mode, sessions::NetworkMode::HostNet) || !can_decide_per_box {
+    if !matches!(network_mode, boxes::NetworkMode::HostNet) || !can_decide_per_box {
         return None;
     }
     let rules = unenforceable_rules(declaration);
@@ -212,13 +212,14 @@ pub(crate) fn refuses_unenforceable_declaration(
 /// The refusal's words, spelled once for the two paths that make it: each
 /// unenforced rule by the field that names it, why this host has no rule
 /// for any of them, and — at the end, where a person still reading is
-/// looking — what to do about it: remove the rules, or declare the one
-/// shape this host's classifier enforces — by the flag that writes it,
-/// `--deny-all-egress`, or by the box's `egress` section — or take the
-/// mode that enforces them. A refusal that names what it refused without
-/// saying how to get the box running leaves a person with nothing to
-/// type, and the words are the typed error a client sees, so the create
-/// and the launch say the same thing about the same declaration.
+/// looking — what to do about it: remove the rules, take the mode that
+/// enforces them, or declare the one shape this host's classifier
+/// enforces — by the flag that writes it, `--deny-all-egress`, or by the
+/// `egress` section in `minimal.toml`, since the rules can come from
+/// either. A refusal that names what it refused without saying how to
+/// get the box running leaves a person with nothing to type, and the
+/// words are the typed error a client sees, so the create and the launch
+/// say the same thing about the same declaration.
 pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> String {
     let named = rules
         .iter()
@@ -226,11 +227,10 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "host_ip boxes on this host enforce only deny-all egress, so these \
-         rules would go unenforced: {named}. Remove them, use \
-         --deny-all-egress (or an egress section with all three allow \
-         lists present and empty and no deny entries), or use --network \
-         own_ip, which enforces them."
+        "with --network host_ip this machine can only block all network access; it \
+         cannot apply these rules: {named}. Remove them, use --network own_ip to \
+         apply them, or use --deny-all-egress to block everything (in minimal.toml: \
+         an egress section with every allow list empty)."
     )
 }
 
@@ -390,7 +390,7 @@ impl Cause {
     /// table names nothing: no command is known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
+            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
             Self::CannotConfine
             | Self::GuestTableNotLoaded
             | Self::TableNotEffective
@@ -423,17 +423,17 @@ impl Cause {
 /// advisory never hands a person a command that leaves the cause standing
 /// or gets the box refused. It is never a prompt: it names what a person
 /// may run, and running it is the person's act, never the session start's.
-pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
+pub fn advisory_text(cause: Cause, declaration: &boxes::EgressPolicy) -> String {
     let verdict = verdict_of(Some(declaration));
     let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
-    let asked = if verdict == sandbox2::config::Verdict::Deny {
+    let asked = if verdict == sandbox::config::Verdict::Deny {
         "you asked this box for no network access"
     } else if unenforceable {
         "you asked this box for limited network access"
     } else {
         "this box declares egress"
     };
-    let refuses = verdict == sandbox2::config::Verdict::Deny
+    let refuses = verdict == sandbox::config::Verdict::Deny
         && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
     let outcome = if refuses {
         "so it refuses to start the box"
@@ -454,7 +454,7 @@ pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> Stri
             None => format!(
                 "Enforce it: start the box with --network own_ip, which enforces it now   \
                  ({} can't fix this: {})",
-                sandbox2::classifier::install_hint(),
+                sandbox::classifier::install_hint(),
                 cause.detail()
             ),
         }
@@ -522,6 +522,612 @@ impl Decision {
     /// Why not, when it cannot.
     pub fn cause(&self) -> Option<Cause> {
         self.cause
+    }
+}
+
+/// The name of the `host_ip` cohort's blocked leaf under the cohort's
+/// `boxes/` directory (BEP-018). The privileged step makes it with the rest
+/// of the tree, and its table rejects UDP to port 443 from every socket in
+/// it. Spelled the same as `QUIC443_BLOCKED_DIR` in
+/// `scripts/install-host-classifier.sh`.
+pub const QUIC443_BLOCKED_DIR: &str = "quic443-blocked";
+
+/// The cohort's blocked leaf under the classifier tree `root`:
+/// `<root>/boxes/quic443-blocked`.
+#[must_use]
+pub fn quic443_blocked_leaf(root: &Path) -> PathBuf {
+    root.join(sandbox::classifier::BOXES_DIR)
+        .join(QUIC443_BLOCKED_DIR)
+}
+
+/// Whether a box's resolved `quic443` stance blocks UDP to port 443
+/// (BEP-018). The declared stance wins, and `auto` (also the stance of a
+/// policy that declares none) resolves on the lane's grants and steering.
+/// The same resolution the `own_ip` gate makes in `net::switch`.
+#[must_use]
+pub fn resolved_quic443_blocked(policy: &boxes::BoxPolicy) -> bool {
+    use boxes::core::bep::{SecretGrant, Steering};
+    let (credentialed, steering) =
+        policy
+            .credentialed_upstream
+            .as_ref()
+            .map_or((false, Steering::default()), |upstream| {
+                (
+                    upstream.secrets.values().any(SecretGrant::is_credentialed),
+                    upstream.bep.resolved_steering(),
+                )
+            });
+    policy
+        .quic443
+        .unwrap_or_default()
+        .blocks(credentialed, steering)
+}
+
+/// The two cgroup operations the cohort's stance is enforced with, behind a
+/// seam so a test can drive them without a kernel: read a cgroup's
+/// processes, move one process into a cgroup, and name a process's parent.
+pub(crate) trait CgroupMoves {
+    /// The pids in `leaf`'s `cgroup.procs`.
+    fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>>;
+    /// Moves `pid` into `to`: one write of the pid to `to`'s
+    /// `cgroup.procs`. Inside the delegated slice this needs no capability.
+    fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()>;
+    /// The parent of `pid`, `None` once it is gone.
+    fn parent(&self, pid: i32) -> Option<i32>;
+}
+
+/// [`CgroupMoves`] over the kernel: `cgroup.procs` reads and writes, and
+/// the `PPid` line of `/proc/<pid>/status`.
+pub(crate) struct KernelMoves;
+
+impl CgroupMoves for KernelMoves {
+    fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>> {
+        let text = std::fs::read_to_string(leaf.join(PROCS_FILE))?;
+        Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    }
+
+    fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()> {
+        std::fs::write(to.join(PROCS_FILE), format!("{pid}\n"))
+    }
+
+    fn parent(&self, pid: i32) -> Option<i32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())
+    }
+}
+
+/// How many passes one move of a box's processes takes at most. A process
+/// that forks while the move runs leaves its child behind, so a move reads
+/// the source again until it is empty, or until this bound.
+const COHORT_MOVE_PASSES: usize = 8;
+
+/// How far up its parents a process in the blocked leaf is followed to
+/// find the box it belongs to.
+const COHORT_OWNER_DEPTH: usize = 64;
+
+/// Why a `host_ip` box's processes could not be placed in the cohort's
+/// blocked leaf (BEP-018). The launch that asked for the placement fails
+/// with it, so a blocked stance never fails open. Its text ends up in the
+/// launch's refusal, after the reason that the refusal gives.
+#[derive(Debug)]
+pub(crate) enum CohortPlaceError {
+    /// The cohort blocks, and this host's classifier tree has no blocked
+    /// leaf: its install predates the leaf.
+    NoBlockedLeaf,
+    /// A leaf's `cgroup.procs` could not be read.
+    Read {
+        /// The leaf that was read.
+        leaf: PathBuf,
+        /// The read's failure.
+        error: std::io::Error,
+    },
+    /// A live process could not be moved into the blocked leaf.
+    Migrate {
+        /// The process.
+        pid: i32,
+        /// The blocked leaf.
+        leaf: PathBuf,
+        /// The write's failure.
+        error: std::io::Error,
+    },
+    /// The box's own leaf still held processes after every pass.
+    StillStarting {
+        /// The box's own leaf.
+        leaf: PathBuf,
+    },
+}
+
+impl std::fmt::Display for CohortPlaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBlockedLeaf => write!(
+                f,
+                "this host's classifier tree has no {}/{QUIC443_BLOCKED_DIR} directory",
+                sandbox::classifier::BOXES_DIR
+            ),
+            Self::Read { leaf, error } => {
+                write!(
+                    f,
+                    "cannot read {}: {error}",
+                    leaf.join(PROCS_FILE).display()
+                )
+            }
+            Self::Migrate { pid, leaf, error } => {
+                write!(
+                    f,
+                    "cannot move process {pid} into {}: {error}",
+                    leaf.display()
+                )
+            }
+            Self::StillStarting { leaf } => write!(
+                f,
+                "new processes kept starting in {} while they were moved",
+                leaf.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CohortPlaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { error, .. } | Self::Migrate { error, .. } => Some(error),
+            Self::NoBlockedLeaf | Self::StillStarting { .. } => None,
+        }
+    }
+}
+
+/// The `host_ip` cohort's stance on UDP to port 443 (BEP-018): blocked
+/// when any resident member's resolved `quic443` stance is blocked. The
+/// cohort leaves as one address, so the most restrictive member wins, and
+/// a grant box costs its whole cohort HTTP/3. An `own_ip` box's stance is
+/// its own, decided at its relay, and never joins this.
+///
+/// Enforced by membership of the cohort's blocked leaf
+/// ([`quic443_blocked_leaf`]), never by an edit of the table: the table
+/// the privileged step loads rejects UDP to port 443 from that leaf with
+/// ICMP port unreachable. While [`Self::blocked`] is true, the processes
+/// of every resident member placed in the `allow` subtree are moved into
+/// the blocked leaf, and when the last blocking member leaves they are
+/// moved back to their own leaves. A move is a `cgroup.procs` write inside
+/// the delegated slice, which needs no CAP_NET_ADMIN. A member in the
+/// `deny` subtree stays where it is: its leaf already refuses everything
+/// but its resolver, UDP 443 included. The daemon's one cohort is
+/// [`cohort_quic443`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CohortQuic443 {
+    /// Each resident member's resolved stance, by box id: `true` where it
+    /// blocks UDP to port 443.
+    members: std::collections::BTreeMap<String, bool>,
+    /// The blocked leaf, once learned and only while it is there. `None`
+    /// on a host whose install predates it: the stance is then logged as
+    /// not enforced, and nothing moves.
+    blocked_leaf: Option<PathBuf>,
+    /// The own leaf of each resident member whose processes move: the
+    /// members placed in the `allow` subtree.
+    homes: std::collections::BTreeMap<String, PathBuf>,
+    /// The pids moved into the blocked leaf, by box id. A process in the
+    /// blocked leaf is sent home to the box whose moved pid is its own or
+    /// an ancestor's.
+    moved: std::collections::BTreeMap<String, std::collections::BTreeSet<i32>>,
+}
+
+impl CohortQuic443 {
+    /// An empty cohort, for the daemon's one static.
+    const fn new() -> Self {
+        Self {
+            members: std::collections::BTreeMap::new(),
+            blocked_leaf: None,
+            homes: std::collections::BTreeMap::new(),
+            moved: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Records that the box `box_id` is resident in the cohort, with its
+    /// resolved stance. A box that joins again replaces its stance.
+    pub fn join(&mut self, box_id: &str, blocked: bool) {
+        self.members.insert(box_id.to_string(), blocked);
+    }
+
+    /// Records that the box `box_id` left the cohort. Its stance stops
+    /// counting at once.
+    pub fn leave(&mut self, box_id: &str) {
+        self.members.remove(box_id);
+    }
+
+    /// Whether the cohort blocks UDP to port 443: any resident member's
+    /// stance blocks it. An empty cohort blocks nothing.
+    pub fn blocked(&self) -> bool {
+        self.members.values().any(|blocked| *blocked)
+    }
+
+    /// The resident members whose stance blocks, the boxes that cost the
+    /// cohort HTTP/3.
+    pub fn blocking_members(&self) -> impl Iterator<Item = &str> {
+        self.members
+            .iter()
+            .filter(|(_, blocked)| **blocked)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Learns where the cohort's blocked leaf is: `leaf` when it is there,
+    /// none when it is not.
+    pub fn learn_blocked_leaf(&mut self, leaf: PathBuf) {
+        self.blocked_leaf = leaf.is_dir().then_some(leaf);
+    }
+
+    /// The blocked leaf this cohort moves its processes into, if learned.
+    pub fn blocked_leaf(&self) -> Option<&Path> {
+        self.blocked_leaf.as_deref()
+    }
+
+    /// The leaf a process injected into `box_id` must join: the blocked
+    /// leaf while the cohort blocks and the box's processes move into it,
+    /// `None` when the box's own leaf is the right one.
+    #[must_use]
+    pub fn injection_leaf(&self, box_id: &str) -> Option<&Path> {
+        if self.blocked() && self.homes.contains_key(box_id) {
+            self.blocked_leaf.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Records `pid`, the shim of a process injected into `box_id` while
+    /// the cohort blocked, under the box. The shim joins the blocked leaf
+    /// itself, and the record sends it and what it forks home with the box
+    /// when the block lifts. When the block lifted before this record, the
+    /// shim is sent home now. The record stays, so a shim that joins the
+    /// blocked leaf after that goes home when the next block lifts.
+    pub(crate) fn adopt_injected(&mut self, box_id: &str, pid: i32, moves: &dyn CgroupMoves) {
+        let Some(home) = self.homes.get(box_id).cloned() else {
+            return;
+        };
+        self.moved
+            .entry(box_id.to_string())
+            .or_default()
+            .insert(pid);
+        if self.blocked() {
+            return;
+        }
+        match moves.migrate(pid, &home) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => tracing::warn!(
+                box_id,
+                pid,
+                %error,
+                "cannot move a process injected into a host-address box back to its own leaf"
+            ),
+        }
+    }
+
+    /// [`Self::join`], and the move that keeps the rule in step with it:
+    /// when the cohort turns blocked every member's processes move into
+    /// the blocked leaf, and when it already was, the joining box's do.
+    /// When the box re-joins with a weaker stance and was the only blocker,
+    /// every process in the blocked leaf goes home, as [`Self::depart`]
+    /// does. `home` is the box's own leaf when its processes are to move,
+    /// `None` for a box in the `deny` subtree or one placed in no leaf.
+    ///
+    /// # Errors
+    ///
+    /// A [`CohortPlaceError`] when the cohort blocks and a member's
+    /// processes cannot all be placed in the blocked leaf. The box stays a
+    /// member: the caller fails its launch and calls [`Self::depart`].
+    pub(crate) fn admit(
+        &mut self,
+        box_id: &str,
+        home: Option<PathBuf>,
+        blocked: bool,
+        moves: &dyn CgroupMoves,
+    ) -> Result<(), CohortPlaceError> {
+        let was = self.blocked();
+        self.join(box_id, blocked);
+        match home {
+            Some(home) => {
+                self.homes.insert(box_id.to_string(), home);
+            }
+            None => {
+                self.homes.remove(box_id);
+            }
+        }
+        let now = self.blocked();
+        if now != was {
+            self.log_flip(box_id);
+        }
+        if !now {
+            if was {
+                self.move_all_home(None, moves);
+            }
+            return Ok(());
+        }
+        if was {
+            return self.move_in(box_id, moves);
+        }
+        let ids: Vec<String> = self.homes.keys().cloned().collect();
+        for id in ids {
+            self.move_in(&id, moves)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::leave`], and the move back: when the last blocking member
+    /// leaves, every process in the blocked leaf goes back to its own box's
+    /// leaf.
+    pub(crate) fn depart(&mut self, box_id: &str, moves: &dyn CgroupMoves) {
+        if !self.members.contains_key(box_id) {
+            return;
+        }
+        let was = self.blocked();
+        self.leave(box_id);
+        self.homes.remove(box_id);
+        let now = self.blocked();
+        if was && !now {
+            self.log_flip(box_id);
+            self.move_all_home(Some(box_id), moves);
+        } else {
+            self.moved.remove(box_id);
+        }
+    }
+
+    /// The one info line per stance change, naming the box that flipped it
+    /// and the members that block now.
+    fn log_flip(&self, box_id: &str) {
+        let blocking: Vec<&str> = self.blocking_members().collect();
+        tracing::info!(
+            box_id,
+            blocked = self.blocked(),
+            blocking_members = ?blocking,
+            blocked_leaf = ?self.blocked_leaf,
+            "the host-address cohort's UDP 443 stance changed"
+        );
+        if self.blocked() && self.blocked_leaf.is_none() {
+            tracing::warn!(
+                box_id,
+                "the host-address cohort blocks UDP 443 but this host's classifier \
+                 tree has no blocked leaf; a launch that needs the leaf fails"
+            );
+        }
+    }
+
+    /// Moves the processes of `box_id`'s own leaf into the blocked leaf.
+    /// It reads the leaf again after each pass, because a process that
+    /// forks while the move runs leaves its child behind. It ends when the
+    /// leaf is empty. A box with no own leaf to move from moves nothing.
+    ///
+    /// # Errors
+    ///
+    /// A [`CohortPlaceError`] when there is no blocked leaf, when the leaf
+    /// cannot be read, when a live process cannot be moved, or when the
+    /// leaf is not empty after [`COHORT_MOVE_PASSES`] passes.
+    fn move_in(&mut self, box_id: &str, moves: &dyn CgroupMoves) -> Result<(), CohortPlaceError> {
+        let Some(home) = self.homes.get(box_id).cloned() else {
+            return Ok(());
+        };
+        let Some(blocked_leaf) = self.blocked_leaf.clone() else {
+            return Err(CohortPlaceError::NoBlockedLeaf);
+        };
+        let moved = self.moved.entry(box_id.to_string()).or_default();
+        let read = |leaf: &Path| {
+            moves.procs(leaf).map_err(|error| CohortPlaceError::Read {
+                leaf: leaf.to_path_buf(),
+                error,
+            })
+        };
+        for _ in 0..COHORT_MOVE_PASSES {
+            let pids = read(&home)?;
+            if pids.is_empty() {
+                return Ok(());
+            }
+            for pid in pids {
+                match moves.migrate(pid, &blocked_leaf) {
+                    Ok(()) => {
+                        moved.insert(pid);
+                    }
+                    // Gone between the read and the write: nothing to move.
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => {
+                        return Err(CohortPlaceError::Migrate {
+                            pid,
+                            leaf: blocked_leaf,
+                            error,
+                        });
+                    }
+                }
+            }
+        }
+        if read(&home)?.is_empty() {
+            Ok(())
+        } else {
+            Err(CohortPlaceError::StillStarting { leaf: home })
+        }
+    }
+
+    /// Sends every process in the blocked leaf back to its own box's leaf,
+    /// after the block lifted. When `departed` left and lifted it, a process
+    /// of `departed` itself is ending with its box, and stays.
+    fn move_all_home(&mut self, departed: Option<&str>, moves: &dyn CgroupMoves) {
+        let Some(blocked_leaf) = self.blocked_leaf.clone() else {
+            self.moved.clear();
+            return;
+        };
+        for _ in 0..COHORT_MOVE_PASSES {
+            let pids = match moves.procs(&blocked_leaf) {
+                Ok(pids) => pids,
+                Err(error) => {
+                    tracing::warn!(
+                        leaf = %blocked_leaf.display(),
+                        %error,
+                        "cannot read the cohort's UDP 443 blocked leaf to move its \
+                         processes back to their own leaves"
+                    );
+                    break;
+                }
+            };
+            let mut any = false;
+            for pid in pids {
+                let owner = self.owner_of(pid, moves);
+                let Some(home) = owner.as_deref().and_then(|id| self.homes.get(id)) else {
+                    if owner.is_none() || owner.as_deref() != departed {
+                        tracing::warn!(
+                            pid,
+                            "a process in the cohort's UDP 443 blocked leaf belongs to \
+                             no resident host-address box; it stays there"
+                        );
+                    }
+                    continue;
+                };
+                match moves.migrate(pid, home) {
+                    Ok(()) => any = true,
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => tracing::warn!(
+                        pid,
+                        %error,
+                        "cannot move a host-address box's process back to its own leaf"
+                    ),
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+        self.moved.clear();
+    }
+
+    /// The box a process in the blocked leaf belongs to: the one whose
+    /// moved pid is the process or one of its ancestors.
+    fn owner_of(&self, pid: i32, moves: &dyn CgroupMoves) -> Option<String> {
+        let mut current = pid;
+        for _ in 0..COHORT_OWNER_DEPTH {
+            if let Some((id, _)) = self.moved.iter().find(|(_, pids)| pids.contains(&current)) {
+                return Some(id.clone());
+            }
+            current = moves.parent(current)?;
+            if current <= 1 {
+                return None;
+            }
+        }
+        None
+    }
+}
+
+/// The daemon's one `host_ip` cohort (BEP-018).
+static COHORT_QUIC443: std::sync::Mutex<CohortQuic443> =
+    std::sync::Mutex::new(CohortQuic443::new());
+
+/// The daemon's one `host_ip` cohort, for the launch and stop paths.
+pub(crate) fn cohort_quic443() -> &'static std::sync::Mutex<CohortQuic443> {
+    &COHORT_QUIC443
+}
+
+/// A `host_ip` box joins `cohort` with its resolved stance
+/// ([`CohortQuic443::admit`]). Its processes move when it sits in the
+/// `allow` subtree of the classifier tree `root`.
+///
+/// # Errors
+///
+/// The [`CohortPlaceError`] of [`CohortQuic443::admit`].
+pub(crate) fn cohort_quic443_admit_over(
+    cohort: &std::sync::Mutex<CohortQuic443>,
+    root: &Path,
+    box_id: &str,
+    blocked: bool,
+    moves: &dyn CgroupMoves,
+) -> Result<(), CohortPlaceError> {
+    let home = sandbox::classifier::box_leaf(root, box_id, Verdict::Allow);
+    let home = home.is_dir().then_some(home);
+    let mut cohort = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cohort.learn_blocked_leaf(quic443_blocked_leaf(root));
+    cohort.admit(box_id, home, blocked, moves)
+}
+
+/// A `host_ip` box leaves `cohort` ([`CohortQuic443::depart`]). A box
+/// that never joined changes nothing.
+pub(crate) fn cohort_quic443_depart_over(
+    cohort: &std::sync::Mutex<CohortQuic443>,
+    box_id: &str,
+    moves: &dyn CgroupMoves,
+) {
+    let mut cohort = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cohort.depart(box_id, moves);
+}
+
+/// A [`CgroupMoves`] over a stand-in tree, with the kernel's own meaning:
+/// a migration takes the pid out of every other cgroup and puts it in the
+/// target, and a process forked later lands where its parent is.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StandinMoves {
+    /// Which cgroup each live pid is in.
+    pub(crate) placed: std::sync::Mutex<std::collections::BTreeMap<i32, PathBuf>>,
+    /// Each pid's parent.
+    pub(crate) parents: std::sync::Mutex<std::collections::BTreeMap<i32, i32>>,
+    /// The pids a migration refuses with `EACCES`, as a write to a leaf the
+    /// daemon was not delegated would.
+    pub(crate) refused: std::sync::Mutex<std::collections::BTreeSet<i32>>,
+}
+
+#[cfg(test)]
+impl StandinMoves {
+    /// Starts `pid` in `leaf`, as a box's first process.
+    pub(crate) fn spawn_in(&self, pid: i32, leaf: &Path) {
+        self.placed.lock().unwrap().insert(pid, leaf.to_path_buf());
+    }
+
+    /// Forks `child` from `parent`, in the parent's cgroup.
+    pub(crate) fn fork(&self, parent: i32, child: i32) {
+        let leaf = self.placed.lock().unwrap()[&parent].clone();
+        self.placed.lock().unwrap().insert(child, leaf);
+        self.parents.lock().unwrap().insert(child, parent);
+    }
+
+    /// The cgroup `pid` is in now.
+    pub(crate) fn where_is(&self, pid: i32) -> PathBuf {
+        self.placed.lock().unwrap()[&pid].clone()
+    }
+
+    /// Ends `pid`, as a box's stop does.
+    pub(crate) fn kill(&self, pid: i32) {
+        self.placed.lock().unwrap().remove(&pid);
+    }
+}
+
+#[cfg(test)]
+impl CgroupMoves for StandinMoves {
+    fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>> {
+        Ok(self
+            .placed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, at)| at.as_path() == leaf)
+            .map(|(pid, _)| *pid)
+            .collect())
+    }
+
+    fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()> {
+        if self.refused.lock().unwrap().contains(&pid) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        match self.placed.lock().unwrap().get_mut(&pid) {
+            Some(at) => {
+                *at = to.to_path_buf();
+                Ok(())
+            }
+            None => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        }
+    }
+
+    fn parent(&self, pid: i32) -> Option<i32> {
+        self.parents.lock().unwrap().get(&pid).copied()
     }
 }
 
@@ -818,7 +1424,7 @@ static PROBE_LEAF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// behind by a probe that died before its own cleanup is remade, not
 /// wedged into, by the next.
 fn probe_leaf(root: &Path) -> PathBuf {
-    sandbox2::classifier::box_leaf(
+    sandbox::classifier::box_leaf(
         root,
         &format!("filter-probe-{}", std::process::id()),
         Verdict::Deny,
@@ -1167,20 +1773,21 @@ pub const GUEST_CT_MARK_MASK: u32 = 0x3000_0000;
 const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 
 /// What the guest's own boot hands the installer's render: the tree this
-/// daemon mounted, the resolver its boxes resolve through, and NET-078's two
-/// source identities — which on a guest are both the guest's own address,
-/// but the render is told so, never left to assume. No answerer: a VM-backed
-/// guest's resolver carve-out is the node's DNS layer at the switch gateway
-/// ([`GUEST_RESOLVER_CARVE_OUT_LINE`]).
+/// daemon mounted, the listener its deny-all boxes' lookups are steered onto,
+/// and NET-078's two source identities — which on a guest are both the
+/// guest's own address, but the render is told so, never left to assume.
 pub struct GuestRender<'a> {
-    /// The tree root this daemon itself laid out: `sandbox2`'s
+    /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
-    /// The resolver Minimal owns for a host-address box on this guest: the
-    /// node's DNS layer at the switch gateway (NET-003), which the daemon's
-    /// own relay carries every lookup to. The deny subtree's carve-out is
-    /// this address on port 53, over UDP and TCP (NET-079).
-    pub gateway_resolver: Ipv4Addr,
+    /// The guest's own DNS listener (NET-079): the loopback answerer the
+    /// deny subtree's DNS-port lookups are dstnat'd onto, which refuses
+    /// every name outside the box zone and forwards the zone's A questions
+    /// to the switch gateway alone (NET-003).
+    pub answerer_address: Ipv4Addr,
+    /// The listener's port: the answerer's own, free inside a guest where
+    /// the in-VM daemon starts no box-zone answerer.
+    pub answerer_port: u16,
     /// What the boxes cohort leaves as, and what everything else in the
     /// slice leaves as.
     pub cohort_address: IpAddr,
@@ -1206,13 +1813,13 @@ const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
 /// before the table reads as gone.
 const TABLE_LIST_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The one line the guest's render logs, with the resolver's address beside
-/// it: on a VM-backed host a deny-all host-address box resolves through the
-/// node's DNS layer at the switch gateway, like every other host-address box
-/// there (NET-003), so the guest's table admits that one destination, port
-/// 53 over UDP and TCP, and retargets nothing.
+/// The one line the guest's render logs, with the listener's address beside
+/// it: on a VM-backed host a deny-all host-address box's lookups are dstnat'd
+/// onto the guest's own DNS listener (NET-079), which refuses every name
+/// outside the box zone and forwards the zone's A questions to the switch
+/// gateway alone.
 pub const GUEST_RESOLVER_CARVE_OUT_LINE: &str = "deny-all host-address box on VM host: resolver \
-     carve-out is the node's DNS layer at the gateway, port 53 over udp and tcp";
+     carve-out is the guest's own DNS listener, which refuses names outside the zone";
 
 /// Feeds one of the guest's own runs the bytes it reads on stdin, then
 /// waits for it, both inside the bound it is given. The feed is part of
@@ -1342,8 +1949,10 @@ pub fn render_guest_ruleset_over(
         .arg("--print-ruleset")
         .arg("--root")
         .arg(params.tree_root)
-        .arg("--gateway-resolver")
-        .arg(params.gateway_resolver.to_string())
+        .arg("--answerer-address")
+        .arg(params.answerer_address.to_string())
+        .arg("--answerer-port")
+        .arg(params.answerer_port.to_string())
         .arg("--cohort-address")
         .arg(params.cohort_address.to_string())
         .arg("--node-plane-address")
@@ -1357,7 +1966,11 @@ pub fn render_guest_ruleset_over(
     if let Some(mountinfo) = params.mountinfo_override {
         installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
     }
-    tracing::info!(resolver = %params.gateway_resolver, "{GUEST_RESOLVER_CARVE_OUT_LINE}");
+    tracing::info!(
+        answerer = %params.answerer_address,
+        port = params.answerer_port,
+        "{GUEST_RESOLVER_CARVE_OUT_LINE}"
+    );
     let child = installer
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
@@ -1439,6 +2052,21 @@ pub fn load_guest_table_over(
         );
         return Err(GuestLoadFailure::Marker(cause));
     }
+    // The table keys one rule on the cohort's blocked leaf, and nft
+    // resolves a cgroup path when it loads, so the leaf must stand before
+    // the check. The guest's tree is its own to build: this makes the one
+    // cgroup of it the table names that its boot does not. A leaf it cannot
+    // make is left for the check to name.
+    let boxes = params.tree_root.join(sandbox::classifier::BOXES_DIR);
+    if boxes.is_dir()
+        && let Err(error) = std::fs::create_dir(quic443_blocked_leaf(params.tree_root))
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        tracing::warn!(
+            %error,
+            "the guest could not make the host-address cohort's UDP 443 blocked leaf"
+        );
+    }
     let ruleset = match render_guest_ruleset_over(bash, params, bound) {
         Ok(ruleset) => ruleset,
         Err(cause) => {
@@ -1494,7 +2122,7 @@ pub fn load_guest_table_over(
     }
     tracing::info!(
         sha256 = %digest,
-        marker = %sandbox2::classifier::TABLE_MARKER,
+        marker = %sandbox::classifier::TABLE_MARKER,
         "loaded the guest's classifier table and wrote its presence marker"
     );
     Ok(GuestLoad { digest })
@@ -1505,7 +2133,7 @@ pub fn load_guest_table_over(
 /// this daemon made, so only a daemon still holding one keeps the removal
 /// from succeeding.
 fn clear_marker_records(root: &Path) -> Result<(), String> {
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     if marker.exists() {
         std::fs::remove_dir(&marker).map_err(|cause| {
             format!("removing the stale marker at {}: {cause}", marker.display())
@@ -1549,7 +2177,7 @@ fn write_guest_marker(mask: u32, root: &Path) -> Result<(), String> {
             ))
         }
     })?;
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     std::fs::create_dir(&marker).or_else(|cause| {
         if cause.kind() == std::io::ErrorKind::AlreadyExists {
             Ok(())
@@ -1905,7 +2533,7 @@ pub(crate) fn decide_over(
     // kind of host. A mount table that cannot be read is the same absence
     // of evidence, and the check may not report a host as confining on no
     // evidence.
-    let confining = sandbox2::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
+    let confining = sandbox::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
         .is_some_and(|(_, nsdelegate)| nsdelegate);
     if !confining {
         return Decision::undecidable(Cause::CannotConfine);
@@ -1999,14 +2627,14 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 /// way. A leaf that is not there, or one this daemon is not in, reads as
 /// what it is: no leaf of the daemon's own.
 ///
-/// [`enter_daemon_leaf`]: sandbox2::classifier::enter_daemon_leaf
+/// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
     let members =
-        std::fs::read_to_string(sandbox2::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
+        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
     members
         .lines()
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
-        .then_some(sandbox2::classifier::DAEMON_LEAF)
+        .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
 /// NET-080: the node-plane record for the daemon's own fetches — one line
@@ -2170,7 +2798,7 @@ pub(crate) fn url_object(url: &str) -> String {
 fn subtrees_delegated(root: &Path) -> bool {
     [Verdict::Deny, Verdict::Allow].iter().all(|verdict| {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         DELEGATION_FILES
             .iter()
@@ -2187,7 +2815,7 @@ fn subtrees_delegated(root: &Path) -> bool {
 /// is a step that did not finish — the state a failed re-install leaves —
 /// and reads the same as no step at all.
 fn table_marker_present(root: &Path) -> bool {
-    root.join(sandbox2::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
+    root.join(sandbox::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
 }
 
 /// The ct-mark mask the loaded table classifies cohort and node plane
@@ -2280,13 +2908,13 @@ pub(crate) fn live_answerer() -> Option<SocketAddr> {
 /// Whether a native deny-all launch over a table that decides per box must
 /// be refused because the table's carve-out is stale, and the words that say
 /// so: the recorded target is not the live answerer bind, no answerer is
-/// bound, or the table recorded no carve-out at all. The words name the
-/// cause, both values, and the remedy as it stands: `min finalize-install
-/// --undo`, then `min finalize-install`, re-renders the carve-out for the
-/// answerer's default port — the step reads no live bind, so a daemon whose
-/// answerer is bound elsewhere has no self-service remedy yet, and the words
-/// say so rather than name flags the verb does not take. `None` when the
-/// carve-out names the live answerer.
+/// bound, or the table recorded no carve-out at all. The words say the
+/// box's lookups would fail, name both addresses, and give the remedy as it
+/// stands: `min finalize-install --undo`, then `min finalize-install`,
+/// rewrites the rules for the answerer's default port — the step reads no
+/// live bind, so it helps only when the answerer listens there, and the
+/// words say so rather than name flags the verb does not take. `None` when
+/// the carve-out names the live answerer.
 pub(crate) fn stale_carve_out_refusal(
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
@@ -2298,28 +2926,30 @@ pub(crate) fn stale_carve_out_refusal(
     if recorded.is_some() && recorded == live_v4 {
         return None;
     }
-    let recorded_words = recorded.map_or_else(
-        || "no recorded carve-out".to_string(),
-        |target| target.to_string(),
+    let allowed = recorded.map_or_else(
+        || "do not allow DNS at any address".to_string(),
+        |target| format!("allow DNS only at {target}"),
     );
-    let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
-    let install = sandbox2::classifier::install_hint();
+    let live_words = live.map_or_else(
+        || "no address (it is not serving)".to_string(),
+        |bound| bound.to_string(),
+    );
+    let install = sandbox::classifier::install_hint();
     let re_render = format!(
-        "{install} --undo, then {install} re-renders the carve-out for the answerer's \
-         default port; a daemon whose answerer is bound elsewhere has no self-service \
-         remedy yet"
+        "`{install} --undo`, then `{install}`, rewrites the rules for the DNS \
+         service's default port, which fixes this only when the service listens there"
     );
     let remedy = match live_v4 {
-        Some(bound) => format!("re-render the carve-out onto the live bind {bound}: {re_render}"),
+        Some(_) => re_render,
         None => format!(
-            "start the daemon's zone answerer on an IPv4 loopback address, then {re_render}"
+            "Minimal's DNS service has to be serving on an IPv4 loopback address first; \
+             after that, {re_render}"
         ),
     };
     Some(format!(
-        "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
-         bound at {live_words}, so a deny-all box's lookups would reach nothing; the box \
-         was refused rather than run on a resolver nothing serves ({remedy})",
-        Cause::TableNotEffective.detail()
+        "this box asks for no network access, and its name lookups would fail: the \
+         egress rules installed on this machine {allowed}, but \
+         Minimal's DNS service is at {live_words}, so the box was not started. {remedy}."
     ))
 }
 
@@ -2362,7 +2992,7 @@ fn standin_mount() -> StandinMount {
     // name on a real host.
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
@@ -2597,18 +3227,19 @@ fn guest_bash() -> PathBuf {
 }
 
 /// The flags the guest's render passes for its resolver carve-out, spelled
-/// as the installer reads them: the default switch's gateway,
-/// `SwitchSubnet::default().dns_server()`, so the print and install lanes
-/// render the guest's own parameters.
+/// as the installer reads them: the guest's own DNS listener (NET-079), on
+/// the answerer's port at the guest's loopback, so the print and install
+/// lanes render the guest's own parameters.
 #[cfg(test)]
-const GUEST_RESOLVER_FLAGS: [&str; 2] = ["--gateway-resolver", "100.64.0.1"];
+const GUEST_RESOLVER_FLAGS: [&str; 4] =
+    ["--answerer-address", "127.0.0.1", "--answerer-port", "7656"];
 
 /// The parameters a guest's own boot renders its table with, over a
-/// stand-in mount: the switch gateway's resolver (NET-079's one carve-out on
-/// a VM-backed host), the ct-mark bits the boot classifies with,
-/// and the two source identities named by the caller — which a guest hands
-/// as two inputs even where they are the one address an un-enrolled guest
-/// has (NET-078).
+/// stand-in mount: the guest's own DNS listener — the loopback answerer the
+/// deny subtree's lookups are steered onto (NET-079) — the ct-mark bits the
+/// boot classifies with, and the two source identities named by the caller
+/// — which a guest hands as two inputs even where they are the one address
+/// an un-enrolled guest has (NET-078).
 #[cfg(test)]
 fn guest_params<'a>(
     mount: &'a StandinMount,
@@ -2618,7 +3249,8 @@ fn guest_params<'a>(
 ) -> GuestRender<'a> {
     GuestRender {
         tree_root: &mount.root,
-        gateway_resolver: crate::net::SwitchSubnet::default().dns_server(),
+        answerer_address: crate::net::guest_dns::LISTENER_ADDRESS,
+        answerer_port: crate::net::guest_dns::LISTENER_PORT,
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
@@ -2787,7 +3419,7 @@ mod tests {
     /// The tree root's own name — the component the installer renders a
     /// ruleset's cgroup paths below their covering mount from.
     fn tree_root_name() -> &'static str {
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("the tree root is a slice below the cgroup2 mount root")
@@ -2807,12 +3439,12 @@ mod tests {
     fn installed_cohort(root: &Path) {
         for verdict in [Verdict::Deny, Verdict::Allow] {
             let subtree = root
-                .join(sandbox2::classifier::BOXES_DIR)
+                .join(sandbox::classifier::BOXES_DIR)
                 .join(verdict.dir_name());
             std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
             model_delegation_files(&subtree);
         }
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         std::fs::create_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("the step records the ct-mark mask beside the marker");
@@ -2845,7 +3477,7 @@ mod tests {
         );
         let ruleset = String::from_utf8(printed.stdout).expect("the rendered ruleset is text");
         let rel = tree_root_name();
-        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
         let classify = chain_rules(&ruleset, "classify");
         assert_eq!(
             classify.len(),
@@ -2951,7 +3583,7 @@ mod tests {
         let root = tree.path();
         installed_cohort(root);
         let deny = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(Verdict::Deny.dir_name());
         std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o555))
             .expect("the deny subtree refuses the probe its leaf");
@@ -2987,8 +3619,8 @@ mod tests {
     fn node_plane_and_cohort_distinct_sources() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
-        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
-        let daemon = sandbox2::classifier::daemon_leaf(root);
+        let cohort = root.join(sandbox::classifier::BOXES_DIR);
+        let daemon = sandbox::classifier::daemon_leaf(root);
 
         // The node plane's identity is keyed on the daemon's leaf, a sibling
         // of the cohort and never inside it: a daemon leaf under `boxes/`
@@ -3010,7 +3642,7 @@ mod tests {
         // every box leaf is one deeper, in one subtree or the other, never
         // the cohort itself.
         for (verdict, id) in [(Verdict::Deny, "a deny-all box"), (Verdict::Allow, "a box")] {
-            let leaf = sandbox2::classifier::box_leaf(root, id, verdict);
+            let leaf = sandbox::classifier::box_leaf(root, id, verdict);
             assert_eq!(
                 leaf.parent().and_then(Path::parent),
                 Some(cohort.as_path()),
@@ -3042,7 +3674,7 @@ mod tests {
         children.sort();
         assert_eq!(
             children,
-            [sandbox2::config::ALLOW_DIR, sandbox2::config::DENY_DIR],
+            [sandbox::config::ALLOW_DIR, sandbox::config::DENY_DIR],
             "the cohort holds the two subtrees and nothing else"
         );
 
@@ -3068,7 +3700,7 @@ mod tests {
         // refuses to render half a pair, and refuses a mask that is not
         // two contiguous bits.
         let rel = tree_root_name();
-        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
         let ruleset = rendered_ruleset();
         assert!(
             ruleset.contains("type filter hook output priority mangle"),
@@ -3152,7 +3784,7 @@ mod tests {
         // The deny subtree is the declaration that admits no destination,
         // spelled the one shape that does: every `allow_*` dimension present
         // and empty.
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(verdict_of(Some(&deny_all)), Verdict::Deny);
 
         // Nothing else gets the deny subtree. A declaration that admits
@@ -3160,11 +3792,11 @@ mod tests {
         // name — is placed under `allow`, so the refusing rule is never the
         // one a box that said what it wanted is held to; an absent section
         // is the default's to decide, never a deny-all.
-        let reachable = sessions::EgressPolicy {
+        let reachable = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..deny_all.clone()
         };
-        let names_only = sessions::EgressPolicy {
+        let names_only = boxes::EgressPolicy {
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             ..deny_all.clone()
         };
@@ -3189,9 +3821,9 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
         let deny_subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::DENY_DIR);
-        let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::DENY_DIR);
+        let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
         assert_eq!(
             leaf.dir().parent(),
             Some(deny_subtree.as_path()),
@@ -3204,8 +3836,8 @@ mod tests {
         assert_ne!(
             leaf.dir().parent(),
             Some(
-                root.join(sandbox2::classifier::BOXES_DIR)
-                    .join(sandbox2::config::ALLOW_DIR)
+                root.join(sandbox::classifier::BOXES_DIR)
+                    .join(sandbox::config::ALLOW_DIR)
                     .as_path()
             ),
             "the deny-all box's leaf is in the deny subtree alone"
@@ -3222,8 +3854,8 @@ mod tests {
         let deny_subtree = format!(
             "{}/{}/{}",
             rel,
-            sandbox2::classifier::BOXES_DIR,
-            sandbox2::config::DENY_DIR
+            sandbox::classifier::BOXES_DIR,
+            sandbox::config::DENY_DIR
         );
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
@@ -3266,7 +3898,7 @@ mod tests {
     fn unenforceable_rules_names_deny_subnets_and_partial_allow_lists() {
         // The CLI's own spelling of a narrowing: `--deny-subnets` subtracts
         // a range from an allow-all — one entry, one rule.
-        let deny_a_range = sessions::EgressPolicy {
+        let deny_a_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3279,11 +3911,11 @@ mod tests {
         // Every entry is a rule, and every present `allow_*` list is one,
         // denied ranges first and the lists in the declaration's own field
         // order — the same order a person typed them in.
-        let narrowing = sessions::EgressPolicy {
+        let narrowing = boxes::EgressPolicy {
             deny_subnets: Some(vec!["10.1.0.0/16".to_string(), "10.2.0.0/16".to_string()]),
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
-            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
         };
         let rules = unenforceable_rules(Some(&narrowing));
         assert_eq!(
@@ -3302,7 +3934,7 @@ mod tests {
         // declaration is not the deny-all shape: an empty `allow_subnets`
         // over a denied range admits one range and refuses the rest, and
         // "refuse the rest" is the rule the table cannot make.
-        let one_range = sessions::EgressPolicy {
+        let one_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/1".to_string()]),
             allow_subnets: Some(vec![]),
             ..Default::default()
@@ -3320,7 +3952,7 @@ mod tests {
         // shape, so the empty list is a narrowing by itself — "refuse
         // every subnet, allow everything else" — and the classifier has no
         // verdict for that half of it.
-        let lone_empty_allow_list = sessions::EgressPolicy {
+        let lone_empty_allow_list = boxes::EgressPolicy {
             allow_subnets: Some(vec![]),
             ..Default::default()
         };
@@ -3346,7 +3978,7 @@ mod tests {
             "the refusal names every rule: {words}"
         );
         assert!(
-            words.contains("--network own_ip") && words.contains("which enforces them"),
+            words.contains("--network own_ip") && words.contains("to apply them"),
             "the refusal says own-address boxes enforce these rules: {words}"
         );
         // The words end with what to do: a refusal that names the rules it
@@ -3361,14 +3993,13 @@ mod tests {
             words.contains("Remove them")
                 && words.contains("--deny-all-egress")
                 && words.contains("egress section")
-                && words.contains("all three allow lists present and empty")
-                && words.contains("no deny entries")
-                && words.contains("host_ip boxes on this host enforce only deny-all egress")
-                && words.contains("these rules would go unenforced"),
+                && words.contains("--network own_ip")
+                && words.contains("can only block all network access")
+                && words.contains("it cannot apply these rules"),
             "the refusal says what to do about the rules it named: {words}"
         );
         assert!(
-            words.ends_with("which enforces them."),
+            words.ends_with("an egress section with every allow list empty)."),
             "the words end with the remedy, so what a person reads last is \
              what they can do: {words}"
         );
@@ -3377,31 +4008,20 @@ mod tests {
         // the same declaration's box over exactly these rules, and the
         // paths that read the host answer over its two facts alone.
         assert_eq!(
-            refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
-                true,
-                Some(&narrowing),
-            ),
+            refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, true, Some(&narrowing),),
             Some(rules),
             "a per-box host refuses the narrowing over its rules"
         );
         assert_eq!(
-            refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
-                false,
-                Some(&narrowing),
-            ),
+            refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, false, Some(&narrowing),),
             None,
             "a host that cannot decide per box keeps the exception, whatever \
              the declaration names"
         );
         for (mode, why) in [
+            (boxes::NetworkMode::NoNet, "a none box declares no traffic"),
             (
-                sessions::NetworkMode::NoNet,
-                "a none box declares no traffic",
-            ),
-            (
-                sessions::NetworkMode::OwnIp,
+                boxes::NetworkMode::OwnIp,
                 "an own-address box's verdict is its own, on the address it \
                  holds — the declaration is enforced, not refused",
             ),
@@ -3425,7 +4045,7 @@ mod tests {
     /// read as two different failures of the same box.
     #[test]
     fn unenforceable_declaration_refusal_is_one_typed_error_for_create_and_launch() {
-        let deny_a_range = sessions::EgressPolicy {
+        let deny_a_range = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3458,7 +4078,7 @@ mod tests {
     /// the section form, never in place of it.
     #[test]
     fn unenforceable_refusal_names_the_deny_all_flag() {
-        let declaration = sessions::EgressPolicy {
+        let declaration = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
             ..Default::default()
         };
@@ -3495,7 +4115,7 @@ mod tests {
     /// admitted set that is already empty.
     #[test]
     fn unenforceable_rules_empty_for_absent_section_and_deny_all() {
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             unenforceable_rules(Some(&deny_all)),
             Vec::new(),
@@ -3506,7 +4126,7 @@ mod tests {
             Vec::new(),
             "an absent section is the default's allow-all"
         );
-        let deny_all_plus_denies = sessions::EgressPolicy {
+        let deny_all_plus_denies = boxes::EgressPolicy {
             deny_subnets: Some(vec!["0.0.0.0/0".to_string(), "192.168.0.0/16".to_string()]),
             ..deny_all.clone()
         };
@@ -3529,11 +4149,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                refuses_unenforceable_declaration(
-                    sessions::NetworkMode::HostNet,
-                    true,
-                    declaration
-                ),
+                refuses_unenforceable_declaration(boxes::NetworkMode::HostNet, true, declaration),
                 None,
                 "{why} is enforceable, so a per-box host refuses it over nothing"
             );
@@ -3679,13 +4295,23 @@ mod tests {
             );
         }
         let output = chain_rules(&ruleset, "output");
+        let jumps: Vec<_> = output.iter().filter(|rule| rule.contains("jump")).collect();
         assert_eq!(
-            output.len(),
+            jumps.len(),
             1,
-            "the output chain does one thing, route a cgroup to its chain: {output:?}"
+            "the output chain routes one cgroup to its chain: {output:?}"
+        );
+        // Its one other rule is the cohort's UDP 443 reject (BEP-018),
+        // which decides nothing else.
+        assert!(
+            output
+                .iter()
+                .filter(|rule| !rule.contains("jump"))
+                .all(|rule| rule.contains(QUIC443_BLOCKED_DIR) && rule.contains("udp dport 443")),
+            "every other output rule is the blocked leaf's UDP 443 reject: {output:?}"
         );
         assert!(
-            output[0].contains(sandbox2::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
+            output[0].contains(sandbox::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
             "the one jump is the deny subtree's, so nothing else is decided \
              against a deny-all box: {output:?}"
         );
@@ -3707,7 +4333,7 @@ mod tests {
         // The box's declaration is the deny-all one, so its leaf is in the
         // subtree whose chain every rule below is read from — the verdict
         // the launch's own placement would pick for this box.
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(verdict_of(Some(&deny_all)), Verdict::Deny);
 
         // The box's listener, on the loopback a host-address box shares with
@@ -3721,7 +4347,7 @@ mod tests {
         registry
             .write()
             .unwrap()
-            .register_host_net(sessions::SessionId::nil(), "denybox");
+            .register_host_net(boxes::SessionId::nil(), "denybox");
         let router = crate::net::proxy::Router::new(
             std::sync::Arc::clone(&registry),
             crate::net::switch::proxied_request_verdict,
@@ -3730,7 +4356,7 @@ mod tests {
             .await
             .expect("the proxy binds a loopback port");
         let proxy_addr = proxy.local_addr().expect("the proxy's address");
-        tokio::spawn(crate::net::proxy::serve(proxy, router));
+        crate::traced::spawn(crate::net::proxy::serve(proxy, router));
         let answered = crate::net::proxy::proxy_get(
             proxy_addr,
             &format!("denybox.min.internal:{backend_port}"),
@@ -3862,14 +4488,14 @@ mod tests {
         let mount = standin_mount();
         let root = mount.root.clone();
         installed_cohort(&root);
-        let deny_all = sessions::EgressPolicy::deny_all();
+        let deny_all = boxes::EgressPolicy::deny_all();
         assert_eq!(
             verdict_of(Some(&deny_all)),
             Verdict::Deny,
             "the resident box is declared deny-all, so its leaf sits in the \
              subtree the refusing rule matches"
         );
-        let resident = sandbox2::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
+        let resident = sandbox::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
             .expect("the launch makes the deny-all box's leaf");
 
         // The daemon's own leaf, entered the way the daemon enters it at
@@ -3877,10 +4503,10 @@ mod tests {
         // performs — its own pid into its leaf's `cgroup.procs` — and the
         // leaf needs the delegation-contract files modelled into it, because
         // nothing behind the stand-in makes them at mkdir.
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf, in the tree the box is resident in");
 
         // The fetch's leg: a connection the daemon opens from its own leaf,
@@ -3927,12 +4553,21 @@ mod tests {
         // `enter_daemon_leaf` performs is what makes that so.
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
+        // Two rules: the deny subtree's refusal first, and the cohort's
+        // UDP 443 rule on its blocked leaf (BEP-018), which the daemon's
+        // leaf is outside of too.
         assert_eq!(
             output.len(),
-            1,
-            "one rule refuses, the deny subtree's: {output:?}"
+            2,
+            "the deny subtree's rule and the blocked leaf's: {output:?}"
         );
         let refusing = output[0];
+        assert!(
+            !cgroup_match_covers(output[1], &daemon_path),
+            "the blocked leaf's rule cannot reach the daemon's leaf \
+             ({daemon_path}): {}",
+            output[1]
+        );
         let deny_subtree = rendered(
             resident
                 .parent()
@@ -4014,7 +4649,7 @@ mod tests {
         let leaf = daemon_fetch_leaf(&root);
         assert_eq!(
             leaf,
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its own leaf above reads back as in it, \
              which is the premise the record's leaf field is about to claim"
         );
@@ -4052,7 +4687,7 @@ mod tests {
                 "the record names the host fetched: {line}"
             );
             assert!(
-                line.contains(sandbox2::classifier::DAEMON_LEAF),
+                line.contains(sandbox::classifier::DAEMON_LEAF),
                 "the record names the leaf the fetch left from: {line}"
             );
             assert!(
@@ -4087,7 +4722,7 @@ mod tests {
         let mount = standin_mount();
         let root = mount.root.clone();
         installed_cohort(&root);
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
 
@@ -4139,11 +4774,11 @@ mod tests {
         // The entry the daemon performs at start, over the same tree: the
         // leaf read turns, and the line with it — the fetch is now recorded
         // as leaving from the leaf the tree holds for it, beside the cohort.
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf over the stand-in tree");
         assert_eq!(
             daemon_fetch_leaf(&root),
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its leaf reads back as in it"
         );
         let (log, guard) = capture_node_plane_log();
@@ -4170,7 +4805,7 @@ mod tests {
         // none to name — the same line as the unplaced daemon's, read the
         // same way by a bundle's tail on a host that never ran the install.
         let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
-        let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        let slice = std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a path with a name");
         assert_eq!(
@@ -4668,7 +5303,7 @@ mod tests {
         // — for a guest, that is the state a launch refuses rather than
         // places (design §7.1).
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4690,7 +5325,7 @@ mod tests {
         // whose table's bits it cannot name.
         std::fs::remove_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("removing the recorded mask");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4740,7 +5375,7 @@ mod tests {
         // the listing is handed to the decision here as the fact a guest
         // whose boot loaded its table reads (the recheck itself is pinned
         // in `guest_decide_rechecks_table_not_only_marker`).
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         let decided = decide(root, Some(&mountinfo(root, true)), false, refused_reading);
         assert!(
@@ -5174,7 +5809,7 @@ mod tests {
         let read = || {
             decide_now(
                 root,
-                sandbox2::classifier::own_mountinfo().as_deref(),
+                sandbox::classifier::own_mountinfo().as_deref(),
                 crate::guest::is_microvm_daemon(),
             )
         };
@@ -5236,6 +5871,8 @@ mod tests {
                     "--print-ruleset",
                     GUEST_RESOLVER_FLAGS[0],
                     GUEST_RESOLVER_FLAGS[1],
+                    GUEST_RESOLVER_FLAGS[2],
+                    GUEST_RESOLVER_FLAGS[3],
                 ],
                 None,
                 &cohort.to_string(),
@@ -5300,8 +5937,10 @@ mod tests {
                 "--print-ruleset".to_string(),
                 "--root".to_string(),
                 mount.root.display().to_string(),
-                "--gateway-resolver".to_string(),
-                crate::net::SwitchSubnet::default().dns_server().to_string(),
+                "--answerer-address".to_string(),
+                crate::net::guest_dns::LISTENER_ADDRESS.to_string(),
+                "--answerer-port".to_string(),
+                crate::net::guest_dns::LISTENER_PORT.to_string(),
                 "--cohort-address".to_string(),
                 guest_ip.to_string(),
                 "--node-plane-address".to_string(),
@@ -5455,31 +6094,49 @@ mod tests {
         );
     }
 
-    /// NET-079's one carve-out on a VM-backed host, as the guest's own render
-    /// spells it: the resolver Minimal owns for a host-address box there is
-    /// the node's DNS layer at the switch gateway (NET-003), so the deny
-    /// chain admits the gateway on DNS's port, over UDP and over TCP (a
-    /// truncated answer retries over TCP), and nothing else beside the reply
-    /// direction. Nothing is retargeted: the box already asks the gateway,
-    /// so the table carries no dstnat chain, and the gateway on any other
-    /// port (its control surface) meets the reject like any destination.
-    /// Read off the guest's own render, over the collapsed pair an
-    /// un-enrolled guest has.
+    /// NET-079's carve-out on a VM-backed host, as the guest's own render
+    /// spells it: the deny subtree's DNS-port lookups are dstnat'd onto the
+    /// guest's own DNS listener at the guest's loopback, on the answerer's
+    /// port, and `deny_out` admits the reply direction and the listener —
+    /// the one destination a deny-all box's lookups reach — and nothing
+    /// else. The match carries no destination address: the box asks the
+    /// switch gateway like every other host-address box there, and the
+    /// retarget is what steers the lookup onto the listener, which refuses
+    /// every name outside the box zone instead of letting the box resolve
+    /// it off the machine. DNS over TCP is not steered and not admitted: a
+    /// truncated answer cannot retry past the verdict. Read off the guest's
+    /// own render, over the collapsed pair an un-enrolled guest has.
     #[test]
-    fn guest_deny_all_renders_gateway_resolver_carve_out() {
+    fn guest_deny_all_renders_listener_carve_out() {
         let subnet = crate::net::SwitchSubnet::default();
         let guest_ip = IpAddr::V4(subnet.daemon_ip());
-        let gateway = subnet.dns_server();
+        let listener_addr = crate::net::guest_dns::LISTENER_ADDRESS;
+        let listener_port = crate::net::guest_dns::LISTENER_PORT;
         assert_eq!(
             GUEST_RESOLVER_FLAGS,
-            ["--gateway-resolver", gateway.to_string().as_str()],
-            "the tests' spelling of the guest's carve-out is the switch gateway"
+            [
+                "--answerer-address",
+                listener_addr.to_string().as_str(),
+                "--answerer-port",
+                listener_port.to_string().as_str()
+            ],
+            "the tests' spelling of the guest's carve-out is the guest's own listener"
         );
         let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
-        assert!(
-            chain_rules(&ruleset, "dstnat").is_empty() && !ruleset.contains("chain dstnat"),
-            "the guest's table has no dstnat chain:\n{ruleset}"
+        // The dstnat chain steers the deny subtree's UDP-53 lookups onto
+        // the listener, with no destination address in the match: a box on
+        // this guest asks the gateway, and the steer is the carve-out.
+        let dstnat = chain_rules(&ruleset, "dstnat");
+        let steer = format!(
+            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" udp dport 53 dnat ip to \
+             {listener_addr}:{listener_port}"
+        );
+        assert_eq!(
+            dstnat,
+            [steer.as_str()],
+            "the guest's table steers the deny subtree's DNS-port lookups onto the \
+             listener:\n{ruleset}"
         );
         let deny_out = chain_rules(&ruleset, "deny_out");
         let accepts: Vec<&str> = deny_out
@@ -5487,37 +6144,42 @@ mod tests {
             .copied()
             .filter(|rule| rule.ends_with("accept"))
             .collect();
-        let udp = format!("ip daddr {gateway} udp dport 53 accept");
-        let tcp = format!("ip daddr {gateway} tcp dport 53 accept");
+        let listener = format!("ip daddr {listener_addr} udp dport {listener_port} accept");
         assert_eq!(
             accepts,
             [
                 "ct state established,related ct direction reply accept",
-                udp.as_str(),
-                tcp.as_str(),
+                listener.as_str(),
             ],
-            "the deny chain admits the reply direction and the gateway's resolver \
-             on port 53 over udp and tcp, and nothing else: {deny_out:?}"
+            "the deny chain admits the reply direction and the listener alone: {deny_out:?}"
         );
         assert_eq!(
             deny_out.last().copied(),
             Some("reject with icmpx admin-prohibited"),
             "everything else a deny-all box opens is rejected: {deny_out:?}"
         );
+        // No gateway carve-out remains, and no TCP leg: the interim
+        // NET-079 admission of the gateway's port 53 whole is gone, and a
+        // truncated answer cannot retry past the verdict.
+        let gateway = crate::net::SwitchSubnet::default().dns_server();
         assert!(
-            !ruleset.contains("dnat "),
-            "no rule moves a lookup anywhere:\n{ruleset}"
+            !ruleset.contains(&format!("ip daddr {gateway}")),
+            "the gateway's resolver is no longer admitted:\n{ruleset}"
+        );
+        assert!(
+            !ruleset.contains("tcp dport"),
+            "no TCP destination is admitted or steered:\n{ruleset}"
         );
         for chain in ["output", "classify", "postrouting"] {
             let rules = chain_rules(&ruleset, chain);
             assert!(
                 rules.iter().all(|rule| !rule.contains("dport 53")),
-                "DNS's port is matched in deny_out alone, not {chain}: {rules:?}"
+                "DNS's port is matched in deny_out and dstnat alone, not {chain}: {rules:?}"
             );
         }
         assert!(
-            GUEST_RESOLVER_CARVE_OUT_LINE.contains("node's DNS layer at the gateway")
-                && GUEST_RESOLVER_CARVE_OUT_LINE.contains("port 53 over udp and tcp"),
+            GUEST_RESOLVER_CARVE_OUT_LINE.contains("guest's own DNS listener")
+                && GUEST_RESOLVER_CARVE_OUT_LINE.contains("refuses names outside the zone"),
             "the render's one line names the carve-out it renders"
         );
     }
@@ -5533,8 +6195,8 @@ mod tests {
     /// box, whose relay enforces it.
     #[test]
     fn allow_list_host_address_declaration_refused_on_vm_host() {
-        let allow_list = sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        let allow_list = boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
             allow_subnets: Some(Vec::new()),
             allow_dns_hosts: Some(vec!["github.com".to_string()]),
             deny_subnets: None,
@@ -5546,7 +6208,7 @@ mod tests {
         );
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
+                boxes::NetworkMode::HostNet,
                 guest_decided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5560,7 +6222,7 @@ mod tests {
         let guest_undecided = Decision::undecidable(Cause::GuestTableNotLoaded);
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::HostNet,
+                boxes::NetworkMode::HostNet,
                 guest_undecided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5569,7 +6231,7 @@ mod tests {
         );
         assert_eq!(
             refuses_unenforceable_declaration(
-                sessions::NetworkMode::OwnIp,
+                boxes::NetworkMode::OwnIp,
                 guest_decided.can_decide_per_box(),
                 Some(&allow_list),
             ),
@@ -5581,8 +6243,8 @@ mod tests {
     /// The native install records the carve-out it loaded beside the marker,
     /// the decision reads that record with the verdict, and a deny-all
     /// launch over it runs only while the record names the answerer's live
-    /// bind (NET-079). An install whose carve-out is the gateway's resolver
-    /// records none.
+    /// bind (NET-079). Every install records one: the carve-out is the
+    /// answerer's address and port on every render, native and guest alike.
     #[test]
     fn carve_out_targets_live_answerer_bind() {
         let mount = standin_mount();
@@ -5621,28 +6283,33 @@ mod tests {
             "a carve-out naming the live bind runs the box"
         );
 
-        // A re-install whose carve-out is the gateway's resolver clears the
-        // answerer record it replaces and writes none.
+        // A re-install records the carve-out it loaded, replacing the
+        // earlier record: the answerer's address and port are the carve-out
+        // every render names, so the record follows the table.
         let bare = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, nft_dir.path());
         assert!(
             bare.status.success(),
             "the re-install runs: {}",
             String::from_utf8_lossy(&bare.stderr),
         );
+        let listener = SocketAddrV4::new(
+            crate::net::guest_dns::LISTENER_ADDRESS,
+            crate::net::guest_dns::LISTENER_PORT,
+        );
         assert_eq!(
             recorded_carve_out(&mount.root),
-            None,
-            "no carve-out, no record"
+            Some(listener),
+            "every install records the carve-out it loaded"
         );
     }
 
     /// A native deny-all launch is refused when the table's carve-out is not
-    /// the live answerer bind, or when the table recorded none: the words are
-    /// the table-not-effective cause, both values, and the remedy as it
-    /// stands — the undo-then-install that re-renders for the default port,
-    /// and that a bind elsewhere has no self-service remedy yet — never the
-    /// verb with flags it does not take, and never a claim the step reads
-    /// the live bind.
+    /// the live answerer bind, or when the table recorded none: the words say
+    /// the box's lookups would fail, name both addresses, and give the
+    /// remedy as it stands — the undo-then-install that rewrites the rules
+    /// for the default port, and that it helps only when the service
+    /// listens there — never the verb with flags it does not take, and
+    /// never a claim the step reads the live bind.
     #[test]
     fn native_deny_all_refused_when_carve_out_target_is_stale() {
         let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
@@ -5650,14 +6317,12 @@ mod tests {
         let refusal = stale_carve_out_refusal(Some(recorded), Some(live))
             .expect("a carve-out naming another port is stale");
         for needle in [
-            Cause::TableNotEffective.detail(),
-            "stale carve-out",
+            "its name lookups would fail",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install \
-             --undo, then min finalize-install re-renders the carve-out for the answerer's \
-             default port",
-            "no self-service remedy yet",
+            "`min finalize-install --undo`, then `min finalize-install`, rewrites the rules \
+             for the DNS service's default port",
+            "only when the service listens there",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5667,7 +6332,8 @@ mod tests {
         let unrecorded = stale_carve_out_refusal(None, Some(live))
             .expect("a table with no recorded carve-out is stale");
         assert!(
-            unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
+            unrecorded.contains("do not allow DNS at any address")
+                && unrecorded.contains("127.0.0.1:7700"),
             "the refusal names the missing record and the live bind: {unrecorded}"
         );
     }
@@ -5695,11 +6361,11 @@ mod tests {
             Cause::ProbeUnreadable,
         ] {
             for declaration in [
-                sessions::EgressPolicy::deny_all(),
-                sessions::EgressPolicy::default(),
-                sessions::EgressPolicy {
+                boxes::EgressPolicy::deny_all(),
+                boxes::EgressPolicy::default(),
+                boxes::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                    ..sessions::EgressPolicy::default()
+                    ..boxes::EgressPolicy::default()
                 },
             ] {
                 rendered.push(advisory_text(cause, &declaration));
@@ -5736,10 +6402,9 @@ mod tests {
         let refusal = stale_carve_out_refusal(Some(recorded), None)
             .expect("a carve-out with no answerer behind it is stale");
         for needle in [
-            Cause::TableNotEffective.detail(),
-            "stale carve-out",
+            "its name lookups would fail",
             "127.0.0.1:7656",
-            "no live answerer",
+            "no address (it is not serving)",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5828,7 +6493,7 @@ mod tests {
             "the digest the boot logs covers exactly the bytes piped to the load"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the marker is written after the load"
         );
         assert!(
@@ -5855,7 +6520,7 @@ mod tests {
             "the check that refused is the only call: no load ran behind it"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused check writes no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -5872,7 +6537,7 @@ mod tests {
             other => panic!("a refused load is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused load writes no marker"
         );
         assert!(
@@ -5910,7 +6575,7 @@ mod tests {
             load_guest_table(&guest_bash(), &nft, &params)
                 .expect("the load runs over an nft stub that accepts it");
             assert!(
-                root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+                root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
                 "the load that succeeded wrote the marker"
             );
         };
@@ -5943,7 +6608,7 @@ mod tests {
             }
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a render that never returned writes no marker, and takes the \
              standing one away first"
         );
@@ -5961,7 +6626,7 @@ mod tests {
             other => panic!("a check that never returns is the check's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "no load ran behind a check that never answered, so no marker stands"
         );
 
@@ -5985,7 +6650,7 @@ mod tests {
             other => panic!("a load that never returns is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a table nobody loaded is not marked present"
         );
     }
@@ -6052,7 +6717,7 @@ mod tests {
              the guest's boot reaches its load: {held:?}"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load the ordered boot ran wrote its marker"
         );
 
@@ -6061,7 +6726,7 @@ mod tests {
         // and a host that allows it keeps the verdict the order is for — and
         // still loads, because the marker's table is not the listeners'.
         let cause = std::io::Error::other("the loopback would not come up");
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let (ran, held_at_load) = (
             std::cell::RefCell::new(Vec::new()),
             std::cell::Cell::new(None),
@@ -6102,14 +6767,14 @@ mod tests {
              bind keeps the verdict the order is for"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load is not gated on the loopback or the listeners: the \
              marker's table is still the decision's own fact"
         );
 
         // And a hold that cannot bind is the same: logged, and the load
         // still runs, so the tree it leaves is the fact a launch reads.
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let ran = std::cell::RefCell::new(Vec::new());
         boot_guest_classifier(
             || {
@@ -6129,7 +6794,7 @@ mod tests {
         );
         assert_eq!(*ran.borrow(), ["loopback", "listeners", "load"]);
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a hold that cannot bind does not stop the load"
         );
         clear_probe_listeners();
@@ -6161,7 +6826,7 @@ mod tests {
         load_guest_table(&guest_bash(), &nft, &params)
             .expect("the load runs over an nft stub that accepts it");
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the previous load wrote its marker"
         );
 
@@ -6187,7 +6852,7 @@ mod tests {
             "no check ran behind a render that failed"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed render leaves no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -6238,12 +6903,12 @@ mod tests {
             "the load the stub refuses fails"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed load leaves no marker to vouch for a table"
         );
         assert!(
-            root.join(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
                 .is_dir(),
             "the subtrees stay: only the table's marker is the boot's half"
         );
@@ -6351,7 +7016,7 @@ mod tests {
         // its subtrees but no marker is still the interim, and no listing is
         // consulted for it either.
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         let listed = std::cell::Cell::new(0);
         let still_unmarked = decide_over(root, Some(&table), true, refused_reading, || {
@@ -6364,7 +7029,7 @@ mod tests {
             "the marker gates the recheck too: subtrees alone are no table"
         );
         assert_eq!(listed.get(), 0, "no listing is read without the marker");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("restoring the marker");
 
         // A table the kernel no longer holds behind its marker — a flush, a
@@ -6626,5 +7291,297 @@ mod tests {
             other => panic!("a dead endpoint reads as unknown, not {other:?}"),
         }
         clear_probe_listeners();
+    }
+
+    /// BEP-018: on the shared `host_ip` address the most restrictive
+    /// resident member wins. One blocked member blocks UDP to port 443 for
+    /// the cohort, and the block lifts when the last blocked member leaves.
+    #[test]
+    fn host_ip_cohort_quic_stance_most_restrictive_wins() {
+        use boxes::core::bep::{Quic443, Steering};
+
+        let mut cohort = CohortQuic443::default();
+        assert!(!cohort.blocked(), "an empty cohort blocks nothing");
+
+        // A box with no grant resolves `auto` to allowed.
+        cohort.join("plain", Quic443::Auto.blocks(false, Steering::Dns));
+        assert!(!cohort.blocked());
+
+        // A `dns`-steered grant box resolves `auto` to blocked, and costs
+        // the whole cohort UDP 443, whatever the other members say.
+        cohort.join("grant", Quic443::Auto.blocks(true, Steering::Dns));
+        cohort.join("open", Quic443::Allow.blocks(true, Steering::Dns));
+        assert!(cohort.blocked());
+        assert_eq!(cohort.blocking_members().collect::<Vec<_>>(), ["grant"]);
+
+        // A second blocked member keeps the block after the first leaves.
+        cohort.join("strict", Quic443::Block.blocks(false, Steering::Off));
+        cohort.leave("grant");
+        assert!(cohort.blocked());
+
+        // The block lifts when no resident member blocks.
+        cohort.leave("strict");
+        assert!(!cohort.blocked());
+
+        // A member that joins again replaces its stance.
+        cohort.join("plain", true);
+        assert!(cohort.blocked());
+        cohort.join("plain", false);
+        assert!(!cohort.blocked());
+    }
+
+    /// BEP-018: the table the privileged step loads rejects UDP to port 443
+    /// from the `host_ip` cohort's blocked leaf with ICMP port unreachable,
+    /// the install makes and delegates that leaf, and a cohort with one
+    /// blocked member moves its allow-subtree processes into it.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443() {
+        let ruleset = rendered_ruleset();
+        let output = chain_rules(&ruleset, "output");
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let leaf = format!(
+            "{slice}/{}/{QUIC443_BLOCKED_DIR}",
+            sandbox::classifier::BOXES_DIR
+        );
+        let rule = format!(
+            "socket cgroupv2 level 3 \"{leaf}\" udp dport 443 reject with icmpx port-unreachable"
+        );
+        assert!(
+            output.contains(&rule.as_str()),
+            "the output chain rejects UDP 443 from the blocked leaf: {output:?}"
+        );
+        // The one rule keyed on the blocked leaf rejects UDP 443 and
+        // nothing else: the cohort keeps TCP 443 and every other port.
+        let keyed: Vec<_> = output.iter().filter(|r| r.contains(&leaf)).collect();
+        assert_eq!(
+            keyed,
+            [&rule.as_str()],
+            "one rule on the blocked leaf: {output:?}"
+        );
+        // The deny subtree's refusal is still the chain's first word.
+        assert!(
+            output.first().is_some_and(|r| r.ends_with("jump deny_out")),
+            "the deny subtree's jump comes first: {output:?}"
+        );
+        // The cohort's identity still covers the blocked leaf: it is under
+        // the boxes directory the classify chain matches.
+        let classify = chain_rules(&ruleset, "classify");
+        assert!(
+            classify
+                .iter()
+                .any(|r| r.contains(&format!("\"{slice}/{}\"", sandbox::classifier::BOXES_DIR))),
+            "the cohort match covers the boxes directory: {classify:?}"
+        );
+
+        // The install lays the leaf out with the rest of the tree, delegated
+        // per the v2 contract, so the daemon's moves need no privilege.
+        let mount = standin_mount();
+        let stub = tempfile::tempdir().expect("a dir for the recording nft");
+        recording_nft(stub.path(), &[]);
+        let installed = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, stub.path());
+        assert!(
+            installed.status.success(),
+            "the install succeeds: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        let blocked = quic443_blocked_leaf(&mount.root);
+        assert!(blocked.is_dir(), "the install made {}", blocked.display());
+        for file in DELEGATION_FILES {
+            assert!(
+                blocked.join(file).exists(),
+                "the blocked leaf carries {file}"
+            );
+        }
+        let loaded = nft_calls(stub.path())
+            .into_iter()
+            .any(|(_, piped)| String::from_utf8_lossy(&piped).contains(&rule));
+        assert!(loaded, "the table the install hands nft carries the rule");
+
+        // A blocked member's processes are in the leaf the rule matches.
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        let moves = StandinMoves::default();
+        let home = sandbox::classifier::create_box_leaf(&mount.root, "grant", Verdict::Allow)
+            .expect("the box's own leaf");
+        moves.spawn_in(10, &home);
+        moves.fork(10, 11);
+        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, &moves)
+            .expect("the grant box is placed");
+        let guard = cohort.lock().unwrap();
+        assert!(guard.blocked());
+        assert_eq!(guard.blocked_leaf(), Some(blocked.as_path()));
+        drop(guard);
+        assert_eq!(moves.where_is(10), blocked);
+        assert_eq!(moves.where_is(11), blocked);
+
+        // A deny-subtree member stays in its own leaf: it is refused
+        // everything but its resolver already.
+        let deny = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
+            .expect("the deny box's own leaf");
+        moves.spawn_in(20, &deny);
+        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves)
+            .expect("the deny box needs no move");
+        assert_eq!(moves.where_is(20), deny);
+    }
+
+    /// A cohort over a stand-in tree: its blocked leaf, learned, and a home
+    /// leaf for each named box.
+    fn standin_cohort(boxes: &[&str]) -> (tempfile::TempDir, CohortQuic443, Vec<PathBuf>) {
+        let tree = tempfile::tempdir().expect("a stand-in tree");
+        let blocked = quic443_blocked_leaf(tree.path());
+        std::fs::create_dir_all(&blocked).expect("the blocked leaf");
+        let mut cohort = CohortQuic443::default();
+        cohort.learn_blocked_leaf(blocked);
+        let homes = boxes
+            .iter()
+            .map(|id| tree.path().join(id))
+            .collect::<Vec<_>>();
+        (tree, cohort, homes)
+    }
+
+    /// BEP-018, review finding 4370595766: the only blocker joins again with
+    /// a weaker stance, the block lifts, and every process in the blocked
+    /// leaf goes home, the re-joined box's own with the rest.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_until_a_weaker_rejoin() {
+        let (tree, mut cohort, homes) = standin_cohort(&["plain", "grant"]);
+        let blocked = quic443_blocked_leaf(tree.path());
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        moves.spawn_in(20, &homes[1]);
+        cohort
+            .admit("plain", Some(homes[0].clone()), false, &moves)
+            .expect("nothing moves");
+        cohort
+            .admit("grant", Some(homes[1].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert_eq!(moves.where_is(10), blocked);
+        assert_eq!(moves.where_is(20), blocked);
+
+        cohort
+            .admit("grant", Some(homes[1].clone()), false, &moves)
+            .expect("the cohort moves home");
+        assert!(!cohort.blocked());
+        assert_eq!(moves.where_is(10), homes[0]);
+        assert_eq!(moves.where_is(20), homes[1]);
+        assert!(cohort.moved.is_empty(), "no stale pids: {:?}", cohort.moved);
+    }
+
+    /// A [`CgroupMoves`] whose box forks one new process into `leaf` on
+    /// every read of it, so a move never empties the leaf.
+    struct ForkingMoves {
+        inner: StandinMoves,
+        leaf: PathBuf,
+        next: std::sync::atomic::AtomicI32,
+    }
+
+    impl CgroupMoves for ForkingMoves {
+        fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>> {
+            if leaf == self.leaf {
+                let pid = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.spawn_in(pid, leaf);
+            }
+            self.inner.procs(leaf)
+        }
+
+        fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()> {
+            self.inner.migrate(pid, to)
+        }
+
+        fn parent(&self, pid: i32) -> Option<i32> {
+            self.inner.parent(pid)
+        }
+    }
+
+    /// BEP-018, review finding 4370595768: a blocked stance never fails
+    /// open. A missing blocked leaf, a refused move and a leaf that never
+    /// empties each come back to the caller as an error.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_or_refuses_the_placement() {
+        // No blocked leaf on this host.
+        let tree = tempfile::tempdir().expect("a stand-in tree");
+        let home = tree.path().join("grant");
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &home);
+        let mut cohort = CohortQuic443::default();
+        cohort.learn_blocked_leaf(quic443_blocked_leaf(tree.path()));
+        let refused = cohort.admit("grant", Some(home.clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::NoBlockedLeaf)),
+            "a missing leaf is an error: {refused:?}"
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("boxes/quic443-blocked"),
+            "the error names the missing directory"
+        );
+
+        // A move the kernel refuses.
+        let (tree, mut cohort, homes) = standin_cohort(&["grant"]);
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        moves.refused.lock().unwrap().insert(10);
+        let refused = cohort.admit("grant", Some(homes[0].clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::Migrate { pid: 10, .. })),
+            "a refused move is an error: {refused:?}"
+        );
+        drop(tree);
+
+        // A box that forks faster than it is moved.
+        let (_tree, mut cohort, homes) = standin_cohort(&["grant"]);
+        let moves = ForkingMoves {
+            inner: StandinMoves::default(),
+            leaf: homes[0].clone(),
+            next: std::sync::atomic::AtomicI32::new(100),
+        };
+        let refused = cohort.admit("grant", Some(homes[0].clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::StillStarting { .. })),
+            "a leaf that never empties is an error: {refused:?}"
+        );
+    }
+
+    /// BEP-018, arch C1: a process injected into a member while the cohort
+    /// blocks joins the blocked leaf, and its shim is recorded under the
+    /// box, so the shim and what it forks go home when the block lifts.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_for_injected_processes() {
+        let (tree, mut cohort, homes) = standin_cohort(&["plain", "grant"]);
+        let blocked = quic443_blocked_leaf(tree.path());
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        cohort
+            .admit("plain", Some(homes[0].clone()), false, &moves)
+            .expect("nothing moves");
+        assert_eq!(cohort.injection_leaf("plain"), None, "not blocked yet");
+        cohort
+            .admit("grant", Some(homes[1].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert_eq!(cohort.injection_leaf("plain"), Some(blocked.as_path()));
+        assert_eq!(cohort.injection_leaf("stranger"), None, "not a member");
+
+        // The shim (pid 50, a child of the daemon) joins the blocked leaf
+        // and forks the injected program (pid 51).
+        moves.spawn_in(50, &blocked);
+        moves.parents.lock().unwrap().insert(50, 1);
+        moves.fork(50, 51);
+        cohort.adopt_injected("plain", 50, &moves);
+
+        cohort.depart("grant", &moves);
+        assert!(!cohort.blocked());
+        assert_eq!(moves.where_is(50), homes[0], "the shim goes home");
+        assert_eq!(moves.where_is(51), homes[0], "its program goes home");
+        assert_eq!(moves.where_is(10), homes[0]);
+
+        // A shim recorded after the block lifted is sent home at once.
+        moves.spawn_in(60, &blocked);
+        cohort.adopt_injected("plain", 60, &moves);
+        assert_eq!(moves.where_is(60), homes[0]);
     }
 }

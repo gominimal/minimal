@@ -19,7 +19,7 @@
 # Usage:
 #   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--gateway-resolver ADDR] [--ct-mark-mask 0x30000000]
+#         [--ct-mark-mask 0x30000000]
 #         [--cohort-address ADDR --node-plane-address ADDR]
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
@@ -85,13 +85,22 @@
 # table that is not the one this step rendered.
 set -euo pipefail
 
-# Mirrors sandbox2::classifier's constants (crates/sandbox2/src/lib.rs): the
+# Mirrors sandbox::classifier's constants (crates/sandbox/src/lib.rs): the
 # tree this script lays out is the one the daemon looks for at startup.
 readonly DEFAULT_TREE_ROOT=/sys/fs/cgroup/minimald.slice
 readonly DAEMON_LEAF=daemon
 readonly BOXES_DIR=boxes
 readonly DENY_DIR=deny
 readonly ALLOW_DIR=allow
+# The host-address cohort's blocked leaf (BEP-018): a delegated leaf
+# directly under the cohort, beside its two subtrees. The daemon moves the
+# processes of the cohort's allow-subtree boxes in here while any resident
+# member's resolved quic443 stance is blocked, and back to their own leaves
+# when the last blocking member stops. The one rule keyed on it rejects UDP
+# to port 443, so the table is never edited at launch or stop: membership
+# is the switch. It is directly under the cohort, so the cohort's
+# source-identity match still covers it.
+readonly QUIC443_BLOCKED_DIR=quic443-blocked
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -111,8 +120,6 @@ readonly MASK_RECORD_PREFIX=ct-mark-mask-
 # The resolver carve-out the loaded table admits, recorded beside the
 # marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
 # refuse a deny-all box whose carve-out no longer names its live answerer.
-# A table rendered with --gateway-resolver carves out the node's DNS layer
-# at the gateway, not an answerer, and records none.
 readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
 
@@ -152,16 +159,6 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
-# --gateway-resolver ADDR renders the carve-out a VM-backed guest needs
-# instead of the answerer's: the resolver Minimal owns for a box there is
-# the node's DNS layer at the switch gateway (NET-003), which every box's
-# lookups reach on DNS's own port, so deny_out admits ADDR on port 53 over
-# UDP and TCP (a truncated answer retries over TCP) and nothing is
-# retargeted, because the box already asks the address the rule admits.
-# The address and port, never the address alone: the gateway is also the
-# switch's control surface, and the carve-out is the resolver, not it.
-gateway_resolver=
-answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
 # this host's to know, not the script's to guess: the SNAT rules are
 # rendered only when the addresses were given, and the two go together —
@@ -196,7 +193,6 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
-            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -205,7 +201,6 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
-            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -221,11 +216,6 @@ while [ $# -gt 0 ]; do
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
-            shift 2
-            ;;
-        --gateway-resolver)
-            [ $# -ge 2 ] || die "--gateway-resolver needs an address"
-            gateway_resolver=$2
             shift 2
             ;;
         --uninstall) mode=uninstall; shift ;;
@@ -253,12 +243,6 @@ while [ $# -gt 0 ]; do
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
-
-# A render whose carve-out is the gateway's resolver has no answerer to
-# name, so a call that names one asked for two carve-outs at once.
-if [ -n "$gateway_resolver" ] && [ -n "$answerer_given" ]; then
-    die "--gateway-resolver carves out the gateway's resolver, not an answerer: drop --answerer-address and --answerer-port"
-fi
 
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
@@ -422,7 +406,8 @@ do_check() {
     # its declaration picked.
     for cgroup in \
         "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+        "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
     do
         path="$tree_root$cgroup"
         if [ ! -d "$path" ]; then
@@ -457,7 +442,7 @@ do_check() {
     fi
     [ "$problems" -eq 0 ] || die "$problems problem(s): the tree is not installed as minimald needs it"
     note "tree:     $tree_root"
-    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR and its $DENY_DIR and $ALLOW_DIR subtrees, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR, its $DENY_DIR and $ALLOW_DIR subtrees and its $QUIC443_BLOCKED_DIR leaf, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
     note "table:    $tree_root/$TABLE_MARKER (the loaded table's marker; minimald records a per-box verdict only while it is there)"
     note "ct-mark:  ${recorded:-<none recorded>} (the mask the table classifies cohort and node plane with, recorded beside the marker)"
     note "the cgroup2 mount above the slice stays root-owned"
@@ -618,6 +603,7 @@ compute_cgroup_paths() {
         die "$tree_root is the cgroup2 mount root itself; the classifier needs a slice below the mount root to key its rules on"
     deny_path="$rel/$BOXES_DIR/$DENY_DIR"
     boxes_path="$rel/$BOXES_DIR"
+    quic443_blocked_path="$rel/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 }
 
 # cgroup_level <path> — the nft socket match compares that many leading
@@ -642,12 +628,13 @@ cgroup_level() {
 # things — and leaves the previous table standing when it dies.
 #
 # The dstnat chain (priority dstnat, before the filter output chain)
-# retargets the deny subtree's DNS-port lookups on the answerer's address
-# onto the answerer's own port: a deny-all box resolves through the
-# answerer (NET-079) by asking DNS's port like any resolver would, and the
-# one destination its deny rule admits is the one its lookups reach. A
-# render with --gateway-resolver has no dstnat chain: the box's lookups
-# already go to the gateway's port 53, the destination deny_out admits.
+# retargets the deny subtree's DNS-port lookups onto the answerer's own
+# port: a deny-all box resolves through the carve-out (NET-079)
+# by asking DNS's port like any resolver would, and the one destination
+# its deny rule admits is the one its lookups reach. The match carries no
+# destination address: on a guest the box asks the switch gateway, not the
+# answerer, and the retarget is what steers the lookup onto the listener
+# that answers it.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -663,6 +650,13 @@ cgroup_level() {
 # is active — reject, never a silent drop — and each one logs,
 # rate-limited, so a diagnostics bundle's daemon log tail carries the
 # refused connections themselves.
+#
+# The output chain's second rule is the cohort's QUIC stance (BEP-018): a
+# socket in the cohort's blocked leaf that sends UDP to port 443 gets ICMP
+# port unreachable, an active reject, so a client falls back to TCP at once.
+# The rule is fixed with the table like every other. The daemon decides
+# who it reaches by moving the cohort's processes into that leaf and out of
+# it, a cgroup.procs write inside the delegated slice.
 #
 # The classify chain is where a flow is classed, at the mangle priority —
 # ahead of the dstnat and filter chains, and the last place the kernel
@@ -694,19 +688,13 @@ render_ruleset() {
         ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
         ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
     fi
-    if [ -n "$gateway_resolver" ]; then
-        carve_out_rule="
-        ip daddr $gateway_resolver udp dport 53 accept
-        ip daddr $gateway_resolver tcp dport 53 accept"
-    else
-        carve_out_rule="
+    carve_out_rule="
         ip daddr $answerer_address udp dport $answerer_port accept"
-        dstnat_chain="
+    dstnat_chain="
     chain dstnat {
         type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" udp dport 53 dnat ip to $answerer_address:$answerer_port
     }"
-    fi
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
@@ -715,6 +703,7 @@ table inet $TABLE_NAME {
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
+        socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
     }
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
@@ -953,6 +942,7 @@ if [ "$mode" = uninstall ]; then
     done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true
+    rmdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR" 2>/dev/null || true
     if rmdir "$tree_root" 2>/dev/null; then
         note "removed the classifier tree at $tree_root"
@@ -988,6 +978,9 @@ mkdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null ||
 mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
     [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR" ] ||
     die "cannot create $tree_root/$BOXES_DIR/$ALLOW_DIR"
+mkdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null ||
+    [ -d "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" ] ||
+    die "cannot create $tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 
 # Delegate each cgroup this script lays out — the slice first, because a
 # migration between two of its leaves is a write to the slice's own
@@ -999,7 +992,8 @@ mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
 # touched — the mount root stays root-owned, which is the barrier.
 for cgroup in \
     "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+    "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 do
     dir="$tree_root$cgroup"
     for file in cgroup.procs cgroup.threads cgroup.subtree_control; do
@@ -1062,12 +1056,10 @@ note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
-if [ -z "$gateway_resolver" ]; then
-    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
-    mkdir "$carve_out_record" 2>/dev/null ||
-        [ -d "$carve_out_record" ] ||
-        die "cannot record the table's resolver carve-out at $carve_out_record"
-fi
+carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+mkdir "$carve_out_record" 2>/dev/null ||
+    [ -d "$carve_out_record" ] ||
+    die "cannot record the table's resolver carve-out at $carve_out_record"
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||
@@ -1078,18 +1070,11 @@ mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
 
 note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
-if [ -n "$gateway_resolver" ]; then
-    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the node's DNS layer at $gateway_resolver:53"
-else
-    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
-fi
+note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
+note "  $BOXES_DIR/$QUIC443_BLOCKED_DIR/   the host-address boxes while one of them blocks QUIC: UDP to port 443 is refused"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
-if [ -n "$gateway_resolver" ]; then
-    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the gateway's resolver at $gateway_resolver:53 over udp and tcp, and the refusal is active, never a silent drop"
-else
-    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
-fi
+note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
 if [ -n "$cohort_address" ]; then
     note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
 else

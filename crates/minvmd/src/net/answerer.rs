@@ -7,7 +7,7 @@
 //! a microVM; the host answerer owns the zone on this host).
 //!
 //! The answer *semantics* are not this module's to invent: they are the
-//! shared decision ([`sessions::core::zone_answer`]) — the same one the
+//! shared decision ([`boxes::core::zone_answer`]) — the same one the
 //! native daemon's answerer calls — and what this module owns beside it is
 //! the DNS wire (decoding a query, encoding the reply the decision's
 //! verdict names, the SOA its negatives cite), the host loopback listener,
@@ -97,9 +97,9 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use minimald_rpc::ZoneAnswererStatus;
 use serde::{Deserialize, Serialize};
 
-use sessions::core::zone_answer::{self, ZoneRow, ZoneView};
+use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
 
-use crate::box_registry::{BoxRegistry, is_host_answerable};
+use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 
 /// The `component` field every answerer log line carries — the same one the
 /// native daemon's answerer logs under, because it is the same zone service
@@ -330,8 +330,8 @@ fn prepare_interim_dir(sock: &Path) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
-                        "the interim answerer channel's dir {} is not a directory owned by \
-                         uid {uid} with mode 0700 (owner {}, mode {:o}); refusing to bind in it",
+                        "{} must be a directory owned by uid {uid} with mode 0700, \
+                         but it has owner {} and mode {:o}; the VM will not create its socket there",
                         dir.display(),
                         meta.uid(),
                         meta.mode() & 0o7777
@@ -395,6 +395,13 @@ struct RegisteredRow {
     address: Option<Ipv4Addr>,
     /// Whether the namespace the name names is running.
     live: bool,
+    /// Whether the row only claims its address and holds no name: a
+    /// dormant creation's, whose box is away and may resume at it
+    /// ([`zone_rows`]). Such a row answers nothing, and it never takes a
+    /// name from another node's row. Absent on the wire when false, so a
+    /// row from a sender that predates it reads as a named row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    address_only: bool,
 }
 
 /// The first line a node sends on the channel: who is connecting, and which
@@ -655,17 +662,15 @@ impl AddressBook {
             let (held, quarantined) = (self.held.len(), self.released.len());
             return Err(match next {
                 Some(wait) => format!(
-                    "{} {first}-{last} is held or was released less than \
-                     {} s ago (the answer TTL a host resolver may still serve it under): \
-                     {held} of {capacity} are held by live boxes and {quarantined} are \
-                     quarantined; the next one frees in {} s",
+                    "{} {first}-{last} is in use or was released in the last {} s: \
+                     {held} of {capacity} are in use and {quarantined} were just released; \
+                     the next one frees in {} s",
                     minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                     REUSE_QUARANTINE.as_secs(),
                     wait.as_secs().max(1)
                 ),
                 None => format!(
-                    "{} {first}-{last} is held ({held} of {capacity} by \
-                     live boxes); none remains to hand out",
+                    "{} {first}-{last} is in use ({held} of {capacity}); none is free",
                     minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                 ),
             });
@@ -766,21 +771,6 @@ fn box_zone_name(name: &str) -> String {
     ))
 }
 
-/// The one form a box's registry name is compared in wherever it keys the
-/// box's published address: the answerer's allocations and releases
-/// ([`box_zone_name`]), the box registry's in-flight registrations
-/// ([`crate::box_registry::BoxRegistry::begin_registration`]), and its
-/// live rows — the row table's name lookups
-/// ([`crate::box_registry::BoxRegistry::row_by_name`]), a client
-/// registration's name-collision refusal
-/// ([`crate::box_registry::AllocationError::NameAlreadyHeld`]), and a
-/// client withdrawal's name proof. Names are DNS labels, so the fold is
-/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
-/// be one to everything its hold is checked against.
-pub(crate) fn canonical_box_name(name: &str) -> String {
-    name.to_ascii_lowercase()
-}
-
 /// The rows other VM host daemons published over the channel, keyed by the
 /// connection that filed them: a publish is held while its connection
 /// lives, replaced by the connection's next line, and retired with the
@@ -846,7 +836,9 @@ impl RegisteredTables {
         let mut claimed: Vec<(Ipv4Addr, String)> = Vec::new();
         for row in rows {
             let name = canonical(&row.name);
-            if reserved.contains(&name) {
+            // An address-only row holds no name, so the name rules below
+            // never refuse it: only its address is claimed.
+            if !row.address_only && reserved.contains(&name) {
                 refused.push(RefusedRow {
                     name: row.name,
                     reason: "the answerer holds this name itself".to_string(),
@@ -861,10 +853,11 @@ impl RegisteredTables {
             let holder = held.values().find_map(|held| {
                 held.rows
                     .iter()
-                    .any(|held_row| canonical(&held_row.name) == name)
+                    .any(|held_row| !held_row.address_only && canonical(&held_row.name) == name)
                     .then_some(held.node.as_str())
             });
-            if let Some(holder) = holder
+            if !row.address_only
+                && let Some(holder) = holder
                 && holder != node
             {
                 refused.push(RefusedRow {
@@ -1294,6 +1287,11 @@ impl HostAnswerer {
         }
         let mut refused: BTreeSet<String> = BTreeSet::new();
         for (connection, row) in self.registered.rows() {
+            // An address-only row claims an address in the book and
+            // answers nothing: it holds no name in the zone.
+            if row.address_only {
+                continue;
+            }
             let name = canonical(&row.name);
             if let Some(kept_by) = held.get(&name) {
                 refused.insert(name.clone());
@@ -1533,10 +1531,9 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
 fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
-    // The channel is world-connectable (its mode grants the connect; this
-    // gate decides), so the refusals in flight are capped: past the cap a
-    // foreign peer is closed bare, and no peer can grow this service's
-    // threads or fds by connecting.
+    // The refusals in flight are capped: past the cap a foreign peer is
+    // closed bare, and no peer can grow this service's threads or fds
+    // by connecting, however connectable the socket's mode left it.
     if FOREIGN_REFUSALS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= FOREIGN_REFUSALS_MAX {
         FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         return;
@@ -1564,6 +1561,15 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) 
 
 /// The most foreign-peer refusals answered at once ([`refuse_foreign_peer`]).
 const FOREIGN_REFUSALS_MAX: usize = 4;
+
+/// How many foreign-peer warns the accept loop writes per second: a
+/// burst of foreign connects is one operator-readable line's worth of
+/// news, not one line each — the refusals themselves are never limited,
+/// only the warns.
+const FOREIGN_WARN_RATE_PER_SECOND: usize = 4;
+
+/// The window [`FOREIGN_WARN_RATE_PER_SECOND`] is counted over.
+const FOREIGN_WARN_WINDOW: Duration = Duration::from_secs(1);
 
 /// The foreign-peer refusals answering now.
 static FOREIGN_REFUSALS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -1767,6 +1773,10 @@ fn serve_channel(
         return;
     }
     let mut next: u64 = 0;
+    // The foreign-uid warns this loop wrote inside the current window:
+    // a connect storm is capped at a few lines a second, while every
+    // peer is still refused.
+    let mut foreign_warns: std::collections::VecDeque<Instant> = Default::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -1791,8 +1801,9 @@ fn serve_channel(
                 // The uid gate, before any byte of the peer is read: a
                 // foreign process is refused on what it is, not on what
                 // it says, and the refusal is a warn naming its uid —
-                // the one a misconfigured unit's service user answers at
-                // a glance.
+                // rate-limited, since one line tells the operator as
+                // much as a storm of them — the one a misconfigured
+                // unit's service user answers at a glance.
                 match peer_uid(&stream) {
                     Ok(uid) if uid == expected_uid => {
                         let connection = next;
@@ -1817,13 +1828,24 @@ fn serve_channel(
                         }
                     }
                     Ok(uid) => {
-                        tracing::warn!(
-                            component = COMPONENT,
-                            peer_uid = uid,
-                            service_uid = expected_uid,
-                            "refused an answerer channel connection from a foreign uid; \
-                             only the uid this answerer serves may publish rows"
-                        );
+                        // The warn is rate-limited; the refusal never is.
+                        let now = Instant::now();
+                        while foreign_warns
+                            .front()
+                            .is_some_and(|at| now.duration_since(*at) >= FOREIGN_WARN_WINDOW)
+                        {
+                            foreign_warns.pop_front();
+                        }
+                        if foreign_warns.len() < FOREIGN_WARN_RATE_PER_SECOND {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                peer_uid = uid,
+                                service_uid = expected_uid,
+                                "refused an answerer channel connection from a foreign uid; \
+                                 only the uid this answerer serves may publish rows"
+                            );
+                            foreign_warns.push_back(now);
+                        }
                         refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
@@ -2266,6 +2288,25 @@ impl Drop for Registration {
     }
 }
 
+/// What a connect the channel socket's own mode refused means: the
+/// socket is owner-only, so the host's DNS service is another account's.
+/// The gate's refusal says the same once a connect gets through
+/// ([`refuse_foreign_peer`]).
+const FOREIGN_CHANNEL_CONNECT: &str = "the host's DNS service belongs to another \
+     account; hosts with more than one operator are not supported";
+
+/// A channel connect's error, with a refusal by the socket's mode (an
+/// owner-only socket another account holds) said as
+/// [`FOREIGN_CHANNEL_CONNECT`] rather than a bare `Permission denied`.
+/// The kind stays `PermissionDenied`, the kind the gate's refusal carries.
+fn foreign_channel_connect(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(io::ErrorKind::PermissionDenied, FOREIGN_CHANNEL_CONNECT)
+    } else {
+        error
+    }
+}
+
 /// One node's first publish: connect to the answerer channel, say the
 /// hello — the node's id, the protocol version this copy speaks — wait
 /// for the answerer's ack, then publish `rows` and wait for the ack that
@@ -2278,7 +2319,7 @@ impl Drop for Registration {
 /// error the loop surfaces, never a reason to host.
 fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
     let mut registration = Registration {
-        stream: UnixStream::connect(sock)?,
+        stream: UnixStream::connect(sock).map_err(foreign_channel_connect)?,
     };
     // The hello and its reply are bounded like a publish's: a service
     // manager starts a socket-activated answerer at the connect, so the
@@ -2338,10 +2379,16 @@ fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io:
 /// held row — and a second VM's publish of it would only be refused as a
 /// clash, the by-construction refusal this exclusion takes out. The host's
 /// own name is in no table's view (the answerer holds it itself), so
-/// nothing else needs excluding here.
+/// nothing else needs excluding here. Beside the published rows fold the
+/// host's own dormant creations — boxes whose rows were withdrawn but whose
+/// creations kept their addresses ([`BoxRegistry::dormant_creation_rows`]).
+/// Each one travels as an address-only row: it answers nothing and holds no
+/// name, so it never wins a name from another node's live box. Its address
+/// is one the holder's book must keep claimed, or a fresh book hands it to
+/// a new box and the dormant box can never resume.
 fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
     let node = crate::box_registry::node_zone_name();
-    registry
+    let mut rows: Vec<_> = registry
         .zone_view()
         .rows()
         .filter(|(name, _)| **name != node)
@@ -2349,8 +2396,33 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
             name: name.to_string(),
             address: row.address,
             live: row.live,
+            address_only: false,
         })
-        .collect()
+        .collect();
+    for (name, address) in registry.dormant_creation_rows() {
+        if !in_box_range(address) {
+            continue;
+        }
+        let row_name = canonical(&name);
+        // A row that carries this address holds it already: a second claim
+        // at it would put two boxes on one loopback address. A row of the
+        // same name that carries an address holds the name's book entry.
+        // A name hold with no address claims nothing, so it does not stop
+        // the dormant creation's claim.
+        if rows.iter().any(|row| {
+            row.address == Some(address)
+                || (row.address.is_some() && canonical(&row.name) == row_name)
+        }) {
+            continue;
+        }
+        rows.push(RegisteredRow {
+            name,
+            address: Some(address),
+            live: false,
+            address_only: true,
+        });
+    }
+    rows
 }
 
 // ── the start ────────────────────────────────────────────────────────────────
@@ -2414,7 +2486,7 @@ fn refuse_command(command: HandoverCommand, why: &str) {
     match command {
         HandoverCommand::Release(reply) | HandoverCommand::Cancel(reply) => {
             let _ = reply.send(ReleaseReply::no_op(
-                "this VM host daemon hosts no interim answerer",
+                "the running VM is not answering box names itself",
             ));
         }
         HandoverCommand::Allocate { reply, .. } => {
@@ -2538,28 +2610,28 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
     );
     if native {
         format!(
-            "the zone answerer's hook port 127.0.0.1:{port} is held by a native minimald, \
-             {who}, with no answerer channel, so no box can be handed an address: install \
-             the answerer service (min session start prints the command); native daemons \
-             publish into it once T90 lands"
+            "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+             daemon running directly on this machine ({who}), so no box in the VM can be given \
+             an address; run `min finalize-install` to install Minimal's DNS service on that \
+             port instead"
         )
     } else {
         format!(
-            "the zone answerer's hook port 127.0.0.1:{port} is held by {who}, which has no \
-             answerer channel, so no box can be handed an address: free port {port} or set \
-             the hook port"
+            "port 127.0.0.1:{port}, which box names are answered on, is in use by {who}, so no \
+             box in the VM can be given an address; free the port, then try again"
         )
     }
 }
 
 /// Why a box cannot be handed an address while this daemon reaches no
 /// answerer.
-const NO_ANSWERER: &str = "this VM host daemon reaches no zone answerer to hand the box an \
-                           address (see the zone-answerer lines in its log); box addresses \
-                           are allocated host-wide by the answerer, never by the node";
+const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for box names, so \
+                           this box cannot be given an address; run `min finalize-install --show` \
+                           to check the service's setup, or see minvmd.log for the cause (`min \
+                           dirs` shows where logs are kept)";
 
 /// The answer to a release or a cancel: whether it changed anything, and
-/// the sentence the daemon logged for it.
+/// a sentence saying what the daemon did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseReply {
     /// Whether the request changed anything.
@@ -2674,7 +2746,11 @@ impl AnswererStatus {
         reply
             .recv_timeout(RELEASE_WINDOW + RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
-                Err("the zone answerer did not hand out an address in time".to_string())
+                Err(
+                    "Minimal's DNS service for box names did not give this box an address in \
+                     time; try again"
+                        .to_string(),
+                )
             })
     }
 
@@ -2756,7 +2832,7 @@ impl AnswererStatus {
     ) -> ReleaseReply {
         if !self.0.hosting.load(Ordering::SeqCst) {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon hosts no interim answerer; {nothing}"
+                "the running VM is not answering box names itself; {nothing}"
             ));
         }
         let sender = self
@@ -2767,19 +2843,19 @@ impl AnswererStatus {
             .clone();
         let Some(sender) = sender else {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon's answerer is not running; {nothing}"
+                "the running VM is not answering box names right now; {nothing}"
             ));
         };
         let (reply_to, reply) = std::sync::mpsc::channel();
         if sender.send(command(reply_to)).is_err() {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon's answerer is not running; {nothing}"
+                "the running VM is not answering box names right now; {nothing}"
             ));
         }
         reply
             .recv_timeout(RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
-                ReleaseReply::no_op("the zone answerer did not answer the request in time")
+                ReleaseReply::no_op("the running VM did not answer the request in time")
             })
     }
 }
@@ -3220,8 +3296,8 @@ fn acquire(
             }
             Err(error) => {
                 let why = format!(
-                    "could not bind the zone answerer's hook port 127.0.0.1:{port}: {error}; \
-                     free port {port} or set the hook port"
+                    "could not listen on 127.0.0.1:{port}, which box names are answered on: \
+                     {error}; free the port, then try again"
                 );
                 surface_error(status, port, &mut erroring, &why);
                 wait_refusing(&pings, &commands, PORT_RECHECK, &why);
@@ -3358,7 +3434,7 @@ fn host_interim(
         };
         if let Some(reply_to) = rebound.take() {
             let _ = reply_to.send(ReleaseReply::acted(format!(
-                "re-bound the interim answerer at 127.0.0.1:{port}"
+                "the running VM is answering box names on 127.0.0.1:{port} again"
             )));
         }
         // ── hosting: wait for a release.
@@ -3367,7 +3443,7 @@ fn host_interim(
                 Ok(HandoverCommand::Release(reply_to)) => break reply_to,
                 Ok(HandoverCommand::Cancel(reply_to)) => {
                     let _ = reply_to.send(ReleaseReply::no_op(
-                        "no release is pending; the interim answerer is serving",
+                        "no handover is in progress; the running VM is answering box names",
                     ));
                 }
                 // The interim is the answerer: its own boxes are handed
@@ -3401,7 +3477,11 @@ fn host_interim(
             paths.global.display()
         );
         tracing::info!(component = COMPONENT, port, "{detail}");
-        let _ = release.send(ReleaseReply::acted(detail));
+        let _ = release.send(ReleaseReply::acted(format!(
+            "the running VM stopped answering box names on 127.0.0.1:{port} so Minimal's DNS \
+             service can take over; it resumes after {} s if the handover has not finished",
+            paths.release_window.as_secs()
+        )));
         // ── the window: the service's channel, a cancel, or the bound.
         let deadline = Instant::now() + paths.release_window;
         // Box address requests that arrive mid-handover wait for the
@@ -3413,7 +3493,7 @@ fn host_interim(
                 Ok(HandoverCommand::Cancel(reply_to)) => break WindowEnd::Cancelled(reply_to),
                 Ok(HandoverCommand::Release(reply_to)) => {
                     let _ = reply_to.send(ReleaseReply::no_op(
-                        "the interim answerer is already released",
+                        "the running VM already stopped answering box names",
                     ));
                 }
                 Ok(
@@ -3464,15 +3544,17 @@ fn host_interim(
         for command in queued {
             refuse_command(
                 command,
-                "answerer handover did not complete: the answerer service's channel did not \
-                 answer within the release window",
+                "the handover of box names to Minimal's DNS service did not finish, so this \
+                 box was not given an address; try again",
             );
         }
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(bound) => socket = bound,
             Err(error) => {
-                let detail =
-                    format!("could not re-bind the interim answerer at 127.0.0.1:{port}: {error}");
+                let detail = format!(
+                    "the running VM could not resume answering box names on \
+                     127.0.0.1:{port}: {error}"
+                );
                 tracing::warn!(component = COMPONENT, port, "{detail}");
                 if let Some(reply_to) = rebound.take() {
                     let _ = reply_to.send(ReleaseReply::no_op(detail));
@@ -3806,6 +3888,7 @@ mod tests {
             name: format!("{name}.{}", zone_answer::ZONE_APEX),
             address: Some(address),
             live: true,
+            address_only: false,
         }
     }
 
@@ -3878,6 +3961,38 @@ mod tests {
                 "{what}: the status never read {wanted:?} within 10 s"
             );
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The tests that take [`FOREIGN_REFUSALS_IN_FLIGHT`]'s slots — every
+    /// test that drives the gate with a foreign uid, and the one that sets
+    /// the count by hand — run one at a time: the count is process-global,
+    /// so a parallel burst would close another test's peer bare, or a
+    /// hand-set count would underflow under a live refusal's release.
+    static REFUSAL_SLOTS: Mutex<()> = Mutex::new(());
+
+    /// A test's exclusive hold on the refusal slots: taken once every
+    /// slot is free, and released only once every refusal the test caused
+    /// has ended, so the next holder starts from a count of zero.
+    struct RefusalSlotsHeld(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    fn hold_refusal_slots() -> RefusalSlotsHeld {
+        let guard = REFUSAL_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        await_refusal_slots_free();
+        RefusalSlotsHeld(guard)
+    }
+
+    impl Drop for RefusalSlotsHeld {
+        fn drop(&mut self) {
+            await_refusal_slots_free();
+        }
+    }
+
+    /// Waits, bounded, for every refusal thread to release its slot.
+    fn await_refusal_slots_free() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while FOREIGN_REFUSALS_IN_FLIGHT.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -4094,11 +4209,13 @@ mod tests {
                         name: "lease.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(100, 64, 0, 10)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
+                        address_only: false,
                     },
                 ],
             );
@@ -4186,16 +4303,19 @@ mod tests {
                         name: "web.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 99)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "host.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 98)),
                         live: true,
+                        address_only: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
+                        address_only: false,
                     },
                 ],
             );
@@ -4436,6 +4556,137 @@ mod tests {
             second_web,
             "the second daemon's own registration keeps its box name answering"
         );
+    }
+
+    /// A dormant creation keeps its loopback in the answerer's zone view —
+    /// a daemon restarted after the creation detached still claims the
+    /// address its earlier run handed out, and a fresh box's name draws an
+    /// address other than the dormant one — because the creation's resume
+    /// would otherwise hand its address to a second box.
+    #[test]
+    fn a_dormant_creation_keeps_its_loopback_in_the_zone_view() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "web".into(),
+                ingress_ports: vec![],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.row_by_name("web").is_none(), "the row is gone");
+
+        let rows = zone_rows(&registry);
+        assert!(rows.contains(&RegisteredRow {
+            name: box_zone_name("web"),
+            address: Some(web.loopback_addr()),
+            live: false,
+            address_only: true,
+        }));
+        let registered = RegisteredTables::new();
+        registered.claim_own("a-node", &rows);
+        assert_eq!(
+            registered.allocate("a-node", &box_zone_name("web")),
+            Ok(web.loopback_addr()),
+            "the dormant creation's address is claimed for its own name"
+        );
+        let peer = registered
+            .allocate("a-node", &box_zone_name("peer"))
+            .expect("a fresh name draws an address");
+        assert_ne!(peer, web.loopback_addr());
+    }
+
+    /// A dormant creation's row claims its address and holds no name, so a
+    /// name hold with no address does not stop the claim, and a row that
+    /// already carries the address stops it: two rows on one loopback
+    /// address would each answer for it.
+    #[test]
+    fn a_dormant_creation_claims_only_an_address_no_row_carries() {
+        let registry = BoxRegistry::new(SUBNET);
+        let spec = |name: &str| crate::box_registry::ClientBoxSpec {
+            name: name.into(),
+            ingress_ports: vec![],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let web = registry
+            .register_client_box(spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        registry.hold_box_name("web", None);
+        let dormant = RegisteredRow {
+            name: box_zone_name("web"),
+            address: Some(web.loopback_addr()),
+            live: false,
+            address_only: true,
+        };
+        assert!(
+            zone_rows(&registry).contains(&dormant),
+            "a name hold with no address does not stop the dormant claim"
+        );
+
+        registry
+            .register_client_box_at(spec("peer"), web.loopback_addr())
+            .expect("a fresh box takes the dormant creation's address");
+        let rows = zone_rows(&registry);
+        assert!(
+            !rows.contains(&dormant),
+            "a row that carries the address keeps it alone: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.address == Some(web.loopback_addr()))
+                .count(),
+            1
+        );
+    }
+
+    /// A dormant creation's address-only row never takes a name from
+    /// another node's live box: at publish time the live row is accepted
+    /// under the name, and the zone answers it with the live box's
+    /// address. The dormant address stays claimed against the other node.
+    #[test]
+    fn an_address_only_row_wins_no_name_against_a_live_box() {
+        let registered = RegisteredTables::new();
+        let dormant = Ipv4Addr::new(127, 0, 64, 10);
+        let live = Ipv4Addr::new(127, 0, 64, 11);
+        let first = registered.install_validated(
+            1,
+            "a-node",
+            vec![RegisteredRow {
+                name: "web.min.internal".to_string(),
+                address: Some(dormant),
+                live: false,
+                address_only: true,
+            }],
+            &[],
+        );
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        let second = registered.install_validated(
+            2,
+            "b-node",
+            vec![published_row("web", live), published_row("api", dormant)],
+            &[],
+        );
+        assert_eq!(
+            second.held,
+            vec![published_row("web", live)],
+            "the live box keeps its name; the dormant address is not handed on"
+        );
+
+        let answerer = HostAnswerer::new(BoxRegistry::new(SUBNET), Arc::new(registered));
+        let view = answerer.zone_view();
+        let held: Vec<_> = view
+            .rows()
+            .filter(|(name, _)| *name == "web.min.internal")
+            .map(|(_, row)| row.address)
+            .collect();
+        assert_eq!(held, vec![Some(live)], "the zone answers the live box");
     }
 
     /// A port held by a process with no channel — a native minimald, a
@@ -4744,6 +4995,7 @@ mod tests {
     /// answers at a glance.
     #[test]
     fn answerer_channel_refuses_foreign_uid() {
+        let _slots = hold_refusal_slots();
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
         let channel = dir.path().join(CHANNEL_SOCK_FILE);
         let listener = UnixListener::bind(&channel).expect("the channel binds");
@@ -4824,6 +5076,124 @@ mod tests {
             .expect("the gate's thread ends when its stop is set");
     }
 
+    /// A channel socket whose mode refuses the connect itself (the
+    /// owner-only socket of another account's service) is said in a plain
+    /// sentence, the gate's own, never a bare `Permission denied`.
+    #[test]
+    fn a_connect_the_socket_mode_refuses_names_the_other_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid only reads the process's own uid.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root connects through any mode; there is no refusal to see.
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let _listener = UnixListener::bind(&channel).expect("the channel binds");
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o000))
+            .expect("the channel's mode is set");
+        let Err(refused) = connect_and_publish(&channel, "vm-a", Vec::new()) else {
+            panic!("a connect the socket's mode refuses never publishes");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
+    }
+
+    /// A burst of foreign connects is one line's worth of news: every
+    /// peer is refused, but the warns naming them are capped at a few
+    /// per second, so a connect storm cannot flood the service's log.
+    #[test]
+    fn foreign_refusal_warns_are_rate_limited() {
+        let _slots = hold_refusal_slots();
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        let registered = Arc::new(RegisteredTables::new());
+        let tables = Arc::clone(&registered);
+        // SAFETY: geteuid only reads the process's own uid; the xor flips
+        // the low bit, so this test's connects are foreign.
+        let expected_uid = unsafe { libc::geteuid() } ^ 1;
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-warn-rate".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                serve_channel(
+                    listener,
+                    registered,
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the gate's thread spawns");
+
+        // A burst inside one window: far more foreign connects than the
+        // warn rate. The connects are made in parallel so they are
+        // accepted back-to-back, inside the window, rather than one per
+        // accept-poll slice apart; past the in-flight cap the later ones
+        // are closed bare (that cap is the other test's proof), but none
+        // is served.
+        let connects = std::thread::scope(|scope| {
+            (0..(FOREIGN_WARN_RATE_PER_SECOND * 4))
+                .map(|_| {
+                    scope.spawn(|| {
+                        connect_and_publish(
+                            &channel,
+                            "vm-a",
+                            vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|joined| joined.join().expect("the connect's thread ends"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            connects.iter().all(|connect| connect.is_err()),
+            "every foreign peer of the burst is refused, none served"
+        );
+        assert!(tables.is_empty(), "none of the burst's rows were ever held");
+
+        // The warns are capped at the rate, and there were enough
+        // refusals to prove the cap bit: a rate's worth of lines per
+        // window, not one per peer. The scope joined every connect, and
+        // the accept loop writes each warn before the refusal it names,
+        // so by the time one warn is visible they have all been written.
+        await_log(
+            &buf,
+            |line| line.contains("refused an answerer channel connection from a foreign uid"),
+            "the gate never warned about the foreign peers",
+        );
+        let warns = buf
+            .contents()
+            .lines()
+            .filter(|line| {
+                line.contains("refused an answerer channel connection from a foreign uid")
+            })
+            .count();
+        // A loaded runner can spread the burst over a second window, so
+        // the bound is two windows' worth — still fewer lines than peers.
+        assert!(
+            (1..=FOREIGN_WARN_RATE_PER_SECOND * 2).contains(&warns),
+            "a burst is capped at the warn rate, not one line per peer: {warns}"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the gate's thread ends when its stop is set");
+    }
+
     /// A node whose hello reaches the channel after the connect is accepted
     /// is still served: the accepted connection blocks on its bounded hello
     /// read rather than inheriting the poll-mode listener's O_NONBLOCK (the
@@ -4882,6 +5252,7 @@ mod tests {
 
     #[test]
     fn foreign_refusals_past_the_cap_close_bare() {
+        let _slots = hold_refusal_slots();
         // Every refusal slot taken: the next foreign peer is closed without
         // a thread or a reply, and the count is left as it was.
         FOREIGN_REFUSALS_IN_FLIGHT.store(FOREIGN_REFUSALS_MAX, Ordering::SeqCst);
@@ -5643,7 +6014,7 @@ mod tests {
             .allocate_at("node-b", "late", t0 + Duration::from_secs(10))
             .expect_err("nothing is free outside the quarantine");
         assert!(
-            refused.contains("released less than 15 s ago") && refused.contains("frees in 5 s"),
+            refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
@@ -5910,7 +6281,9 @@ mod tests {
         let refused = prepare_interim_dir(&wide.join(INTERIM_CHANNEL_SOCK_FILE))
             .expect_err("a dir open to others is refused");
         assert!(
-            refused.to_string().contains("refusing to bind"),
+            refused
+                .to_string()
+                .contains("will not create its socket there"),
             "{refused}"
         );
     }
@@ -6075,6 +6448,12 @@ mod tests {
         std::fs::write(&paths.marker, b"").expect("the marker is written");
         let reply = status.release();
         assert!(reply.acted, "the hosting daemon releases: {reply:?}");
+        assert!(
+            reply.detail.contains("stopped answering box names")
+                && !reply.detail.contains("interim answerer"),
+            "the reply is the user's sentence, not the logged one: {}",
+            reply.detail
+        );
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
             .expect("the port is free once the release is answered");
         assert!(!paths.interim.exists(), "the interim's channel is retired");
@@ -6190,13 +6569,13 @@ mod tests {
             "the error names the holder's pid: {refused}"
         );
         assert!(
-            refused.contains(&format!("free port {port} or set the hook port")),
+            refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
         // The native remedy, for a minimald holder.
         let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
         assert!(
-            native.contains("install the answerer service (min session start prints the command)")
+            native.contains("run `min finalize-install` to install Minimal's DNS service")
                 && native.contains("pid 42"),
             "{native}"
         );
@@ -6264,7 +6643,9 @@ mod tests {
         let reply = status.release_cancel();
         assert!(reply.acted, "the cancel re-binds: {reply:?}");
         assert!(
-            reply.detail.contains("re-bound"),
+            reply
+                .detail
+                .contains(&format!("is answering box names on 127.0.0.1:{port} again")),
             "and says so: {}",
             reply.detail
         );

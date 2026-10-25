@@ -21,7 +21,7 @@ pub enum Error {
     BuildFailed(String, #[source] op::Error),
     /// A generic error occurred during the setup or execution of a sandbox.
     #[error("sandbox error: {0}")]
-    Sandbox(#[from] sandbox2::Error),
+    Sandbox(#[from] sandbox::Error),
     /// Other errors.
     #[error("other: {0}")]
     Other(anyhow::Error),

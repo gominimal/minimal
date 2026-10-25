@@ -31,7 +31,7 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 const BOOT_MARKER_PORT: u32 = 7350;
 
 /// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
-/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// devpts is capped at [`sandbox::config::BOX_PTY_MAX`] by its own remount,
 /// but every instance still draws from the one kernel-wide counter, so the
 /// pool must be large enough for several boxes at their cap plus the session
 /// host's own shells. 65536 is a working value.
@@ -101,11 +101,11 @@ pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL
 /// operator set the opt-out on the host, and the guest daemon runs the egress
 /// default its host was started with. Truthy like the host's reader
 /// (`1`/`true`/`yes`/`on`, case-insensitive) through the one parse both
-/// sides share ([`sessions::egress_deny_all_opt_out_from_raw`]); an absent
+/// sides share ([`boxes::egress_deny_all_opt_out_from_raw`]); an absent
 /// token — an older minvmd, a native run — or any other value is `false`,
 /// the egress default.
 pub fn handed_egress_deny_all_opt_out() -> bool {
-    sessions::egress_deny_all_opt_out_from_raw(
+    boxes::egress_deny_all_opt_out_from_raw(
         std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN)
             .ok()
             .as_deref(),
@@ -433,7 +433,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // ran unenforced here would speak with the VM's address and no verdict at
     // all (design §7.1). Boot still continues — the daemon keeps serving the
     // modes that need no classification — but the failure is logged at error
-    // level with the consequence named, and `session_host` refuses a
+    // level with the consequence named, and `box_runtime` refuses a
     // host-address session on it.
     let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
     if let Err(e) = std::fs::create_dir_all(&cgroup2) {
@@ -471,7 +471,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // the question is about.
     let mountinfo =
         std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
-    let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
+    let delegated = sandbox::classifier::host_cgroup2_mounts(&mountinfo)
         .into_iter()
         .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
     match (failure, delegated) {

@@ -1164,7 +1164,9 @@ fn serve_held_registration(
         write_reply(
             stream,
             &BoxControlReply::Error {
-                error: format!("the VM host daemon could not hold the registration: {error}"),
+                error: format!(
+                    "the VM host daemon could not keep the registration connection open: {error}"
+                ),
             },
         )
     };
@@ -1227,7 +1229,9 @@ fn hold_registration_lease(
             if let Err(write_error) = write_reply(
                 &mut stream,
                 &BoxControlReply::Error {
-                    error: format!("the VM host daemon could not hold the registration: {error}"),
+                    error: format!(
+                        "the VM host daemon could not keep the registration connection open: {error}"
+                    ),
                 },
             ) {
                 tracing::debug!(error = %write_error, "could not write the lease refusal");
@@ -1332,7 +1336,7 @@ fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
 /// decision half of the connection's peer check, apart from the socket.
-fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+pub(crate) fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
     if peer_uid == my_uid {
@@ -1366,7 +1370,7 @@ fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -1391,7 +1395,7 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
     // SAFETY: getpeereid reads the peer's effective uid and gid from the
@@ -1557,7 +1561,7 @@ fn allocate_box_address(
             "box registration refused: the zone answerer handed out no address"
         );
         BoxControlReply::Error {
-            error: format!("the zone answerer could not allocate a box address: {reason}"),
+            error: format!("could not give the box an address: {reason}"),
         }
     })
 }
@@ -1627,7 +1631,7 @@ fn withdraw_box(
 fn hold_box_name(
     boxes: &BoxRegistry,
     name: &str,
-    session_id: Option<sessions::SessionId>,
+    session_id: Option<boxes::SessionId>,
 ) -> BoxControlReply {
     boxes.hold_box_name(name, session_id);
     BoxControlReply::NameHeld {
@@ -1643,7 +1647,7 @@ fn hold_box_name(
 fn release_box_name(
     boxes: &BoxRegistry,
     name: &str,
-    session_id: Option<sessions::SessionId>,
+    session_id: Option<boxes::SessionId>,
 ) -> BoxControlReply {
     boxes.release_held_name(name, session_id);
     BoxControlReply::NameHeld {
@@ -1754,7 +1758,7 @@ fn withdraw_report(boxes: &BoxRegistry, request: &WithdrawPortRequest) -> BoxCon
 
 /// Serve the read-only row verb (NET-138): the live row the asked-for name
 /// resolves to under the alias rule — the name is matched in its canonical
-/// form ([`crate::net::answerer::canonical_box_name`]), and liveness is
+/// form ([`crate::box_registry::canonical_box_name`]), and liveness is
 /// the table's own fact ([`BoxRegistry::row_by_name`]) — answered with its
 /// switch address, its derived egress allow-list, and its declared and
 /// runtime-admitted ports. A name no live box holds answers the no-row
@@ -1910,7 +1914,9 @@ fn spawn_ask_thread(
             write_reply(
                 &mut stream,
                 &BoxControlReply::Error {
-                    error: format!("the VM host daemon could not serve the ask verb: {error}"),
+                    error: format!(
+                        "the VM host daemon could not start handling the port prompt: {error}"
+                    ),
                 },
             )
         }
@@ -2140,12 +2146,26 @@ fn refuse_past_cap(
             "refused a connection past the VM host daemon's cap"
         );
     }
+    // The kind in the words a person reads; the log lines keep the daemon's.
+    // A cap of one reads in the singular.
+    let noun = if cap == 1 {
+        "connection"
+    } else {
+        "connections"
+    };
+    let connections = match kind {
+        "guest ask" => format!("port prompt {noun}"),
+        "ask subscription" => format!("{noun} waiting for port prompts"),
+        "registration lease" => format!("box registration {noun}"),
+        // A kind with no phrase of its own reads under the daemon's word.
+        other => format!("{other} {noun}"),
+    };
     write_reply(
         stream,
         &BoxControlReply::Error {
             error: format!(
-                "the VM host daemon is already serving {cap} {kind} connections; try again \
-                 once one ends"
+                "the VM host daemon is at its limit of {cap} {connections}; try again once one \
+                 ends"
             ),
         },
     )
@@ -2335,6 +2355,9 @@ pub fn die_by_received_stop_signal() {
 /// the one path that must end the process. The log is already flushed.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn die_by_signal(signum: libc::c_int) -> ! {
+    // the spans and records of the stop export first (bounded; a no-op when
+    // telemetry is off), then the log
+    mlog::otel::shutdown(std::time::Duration::from_secs(2));
     flush_log();
     // SAFETY: restoring the default disposition, signalling this process and
     // exiting it touch no memory; the default action of SIGTERM and SIGINT
@@ -2482,7 +2505,7 @@ fn serve_ask_subscription(
             &mut stream,
             &BoxControlReply::Error {
                 error: format!(
-                    "no live box row holds box id {}; there are no asks to subscribe to",
+                    "no running box has id {}, so there are no port prompts to wait for",
                     crate::bep_attach::BoxIdText(&box_id)
                 ),
             },
@@ -2608,7 +2631,9 @@ fn record_ask_answer(
             );
             audit_ask(audit_path, AskAudit::new("refused_unknown_id", ask_id));
             BoxControlReply::Error {
-                error: format!("no pending or recently ended ask holds id {ask_id}"),
+                error: format!(
+                    "port prompt {ask_id} is not pending and did not end recently; nothing was changed"
+                ),
             }
         }
     }
@@ -2751,7 +2776,11 @@ impl AskAudit {
     /// The host row's facts, when there are any.
     fn with_facts(mut self, facts: Option<&crate::box_registry::AskFacts>) -> Self {
         if let Some(facts) = facts {
-            self.box_id = Some(crate::bep_attach::BoxIdText(&facts.box_id).to_string());
+            // An audit record spells the box id as 32 lowercase hex, the
+            // form `bep::listener::box_id_text` gives every BEP audit
+            // `subject` and older `box-admissions.log` lines carry. Log
+            // lines keep the hyphenated `BoxIdText`.
+            self.box_id = Some(minimald_rpc::BoxId::from_bytes(facts.box_id).simple());
             self.box_name = Some(facts.name.clone());
             self.switch_address = Some(facts.switch_address);
             self.port = Some(facts.port);
@@ -3046,8 +3075,8 @@ mod tests {
                 &RegisterBoxRequest {
                     name: "web".to_string(),
                     ingress_ports: vec![8080, 9090],
-                    egress: Some(sessions::EgressPolicy {
-                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    egress: Some(boxes::EgressPolicy {
+                        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                         allow_dns_hosts: None,
                         deny_subnets: None,
@@ -3191,8 +3220,8 @@ mod tests {
             .register_client_box(ClientBoxSpec {
                 name: "web".to_string(),
                 ingress_ports: vec![8080],
-                egress: Some(sessions::EgressPolicy {
-                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                egress: Some(boxes::EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     deny_subnets: None,
@@ -3218,10 +3247,10 @@ mod tests {
             [10, 0, 0, 1],
             80,
         );
-        let summary = sessions::core::egress::summarize(&frame);
-        let verdict = sessions::core::egress::verdict(&summary, row.egress());
+        let summary = boxes::core::egress::summarize(&frame);
+        let verdict = boxes::core::egress::verdict(&summary, row.egress());
         assert!(
-            matches!(verdict, sessions::core::egress::FrameVerdict::Admit),
+            matches!(verdict, boxes::core::egress::FrameVerdict::Admit),
             "the compiled policy admits what the declaration allows, got {verdict:?}"
         );
         let outside = crate::net::egress_gate::test_support::ipv4_frame(
@@ -3230,11 +3259,11 @@ mod tests {
             [203, 0, 113, 7],
             443,
         );
-        let outside_summary = sessions::core::egress::summarize(&outside);
+        let outside_summary = boxes::core::egress::summarize(&outside);
         assert!(
             matches!(
-                sessions::core::egress::verdict(&outside_summary, row.egress()),
-                sessions::core::egress::FrameVerdict::Drop(_)
+                boxes::core::egress::verdict(&outside_summary, row.egress()),
+                boxes::core::egress::FrameVerdict::Drop(_)
             ),
             "the compiled policy drops what the declaration does not allow"
         );
@@ -3354,8 +3383,8 @@ mod tests {
                 &RegisterBoxRequest {
                     name: "web".to_string(),
                     ingress_ports: vec![8080],
-                    egress: Some(sessions::EgressPolicy {
-                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    egress: Some(boxes::EgressPolicy {
+                        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                         allow_dns_hosts: None,
                         deny_subnets: None,
@@ -3476,8 +3505,8 @@ mod tests {
                 &RegisterBoxRequest {
                     name: "db".to_string(),
                     ingress_ports: Vec::new(),
-                    egress: Some(sessions::EgressPolicy {
-                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    egress: Some(boxes::EgressPolicy {
+                        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                         allow_dns_hosts: None,
                         deny_subnets: None,
@@ -3788,7 +3817,7 @@ mod tests {
         );
         assert_eq!(
             held_row(&registry),
-            Some(sessions::core::zone_answer::ZoneRow {
+            Some(boxes::core::zone_answer::ZoneRow {
                 address: None,
                 live: true,
             }),
@@ -3831,9 +3860,9 @@ mod tests {
         let (sock_path, _server, registry, _answerer, _proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
         let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
-        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let owner = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let other = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
         let in_zone = |name: &str| {
             registry
@@ -3897,9 +3926,9 @@ mod tests {
         use crate::box_registry::{HELD_NAME_RECONFIRM_BOUND, REGISTRY_FILE};
         let dir = tempfile::TempDir::new().expect("temp dir");
         let registry_file = dir.path().join(REGISTRY_FILE);
-        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+        let gone = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
-        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+        let live = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
             .expect("a session id");
         let before = BoxRegistry::new(SUBNET).persisting_to(registry_file.clone());
         assert!(before.hold_box_name("old", Some(gone)));
@@ -4308,14 +4337,14 @@ mod tests {
                 &RegisterBoxRequest {
                     name: "web".to_string(),
                     ingress_ports: vec![8080, 9090],
-                    egress: Some(sessions::EgressPolicy {
-                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    egress: Some(boxes::EgressPolicy {
+                        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
                         allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                         allow_dns_hosts: None,
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
-                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
@@ -4331,7 +4360,7 @@ mod tests {
             &BoxControlRequest::AdmitPort(AdmitPortRequest {
                 switch_address: web.switch_address,
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Expose,
             }),
         )
@@ -4341,7 +4370,7 @@ mod tests {
                 recorded,
                 BoxControlReply::PortRecorded {
                     port: 3000,
-                    proto: sessions::IpProto::Tcp
+                    proto: boxes::IpProto::Tcp
                 }
             ),
             "a report within the grant is answered with the recorded port, got {recorded:?}"
@@ -4426,7 +4455,7 @@ mod tests {
             &AdmitPortRequest {
                 switch_address: record.switch_addr(),
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Expose,
             },
         );
@@ -4606,7 +4635,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
@@ -4636,7 +4665,7 @@ mod tests {
             &BoxControlRequest::AdmitPort(AdmitPortRequest {
                 switch_address: web.switch_address,
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Listen,
             }),
         )
@@ -4820,7 +4849,7 @@ mod tests {
                         ingress_ports: Vec::new(),
                         egress: None,
                         credentialed_upstream: None,
-                        dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+                        dynamic_ingress: Some(boxes::DynamicIngress::Ask),
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
                         task_slots: 0,
@@ -4928,7 +4957,7 @@ mod tests {
             &BoxControlRequest::AdmitAsk(AdmitAskRequest {
                 switch_address: web.switch_address,
                 port,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
             }),
         )
     }
@@ -4983,7 +5012,7 @@ mod tests {
             AskAdmitOutcome::Admitted {
                 ask_id: offer.ask_id,
                 port: ASK_PORT,
-                proto: sessions::IpProto::Tcp
+                proto: boxes::IpProto::Tcp
             }
         );
         assert_eq!(host.runtime_ports("web"), vec![ASK_PORT]);
@@ -5001,7 +5030,7 @@ mod tests {
             &BoxControlRequest::AdmitPort(AdmitPortRequest {
                 switch_address: web.switch_address,
                 port: ASK_PORT,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Ask,
             }),
         )
@@ -5377,7 +5406,7 @@ mod tests {
                 "the audit records {outcome}: {audit}"
             );
         }
-        let box_id = format!(r#""box_id":"{}""#, web.box_id);
+        let box_id = format!(r#""box_id":"{}""#, web.box_id.simple());
         for line in audit
             .lines()
             .filter(|line| !line.contains("refused_unknown_id"))
@@ -5441,7 +5470,7 @@ mod tests {
             BoxControlReply::AskAlreadyEnded {
                 ask_id: offer.ask_id,
                 port: ASK_PORT,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 already_ended: minimald_rpc::AskLateEnd::Denied,
             }
         );
@@ -5569,7 +5598,7 @@ mod tests {
         let mut past = guest_ask(&host, &web, ASK_PORT + 2);
         let refused_ask = past.next();
         assert!(
-            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("2 guest ask")),
+            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("limit of 2 port prompt connections")),
             "the third guest ask is refused at the cap: {refused_ask:?}"
         );
         assert_eq!(
@@ -5584,7 +5613,7 @@ mod tests {
         );
         let refused_sub = second.next();
         assert!(
-            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("1 ask subscription")),
+            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connection waiting for port prompts;")),
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
@@ -5680,7 +5709,7 @@ mod tests {
         let refused =
             control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
         assert!(
-            matches!(&refused, BoxControlReply::Error { error } if error.contains("1 control")),
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 control connection;")),
             "a connection past the cap is refused: {refused:?}"
         );
 
@@ -5710,13 +5739,13 @@ mod tests {
             AdmitPortRequest {
                 switch_address: web.switch_address,
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Expose,
             },
             WithdrawPortRequest {
                 switch_address: web.switch_address,
                 port: 3000,
-                proto: sessions::IpProto::Tcp,
+                proto: boxes::IpProto::Tcp,
                 source: PortReportSource::Expose,
             },
         )
@@ -5732,7 +5761,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
@@ -6365,7 +6394,7 @@ mod tests {
         let (_second, refused) = register_holding(&host.sock_path, "db");
         match &refused {
             BoxControlReply::Error { error } => assert!(
-                error.contains("already serving 1 registration lease connections"),
+                error.contains("limit of 1 box registration connection;"),
                 "the refusal names the cap, got {error}"
             ),
             other => panic!("a lease past the cap is refused, got {other:?}"),
@@ -6375,5 +6404,27 @@ mod tests {
             "a refused lease publishes no row"
         );
         host.register_live("api");
+    }
+
+    /// An ask audit line spells the row's box id as 32 lowercase hex: the
+    /// spelling of every BEP audit `subject`, never the hyphenated
+    /// log-line form.
+    #[test]
+    fn ask_audit_line_spells_box_id_as_32_hex() {
+        let box_id: crate::bep_attach::BoxId = [
+            0x01, 0x9a, 0x2b, 0x3c, 0x4d, 0x5e, 0x7f, 0x60, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6,
+            0xe7, 0xf8,
+        ];
+        let facts = crate::box_registry::AskFacts {
+            name: "web".to_owned(),
+            box_id,
+            switch_address: Ipv4Addr::new(10, 0, 2, 5),
+            port: 8080,
+            proto: IpProto::Tcp,
+        };
+        let line = AskAudit::new("offered", minimald_rpc::AskId::from_bytes([9; 16]))
+            .with_facts(Some(&facts));
+        let json = serde_json::to_value(&line).expect("serialise the ask audit line");
+        assert_eq!(json["box_id"], "019a2b3c4d5e7f608192a3b4c5d6e7f8");
     }
 }

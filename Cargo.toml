@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/args",
+    "crates/bep",
     "crates/async-dialog",
     "crates/lcache",
     "crates/rcache",
@@ -19,7 +20,6 @@ members = [
     "crates/mip",
     "crates/minimal",
     "crates/minimal-client",
-    "crates/minimal-tui",
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
@@ -27,8 +27,8 @@ members = [
     "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
-    "crates/sandbox2",
-    "crates/sessions",
+    "crates/sandbox",
+    "crates/boxes",
     "crates/stdlib",
     "crates/switch",
     "crates/version",
@@ -71,7 +71,7 @@ package.version = "0.8.0"
 # and should be promoted here as their counts reach zero. Test code is exempt
 # from the panic family in clippy.toml.
 [workspace.lints.rust]
-# The kani proof harnesses (sessions, rcache) are gated on `cfg(kani)`, a
+# The kani proof harnesses (boxes, rcache) are gated on `cfg(kani)`, a
 # custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
 # on the normal (non-kani) builds without every crate repeating the check-cfg.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
@@ -121,6 +121,7 @@ codegen-units = 16
 debug = "line-tables-only"
 
 [workspace.dependencies]
+aes-gcm = "0.11"
 anyhow = "1.0"
 arbitrary = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
@@ -139,6 +140,7 @@ codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep i
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
+crc32c = "0.6"
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "7"
 fd-lock = "4"
@@ -146,6 +148,7 @@ either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
+getrandom = "0.3"
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.15"
 google-cloud-storage = "1.17"
@@ -175,12 +178,20 @@ lzma-rs = "0.3"
 nickel-lang-core = { version = "0.19", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.33"
+# OTLP export (spec 25, telemetry); all opt-in at runtime.
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = "0.34"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.8", features = ["serde"] }
 object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
+p256 = { version = "0.14", features = ["ecdh"] }
 path-absolutize = "4.0"
 rand = "0.10"
 # rand_core 0.6 (not 0.10) to match boringtun/x25519-dalek's RNG traits for
@@ -198,8 +209,9 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
-russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.64", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
+serde_json = { version = "1" }
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
 sha2 = "0.11"
@@ -220,6 +232,9 @@ tempfile = "3.27"
 tokio = { version = "1.53", features = ["full"] }
 tokio-stream = "0.1"
 tokio-vsock = "0.7"
+# The blocking AF_VSOCK stream the guest daemon's telemetry sender writes
+# the host over (`minimald::telemetry_forward`), tokio-vsock's own base.
+vsock = "0.5"
 tokio-util = "0.7"
 toml = "1.1"
 toml_edit = "0.25"
@@ -234,6 +249,7 @@ unicode-width = "0.2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100 = { version = "0.16.2" }
+zeroize = "1"
 zstd = "0.14"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }
@@ -257,7 +273,6 @@ decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }
 mctx = { path = "crates/mctx" }
 minimal-client = { path = "crates/minimal-client" }
-minimal-tui = { path = "crates/minimal-tui" }
 minimald-rpc = { path = "crates/minimald-rpc" }
 mlog = { path = "crates/mlog" }
 mfile = { path = "crates/mfile" }
@@ -267,8 +282,8 @@ orchestrator = { path = "crates/orchestrator" }
 paths = { path = "crates/paths" }
 remote-proto = { path = "crates/remote-proto" }
 remote-client = { path = "crates/remote-client" }
-sandbox2 = { path = "crates/sandbox2" }
-sessions = { path = "crates/sessions" }
+sandbox = { path = "crates/sandbox" }
+boxes = { path = "crates/boxes" }
 switch = { path = "crates/switch" }
 version = { path = "crates/version" }
 

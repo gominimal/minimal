@@ -89,6 +89,8 @@ jobs:
                         # boot the VM on HVF (parity with the KVM lane's filter).
                         - ".minimal/minimal.toml"
                         - ".github/workflows/ci-macos.yml"
+                        # The unit job's crate scope lives in the justfile.
+                        - "justfile"
                         - "scripts/**"
                         # Composite actions this lane's setup runs through — without
                         # these, a composite-only edit would skip this lane and
@@ -120,7 +122,7 @@ jobs:
               # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
               # step below reinstalls the Rust toolchain we actually need. The
               # Android SDK is removed by the next step instead.
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: false
                   remove_dotnet: true
@@ -171,7 +173,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+              uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -180,19 +182,19 @@ jobs:
               # not baked into the rootfs.
               run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio"
             - name: Upload kernel artifact
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: virtio-kernel-aarch64
                   path: ${{ runner.temp }}/vmlinuz
                   if-no-files-found: error
             - name: Upload rootfs artifact
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-rootfs-aarch64
                   path: ${{ runner.temp }}/rootfs.img
                   if-no-files-found: error
             - name: Upload initramfs artifact
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs.cpio
@@ -331,28 +333,50 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
+            - name: Reap VM processes an earlier run left on the runner
+              # The runner persists across jobs, and a run that failed or was
+              # cancelled before the mid-job reap below leaves its testbed
+              # minvmd (and its __krun-vmm child) and gvproxy running. They
+              # hold the host proxy ports, so every later run failed at the
+              # first boot with `hostname proxy port 7654 held by pid … (gvproxy)`
+              # or `port 127.0.0.1:7656 … is in use by pid … (minvmd)` (#2456).
+              # `--root "$RUNNER_TEMP"` scopes the match there: every leftover
+              # runs from it (testbed/bin/minvmd, the harness's minimal-gvproxy/
+              # and the CLI e2e's gvproxy), so nothing else on the mini is hit.
+              # Then fail fast, naming the holder, if a port is still taken.
+              run: |
+                  scripts/reap-vms.sh --root "$RUNNER_TEMP"
+                  sleep 1
+                  held=0
+                  for port in 7654 7656; do
+                      if pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); then
+                          echo "::error::port $port is still held after the reap: $(ps -o pid=,command= -p "$(printf '%s\n' "$pids" | paste -sd, -)")"
+                          held=1
+                      fi
+                  done
+                  exit "$held"
             - name: Download virtio-linux kernel
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: virtio-kernel-aarch64
                   path: ${{ runner.temp }}/kernel
             - name: Download minvmd-rootfs image
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-rootfs-aarch64
                   path: ${{ runner.temp }}/rootfs
             - name: Download guest initramfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
             - name: Download darwin testbed
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+              uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -407,9 +431,9 @@ jobs:
               # Run every full-boot harness the archive carries by the `_integration`
               # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
               # (Linux-only; empty here) and minus krun_smoke_integration (the kernel-less
-              # FFI smoke run above; the sessions unit binaries the archive also
-              # carries don't match the filterset — their tier ran on the hosted
-              # `unit` job). Currently boot_integration, minimald_session_integration,
+              # FFI smoke run above; the other unit binaries the archive also
+              # carries (the justfile's darwin `scope`) don't match the
+              # filterset — their tier ran on the hosted `unit` job). Currently boot_integration, minimald_session_integration,
               # and volume_quiesce_integration; a new *_integration.rs joins with no yaml. Each
               # boots the GENERIC upstream rootfs with minimald as the initramfs
               # /init and drives the full Stage-2 path (russh client -> bridge ->
@@ -451,6 +475,17 @@ jobs:
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
+            - name: Fetch pinned gvproxy switch binary
+              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
+              # provides the guest's egress (NAT + DNS). Without it minvmd boots
+              # the VM switchless (gvproxy resolution is best-effort and never
+              # errors), so the guest overlay has no other end and every egress —
+              # including the in-guest `pkgs` clone during session mint — dies
+              # with "Could not resolve host". Fetched before the lifecycle step,
+              # which points MINVMD_GVPROXY_BIN here too: every gvproxy this job
+              # starts then runs from $RUNNER_TEMP, where the scoped reaps match
+              # it, and never from a gvproxy installed on the mini (#2456).
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Daemon lifecycle (run --detach → status → stop)
               # Exercises the supervised daemon path (detach, status polling,
               # documented stop semantics) that the integration harnesses and
@@ -464,15 +499,8 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
               run: ./scripts/minvmd-lifecycle.sh
-            - name: Fetch pinned gvproxy switch binary
-              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
-              # provides the guest's egress (NAT + DNS). Without it minvmd boots
-              # the VM switchless (gvproxy resolution is best-effort and never
-              # errors), so the guest overlay has no other end and every egress —
-              # including the in-guest `pkgs` clone during session mint — dies
-              # with "Could not resolve host".
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed
@@ -499,7 +527,7 @@ jobs:
               # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
               # virtio driver in the kernel). Always runs so a red boot is debuggable.
               if: always()
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-boot-logs
                   path: |
@@ -507,6 +535,13 @@ jobs:
                       ${{ runner.temp }}/boot-daemon.log
                       ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
+            - name: Reap this run's VM processes
+              # Always, so a failed or cancelled run does not leave the next
+              # one a held port (#2456). The same $RUNNER_TEMP-scoped reap as
+              # the first step, which stays as the backstop for a runner that
+              # died before reaching this one.
+              if: always()
+              run: scripts/reap-vms.sh --root "$RUNNER_TEMP"
 
     unit:
         # GitHub-hosted Apple Silicon (macos-latest is arm64). minvmd links
@@ -553,13 +588,17 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+              # just too: the test steps below call justfile recipes, so the
+              # crate list lives only in the justfile's `scope` variable.
+              uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
               with:
-                  tool: nextest
+                  tool: nextest,just
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets --locked -- -D warnings
-            - name: Unit tests (minvmd + sessions)
-              # sessions is platform-sensitive surface: std::fs::canonicalize
+            - name: Unit tests (justfile darwin scope)
+              # The crates are the justfile's darwin `scope`; rename or add one
+              # there, not here. The session-types crate is platform-sensitive
+              # surface: std::fs::canonicalize
               # behavior on prefix-symlinked roots (/tmp → /private/tmp on
               # macOS) and the follow_symlinks dual-path policy logic. The
               # `_integration` harnesses are excluded here — they are the
@@ -572,12 +611,10 @@ jobs:
               # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
               # coverage stays the session e2e until minimald's sandbox deps
               # are cfg(linux)-gated.
-              run: |
-                  cargo nextest run -p minvmd -p sessions --locked --profile ci \
-                    --no-tests=fail -E 'not binary(/_integration$/)'
-            - name: Doctests (minvmd + sessions)
+              run: just test --profile ci -E 'not binary(/_integration$/)'
+            - name: Doctests (justfile darwin scope)
               # nextest does not run doctests; same split as core-tests.
-              run: cargo test --doc -p minvmd -p sessions --locked
+              run: just doctest
             - name: Build minvmd + the minimal CLI
               run: |
                   cargo build -p minvmd --bin minvmd --locked
@@ -614,17 +651,17 @@ jobs:
               # test binary, so the mini's harnesses are selected by the
               # `_integration` convention with no per-test list — a new
               # crates/minvmd/tests/*_integration.rs is picked up with no yaml.
+              # The archived crates are the justfile's darwin `scope`.
               run: |
                   set -euo pipefail
                   mkdir -p testbed/bin testbed/lib
-                  cargo nextest archive -p minvmd -p sessions --locked \
-                    --archive-file testbed/nextest-archive.tar.zst
+                  just test-archive testbed/nextest-archive.tar.zst
                   cp target/debug/minvmd testbed/bin/minvmd
                   cp target/debug/min testbed/bin/min
                   cp "$LIBKRUN_PREFIX/libkrun.1.dylib" testbed/lib/libkrun.1.dylib
                   scripts/rewrite-macos-linkage.sh testbed/bin/minvmd
             - name: Upload darwin testbed
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: mac-testbed
                   path: testbed/

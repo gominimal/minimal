@@ -351,7 +351,7 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     loop {
         let (client, peer) = listener.accept().await?;
         let router = router.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             if let Err(error) = handle_connection_io(client, Some(peer), &router).await {
                 tracing::debug!(
                     component = "dns-proxy",
@@ -1441,9 +1441,9 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
 pub(crate) async fn spawn_backend() -> u16 {
     let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = backend.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    crate::traced::spawn(async move {
         while let Ok((mut sock, _)) = backend.accept().await {
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 let mut scratch = [0u8; 1024];
                 let _ = sock.read(&mut scratch).await;
                 let _ = sock
@@ -1476,15 +1476,15 @@ mod tests {
     use std::net::SocketAddrV4;
     use std::sync::{Mutex, RwLock};
 
-    use sessions::core::egress::{self, FrameVerdict};
-    use sessions::{EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId, SessionPolicy};
+    use boxes::core::egress::{self, FrameVerdict};
+    use boxes::{BoxPolicy, EgressPolicy, IngressPolicy, IpProto, PortMapping, SessionId};
     use tokio::net::TcpSocket;
 
     use crate::net::SwitchSubnet;
     use crate::net::dns::DEFAULT_HOST_ID;
     use crate::net::policy::Direction;
     use crate::net::switch::{
-        NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, SessionGate, declared_request_ports,
+        BoxGate, NO_INGRESS_MAPPING_RULE, ProxiedRequest, Refusal, declared_request_ports,
         proxied_request_verdict,
     };
     use crate::test_harness::CaptureWriter;
@@ -1509,7 +1509,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let authority = format!("myservice.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
@@ -1600,7 +1600,7 @@ mod tests {
         let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
         assert!(
@@ -1648,7 +1648,7 @@ mod tests {
         // box's internal listener.
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let routed = proxy_get(proxy_addr, "web.min.internal:18080").await;
         assert!(
@@ -1694,7 +1694,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let refused = proxy_get(proxy_addr, "web.min.internal:9000").await;
         assert!(
@@ -1796,7 +1796,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // Nothing owns the name: a no-route refusal.
         let no_route = proxy_get(proxy_addr, "ghost.min.internal").await;
@@ -2354,7 +2354,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2370,7 +2370,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let request_line = format!("GET http://web.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2407,7 +2407,7 @@ mod tests {
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap();
@@ -2425,7 +2425,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // URI authority is `real.min.internal`, `Host:` header is a different
         // host that is not registered — the request must route by the URI.
@@ -2484,7 +2484,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // HTTP: a plain request routes to the registered PTask and returns
         // its response.
@@ -2541,7 +2541,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -2592,7 +2592,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The h2c offer in RFC 7540 §3.2's wire shape, with an unrelated
         // header riding along.
@@ -2725,7 +2725,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // First request: box-a.
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -2797,7 +2797,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2828,7 +2828,7 @@ mod tests {
     async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
             let mut scratch = [0u8; 1024];
             let _ = sock.read(&mut scratch).await;
@@ -2841,7 +2841,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2859,9 +2859,9 @@ mod tests {
         // A backend that answers without a `Connection` header.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
                     let _ = sock
@@ -2877,7 +2877,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
@@ -2905,9 +2905,9 @@ mod tests {
         // echoes back whatever the client sends after the upgrade.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 2048];
                     let n = sock.read(&mut scratch).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&scratch[..n]);
@@ -2937,7 +2937,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!(
@@ -2997,10 +2997,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let mut continued = !interim;
                     let mut answered = false;
@@ -3056,7 +3056,7 @@ mod tests {
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
         proxy_addr
     }
 
@@ -3478,7 +3478,7 @@ mod tests {
 
         // The target's declaration, as launch records it: one published TCP
         // port forwarding to the box's own port (the real listener here).
-        let policy = SessionPolicy {
+        let policy = BoxPolicy {
             egress: None,
             ingress: Some(IngressPolicy {
                 port_mappings: vec![PortMapping {
@@ -3490,6 +3490,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
+            quic443: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the
@@ -3507,12 +3508,12 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
         // the declaration's connections terminate on, and refuses any other.
-        let gate = SessionGate::for_session(
+        let gate = BoxGate::for_session(
             "web".to_string(),
             Ipv4Addr::LOCALHOST,
             &policy,
@@ -3616,7 +3617,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, router));
+        crate::traced::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -3792,7 +3793,7 @@ mod tests {
             // port 1024+i forwarding to internal port 8000+i.
             published in 0u8..=15,
             // Whether an own-address target declares an ingress section at
-            // all. `sessions::validate_policy` accepts an `OwnIp` record with
+            // all. `boxes::validate_policy` accepts an `OwnIp` record with
             // none, whose posture is deny-all — so the property ranges over
             // the absent declaration too, and every own-address path that
             // fills the registry must carry it as the empty set it is, never
@@ -3820,7 +3821,7 @@ mod tests {
             // The target's declaration. A host-address box cannot carry one
             // (launch validation rejects it); an own-address box carries
             // exactly its mappings, or no section at all.
-            let target_policy = SessionPolicy {
+            let target_policy = BoxPolicy {
                 egress: None,
                 ingress: (mode != TargetMode::HostAddress && declares_ingress).then(|| {
                     IngressPolicy {
@@ -3830,6 +3831,7 @@ mod tests {
                     }
                 }),
                 credentialed_upstream: None,
+                quic443: None,
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
@@ -3853,7 +3855,7 @@ mod tests {
                 }
                 TargetMode::OwnAddressNative => {
                     // The creator's hand has published the box's address, as
-                    // `Session::register_hostname` records it; the attach
+                    // `BoxActor::register_hostname` records it; the attach
                     // path's report and the session's own registration both
                     // follow it, and neither is a source of the address.
                     reg.publish_own_address(
@@ -3864,7 +3866,7 @@ mod tests {
                     );
                     reg.report_own_address(target, "web", target_lease, applied);
                     // The session's own registration carries the declared
-                    // set, as `Session::register_hostname` passes it.
+                    // set, as `BoxActor::register_hostname` passes it.
                     reg.register_own_ip(
                         target,
                         "web",
@@ -3880,10 +3882,11 @@ mod tests {
                 reg.register_caller(
                     client,
                     "client",
-                    &SessionPolicy {
+                    &BoxPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
                         credentialed_upstream: None,
+                        quic443: None,
                     },
                     subnet,
                     None,
@@ -3960,7 +3963,7 @@ mod tests {
                     ),
                 };
                 if let Some(internal) = terminated_on {
-                    let gate = SessionGate::for_session(
+                    let gate = BoxGate::for_session(
                         "web".to_string(),
                         target_lease,
                         &target_policy,
@@ -3978,7 +3981,7 @@ mod tests {
 
     /// The own-address/absent-ingress case the NET-071 property ranges over
     /// and must never lose again: a box that declares no ingress — a
-    /// configuration `sessions::validate_policy` accepts on `own_ip` — is
+    /// configuration `boxes::validate_policy` accepts on `own_ip` — is
     /// deny-all on *every* host form, because `None` on a route is the
     /// *host-address* box's ungated route, and an own-address box with no
     /// declaration is not one. Both registry paths that build its route are
@@ -3992,14 +3995,15 @@ mod tests {
     #[test]
     fn own_ip_target_with_no_ingress_is_deny_all_on_every_host_form() {
         // The target's declaration: none, which launch accepts on `own_ip`.
-        let policy = SessionPolicy {
+        let policy = BoxPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
-        let gate = SessionGate::for_session(
+        let gate = BoxGate::for_session(
             "web".to_string(),
             Ipv4Addr::LOCALHOST,
             &policy,
@@ -4134,18 +4138,20 @@ mod tests {
         // The documented default each VM binds in its own guest: a free
         // port with a free rung above it — the walk's next proposal — probed
         // the way every other borrowed port in this suite is.
-        let guest_port = loop {
+        // Both host-side numbers stay bound on the host loopback from here
+        // until the forwards take them over: a number probed free and bound
+        // later is a race against every sibling test's own port pick. Each
+        // VM's proxy binds its own guest loopback, never this address.
+        let (guest_port, host_a_listener, host_b_listener) = loop {
             let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
-            drop(probe);
             let Some(rung) = crate::server::next_host_publish_port(port) else {
                 continue;
             };
             match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
+                Ok(rung_probe) => break (port, probe, rung_probe),
                 Err(_) => continue,
             }
-            break port;
         };
         let rung = guest_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
 
@@ -4208,15 +4214,15 @@ mod tests {
             "the second VM's publication must take a host port of its own"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4226,7 +4232,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4237,16 +4243,17 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards the publications describe, played by hand: each VM's
         // published host port relays to that VM's proxy — the half of the
-        // publication that lives on the host.
+        // publication that lives on the host — on the sockets held since the
+        // numbers were chosen.
         let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-        spawn_forward(host_a, guest_a).await;
-        spawn_forward(host_b, guest_b).await;
+        spawn_forward(host_a_listener, guest_a);
+        spawn_forward(host_b_listener, guest_b);
 
         // Both VMs' box names route through the host at the same time: each
         // published port reaches its own VM's box and refuses the other
@@ -4291,10 +4298,11 @@ mod tests {
         // the answerer's documented default on their own guest loopbacks —
         // so the host ports their *publications* contend for are the ones
         // that must differ, exactly as the proxies' did.
-        let zone_port = loop {
+        // Held on the host loopback until the UDP forwards take them, as the
+        // proxies' numbers are above.
+        let (zone_port, zone_a_socket, zone_b_socket) = loop {
             let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
-            drop(probe);
             let Some(zone_rung) = crate::server::next_host_publish_port(port) else {
                 continue;
             };
@@ -4302,10 +4310,9 @@ mod tests {
                 continue;
             }
             match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, zone_rung)) {
-                Ok(rung_probe) => drop(rung_probe),
+                Ok(rung_probe) => break (port, probe, rung_probe),
                 Err(_) => continue,
             }
-            break port;
         };
         let zone_rung = zone_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
 
@@ -4356,8 +4363,8 @@ mod tests {
         let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
         let zone_guest_a = SocketAddr::new(guest_a.ip(), zone_port);
         let zone_guest_b = SocketAddr::new(guest_b.ip(), zone_port);
-        spawn_udp_forward(zone_host_a, zone_guest_a).await;
-        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+        spawn_udp_forward(zone_a_socket, zone_guest_a);
+        spawn_udp_forward(zone_b_socket, zone_guest_b);
 
         // Both VMs' box names answer through the host at the same time, each
         // through the answerer port its VM published: its own box is held in
@@ -4452,31 +4459,33 @@ mod tests {
         // host — the property two pinned publications rely on. Probed free
         // on the loopback, TCP for the proxies and UDP for the answerers,
         // the way every other borrowed port in this suite is.
-        let free_tcp = |taken: &mut HashSet<u16>| -> u16 {
+        // Each pick keeps its socket bound on the host loopback until the
+        // forward takes it over (a number probed free and bound later is a
+        // race against every sibling's pick); the VMs bind their own guest
+        // loopbacks, never this address.
+        let free_tcp = |taken: &mut HashSet<u16>| -> (u16, std::net::TcpListener) {
             loop {
                 let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let port = probe.local_addr().unwrap().port();
-                drop(probe);
                 if taken.insert(port) {
-                    break port;
+                    break (port, probe);
                 }
             }
         };
-        let free_udp = |taken: &mut HashSet<u16>| -> u16 {
+        let free_udp = |taken: &mut HashSet<u16>| -> (u16, std::net::UdpSocket) {
             loop {
                 let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let port = probe.local_addr().unwrap().port();
-                drop(probe);
                 if taken.insert(port) {
-                    break port;
+                    break (port, probe);
                 }
             }
         };
         let mut handed = HashSet::new();
-        let proxy_a_port = free_tcp(&mut handed);
-        let answerer_a_port = free_udp(&mut handed);
-        let proxy_b_port = free_tcp(&mut handed);
-        let answerer_b_port = free_udp(&mut handed);
+        let (proxy_a_port, host_a_listener) = free_tcp(&mut handed);
+        let (answerer_a_port, zone_a_socket) = free_udp(&mut handed);
+        let (proxy_b_port, host_b_listener) = free_tcp(&mut handed);
+        let (answerer_b_port, zone_b_socket) = free_udp(&mut handed);
 
         // Two VM-shaped daemons: `in_microvm` is what routes an own-address
         // box to its lease, and each binds the pair its VM was handed on its
@@ -4537,15 +4546,15 @@ mod tests {
             "VM B's proxy must publish at exactly the number it was handed"
         );
 
-        // Each VM's own box, on its own lease, at the one external port both
-        // registries publish — the two leases the attach path would report.
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let box_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Each VM's own box, on its own lease, at a port of its own — the
+        // two leases the attach path would report. The backend binds its
+        // port itself: a number probed free on one address and bound later
+        // on another is a race against every other test's port pick, and
+        // lost it (`AddrInUse` on the second backend, CI and the lab gate).
         let lease_a = Ipv4Addr::new(127, 0, 0, 4);
         let lease_b = Ipv4Addr::new(127, 0, 0, 5);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        let box_port_a = spawn_backend_on(lease_a, "vm-a-web").await;
+        let box_port_b = spawn_backend_on(lease_b, "vm-b-api").await;
         a.sessions_manager()
             .await
             .hostnames()
@@ -4555,7 +4564,7 @@ mod tests {
                 SessionId::nil(),
                 "web",
                 lease_a,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_a)]),
             );
         b.sessions_manager()
             .await
@@ -4566,16 +4575,17 @@ mod tests {
                 SessionId::nil(),
                 "api",
                 lease_b,
-                BTreeMap::from([(80, box_port)]),
+                BTreeMap::from([(80, box_port_b)]),
             );
 
         // The forwards those publications describe, played by hand: each
         // VM's handed host port relays to that VM's proxy — the half of the
-        // publication that lives on the host.
+        // publication that lives on the host — on the sockets held since the
+        // numbers were handed.
         let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-        spawn_forward(host_a, guest_a).await;
-        spawn_forward(host_b, guest_b).await;
+        spawn_forward(host_a_listener, guest_a);
+        spawn_forward(host_b_listener, guest_b);
 
         // Both VMs' box names route through the host at the same time: each
         // handed port reaches its own VM's box and refuses the other VM's
@@ -4647,8 +4657,8 @@ mod tests {
         let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
         let zone_guest_a = SocketAddr::new(guest_a.ip(), answerer_a_port);
         let zone_guest_b = SocketAddr::new(guest_b.ip(), answerer_b_port);
-        spawn_udp_forward(zone_host_a, zone_guest_a).await;
-        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+        spawn_udp_forward(zone_a_socket, zone_guest_a);
+        spawn_udp_forward(zone_b_socket, zone_guest_b);
 
         // Both VMs' box names answer through the host at the same time, each
         // through the port its VM was handed: its own box is held in its
@@ -4718,10 +4728,10 @@ mod tests {
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
                 let sink = Arc::clone(&sink);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     sink.lock().unwrap().extend_from_slice(&buf[..n]);
@@ -4755,15 +4765,17 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    /// Spawns a one-shot backend on `addr` that answers every connection
-    /// with a `200 OK` carrying `body`, closing when it has — the box each
-    /// VM's name routes to, distinguishable by what it says.
+    /// Spawns a one-shot backend on `lease`, at a port the kernel hands it,
+    /// that answers every connection with a `200 OK` carrying `body`,
+    /// closing when it has — the box each VM's name routes to,
+    /// distinguishable by what it says. Returns the port it listens on.
     #[cfg(target_os = "linux")]
-    async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
-        let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
+    async fn spawn_backend_on(lease: Ipv4Addr, body: &'static str) -> u16 {
+        let backend = TcpListener::bind((lease, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     // Neither the read's count nor the answer's fate is what
                     // this backend exists for; the drop that follows closes
@@ -4786,20 +4798,23 @@ mod tests {
                 });
             }
         });
+        port
     }
 
-    /// Binds `local` on the host loopback and relays every connection to
+    /// Takes over `held` (a socket bound on the host loopback when its
+    /// number was chosen) and relays every connection to
     /// `remote`: the forward a published port stands for, played by hand —
     /// the real gvproxy forwarder binds the host port and bridges it to the
     /// guest listener over the switch, and this is the same wiring with the
     /// switch replaced by a loopback dial, so a test's dials go through the
     /// host port the way a host client's do.
     #[cfg(target_os = "linux")]
-    async fn spawn_forward(local: SocketAddr, remote: SocketAddr) {
-        let listener = TcpListener::bind(local).await.unwrap();
-        tokio::spawn(async move {
+    fn spawn_forward(held: std::net::TcpListener, remote: SocketAddr) {
+        held.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(held).unwrap();
+        crate::traced::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let Ok(mut upstream) = TcpStream::connect(remote).await else {
                         return;
                     };
@@ -4880,9 +4895,10 @@ mod tests {
     /// loopback dial, so a test's resolver dials go through the host port the
     /// way a host resolver's datagrams do.
     #[cfg(target_os = "linux")]
-    async fn spawn_udp_forward(local: SocketAddr, remote: SocketAddr) {
-        let listener = tokio::net::UdpSocket::bind(local).await.unwrap();
-        tokio::spawn(async move {
+    fn spawn_udp_forward(held: std::net::UdpSocket, remote: SocketAddr) {
+        held.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UdpSocket::from_std(held).unwrap();
+        crate::traced::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
                 let Ok((len, reply_to)) = listener.recv_from(&mut buf).await else {
@@ -4920,27 +4936,29 @@ mod tests {
 
     /// A caller's egress declaration that denies exactly the target's address
     /// (the loopback stand-in the test's boxes live at).
-    fn egress_denying_the_target() -> SessionPolicy {
-        SessionPolicy {
+    fn egress_denying_the_target() -> BoxPolicy {
+        BoxPolicy {
             egress: Some(EgressPolicy {
                 deny_subnets: Some(vec!["127.0.0.1/32".to_string()]),
                 ..EgressPolicy::default()
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
     /// A caller's egress declaration that allows the target's address: an
     /// allow list naming it.
-    fn egress_allowing_the_target() -> SessionPolicy {
-        SessionPolicy {
+    fn egress_allowing_the_target() -> BoxPolicy {
+        BoxPolicy {
             egress: Some(EgressPolicy {
                 allow_subnets: Some(vec!["127.0.0.1/32".to_string()]),
                 ..EgressPolicy::default()
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 }

@@ -24,7 +24,7 @@
 //! sends as the remote pty's modes) is what it read off the real terminal
 //! before. The relay keeps the *real* terminal in exactly the raw set ssh
 //! applied to it ([`ssh_raw_termios`]), so the session-key chord still
-//! arrives as data ([`sessions::keys`]'s raw-tty premise) and every byte
+//! arrives as data ([`boxes::keys`]'s raw-tty premise) and every byte
 //! flows through in full chunks, in order, with no line discipline in the
 //! way.
 //!
@@ -262,7 +262,7 @@ fn set_winsize(fd: &impl AsFd, ws: Winsize) -> Result<(), anyhow::Error> {
 /// The termios the relay keeps the real terminal in while an interactive
 /// attach runs: exactly the set OpenSSH's `enter_raw_mode` (sshtty.c)
 /// applied to it before this change, so the session-key leader rule's
-/// raw-tty premise ([`sessions::keys`]: the chord must reach the app as
+/// raw-tty premise ([`boxes::keys`]: the chord must reach the app as
 /// data) still holds.
 ///
 /// That is: IGNPAR on; ISTRIP, INLCR, IGNCR, ICRNL, IXON, IXANY, IXOFF
@@ -1484,7 +1484,7 @@ mod tests {
     fn chord_bytes_pass_through_unmodified() {
         let _serial = serial();
         let term = FakeTerminal::new(24, 80);
-        let keys = sessions::keys::SessionKeys::default();
+        let keys = boxes::keys::SessionKeys::default();
         // Every control byte (the termios specials among them: ^C ^Z ^\
         // ^S ^Q ^V ^O ^D ^T), DEL, and each encoding of the default leader
         // and detach key.

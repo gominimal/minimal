@@ -114,6 +114,19 @@ fn run_boot(foreground: bool) -> Result<()> {
     let volume_path = crate::volume::resolve_data_volume_path();
     let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
 
+    // `vm.boot`: from spawning the VMM child to the guest's READY beacon. The
+    // child and, through the boot line, the guest daemon inherit it as their
+    // parent (`telemetry::forward_trace`), so the guest's boot spans land
+    // under it in the same trace.
+    let boot_span = tracing::info_span!(
+        "vm.boot",
+        vm = %crate::state::vm_name(),
+        otel.status_code = tracing::field::Empty,
+    )
+    .entered();
+    // Every return from here to READY (`?` and `bail!` alike) exports
+    // `vm.boot` with an error status (TEL-035); reaching READY clears it.
+    let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
@@ -126,6 +139,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     // Forward the state-dir override and VM name so the VMM child resolves the
     // same per-VM state dir this process does.
     crate::state::forward_identity(&mut cmd);
+    crate::telemetry::forward_trace(&mut cmd);
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
@@ -217,6 +231,9 @@ fn run_boot(foreground: bool) -> Result<()> {
         }
     }
 
+    boot_failed.ok();
+    drop(boot_span);
+
     if foreground {
         let status = child.wait().context("waiting for VMM child")?;
         // The one-per-stop line (NET-055): a foreground `boot` supervises the
@@ -225,6 +242,14 @@ fn run_boot(foreground: bool) -> Result<()> {
         crate::cmd::log_stopping_vm(state_dir.dir());
         if !status.success() {
             let code = status.code().unwrap_or(-1);
+            // `vm.boot` ended at READY and is right as it stands; the
+            // command's failure after it is recorded on its own, so a trace
+            // reader finds the failed `boot` next to the clean boot.
+            tracing::error!(
+                code,
+                vm = %crate::state::vm_name(),
+                "the VMM child exited after READY; a foreground boot fails with it"
+            );
             bail!("VMM child exited with code {code}");
         }
     }

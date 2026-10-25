@@ -24,13 +24,13 @@ use minimald_rpc::ListSessionsEntry;
 /// reset.
 ///
 /// The same vocabulary `minimald` draws its per-session unwind codes from
-/// (both sides name the sequences out of [`sessions::terminal`], so neither
+/// (both sides name the sequences out of [`boxes::terminal`], so neither
 /// can drift), but without the "only if currently set" narrowing: a client has
 /// no screen model to diff against, so it can only write the lot.
 ///
 /// Writing the lot is *not* free. Every sequence here bar one is inert against
 /// a terminal that was never in that mode; the exception is
-/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN), which on
+/// [`LEAVE_ALT_SCREEN`](boxes::terminal::LEAVE_ALT_SCREEN), which on
 /// xterm-family terminals performs a `DECRC`-style cursor restore even from
 /// the normal buffer, so a gratuitous one can jump the cursor to a stale saved
 /// position and have the shell prompt redraw over existing content. That is
@@ -38,24 +38,24 @@ use minimald_rpc::ListSessionsEntry;
 /// demonstrably could not have spoken for itself, rather than on every attach.
 const TERMINAL_UNWIND: &[&str] = &[
     // mouse reporting: press, press/release, button-motion, any-motion
-    sessions::terminal::MOUSE_X10_OFF,
-    sessions::terminal::MOUSE_PRESS_RELEASE_OFF,
-    sessions::terminal::MOUSE_BUTTON_MOTION_OFF,
-    sessions::terminal::MOUSE_ANY_MOTION_OFF,
+    boxes::terminal::MOUSE_X10_OFF,
+    boxes::terminal::MOUSE_PRESS_RELEASE_OFF,
+    boxes::terminal::MOUSE_BUTTON_MOTION_OFF,
+    boxes::terminal::MOUSE_ANY_MOTION_OFF,
     // mouse encodings: utf-8, SGR, urxvt
-    sessions::terminal::MOUSE_ENCODING_UTF8_OFF,
-    sessions::terminal::MOUSE_ENCODING_SGR_OFF,
-    sessions::terminal::MOUSE_ENCODING_URXVT_OFF,
+    boxes::terminal::MOUSE_ENCODING_UTF8_OFF,
+    boxes::terminal::MOUSE_ENCODING_SGR_OFF,
+    boxes::terminal::MOUSE_ENCODING_URXVT_OFF,
     // bracketed paste, application cursor keys, application keypad
-    sessions::terminal::BRACKETED_PASTE_OFF,
-    sessions::terminal::APPLICATION_CURSOR_KEYS_OFF,
-    sessions::terminal::APPLICATION_KEYPAD_OFF,
+    boxes::terminal::BRACKETED_PASTE_OFF,
+    boxes::terminal::APPLICATION_CURSOR_KEYS_OFF,
+    boxes::terminal::APPLICATION_KEYPAD_OFF,
     // leave the alternate screen, unhide the cursor
-    sessions::terminal::LEAVE_ALT_SCREEN,
-    sessions::terminal::SHOW_CURSOR,
+    boxes::terminal::LEAVE_ALT_SCREEN,
+    boxes::terminal::SHOW_CURSOR,
     // reset drawing attributes ('SGR') and focus reporting
-    sessions::terminal::SGR_RESET,
-    sessions::terminal::FOCUS_REPORTING_OFF,
+    boxes::terminal::SGR_RESET,
+    boxes::terminal::FOCUS_REPORTING_OFF,
 ];
 
 /// [`TERMINAL_UNWIND`] as the byte string that goes to the tty.
@@ -83,7 +83,7 @@ fn terminal_unwind_bytes() -> Vec<u8> {
 /// The one ambiguity is honest and unavoidable: a session process that itself
 /// exits 255 is indistinguishable, from out here, from an ssh transport
 /// failure, so it earns a redundant blind unwind. Harmless but for the
-/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN) caveat on
+/// [`LEAVE_ALT_SCREEN`](boxes::terminal::LEAVE_ALT_SCREEN) caveat on
 /// [`TERMINAL_UNWIND`].
 ///
 /// Pure in its input so both branches are unit-testable without spawning ssh.
@@ -252,7 +252,7 @@ pub(crate) struct ResolvedBoxVm {
     /// That VM's daemon socket.
     pub sock: std::path::PathBuf,
     /// The record the name resolved to on that VM.
-    pub record: sessions::Record,
+    pub record: boxes::Record,
 }
 
 /// Resolve the VM that owns a box name from the name alone (NET-058), across
@@ -359,7 +359,7 @@ pub(crate) async fn resolve_box_vm(
 async fn box_record_on(
     vm: &crate::client::VmSocket,
     name: &str,
-) -> Result<Option<sessions::Record>, anyhow::Error> {
+) -> Result<Option<boxes::Record>, anyhow::Error> {
     let mut client = match crate::client::Client::probe(&vm.sock).await {
         Ok(client) => client,
         Err(crate::client::ProbeRefusal::NotRunning) => return Ok(None),
@@ -402,10 +402,10 @@ impl fmt::Display for SessionCandidate {
 /// the client's verdict, `Materializing` has finalized its composition but
 /// is still ingesting patches. Both render with the hollow glyph so the
 /// picker communicates "not-yet-ready" uniformly.
-fn state_glyph(status: sessions::SessionStatus) -> &'static str {
+fn state_glyph(status: boxes::BoxState) -> &'static str {
     match status {
-        sessions::SessionStatus::Active => "●",
-        sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => "◯",
+        boxes::BoxState::Active => "●",
+        boxes::BoxState::Pending | boxes::BoxState::Materializing => "◯",
     }
 }
 
@@ -582,13 +582,13 @@ pub(crate) fn ambiguous_no_input_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::BoxState;
     use minimald_rpc::{ListSessionsEntry, RunningSessionAttrs};
     use paths::HostAbsPath;
-    use sessions::SessionStatus;
 
-    fn entry(id: &str, path: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry(id: &str, path: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
-            id: sessions::SessionId::parse_str(id).unwrap(),
+            id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
@@ -601,9 +601,9 @@ mod tests {
 
     /// Like [`entry`] but builds a session with no project_path, simulating an
     /// entry from an older daemon that predates the field.
-    fn entry_no_path(id: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry_no_path(id: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
-            id: sessions::SessionId::parse_str(id).unwrap(),
+            id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
             project_path: None,
             status,
@@ -646,7 +646,7 @@ mod tests {
         }
     }
 
-    /// The unwind set is now assembled from named constants in `sessions`,
+    /// The unwind set is now assembled from named constants in `boxes`,
     /// shared with the daemon. Naming them cannot be allowed to change what
     /// goes on the wire, so this pins the exact byte string the guard emitted
     /// before the constants existed: edit a constant and this test says so.
@@ -728,13 +728,13 @@ mod tests {
         let entries = vec![entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => {
                 assert_eq!(
                     e.id,
-                    sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                    boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
                 );
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -747,19 +747,19 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => {
                 assert_eq!(
                     e.id,
-                    sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                    boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
                 );
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -772,17 +772,17 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0077",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
@@ -800,12 +800,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/c")) {
@@ -819,7 +819,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("● "), "active glyph prefix: {label}");
@@ -852,7 +852,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Pending,
+            BoxState::Pending,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("◯ "), "pending glyph prefix: {label}");
@@ -864,12 +864,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         let msg = ambiguous_no_input_message(&entries, &cwd("/a"));
@@ -887,27 +887,21 @@ mod tests {
     fn entry_without_project_path_never_matches_cwd_but_still_attaches() {
         let entries = vec![entry_no_path(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         // Single session, no cwd match → attach directly.
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => assert_eq!(
                 e.id,
-                sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
             ),
             other => panic!("expected Attach for pathless single session, got {other:?}"),
         }
 
         // Two pathless sessions → pick over all, none tagged as cwd.
         let entries = vec![
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0052",
-                SessionStatus::Active,
-            ),
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0066",
-                SessionStatus::Active,
-            ),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0066", BoxState::Active),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Pick(cands) => {
@@ -928,7 +922,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(
@@ -946,7 +940,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(
             created_from_suffix(&e, &cwd("/a")),
@@ -959,17 +953,14 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
     #[test]
     fn created_from_suffix_empty_when_project_path_absent() {
-        let e = entry_no_path(
-            "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
-        );
+        let e = entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active);
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
@@ -992,7 +983,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let row = PickerRow::Session(SessionCandidate {
             entry: Box::new(e.clone()),

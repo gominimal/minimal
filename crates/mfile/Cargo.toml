@@ -16,7 +16,7 @@ tracing-subscriber.workspace = true
 args.workspace = true
 common.workspace = true
 paths.workspace = true
-sessions.workspace = true
+boxes.workspace = true
 
 serde.workspace = true
 toml.workspace = true

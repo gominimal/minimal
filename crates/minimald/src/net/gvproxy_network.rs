@@ -17,12 +17,12 @@ use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use sandbox2::NetGuard;
+use sandbox::NetGuard;
 use tokio::sync::Mutex;
 
 use crate::net::dns;
 use crate::net::policy::{ControlChannel, PortForwarder};
-use crate::net::switch::{SessionGate, SwitchRelay};
+use crate::net::switch::{BoxGate, SwitchRelay};
 use crate::net::{PtaskLease, SwitchClient};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
@@ -84,10 +84,16 @@ impl OwnIpAttach {
             _relay: relay,
             switch,
             control,
-            exposed,
+            mut exposed,
             runtime_ingress,
             lease,
         } = self;
+        // A declared port bound for this spawn after its attach, at a
+        // shared-address port's hand-over (NET-129), is released with the
+        // ones the attach bound.
+        if let Some(runtime_ingress) = &runtime_ingress {
+            exposed.extend(runtime_ingress.detach_handed());
+        }
         if !exposed.is_empty() {
             crate::net::policy::release_declared_ingress(&control, &exposed).await;
         }
@@ -233,7 +239,7 @@ impl NetGuard for OwnIpGuard {
 /// a task's ungated relay is bound by its lease too. The gate also carries
 /// the session's DNS dimension — its `egress.allow_dns_hosts` and
 /// `egress.deny_subnets` ride the same
-/// [`SessionGate`](crate::net::switch::SessionGate) into the relay, where
+/// [`BoxGate`](crate::net::switch::BoxGate) into the relay, where
 /// the DNS gate pins the addresses those names resolve to for their
 /// admission window (NET-066), refuses the ones that land in denied ranges
 /// (NET-067), and answers AAAA/HTTPS/SVCB lookups NODATA (NET-136).
@@ -241,7 +247,7 @@ impl NetGuard for OwnIpGuard {
 /// The lease was already allocated and gvproxy already ensured-running by the
 /// provider's plan, so this only does the post-spawn relay + ingress. A failure
 /// here just propagates: the release of that lease stays with the launch
-/// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
+/// (`sandbox::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
 ///
 /// `handed_from_host` says whether `lease`'s address is the address the VM host
@@ -261,7 +267,7 @@ pub(crate) async fn complete_own_ip_attach(
     control: ControlChannel,
     lease: PtaskLease,
     session_name: &str,
-    policy: Option<&sessions::SessionPolicy>,
+    policy: Option<&boxes::BoxPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
     handed_from_host: bool,
 ) -> io::Result<OwnIpGuard> {
@@ -298,7 +304,7 @@ pub(crate) async fn complete_own_ip_attach(
     // forwarder's revocation sets.
     let gate = policy
         .map(|policy| {
-            SessionGate::for_session(
+            BoxGate::for_session(
                 lease_ip.to_string(),
                 lease_ip,
                 policy,
@@ -374,8 +380,8 @@ async fn finish_own_ip_attach(
     control: ControlChannel,
     lease: PtaskLease,
     session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
-    gate: Option<&Arc<SessionGate>>,
+    ingress: Option<&boxes::IngressPolicy>,
+    gate: Option<&Arc<BoxGate>>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     let lease_ip = lease.ip;
@@ -545,7 +551,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use sandbox2::NetGuard as _;
+    use sandbox::NetGuard as _;
     use switch::MacAddr;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -558,7 +564,7 @@ mod tests {
     use crate::net::policy::{ControlChannel, register_dns_name};
     use crate::net::provider::network_for;
     use crate::test_harness::CaptureWriter;
-    use sessions::BoxAddresses;
+    use boxes::BoxAddresses;
 
     /// A lease at `ip` for an attach whose switch never handed it: epoch 0,
     /// which no allocator hands, so its teardown releases nothing.
@@ -631,7 +637,7 @@ mod tests {
     fn spawn_control_channel_capturing(path: PathBuf, requests: usize) -> mpsc::Receiver<Vec<u8>> {
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel(requests);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             for _ in 0..requests {
                 let (mut sock, _) = listener
                     .accept()
@@ -770,7 +776,7 @@ mod tests {
     /// the shape a VM-backed host's daemon carries. Carries the same
     /// instance host id the NET-121 proofs build their registry with
     /// (`aaaa1`), the pairing the daemon itself makes
-    /// (`sessions.rs` builds its registry from this switch's `host_id`),
+    /// (`box_manager.rs` builds its registry from this switch's `host_id`),
     /// so the attach's per-id `/services/dns/add` publishes — its own id
     /// beside the deprecated `local` one — are the two the proofs count.
     fn vm_host_switch() -> Arc<Mutex<SwitchClient>> {
@@ -822,7 +828,7 @@ mod tests {
         let handed_switch = Ipv4Addr::new(100, 64, 128, 9);
         let handed_loopback = Ipv4Addr::new(127, 0, 64, 9);
         let net = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "web",
             None,
@@ -873,7 +879,7 @@ mod tests {
         // came from, so the two allocators cannot meet and the handed
         // address is never drawn.
         let unregistered = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "other",
             None,
@@ -908,7 +914,7 @@ mod tests {
         // and the refusal spends nothing: no lease joins the table, no
         // attach is counted.
         let colliding_reserve = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "third",
             None,
@@ -944,7 +950,7 @@ mod tests {
         // table holds exactly the drawn lease and the handed one, nothing
         // drawn beside it, and the attach counts like any other.
         let reattached = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "web",
             None,
@@ -983,7 +989,7 @@ mod tests {
         // two taps on one address would key one PTask's frames to the
         // other's host-side row. The refusal spends nothing.
         let colliding_live = network_for(
-            sessions::NetworkMode::OwnIp,
+            boxes::NetworkMode::OwnIp,
             &switch,
             "fourth",
             None,
@@ -1127,7 +1133,7 @@ mod tests {
         handed: mpsc::Sender<UnixStream>,
     ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -1253,19 +1259,19 @@ mod tests {
 
     /// The two declared ports the NET-121 proofs publish: host `:8080` and
     /// `:9090`, each forwarding to its own number on the box.
-    fn declared_two_ports() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+    fn declared_two_ports() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 9090,
                         internal_port: 90,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -1273,30 +1279,31 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
     /// Three declared ports — one more than any one attach can bind before a
     /// refusal — so a proof can show the rollback of a half-bound box: two
     /// bound, the third refused, and the two unbound with it.
-    fn declared_three_ports() -> sessions::SessionPolicy {
-        sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+    fn declared_three_ports() -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 9090,
                         internal_port: 90,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: 7070,
                         internal_port: 70,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -1304,6 +1311,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -1331,7 +1339,7 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
@@ -1418,7 +1426,7 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         let policy = declared_two_ports();
 
@@ -1429,16 +1437,12 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
         let dns::ZoneEntry::Held {
             address: held_from_finalize,
@@ -1597,13 +1601,13 @@ mod tests {
         {
             let mut reg = refused.registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090, 7070]),
             );
             reg.register_own_ip(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 BTreeSet::from([8080, 9090, 7070]),
             );
@@ -1711,16 +1715,12 @@ mod tests {
         {
             let mut reg = failed.registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
         let held_before = failed
             .registry
@@ -1874,11 +1874,7 @@ mod tests {
                 .registry
                 .write()
                 .expect("registry lock")
-                .register_own_ip(
-                    sessions::SessionId::nil(),
-                    "web",
-                    BTreeSet::from([8080, 9090])
-                )
+                .register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]))
                 .is_none(),
             "finalize with no hand registers no name"
         );
@@ -1953,7 +1949,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080, 9090]),
@@ -2098,14 +2094,14 @@ mod tests {
 
         // Finalize has run for both boxes: the holder published 8080 first,
         // and this box (the nil id) yields it.
-        let holder = sessions::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
             .expect("a valid id");
         {
             let mut reg = scenario.registry.write().expect("registry lock");
             reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
             reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
             let collisions = reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 SHARED,
                 BTreeSet::from([8080, 9090]),
@@ -2115,11 +2111,7 @@ mod tests {
                 vec![8080],
                 "the later box yields the held port"
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([8080, 9090]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
         }
 
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
@@ -2171,6 +2163,149 @@ mod tests {
         fake.abort();
     }
 
+    /// NET-129 across a respawn: a shared-address port the box took over
+    /// while it ran is bound for the spawn that was running then. That
+    /// spawn's teardown unbinds it beside the forwards its attach bound, and
+    /// the box's next attach, which now holds the port of record, binds it
+    /// itself and succeeds.
+    #[tokio::test]
+    async fn a_port_taken_over_while_running_comes_down_with_its_spawn_and_binds_at_the_next_attach()
+     {
+        const FIRST_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const SECOND_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+        const SHARED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+        let control = ControlChannel::Unix(scenario.control_path.clone());
+        let holder = boxes::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+            .expect("a valid id");
+        {
+            let mut reg = scenario.registry.write().expect("registry lock");
+            reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
+            reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
+            reg.publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                SHARED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([8080, 9090]));
+        }
+        // The session actor's cell, shared with every spawn's guard through
+        // the reporter, as the launcher wires it.
+        let runtime = crate::net::provider::RuntimeIngress::default();
+        let reporter = scenario
+            .reporter
+            .clone()
+            .with_runtime_ingress(runtime.clone());
+
+        // First spawn: the box yields 8080, so its attach binds 9090 alone.
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control.clone(),
+            lease_at(FIRST_LEASE),
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the first spawn attaches");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{SHARED}:9090")],
+            "the yielded port is not asked for at the attach: {events:?}"
+        );
+
+        // The holder is destroyed and the box takes the port over while it
+        // runs: its forward is bound and tracked with the running spawn.
+        let (_, hand_overs) = scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .unpublish_own_address(holder);
+        assert_eq!(hand_overs.len(), 1, "the box is handed the port");
+        let handed = boxes::PortMapping {
+            external_port: 8080,
+            internal_port: 80,
+            proto: boxes::IpProto::Tcp,
+        };
+        let bind =
+            crate::net::policy::bind_handed_port(&control, SHARED, FIRST_LEASE, &handed, None)
+                .await
+                .expect("the hand-over's bind stands");
+        let crate::net::policy::HandedBind::Bound(forwarder) = bind else {
+            panic!("a native host's switch bound the forward");
+        };
+        let exposed = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
+        assert!(
+            exposed
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{FIRST_LEASE}:80\""))),
+            "the hand-over's forward delivers to the running spawn's lease: {exposed:?}"
+        );
+        assert!(runtime.record_handed(forwarder).is_ok());
+        assert!(runtime.holds_handed(SHARED, &handed));
+
+        // The spawn ends: its teardown unbinds the handed-over forward with
+        // the one its attach bound.
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        let mut locals = locals_of(&unbound, "/services/forwarder/unexpose");
+        locals.sort();
+        assert_eq!(
+            locals,
+            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
+            "the spawn's teardown unbinds both forwards: {unbound:?}"
+        );
+        assert!(!runtime.holds_handed(SHARED, &handed));
+        assert!(runtime.is_detached());
+
+        // The next spawn holds the port of record: its attach binds both
+        // ports itself, toward its own lease.
+        let second_tap = attach_scenario(&dir, "unused.sock").tap_fd;
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            second_tap,
+            control.clone(),
+            lease_at(SECOND_LEASE),
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the box's next attach succeeds");
+        let reattached = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        let mut locals = locals_of(&reattached, "/services/forwarder/expose");
+        locals.sort();
+        assert_eq!(
+            locals,
+            vec![format!("{SHARED}:8080"), format!("{SHARED}:9090")],
+            "the next attach binds the port the box holds now: {reattached:?}"
+        );
+        assert!(
+            reattached
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{SECOND_LEASE}:80\""))),
+            "toward the new spawn's lease: {reattached:?}"
+        );
+        Box::new(guard).teardown().await;
+        fake.abort();
+    }
+
     /// NET-044 across a respawn: a runtime publish delivers to the lease of
     /// the spawn that was running when it was made, and leases are per-spawn,
     /// so it follows the declared forwards — the spawn's teardown unbinds it
@@ -2200,7 +2335,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 PUBLISHED,
                 BTreeSet::from([8080, 9090]),
@@ -2232,7 +2367,7 @@ mod tests {
             PUBLISHED,
             FIRST_LEASE,
             3000,
-            sessions::IpProto::Tcp,
+            boxes::IpProto::Tcp,
             None,
         )
         .await
@@ -2249,7 +2384,7 @@ mod tests {
                 mapping: minimald_rpc::LiveMapping {
                     local: forwarder.local().to_string(),
                     internal_port: forwarder.internal_port(),
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                     // The gate-less runtime publish this test drives reads
                     // as reachable — there is no relay gate to have
                     // admitted the port — so the field says so outright
@@ -2310,7 +2445,7 @@ mod tests {
                 .registry
                 .read()
                 .expect("registry lock")
-                .own_lease(sessions::SessionId::nil()),
+                .own_lease(boxes::SessionId::nil()),
             Some(SECOND_LEASE),
             "the registry's lease, which the next publish delivers to, is the new spawn's"
         );
@@ -2354,7 +2489,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::channel(4);
         let mut accepted_rx = Some(accepted_rx);
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -2367,7 +2502,7 @@ mod tests {
                     // response; this stand-in *is* the switch side from here
                     // on.
                     if let Some(accepted_rx) = accepted_rx.take() {
-                        tokio::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
+                        crate::traced::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
                     }
                     continue;
                 }
@@ -2403,7 +2538,7 @@ mod tests {
                                             .expect("the stand-in's forwards lock")
                                             .insert(local.to_string(), stop_tx);
                                         let accepted_tx = accepted_tx.clone();
-                                        tokio::spawn(async move {
+                                        crate::traced::spawn(async move {
                                             let mut stop_rx = stop_rx;
                                             let stopped: Option<oneshot::Sender<()>> = loop {
                                                 tokio::select! {
@@ -2655,21 +2790,22 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         // One declared port: host :48080 forwards to the box's :80.
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
+        let policy = boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![boxes::PortMapping {
                     external_port: HOST_PORT,
                     internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
+                    proto: boxes::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         // Finalize has already run (NET-011): the creator handed the box's
         // published address, finalize recorded the hand, and the
@@ -2677,16 +2813,12 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([HOST_PORT]),
             );
-            reg.register_own_ip(
-                sessions::SessionId::nil(),
-                "web",
-                BTreeSet::from([HOST_PORT]),
-            );
+            reg.register_own_ip(boxes::SessionId::nil(), "web", BTreeSet::from([HOST_PORT]));
         }
 
         let mut fds = [0 as libc::c_int; 2];
@@ -2924,22 +3056,22 @@ mod tests {
         )));
         let reporter = crate::net::provider::OwnAddressReporter::new(
             Arc::clone(&registry),
-            sessions::SessionId::nil(),
+            boxes::SessionId::nil(),
         );
         // Two declared ports, one in-box port: the shape that makes a
         // revocation's scoping observable.
-        let policy = sessions::SessionPolicy {
-            ingress: Some(sessions::IngressPolicy {
+        let policy = boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
                 port_mappings: vec![
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: REVOKED_PORT,
                         internal_port: INTERNAL_PORT,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
-                    sessions::PortMapping {
+                    boxes::PortMapping {
                         external_port: SIBLING_PORT,
                         internal_port: INTERNAL_PORT,
-                        proto: sessions::IpProto::Tcp,
+                        proto: boxes::IpProto::Tcp,
                     },
                 ],
                 dynamic_allowed_range: None,
@@ -2947,6 +3079,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         // Finalize has already run (NET-011): the creator handed the box's
         // published address, finalize recorded the hand, and the
@@ -2954,13 +3087,13 @@ mod tests {
         {
             let mut reg = registry.write().expect("registry lock");
             reg.publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
             );
             reg.register_own_ip(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
             );
@@ -3281,7 +3414,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let scenario = attach_scenario(&dir, "gvproxy.sock");
         // The host-side registration's row: the box's own address, published
-        // by the same stable id the reporter reads back — what `session`'s
+        // by the same stable id the reporter reads back — what `box_actor`'s
         // finalize does for a handed box, standing in for the host-side
         // creator that owns the row.
         scenario
@@ -3289,7 +3422,7 @@ mod tests {
             .write()
             .expect("registry lock")
             .publish_own_address(
-                sessions::SessionId::nil(),
+                boxes::SessionId::nil(),
                 "web",
                 HANDED,
                 BTreeSet::from([8080u16, 9090]),

@@ -15,7 +15,7 @@
 //! The same spike established that gvproxy v0.8.9 has **no per-client egress
 //! ACL API**, so egress *enforcement* (R2.2, NET-062) lives in the relay
 //! layer ([`switch`](super::switch)) — it inspects each frame against the
-//! pure verdict in `sessions::core::egress` and drops what the box did not
+//! pure verdict in `boxes::core::egress` and drops what the box did not
 //! declare. What this module carries for that enforcement is the warning
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
@@ -33,8 +33,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
-use sessions::core::egress::{DynamicPortVerdict, IngressRules};
-use sessions::{IngressPolicy, IpProto, PortMapping};
+use boxes::core::egress::{DynamicPortVerdict, IngressRules};
+use boxes::{IngressPolicy, IpProto, PortMapping};
 
 /// The forwarder-expose request body gvproxy's `POST /services/forwarder/expose`
 /// expects: a host-side `local` listen address and the PTask-side `remote` it
@@ -183,7 +183,7 @@ impl ExposedMapping {
 pub struct PortForwarder {
     mapping: ExposedMapping,
     internal_port: u16,
-    gate: Option<Arc<super::switch::SessionGate>>,
+    gate: Option<Arc<super::switch::BoxGate>>,
     /// Whether this forwarder's ingress was revoked already — set by
     /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
     /// failed at the switch stays unrevoked and both a retry and the
@@ -205,6 +205,15 @@ impl PortForwarder {
     #[must_use]
     pub fn host_port(&self) -> Option<(&str, u16)> {
         self.mapping.host_port()
+    }
+
+    /// Whether this is the forward `mapping` declares at `published`: the
+    /// same listener and the same protocol. TCP and UDP on one port are two
+    /// forwards.
+    #[must_use]
+    pub fn is_forward_of(&self, published: Ipv4Addr, mapping: &PortMapping) -> bool {
+        self.mapping.protocol == protocol_str(mapping.proto)
+            && self.mapping.local == format!("{published}:{}", mapping.external_port)
     }
 
     /// The internal port the forward delivers to — the port a revocation
@@ -339,7 +348,7 @@ pub async fn apply_ingress(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::SessionGate>>,
+    gate: Option<&Arc<super::switch::BoxGate>>,
     yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
@@ -389,6 +398,83 @@ pub async fn apply_ingress(
         }
     }
     Ok(bound)
+}
+
+/// The body the forwarder answers an expose with when a forward is already
+/// bound at the listener, as an HTTP 500. On a VM-backed host the egress
+/// gate gives the same answer to a publish whose listener another box's row
+/// still holds, and keeps the publish to bind when that row is withdrawn.
+const ALREADY_RUNNING_BODY: &str = "proxy already running";
+
+/// Whether `error` is the forwarder's answer to an expose of a listener
+/// that is already bound, as [`post_json`] reports a refused request.
+fn is_already_running(error: &io::Error) -> bool {
+    let said = error.to_string();
+    said.contains("returned HTTP 500") && said.contains(ALREADY_RUNNING_BODY)
+}
+
+/// What binding a shared-address port's forward at its hand-over came to
+/// ([`bind_handed_port`]). Both carry the forwarder to track for the box.
+pub enum HandedBind {
+    /// The switch bound the forward.
+    Bound(PortForwarder),
+    /// On a VM-backed host, the listener is still held by the row of the
+    /// box that gave the port up. The host keeps this publish and binds it
+    /// when that row is withdrawn.
+    HeldByHost(PortForwarder),
+}
+
+/// Binds one declared mapping's forward for a box that took its port over
+/// while running (NET-129): the expose the box's own attach posts for the
+/// mapping ([`apply_ingress`]), at `published` toward `ptask_ip`. Nothing
+/// else of the box's ingress is touched, so a failure rolls nothing back.
+///
+/// On a VM-backed host an answer that the listener is already bound is the
+/// host's egress gate holding the publish behind the old holder's row,
+/// which it binds itself when that row is withdrawn: [`HandedBind::HeldByHost`].
+/// On a native host the same answer is a forward still bound at the
+/// listener, and is the error it reads as.
+///
+/// # Errors
+///
+/// Returns the I/O error from the failing `expose` call.
+pub async fn bind_handed_port(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    mapping: &PortMapping,
+    gate: Option<&Arc<super::switch::BoxGate>>,
+) -> io::Result<HandedBind> {
+    let req = expose_request(mapping, published, ptask_ip);
+    let answer = post_json(control, "/services/forwarder/expose", &req).await;
+    let forwarder = PortForwarder {
+        mapping: ExposedMapping {
+            local: req.local,
+            protocol: req.protocol,
+        },
+        internal_port: mapping.internal_port,
+        gate: gate.cloned(),
+        revoked: Arc::new(AtomicBool::new(false)),
+    };
+    handed_bind(control.host_unbinds_declared_forwards(), answer, forwarder)
+}
+
+/// Reads the forwarder's answer to a hand-over's expose
+/// ([`bind_handed_port`]). `host_holds_listeners` is whether a host-side
+/// gate sits in front of the switch
+/// ([`ControlChannel::host_unbinds_declared_forwards`]).
+fn handed_bind(
+    host_holds_listeners: bool,
+    answer: io::Result<()>,
+    forwarder: PortForwarder,
+) -> io::Result<HandedBind> {
+    match answer {
+        Ok(()) => Ok(HandedBind::Bound(forwarder)),
+        Err(error) if host_holds_listeners && is_already_running(&error) => {
+            Ok(HandedBind::HeldByHost(forwarder))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Removes every forward in `bound` from the switch's `control_sock` (R2.3
@@ -582,10 +668,13 @@ pub enum ExposeRefusal {
     NotRunning,
     /// The port is held already by this box's other runtime surface — the
     /// reservation or publication that holds it, whichever surface that
-    /// is, named by the owner the loser is refused with.
+    /// is, named by the owner the loser is refused with. While `pending`
+    /// is true the hold is a reservation whose publish has not landed
+    /// yet: the port is on its way to being published, not there yet.
     AlreadyPublished {
         port: u16,
         owner: super::listeners::PublicationOwner,
+        pending: bool,
     },
     /// The box shares the host's network (`host_ip`), so the port already
     /// answers on the host and there is nothing to publish. The request's
@@ -608,11 +697,11 @@ impl ExposeRefusal {
     /// offered. The verdict alone (`Display`) is what the log line and the
     /// audit record carry.
     #[must_use]
-    pub fn for_caller(&self, box_name: &str, network: sessions::NetworkMode, port: u16) -> String {
+    pub fn for_caller(&self, box_name: &str, network: boxes::NetworkMode, port: u16) -> String {
         let forward = format!("min net forward {box_name} <local>:{port}");
         match self {
             Self::DeniedByPolicy => match network {
-                sessions::NetworkMode::NoNet => format!(
+                boxes::NetworkMode::NoNet => format!(
                     "{self}: a --network none box has no address to publish at. Forward it \
                      from the host instead: {forward}"
                 ),
@@ -625,8 +714,8 @@ impl ExposeRefusal {
                 ),
             },
             Self::DeniedByHuman => format!(
-                "{self}: your operator declined it. Ask again, or forward it from the \
-                 host: {forward}"
+                "{self}: the person attached to this session answered no. Ask again, or \
+                 forward it from the host: {forward}"
             ),
             Self::AskNoTerminal => format!(
                 "{self}: no terminal was attached to answer. Attach one and retry, or \
@@ -668,7 +757,7 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NoDynamicRange => write!(
                 f,
-                "this box declares no dynamic port range, so no port can be allowed"
+                "this box has no --dynamic-range, so no port can be opened at runtime"
             ),
             Self::OutOfRange { requested, range } => write!(
                 f,
@@ -677,20 +766,32 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NoPublishedAddress => write!(
                 f,
-                "this box has no published address on file to expose a port at"
+                "this box was given no address on the host to open a port at"
             ),
             Self::NotAttached => write!(
                 f,
-                "this box has no address on the switch yet; start the box and try again"
+                "this box's network is not connected, so no port can be opened on it; \
+                 start the box and try again"
             ),
             Self::NotRunning => {
-                write!(f, "this box is not running; start the box and try again")
+                write!(
+                    f,
+                    "this box is not running, so there is nothing to open a port on; \
+                     start the box and try again"
+                )
             }
-            Self::AlreadyPublished { port, owner } => write!(
-                f,
-                "port {port} is published already by this box ({})",
-                owner.as_str()
-            ),
+            Self::AlreadyPublished {
+                port,
+                owner,
+                pending,
+            } => {
+                let state = if *pending {
+                    "is being published"
+                } else {
+                    "is published already"
+                };
+                write!(f, "port {port} {state} by this box ({})", owner.as_str())
+            }
             Self::NeedsNoExposing { port, .. } => write!(
                 f,
                 "port {port} needs no exposing: this box shares the host's network"
@@ -738,14 +839,14 @@ impl fmt::Display for ExposeFailure {
             Self::RecordUnreadable { port, source } => {
                 write!(
                     f,
-                    "reading the session record for port {port} failed: {source}"
+                    "port {port} was not opened: the session's saved state could \
+                     not be read: {source}"
                 )
             }
             Self::ActorGone { port } => {
                 write!(
                     f,
-                    "the session actor for port {port} is gone; the box is \
-                     stopping or stopped"
+                    "port {port} was not opened: the box is stopping or stopped"
                 )
             }
         }
@@ -766,9 +867,9 @@ impl fmt::Display for ExposeFailure {
 pub fn dynamic_ingress_decision(
     ingress: Option<&IngressPolicy>,
     port: u16,
-) -> Result<sessions::DynamicIngress, ExposeRefusal> {
+) -> Result<boxes::DynamicIngress, ExposeRefusal> {
     match IngressRules::from_policy(ingress).dynamic_verdict(port) {
-        DynamicPortVerdict::Allow => Ok(sessions::DynamicIngress::Allow),
+        DynamicPortVerdict::Allow => Ok(boxes::DynamicIngress::Allow),
         DynamicPortVerdict::Deny => Err(ExposeRefusal::DeniedByPolicy),
         DynamicPortVerdict::Ask => Err(ExposeRefusal::AskNeedsAnswer),
         DynamicPortVerdict::NoRange => Err(ExposeRefusal::NoDynamicRange),
@@ -802,7 +903,7 @@ pub async fn expose_dynamic(
     ptask_ip: Ipv4Addr,
     port: u16,
     proto: IpProto,
-    gate: Option<&Arc<super::switch::SessionGate>>,
+    gate: Option<&Arc<super::switch::BoxGate>>,
 ) -> io::Result<PortForwarder> {
     let req = ExposeRequest {
         local: format!("{published}:{port}"),
@@ -1501,7 +1602,7 @@ mod tests {
 
     #[test]
     fn refusals_name_the_way_forward_for_the_caller() {
-        use sessions::NetworkMode;
+        use boxes::NetworkMode;
 
         // The in-box line carries the verdict and the next command, named
         // with the host-side box name and the port asked for; the verdict
@@ -1531,8 +1632,9 @@ mod tests {
         );
         assert_eq!(
             ExposeRefusal::DeniedByHuman.for_caller("web", NetworkMode::OwnIp, 3001),
-            "dynamic ingress is denied for this box: your operator declined it. Ask again, \
-             or forward it from the host: min net forward web <local>:3001"
+            "dynamic ingress is denied for this box: the person attached to this session \
+             answered no. Ask again, or forward it from the host: min net forward web \
+             <local>:3001"
         );
         assert_eq!(
             ExposeRefusal::AskNoTerminal.for_caller("web", NetworkMode::OwnIp, 3001),
@@ -1566,6 +1668,28 @@ mod tests {
             "port 3001 needs no exposing: this box shares the host's network, so it \
              already answers at web.min.internal:3001"
         );
+        // The hold a port loses to is one watch in either of its two
+        // states: the publication it stands on, or the reservation still
+        // on its way there. Each state is its own verdict, and the in-box
+        // line names it the same way the log does.
+        assert_eq!(
+            ExposeRefusal::AlreadyPublished {
+                port: 3001,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: false
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is published already by this box (listen)"
+        );
+        assert_eq!(
+            ExposeRefusal::AlreadyPublished {
+                port: 3001,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+                pending: true
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is being published by this box (listen)"
+        );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(
             ExposeRefusal::NoDynamicRange.for_caller("web", NetworkMode::OwnIp, 3001),
@@ -1579,7 +1703,7 @@ mod tests {
         // deny-all default — the two shapes a request from inside a bare box
         // meets.
         let allow = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1589,7 +1713,7 @@ mod tests {
             "a box that declared no ingress denies every runtime publish"
         );
         let deny = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_ingress: Some(boxes::DynamicIngress::Deny),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1599,7 +1723,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_ingress_decision(Some(&allow), 3000),
-            Ok(sessions::DynamicIngress::Allow),
+            Ok(boxes::DynamicIngress::Allow),
         );
     }
 
@@ -1616,7 +1740,7 @@ mod tests {
             ..Default::default()
         };
         let explicit = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_ingress: Some(boxes::DynamicIngress::Deny),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1648,7 +1772,7 @@ mod tests {
         // opted in — the bounds are inclusive, unset means nothing was opted
         // in, and `ask` fails closed with nobody to answer it.
         let allow = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1665,12 +1789,12 @@ mod tests {
         for port in [3000, 3999] {
             assert_eq!(
                 dynamic_ingress_decision(Some(&allow), port),
-                Ok(sessions::DynamicIngress::Allow),
+                Ok(boxes::DynamicIngress::Allow),
                 "the range's own bounds are inside it"
             );
         }
         let no_range = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_ingress: Some(boxes::DynamicIngress::Allow),
             dynamic_allowed_range: None,
             ..Default::default()
         };
@@ -1679,7 +1803,7 @@ mod tests {
             Err(ExposeRefusal::NoDynamicRange),
         );
         let ask = IngressPolicy {
-            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_ingress: Some(boxes::DynamicIngress::Ask),
             dynamic_allowed_range: Some((3000, 3999)),
             ..Default::default()
         };
@@ -1702,8 +1826,8 @@ mod tests {
         // every policy below declares nothing: on these rows the verdict is
         // `Publish` or `Deny`, and `Publish` holds exactly where the expose
         // decision allows.
-        use sessions::DynamicIngress;
-        use sessions::core::egress::ListenVerdict;
+        use boxes::DynamicIngress;
+        use boxes::core::egress::ListenVerdict;
 
         const LOW: u16 = 3000;
         const HIGH: u16 = 3010;
@@ -1785,10 +1909,13 @@ mod tests {
         let unpublished = ExposeRefusal::NoPublishedAddress.to_string();
         let unattached = ExposeRefusal::NotAttached.to_string();
         assert!(
-            unpublished.contains("no published address"),
+            unpublished.contains("no address on the host to open a port at"),
             "{unpublished}"
         );
-        assert!(unattached.contains("start the box"), "{unattached}");
+        assert!(
+            unattached.contains("not connected") && unattached.contains("start the box"),
+            "{unattached}"
+        );
         assert_ne!(unpublished, unattached);
         assert!(!unattached.contains("denied") && !unpublished.contains("denied"));
         assert!(
@@ -1917,7 +2044,7 @@ mod tests {
         // must return the full reply from a peer that stays open. If it ever
         // reverts to read-to-EOF, this test hangs (the peer never closes).
         let (client, mut server) = tokio::io::duplex(1024);
-        let server = tokio::spawn(async move {
+        let server = crate::traced::spawn(async move {
             let mut buf = [0u8; 256];
             // Drain the request (headers + empty body arrive together here).
             let _ = server.read(&mut buf).await.unwrap();
@@ -1963,7 +2090,7 @@ mod tests {
         /// end-of-head marker, then exactly its `Content-Length` body — the
         /// mirror of `post_json`'s keep-alive framing, so the fake forwarder
         /// never blocks reading past what the probe sent.
-        async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
+        pub(super) async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
             let mut buf = Vec::with_capacity(256);
             let mut scratch = [0u8; 512];
             let head_end = loop {
@@ -2024,7 +2151,7 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let (tx, rx) = mpsc::channel(512);
             let decide = std::sync::Arc::new(decide);
-            let handle = tokio::spawn(async move {
+            let handle = crate::traced::spawn(async move {
                 // Sequential on purpose: the probe is a walk, one request per
                 // address, so one connection served at a time is its shape.
                 loop {
@@ -2329,6 +2456,135 @@ mod tests {
         }
     }
 
+    // ---- a shared-address port's forward bound at its hand-over (NET-129) --
+    mod handed_port {
+        use std::net::Ipv4Addr;
+
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixListener;
+
+        use super::super::{
+            ControlChannel, HandedBind, PortMapping, bind_handed_port, handed_bind,
+            is_already_running,
+        };
+        use super::forwarder_probe::read_request;
+
+        const PUBLISHED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 128, 10);
+
+        fn mapping() -> PortMapping {
+            PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: boxes::IpProto::Tcp,
+            }
+        }
+
+        /// A forwarder that answers one expose with `status` and `body`,
+        /// framed as the real one frames its answers, and hands back the
+        /// request body it read.
+        fn forwarder_answering_once(
+            path: std::path::PathBuf,
+            status: u16,
+            body: &'static str,
+        ) -> tokio::task::JoinHandle<String> {
+            let listener = UnixListener::bind(&path).unwrap();
+            crate::traced::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("the bind is asked");
+                let request = String::from_utf8_lossy(&read_request(&mut sock).await).into_owned();
+                sock.write_all(
+                    format!(
+                        "HTTP/1.1 {status} Whatever\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("the fake forwarder must answer");
+                request
+            })
+        }
+
+        /// The switch binds the forward: the bind posts the expose the
+        /// box's own attach posts for the mapping, and hands back the
+        /// forwarder to track, naming the listener and the inside port.
+        #[tokio::test]
+        async fn a_bound_hand_over_hands_back_the_forwarder_to_track() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_once(sock.clone(), 200, "");
+
+            let bind = bind_handed_port(
+                &ControlChannel::Unix(sock),
+                PUBLISHED,
+                LEASE,
+                &mapping(),
+                None,
+            )
+            .await
+            .expect("the switch bound the forward");
+
+            let request = forwarder.await.expect("the fake forwarder ran");
+            assert!(
+                request.contains("\"local\":\"127.0.64.9:18080\""),
+                "{request}"
+            );
+            assert!(
+                request.contains("\"remote\":\"100.64.128.10:80\""),
+                "{request}"
+            );
+            let HandedBind::Bound(tracked) = bind else {
+                panic!("a 2xx answer is a bound forward");
+            };
+            assert_eq!(tracked.local(), "127.0.64.9:18080");
+            assert_eq!(tracked.internal_port(), 80);
+            // TCP and UDP on one port are two forwards: the tracked TCP
+            // one is not the UDP mapping's.
+            assert!(tracked.is_forward_of(PUBLISHED, &mapping()));
+            let udp = PortMapping {
+                proto: boxes::IpProto::Udp,
+                ..mapping()
+            };
+            assert!(!tracked.is_forward_of(PUBLISHED, &udp));
+        }
+
+        /// The forwarder's own answer for a listener that is already bound.
+        /// On a native host it is a failed bind: a forward still stands at
+        /// the listener. Behind a VM host's gate the same answer is the
+        /// gate keeping the publish for the old holder's row to end, so the
+        /// forwarder is handed back to track. Any other refusal fails on
+        /// both.
+        #[tokio::test]
+        async fn an_already_running_answer_is_held_only_behind_a_vm_hosts_gate() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_once(sock.clone(), 500, "proxy already running\n");
+            let control = ControlChannel::Unix(sock);
+            assert!(!control.host_unbinds_declared_forwards());
+
+            let Err(native) = bind_handed_port(&control, PUBLISHED, LEASE, &mapping(), None).await
+            else {
+                panic!("on a native host an already-bound listener is a failed bind");
+            };
+            let _request = forwarder.await.expect("the fake forwarder ran");
+            assert!(is_already_running(&native), "got: {native}");
+
+            let tracked = || super::declared_release::declared_at("127.0.64.9:18080");
+            assert!(matches!(
+                handed_bind(true, Err(native), tracked()),
+                Ok(HandedBind::HeldByHost(_))
+            ));
+            let refused = || {
+                std::io::Error::other(
+                    "gvproxy /services/forwarder/expose returned HTTP 500: listen tcp: bind failed",
+                )
+            };
+            assert!(!is_already_running(&refused()));
+            assert!(handed_bind(true, Err(refused()), tracked()).is_err());
+            assert!(handed_bind(false, Err(refused()), tracked()).is_err());
+        }
+    }
+
     // ---- who unbinds a declared forward when its box stops (NET-121) ------
     mod declared_release {
         use std::sync::Arc;
@@ -2342,7 +2598,7 @@ mod tests {
 
         /// A declared forwarder bound at `local`, as `apply_ingress` builds
         /// one, with no session gate behind it.
-        fn declared_at(local: &str) -> PortForwarder {
+        pub(super) fn declared_at(local: &str) -> PortForwarder {
             PortForwarder {
                 mapping: ExposedMapping {
                     local: local.to_string(),

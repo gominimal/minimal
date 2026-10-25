@@ -11,7 +11,7 @@ use globset::GlobSet;
 use graph::{BuildDep, BuildSpec, BuildSpecRef, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner, PendingDir};
 use ot::{OpTracker, Operation};
-use sandbox2::config::SandboxMapped;
+use sandbox::config::SandboxMapped;
 use tracing::info;
 
 /// The return value of a successful build of a build-spec.
@@ -80,7 +80,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     .await?;
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
-                        Materialized::File(path) => build_deps.push(SandboxMapped::File(path)),
+                        // A copy, not a hardlink: the path is the download cache's own file,
+                        // and /build is writable, so a hardlink would let a build rewrite the
+                        // cached source under a concurrent build of the same source
+                        // (build-servers#231). The cache re-hashes on every hit, so only a
+                        // reader already past that check could see the change.
+                        Materialized::File(path) => build_deps.push(SandboxMapped::FileCopy(path)),
                         Materialized::TempDir(td) => build_deps.push(SandboxMapped::TempDir(td)),
                     }
                 }
@@ -208,14 +213,14 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     #[cfg(target_os = "linux")]
     async fn execute_in_sandbox(
         &mut self,
-        sandbox: &mut sandbox2::Sandbox<()>,
+        sandbox: &mut sandbox::Sandbox<()>,
         build: &BuildSpec,
     ) -> Result<(), Error> {
         sandbox
             .run_with_cancel(
                 self.invocations(build)?
                     .into_iter()
-                    .map(|(program, args)| sandbox2::config::Invocation {
+                    .map(|(program, args)| sandbox::config::Invocation {
                         executable: program,
                         args,
                         envs: Default::default(),
@@ -233,7 +238,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     #[cfg(not(target_os = "linux"))]
     async fn execute_in_sandbox(
         &mut self,
-        _sandbox: &mut sandbox2::Sandbox<()>,
+        _sandbox: &mut sandbox::Sandbox<()>,
         _build: &BuildSpec,
     ) -> Result<(), Error> {
         Err(crate::sandbox_unsupported())
@@ -310,7 +315,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let channel = ();
 
-        let mut config = sandbox2::config::Config::new(&build.name)
+        let mut config = sandbox::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
@@ -319,9 +324,9 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             // rather than as a mode: a build is not a PTask and has never had
             // one, and the sandbox layer acts on plans.
             .with_plan(if !needs_dns && !needs_internet {
-                sandbox2::NetPlan::isolated()
+                sandbox::NetPlan::isolated()
             } else {
-                sandbox2::NetPlan::host()
+                sandbox::NetPlan::host()
             });
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
@@ -448,6 +453,31 @@ mod tests {
         }
     }
 
+    /// Serves the same file for every source, as the download cache does on a hit.
+    #[derive(Debug)]
+    struct OneFileFetcher(PathBuf);
+
+    impl SourceFetcher for OneFileFetcher {
+        async fn download_web(
+            &self,
+            _url: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            Ok(self.0.clone())
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn graph_from(ncl: &str) -> Graph {
         Graph::new()
             .ingest(Layer::new_for_test(ncl.to_string()).unwrap())
@@ -542,5 +572,54 @@ mod tests {
             msg.contains("amd64/macos"),
             "error should name the unbuildable target, got: {msg}"
         );
+    }
+
+    /// A non-extracted source reaches the sandbox's writable /build as a private
+    /// copy of the cached file. A hardlink there would be the download cache's own
+    /// inode, so a build appending to its input changed the cached source for any
+    /// concurrent build of it (build-servers#231, reproduced from inside a real
+    /// build sandbox).
+    #[test]
+    fn a_non_extracted_source_is_mapped_as_a_private_copy() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let cached = tmp.path().join("payload.tar.gz");
+        std::fs::write(&cached, b"payload").unwrap();
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, Source, ..} = import "minimal.ncl" in
+            {
+                name = "uses-raw-source",
+                build_deps = [
+                    {
+                        url = "https://example.invalid/payload.tar.gz",
+                        sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+                        extract = false,
+                    } | Source,
+                ],
+                cmd = "true",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("uses-raw-source").unwrap();
+        let fetcher = OneFileFetcher(cached.clone());
+        let sb = SpecBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            override_deps: None,
+            stdout_writer: None,
+            stderr_writer: None,
+            cancel: CancellationToken::new(),
+            cpu_weight: None,
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+        let build = dg.get(&bsr).unwrap();
+        let op = OpTracker::new_root();
+        let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
+        assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
     }
 }

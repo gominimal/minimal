@@ -6,10 +6,10 @@ name: Release
 #     `release-<sha>` GitHub Release (auto-pruned);
 #   * a VERSIONED build (`versioned: true`) builds with
 #     MINIMAL_RELEASE_VERSION = Cargo.toml package.version so every binary
-#     reports the release version on an UNTAGGED commit, packages the
-#     .deb/.rpm/.apk from the same bytes, generates the release notes, stages
-#     versions/<semver>/ (binaries, manifest, pkg/, notes.md, install.sh),
-#     and parks a DRAFT GitHub Release `v<semver>` with everything attached.
+#     reports the release version on an UNTAGGED commit, generates the
+#     release notes, stages versions/<semver>/ (binaries, manifest, notes.md,
+#     install.sh), and parks a DRAFT GitHub Release `v<semver>` with
+#     everything attached.
 #
 # Both then smoke the shipped artifacts in this same run and, on success,
 # record versions/<version>/smoked — the provenance the promote workflow
@@ -20,7 +20,7 @@ on:
     workflow_dispatch:
         inputs:
             versioned:
-                description: "Cut a versioned release: build with MINIMAL_RELEASE_VERSION = Cargo.toml package.version, package .deb/.rpm/.apk, stage versions/<semver>/ with release notes, park a draft GitHub Release v<semver>. The tag is created by promote, last."
+                description: "Cut a versioned release: build with MINIMAL_RELEASE_VERSION = Cargo.toml package.version, stage versions/<semver>/ with release notes, park a draft GitHub Release v<semver>. The tag is created by promote, last."
                 type: boolean
                 default: false
             dry_run:
@@ -197,7 +197,7 @@ jobs:
               # pre-installed Rust toolchain on ubuntu-latest lives in
               # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
               # `rustup target add` below still resolves.
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -265,25 +265,25 @@ jobs:
               # checked bytes.
               run: scripts/check-zoned-links.sh target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
             - name: Upload binary (minzoned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
                   retention-days: 7
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: mip-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
@@ -316,7 +316,7 @@ jobs:
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
@@ -338,7 +338,7 @@ jobs:
               #
               # Runs BEFORE checkout: the action copies a `bc` binary into its
               # working dir, which dirty's the checkout.
-              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
+              uses: endersonmenezes/free-disk-space@8b8cd4e2277836962939a8f3b4ea0ee4bc006156 # v4.0.1
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -395,25 +395,25 @@ jobs:
               # See the amd64 job: the gate runs again on the file that uploads.
               run: scripts/check-zoned-links.sh target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
             - name: Upload binary (minzoned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: mip-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
@@ -435,7 +435,7 @@ jobs:
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
@@ -455,7 +455,8 @@ jobs:
         # labels only (docs/internal/macos-runner-setup.md).
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
         # 60, not 45: the build takes about 15 minutes, and the notarization
-        # step below waits on Apple's notary service for three submissions.
+        # step below waits on Apple's notary service for three submissions
+        # (minvmd, min, and the app bundle minzoned ships in).
         timeout-minutes: 60
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
@@ -465,7 +466,10 @@ jobs:
             # into `min` (option_env! in crates/minimal/src/resolver.rs): the
             # session advisory verifies the copy source against the Developer
             # ID requirement for this team and identifier, and a `min` built
-            # without them offers no answerer step on macOS.
+            # without them offers no answerer step on macOS. The identifier
+            # is also the CFBundleIdentifier of the app bundle minzoned ships
+            # in (packaging/macos/Info.plist); the assemble step below fails
+            # when the two differ.
             MINIMAL_ZONED_TEAMID: 3G47C5HY64
             MINIMAL_ZONED_IDENTIFIER: dev.minimal.minzoned
         steps:
@@ -524,11 +528,33 @@ jobs:
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
                   mv target/release/min target/release/minimal-macos-arm64
-                  mv target/release/minzoned target/release/minzoned-macos-arm64
+            - name: Assemble the minzoned app bundle
+              # minzoned ships inside Minimal.app, never as a bare file: macOS
+              # lists a launchd job under an app's name and icon (System
+              # Settings > General > Login Items & Extensions) only when the
+              # job's program belongs to an app bundle signed with the
+              # vendor's Developer ID. The bundle is Info.plist, the program
+              # and the icon (scripts/build-app-bundle.sh); it is signed,
+              # notarized and stapled below, then flattened to one file per
+              # bundle file for the release.
+              #
+              # The bundle's version is the release version, or 0.0.0 on a
+              # build that is not a versioned release.
+              run: |
+                  scripts/build-app-bundle.sh assemble target/release/minzoned \
+                    target/release/Minimal.app "${MINIMAL_RELEASE_VERSION:-0.0.0}"
+                  bundle_id="$(plutil -extract CFBundleIdentifier raw -o - \
+                    target/release/Minimal.app/Contents/Info.plist)"
+                  if [ "$bundle_id" != "$MINIMAL_ZONED_IDENTIFIER" ]; then
+                    echo "::error::packaging/macos/Info.plist names the bundle '$bundle_id', but min verifies minzoned as '$MINIMAL_ZONED_IDENTIFIER'" >&2
+                    exit 1
+                  fi
             - name: Codesign binaries with Developer ID
-              # Sign the two shipped Mach-O binaries with the Developer ID
-              # Application identity held in the runner's signing keychain. This
-              # is the LAST mutation before upload.
+              # Sign the two shipped Mach-O binaries and the minzoned app
+              # bundle with the Developer ID Application identity held in the
+              # runner's signing keychain. For the two binaries this is the
+              # LAST mutation before upload; the bundle is stapled after it is
+              # notarized, which adds a file its signature does not cover.
               # Hardened runtime (--options runtime) + a secure --timestamp so the
               # artifacts are notarization-ready.
               env:
@@ -552,32 +578,40 @@ jobs:
                   # minzoned: no entitlements at all (no hypervisor, no
                   # disable-library-validation, no dyld environment, no JIT),
                   # and an explicit identifier, the one `min` checks it by.
+                  # Signing the bundle signs its program, Contents/MacOS/minzoned,
+                  # and seals Info.plist and the icon into that signature
+                  # (Contents/_CodeSignature/CodeResources). No --deep: the
+                  # bundle holds one program and no nested code.
                   codesign --force --timestamp --options runtime \
                     --identifier "$MINIMAL_ZONED_IDENTIFIER" \
                     --sign "$IDENTITY" \
-                    target/release/minzoned-macos-arm64
+                    target/release/Minimal.app
 
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
                   # The exact designated requirement the session advisory and
-                  # the privileged step verify the answerer against.
+                  # the privileged step verify the answerer's bundle against.
                   codesign --verify --strict --verbose=2 \
                     -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\"" \
-                    target/release/minzoned-macos-arm64
+                    target/release/Minimal.app
             - name: Re-check minzoned links on the signed artifact
-              # The last check before upload, on the signed and renamed bytes.
-              run: scripts/check-zoned-links.sh target/release/minzoned-macos-arm64
+              # The link check on the signed bytes, before notarization. The
+              # "Staple and flatten the minzoned app bundle" step repeats it on
+              # the rebuilt bundle, which is the last check before upload.
+              run: scripts/check-zoned-links.sh target/release/Minimal.app/Contents/MacOS/minzoned
             - name: Notarize binaries
-              # Submit each signed binary to Apple's notary service and fail the
-              # release unless every result is Accepted. Notarization does not
-              # modify the file, so the uploaded bytes stay the signed, link-gated
-              # bytes above. notarytool takes a zip, a .pkg or a .dmg, never a
-              # bare Mach-O, so each binary goes up in a ditto zip that is used
-              # only for the submission.
+              # Submit each signed binary, and the signed minzoned app bundle,
+              # to Apple's notary service and fail the release unless every
+              # result is Accepted. Notarization does not modify the file, so
+              # the uploaded bytes stay the signed, link-gated bytes above.
+              # notarytool takes a zip, a .pkg or a .dmg, never a bare Mach-O
+              # or a bundle directory, so each one goes up in a ditto zip that
+              # is used only for the submission.
               #
-              # No staple: the release ships each binary as a bare Mach-O file,
-              # and stapler cannot attach a ticket to one (only to an .app, a .pkg
-              # or a .dmg). Gatekeeper looks the ticket up online instead.
+              # No staple for minvmd and min: the release ships each as a bare
+              # Mach-O file, and stapler cannot attach a ticket to one (only to
+              # an .app, a .pkg or a .dmg). Gatekeeper looks the ticket up
+              # online instead. The app bundle is stapled in the next step.
               #
               # The credentials are a notarytool keychain profile stored in the
               # signing keychain; the repository variable MACOS_NOTARY_PROFILE
@@ -598,7 +632,7 @@ jobs:
                   mkdir -p "$work"
                   for f in target/release/minvmd-macos-arm64 \
                            target/release/minimal-macos-arm64 \
-                           target/release/minzoned-macos-arm64; do
+                           target/release/Minimal.app; do
                     name=$(basename "$f")
                     zip="$work/$name.zip"
                     result="$work/$name.json"
@@ -626,22 +660,79 @@ jobs:
                     echo "$name: Accepted"
                   done
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-macos-arm64
                   path: target/release/minvmd-macos-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
                   retention-days: 7
-            - name: Upload binary (minzoned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+            - name: Staple and flatten the minzoned app bundle
+              # Staple the notarization ticket to the bundle, so macOS can
+              # check it with no network: stapler writes it to
+              # Contents/CodeResources, a path the bundle's signature does
+              # not cover, so the signature verified above still holds and is
+              # verified again here. The ticket can take a moment to reach
+              # the service stapler reads it from, so the staple is retried.
+              #
+              # A release carries flat files, so the bundle is then flattened
+              # to one file per bundle file (scripts/build-app-bundle.sh), the
+              # names scripts/stage-release.sh installs under bin/Minimal.app.
+              # The last check rebuilds the bundle from those flat files, the
+              # way the installer lays it down, and verifies that copy: its
+              # Developer ID requirement, and its stapled ticket.
+              run: |
+                  app=target/release/Minimal.app
+                  flat=target/release/minzoned-flat
+                  requirement="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\""
+
+                  stapled=
+                  for _ in 1 2 3 4 5; do
+                    if xcrun stapler staple "$app"; then
+                      stapled=yes
+                      break
+                    fi
+                    sleep 15
+                  done
+                  if [ -z "$stapled" ]; then
+                    echo "::error::stapler could not staple the notarization ticket to $app" >&2
+                    exit 1
+                  fi
+                  xcrun stapler validate "$app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$app"
+
+                  # A persistent runner keeps target/: start from an empty
+                  # directory, so a file a previous run left is never shipped.
+                  rm -rf "$flat"
+                  scripts/build-app-bundle.sh flatten "$app" "$flat"
+                  ls -l "$flat"
+                  for name in minzoned-macos-arm64-CodeSignature minzoned-macos-arm64-ticket; do
+                    if [ ! -f "$flat/$name" ]; then
+                      echo "::error::the flattened bundle has no $name: the bundle is not signed and stapled" >&2
+                      exit 1
+                    fi
+                  done
+
+                  rebuilt="$RUNNER_TEMP/minzoned-rebuilt"
+                  rm -rf "$rebuilt"
+                  scripts/build-app-bundle.sh unflatten "$flat" "$rebuilt/Minimal.app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$rebuilt/Minimal.app"
+                  xcrun stapler validate "$rebuilt/Minimal.app"
+                  scripts/check-zoned-links.sh "$rebuilt/Minimal.app/Contents/MacOS/minzoned"
+                  rm -rf "$rebuilt"
+            - name: Upload the minzoned app bundle's files
+              # One artifact, one flat file per bundle file: the release job's
+              # merge-multiple download drops each beside the other
+              # artifacts under its flat name.
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minzoned-macos-arm64
-                  path: target/release/minzoned-macos-arm64
+                  path: target/release/minzoned-flat/
+                  if-no-files-found: error
                   retention-days: 7
 
     build-libkrun-macos-arm64:
@@ -676,7 +767,7 @@ jobs:
               # it, re-signs with Developer ID, and re-uploads under the final
               # `libkrun-macos-arm64` name. The release job drops any leftover
               # `temp-` artifact so the ad-hoc copy never ships.
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: temp-libkrun-macos-arm64
                   path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
@@ -696,7 +787,7 @@ jobs:
         needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
         steps:
             - name: Download unsigned macOS artifacts (temp)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: temp-*
                   path: ${{ runner.temp }}/unsigned
@@ -730,14 +821,14 @@ jobs:
                     codesign --verify --strict --verbose=2 "$f"
                   done
             - name: Upload signed libkrun dylib
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload signed gvproxy (darwin-arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
@@ -805,49 +896,49 @@ jobs:
               # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/vmlinuz-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload kernel (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/vmlinuz-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/rootfs-amd64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/rootfs-arm64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-linux-amd64
                   path: ${{ runner.temp }}/gvproxy-linux-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: gvproxy-linux-arm64
                   path: ${{ runner.temp }}/gvproxy-linux-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (darwin-arm64, temp/unsigned)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: temp-gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
@@ -872,12 +963,12 @@ jobs:
             - name: Install cpio
               run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cpio
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
                   path: prebuilt
             - name: Download minimald (arm64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-arm64
                   path: prebuilt
@@ -892,14 +983,14 @@ jobs:
                   MINIMALD_BIN="$PWD/prebuilt/minimald-linux-arm64" \
                     ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio"
             - name: Upload initramfs (amd64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/initramfs-amd64.cpio
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload initramfs (arm64)
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/initramfs-arm64.cpio
@@ -916,7 +1007,7 @@ jobs:
             version: ${{ steps.read.outputs.version }}
         steps:
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
             - name: Read version from the built binary
@@ -939,9 +1030,9 @@ jobs:
                   echo "resolved release version: $ver"
 
     release:
-        # Assemble everything: completions, the legacy archive, the release
-        # notes, and (versioned) the distro packages; then cut the GitHub
-        # Release — `release-<sha>` for a nightly/plain build, or a DRAFT
+        # Assemble everything: completions, the legacy archive, and the
+        # release notes; then cut the GitHub Release — `release-<sha>` for a
+        # nightly/plain build, or a DRAFT
         # `v<semver>` for a versioned one, which promote publishes later
         # (publishing the draft is what creates the tag).
         runs-on: ubuntu-latest
@@ -995,14 +1086,14 @@ jobs:
               # nightly it names the release the commits are heading toward.
               run: scripts/next-version.sh --notes "$RUNNER_TEMP/notes.md"
             - name: Upload release notes
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes.md
                   if-no-files-found: error
                   retention-days: 7
             - name: Download artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
@@ -1011,26 +1102,6 @@ jobs:
               run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
-            - name: Build the distro packages (versioned release only)
-              # .deb/.rpm/.apk for both Linux arches from THIS run's binaries
-              # (ARTIFACTS_DIR mode, no bucket round-trip), via the pinned
-              # nfpm. They are attached to the draft release below, staged as
-              # versions/<semver>/pkg/ by stage-installer, and the .deb is
-              # install-smoked by smoke-linux-amd64 — all the same bytes.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              env:
-                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
-                  ARTIFACTS_DIR: artifacts
-                  OUT_DIR: ${{ runner.temp }}/dist
-              run: scripts/package-nfpm.sh
-            - name: Upload distro packages
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/dist/
-                  if-no-files-found: error
-                  retention-days: 7
             - name: Generate completions
               # `min` splits printing from installing (`completions print
               # <shell>`); `mip` and `minimald` keep the flat verb. The `min`
@@ -1075,13 +1146,9 @@ jobs:
                   REL_SHA: ${{ steps.release_info.outputs.sha }}
                   RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   NOTES: ${{ runner.temp }}/notes.md
-                  DIST: ${{ runner.temp }}/dist
               run: |
                   set -euo pipefail
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
-                  if [ -n "$RELEASE_VERSION" ]; then
-                    cp "$DIST"/* artifacts/
-                  fi
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
                     exit 0
@@ -1089,7 +1156,7 @@ jobs:
                   extra=()
                   if [ -n "$RELEASE_VERSION" ]; then
                     # Versioned: a DRAFT parked on this commit. Drafts create no
-                    # tag; promote publishes it (publish-packages.yml), and THAT
+                    # tag; promote publishes it (promote.yml), and THAT
                     # creates v<semver> — last, on a smoked and promoted commit.
                     # A pre-release version (one with a `-` suffix) is marked a
                     # GitHub prerelease so it never shows as "Latest". A
@@ -1124,9 +1191,9 @@ jobs:
         # installer reads (docs/specs/07-spec-installer): ONE write-once row,
         # versions/<version>/ — the short sha for a nightly/plain build, the
         # semver for a versioned one — holding the binaries, the `components`
-        # manifest, the version-pinned install.sh, the release notes, and
-        # (versioned) pkg/ with the .deb/.rpm/.apk. It re-fetches the same
-        # build artifacts and touches only gs://minimal-one. Wholly a publish
+        # manifest, the version-pinned install.sh, and the release notes. It
+        # re-fetches the same build artifacts and touches only
+        # gs://minimal-one. Wholly a publish
         # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
@@ -1140,22 +1207,16 @@ jobs:
               with:
                   persist-credentials: false
             - name: Download artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
                   merge-multiple: true
             - name: Download release notes
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes
-            - name: Download distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/dist
             - name: Authenticate to Google Cloud (installer bucket)
               # Distinct project + workload-identity pool from the release job's
               # minimal-shim auth; this one grants write to gs://minimal-one.
@@ -1165,22 +1226,19 @@ jobs:
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Stage release into installer bucket
               # Upload versions/<version>/{components,<artifacts>,install.sh,
-              # notes.md[,pkg/]}. Inert on its own: changes nothing users
-              # receive until a channel points at it. Staged rows are
-              # write-once — a row that already exists fails here before any
-              # object is touched — unless `restage` was set to re-run a
-              # versioned build that failed after staging.
+              # notes.md}. Inert on its own: changes nothing users receive
+              # until a channel points at it. Staged rows are write-once — a
+              # row that already exists fails here before any object is
+              # touched — unless `restage` was set to re-run a versioned build
+              # that failed after staging.
               env:
                   VERSION: ${{ needs.assert-version.outputs.version }}
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   RESTAGE: ${{ inputs.restage }}
                   NOTES: ${{ runner.temp }}/notes/notes.md
-                  DIST: ${{ runner.temp }}/dist
               run: |
                   set -euo pipefail
                   args=(--artifacts-dir artifacts --version "$VERSION" --bucket gs://minimal-one)
                   args+=(--extra scripts/install.sh --extra "$NOTES")
-                  [ -z "$RELEASE_VERSION" ] || args+=(--pkg-dir "$DIST")
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
 
@@ -1199,9 +1257,7 @@ jobs:
         # `min`/`minimald` — downloaded back by name — must auto-spawn a daemon
         # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
         # job, but against the release artifacts instead of a target/debug build.
-        # A versioned build additionally installs the .deb it packaged and
-        # checks the installed `min` reports the release version.
-        needs: [assert-version, release]
+        needs: [release]
         runs-on: ubuntu-latest
         timeout-minutes: 30
         permissions:
@@ -1211,12 +1267,12 @@ jobs:
               with:
                   persist-credentials: false
             - name: Download shipped min
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimal-linux-amd64
                   path: ${{ runner.temp }}/bin
             - name: Download shipped minimald
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-linux-amd64
                   path: ${{ runner.temp }}/bin
@@ -1249,31 +1305,6 @@ jobs:
               # No E2E_* knobs: native target, host daemon, and the e2e seeds its
               # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
               run: ./scripts/session-e2e.sh
-            - name: Download the distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-              with:
-                  name: packages
-                  path: ${{ runner.temp }}/pkg
-            - name: Install the .deb and check the version it reports
-              # The package is installed from the file (no repo), so this
-              # proves the .deb built from this run's bytes installs on a
-              # stock Ubuntu and its `min` reports the release version. Runs
-              # AFTER the e2e so the PATH-first shipped binaries above are what
-              # the e2e exercised; /usr/bin/min is addressed explicitly.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
-              env:
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
-                  PKG: ${{ runner.temp }}/pkg
-              run: |
-                  set -euo pipefail
-                  deb="$(find "$PKG" -maxdepth 1 -name '*amd64*.deb' | head -n 1)"
-                  [ -n "$deb" ] || { echo "::error::no amd64 .deb among the packages"; ls -l "$PKG"; exit 1; }
-                  sudo apt-get install -y "$deb"
-                  got="$(/usr/bin/min -V | awk '{print $2}')"
-                  [ "$got" = "$RELEASE_VERSION" ] \
-                    || { echo "::error::installed min reports '$got', expected '$RELEASE_VERSION'"; exit 1; }
-                  echo "installed $(basename "$deb"): min -V reports $got"
 
     smoke-linux-kvm:
         # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
@@ -1318,23 +1349,23 @@ jobs:
               # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
               # host — it ships inside the initramfs). `*-linux-amd64` is a clean
               # glob here: only darwin artifacts carry the `temp-` prefix.
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: "*-linux-amd64"
                   path: ${{ runner.temp }}/bin
                   merge-multiple: true
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/guest
@@ -1397,7 +1428,7 @@ jobs:
                   sudo pkill -f __krun-vmm || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: smoke-linux-kvm-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log
@@ -1429,37 +1460,37 @@ jobs:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
             - name: Download signed CLI (min)
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimal-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed minvmd
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed libkrun dylib
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed gvproxy
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/dl
@@ -1517,7 +1548,7 @@ jobs:
                   pkill -f gvproxy 2>/dev/null || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:
                   name: smoke-macos-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log

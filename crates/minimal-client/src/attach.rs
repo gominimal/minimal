@@ -9,7 +9,14 @@
 use std::path::Path;
 
 use crate::HANDSHAKE_TIMEOUT;
-use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
+// AskWatch is deliberately NOT re-exported here. CodeRabbit asked to
+// `pub use crate::ask_dialog::AskWatch` to keep the historical
+// `attach::AskWatch` path, but minimal-client is an in-workspace crate,
+// nothing names that path, and `ask_dialog` is a `pub mod`, so the public
+// path is `minimal_client::ask_dialog::AskWatch`. The re-export was
+// withdrawn by the reviewer (PR #2341); restoring it would re-couple the
+// two modules this refactor split apart.
+use crate::ask_dialog::{AskDialogEnd, AskWatch, is_dismissal_of, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
 
@@ -21,7 +28,7 @@ const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
 const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 
 /// Read and validate the session-key config, returning the resolved
-/// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
+/// [`boxes::keys::SessionKeys`] to negotiate at attach. A missing config
 /// file yields the shipped defaults; a present-but-invalid one (e.g. a
 /// termios-special leader) surfaces its error loudly so the user fixes the
 /// config rather than silently attaching with the wrong chord.
@@ -31,9 +38,9 @@ const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 /// those.
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
-) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
+) -> Result<boxes::keys::SessionKeys, anyhow::Error> {
     let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
-    let cfg = sessions::client::config::read_config_or_default(&cfg_path)
+    let cfg = boxes::client::config::read_config_or_default(&cfg_path)
         .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
     cfg.session_keys
         .to_session_keys()
@@ -81,6 +88,119 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
     }
 }
 
+/// The exclusive lock this process holds for the proxies it drives, taken
+/// once and kept for the process's life; see [`hold_owner_lock`].
+static OWNER_LOCK: std::sync::OnceLock<(std::path::PathBuf, nix::fcntl::Flock<std::fs::File>)> =
+    std::sync::OnceLock::new();
+
+/// Takes (once per process) the exclusive `flock` the proxy's owner watch
+/// reads, on a file beside the daemon socket named for this pid, and
+/// returns its path. Held in [`OWNER_LOCK`] until the process ends: that
+/// end — a SIGKILL as much as an exit — is what releases it, and what the
+/// proxy is waiting for. Best-effort: where the file cannot be made or
+/// locked (a socket path with no directory yet, a read-only state dir)
+/// the proxy keeps the pid watch alone, and the attach goes on.
+fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
+    if let Some((path, _)) = OWNER_LOCK.get() {
+        return Some(path.clone());
+    }
+    // One coordination lock per directory, held across the sweep of stale
+    // owner files and this one's create-and-lock, so a sweep never removes
+    // a file between its creation and its owner's lock. Not taken, the
+    // proxy keeps the pid watch alone.
+    let coord_path = sock.with_file_name(OWNER_COORD_FILE);
+    let coord = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&coord_path)
+        .ok()
+        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
+    if coord.is_none() {
+        tracing::debug!(
+            path = %coord_path.display(),
+            "no proxy owner coordination lock; the proxy watches the pid alone"
+        );
+        return None;
+    }
+    if let Some(dir) = sock.parent() {
+        sweep_stale_owner_locks(dir);
+    }
+    // Unique to this process, not just its pid: a recycled pid must not
+    // find (or be found by) a proxy still watching the old owner's path.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = sock.with_file_name(format!("proxy-owner-{}-{started}.lock", std::process::id()));
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "no proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, errno)) => {
+            tracing::debug!(
+                path = %path.display(),
+                %errno,
+                "could not lock the proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    // A second caller racing this one holds the same lock: either value is
+    // the process's, and the loser's lock drops, released, with its file
+    // still ours through the winner.
+    let (path, _) = OWNER_LOCK.get_or_init(|| (path, lock));
+    drop(coord);
+    Some(path.clone())
+}
+
+/// The coordination lock beside the daemon socket; see [`hold_owner_lock`].
+const OWNER_COORD_FILE: &str = "proxy-owners.lock";
+
+/// Removes the `proxy-owner-*.lock` files in `dir` that no live process
+/// holds: an owner that ended (an attach or exec that completed, or one
+/// killed) leaves its file behind, and the proxy unlinks it only when it
+/// was still watching at that moment. A file is removed while this process
+/// holds its lock, then released. Called under the coordination lock, so a
+/// new file is never caught between its creation and its owner's lock.
+fn sweep_stale_owner_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("proxy-owner-") && name.ends_with(".lock")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if let Ok(lock) = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
+            let removed = std::fs::remove_file(&path);
+            drop(lock);
+            tracing::debug!(?removed, path = %path.display(), "swept a stale proxy owner lock");
+        }
+    }
+}
+
 /// Build the `ssh` command that attaches to session `id` via the daemon
 /// socket at `sock`.
 ///
@@ -99,20 +219,44 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// matching `SendEnv` option) the daemon reads back alongside
 /// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
 /// for non-interactive exec channels, which have no detach.
+///
+/// Returns the command without spawning ssh. Configures the proxy to close
+/// when this process exits, using a process-lifetime owner lock when available
+/// and a PID watch otherwise. Preparing the lock may create files beside
+/// `sock` and remove stale owner lock files; lock failures use the PID fallback.
+///
+/// # Errors
+///
+/// Returns an error if the current executable cannot be located or `sock`
+/// has no parent from which an SSH host alias can be derived.
 pub fn attach_command(
     sock: &Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     wire: Option<&str>,
-    session_keys: Option<&sessions::keys::SessionKeys>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed.
+    // depend on socat or nc being installed. `--owner-lock` is a file this
+    // process holds an exclusive `flock` on for its lifetime, and `--owner`
+    // its pid: a `min` that dies without taking ssh down (SIGKILL, an OOM
+    // kill) leaves ssh and the proxy holding the daemon's socket open, and
+    // the daemon learns of a lost client only from that socket closing — so
+    // the proxy watches its owner and exits when it is gone. The lock is
+    // the watch that cannot be fooled: the kernel releases it on any end of
+    // this process, where a pid can be recycled or linger as a zombie.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
-        "{} proxy --socket {}",
+    let mut proxy_cmd = format!(
+        "{} proxy --socket {} --owner {}",
         shell_quote(&exe.display().to_string()),
         shell_quote(&sock.display().to_string()),
+        std::process::id(),
     );
+    if let Some(owner_lock) = hold_owner_lock(sock) {
+        proxy_cmd.push_str(&format!(
+            " --owner-lock {}",
+            shell_quote(&owner_lock.display().to_string())
+        ));
+    }
 
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
@@ -126,6 +270,16 @@ pub fn attach_command(
     // always-present `/bin/sh` rather than inherit the user's interactive shell.
     ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string());
+    // The CLI's trace context, as the native client sends it on every channel
+    // (`send_trace_context`): without it a `min session exec` / `run` /
+    // `attach` reached the daemon with no parent and its `exec` span began a
+    // trace of its own. With telemetry off the opt-out marker goes instead,
+    // and no `TRACEPARENT`. The daemon reads either from the channel config,
+    // not the session env (neither is in the `AcceptEnv` allowlist and
+    // neither reaches the box).
+    let (trace_var, trace_value) = trace_env();
+    ssh.env(trace_var, trace_value);
+    ssh.args(["-o", &format!("SendEnv={trace_var}")]);
     ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
@@ -157,28 +311,25 @@ pub fn attach_command(
     // paired with its `env` set above. Only the interactive attach path sends
     // these — exec/task channels pass `None`.
     if let Some(keys) = session_keys {
-        ssh.env(sessions::keys::LEADER_ENV, keys.leader.as_config_str())
+        ssh.env(boxes::keys::LEADER_ENV, keys.leader.as_config_str())
+            .env(boxes::keys::DETACH_KEY_ENV, keys.detach_key.as_config_str())
             .env(
-                sessions::keys::DETACH_KEY_ENV,
-                keys.detach_key.as_config_str(),
-            )
-            .env(
-                sessions::keys::FORWARD_KEY_ENV,
+                boxes::keys::FORWARD_KEY_ENV,
                 keys.forward_key.as_config_str(),
             )
             .env(
-                sessions::keys::BELL_ENV,
+                boxes::keys::BELL_ENV,
                 if keys.bell_on_leader { "1" } else { "0" },
             )
             .args([
                 "-o",
-                &format!("SendEnv={}", sessions::keys::LEADER_ENV),
+                &format!("SendEnv={}", boxes::keys::LEADER_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::DETACH_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::DETACH_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::FORWARD_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::FORWARD_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::BELL_ENV),
+                &format!("SendEnv={}", boxes::keys::BELL_ENV),
             ]);
     }
 
@@ -313,72 +464,6 @@ pub struct HostAsks {
     held: std::collections::VecDeque<String>,
 }
 
-/// A dialog's view of the subscription while it is up: whether the host
-/// has taken its ask away. Every other line read here is held, in order,
-/// for the serving loop.
-pub struct AskWatch<'a> {
-    ask_id: minimald_rpc::AskId,
-    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-    held: &'a mut std::collections::VecDeque<String>,
-}
-
-impl<'a> AskWatch<'a> {
-    pub(crate) fn new(
-        ask_id: minimald_rpc::AskId,
-        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
-        held: &'a mut std::collections::VecDeque<String>,
-    ) -> Self {
-        Self {
-            ask_id,
-            subscription,
-            held,
-        }
-    }
-
-    /// The subscription's socket, for a poll beside the terminal.
-    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
-        self.subscription.get_ref().as_fd()
-    }
-
-    /// Whether bytes already read off the socket are waiting: a poll of
-    /// the socket would not see them.
-    pub(crate) fn has_buffered(&self) -> bool {
-        !self.subscription.buffer().is_empty()
-    }
-
-    /// Read one line. `true` when it ends this dialog: the dismissal of
-    /// this ask, or the subscription ending, after which nothing this
-    /// attach records could count. Any other line is held.
-    pub(crate) fn take_line(&mut self) -> bool {
-        use std::io::BufRead as _;
-        let mut line = String::new();
-        match self.subscription.read_line(&mut line) {
-            Ok(0) | Err(_) => return true,
-            Ok(_) => {}
-        }
-        if is_dismissal_of(&line, self.ask_id) {
-            return true;
-        }
-        self.held.push_back(line);
-        false
-    }
-
-    /// Block until the host dismisses this ask or the subscription ends:
-    /// a dialog that never answers.
-    pub fn wait_dismissed(&mut self) {
-        while !self.take_line() {}
-    }
-}
-
-/// Whether `line` is the host's dismissal of `ask_id`.
-fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
-    matches!(
-        serde_json_lenient::from_str(line.trim()),
-        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
-    )
-}
-
 /// The terminal side of the ask dialog: the relay's suspend and resume, as
 /// a trait so the serving loop is testable without a pty.
 pub trait AskTerminal {
@@ -494,7 +579,7 @@ fn host_control_within(
 pub fn hold_box_name_beside(
     ssh_sock: &Path,
     box_name: &str,
-    session_id: Option<sessions::SessionId>,
+    session_id: Option<boxes::SessionId>,
     hold: bool,
 ) {
     let Some(control_sock) = ssh_sock
@@ -551,7 +636,7 @@ pub fn hold_box_name_beside(
 pub fn withdraw_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
@@ -593,7 +678,7 @@ pub fn withdraw_box_row_at(
 pub fn withdraw_box_row_beside(
     ssh_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(control_sock) = ssh_sock
@@ -631,7 +716,7 @@ pub fn withdraw_box_row_beside(
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
-    addresses: sessions::BoxAddresses,
+    addresses: boxes::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
 ) -> anyhow::Result<bool> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
@@ -868,11 +953,7 @@ impl HostAsks {
 /// The one line a late answer prints: how the ask it answered had already
 /// ended, as the VM host daemon recorded it.
 #[must_use]
-pub fn late_answer_line(
-    port: u16,
-    proto: sessions::IpProto,
-    end: minimald_rpc::AskLateEnd,
-) -> String {
+pub fn late_answer_line(port: u16, proto: boxes::IpProto, end: minimald_rpc::AskLateEnd) -> String {
     match end {
         minimald_rpc::AskLateEnd::Allowed => {
             format!("ask {port}/{proto} was already allowed by another attach")
@@ -953,9 +1034,45 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
     Ok(wire)
 }
 
+/// The one trace variable the ssh child carries to the daemon: the
+/// process's `TRACEPARENT`, or the opt-out marker when telemetry is off
+/// ([`crate::telemetry_opted_out`]).
+pub(crate) fn trace_env() -> (&'static str, String) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    if crate::telemetry_opted_out() {
+        (OTEL_ENV, OTEL_OFF.to_owned())
+    } else {
+        (TRACEPARENT_ENV, crate::trace_context().traceparent())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale owner file (its owner gone, its lock free) is swept; one a
+    /// live process holds stays, as does anything that is not an owner file.
+    #[test]
+    fn stale_owner_locks_are_swept_and_held_ones_kept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let stale = dir.path().join("proxy-owner-1-1.lock");
+        std::fs::File::create(&stale).expect("the stale file");
+        let held_path = dir.path().join("proxy-owner-2-2.lock");
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&held_path).expect("the held file"),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let other = dir.path().join(OWNER_COORD_FILE);
+        std::fs::File::create(&other).expect("the coordination file");
+
+        sweep_stale_owner_locks(dir.path());
+
+        assert!(!stale.exists(), "a free owner file is swept");
+        assert!(held_path.exists(), "a held owner file is kept");
+        assert!(other.exists(), "the coordination file is not an owner file");
+        drop(held);
+    }
     use std::path::PathBuf;
 
     /// The dashboard's hold verbs: a release is one release line naming the
@@ -989,7 +1106,7 @@ mod tests {
             }
             seen
         });
-        let id = sessions::SessionId::nil();
+        let id = boxes::SessionId::nil();
         hold_box_name_beside(&ssh_sock, "web", Some(id), false);
         hold_box_name_beside(&ssh_sock, "api", Some(id), true);
         let seen = server.join().unwrap();
@@ -1011,7 +1128,7 @@ mod tests {
     #[test]
     fn late_answer_line_names_the_real_end() {
         use minimald_rpc::{AskCancelCause, AskLateEnd};
-        let tcp = sessions::IpProto::Tcp;
+        let tcp = boxes::IpProto::Tcp;
         assert_eq!(
             late_answer_line(3000, tcp, AskLateEnd::Allowed),
             "ask 3000/tcp was already allowed by another attach"
@@ -1035,7 +1152,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1046,6 +1163,14 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
         );
+        // The proxy is told who it serves (lab scenario 732): without the
+        // flag a SIGKILLed `min` leaves the daemon socket open again.
+        let owner = format!("--owner {}", std::process::id());
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains(&owner)),
+            "the ProxyCommand should name this process as the proxy's owner: {args:?}"
+        );
     }
 
     /// The exec path (`wire: Some`) is not the relay's: its command carries
@@ -1054,7 +1179,7 @@ mod tests {
     #[test]
     fn exec_path_keeps_inherited_stdio() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1074,8 +1199,8 @@ mod tests {
     #[test]
     fn attach_command_bounds_the_handshake() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
-        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
 
         let args = |cmd: &std::process::Command| -> Vec<String> {
             cmd.get_args()
@@ -1117,7 +1242,7 @@ mod tests {
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1133,7 +1258,7 @@ mod tests {
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
         let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref(), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), wire.as_deref(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1233,8 +1358,8 @@ mod tests {
     #[test]
     fn attach_command_negotiates_session_keys_when_given() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let keys = sessions::keys::SessionKeys::default();
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, Some(&keys)).unwrap();
+        let keys = boxes::keys::SessionKeys::default();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, Some(&keys)).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1248,19 +1373,19 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            env.get(sessions::keys::LEADER_ENV).map(String::as_str),
+            env.get(boxes::keys::LEADER_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::DETACH_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
             Some("d")
         );
         assert_eq!(
-            env.get(sessions::keys::FORWARD_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::FORWARD_KEY_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::BELL_ENV).map(String::as_str),
+            env.get(boxes::keys::BELL_ENV).map(String::as_str),
             Some("0")
         );
 
@@ -1269,10 +1394,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
@@ -1286,7 +1411,7 @@ mod tests {
     #[test]
     fn attach_command_omits_session_keys_when_none() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -1300,10 +1425,10 @@ mod tests {
             })
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(!env.contains_key(name), "{name} should not be set for exec");
         }
@@ -1313,10 +1438,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 !args.iter().any(|a| a == format!("SendEnv={name}").as_str()),

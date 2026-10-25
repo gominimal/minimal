@@ -22,6 +22,22 @@ pub mod refusal;
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
 
+/// How many outbound TCP connection attempts the switch keeps in flight at
+/// once (gvproxy's `tcpMaxInFlight`).
+///
+/// Each attempt holds its slot while the switch dials the remote host, and the
+/// switch drops a SYN that arrives with every slot taken, leaving the guest to
+/// retransmit on its backoff. gvproxy up to v0.8.9 fixed the bound at 10 and
+/// v0.9.0 defaults it to 128. A package manager opens a few hundred
+/// connections at once, so the bound is set above that burst.
+pub const TCP_MAX_IN_FLIGHT: u32 = 512;
+
+/// How long the switch waits on one outbound TCP dial before giving its slot
+/// back, in seconds (gvproxy's `tcpConnectTimeout`). It is gvproxy v0.9.0's
+/// own default, written out so the time an unanswered dial holds a slot does
+/// not move with the pinned version.
+pub const TCP_CONNECT_TIMEOUT_SECS: u32 = 30;
+
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
@@ -124,9 +140,8 @@ pub const SWITCH_SLICE_PREFIX: u8 = 27;
 pub const GVPROXY_FILE: &str = "gvproxy-min";
 
 /// System package install path for the switch binary: where the distro
-/// packages place it (`packaging/nfpm.yaml` for deb/rpm/apk,
-/// `packaging/arch/PKGBUILD-bin.tmpl` for the AUR), so a host that installed
-/// minimal through its package manager finds the binary without a user-local
+/// packages of earlier releases placed it, so a host that installed minimal
+/// through its package manager finds the binary without a user-local
 /// install.
 pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
 
@@ -614,11 +629,15 @@ impl MacAddr {
 
 /// Renders the gvproxy `-config` YAML for the given subnet and static leases.
 ///
-/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, DNS
-/// zone, and DHCP static leases are all expressed through a `-config` YAML file
-/// (see the 2026-06-21 spike). gvproxy reads this file only at spawn time; an
-/// `OwnIp` PTask configures its switch address statically rather than via DHCP,
-/// so `dhcpStaticLeases` is a startup-time seed, not a live source.
+/// The subnet, gateway, NAT alias, DNS zone, DHCP static leases and TCP
+/// forwarder bounds are all expressed through a `-config` YAML file (see the
+/// 2026-06-21 spike): gvproxy v0.9.0 also takes the subnet and gateway as CLI
+/// flags, but the rest is YAML-only. gvproxy reads this file only at spawn
+/// time; an `OwnIp` PTask configures its switch address statically rather than
+/// via DHCP, so `dhcpStaticLeases` is a startup-time seed, not a live source.
+///
+/// `tcpMaxInFlight` and `tcpConnectTimeout` need gvproxy v0.9.0 or later: an
+/// older switch ignores both keys and keeps its fixed bound of 10 attempts.
 #[must_use]
 pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)]) -> String {
     let mut s = String::with_capacity(256 + leases.len() * 48);
@@ -627,6 +646,10 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!("  subnet: \"{subnet}\"\n"));
     s.push_str(&format!("  gatewayIP: \"{}\"\n", subnet.gateway()));
     s.push_str(&format!("  gatewayMacAddress: \"{GATEWAY_MAC}\"\n"));
+    s.push_str(&format!("  tcpMaxInFlight: {TCP_MAX_IN_FLIGHT}\n"));
+    s.push_str(&format!(
+        "  tcpConnectTimeout: {TCP_CONNECT_TIMEOUT_SECS}\n"
+    ));
     s.push_str("  nat:\n");
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
     s.push_str("  gatewayVirtualIPs:\n");
@@ -807,6 +830,26 @@ mod tests {
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
     }
 
+    /// The switch's outbound TCP bounds are scalars directly under `stack:`,
+    /// spelled as gvproxy v0.9.0's `types.Configuration` reads them
+    /// (`tcpMaxInFlight`, and `tcpConnectTimeout` in whole seconds).
+    #[test]
+    fn gvproxy_config_raises_the_tcp_connect_bound() {
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        let mut lines = yaml.lines();
+        assert_eq!(lines.next(), Some("stack:"));
+        let stack: Vec<&str> = lines.collect();
+        assert!(
+            stack.iter().all(|l| l.starts_with("  ")),
+            "every key sits under `stack:`; config was:\n{yaml}"
+        );
+        assert!(stack.contains(&"  tcpMaxInFlight: 512"), "config:\n{yaml}");
+        assert!(
+            stack.contains(&"  tcpConnectTimeout: 30"),
+            "config:\n{yaml}"
+        );
+    }
+
     #[test]
     fn gvproxy_config_carries_host_min_internal() {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
@@ -916,10 +959,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn package_install_wins_over_the_operator_paths() {
-        // /usr/bin/gvproxy-min is where the system packages put the binary
-        // (packaging/nfpm.yaml, packaging/arch/PKGBUILD-bin.tmpl): a managed
-        // package install outranks an operator-provisioned /usr/lib path, and
-        // is itself outranked by a user-local install.
+        // /usr/bin/gvproxy-min is where the system packages of earlier
+        // releases put the binary: a managed package install outranks an
+        // operator-provisioned /usr/lib path, and is itself outranked by a
+        // user-local install.
         let tmp = tempfile::tempdir().unwrap();
         let package = tmp.path().join("package-gvproxy-min");
         std::fs::write(&package, b"from the package").unwrap();

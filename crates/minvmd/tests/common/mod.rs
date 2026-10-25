@@ -205,7 +205,7 @@ fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
 pub fn register_box(
     control_sock: &Path,
     name: &str,
-    egress: Option<sessions::EgressPolicy>,
+    egress: Option<boxes::EgressPolicy>,
 ) -> Result<(minimald_rpc::BoxAddresses, minimald_rpc::BoxId), String> {
     let request = minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),

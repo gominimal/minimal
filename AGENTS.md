@@ -37,6 +37,48 @@ crates and the product surface, and §3 adds which plane each crate belongs to
 When you change a crate's scope, update its `Cargo.toml` description too, so
 this information stays current.
 
+## Naming: box, Box Type, sandbox
+
+Use these terms in code, comments, docs and commit messages. The BOX spec
+([docs/specs/29-spec-box-local-first](docs/specs/29-spec-box-local-first/29-spec-box-local-first.md))
+plans the box model they describe. That spec defines the Box Types and the
+spec settings. Today the tree has `BoxId` and `BoxRecord`, and `minimald`
+still branches on session or task. The rest of this section is the target
+for new code.
+
+- A **box** is the thing itself: its record, id, state, lifecycle, events,
+  spec and processes. Code about the box says box, as `BoxId` and
+  `BoxRecord` do.
+- A **Box Type** names a kind of box, never the box itself. session and task
+  are Box Types. The BOX spec lists the rest.
+- A **sandbox** is the operating-system isolation (namespaces, mounts,
+  cgroups) that every box runs in: the `sandbox` crate. Package builds are
+  boxes of the `build` Box Type, though today `mip` runs them in the sandbox
+  directly, outside a box.
+- A **Box Host** is a running `minimald` that creates and hosts boxes, as
+  the architecture glossary defines it, not the machine it runs on. Gatehouse
+  calls an enrolled Box Host a node.
+
+Rules that follow from these:
+
+- `box` is a reserved word in Rust. A module about boxes is `boxes` or
+  `box_<noun>`, and a type is `Box<Noun>`. A bare `Box` shadows
+  `std::boxed::Box`.
+- Code never uses session or task to mean the box. Some wire, on-disk,
+  printed and environment names say session because a spec keeps them for
+  compatibility. Those keep their serialised name, and the Rust name says box
+  with a serde `rename` or `alias`.
+- Under the BOX spec, a box's behaviour follows the settings in its spec:
+  its lifetime, PTY, timeout and network mode. It never follows the Box Type
+  name. Besides type resolution, the Box Spec projection reads the type's
+  name, source and root, and admission checks a spec against the root's
+  constraints. Until then,
+  do not add new branching on session versus task where a setting can carry
+  the difference.
+- New files, modules and types about the box take box names from the start.
+  Rename code that still says session for the box in a pull request of its
+  own. Never mix a rename into a move or a feature change.
+
 ## Platform matrix
 
 | Platform | What you can build and test |
@@ -54,7 +96,7 @@ recipe, add one — the justfile is where local build knowledge lives.
 limit, not a coverage gap. Consequences:
 
 - `just test`, `just clippy`, and `just fix` scope themselves: on macOS they
-  resolve to `-p minvmd -p sessions` automatically (the justfile's `scope`
+  resolve to `-p minvmd -p boxes` automatically (the justfile's `scope`
   variable), on Linux to `--workspace`.
 - `just test-cross` covers the Linux-only crates — `minimald` and the `min`
   CLI's test targets included — by cross-compiling to musl in Docker
@@ -202,6 +244,78 @@ proves, `nightly` ships.
   that owns the list, or give the command that prints it (`just crates`,
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
+
+### User-facing text
+
+Everything `min`, `mip`, the daemons and the installer scripts print for a
+person is part of the product. Treat a message like an interface: specify it,
+test it, and review it.
+
+**Every message passes one test.** It states the current situation in plain
+words, or it tells the user one action to take and what that action does.
+Remove or rewrite a message that does neither.
+
+- Use the words the user types and sees: command names, flag names, file
+  paths. Do not name internal components, design terms, RPC names, or
+  requirement identifiers. A product term that the user configures or sees,
+  such as the Box Egress Proxy, is not an internal component. A process name
+  or a crate name is.
+- An instruction names a command the user can run as written. If no such
+  command exists, state the situation and stop.
+- A command that takes an argument shows it. Fill in the value when the
+  message knows it. Use a placeholder in angle brackets when it does not, or
+  when the value is a secret. A secret prints only where the command itself
+  just issued it for the user to keep.
+- Say only what the code can prove. Leave out a remedy that you did not check
+  against the code path that prints the message.
+- When one condition covers several causes with different outcomes, say what
+  can happen, not one outcome.
+- Give each fact its own sentence. Do not merge sentences that read alike but
+  state different facts.
+- A label that prints after both a pass mark and a fail mark is a noun
+  phrase, never a statement.
+- A refusal says what the tool refused, why, and the next step. Where a flag
+  and a `minimal.toml` setting both give the remedy, name both.
+- Use one name for one thing across the CLI, the dashboard and the docs. When
+  a sentence appears in two places, change both or neither.
+- A logged warning is not a message for the user. Log records go to the log.
+  Write a message for the user by hand.
+
+**Do not add a message before the box shell on a healthy start.** On an
+interactive attach, the shell's first paint replaces whatever the command
+printed before it, so nobody can read a line there. A command that does not
+attach, or that runs without a terminal, prints lines that stay. A healthy
+start is one that reaches the shell with nothing for the user to do. A value
+that a command prints on stdout for a script to read is output, not a message.
+
+- This rule governs new messages. A line that a spec requires at session
+  start stays until that spec changes. Do not remove it to satisfy this rule.
+- On the healthy path, do not add a warning or a note to an interactive start
+  or attach.
+- A new line can appear before the shell only when the command cannot
+  continue without a decision from the user. That line is a prompt that waits
+  for an answer. A prompt is never for information, and an advisory never
+  becomes a prompt.
+- Without a terminal, or with `--no-input`, a new prompt is an immediate
+  error that names the flag that answers it, and the command does not wait.
+- Anything else worth telling the user goes to a surface that stays, such as
+  `min ls`, `min session policy`, `min dash` or a notice inside the box. A
+  detail for whoever debugs the start goes to the log.
+- An error that ends the command is not covered by this rule: the command
+  exits non-zero and the text stays on screen.
+
+**When you specify or plan work that adds or changes a message:**
+
+- Write the exact text in the spec or the issue, with the condition that
+  prints it and the surface it appears on.
+- Say why it is true: name the code path or state that makes it so.
+- List the tests and scripts that pin the text, so the change updates them.
+- If a spec pins the old text, say so. Change the spec in the same piece of
+  work, or record the spec line that must follow in an issue linked from the
+  PR.
+
+**When you review such work**, read each new string as a user who has never
+seen the design. Apply the test above before you approve.
 
 ### Pre-PR verification
 
