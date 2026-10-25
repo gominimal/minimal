@@ -71,36 +71,56 @@ fn proxy_path() -> anyhow::Result<PathBuf> {
 /// `autospawn` starts `minvmd` with `Command::new("minvmd")`, which finds
 /// it on `PATH` in the same way. The `minvmd` that autospawn starts gets
 /// this process's environment, so it reads the same variable.
+///
+/// The item's access control trusts this path, so it is absolute. A
+/// relative variable is refused, and an empty or relative `PATH` entry is
+/// skipped, so a program in the current directory never becomes the
+/// trusted one. A path that exists comes back canonical. A path that does
+/// not exist comes back as is, and `run_set` refuses it.
+///
+/// This rule and `resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`
+/// predict the same program. One owner for the rule:
+/// <https://github.com/gominimal/minimal/issues/2527>.
 pub(crate) fn resolve_proxy(
     env: Option<&std::ffi::OsStr>,
     path: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(env) = env.filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(env));
-    }
-    let Some(minvmd) = find_on_path("minvmd", path) else {
-        bail!(
-            "min secret set did not read the value: no `minvmd` program is on PATH, \
-             and `min secret set` looks for the `bep` program beside it. \
-             Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
-            bep::store::PROXY_BIN_ENV
-        );
+    let proxy = match env.filter(|v| !v.is_empty()) {
+        Some(env) => {
+            let env = Path::new(env);
+            if !env.is_absolute() {
+                bail!(
+                    "min secret set did not read the value: {var} is the relative path {}. \
+                     Set {var} to the absolute path of the `bep` program, and run the command again.",
+                    env.display(),
+                    var = bep::store::PROXY_BIN_ENV
+                );
+            }
+            env.to_path_buf()
+        }
+        None => {
+            let Some(minvmd) = find_on_path("minvmd", path) else {
+                bail!(
+                    "min secret set did not read the value: no `minvmd` program is on PATH, \
+                     and `min secret set` looks for the `bep` program beside it. \
+                     Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
+                    bep::store::PROXY_BIN_ENV
+                );
+            };
+            proxy_binary_path(None, &minvmd)
+        }
     };
-    Ok(proxy_binary_path(None, &minvmd))
+    Ok(std::fs::canonicalize(&proxy).unwrap_or(proxy))
 }
 
-/// The first executable file `name` in the directories of `path`, in the
-/// order that `execvp` tries them. An empty entry is the current directory.
+/// The first executable file `name` in the absolute directories of `path`,
+/// in the order that `execvp` tries them. An empty or relative entry names
+/// a directory under the current one, so it is skipped.
 fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    std::env::split_paths(path?).find_map(|dir| {
-        let dir = if dir.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            dir
-        };
-        let candidate = dir.join(name);
-        is_executable(&candidate).then_some(candidate)
-    })
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
 }
 
 #[cfg(unix)]
@@ -184,7 +204,7 @@ pub(crate) fn run_set(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     refuse_set_args(args)?;
-    if !proxy.is_file() {
+    if !proxy.is_absolute() || !proxy.is_file() {
         bail!(
             "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
              Only that program can read the stored secret without a prompt. \
@@ -742,5 +762,78 @@ attributes:
         assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
         assert!(text.contains(bep::store::PROXY_BIN_ENV), "{text}");
         assert!(resolve_proxy(None, None).is_err());
+
+        // An empty PATH entry is the current directory: skipped, so the
+        // `minvmd` after it is the anchor, and alone it finds nothing.
+        let after_empty = std::env::join_paths([Path::new(""), second.path()]).unwrap();
+        assert_eq!(
+            resolve_proxy(None, Some(&after_empty)).unwrap(),
+            second.path().join("bep")
+        );
+        let only_empty = std::ffi::OsString::from("");
+        let text = format!(
+            "{:#}",
+            resolve_proxy(None, Some(&only_empty)).expect_err("refused")
+        );
+        assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
+
+        // A relative PATH entry that reaches an executable `minvmd` from the
+        // current directory is skipped too.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(second.path().strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+        assert!(relative.join("minvmd").is_file(), "{}", relative.display());
+        let rel_path = std::env::join_paths([relative.as_path()]).unwrap();
+        let text = format!(
+            "{:#}",
+            resolve_proxy(None, Some(&rel_path)).expect_err("refused")
+        );
+        assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
+        let rel_then_abs = std::env::join_paths([relative.as_path(), first.path()]).unwrap();
+        std::fs::remove_file(first.path().join("minvmd")).unwrap();
+        assert!(resolve_proxy(None, Some(&rel_then_abs)).is_err());
+
+        // A relative MINVMD_BEP_BIN is refused, and names the variable.
+        for rel in ["bep", "./bep", "bin/bep"] {
+            let text = format!(
+                "{:#}",
+                resolve_proxy(Some(std::ffi::OsStr::new(rel)), Some(&path)).expect_err("refused")
+            );
+            assert!(text.contains("is the relative path"), "{text}");
+            assert!(text.contains(bep::store::PROXY_BIN_ENV), "{text}");
+        }
+
+        // A proxy that exists comes back canonical, through a symbolic link.
+        let real = second.path().join("bep");
+        std::fs::write(&real, b"").unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(resolve_proxy(None, Some(&path)).unwrap(), canonical);
+        #[cfg(unix)]
+        {
+            let link = none.path().join("bep-link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                resolve_proxy(Some(link.as_os_str()), Some(&path)).unwrap(),
+                canonical
+            );
+        }
+
+        // `run_set` refuses a relative proxy path, even one that exists.
+        let err = run_set(
+            &store,
+            &set_args(&["claude"]),
+            &relative.join("minvmd"),
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut PanicRead,
+            &mut out,
+        )
+        .expect_err("refused");
+        assert!(format!("{err:#}").contains("did not read the value"));
+        assert!(store.value("claude").is_none());
     }
 }
