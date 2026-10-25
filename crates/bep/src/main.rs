@@ -24,7 +24,6 @@
 
 use std::io::{self, Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -34,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
-use bep::control::{Control, Registry};
+use bep::control::{Control, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
@@ -44,7 +43,6 @@ use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::BoxRedeemer;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
-use tokio::signal::unix::SignalKind;
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// Runs the box egress proxy on this host.
@@ -159,7 +157,7 @@ where
                 "bep did not find your home directory. Give the socket with `bep --rotate-signing --control <PATH>`."
                     .to_string()
             })
-            .and_then(|control| request_rotation(&control, signal_rotation, ROTATE_TIMEOUT));
+            .and_then(|control| request_rotation(&control, ROTATE_TIMEOUT));
         return match rotated {
             Ok(report) => {
                 println!("{report}");
@@ -347,306 +345,114 @@ fn log_root(root: &RootCertificate) {
     );
 }
 
-/// What `bep --rotate-signing` prints when the rotation is done. The task
-/// text fixes these words (BEP-061).
-const ROTATED_SIGNING: &str =
-    "Signing certificate rotated. Running boxes keep working; nothing inside them changes.";
+/// What `bep --rotate-signing` prints when the rotation is done. It names
+/// the signing certificate the rotation replaced and the one now in use. The
+/// earlier task text fixes the last sentence (BEP-061).
+fn rotated_signing(old_fingerprint: &str, new_fingerprint: &str) -> String {
+    format!(
+        "Signing certificate rotated from {old_fingerprint} to {new_fingerprint}. \
+         Running boxes keep working; nothing inside them changes."
+    )
+}
 
-/// The suffix of the file a serving proxy holds locked for its life. It
-/// names the process, so `bep --rotate-signing` can reach it.
-const SERVE_LOCK: &str = "lock";
-
-/// The suffix of the file that holds the fingerprint of the signing CA that
-/// a serving proxy signs leaves with.
-const SIGNING_FINGERPRINT: &str = "signing";
-
-/// How long `bep --rotate-signing` waits for the serving proxy to report
-/// its new signing CA.
-const ROTATE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `bep --rotate-signing` waits for the serving proxy to answer.
+/// The rotation signs through the keychain, which can wait for a prompt.
+const ROTATE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The control socket of `bep serve` when `--control` names none.
 fn default_control() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/control.sock"))
 }
 
-/// A state file of the proxy whose control socket is `control`: the socket
-/// path with `.suffix` added. Each control socket has its own state, so two
-/// proxies in one directory do not share a lock.
-fn state_file(control: &Path, suffix: &str) -> PathBuf {
-    let mut name = control.as_os_str().to_owned();
-    name.push(".");
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// How long `bep serve` tries again to take its state while the lock is
-/// busy.
-const CLAIM_RETRY: Duration = Duration::from_secs(2);
-
-/// How long `bep serve` waits between two tries to take its state.
-const CLAIM_STEP: Duration = Duration::from_millis(50);
-
-/// What a serving proxy keeps on disk so that `bep --rotate-signing` can
-/// reach it: its process id, in a file it holds locked while it runs, and
-/// the fingerprint of the signing CA in use.
-#[derive(Debug)]
-struct ServeState {
-    control: PathBuf,
-    _lock: std::fs::File,
-}
-
-impl ServeState {
-    /// Takes the lock beside the control socket `control` for the process
-    /// `pid`, whose signing CA is `signing`. Tries again for up to `retry`
-    /// while the lock is busy, because `bep --rotate-signing` holds a shared
-    /// lock for a moment when it probes a stopped proxy. Gives `None` when
-    /// another serving proxy still holds it. Refuses a directory that
-    /// another user owns or can write, and a symlink at the lock path.
-    fn claim(
-        control: &Path,
-        pid: u32,
-        signing: &[u8],
-        retry: Duration,
-    ) -> io::Result<Option<Self>> {
-        let dir = control
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        // Another user who can write the directory can plant a symlink at
-        // a state file, and bep would write the file it names.
-        if !is_private(dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("another user owns or can write {}", dir.display()),
+/// `bep --rotate-signing`: asks the `bep serve` on the control socket
+/// `control` to rotate its signing CA, and waits up to `timeout` for the
+/// answer. Gives the line to print, which names the old and the new
+/// fingerprint (BEP-061).
+fn request_rotation(control: &Path, timeout: Duration) -> Result<String, String> {
+    use std::io::BufRead as _;
+    let socket = control.display();
+    let mut stream = match std::os::unix::net::UnixStream::connect(control) {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(format!(
+                "The signing certificate was not rotated, because no `bep serve` listens on {socket}. \
+                 Give the control socket of the running `bep serve` with `bep --rotate-signing --control <PATH>`. \
+                 Each `bep serve` issues a new signing certificate when it starts."
             ));
         }
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(state_file(control, SERVE_LOCK))?;
-        let deadline = std::time::Instant::now() + retry;
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(CLAIM_STEP);
-                }
-                Err(std::fs::TryLockError::Error(err)) => return Err(err),
-            }
+        Err(err) => {
+            return Err(format!(
+                "The signing certificate was not rotated, because bep did not connect to {socket}: {err}."
+            ));
         }
-        lock.set_len(0)?;
-        let state = Self {
-            control: control.to_path_buf(),
-            _lock: lock,
-        };
-        // The fingerprint is current before the pid names this process, so
-        // `bep --rotate-signing` never reads one from an earlier run as the
-        // signing CA in use.
-        state.record(signing)?;
-        writeln!(&state._lock, "{pid}")?;
-        Ok(Some(state))
-    }
-
-    /// Records `signing` as the signing CA in use. The write replaces the
-    /// file whole, so a reader never sees half of it. The staged file is
-    /// created fresh, so a symlink planted there is never followed.
-    fn record(&self, signing: &[u8]) -> io::Result<()> {
-        let path = state_file(&self.control, SIGNING_FINGERPRINT);
-        let staged = state_file(&path, "new");
-        match std::fs::remove_file(&staged) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&staged)?;
-        file.write_all(certificate_fingerprint(signing).as_bytes())?;
-        drop(file);
-        std::fs::rename(staged, path)
-    }
-}
-
-/// Issues a new signing CA under the unchanged root and records it. The
-/// root does not change, so a box's trust store needs no change (BEP-061).
-/// `Ca::renew_signing` logs the old and the new fingerprint.
-fn rotate<K: CaKey>(
-    ca: &Mutex<Ca<'_, K>>,
-    state: Option<&ServeState>,
-    now: SystemTime,
-) -> Result<(), CaError> {
-    let mut ca = ca.lock().unwrap_or_else(PoisonError::into_inner);
-    ca.renew_signing(now)?;
-    if let Some(state) = state
-        && let Err(error) = state.record(ca.signing())
-    {
-        tracing::warn!(control = %state.control.display(), %error, "did not record the new signing CA fingerprint");
-    }
-    Ok(())
-}
-
-/// Answers one rotation request from `bep --rotate-signing`. The rotation
-/// signs through the keychain, which can block or wait for a prompt, so it
-/// runs on a blocking thread and never stalls a runtime thread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-async fn rotate_on_request<K: CaKey + Send + Sync + 'static>(
-    ca: &Arc<Mutex<Ca<'static, K>>>,
-    state: &Option<Arc<ServeState>>,
-) {
-    let ca = Arc::clone(ca);
-    let state = state.clone();
-    let rotated =
-        tokio::task::spawn_blocking(move || rotate(&ca, state.as_deref(), SystemTime::now())).await;
-    match rotated {
-        Ok(Ok(())) => {}
-        Ok(Err(CaError::RootExpired(at))) => tracing::error!(
-            %at,
-            "the signing CA did not rotate: the root CA expired; run `bep --replace-key root`"
-        ),
-        Ok(Err(error)) => tracing::warn!(%error, "the signing CA did not rotate on request"),
-        Err(error) => tracing::warn!(%error, "the signing CA did not rotate on request"),
-    }
-}
-
-/// `bep --rotate-signing`: asks the `bep serve` on the control socket
-/// `control` to
-/// rotate its signing CA, through `notify`, and waits until it records a
-/// new one. Gives the line to print.
-fn request_rotation(
-    control: &Path,
-    notify: impl FnOnce(u32) -> io::Result<()>,
-    timeout: Duration,
-) -> Result<&'static str, String> {
-    let lock_path = state_file(control, SERVE_LOCK);
-    // A `bep serve` that did not claim its state still serves, so this
-    // names the missing state and not a missing proxy.
-    let not_running = || no_serve_state(control, &lock_path);
-    let lock = match std::fs::File::open(&lock_path) {
-        Ok(lock) => lock,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(not_running()),
-        Err(err) => return Err(format!("bep did not read {}: {err}", lock_path.display())),
     };
-    let probe = lock.try_lock_shared();
-    // Release the probe before anything else, so a `bep serve` that starts
-    // now does not find the lock busy.
-    drop(lock);
-    match probe {
-        // Nothing holds the lock, so the file is from a proxy that stopped.
-        Ok(()) => return Err(not_running()),
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(err)) => {
-            return Err(format!("bep did not read {}: {err}", lock_path.display()));
-        }
-    }
-    // Signal only a process that this user recorded. Another user who can
-    // write the file can name any process in it.
-    if let Some(unsafe_path) = not_private(&lock_path) {
+    let mut request =
+        serde_json::to_vec(&RotationRequest::RotateSigning).map_err(|err| err.to_string())?;
+    request.push(b'\n');
+    let sent = stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .and_then(|()| stream.write_all(&request));
+    if let Err(err) = sent {
         return Err(format!(
-            "The signing certificate was not rotated, because another user owns or can write {}. \
-             Run `bep --rotate-signing` as the user that runs `bep serve`, or make that path writable only by that user.",
-            unsafe_path.display()
+            "The signing certificate was not rotated, because bep did not send the request to {socket}: {err}."
         ));
     }
-    let pid = std::fs::read_to_string(&lock_path)
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .ok_or_else(|| {
-            format!(
-                "The signing certificate was not rotated: {} names no process. Run `bep --rotate-signing` again.",
-                lock_path.display()
-            )
-        })?;
-    let fingerprint_path = state_file(control, SIGNING_FINGERPRINT);
-    let read_fingerprint = || std::fs::read_to_string(&fingerprint_path).ok();
-    let before = read_fingerprint();
-    notify(pid).map_err(|err| {
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            not_running()
-        } else {
-            format!("The signing certificate was not rotated: bep did not reach `bep serve` (process {pid}): {err}.")
-        }
-    })?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let now = read_fingerprint();
-        if now.is_some() && now != before {
-            return Ok(ROTATED_SIGNING);
-        }
-        if std::time::Instant::now() >= deadline {
+    let mut line = String::new();
+    match io::BufReader::new(&stream).read_line(&mut line) {
+        Ok(0) => {
             return Err(format!(
-                "`bep serve` (process {pid}) did not report a new signing certificate within {} seconds. \
-                 Its log says why.",
+                "The signing certificate was not rotated: `bep serve` on {socket} closed the connection with no answer. \
+                 `bep serve` closes a connection from another user, and its log says why."
+            ));
+        }
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(format!(
+                "`bep serve` on {socket} did not answer within {} seconds. \
+                 The signing certificate can still rotate. The log of `bep serve` says if it did.",
                 timeout.as_secs()
             ));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        Err(err) => {
+            return Err(format!(
+                "bep did not read the answer of `bep serve` on {socket}: {err}. \
+                 The log of `bep serve` says if the signing certificate rotated."
+            ));
+        }
     }
-}
-
-/// What `bep --rotate-signing` says when no `bep serve` holds the state at
-/// `lock_path`. Either no proxy uses `control`, or the proxy did not claim
-/// its state and logged why. A restart rotates in both cases.
-fn no_serve_state(control: &Path, lock_path: &Path) -> String {
-    format!(
-        "The signing certificate was not rotated, because no `bep serve` holds its state at {lock}. \
-         Either no `bep serve` uses the control socket {control}, or a `bep serve` did not claim that state. \
-         The log of a running `bep serve` says why it did not claim it. \
-         To rotate, stop `bep serve` and start it again. \
-         Each `bep serve` issues a new signing certificate when it starts.",
-        lock = lock_path.display(),
-        control = control.display(),
-    )
-}
-
-/// The first of `lock_path` and its directory that another user owns or can
-/// write, or that bep cannot inspect. `None` when both are private to the
-/// caller.
-fn not_private(lock_path: &Path) -> Option<PathBuf> {
-    let dir = lock_path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    [lock_path, dir]
-        .into_iter()
-        .find(|path| !is_private(path))
-        .map(Path::to_path_buf)
-}
-
-/// Whether the caller owns `path` and no other user can write it. `false`
-/// when bep cannot inspect it.
-fn is_private(path: &Path) -> bool {
-    // SAFETY: `geteuid` takes no argument and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    matches!(std::fs::metadata(path), Ok(meta) if meta.uid() == me && meta.mode() & 0o022 == 0)
-}
-
-/// Asks the process `pid` to rotate its signing CA, with SIGUSR1.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn signal_rotation(pid: u32) -> io::Result<()> {
-    // A pid of 0 or less signals a whole process group.
-    let pid = libc::pid_t::try_from(pid)
-        .ok()
-        .filter(|pid| *pid > 0)
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-    // SAFETY: `kill` takes no pointer. It sends one signal to one process.
-    if unsafe { libc::kill(pid, libc::SIGUSR1) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    let reply: RotationReply = serde_json::from_str(&line).map_err(|err| {
+        format!(
+            "bep did not understand the answer of `bep serve` on {socket}: {err}. \
+             The log of `bep serve` says if the signing certificate rotated."
+        )
+    })?;
+    match reply {
+        RotationReply {
+            ok: true,
+            old_fingerprint: Some(old),
+            new_fingerprint: Some(new),
+            ..
+        } => Ok(rotated_signing(&old, &new)),
+        RotationReply {
+            ok: false,
+            error: Some(error),
+            ..
+        } => Err(format!("The signing certificate was not rotated: {error}.")),
+        _ => Err(format!(
+            "bep did not understand the answer of `bep serve` on {socket}. \
+             The log of `bep serve` says if the signing certificate rotated."
+        )),
     }
 }
 
@@ -671,12 +477,10 @@ fn renewal_wait(expiry: SystemTime, now: SystemTime) -> Duration {
 
 /// Renews the signing CA of a serving proxy before each expiry, so the
 /// proxy keeps signing leaves past one signing CA validity. The root does
-/// not change, so running boxes see no change (BEP-061).
+/// not change, so running boxes see no change (BEP-061). `Ca::renew_signing`
+/// logs the old and the new fingerprint.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
-    ca: Arc<Mutex<Ca<'static, K>>>,
-    state: Option<Arc<ServeState>>,
-) {
+fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(ca: Arc<Mutex<Ca<'static, K>>>) {
     let expiry_of = |ca: &Mutex<Ca<'static, K>>| {
         ca.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -693,7 +497,11 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
                 std::thread::sleep(wait.min(RENEW_CHECK));
                 continue;
             }
-            match rotate(&ca, state.as_deref(), SystemTime::now()) {
+            let renewed = ca
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .renew_signing(SystemTime::now());
+            match renewed {
                 Ok(()) if expiry_of(&ca) > expiry => {}
                 Ok(()) => {
                     // The signing CA never outlives the root, so a renewal
@@ -715,24 +523,6 @@ fn keep_signing_renewed<K: CaKey + Send + Sync + 'static>(
             }
         }
     });
-}
-
-/// Takes the state of this serving proxy beside its control socket. With
-/// no state, `bep --rotate-signing` cannot reach it, and the proxy still
-/// serves and renews its signing CA.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn claim_state(control: &Path, signing: &[u8]) -> Option<Arc<ServeState>> {
-    match ServeState::claim(control, std::process::id(), signing, CLAIM_RETRY) {
-        Ok(Some(state)) => Some(Arc::new(state)),
-        Ok(None) => {
-            tracing::warn!(control = %control.display(), "another `bep serve` holds the state; `bep --rotate-signing` reaches that one");
-            None
-        }
-        Err(error) => {
-            tracing::warn!(control = %control.display(), %error, "did not write the state that `bep --rotate-signing` reads");
-            None
-        }
-    }
 }
 
 /// What a start says when the root key did not issue the root certificate.
@@ -897,38 +687,17 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
-        // The handler is in place before the state names this process, so
-        // a SIGUSR1 from `bep --rotate-signing` never meets the default
-        // action, which ends the process.
-        let mut rotation = tokio::signal::unix::signal(SignalKind::user_defined1())
-            .map_err(|err| format!("bep did not take rotation requests: {err}"))?;
-        let signing = ca
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .signing()
-            .clone();
-        // `claim_state` can sleep for `CLAIM_RETRY`, so it runs off the
-        // runtime threads.
-        let claim_control = control.clone();
-        let state = tokio::task::spawn_blocking(move || claim_state(&claim_control, &signing))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "did not write the state that `bep --rotate-signing` reads");
-                None
-            });
-        keep_signing_renewed(Arc::clone(&ca), state.clone());
-        tokio::spawn(async move {
-            while rotation.recv().await.is_some() {
-                rotate_on_request(&ca, &state).await;
-            }
-        });
+        keep_signing_renewed(Arc::clone(&ca));
         let listener = Listener::bind(&args.listener, token, Arc::new(PeerAttested))
             .map_err(|err| format!("bep did not listen on {}: {err}", args.listener.display()))?;
         // The redeemer reads the client keys and the boxes this socket
         // registers, at each request.
+        // The same socket takes `bep --rotate-signing`, which rotates the
+        // signing CA the proxy signs leaves with (BEP-061).
         let control_socket = wiring
             .control(&control)
-            .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?;
+            .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
+            .with_rotation(ca);
         tracing::warn!(
             "A store-handle member is not admitted until #2280 lands. \
              No revocation is in force until #2277 and #2290 land. \
@@ -1395,176 +1164,30 @@ mod tests {
         }
     }
 
-    // BEP-061: `bep --rotate-signing` reaches the serving proxy, which
-    // issues a new signing CA under the root it already had. The command
-    // prints that running boxes need no change, and it refuses when no
-    // proxy runs. `bep serve` also renews its signing CA before it expires.
+    // BEP-061: `bep --rotate-signing` refuses when no `bep serve` listens on
+    // the control socket. `bep serve` also renews its signing CA before it
+    // expires.
     #[test]
     fn signing_ca_rotation_invisible_to_boxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("custom/one.sock");
+        let refused = request_rotation(&control, ROTATE_TIMEOUT);
+        assert_eq!(
+            refused.unwrap_err(),
+            format!(
+                "The signing certificate was not rotated, because no `bep serve` listens on {}. \
+                 Give the control socket of the running `bep serve` with `bep --rotate-signing --control <PATH>`. \
+                 Each `bep serve` issues a new signing certificate when it starts.",
+                control.display()
+            )
+        );
+
         let root_key = CaTestKey::new(Role::Root);
         let signing_key = CaTestKey::new(Role::Signing);
         let at = SystemTime::now();
         let root = bep::ca::issue_root(&root_key, registered_union(), at).unwrap();
-        let ca = Mutex::new(Ca::with_root(&root_key, &signing_key, root, at).unwrap());
-        let box_trust = ca.lock().unwrap().root().clone();
-        let dir = tempfile::tempdir().unwrap();
-        // A custom `--control` path: the state follows the socket.
-        let control = dir.path().join("custom/one.sock");
-        let other = dir.path().join("custom/two.sock");
-
-        // No proxy ran here, so there is nothing to rotate.
-        let refused = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert_eq!(
-            refused.unwrap_err(),
-            format!(
-                "The signing certificate was not rotated, because no `bep serve` holds its state at {}. \
-                 Either no `bep serve` uses the control socket {}, or a `bep serve` did not claim that state. \
-                 The log of a running `bep serve` says why it did not claim it. \
-                 To rotate, stop `bep serve` and start it again. \
-                 Each `bep serve` issues a new signing certificate when it starts.",
-                state_file(&control, SERVE_LOCK).display(),
-                control.display(),
-            )
-        );
-
-        // A fingerprint left by an earlier run is replaced before the lock
-        // names the new process.
-        let in_use = ca.lock().unwrap().signing().clone();
-        // The directory is private whatever the umask, as `bep serve`
-        // makes it, so `claim` does not refuse it on a host with umask 002.
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(control.parent().unwrap())
-            .unwrap();
-        let fingerprint_path = state_file(&control, SIGNING_FINGERPRINT);
-        std::fs::write(&fingerprint_path, "from an earlier run").unwrap();
-
-        // A symlink planted at a state file is never written through.
-        let victim = dir.path().join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        let lock_path = state_file(&control, SERVE_LOCK);
-        std::os::unix::fs::symlink(&victim, &lock_path).unwrap();
-        assert!(
-            ServeState::claim(&control, 4242, &in_use, Duration::ZERO).is_err(),
-            "claim followed a symlink at the lock"
-        );
-        std::fs::remove_file(&lock_path).unwrap();
-        std::os::unix::fs::symlink(&victim, state_file(&fingerprint_path, "new")).unwrap();
-
-        // A `bep --rotate-signing` that holds a shared lock for a moment
-        // does not cost the starting proxy its state.
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .unwrap();
-        reader.try_lock_shared().unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            drop(reader);
-        });
-        let state = ServeState::claim(&control, 4242, &in_use, CLAIM_RETRY)
-            .unwrap()
-            .expect("claim gave up while a reader held the lock for a moment");
-        release.join().unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert_eq!(
-            std::fs::read_to_string(&fingerprint_path).unwrap(),
-            certificate_fingerprint(&in_use)
-        );
-        assert!(
-            ServeState::claim(&control, 4343, &in_use, Duration::ZERO)
-                .unwrap()
-                .is_none(),
-            "a second proxy took the state of a running one"
-        );
-        // A proxy on another socket in the same directory has its own state.
-        let refused = request_rotation(&other, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(
-            refused
-                .unwrap_err()
-                .contains("no `bep serve` holds its state")
-        );
-        assert!(
-            ServeState::claim(&other, 4444, &in_use, Duration::ZERO)
-                .unwrap()
-                .is_some(),
-            "two control sockets share one lock"
-        );
-        // A directory that another user can write is refused.
-        let loose = dir.path().join("loose");
-        std::fs::create_dir(&loose).unwrap();
-        let mut mode = std::fs::metadata(&loose).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o777);
-        std::fs::set_permissions(&loose, mode).unwrap();
-        assert!(
-            ServeState::claim(&loose.join("control.sock"), 4545, &in_use, Duration::ZERO).is_err(),
-            "claim wrote state in a directory another user can write"
-        );
-
-        let mut asked = None;
-        let printed = request_rotation(
-            &control,
-            |pid| {
-                asked = Some(pid);
-                rotate(&ca, Some(&state), SystemTime::now()).map_err(io::Error::other)
-            },
-            ROTATE_TIMEOUT,
-        );
-        assert_eq!(
-            printed.unwrap(),
-            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
-        );
-        assert_eq!(asked, Some(4242), "the request went to another process");
-        let ca_now = ca.lock().unwrap();
-        assert_eq!(*ca_now.root(), box_trust, "the root changed");
-        assert_ne!(
-            *ca_now.signing(),
-            in_use,
-            "the serving proxy kept its signing CA"
-        );
-        assert_eq!(
-            std::fs::read_to_string(state_file(&control, SIGNING_FINGERPRINT)).unwrap(),
-            certificate_fingerprint(ca_now.signing())
-        );
-        drop(ca_now);
-
-        // A lock file that another user can write names no process to
-        // trust.
-        let private = std::fs::metadata(&lock_path).unwrap().permissions();
-        let mut shared = private.clone();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut shared, 0o666);
-        std::fs::set_permissions(&lock_path, shared).unwrap();
-        let planted = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(
-            planted
-                .unwrap_err()
-                .contains("another user owns or can write")
-        );
-        std::fs::set_permissions(&lock_path, private).unwrap();
-
-        // A proxy that answers nothing gets a refusal, not a claim.
-        let silent = request_rotation(&control, |_| Ok(()), Duration::ZERO);
-        assert!(
-            silent
-                .unwrap_err()
-                .contains("did not report a new signing certificate")
-        );
-
-        // A proxy that stopped leaves its file unlocked.
-        drop(state);
-        let stale = request_rotation(&control, |_| unreachable!(), ROTATE_TIMEOUT);
-        assert!(
-            stale
-                .unwrap_err()
-                .contains("no `bep serve` holds its state")
-        );
-
-        let expiry = ca.lock().unwrap().signing_expiry();
+        let ca = Ca::with_root(&root_key, &signing_key, root, at).unwrap();
+        let expiry = ca.signing_expiry();
         let at = SystemTime::now();
         assert!(expiry > at + RENEW_BEFORE_EXPIRY);
         let wait = renewal_wait(expiry, at);
@@ -1615,11 +1238,39 @@ mod tests {
         }
     }
 
-    // BEP-061: a rotation request reaches `bep serve` through the same
-    // handler as SIGUSR1. The keychain signature runs on a blocking thread,
-    // never on a runtime thread, and the rotation still completes.
+    /// Whether `leaf` validates for `hostname` at `at` against `root` alone,
+    /// as a box that holds only the root checks it.
+    fn validates(
+        root: &rustls::pki_types::CertificateDer<'_>,
+        leaf: &Leaf,
+        hostname: &str,
+        at: SystemTime,
+    ) -> bool {
+        use rustls::pki_types::{ServerName, UnixTime};
+        let anchors = [webpki::anchor_from_trusted_cert(root).unwrap()];
+        let ee = webpki::EndEntityCert::try_from(&leaf.chain[0]).unwrap();
+        let time = UnixTime::since_unix_epoch(at.duration_since(SystemTime::UNIX_EPOCH).unwrap());
+        let path = ee.verify_for_usage(
+            &[webpki::ring::ECDSA_P256_SHA256],
+            &anchors,
+            &leaf.chain[1..],
+            time,
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        );
+        let name = ServerName::try_from(hostname.to_owned()).unwrap();
+        path.is_ok() && ee.verify_is_valid_for_subject_name(&name).is_ok()
+    }
+
+    // BEP-061: `bep --rotate-signing` reaches the serving proxy over its
+    // control socket, which issues a new signing CA under the root it
+    // already had. The command prints the old and the new fingerprint. A
+    // leaf issued before the rotation and one issued after both validate
+    // against the root a box holds. The keychain signature runs on a
+    // blocking thread, never on a runtime thread.
     #[tokio::test(flavor = "current_thread")]
-    async fn signing_ca_rotation_invisible_to_boxes_off_the_runtime() {
+    async fn rotate_signing_over_control_socket_keeps_leaves_valid() {
         let runtime_thread = std::thread::current().id();
         let root_key: &'static ThreadNotingKey = Box::leak(Box::new(ThreadNotingKey {
             inner: CaTestKey::new(Role::Root),
@@ -1634,60 +1285,72 @@ mod tests {
         let ca = Arc::new(Mutex::new(
             Ca::with_root(root_key, signing_key, root, at).unwrap(),
         ));
-        let (box_trust, in_use) = {
+        let (box_trust, in_use, before) = {
             let ca = ca.lock().unwrap();
-            (ca.root().clone(), ca.signing().clone())
+            let before = ca.issue_leaf("api.github.com", at).unwrap();
+            (ca.root().clone(), ca.signing().clone(), before)
         };
         root_key.signed_on.lock().unwrap().clear();
 
         let dir = tempfile::tempdir().unwrap();
-        let control = dir.path().join("private/control.sock");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(control.parent().unwrap())
-            .unwrap();
-        let state = ServeState::claim(&control, std::process::id(), &in_use, Duration::ZERO)
+        let control = dir.path().join("bep/control.sock");
+        let socket = Control::bind(&control, Registry::default(), BoxRegistry::default())
             .unwrap()
-            .map(Arc::new);
-        assert!(state.is_some(), "the test proxy did not claim its state");
-
-        // The loop `bep serve` runs for SIGUSR1, fed from a channel.
-        let (request, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let serving = Arc::clone(&ca);
-        tokio::spawn(async move {
-            while requests.recv().await.is_some() {
-                rotate_on_request(&serving, &state).await;
-            }
-        });
+            .with_rotation(Arc::clone(&ca) as _);
+        tokio::spawn(socket.run());
 
         let asking = control.clone();
-        let printed = tokio::task::spawn_blocking(move || {
-            request_rotation(
-                &asking,
-                |_| request.send(()).map_err(io::Error::other),
-                ROTATE_TIMEOUT,
-            )
-        })
-        .await
-        .unwrap();
+        let printed =
+            tokio::task::spawn_blocking(move || request_rotation(&asking, ROTATE_TIMEOUT))
+                .await
+                .unwrap()
+                .unwrap();
+
+        let (signing_now, after) = {
+            let ca = ca.lock().unwrap();
+            assert_eq!(*ca.root(), box_trust, "the root changed");
+            let after = ca.issue_leaf("api.github.com", SystemTime::now()).unwrap();
+            (ca.signing().clone(), after)
+        };
+        assert_ne!(signing_now, in_use, "the signing CA did not rotate");
         assert_eq!(
-            printed.unwrap(),
-            "Signing certificate rotated. Running boxes keep working; nothing inside them changes."
+            printed,
+            format!(
+                "Signing certificate rotated from {} to {}. \
+                 Running boxes keep working; nothing inside them changes.",
+                certificate_fingerprint(&in_use),
+                certificate_fingerprint(&signing_now)
+            )
+        );
+        assert_eq!(before.chain[1], in_use);
+        assert_eq!(after.chain[1], signing_now);
+        let check_at = SystemTime::now();
+        assert!(
+            validates(&box_trust, &before, "api.github.com", check_at),
+            "the leaf issued before the rotation no longer validates against the root"
+        );
+        assert!(
+            validates(&box_trust, &after, "api.github.com", check_at),
+            "the leaf issued after the rotation does not validate against the root"
         );
 
-        let ca_now = ca.lock().unwrap();
-        assert_eq!(*ca_now.root(), box_trust, "the root changed");
-        assert_ne!(*ca_now.signing(), in_use, "the signing CA did not rotate");
-        assert_eq!(
-            std::fs::read_to_string(state_file(&control, SIGNING_FINGERPRINT)).unwrap(),
-            certificate_fingerprint(ca_now.signing())
-        );
-        let signed_on = root_key.signed_on.lock().unwrap();
+        let signed_on = root_key.signed_on.lock().unwrap().clone();
         assert!(!signed_on.is_empty(), "the rotation signed nothing");
         assert!(
             signed_on.iter().all(|thread| *thread != runtime_thread),
             "the rotation signed on the runtime thread"
+        );
+
+        // A control socket that holds no CA refuses the rotation.
+        let bare = dir.path().join("bare/control.sock");
+        let socket = Control::bind(&bare, Registry::default(), BoxRegistry::default()).unwrap();
+        tokio::spawn(socket.run());
+        let refused = tokio::task::spawn_blocking(move || request_rotation(&bare, ROTATE_TIMEOUT))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.unwrap_err(),
+            "The signing certificate was not rotated: this proxy does not rotate its signing certificate."
         );
     }
 
