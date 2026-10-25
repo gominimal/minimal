@@ -91,7 +91,8 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// The daemon stamps the box's type, parent and project root here
 /// (BOX-001): `box_type` is the creating verb's, `parent` is `parent`, which
 /// the caller derives from the creating connection and never from the
-/// request, and `project_root` is the project directory the client resolved.
+/// request, and `project_root` is the project root the client resolved,
+/// or the project path when an older client sends no root.
 fn build_record(
     config: minimald_rpc::BoxConfig,
     username: Option<String>,
@@ -117,7 +118,14 @@ fn build_record(
         id: SessionId::nil(),
         name: config.name,
         username,
-        project_root: Some(config.project_path.clone()),
+        // The root the client resolved from the project's `minimal.toml`.
+        // A client that predates the field sends none: the working path is
+        // the best root the daemon has then.
+        project_root: Some(
+            config
+                .project_root
+                .unwrap_or_else(|| config.project_path.clone()),
+        ),
         project_path: config.project_path,
         network: config.network,
         policy: config.policy,
@@ -1355,7 +1363,7 @@ impl BoxManager {
         skip_all,
         fields(
             box_id = tracing::field::Empty,
-            box_type = boxes::SESSION_BOX_TYPE,
+            box_type = tracing::field::Empty,
             parent = tracing::field::Empty,
         )
     )]
@@ -1417,13 +1425,20 @@ impl BoxManager {
         // creating connection once one can carry that identity, never from
         // the request body.
         let parent = None;
+        // BOX-001: the type is the creating verb's. A client that predates
+        // the field sends none, which reads as the session verb.
+        let box_type = match config.creating_verb {
+            minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+            minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+        };
         let record = build_record(
             config,
             username,
             boxes::BoxState::Pending,
-            boxes::SESSION_BOX_TYPE,
+            box_type,
             parent,
         )?;
+        tracing::Span::current().record("box_type", box_type);
         let project_root = record.project_root.clone();
         let name = record.name.clone();
         let retry = record.clone();
@@ -1466,7 +1481,7 @@ impl BoxManager {
         tracing::info!(
             session_id = %session_id,
             box_id = %box_id,
-            box_type = boxes::SESSION_BOX_TYPE,
+            box_type = %box_type,
             parent = %parent_field,
             project_root = ?project_root.as_ref().map(paths::HostAbsPath::as_str),
             "filed the box record"
@@ -2092,6 +2107,8 @@ mod create_stamp_tests {
             .collect(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
         }
     }
 
@@ -2132,17 +2149,49 @@ mod create_stamp_tests {
         }
     }
 
+    /// BOX-001: the record's type is the creating verb's, one box per verb.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_create_path_records_type_from_creating_verb() {
+        let (_state, _cache, mngr) = manager().await;
+        for (name, verb, expected) in [
+            (
+                "by-session",
+                minimald_rpc::CreatingVerb::Session,
+                boxes::SESSION_BOX_TYPE,
+            ),
+            (
+                "by-task",
+                minimald_rpc::CreatingVerb::Task,
+                boxes::TASK_BOX_TYPE,
+            ),
+        ] {
+            let mut config = config(name, "/home/dev/proj");
+            config.creating_verb = verb;
+            let id = mngr.create_session(config, None).await.unwrap();
+            assert_eq!(record(&mngr, id).await.box_type.as_deref(), Some(expected));
+        }
+    }
+
+    /// BOX-001: the record holds the project root the client resolved, not
+    /// the working path. A client that sends no root gets the working path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_records_project_root() {
         let (_state, _cache, mngr) = manager().await;
+        let mut rooted = config("rooted", "/home/dev/proj/sub");
+        rooted.project_root = Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap());
+        let id = mngr.create_session(rooted, None).await.unwrap();
+        assert_eq!(
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap())
+        );
+
         let id = mngr
-            .create_session(config("rooted", "/home/dev/proj"), None)
+            .create_session(config("older-client", "/home/dev/proj/sub"), None)
             .await
             .unwrap();
-        let record = record(&mngr, id).await;
         assert_eq!(
-            record.project_root,
-            Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap())
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
         );
     }
 }
