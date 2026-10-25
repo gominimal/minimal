@@ -955,8 +955,16 @@ fn serve<K: CaKey + Send + Sync + 'static>(
 /// signs in under the same id.
 const GITHUB_APP_CLIENT_ID: &str = "Iv23liv6KetAFJp4Eb5K";
 
-/// The environment variable that carries the App's client secret, which
-/// the host passes to the proxy. A browser-flow sign-in renews under it.
+/// The App's client secret, embedded at build time from the
+/// `MINIMAL_GITHUB_APP_CLIENT_SECRET` variable, as `min` embeds its own
+/// (`BUILT_IN_SECRET` in `crates/minimal/src/cmd/auth.rs`). A browser-flow
+/// sign-in renews under it (Gatehouse §6.10). A build without it renews
+/// only device-flow sign-ins.
+const BUILT_IN_SECRET: Option<&str> = option_env!("MINIMAL_GITHUB_APP_CLIENT_SECRET");
+
+/// The environment variable that overrides [`BUILT_IN_SECRET`] at run time.
+/// No launcher sets it: the embedded secret is the default, and this is for
+/// a build or a test that runs under another App secret.
 const CLIENT_SECRET_ENV: &str = "MINIMAL_GITHUB_APP_CLIENT_SECRET";
 
 /// How long one renewal has, in all, to look up GitHub, connect, send and
@@ -977,22 +985,34 @@ struct GitHubTokenEndpoint {
 
 impl GitHubTokenEndpoint {
     /// The endpoint at `github.com`, trusting `roots`. The client secret is
-    /// read from [`CLIENT_SECRET_ENV`].
+    /// the one embedded at build time ([`BUILT_IN_SECRET`]). A non-empty
+    /// [`CLIENT_SECRET_ENV`] at run time overrides it.
     ///
     /// # Errors
     ///
     /// When the TLS client is not built.
     fn new(roots: rustls::RootCertStore) -> Result<Self, String> {
-        let client_secret = std::env::var(CLIENT_SECRET_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(Zeroizing::new);
+        let run_time = std::env::var(CLIENT_SECRET_ENV).ok();
+        let client_secret = client_secret(BUILT_IN_SECRET, run_time);
         if client_secret.is_none() {
             tracing::info!(
                 env = CLIENT_SECRET_ENV,
-                "no GitHub App client secret was given; a browser-flow sign-in will not renew at the proxy"
+                "this build embeds no GitHub App client secret and none was given; a browser-flow sign-in will not renew at the proxy"
             );
         }
+        Self::with_secret(roots, client_secret)
+    }
+
+    /// The endpoint at `github.com`, trusting `roots`, with `client_secret`
+    /// for a browser-flow sign-in.
+    ///
+    /// # Errors
+    ///
+    /// When the TLS client is not built.
+    fn with_secret(
+        roots: rustls::RootCertStore,
+        client_secret: Option<Zeroizing<String>>,
+    ) -> Result<Self, String> {
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
@@ -1141,6 +1161,38 @@ fn form_encode(value: &str) -> String {
 
 impl TokenEndpoint for GitHubTokenEndpoint {
     fn refresh(&self, flow: signin::Flow, refresh_token: &str) -> Result<Refreshed, RefreshError> {
+        let body = self.refresh_body(flow, refresh_token)?;
+        self.exchange(&body)
+    }
+}
+
+impl GitHubTokenEndpoint {
+    /// The form body of a refresh of `refresh_token`. A browser-flow sign-in
+    /// carries the client secret, and without one the renewal is refused.
+    fn refresh_body(
+        &self,
+        flow: signin::Flow,
+        refresh_token: &str,
+    ) -> Result<Zeroizing<String>, RefreshError> {
+        let mut body = Zeroizing::new(format!(
+            "client_id={GITHUB_APP_CLIENT_ID}&grant_type=refresh_token&refresh_token={}",
+            form_encode(refresh_token)
+        ));
+        if flow == signin::Flow::Browser {
+            let Some(secret) = &self.client_secret else {
+                return Err(RefreshError::Failed(
+                    "a browser-flow sign-in renews under the App's client secret, and this build has none"
+                        .into(),
+                ));
+            };
+            body.push_str("&client_secret=");
+            body.push_str(&form_encode(secret));
+        }
+        Ok(body)
+    }
+
+    /// Send the refresh `body` to GitHub, and read the renewed token.
+    fn exchange(&self, body: &str) -> Result<Refreshed, RefreshError> {
         #[derive(serde::Deserialize)]
         struct Reply {
             access_token: Option<String>,
@@ -1149,20 +1201,7 @@ impl TokenEndpoint for GitHubTokenEndpoint {
             refresh_token_expires_in: Option<u64>,
             error: Option<String>,
         }
-        let mut body = Zeroizing::new(format!(
-            "client_id={GITHUB_APP_CLIENT_ID}&grant_type=refresh_token&refresh_token={}",
-            form_encode(refresh_token)
-        ));
-        if flow == signin::Flow::Browser {
-            let Some(secret) = &self.client_secret else {
-                return Err(RefreshError::Failed(format!(
-                    "a browser-flow sign-in renews under the App's client secret, and {CLIENT_SECRET_ENV} is not set"
-                )));
-            };
-            body.push_str("&client_secret=");
-            body.push_str(&form_encode(secret));
-        }
-        let (status, reply) = self.post(&body).map_err(RefreshError::Failed)?;
+        let (status, reply) = self.post(body).map_err(RefreshError::Failed)?;
         let parsed: Reply = serde_json::from_slice(&reply).map_err(|_| {
             RefreshError::Failed(format!(
                 "GitHub answered {status} with a body that is not a token"
@@ -1197,6 +1236,19 @@ impl TokenEndpoint for GitHubTokenEndpoint {
             }
         }
     }
+}
+
+/// The client secret the proxy renews under: a non-empty `run_time` value
+/// overrides the `built_in` one, and an empty value counts as none.
+fn client_secret(built_in: Option<&str>, run_time: Option<String>) -> Option<Zeroizing<String>> {
+    run_time
+        .filter(|s| !s.is_empty())
+        .map(Zeroizing::new)
+        .or_else(|| {
+            built_in
+                .filter(|s| !s.is_empty())
+                .map(|s| Zeroizing::new(s.to_owned()))
+        })
 }
 
 /// The per-boot token, 64 hex digits on the first line of `input`.
@@ -1779,5 +1831,72 @@ mod tests {
             wiring.redeemer.redeem(BOX, &api, &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    // BEP-069 (Gatehouse §6.10): a browser-flow sign-in renews under the
+    // App secret that the build embeds. With no secret, the renewal is
+    // refused `github_sign_in_required` before GitHub is called. With one,
+    // the exchange carries it. A run-time value overrides the embedded one.
+    #[test]
+    fn a_browser_sign_in_renews_under_the_embedded_secret() {
+        let keychain = MemoryKeychain::default();
+        keychain
+            .write(
+                &Metadata {
+                    account: "octocat".into(),
+                    instance: INSTANCE.into(),
+                    flow: Flow::Browser,
+                    token_expires_at: 1_000,
+                    refresh_expires_at: 100_000,
+                },
+                &Material {
+                    instance: INSTANCE.into(),
+                    access_token: "ghu_held".into(),
+                    refresh_token: "ghr_held".into(),
+                },
+            )
+            .unwrap();
+        let unset = GitHubTokenEndpoint::with_secret(
+            rustls::RootCertStore::empty(),
+            client_secret(None, None),
+        )
+        .unwrap();
+        // `RenewError::SignInRequired` is the refusal the proxy audits as
+        // `github_sign_in_required`.
+        assert_eq!(
+            signin::renew(&keychain, &unset, INSTANCE, 2_000).unwrap_err(),
+            signin::RenewError::SignInRequired
+        );
+        assert!(unset.refresh_body(Flow::Browser, "ghr_held").is_err());
+        let device = unset.refresh_body(Flow::Device, "ghr_held").unwrap();
+        assert!(!device.contains("client_secret"), "{}", *device);
+
+        let set = GitHubTokenEndpoint::with_secret(
+            rustls::RootCertStore::empty(),
+            client_secret(Some("embedded+secret"), None),
+        )
+        .unwrap();
+        let body = set.refresh_body(Flow::Browser, "ghr_held").unwrap();
+        assert!(
+            body.contains("&client_secret=embedded%2Bsecret"),
+            "{}",
+            *body
+        );
+        assert!(body.contains("refresh_token=ghr_held"), "{}", *body);
+
+        let chosen = |built_in, run_time: Option<&str>| {
+            client_secret(built_in, run_time.map(str::to_owned)).map(|s| s.to_string())
+        };
+        assert_eq!(chosen(Some("embedded"), None).as_deref(), Some("embedded"));
+        assert_eq!(
+            chosen(Some("embedded"), Some("override")).as_deref(),
+            Some("override")
+        );
+        assert_eq!(
+            chosen(Some("embedded"), Some("")).as_deref(),
+            Some("embedded")
+        );
+        assert_eq!(chosen(Some(""), None), None);
+        assert_eq!(chosen(None, None), None);
     }
 }
