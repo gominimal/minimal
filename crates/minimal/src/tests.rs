@@ -4749,36 +4749,61 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         CREATIONS,
         "each creation under one name gets an id of its own, got {ids:02x?}"
     );
-    // The random fields are random fills, not a counter. The low 32 bits of
-    // `rand_b` are fresh CSPRNG output on every mint (the monotonic counter
-    // the mint keeps sits above them). Eight draws of 32 random bits are all
-    // distinct, and no two consecutive draws differ by one.
-    let tails: Vec<u32> = ids
+    // The random fields are random fills, never a counter: all 74 bits
+    // after the version and the variant. `rand_a` is the 12 bits after the
+    // version, and `rand_b` is the 62 bits after the variant. Each field is
+    // distinct across the creations, and no two consecutive draws of either
+    // field differ by one.
+    let rand_a: Vec<u16> = ids
         .iter()
-        .map(|bytes| u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]))
+        .map(|bytes| u16::from_be_bytes([bytes[6] & 0x0f, bytes[7]]))
         .collect();
-    let distinct_tails: std::collections::BTreeSet<u32> = tails.iter().copied().collect();
+    let rand_b: Vec<u64> = ids
+        .iter()
+        .map(|bytes| {
+            let mut field = [0u8; 8];
+            field.copy_from_slice(&bytes[8..16]);
+            field[0] &= 0x3f;
+            u64::from_be_bytes(field)
+        })
+        .collect();
+    let distinct_a: std::collections::BTreeSet<u16> = rand_a.iter().copied().collect();
     assert_eq!(
-        distinct_tails.len(),
+        distinct_a.len(),
         CREATIONS,
-        "the random fields differ on every creation, got {tails:08x?}"
+        "rand_a differs on every creation, got {rand_a:03x?}"
+    );
+    let distinct_b: std::collections::BTreeSet<u64> = rand_b.iter().copied().collect();
+    assert_eq!(
+        distinct_b.len(),
+        CREATIONS,
+        "rand_b differs on every creation, got {rand_b:016x?}"
     );
     assert!(
-        tails
+        rand_a
             .windows(2)
-            .all(|pair| pair[1].wrapping_sub(pair[0]) != 1),
-        "the random fields are not a counter, got {tails:08x?}"
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff != 1),
+        "rand_a is not a counter, got {rand_a:03x?}"
+    );
+    assert!(
+        rand_b
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
+        "rand_b is not a counter, got {rand_b:016x?}"
     );
 }
 
 /// BEP-070: a minted box id that a retained record already names refuses
-/// the creation. The host's half — the registry refuses the colliding mint
-/// before it spends an address — is `minvmd`'s `colliding_box_id_refused`.
-/// A real mint does not collide, and no public door fixes the id the host
-/// mints. So this test stands in for the host on the control socket and
-/// answers the CLI's registration with the exact refusal the host sends for
-/// a collision. The CLI must refuse the creation: the activation fails with
-/// the refusal, which names the colliding id, and no box id comes back.
+/// the creation. This test proves the CLI half only: when the host refuses
+/// a registration for a colliding id, the CLI refuses the creation. It does
+/// not prove that the host detects a collision. The host half — the
+/// registry refuses the colliding mint before it spends an address — is
+/// `minvmd`'s `colliding_box_id_refused`, which the spec names as a second
+/// verify line. A real mint does not collide, and no public door fixes the
+/// id the host mints. So this test stands in for the host on the control
+/// socket and answers the CLI's registration with the exact refusal the
+/// host sends for a collision. The activation fails with the refusal, which
+/// names the colliding id, and no box id comes back.
 #[tokio::test]
 async fn colliding_box_id_refuses_creation() {
     use minimal_client::box_registration::register_box_for_activation;

@@ -1003,7 +1003,9 @@ where
 /// the two id types merged reads back as the same id.
 ///
 /// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
-/// time: a map keyed by box id holds its boxes in creation order.
+/// millisecond: a map keyed by box id holds its boxes sorted by the
+/// millisecond each id was minted in. Ids minted in the same millisecond
+/// sort by their random fields, not by creation order.
 ///
 /// [`Display`]: std::fmt::Display
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1024,11 +1026,14 @@ impl BoxId {
     }
 
     /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
-    /// and its random fields from the OS CSPRNG. Ids minted in one process
-    /// sort in mint order.
+    /// and all 74 of its random bits from the OS CSPRNG, with no counter.
+    /// Ids sort by mint millisecond. Two ids minted in the same
+    /// millisecond sort by their random bits.
     #[must_use]
     pub fn mint() -> Self {
-        Self(Uuid::now_v7())
+        // `NoContext` gives the timestamp no counter bits, so `new_v7`
+        // fills `rand_a` and `rand_b` with fresh random bits.
+        Self(Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)))
     }
 
     /// The all-zero id: what a record read without an id carries until it
