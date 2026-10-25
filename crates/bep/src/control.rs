@@ -87,6 +87,7 @@
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -449,6 +450,17 @@ fn enforce(entries: &mut Vec<Entry>, bound: KeyBound, now: u64, keep: Option<&st
     dropped
 }
 
+/// Whether `bound` admits every key of `entries` at `now`, so that
+/// [`enforce`] drops none of them.
+fn within(entries: &[Entry], bound: KeyBound, now: u64) -> bool {
+    entries.len() <= bound.max_keys.max(1)
+        && bound.idle.is_none_or(|idle| {
+            entries
+                .iter()
+                .all(|entry| now.saturating_sub(entry.seen) < idle.as_secs())
+        })
+}
+
 /// Makes `registry` hold exactly the keys of `entries`.
 fn install(entries: &[Entry], registry: &RwLock<ClientKeys>) {
     let mut fresh = ClientKeys::new();
@@ -469,7 +481,12 @@ struct KeyFile {
     /// The kept keys, in the file's order. The lock also orders the file
     /// writes.
     entries: Mutex<Vec<Entry>>,
+    /// The time that `register` last wrote the file, or [`NEVER_WRITTEN`].
+    written: AtomicU64,
 }
+
+/// The value of [`KeyFile::written`] before `register` writes the file.
+const NEVER_WRITTEN: u64 = u64::MAX;
 
 impl KeyFile {
     fn new(path: PathBuf) -> Self {
@@ -477,7 +494,17 @@ impl KeyFile {
             path,
             bound: KeyBound::default(),
             entries: Mutex::new(Vec::new()),
+            written: AtomicU64::new(NEVER_WRITTEN),
         }
+    }
+
+    /// How long `register` waits after its last file write before a known
+    /// key's new time is written: a minute, or a quarter of the idle period
+    /// when that is shorter. A restart can lose this much of a key's
+    /// registration time, and no more.
+    fn seen_refresh(&self) -> Duration {
+        let minute = Duration::from_secs(60);
+        self.bound.idle.map_or(minute, |idle| minute.min(idle / 4))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
@@ -543,6 +570,19 @@ impl KeyFile {
     ) -> Result<Vec<String>, String> {
         let mut entries = self.lock();
         let known = entries.iter().any(|e| e.kid == entry.kid);
+        // A known key inside the bound changes only its time. The file
+        // takes that time at the next write, and the write waits until the
+        // last one is older than the refresh interval.
+        let recent = Some(self.written.load(Ordering::Relaxed))
+            .filter(|&last| last != NEVER_WRITTEN)
+            .and_then(|last| now.checked_sub(last))
+            .is_some_and(|since| since < self.seen_refresh().as_secs());
+        if known && !replace && recent && within(&entries, self.bound, now) {
+            if let Some(kept) = entries.iter_mut().find(|e| e.kid == entry.kid) {
+                kept.seen = now;
+            }
+            return Ok(Vec::new());
+        }
         let kid = entry.kid.clone();
         let mut next = entries.clone();
         let mut revoked = Vec::new();
@@ -567,6 +607,7 @@ impl KeyFile {
                 tracing::error!(path = %self.path.display(), %err, "did not keep a client key registration");
                 return Err(format!("the proxy did not record the key: {err}"));
             }
+            self.written.store(now, Ordering::Relaxed);
             *entries = next;
             install(&entries, registry);
             return Ok(revoked);
@@ -578,15 +619,18 @@ impl KeyFile {
         for gone in &revoked {
             tracing::info!(kid = %gone, replacement = %kid, "revoked a client key that the client replaced");
         }
-        if let Err(err) = self.write(&entries) {
-            tracing::error!(path = %self.path.display(), %err, "did not record the client key change");
-            if replace {
-                return Err(format!(
-                    "the proxy revoked the other keys, but did not record the change, so they return after a restart: {err}"
-                ));
+        match self.write(&entries) {
+            Ok(()) => self.written.store(now, Ordering::Relaxed),
+            Err(err) => {
+                tracing::error!(path = %self.path.display(), %err, "did not record the client key change");
+                if replace {
+                    return Err(format!(
+                        "the proxy revoked the other keys, but did not record the change, so they return after a restart: {err}"
+                    ));
+                }
+                // A known key stays registered across a restart already. Only
+                // its last registration time and the dropped keys are lost.
             }
-            // A known key stays registered across a restart already. Only
-            // its last registration time and the dropped keys are lost.
         }
         Ok(revoked)
     }
@@ -1389,6 +1433,37 @@ mod tests {
         let kept = std::fs::read_to_string(client_keys_path(&path)).unwrap();
         assert_eq!(kept, text);
         drop(control);
+    }
+
+    // BEP-063: a known key that registers again soon after the last write
+    // does not rewrite the registrations file. The next write keeps its time.
+    #[test]
+    fn a_key_removal_survives_a_restart_without_a_write_for_each_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFile::new(dir.path().join("control.sock.client-keys"));
+        let registry = RwLock::new(ClientKeys::new());
+        let entry = |byte: u8| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                0,
+            )
+            .unwrap()
+        };
+        let (a, b) = (entry(1), entry(2));
+        keys.register(a.clone(), &registry, 100, false).unwrap();
+        let written = std::fs::read_to_string(&keys.path).unwrap();
+        keys.register(a.clone(), &registry, 110, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&keys.path).unwrap(), written);
+
+        keys.register(b.clone(), &registry, 120, false).unwrap();
+        let kept = std::fs::read_to_string(&keys.path).unwrap();
+        assert!(kept.contains(&format!("{} 110\n", a.key)), "{kept}");
+
+        // Past the refresh interval, a known key writes its time again.
+        keys.register(a.clone(), &registry, 200, false).unwrap();
+        let kept = std::fs::read_to_string(&keys.path).unwrap();
+        assert!(kept.contains(&format!("{} 200\n", a.key)), "{kept}");
     }
 
     // BEP-063: the registry never holds more keys than its count, and drops
