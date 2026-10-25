@@ -608,6 +608,78 @@ const COHORT_MOVE_PASSES: usize = 8;
 /// find the box it belongs to.
 const COHORT_OWNER_DEPTH: usize = 64;
 
+/// Why a `host_ip` box's processes could not be placed in the cohort's
+/// blocked leaf (BEP-018). The launch that asked for the placement fails
+/// with it, so a blocked stance never fails open. Its text ends up in the
+/// launch's refusal, after the reason that the refusal gives.
+#[derive(Debug)]
+pub(crate) enum CohortPlaceError {
+    /// The cohort blocks, and this host's classifier tree has no blocked
+    /// leaf: its install predates the leaf.
+    NoBlockedLeaf,
+    /// A leaf's `cgroup.procs` could not be read.
+    Read {
+        /// The leaf that was read.
+        leaf: PathBuf,
+        /// The read's failure.
+        error: std::io::Error,
+    },
+    /// A live process could not be moved into the blocked leaf.
+    Migrate {
+        /// The process.
+        pid: i32,
+        /// The blocked leaf.
+        leaf: PathBuf,
+        /// The write's failure.
+        error: std::io::Error,
+    },
+    /// The box's own leaf still held processes after every pass.
+    StillStarting {
+        /// The box's own leaf.
+        leaf: PathBuf,
+    },
+}
+
+impl std::fmt::Display for CohortPlaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBlockedLeaf => write!(
+                f,
+                "this host's classifier tree has no {}/{QUIC443_BLOCKED_DIR} directory",
+                sandbox::classifier::BOXES_DIR
+            ),
+            Self::Read { leaf, error } => {
+                write!(
+                    f,
+                    "cannot read {}: {error}",
+                    leaf.join(PROCS_FILE).display()
+                )
+            }
+            Self::Migrate { pid, leaf, error } => {
+                write!(
+                    f,
+                    "cannot move process {pid} into {}: {error}",
+                    leaf.display()
+                )
+            }
+            Self::StillStarting { leaf } => write!(
+                f,
+                "new processes kept starting in {} while they were moved",
+                leaf.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CohortPlaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { error, .. } | Self::Migrate { error, .. } => Some(error),
+            Self::NoBlockedLeaf | Self::StillStarting { .. } => None,
+        }
+    }
+}
+
 /// The `host_ip` cohort's stance on UDP to port 443 (BEP-018): blocked
 /// when any resident member's resolved `quic443` stance is blocked. The
 /// cohort leaves as one address, so the most restrictive member wins, and
@@ -692,18 +764,67 @@ impl CohortQuic443 {
         self.blocked_leaf.as_deref()
     }
 
+    /// The leaf a process injected into `box_id` must join: the blocked
+    /// leaf while the cohort blocks and the box's processes move into it,
+    /// `None` when the box's own leaf is the right one.
+    #[must_use]
+    pub fn injection_leaf(&self, box_id: &str) -> Option<&Path> {
+        if self.blocked() && self.homes.contains_key(box_id) {
+            self.blocked_leaf.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Records `pid`, the shim of a process injected into `box_id` while
+    /// the cohort blocked, under the box. The shim joins the blocked leaf
+    /// itself, and the record sends it and what it forks home with the box
+    /// when the block lifts. When the block lifted before this record, the
+    /// shim is sent home now. The record stays, so a shim that joins the
+    /// blocked leaf after that goes home when the next block lifts.
+    pub(crate) fn adopt_injected(&mut self, box_id: &str, pid: i32, moves: &dyn CgroupMoves) {
+        let Some(home) = self.homes.get(box_id).cloned() else {
+            return;
+        };
+        self.moved
+            .entry(box_id.to_string())
+            .or_default()
+            .insert(pid);
+        if self.blocked() {
+            return;
+        }
+        match moves.migrate(pid, &home) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => tracing::warn!(
+                box_id,
+                pid,
+                %error,
+                "cannot move a process injected into a host-address box back to its own leaf"
+            ),
+        }
+    }
+
     /// [`Self::join`], and the move that keeps the rule in step with it:
     /// when the cohort turns blocked every member's processes move into
     /// the blocked leaf, and when it already was, the joining box's do.
-    /// `home` is the box's own leaf when its processes are to move, `None`
-    /// for a box in the `deny` subtree or one placed in no leaf.
+    /// When the box re-joins with a weaker stance and was the only blocker,
+    /// every process in the blocked leaf goes home, as [`Self::depart`]
+    /// does. `home` is the box's own leaf when its processes are to move,
+    /// `None` for a box in the `deny` subtree or one placed in no leaf.
+    ///
+    /// # Errors
+    ///
+    /// A [`CohortPlaceError`] when the cohort blocks and a member's
+    /// processes cannot all be placed in the blocked leaf. The box stays a
+    /// member: the caller fails its launch and calls [`Self::depart`].
     pub(crate) fn admit(
         &mut self,
         box_id: &str,
         home: Option<PathBuf>,
         blocked: bool,
         moves: &dyn CgroupMoves,
-    ) {
+    ) -> Result<(), CohortPlaceError> {
         let was = self.blocked();
         self.join(box_id, blocked);
         match home {
@@ -719,16 +840,19 @@ impl CohortQuic443 {
             self.log_flip(box_id);
         }
         if !now {
-            return;
+            if was {
+                self.move_all_home(None, moves);
+            }
+            return Ok(());
         }
         if was {
-            self.move_in(box_id, moves);
-        } else {
-            let ids: Vec<String> = self.homes.keys().cloned().collect();
-            for id in ids {
-                self.move_in(&id, moves);
-            }
+            return self.move_in(box_id, moves);
         }
+        let ids: Vec<String> = self.homes.keys().cloned().collect();
+        for id in ids {
+            self.move_in(&id, moves)?;
+        }
+        Ok(())
     }
 
     /// [`Self::leave`], and the move back: when the last blocking member
@@ -744,7 +868,7 @@ impl CohortQuic443 {
         let now = self.blocked();
         if was && !now {
             self.log_flip(box_id);
-            self.move_all_home(box_id, moves);
+            self.move_all_home(Some(box_id), moves);
         } else {
             self.moved.remove(box_id);
         }
@@ -765,61 +889,68 @@ impl CohortQuic443 {
             tracing::warn!(
                 box_id,
                 "the host-address cohort blocks UDP 443 but this host's classifier \
-                 tree has no blocked leaf, so the cohort still sends UDP 443; \
-                 re-running the classifier install creates it"
+                 tree has no blocked leaf; a launch that needs the leaf fails"
             );
         }
     }
 
     /// Moves the processes of `box_id`'s own leaf into the blocked leaf.
-    fn move_in(&mut self, box_id: &str, moves: &dyn CgroupMoves) {
-        let (Some(blocked_leaf), Some(home)) = (self.blocked_leaf.clone(), self.homes.get(box_id))
-        else {
-            return;
+    /// It reads the leaf again after each pass, because a process that
+    /// forks while the move runs leaves its child behind. It ends when the
+    /// leaf is empty. A box with no own leaf to move from moves nothing.
+    ///
+    /// # Errors
+    ///
+    /// A [`CohortPlaceError`] when there is no blocked leaf, when the leaf
+    /// cannot be read, when a live process cannot be moved, or when the
+    /// leaf is not empty after [`COHORT_MOVE_PASSES`] passes.
+    fn move_in(&mut self, box_id: &str, moves: &dyn CgroupMoves) -> Result<(), CohortPlaceError> {
+        let Some(home) = self.homes.get(box_id).cloned() else {
+            return Ok(());
         };
-        let home = home.clone();
+        let Some(blocked_leaf) = self.blocked_leaf.clone() else {
+            return Err(CohortPlaceError::NoBlockedLeaf);
+        };
         let moved = self.moved.entry(box_id.to_string()).or_default();
+        let read = |leaf: &Path| {
+            moves.procs(leaf).map_err(|error| CohortPlaceError::Read {
+                leaf: leaf.to_path_buf(),
+                error,
+            })
+        };
         for _ in 0..COHORT_MOVE_PASSES {
-            let pids = match moves.procs(&home) {
-                Ok(pids) => pids,
-                Err(error) => {
-                    tracing::warn!(
-                        box_id,
-                        leaf = %home.display(),
-                        %error,
-                        "cannot read a host-address box's processes to move them \
-                         into the cohort's UDP 443 blocked leaf"
-                    );
-                    return;
-                }
-            };
-            let mut any = false;
+            let pids = read(&home)?;
+            if pids.is_empty() {
+                return Ok(());
+            }
             for pid in pids {
                 match moves.migrate(pid, &blocked_leaf) {
                     Ok(()) => {
                         moved.insert(pid);
-                        any = true;
                     }
+                    // Gone between the read and the write: nothing to move.
                     Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                    Err(error) => tracing::warn!(
-                        box_id,
-                        pid,
-                        %error,
-                        "cannot move a host-address box's process into the \
-                         cohort's UDP 443 blocked leaf"
-                    ),
+                    Err(error) => {
+                        return Err(CohortPlaceError::Migrate {
+                            pid,
+                            leaf: blocked_leaf,
+                            error,
+                        });
+                    }
                 }
             }
-            if !any {
-                return;
-            }
+        }
+        if read(&home)?.is_empty() {
+            Ok(())
+        } else {
+            Err(CohortPlaceError::StillStarting { leaf: home })
         }
     }
 
     /// Sends every process in the blocked leaf back to its own box's leaf,
-    /// after `departed` left and lifted the block. A process of `departed`
-    /// itself is ending with its box, and stays.
-    fn move_all_home(&mut self, departed: &str, moves: &dyn CgroupMoves) {
+    /// after the block lifted. When `departed` left and lifted it, a process
+    /// of `departed` itself is ending with its box, and stays.
+    fn move_all_home(&mut self, departed: Option<&str>, moves: &dyn CgroupMoves) {
         let Some(blocked_leaf) = self.blocked_leaf.clone() else {
             self.moved.clear();
             return;
@@ -841,7 +972,7 @@ impl CohortQuic443 {
             for pid in pids {
                 let owner = self.owner_of(pid, moves);
                 let Some(home) = owner.as_deref().and_then(|id| self.homes.get(id)) else {
-                    if owner.as_deref() != Some(departed) {
+                    if owner.is_none() || owner.as_deref() != departed {
                         tracing::warn!(
                             pid,
                             "a process in the cohort's UDP 443 blocked leaf belongs to \
@@ -896,20 +1027,24 @@ pub(crate) fn cohort_quic443() -> &'static std::sync::Mutex<CohortQuic443> {
 /// A `host_ip` box joins `cohort` with its resolved stance
 /// ([`CohortQuic443::admit`]). Its processes move when it sits in the
 /// `allow` subtree of the classifier tree `root`.
+///
+/// # Errors
+///
+/// The [`CohortPlaceError`] of [`CohortQuic443::admit`].
 pub(crate) fn cohort_quic443_admit_over(
     cohort: &std::sync::Mutex<CohortQuic443>,
     root: &Path,
     box_id: &str,
     blocked: bool,
     moves: &dyn CgroupMoves,
-) {
+) -> Result<(), CohortPlaceError> {
     let home = sandbox::classifier::box_leaf(root, box_id, Verdict::Allow);
     let home = home.is_dir().then_some(home);
     let mut cohort = cohort
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cohort.learn_blocked_leaf(quic443_blocked_leaf(root));
-    cohort.admit(box_id, home, blocked, moves);
+    cohort.admit(box_id, home, blocked, moves)
 }
 
 /// A `host_ip` box leaves `cohort` ([`CohortQuic443::depart`]). A box
@@ -935,6 +1070,9 @@ pub(crate) struct StandinMoves {
     pub(crate) placed: std::sync::Mutex<std::collections::BTreeMap<i32, PathBuf>>,
     /// Each pid's parent.
     pub(crate) parents: std::sync::Mutex<std::collections::BTreeMap<i32, i32>>,
+    /// The pids a migration refuses with `EACCES`, as a write to a leaf the
+    /// daemon was not delegated would.
+    pub(crate) refused: std::sync::Mutex<std::collections::BTreeSet<i32>>,
 }
 
 #[cfg(test)]
@@ -976,6 +1114,9 @@ impl CgroupMoves for StandinMoves {
     }
 
     fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()> {
+        if self.refused.lock().unwrap().contains(&pid) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         match self.placed.lock().unwrap().get_mut(&pid) {
             Some(at) => {
                 *at = to.to_path_buf();
@@ -7267,7 +7408,8 @@ mod tests {
             .expect("the box's own leaf");
         moves.spawn_in(10, &home);
         moves.fork(10, 11);
-        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, &moves);
+        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, &moves)
+            .expect("the grant box is placed");
         let guard = cohort.lock().unwrap();
         assert!(guard.blocked());
         assert_eq!(guard.blocked_leaf(), Some(blocked.as_path()));
@@ -7280,7 +7422,166 @@ mod tests {
         let deny = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
             .expect("the deny box's own leaf");
         moves.spawn_in(20, &deny);
-        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves);
+        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves)
+            .expect("the deny box needs no move");
         assert_eq!(moves.where_is(20), deny);
+    }
+
+    /// A cohort over a stand-in tree: its blocked leaf, learned, and a home
+    /// leaf for each named box.
+    fn standin_cohort(boxes: &[&str]) -> (tempfile::TempDir, CohortQuic443, Vec<PathBuf>) {
+        let tree = tempfile::tempdir().expect("a stand-in tree");
+        let blocked = quic443_blocked_leaf(tree.path());
+        std::fs::create_dir_all(&blocked).expect("the blocked leaf");
+        let mut cohort = CohortQuic443::default();
+        cohort.learn_blocked_leaf(blocked);
+        let homes = boxes
+            .iter()
+            .map(|id| tree.path().join(id))
+            .collect::<Vec<_>>();
+        (tree, cohort, homes)
+    }
+
+    /// BEP-018, review finding 4370595766: the only blocker joins again with
+    /// a weaker stance, the block lifts, and every process in the blocked
+    /// leaf goes home, the re-joined box's own with the rest.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_until_a_weaker_rejoin() {
+        let (tree, mut cohort, homes) = standin_cohort(&["plain", "grant"]);
+        let blocked = quic443_blocked_leaf(tree.path());
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        moves.spawn_in(20, &homes[1]);
+        cohort
+            .admit("plain", Some(homes[0].clone()), false, &moves)
+            .expect("nothing moves");
+        cohort
+            .admit("grant", Some(homes[1].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert_eq!(moves.where_is(10), blocked);
+        assert_eq!(moves.where_is(20), blocked);
+
+        cohort
+            .admit("grant", Some(homes[1].clone()), false, &moves)
+            .expect("the cohort moves home");
+        assert!(!cohort.blocked());
+        assert_eq!(moves.where_is(10), homes[0]);
+        assert_eq!(moves.where_is(20), homes[1]);
+        assert!(cohort.moved.is_empty(), "no stale pids: {:?}", cohort.moved);
+    }
+
+    /// A [`CgroupMoves`] whose box forks one new process into `leaf` on
+    /// every read of it, so a move never empties the leaf.
+    struct ForkingMoves {
+        inner: StandinMoves,
+        leaf: PathBuf,
+        next: std::sync::atomic::AtomicI32,
+    }
+
+    impl CgroupMoves for ForkingMoves {
+        fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>> {
+            if leaf == self.leaf {
+                let pid = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.spawn_in(pid, leaf);
+            }
+            self.inner.procs(leaf)
+        }
+
+        fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()> {
+            self.inner.migrate(pid, to)
+        }
+
+        fn parent(&self, pid: i32) -> Option<i32> {
+            self.inner.parent(pid)
+        }
+    }
+
+    /// BEP-018, review finding 4370595768: a blocked stance never fails
+    /// open. A missing blocked leaf, a refused move and a leaf that never
+    /// empties each come back to the caller as an error.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_or_refuses_the_placement() {
+        // No blocked leaf on this host.
+        let tree = tempfile::tempdir().expect("a stand-in tree");
+        let home = tree.path().join("grant");
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &home);
+        let mut cohort = CohortQuic443::default();
+        cohort.learn_blocked_leaf(quic443_blocked_leaf(tree.path()));
+        let refused = cohort.admit("grant", Some(home.clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::NoBlockedLeaf)),
+            "a missing leaf is an error: {refused:?}"
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("boxes/quic443-blocked"),
+            "the error names the missing directory"
+        );
+
+        // A move the kernel refuses.
+        let (tree, mut cohort, homes) = standin_cohort(&["grant"]);
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        moves.refused.lock().unwrap().insert(10);
+        let refused = cohort.admit("grant", Some(homes[0].clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::Migrate { pid: 10, .. })),
+            "a refused move is an error: {refused:?}"
+        );
+        drop(tree);
+
+        // A box that forks faster than it is moved.
+        let (_tree, mut cohort, homes) = standin_cohort(&["grant"]);
+        let moves = ForkingMoves {
+            inner: StandinMoves::default(),
+            leaf: homes[0].clone(),
+            next: std::sync::atomic::AtomicI32::new(100),
+        };
+        let refused = cohort.admit("grant", Some(homes[0].clone()), true, &moves);
+        assert!(
+            matches!(refused, Err(CohortPlaceError::StillStarting { .. })),
+            "a leaf that never empties is an error: {refused:?}"
+        );
+    }
+
+    /// BEP-018, arch C1: a process injected into a member while the cohort
+    /// blocks joins the blocked leaf, and its shim is recorded under the
+    /// box, so the shim and what it forks go home when the block lifts.
+    #[test]
+    fn host_ip_cohort_blocked_stance_rejects_udp_443_for_injected_processes() {
+        let (tree, mut cohort, homes) = standin_cohort(&["plain", "grant"]);
+        let blocked = quic443_blocked_leaf(tree.path());
+        let moves = StandinMoves::default();
+        moves.spawn_in(10, &homes[0]);
+        cohort
+            .admit("plain", Some(homes[0].clone()), false, &moves)
+            .expect("nothing moves");
+        assert_eq!(cohort.injection_leaf("plain"), None, "not blocked yet");
+        cohort
+            .admit("grant", Some(homes[1].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert_eq!(cohort.injection_leaf("plain"), Some(blocked.as_path()));
+        assert_eq!(cohort.injection_leaf("stranger"), None, "not a member");
+
+        // The shim (pid 50, a child of the daemon) joins the blocked leaf
+        // and forks the injected program (pid 51).
+        moves.spawn_in(50, &blocked);
+        moves.parents.lock().unwrap().insert(50, 1);
+        moves.fork(50, 51);
+        cohort.adopt_injected("plain", 50, &moves);
+
+        cohort.depart("grant", &moves);
+        assert!(!cohort.blocked());
+        assert_eq!(moves.where_is(50), homes[0], "the shim goes home");
+        assert_eq!(moves.where_is(51), homes[0], "its program goes home");
+        assert_eq!(moves.where_is(10), homes[0]);
+
+        // A shim recorded after the block lifted is sent home at once.
+        moves.spawn_in(60, &blocked);
+        cohort.adopt_injected("plain", 60, &moves);
+        assert_eq!(moves.where_is(60), homes[0]);
     }
 }

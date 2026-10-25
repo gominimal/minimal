@@ -12,24 +12,46 @@ pub(super) type LaunchedHost = (
 /// stance, and its processes move into the cohort's blocked leaf while any
 /// member blocks. A box that is not a host-address box (no
 /// `host_ip_enforcement`) shares no address and joins nothing.
+///
+/// # Errors
+///
+/// A [`crate::net::classifier::CohortPlaceError`] when the cohort blocks
+/// and a member's processes cannot all be placed in the blocked leaf. The
+/// box has left the cohort again by then, so a block it alone asked for is
+/// lifted, and the caller fails the launch.
 pub(super) fn join_quic443_cohort(
     record: &Record,
     host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
     root: &std::path::Path,
     cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
     moves: &dyn crate::net::classifier::CgroupMoves,
-) {
+) -> Result<(), crate::net::classifier::CohortPlaceError> {
     if host_ip_enforcement.is_none() || record.network != boxes::NetworkMode::HostNet {
-        return;
+        return Ok(());
     }
+    let box_id = record.id.to_string();
     let blocked = crate::net::classifier::resolved_quic443_blocked(&record.policy);
-    crate::net::classifier::cohort_quic443_admit_over(
-        cohort,
-        root,
-        &record.id.to_string(),
-        blocked,
-        moves,
-    );
+    let placed =
+        crate::net::classifier::cohort_quic443_admit_over(cohort, root, &box_id, blocked, moves);
+    if let Err(error) = &placed {
+        tracing::warn!(
+            box_id,
+            %error,
+            "a host-address box could not be placed under the cohort's UDP 443 block; \
+             its launch fails"
+        );
+        crate::net::classifier::cohort_quic443_depart_over(cohort, &box_id, moves);
+    }
+    placed
+}
+
+/// The refusal a launch ends with when [`join_quic443_cohort`] fails.
+fn quic443_placement_refused(error: &crate::net::classifier::CohortPlaceError) -> std::io::Error {
+    std::io::Error::other(format!(
+        "the session was stopped because QUIC (UDP to port 443) could not be blocked for it. \
+         Every session that runs with the host's address gets this block while the \
+         quic443 setting of one of them blocks QUIC. The cause: {error}"
+    ))
 }
 
 /// The stop's half of the cohort's QUIC stance (BEP-018): the box
@@ -610,14 +632,21 @@ impl BoxActor {
         }
         // BEP-018: a `host_ip` box joins the cohort that shares its address,
         // with its resolved `quic443` stance. One blocked member moves the
-        // cohort into the leaf the table rejects UDP 443 from.
-        join_quic443_cohort(
+        // cohort into the leaf the table rejects UDP 443 from. The move runs
+        // after the spawn, because the launcher places the first process in
+        // the box's own leaf.
+        // A launch whose box cannot be placed under the block fails here,
+        // and its box is killed: a blocked stance never fails open.
+        if let Err(error) = join_quic443_cohort(
             &record,
             host_ip_enforcement,
             std::path::Path::new(sandbox::classifier::TREE_ROOT),
             crate::net::classifier::cohort_quic443(),
             &crate::net::classifier::KernelMoves,
-        );
+        ) {
+            let _ = host.kill(false).await;
+            return Err(AttachError::SpawnFailed(quic443_placement_refused(&error)));
+        }
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -1059,7 +1088,7 @@ impl BoxActor {
 
 #[cfg(test)]
 mod quic443_cohort_tests {
-    use super::{join_quic443_cohort, leave_quic443_cohort};
+    use super::{join_quic443_cohort, leave_quic443_cohort, quic443_placement_refused};
     use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
     use boxes::{BoxId, HostIpEnforcement, NetworkMode, Record};
     use sandbox::config::Verdict;
@@ -1112,7 +1141,8 @@ mod quic443_cohort_tests {
                 sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
                     .unwrap();
             moves.spawn_in(pid, &leaf);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves);
+            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
+                .expect("the box is placed");
             leaf
         };
 
@@ -1142,7 +1172,7 @@ mod quic443_cohort_tests {
         let mut own = host_ip_record(Some(Quic443::Block));
         own.network = NetworkMode::OwnIp;
         own.host_ip_enforcement = None;
-        join_quic443_cohort(&own, None, root, &cohort, &moves);
+        join_quic443_cohort(&own, None, root, &cohort, &moves).expect("nothing to place");
         assert_eq!(
             cohort.lock().unwrap().blocking_members().count(),
             1,
@@ -1162,5 +1192,60 @@ mod quic443_cohort_tests {
         // A box that never joined changes nothing when it stops.
         leave_quic443_cohort(&own.id.to_string(), &cohort, &moves);
         assert!(!cohort.lock().unwrap().blocked());
+    }
+
+    /// BEP-018, review finding 4370595764: a launch that cannot place the
+    /// cohort under its block fails, and the box that asked for the block
+    /// leaves the cohort again, so nobody stays half moved.
+    #[test]
+    fn host_ip_cohort_join_block_leave_drives_the_rule_or_fails_the_launch() {
+        use boxes::core::bep::Quic443;
+
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        for dir in [sandbox::config::DENY_DIR, sandbox::config::ALLOW_DIR] {
+            std::fs::create_dir_all(root.join(sandbox::classifier::BOXES_DIR).join(dir)).unwrap();
+        }
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        let moves = StandinMoves::default();
+        let plain = host_ip_record(None);
+        let plain_leaf =
+            sandbox::classifier::create_box_leaf(root, &plain.id.to_string(), Verdict::Allow)
+                .unwrap();
+        moves.spawn_in(100, &plain_leaf);
+        join_quic443_cohort(&plain, plain.host_ip_enforcement, root, &cohort, &moves)
+            .expect("nothing to place");
+
+        // This host's tree has no blocked leaf: the blocked box fails.
+        let strict = host_ip_record(Some(Quic443::Block));
+        let strict_leaf =
+            sandbox::classifier::create_box_leaf(root, &strict.id.to_string(), Verdict::Allow)
+                .unwrap();
+        moves.spawn_in(200, &strict_leaf);
+        let error = join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
+            .expect_err("no leaf to place the cohort in");
+        assert!(
+            !cohort.lock().unwrap().blocked(),
+            "the block left with its box"
+        );
+        let refusal = quic443_placement_refused(&error).to_string();
+        assert!(
+            refusal.contains("QUIC (UDP to port 443) could not be blocked")
+                && refusal.contains("quic443")
+                && refusal.contains("boxes/quic443-blocked"),
+            "the refusal says what failed and why: {refusal}"
+        );
+
+        // The leaf is there, but the other member's process cannot move.
+        let blocked_leaf = quic443_blocked_leaf(root);
+        std::fs::create_dir(&blocked_leaf).unwrap();
+        moves.refused.lock().unwrap().insert(100);
+        join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
+            .expect_err("a member that cannot move fails the launch");
+        let guard = cohort.lock().unwrap();
+        assert!(!guard.blocked(), "the block left with its box");
+        assert_eq!(guard.blocking_members().count(), 0);
+        drop(guard);
+        assert_eq!(moves.where_is(100), plain_leaf, "the member stays home");
     }
 }
