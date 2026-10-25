@@ -4751,9 +4751,12 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     );
     // The random fields are random fills, never a counter: all 74 bits
     // after the version and the variant. `rand_a` is the 12 bits after the
-    // version, and `rand_b` is the 62 bits after the variant. Each field is
-    // distinct across the creations, and no two consecutive draws of either
-    // field differ by one.
+    // version, and `rand_b` is the 62 bits after the variant. Eight draws of
+    // 62 random bits are all distinct, and no two consecutive draws differ
+    // by one: either chance is below 2^-55. `rand_a` holds 12 bits only, so
+    // two of eight draws match about once in 150 runs. The test asserts
+    // only that `rand_a` does not step by one on every creation, the shape
+    // a counter gives it: a chance of 2^-84 for random fills.
     let rand_a: Vec<u16> = ids
         .iter()
         .map(|bytes| u16::from_be_bytes([bytes[6] & 0x0f, bytes[7]]))
@@ -4767,12 +4770,6 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
             u64::from_be_bytes(field)
         })
         .collect();
-    let distinct_a: std::collections::BTreeSet<u16> = rand_a.iter().copied().collect();
-    assert_eq!(
-        distinct_a.len(),
-        CREATIONS,
-        "rand_a differs on every creation, got {rand_a:03x?}"
-    );
     let distinct_b: std::collections::BTreeSet<u64> = rand_b.iter().copied().collect();
     assert_eq!(
         distinct_b.len(),
@@ -4780,16 +4777,16 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         "rand_b differs on every creation, got {rand_b:016x?}"
     );
     assert!(
-        rand_a
-            .windows(2)
-            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff != 1),
-        "rand_a is not a counter, got {rand_a:03x?}"
-    );
-    assert!(
         rand_b
             .windows(2)
             .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
         "rand_b is not a counter, got {rand_b:016x?}"
+    );
+    assert!(
+        !rand_a
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff == 1),
+        "rand_a is not a counter, got {rand_a:03x?}"
     );
 }
 

@@ -633,6 +633,7 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
     verify: cargo nextest run -p minvmd colliding_box_id_refused
+    <!-- Limit: both tests prove a collision with a live row, a kept creation or an attachment. The host's collision check does not read the retained revocation records, so a collision with a revocation record alone is not yet refused. This gap needs an issue of its own. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems

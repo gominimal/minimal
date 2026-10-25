@@ -6865,10 +6865,6 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         shared,
     )
     .await;
-    // A clock tick between the creations, so the newer id carries a later
-    // mint millisecond. Ids minted in the same millisecond sort by their
-    // random bits.
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let newer = create_handed_own_ip_session(
         &mut client,
         "newer",
@@ -6876,7 +6872,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         shared,
     )
     .await;
-    assert!(older < newer, "ids sort by mint millisecond");
+    assert!(older < newer, "ids are minted in creation order");
 
     // The newer box finalizes first and launches; the older one finalizes
     // after it and yields.

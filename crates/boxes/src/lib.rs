@@ -1004,8 +1004,8 @@ where
 ///
 /// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
 /// millisecond: a map keyed by box id holds its boxes sorted by the
-/// millisecond each id was minted in. Ids minted in the same millisecond
-/// sort by their random fields, not by creation order.
+/// millisecond each id was minted in. One process mints no two ids in the
+/// same millisecond, so its ids sort in creation order.
 ///
 /// [`Display`]: std::fmt::Display
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1027,13 +1027,37 @@ impl BoxId {
 
     /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
     /// and all 74 of its random bits from the OS CSPRNG, with no counter.
-    /// Ids sort by mint millisecond. Two ids minted in the same
-    /// millisecond sort by their random bits.
+    /// No two ids minted in one process share a mint millisecond: a mint
+    /// in the millisecond of the one before it waits for the clock to
+    /// tick. So, while the clock moves forward, ids minted in one process
+    /// sort in mint order, which is creation order (NET-129).
     #[must_use]
     pub fn mint() -> Self {
-        // `NoContext` gives the timestamp no counter bits, so `new_v7`
-        // fills `rand_a` and `rand_b` with fresh random bits.
-        Self(Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)))
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // The mint millisecond of the last id this process minted.
+        static LAST_MINT_MS: AtomicU64 = AtomicU64::new(0);
+
+        loop {
+            let stamp = uuid::Timestamp::now(uuid::NoContext);
+            let (secs, nanos) = stamp.to_unix();
+            let ms = secs * 1000 + u64::from(nanos) / 1_000_000;
+            let last = LAST_MINT_MS.load(Ordering::Acquire);
+            if ms == last {
+                // At most one millisecond: the clock ticks soon.
+                std::thread::yield_now();
+                continue;
+            }
+            if LAST_MINT_MS
+                .compare_exchange(last, ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // `NoContext` gives the timestamp no counter bits, so
+                // `new_v7` fills `rand_a` and `rand_b` with fresh random
+                // bits.
+                return Self(Uuid::new_v7(stamp));
+            }
+        }
     }
 
     /// The all-zero id: what a record read without an id carries until it

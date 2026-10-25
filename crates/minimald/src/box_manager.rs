@@ -210,7 +210,7 @@ enum ManagerMessage {
     RunningCount(Responder<usize>),
     /// The ids of the live session actors, in the order the `running`
     /// map holds them. Test-only: it shows that the holder keeps its boxes
-    /// in box id order, which sorts them by mint millisecond.
+    /// in box id order, which is their creation order.
     #[cfg(test)]
     RunningIds(Responder<Vec<SessionId>>),
     CreateSession(Box<CreateSessionMsg>),
@@ -270,10 +270,9 @@ pub struct BoxManager {
     in_shutdown: CancellationToken,
     receiver: crate::traced::Receiver<ManagerMessage>,
     /// The live session actors, keyed by box id. A box id is a `UUIDv7`
-    /// and orders by its bytes, so the map holds its boxes sorted by the
-    /// millisecond their ids were minted in. Ids minted in the same
-    /// millisecond sort by their random bits. The shutdown stops them in
-    /// that order.
+    /// and orders by its bytes, so the map holds its boxes in the time
+    /// order their ids were minted: creation order. The shutdown stops
+    /// them in that order.
     running: BTreeMap<SessionId, BoxHandle>,
     /// Sessions whose teardown runs on a task of its own (`DeleteSession`):
     /// out of `running`, their record on disk until the task deletes it. The
