@@ -404,8 +404,12 @@ fn plan_rule(
 ) -> anyhow::Result<Option<StoreRuleConfig>> {
     let id = &args.id;
     check_new_rule(id, &rule, target.path)?;
-    let (_, mut rules) = crate::config::read_config_parts(target.path)
-        .context("min secret set did not read the value")?;
+    let (_, mut rules) = crate::config::read_config_parts(target.path).with_context(|| {
+        format!(
+            "min secret set stored nothing: it did not read the rules in {}",
+            target.path.display()
+        )
+    })?;
     let Some(current) = rules.remove(id) else {
         return Ok(Some(rule));
     };
@@ -419,7 +423,7 @@ fn plan_rule(
     if source != ValueSource::Terminal {
         bail!(
             "min secret set stored nothing and changed no rule: \
-             there is no terminal to confirm the new rule.\n{change}\n\
+             it cannot ask you to confirm the new rule.\n{change}\n\
              Run the command again with --yes to replace the rule."
         );
     }
@@ -630,7 +634,7 @@ pub(crate) fn run_set_with_rule(
         }
         let mut message = format!("min secret set did not store {}", args.id);
         if let Some((path, snapshot)) = &snapshot {
-            match crate::config::restore_config(path, snapshot) {
+            match crate::config::restore_config(snapshot) {
                 Ok(()) => {
                     tracing::info!(id = %args.id, file = %path.display(), "secret-store rule restored");
                     message.push_str(&format!(
@@ -642,7 +646,7 @@ pub(crate) fn run_set_with_rule(
                 Err(restore) => {
                     tracing::warn!(id = %args.id, error = %restore, "secret-store rule not restored");
                     message.push_str(&format!(
-                        ". The new rule for {id} is still in {path}, because it was not put back: {restore:#}. \
+                        ". The rule for {id} in {path} was not put back: {restore:#}. \
                          Check [secret-store-rules.{id}] in {path}",
                         id = args.id,
                         path = path.display()
@@ -1996,7 +2000,7 @@ attributes:
                 text.starts_with("min secret set stored nothing and changed no rule"),
                 "{text}"
             );
-            assert!(text.contains("no terminal"), "{text}");
+            assert!(text.contains("cannot ask you to confirm"), "{text}");
             assert!(text.contains("Current rule:"), "{text}");
             assert!(text.contains("New rule:"), "{text}");
             assert!(

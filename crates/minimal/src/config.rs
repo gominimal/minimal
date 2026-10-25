@@ -239,14 +239,35 @@ pub fn user_config_path(global: &GlobalArgs) -> PathBuf {
     resolve_minimal_config_dir(global).join("config.toml")
 }
 
-/// The bytes of the file at `path` before a write, or `None` when there was
-/// no file. [`restore_config`] puts them back.
-pub type ConfigSnapshot = Option<Vec<u8>>;
+/// What [`write_store_rule`] changed: the file it wrote, after any
+/// symlink, with its bytes before and after the write.
+/// [`restore_config`] puts the old bytes back.
+#[derive(Debug)]
+pub struct ConfigSnapshot {
+    /// The file that was written. A symlinked `config.toml` names its target.
+    file: PathBuf,
+    /// The bytes before the write, or `None` when there was no file.
+    before: Option<Vec<u8>>,
+    /// The bytes the write left in the file.
+    written: Vec<u8>,
+}
+
+/// The file a write to `path` changes: the target when `path` is a
+/// symlink, so the rename keeps the link. A dangling link stays `path`.
+fn write_target(path: &Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
 
 /// Write `rule` as the `[secret-store-rules.<id>]` rule of the client
 /// configuration at `path`, replacing any rule for `id` there. Every other
 /// line of the file stays as it is. The file is replaced in one rename, so a
-/// failed write leaves the old file. Returns the file as it was before.
+/// failed write leaves the old file. A symlinked file is written at its
+/// target. Returns the file as it was before.
 ///
 /// # Errors
 ///
@@ -257,7 +278,8 @@ pub fn write_store_rule(
     id: &str,
     rule: &boxes::core::bep::StoreRuleConfig,
 ) -> Result<ConfigSnapshot, anyhow::Error> {
-    let before = match std::fs::read(path) {
+    let file = write_target(path);
+    let before = match std::fs::read(&file) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => anyhow::bail!("read `{}`: {e}", path.display()),
@@ -287,8 +309,13 @@ pub fn write_store_rule(
             )
         })?;
     table.insert(id, toml_edit::Item::Table(store_rule_table(rule)));
-    write_config_bytes(path, doc.to_string().as_bytes())?;
-    Ok(before)
+    let written = doc.to_string().into_bytes();
+    write_config_bytes(&file, &written)?;
+    Ok(ConfigSnapshot {
+        file,
+        before,
+        written,
+    })
 }
 
 /// `rule` as a TOML table, with the fields in the order the docs show.
@@ -319,14 +346,28 @@ fn store_rule_table(rule: &boxes::core::bep::StoreRuleConfig) -> toml_edit::Tabl
     table
 }
 
-/// Put the file at `path` back as `snapshot` holds it: its old bytes, or no
-/// file when there was none.
+/// Put the file that `snapshot` names back as it was before the write: its
+/// old bytes, or no file when there was none. A file that changed after the
+/// write stays as it is, so no other edit is lost.
 ///
 /// # Errors
 ///
-/// A write or a remove that fails, naming the path.
-pub fn restore_config(path: &Path, snapshot: &ConfigSnapshot) -> Result<(), anyhow::Error> {
-    match snapshot {
+/// A file that changed after the write, or a read, write or remove that
+/// fails, naming the path.
+pub fn restore_config(snapshot: &ConfigSnapshot) -> Result<(), anyhow::Error> {
+    let path = &snapshot.file;
+    let now = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => anyhow::bail!("read `{}`: {e}", path.display()),
+    };
+    if now.as_deref() != Some(snapshot.written.as_slice()) {
+        anyhow::bail!(
+            "`{}` changed after min secret set wrote the rule, so it was left as it is",
+            path.display()
+        );
+    }
+    match &snapshot.before {
         Some(bytes) => write_config_bytes(path, bytes),
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -613,5 +654,62 @@ mod tests {
             boxes::core::bep::store_consent(rule, true),
             boxes::core::bep::StoreConsent::Deny
         );
+    }
+
+    fn sample_rule() -> boxes::core::bep::StoreRuleConfig {
+        boxes::core::bep::StoreRuleConfig {
+            store: None,
+            upstream: vec!["api.example.com".to_owned()],
+            header: Some("x-api-key".to_owned()),
+            prefix: None,
+            basic_auth: None,
+            action: None,
+        }
+    }
+
+    /// BEP-079: the write and the restore go through a symlinked
+    /// `config.toml` to its target, and the link stays a link.
+    #[cfg(unix)]
+    #[test]
+    fn secret_set_partial_failure_restores_both_through_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&real, "# mine\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let snapshot = write_store_rule(&link, "claude", &sample_rule()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .unwrap()
+                .contains("[secret-store-rules.claude]")
+        );
+        restore_config(&snapshot).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "# mine\n");
+    }
+
+    /// BEP-079: an edit made after the rule write is not lost by the
+    /// restore. The restore refuses and names the file.
+    #[test]
+    fn secret_set_partial_failure_restores_both_keeps_later_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n").unwrap();
+        let snapshot = write_store_rule(&path, "claude", &sample_rule()).unwrap();
+        std::fs::write(&path, "# edited\n").unwrap();
+        let err = restore_config(&snapshot).expect_err("the file changed");
+        assert!(format!("{err:#}").contains("changed after min secret set wrote the rule"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# edited\n");
     }
 }
