@@ -12142,6 +12142,206 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
   echo "::endgroup::"
 }
 
+# DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
+# the gvproxy switch. A box on a credentialed lane with the default `dns`
+# steering and `quic443 = "block"` starts. Then the case stops the Box Egress
+# Proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
+# runs and it is down from the start) and, from inside the box:
+#   1. an A lookup of api.github.com, a steered name, must be answered
+#      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
+#   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
+#      answers (BEP-078, NET-136);
+#   3. a UDP datagram to port 443 must be rejected at once: the switch
+#      answers ICMP port unreachable, so socat reads "Connection refused"
+#      well inside its 5 s wait (BEP-018).
+# Legs 2 and 3 are hard assertions. Leg 1 is a KNOWN GAP while
+# https://github.com/gominimal/minimal/issues/2523 is open: no production
+# code wires the steering into the relay's DNS gate yet, so the lookup is
+# forwarded. When that issue lands, change its known_gap to a fail.
+# Admission refuses `dns` steering for a box with a broker secret on every
+# host today (no box-zone resolver, BEP-017), so the lane comes from
+# --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
+# (its `auto` blocks only with a credentialed secret).
+# Diagnostics: the pair restarts with the relay's switch and DNS gate records
+# at debug, so on a failure the `min bug` bundle's daemon-log tail carries the
+# SERVFAIL warnings and the rejected datagrams. On a pass, the case prints the
+# same two records out of a bundle it writes itself.
+proof_bep_dns_steering_fails_closed_end_to_end() {
+  echo "::group::DNS steering fails closed while the Box Egress Proxy is down"
+  local ds_case=bep_dns_steering_fails_closed_end_to_end
+  local ds_sid ds_out ds_ns ds_resolv ds_ans ds_rc ds_q ds_quic ds_ms
+  local ds_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  local ds_bundle ds_lines
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$ds_case" "no MINVMD_GVPROXY_BIN: the steered lookups and the UDP 443 rejection run on the VM host's switch, and this target has none"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # A fresh pair: without MINVMD_BEP_STUB (the stand-in is not the proxy) and
+  # with the switch's debug records, which the UDP 443 rejection writes. The
+  # guest daemon takes its filter from the RUST_LOG minvmd starts with.
+  unset MINVMD_BEP_STUB
+  BEP_LIVE_DAEMON=""
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! RUST_LOG="$RUST_LOG,minimald::net::switch=debug,minimald::net::dns_gate=debug" \
+    mnl ls >/dev/null 2>"$WORK/$ds_case.up.err"; then
+    echo "::error::the daemon did not start for $ds_case"
+    cat "$WORK/$ds_case.up.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: ds_cleanup reads it.
+  DS_SID=""
+  ds_cleanup() {
+    [ -n "$DS_SID" ] && mnl session destroy --force "$DS_SID" >/dev/null 2>&1
+    DS_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # The proxy is stopped: the next live case restarts the pair.
+    BEP_LIVE_DAEMON=""
+    return 0
+  }
+  ds_fail() {
+    ds_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlsteer.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  ds_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-dns-steering --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    </dev/null 2>"$WORK/$ds_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for the DNS steering box"
+    echo "--- stdout ---"; printf '%s\n' "$ds_out"
+    echo "--- stderr ---"; cat "$WORK/$ds_case.err" 2>/dev/null || true
+    ds_fail
+  }
+  DS_SID="$(printf '%s\n' "$ds_out" | tail -n1 | tr -d '\r')"
+  ds_sid="$DS_SID"
+  mnl session exec "$ds_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the DNS steering box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    ds_fail
+  }
+
+  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
+  # proxy stays down for the rest of the case.
+  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
+    for _ in $(seq 1 20); do
+      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
+      ds_fail
+    fi
+    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
+  else
+    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
+  fi
+
+  ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
+  ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$ds_ns" ]; then
+    echo "::error::the DNS steering box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$ds_resolv"
+    ds_fail
+  fi
+
+  # A raw query from inside the box, the way the NET-141 legs send one:
+  # built and parsed host-side with python3, carried as base64. Prints
+  # "rcode ancount" for a reply to the query's own id, or nothing.
+  ds_dns() { # $1 name, $2 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e32, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$ds_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$ds_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/$ds_case.dns.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  }
+
+  # Leg 1: the steered A lookup fails closed.
+  ds_ans="$(ds_dns api.github.com 1)"
+  echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
+  ds_a_gap=""
+  if [ "${ds_ans%% *}" = 2 ]; then
+    echo "steered A lookup: SERVFAIL while the proxy is down"
+  else
+    ds_a_gap=1
+    known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
+  fi
+
+  # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
+  for ds_q in AAAA:28 HTTPS:65 SVCB:64; do
+    ds_ans="$(ds_dns api.github.com "${ds_q#*:}")"
+    echo "${ds_q%%:*} api.github.com -> rcode and answers: ${ds_ans:-no reply}"
+    if [ "$ds_ans" != "0 0" ]; then
+      echo "::error::the ${ds_q%%:*} lookup of the steered name api.github.com was not answered NODATA (rcode 0, no answers): got '${ds_ans:-no reply}'"
+      cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+      ds_fail
+    fi
+  done
+
+  # Leg 3: UDP to port 443 is rejected at once. 192.0.2.1 is TEST-NET-1: the
+  # switch answers before any egress verdict, so nothing leaves the host.
+  # Without the rejection socat waits its full 5 s and exits 0.
+  # shellcheck disable=SC2016
+  ds_quic="$(mnl session exec "$ds_sid" \
+    's=$(date +%s%N); printf q | /usr/bin/socat -t 5 -T 5 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>&1 | tr -d '\r')" || true
+  ds_rc="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+  ds_ms="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+  echo "UDP 192.0.2.1:443 from the blocked box -> exit ${ds_rc:-?} after ${ds_ms:-?} ms"
+  if [ -z "$ds_rc" ] || [ "$ds_rc" = 0 ] || ! printf '%s\n' "$ds_quic" | grep -q 'Connection refused' \
+    || [ -z "$ds_ms" ] || [ "$ds_ms" -ge 2000 ]; then
+    echo "::error::UDP to port 443 from a box with quic443 = \"block\" was not rejected at once (expected 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$ds_quic"
+    ds_fail
+  fi
+
+  # The daemon's records of the run, from the bundle a person attaches to a
+  # report. A note only: the bundle carries a tail of the log.
+  ds_bundle="${WORK:?}/$ds_case.tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$ds_bundle" >/dev/null 2>&1; then
+    ds_lines="$(zstd -dc "$ds_bundle" 2>/dev/null | tar -xOf - 2>/dev/null \
+      | grep -a -e 'answered SERVFAIL for a steered name' -e 'rejected UDP to port 443' | tail -n4)"
+    echo "daemon records in the min bug bundle:"
+    printf '%s\n' "${ds_lines:-(none found)}"
+  else
+    echo "(min bug produced no bundle)"
+  fi
+  rm -f "${WORK:?}/${ds_case:?}".*
+
+  ds_cleanup
+  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
+  # the known gap, the steered A lookup did not fail closed.
+  if [ -n "$ds_a_gap" ]; then
+    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  else
+    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  fi
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -23703,6 +23903,7 @@ case "${1:-}" in
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
     proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -23767,7 +23968,8 @@ case "${1:-}" in
     | bep_root_ca_present_in_box_trust_store \
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
-    | bep_logout_refuses_every_reference_at_next_request)
+    | bep_logout_refuses_every_reference_at_next_request \
+    | bep_dns_steering_fails_closed_end_to_end)
     "proof_$1"
     ;;
   *)
@@ -23810,6 +24012,7 @@ case "${1:-}" in
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
+    echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;
 esac
