@@ -761,6 +761,21 @@ impl<B: FetchBackend> RemoteCache<B> {
             .map_err(Error::Request)?;
 
         let mut resp = self.backend.execute(req).await?;
+        // An index hit whose object is gone (inbox#535): the index said the
+        // artifact exists and the store says it does not. That is a normal
+        // state of this architecture, not an outage: a snapshot index keeps
+        // every record forever, and the store's retention deletes cold
+        // objects out from under them. It is a miss, reported as one, and
+        // not retried; the warning is the divergence signal an operator
+        // watches, since a burst of it against the root index means someone
+        // deleted objects the root still names.
+        if resp.status_code() == 404 {
+            tracing::warn!(
+                sha256 = %hex::encode(sha256),
+                "cache_dangling_hit: the index names an artifact the store no longer has; building locally"
+            );
+            return Err(Error::NotFound);
+        }
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
         // Classified as the index path classifies it: `Fetch { status }`, so
@@ -1600,6 +1615,42 @@ mod tests {
             1,
             "a refusal is not retried"
         );
+    }
+
+    /// inbox#535: an index hit whose artifact object is gone is a miss, not a
+    /// failure: `NotFound`, after one attempt, so the caller falls back to a
+    /// local build the way it does for a spec the index never had.
+    #[tokio::test(start_paused = true)]
+    async fn materialize_dangling_index_hit_is_a_miss() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses).script(
+            &art_url,
+            vec![(404, b"gone".to_vec()), (404, b"gone".to_vec())],
+        );
+        let calls = backend.calls.clone();
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        assert!(rc.exists(&spec_hash), "the index names it: a hit");
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc
+            .materialize(&spec_hash, &cache, "dangling")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound),
+            "a dangling hit is a miss, got {err:?}"
+        );
+        // The index fetch, then one artifact attempt: a gone object is not retried.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
