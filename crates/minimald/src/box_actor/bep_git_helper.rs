@@ -19,8 +19,9 @@
 //! on every start of the box. A start without a usable grant removes it.
 
 use std::io::Write as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The minimal-owned directory under the box's home that holds the helper,
 /// its configuration and its log. The same directory holds the per-attach
@@ -38,6 +39,11 @@ pub(crate) const HELPER_CONFIG_REL: &str = ".local/state/minimal/git-credential.
 /// The helper's log, relative to the box's home: one line per answer,
 /// naming the host and never the value.
 pub(crate) const HELPER_LOG_REL: &str = ".local/state/minimal/git-credential.log";
+
+/// The size in bytes above which the helper moves its log to
+/// `git-credential.log.1`, over any older copy, before it appends. The two
+/// files together stay near twice this size.
+pub(crate) const HELPER_LOG_MAX_BYTES: u64 = 64 * 1024;
 
 /// The hosts the helper answers for: the GitHub module's host set
 /// (`bep::module::GITHUB`), each authority as git names it in a URL. The
@@ -106,8 +112,7 @@ fn is_installed(home: &Path) -> bool {
     let Ok(Some(dir)) = real_dir(home, HELPER_DIR_REL, false) else {
         return false;
     };
-    std::fs::symlink_metadata(dir.join(file_name(HELPER_REL)))
-        .is_ok_and(|meta| meta.file_type().is_file())
+    dir.is_file(file_name(HELPER_REL))
 }
 
 /// What [`install`] did.
@@ -137,8 +142,9 @@ pub(crate) enum Installed {
 ///
 /// # Errors
 ///
-/// An I/O error from a write, or a symbolic link on a path it writes. The
-/// caller logs it: a box without the helper still starts.
+/// An I/O error from a write, or a symbolic link on a path it writes. A
+/// helper from an earlier start is then removed, so git sends no credential
+/// for the grant hosts. The caller logs the error: the box still starts.
 pub(crate) fn install(
     home: &Path,
     deliveries: &[boxes::SealedDelivery],
@@ -155,27 +161,38 @@ pub(crate) fn install(
         remove_helper(home)?;
         return Ok(Installed::Refused);
     }
-    let dir = made_dir(home, HELPER_DIR_REL)?;
-
-    // The helper holds the sealed value, so only the box's user reads it.
-    write_atomically(
-        &dir,
-        file_name(HELPER_REL),
-        helper_script(&delivery.sealed).as_bytes(),
-        0o700,
-    )?;
-    write_atomically(
-        &dir,
-        file_name(HELPER_CONFIG_REL),
-        helper_config().as_bytes(),
-        0o644,
-    )?;
+    if let Err(error) = write_helper(home, &delivery.sealed) {
+        // Fail closed: a helper from an earlier start holds a value this
+        // start did not confirm, so it must not answer. When the directory
+        // is refused, [`launch_git_config_env`] does not find the helper.
+        if let Err(remove_error) = remove_helper(home) {
+            tracing::warn!(%remove_error, "removing the git credential helper after a failed write");
+        }
+        return Err(error);
+    }
     tracing::debug!(
         variable = %delivery.variable,
         hosts = ?grant_hosts(),
         "wrote the git credential helper for the GitHub grant"
     );
     Ok(Installed::Written)
+}
+
+/// Writes the helper with the sealed value `sealed`, and its readable
+/// configuration, into the box home `home`.
+fn write_helper(home: &Path, sealed: &str) -> std::io::Result<()> {
+    let dir = made_dir(home, HELPER_DIR_REL)?;
+    // The helper holds the sealed value, so only the box's user reads it.
+    dir.write_atomically(
+        file_name(HELPER_REL),
+        helper_script(sealed).as_bytes(),
+        0o700,
+    )?;
+    dir.write_atomically(
+        file_name(HELPER_CONFIG_REL),
+        helper_config().as_bytes(),
+        0o644,
+    )
 }
 
 /// Removes the helper and its configuration that an earlier start wrote, so
@@ -185,7 +202,7 @@ fn remove_helper(home: &Path) -> std::io::Result<()> {
         return Ok(());
     };
     for rel in [HELPER_REL, HELPER_CONFIG_REL] {
-        match std::fs::remove_file(dir.join(file_name(rel))) {
+        match dir.unlink(file_name(rel)) {
             Ok(()) => tracing::debug!(file = rel, "removed a git credential helper file"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -200,41 +217,196 @@ fn file_name(rel: &str) -> &str {
 }
 
 /// [`real_dir`] with `create`: the directory `home/rel`, made when absent.
-fn made_dir(home: &Path, rel: &str) -> std::io::Result<PathBuf> {
+fn made_dir(home: &Path, rel: &str) -> std::io::Result<DirFd> {
     real_dir(home, rel, true)?
         .ok_or_else(|| std::io::Error::other(format!("{rel} was not created under the box home")))
 }
 
-/// The directory `home/rel`, after a check of each component under `home`:
-/// each must be a directory and not a symbolic link. With `create`, a
-/// component that does not exist is made. Without it, a component that does
-/// not exist gives `None`.
-fn real_dir(home: &Path, rel: &str, create: bool) -> std::io::Result<Option<PathBuf>> {
+/// The directory `home/rel`, open, after a walk of each component under
+/// `home`. Each component is opened relative to the one before it with
+/// `O_NOFOLLOW`, so it must be a directory and not a symbolic link, and a
+/// swap of a component after the walk does not move the open directory.
+/// With `create`, a component that does not exist is made. Without it, a
+/// component that does not exist gives `None`.
+fn real_dir(home: &Path, rel: &str, create: bool) -> std::io::Result<Option<DirFd>> {
+    // The home's own path is the daemon's, so it can hold a symbolic link.
+    let mut dir = DirFd::open_home(home)?;
     let mut path = home.to_path_buf();
     for component in rel.split('/').filter(|component| !component.is_empty()) {
         path.push(component);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        let next = match dir.open_child(component) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                match dir.mkdir(component) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                dir.open_child(component)
+            }
+            next => next,
+        };
+        dir = match next {
+            Ok(next) => next,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 return Err(std::io::Error::other(format!(
                     "{} is a symbolic link",
                     path.display()
                 )));
             }
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
                 return Err(std::io::Error::other(format!(
                     "{} is not a directory",
                     path.display()
                 )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-                std::fs::create_dir(&path)?;
-            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
-        }
+        };
     }
-    Ok(Some(path))
+    Ok(Some(dir))
+}
+
+/// An open directory. Every file operation in it is relative to the open
+/// directory, never to a path, so a symbolic link that the box puts on the
+/// path after the open is not followed.
+struct DirFd(std::os::fd::OwnedFd);
+
+/// `name` as a C string. A name with a NUL byte is an error.
+fn c_name(name: &str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name).map_err(std::io::Error::other)
+}
+
+/// The result of a libc call that returns `-1` on error.
+fn check(ret: libc::c_int) -> std::io::Result<libc::c_int> {
+    if ret == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+impl DirFd {
+    /// Opens the box home `home`.
+    fn open_home(home: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(home)?;
+        Ok(Self(file.into()))
+    }
+
+    /// Opens the directory `name` in this directory. A symbolic link gives
+    /// `ELOOP`, and a file that is not a directory gives `ENOTDIR`.
+    fn open_child(&self, name: &str) -> std::io::Result<Self> {
+        let name = c_name(name)?;
+        // SAFETY: `self.0` is an open descriptor and `name` is a valid C
+        // string. A returned descriptor is new and owned by nobody else.
+        let fd = check(unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })?;
+        // SAFETY: `fd` is the new descriptor from `openat` above.
+        Ok(Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Makes the directory `name` in this directory.
+    fn mkdir(&self, name: &str) -> std::io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: `self.0` is an open descriptor and `name` is a valid C string.
+        check(unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o755) })?;
+        Ok(())
+    }
+
+    /// Removes the entry `name`, which is not a directory, from this
+    /// directory. A symbolic link is removed, never its target.
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: `self.0` is an open descriptor and `name` is a valid C string.
+        check(unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) })?;
+        Ok(())
+    }
+
+    /// Whether `name` in this directory is a regular file. A symbolic link
+    /// is not followed.
+    fn is_file(&self, name: &str) -> bool {
+        let Ok(name) = c_name(name) else {
+            return false;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `self.0` is an open descriptor, `name` is a valid C string
+        // and `stat` has room for the result.
+        let ret = unsafe {
+            libc::fstatat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            return false;
+        }
+        // SAFETY: `fstatat` returned 0, so it filled `stat`.
+        let stat = unsafe { stat.assume_init() };
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    /// Writes `body` to a new file in this directory with mode `mode`, and
+    /// renames it over `name`, so a git that runs during a restart never
+    /// reads half a helper. The new file is made with `O_EXCL` and
+    /// `O_NOFOLLOW`, so a file or symbolic link that the box put at its
+    /// name is not written through. The rename replaces `name` itself, also
+    /// when it is a symbolic link.
+    fn write_atomically(&self, name: &str, body: &[u8], mode: u32) -> std::io::Result<()> {
+        let tmp = format!(".{name}.{}.tmp", std::process::id());
+        // A file left at the name by an earlier run, or put there by the box.
+        match self.unlink(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let tmp_c = c_name(&tmp)?;
+        let name_c = c_name(name)?;
+        let written = (|| {
+            // SAFETY: `self.0` is an open descriptor and `tmp_c` is a valid
+            // C string. A returned descriptor is new and owned by nobody else.
+            let fd = check(unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    libc::c_uint::from(mode as libc::mode_t),
+                )
+            })?;
+            // SAFETY: `fd` is the new descriptor from `openat` above.
+            let mut file = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            file.write_all(body)?;
+            // The mode on `openat` is narrowed by the umask. Set it outright.
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            // SAFETY: `self.0` is an open descriptor and both names are
+            // valid C strings.
+            check(unsafe {
+                libc::renameat(
+                    self.0.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                    self.0.as_raw_fd(),
+                    name_c.as_ptr(),
+                )
+            })?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = self.unlink(&tmp);
+        }
+        written
+    }
 }
 
 /// Whether `sealed` holds only the characters of a sealed value's printed
@@ -285,9 +457,13 @@ case "$host" in
   *) exit 0 ;;
 esac
 printf 'username=x-access-token\npassword=%s\n' '{sealed}'
+log="$HOME/{HELPER_LOG_REL}"
+if [ -f "$log" ] && [ "$(wc -c <"$log" 2>/dev/null || echo 0)" -gt {HELPER_LOG_MAX_BYTES} ]; then
+  mv -f "$log" "$log.1" 2>/dev/null
+fi
 printf '%s git-credential-minimal answered for host %s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$host" \
-  >>"$HOME/{HELPER_LOG_REL}" 2>/dev/null
+  >>"$log" 2>/dev/null
 exit 0
 "#
     )
@@ -310,36 +486,4 @@ fn helper_config() -> String {
         ));
     }
     config
-}
-
-/// Writes `body` to a new file in `dir` with mode `mode`, and renames it
-/// over `dir/name`, so a git that runs during a restart never reads half a
-/// helper. The new file is made with `O_EXCL` and `O_NOFOLLOW`, so a file
-/// or symbolic link that the box put at its name is not written through.
-/// The rename replaces `dir/name` itself, also when it is a symbolic link.
-fn write_atomically(dir: &Path, name: &str, body: &[u8], mode: u32) -> std::io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    // A file left at the name by an earlier run, or put there by the box.
-    // `remove_file` removes a symbolic link, never its target.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.write_all(body)?;
-        // The mode on `open` is narrowed by the umask. Set it outright.
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        std::fs::rename(&tmp, dir.join(name))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
 }

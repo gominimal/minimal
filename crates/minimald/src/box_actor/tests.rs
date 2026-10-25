@@ -11865,8 +11865,8 @@ async fn a_hook_launched_shell_of_a_registered_box_is_kept_for_a_terminal() {
 #[test]
 fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     use super::bep_git_helper::{
-        HELPER_CONFIG_REL, HELPER_DIR_REL, HELPER_LOG_REL, HELPER_REL, Installed, grant_hosts,
-        install, launch_git_config_env,
+        HELPER_CONFIG_REL, HELPER_DIR_REL, HELPER_LOG_MAX_BYTES, HELPER_LOG_REL, HELPER_REL,
+        Installed, grant_hosts, install, launch_git_config_env,
     };
     const SEALED: &str = "eyJ0eXAiOiJ4In0..aXY.Y3Q.dGFn";
     let delivery = |sealed: &str| boxes::SealedDelivery {
@@ -12008,6 +12008,16 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     }
     assert!(!log.contains(SEALED), "the log holds the value: {log}");
 
+    // The log does not grow without bound: past its cap it moves to `.1`.
+    let log_path = home.path().join(HELPER_LOG_REL);
+    std::fs::write(&log_path, vec![b'x'; HELPER_LOG_MAX_BYTES as usize + 1]).unwrap();
+    assert!(fill("github.com").status.success());
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("answered for host github.com\n"), "{log}");
+    let rotated = std::fs::metadata(log_path.with_extension("log.1")).unwrap();
+    assert_eq!(rotated.len(), HELPER_LOG_MAX_BYTES + 1);
+
     // A box with no grant, or a value that is not inert, gets no helper.
     let plain = tempfile::tempdir().unwrap();
     assert_eq!(install(plain.path(), &[]).unwrap(), Installed::NoGrant);
@@ -12033,6 +12043,19 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
     assert_eq!(install(home.path(), &[]).unwrap(), Installed::NoGrant);
     assert!(!home.path().join(HELPER_REL).exists());
+
+    // A write that fails removes the helper an earlier start wrote, so the
+    // launch does not name it: here a directory sits at the config's name.
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    std::fs::remove_file(home.path().join(HELPER_CONFIG_REL)).unwrap();
+    std::fs::create_dir_all(home.path().join(HELPER_CONFIG_REL).join("blocker")).unwrap();
+    assert!(install(home.path(), &[delivery(SEALED)]).is_err());
+    assert!(!home.path().join(HELPER_REL).exists());
+    assert!(launch_git_config_env(home.path(), 0).is_empty());
+    std::fs::remove_dir_all(home.path().join(HELPER_CONFIG_REL)).unwrap();
 
     // The box's user owns its home. A symbolic link on a path the helper
     // writes is refused, and nothing is written through it.
