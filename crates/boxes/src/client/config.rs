@@ -303,7 +303,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_file(dir.path(), "config.toml", "# empty");
         let cfg = read_config_file(&path).unwrap();
-        assert!(cfg.loadouts.default_loadouts.is_empty());
+        assert!(
+            cfg.loadouts.default_loadouts.is_empty(),
+            "expected empty, got {:?}",
+            cfg.loadouts.default_loadouts
+        );
     }
 
     /// Unknown top-level keys are rejected so a typo (`loadout`
