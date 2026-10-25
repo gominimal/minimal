@@ -85,6 +85,9 @@ ot.workspace = true
 paths.workspace = true
 sandbox.workspace = true
 boxes.workspace = true
+# The GitHub module's host set, the names a `dns` or `both` box's DNS gate
+# steers to the Box Egress Proxy (BEP-062).
+bep = { path = "../bep" }
 switch.workspace = true
 stdlib.workspace = true
 version.workspace = true
