@@ -842,7 +842,27 @@ mod host {
     /// `errSecItemNotFound`.
     const ITEM_NOT_FOUND: i32 = -25300;
 
+    /// Serialises reads. The setting that turns off Keychain prompts is
+    /// process-wide, so one read must not turn prompts back on while
+    /// another read is in progress.
+    static NO_PROMPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     pub(super) fn read(id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        let _serial = NO_PROMPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // With prompts off, an item that does not let the proxy read it
+        // returns `errSecInteractionNotAllowed` and does not block the
+        // request on a dialog. The lock turns prompts back on when it drops.
+        let _no_prompt =
+            security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+                .map_err(|e| {
+                    ReadError::Store(StoreError::Refused {
+                        store: NATIVE_STORE,
+                        action: "read the secret",
+                        detail: e.to_string(),
+                    })
+                })?;
         match security_framework::passwords::get_generic_password(SERVICE, id) {
             Ok(value) => Ok(Zeroizing::new(value)),
             Err(e) if e.code() == ITEM_NOT_FOUND => Err(ReadError::Deleted(id.to_owned())),
