@@ -198,6 +198,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// (exec ssh, or exit with the attach's status) that [`run`] finishes once
 /// the command's `cmd` span has ended, so callers return it untouched.
 pub(crate) async fn box_via_ssh(
+    kind: paths::ProviderKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     wire: Option<String>,
@@ -243,7 +244,7 @@ pub(crate) async fn box_via_ssh(
     // The name hold a `host_ip` session without a row depends on may not
     // have survived a VM host daemon restart; re-make it before the
     // attach or the exec, idempotently.
-    rehold_held_name_before_attach(sock, id, record.as_ref()).await;
+    rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();

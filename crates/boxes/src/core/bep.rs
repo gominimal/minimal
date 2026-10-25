@@ -1889,7 +1889,11 @@ mod tests {
         let spec = ActivationSpec { bep: &bep, ..spec };
         let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
         assert!(plan.inject_ca);
-        assert!(plan.warnings.is_empty());
+        assert!(
+            plan.warnings.is_empty(),
+            "expected empty, got {:?}",
+            plan.warnings
+        );
     }
 
     /// BEP-011: a box spec that sets a trust variable keeps its value, and

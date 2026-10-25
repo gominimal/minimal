@@ -565,10 +565,26 @@ mod tests {
                 .compose(nil_id(), ComposeOptions::default())
                 .unwrap(),
         );
-        assert!(res.vars().is_empty());
-        assert!(res.patches().is_empty());
-        assert!(res.packages().is_empty());
-        assert!(res.lifecycle_hooks().is_empty());
+        assert!(
+            res.vars().is_empty(),
+            "expected empty, got {:?}",
+            res.vars()
+        );
+        assert!(
+            res.patches().is_empty(),
+            "expected empty, got {:?}",
+            res.patches()
+        );
+        assert!(
+            res.packages().is_empty(),
+            "expected empty, got {:?}",
+            res.packages()
+        );
+        assert!(
+            res.lifecycle_hooks().is_empty(),
+            "expected empty, got {:?}",
+            res.lifecycle_hooks()
+        );
     }
 
     /// A daemon-collected var becomes a `Pending` outcome with the
@@ -624,11 +640,23 @@ mod tests {
                 assert!(
                     matches!(&v.spec, WireVarSpec::Specified { value } if value == "from-project")
                 );
-                assert!(response.patches.is_empty());
-                assert!(response.lifecycle_hooks.is_empty());
+                assert!(
+                    response.patches.is_empty(),
+                    "expected empty, got {:?}",
+                    response.patches
+                );
+                assert!(
+                    response.lifecycle_hooks.is_empty(),
+                    "expected empty, got {:?}",
+                    response.lifecycle_hooks
+                );
                 // Stash is empty (no packages or hooks collected); the
                 // client's wire contribution is the default we passed.
-                assert!(state.daemon_packages.is_empty());
+                assert!(
+                    state.daemon_packages.is_empty(),
+                    "expected empty, got {:?}",
+                    state.daemon_packages
+                );
                 assert!(state.pending_hooks.is_empty());
                 assert_eq!(state.client_contribution, WireContribution::default());
             }
@@ -729,7 +757,11 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(res.packages().len(), 1);
-        assert!(res.lifecycle_hooks().is_empty());
+        assert!(
+            res.lifecycle_hooks().is_empty(),
+            "expected empty, got {:?}",
+            res.lifecycle_hooks()
+        );
     }
 
     // ============================================================
@@ -805,7 +837,11 @@ mod tests {
             lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
-        assert!(comp.vars().is_empty());
+        assert!(
+            comp.vars().is_empty(),
+            "expected empty, got {:?}",
+            comp.vars()
+        );
     }
 
     /// A `Denied` verdict aborts with `ComposeError::Denied`.
@@ -895,10 +931,26 @@ mod tests {
             lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
-        assert!(comp.vars().is_empty());
-        assert!(comp.patches().is_empty());
-        assert!(comp.packages().is_empty());
-        assert!(comp.lifecycle_hooks().is_empty());
+        assert!(
+            comp.vars().is_empty(),
+            "expected empty, got {:?}",
+            comp.vars()
+        );
+        assert!(
+            comp.patches().is_empty(),
+            "expected empty, got {:?}",
+            comp.patches()
+        );
+        assert!(
+            comp.packages().is_empty(),
+            "expected empty, got {:?}",
+            comp.packages()
+        );
+        assert!(
+            comp.lifecycle_hooks().is_empty(),
+            "expected empty, got {:?}",
+            comp.lifecycle_hooks()
+        );
     }
 
     /// Build a `PendingComposeState` holding one package and one
@@ -979,7 +1031,11 @@ mod tests {
             }],
         };
         let comp = resume_from_verdict(state_with_one_package_and_hook(), ignored).unwrap();
-        assert!(comp.lifecycle_hooks().is_empty());
+        assert!(
+            comp.lifecycle_hooks().is_empty(),
+            "expected empty, got {:?}",
+            comp.lifecycle_hooks()
+        );
 
         let denied = ContributionVerdict {
             session_id: SessionId::nil(),

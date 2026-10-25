@@ -152,6 +152,15 @@ impl SignInItem for signin::MemoryKeychain {
 
 impl SignInItem for HostKeychain {
     fn delete(&self) -> anyhow::Result<()> {
+        // BEP-069: the delete holds the item lock, so a renewal at the proxy
+        // cannot check the item before the delete and write it back after.
+        // A lock that is not taken does not stop the delete: the delete is
+        // the enforcement (BEP-044).
+        let _lock = signin::lock_item()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "the sign-in was deleted without the item lock");
+            })
+            .ok();
         host_delete()?;
         confirm_deleted(self)
     }
@@ -1374,6 +1383,99 @@ mod tests {
             "Signed in to GitHub as octocat. The token renews at the proxy on the next request that uses it.\n"
         );
         assert!(!out.contains(ACCESS) && !out.contains(REFRESH));
+    }
+
+    /// A memory keychain that counts the reads of the material and the
+    /// writes.
+    #[derive(Default)]
+    struct CountingKeychain {
+        inner: MemoryKeychain,
+        material_reads: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Keychain for CountingKeychain {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.inner.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.material_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.material()
+        }
+        fn write(
+            &self,
+            metadata: &Metadata,
+            material: &Material,
+        ) -> Result<(), signin::SignInError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.write(metadata, material)
+        }
+    }
+
+    // BEP-069: the proxy alone presents and renews the token. After sign-in
+    // the client reads only the item's metadata, whatever the token's
+    // standing, and never sends a refresh grant.
+    #[tokio::test]
+    async fn client_never_presents_or_refreshes_the_token() {
+        let gh = fake_github("octocat").await;
+        let keychain = CountingKeychain::default();
+        let login = Login {
+            keychain: &keychain,
+            endpoints: &gh.endpoints,
+            client_secret: None,
+            device: true,
+            open_browser: &no_browser,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let stored = run_login(&login, &mut out, &mut err).await.expect("login");
+        let seen_at_sign_in = gh.seen.lock().unwrap().len();
+        assert_eq!(keychain.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Live, within the proxy's renewal window, expired with live
+        // refresh material, and lapsed.
+        let expires = stored.metadata.token_expires_at;
+        for now in [
+            expires - 3600,
+            expires - 60,
+            expires + 60,
+            stored.metadata.refresh_expires_at + 60,
+        ] {
+            let mut out = Vec::new();
+            write_status(&keychain, now, &mut out).expect("status");
+            let out = String::from_utf8(out).expect("utf8");
+            assert!(!out.contains(ACCESS) && !out.contains(REFRESH), "{out}");
+        }
+
+        assert_eq!(
+            keychain
+                .material_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the client never reads the token"
+        );
+        assert_eq!(
+            keychain.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the client never writes a renewed token"
+        );
+        let seen = gh.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            seen_at_sign_in,
+            "nothing reaches GitHub after sign-in"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("grant_type=refresh_token")),
+            "{seen:?}"
+        );
+        // The one request that carries the token is the sign-in's account
+        // lookup.
+        assert_eq!(
+            seen.iter().filter(|r| r.starts_with("GET /user")).count(),
+            1
+        );
     }
 
     #[test]
