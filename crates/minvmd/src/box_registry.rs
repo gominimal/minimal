@@ -3988,6 +3988,13 @@ impl BoxRegistry {
     /// the row's creation, when it is a client box's, goes dormant
     /// ([`Creation`]) and is persisted; and the switch address returns to
     /// the hand-out book, quarantined when the row was ever attributed.
+    ///
+    /// It sends the proxy no revocation (BEP-043). A live client row always
+    /// has its standing creation, because a registration under a held name
+    /// is refused. So a row this removes goes dormant, and its creator can
+    /// resume it under the same box id, which a revocation refuses for good
+    /// (BEP-071). Only the creator's destroy of a live box revokes it
+    /// ([`Self::withdraw_client_box`]).
     fn withdraw_where(
         &self,
         switch_addr: Ipv4Addr,
@@ -10287,5 +10294,52 @@ mod tests {
         let wired = BoxRegistry::new(SUBNET).with_proxy_control(Some(path.clone()));
         assert_eq!(wired.proxy_control(), Some(path.as_path()));
         assert_eq!(wired.clone().proxy_control(), Some(path.as_path()));
+    }
+
+    // BEP-043, BEP-071: the expiry of a detached box is not its destroy. Its
+    // creation goes dormant, and its creator can resume it under the same
+    // box id. A revocation refuses that id for good, so the expiry sends
+    // none: the withdrawn attachment refuses the box's values meanwhile
+    // (NET-133).
+    #[test]
+    fn expired_credentialed_box_sends_no_revocation_and_stays_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(path));
+        registry.spawn_withdrawal_drainer(|_| {});
+        let mut spec = client_spec("web");
+        spec.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        let web = registry
+            .register_client_box(spec)
+            .expect("the plan has an address for the box");
+        assert!(web.declares_credentialed_upstream());
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn at its grace's end",
+        );
+        // A revocation thread connects at once. Give one the time to.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the expiry sends nothing to the proxy"
+        );
+        assert!(
+            registry
+                .resumable_creation(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id()),
+                )
+                .is_ok(),
+            "the creator can resume the box under the same id"
+        );
     }
 }
