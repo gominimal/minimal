@@ -663,11 +663,18 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let restored = revoke::restore(&dir)
         .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?;
     tracing::info!(
-        count = restored.len(),
-        box_ids = ?restored,
+        count = restored.box_ids.len(),
+        box_ids = ?restored.box_ids,
         audit = %dir.display(),
         "restored the revocations recorded in the audit log"
     );
+    if restored.skipped != 0 {
+        tracing::warn!(
+            skipped = restored.skipped,
+            audit = %dir.display(),
+            "skipped audit log lines that did not parse; a revocation on one is not in force"
+        );
+    }
     let log = AuditLog::open_dir(&dir, audit::Rotation::default())
         .map_err(|err| format!("bep did not open the audit log in {}: {err}", dir.display()))?;
     let segment = log.path().to_path_buf();
@@ -702,7 +709,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         log.clone(),
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored);
+    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored.box_ids);
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {

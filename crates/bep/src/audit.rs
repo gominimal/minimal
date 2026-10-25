@@ -655,11 +655,18 @@ fn final_hash(path: &Path) -> io::Result<String> {
     Ok(head_hash(&tail[..complete]))
 }
 
-/// Whether the segment at `path` holds a revocation record.
+/// Whether the segment at `path` holds a revocation record, or can hold
+/// one. A complete, non-empty line that does not parse as a record counts
+/// as one, so [`prune`] keeps a segment it cannot read whole. The bytes
+/// after the last newline are a partial write and count as none.
 fn holds_revocation(path: &Path) -> io::Result<bool> {
     let bytes = fs::read(path)?;
-    Ok(bytes.split(|&b| b == b'\n').any(|raw| {
-        serde_json::from_slice::<Record>(raw).is_ok_and(|record| record.kind == Kind::Revocation)
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+    Ok(bytes[..complete].split(|&b| b == b'\n').any(|raw| {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        !raw.is_empty()
+            && serde_json::from_slice::<Record>(raw)
+                .map_or(true, |record| record.kind == Kind::Revocation)
     }))
 }
 
@@ -1357,6 +1364,32 @@ mod tests {
         assert_eq!(
             Rotation::default().revocation_ceiling.as_secs(),
             crate::publish::ROOT_VALIDITY_SECS
+        );
+    }
+
+    // BEP-068: a complete line that does not parse can be a revocation, so
+    // prune keeps its segment. A partial last line is a torn write, not a
+    // record, and does not keep one.
+    #[test]
+    fn segment_with_unparsable_line_survives_prune() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        fs::create_dir_all(&audit).unwrap();
+        fs::write(audit.join(segment_name(0)), b"{\"kind\":\"revoc\n").unwrap();
+        fs::write(audit.join(segment_name(1)), b"{\"kind\":\"revoc").unwrap();
+        fs::write(audit.join(segment_name(2)), b"").unwrap();
+        assert!(holds_revocation(&audit.join(segment_name(0))).unwrap());
+        assert!(!holds_revocation(&audit.join(segment_name(1))).unwrap());
+
+        let day = 24 * 60 * 60;
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(day / 2);
+        assert_eq!(
+            prune(&audit, &rotation(1, 1, day), soon).unwrap(),
+            vec![audit.join(segment_name(1))]
+        );
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(0)), audit.join(segment_name(2))]
         );
     }
 
