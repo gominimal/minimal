@@ -317,6 +317,10 @@ pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintErr
 ///    and is logged at warn. The next creation finds the replacement in the
 ///    store and the pending file under its identifier, and revokes again.
 ///
+/// A lock file next to the control socket serialises the replacement and
+/// the retry across `min` processes. A creation that waited on the lock
+/// reads the store again, and uses a key that another creation kept.
+///
 /// # Errors
 ///
 /// As [`local_client_key`].
@@ -332,8 +336,20 @@ pub fn local_client_key_at(
     let pending = pending_revoke_path(control);
     let replacing = match store.find() {
         Ok(Some(key)) => {
-            retry_pending_revoke(&key, control, &pending);
-            return Ok(key);
+            if !pending.exists() {
+                return Ok(key);
+            }
+            // A pending revoke is retried under the lock, against the key
+            // that the store holds then.
+            let _lock = ReplaceLock::acquire(control);
+            return match store.find() {
+                Ok(Some(key)) => {
+                    retry_pending_revoke(&key, control, &pending);
+                    Ok(key)
+                }
+                Ok(None) => Ok(key),
+                Err(error) => Err(store_error(error)),
+            };
         }
         Ok(None) => false,
         Err(ClientKeyError::Refused(detail)) => {
@@ -342,6 +358,14 @@ pub fn local_client_key_at(
         }
         Err(error) => return Err(store_error(error)),
     };
+    // Two creations that both get a refusal replace the key one after the
+    // other. The second one finds the first one's replacement in the store
+    // and uses it, so the revoke never removes the key that the store keeps.
+    let _lock = replacing.then(|| ReplaceLock::acquire(control));
+    if replacing && let Ok(Some(key)) = store.find() {
+        retry_pending_revoke(&key, control, &pending);
+        return Ok(key);
+    }
     let key = ClientKey::generate()?;
     if replacing {
         ControlClient::connect(control)?.register_client_key(&key)?;
@@ -356,6 +380,36 @@ pub fn local_client_key_at(
     }
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
+}
+
+/// An exclusive lock on the file next to the control socket at `control`.
+/// It serialises the replacement of the client's key, and the retry of a
+/// pending revoke, across `min` processes. The lock ends when it is dropped.
+struct ReplaceLock {
+    _file: Option<std::fs::File>,
+}
+
+impl ReplaceLock {
+    /// Waits for the lock. A lock file that does not open, or a lock that
+    /// fails, is logged at warn, and the caller goes on without the lock.
+    fn acquire(control: &Path) -> Self {
+        let mut name = control.as_os_str().to_owned();
+        name.push(".replace-lock");
+        let path = PathBuf::from(name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.lock().map(|()| file));
+        match file {
+            Ok(file) => Self { _file: Some(file) },
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "did not lock the client key replacement");
+                Self { _file: None }
+            }
+        }
+    }
 }
 
 /// The file next to the control socket at `control` that names a kept
@@ -1375,17 +1429,17 @@ mod tests {
         }
     }
 
-    /// A key store that refuses its key once, as a keychain does to a
-    /// rebuilt program, and keeps the replacement.
+    /// A key store that refuses its key until it keeps a replacement, as a
+    /// keychain does to a rebuilt program.
     #[derive(Default)]
     struct RefusingOnce {
-        refused: RefCell<bool>,
+        replaced: RefCell<bool>,
         kept: RefCell<Option<[u8; 32]>>,
     }
 
     impl ClientKeyStore for RefusingOnce {
         fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
-            if !self.refused.replace(true) {
+            if !*self.replaced.borrow() {
                 return Err(ClientKeyError::Refused("not this program".into()));
             }
             Ok(self.kept.borrow().and_then(|b| ClientKey::from_secret(&b)))
@@ -1393,6 +1447,7 @@ mod tests {
 
         fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
             *self.kept.borrow_mut() = Some(*key.secret());
+            *self.replaced.borrow_mut() = true;
             Ok(())
         }
     }
@@ -1718,7 +1773,7 @@ mod tests {
             .register_client_key(&old)
             .unwrap();
         let store = RefusingOnce {
-            refused: RefCell::new(false),
+            replaced: RefCell::new(false),
             kept: RefCell::new(Some(*old.secret())),
         };
 
@@ -1774,7 +1829,7 @@ mod tests {
         assert!(verifies(&clients, &before));
 
         let store = RefusingOnce {
-            refused: RefCell::new(false),
+            replaced: RefCell::new(false),
             kept: RefCell::new(Some(*old.secret())),
         };
         let replacement = local_client_key_at(&store, &path).unwrap();
@@ -1790,7 +1845,7 @@ mod tests {
         let refusing = dir.path().join("refusing.sock");
         serve_refusing(&refusing);
         let store = RefusingOnce {
-            refused: RefCell::new(false),
+            replaced: RefCell::new(false),
             kept: RefCell::new(Some(*old.secret())),
         };
         let err = local_client_key_at(&store, &refusing).unwrap_err();
@@ -1832,7 +1887,7 @@ mod tests {
             .unwrap();
         let store = RefusingThenUnlinking {
             inner: RefusingOnce {
-                refused: RefCell::new(false),
+                replaced: RefCell::new(false),
                 kept: RefCell::new(Some(*old.secret())),
             },
             socket: path.clone(),
@@ -1853,6 +1908,49 @@ mod tests {
         assert!(!clients.read().unwrap().contains(&old.kid()));
         assert!(clients.read().unwrap().contains(&replacement.kid()));
         assert!(!pending.exists());
+    }
+
+    /// A key store that refuses its key once. Then it gives `other`, as a
+    /// keychain does after another creation kept its replacement.
+    struct ReplacedMeanwhile {
+        found: RefCell<bool>,
+        other: [u8; 32],
+    }
+
+    impl ClientKeyStore for ReplacedMeanwhile {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            if !self.found.replace(true) {
+                return Err(ClientKeyError::Refused("not this program".into()));
+            }
+            Ok(ClientKey::from_secret(&self.other))
+        }
+
+        fn replace(&self, _: &ClientKey) -> Result<(), ClientKeyError> {
+            panic!("a creation replaced a key that another creation kept");
+        }
+    }
+
+    // BEP-063: a creation that gets a refusal after another creation kept a
+    // replacement uses that replacement, and revokes no key the store keeps.
+    #[test]
+    fn a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let other = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&other)
+            .unwrap();
+        let store = ReplacedMeanwhile {
+            found: RefCell::new(false),
+            other: *other.secret(),
+        };
+
+        let key = local_client_key_at(&store, &path).unwrap();
+        assert_eq!(key.kid(), other.kid());
+        assert!(clients.read().unwrap().contains(&other.kid()));
+        assert_eq!(kept_registrations(&path), vec![other.public()]);
     }
 
     /// A key store that refuses its key, and then fails to keep the
