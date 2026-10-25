@@ -340,4 +340,222 @@ mod tests {
         restrict_owned_dir(&dir).unwrap();
         verify_provider_dir_ownership(&dir).unwrap();
     }
+
+    /// The split-user design (T57) names each socket and file in the list
+    /// below with an owner, a mode and the users that open it. The list
+    /// covers the provider dir, its `vmm/` subdirectory, the gvproxy dir,
+    /// gvproxy config dir and gate dir that `minimal-gvproxy` uses outside
+    /// the provider dir, and the supervisor channel to the EGW process. The
+    /// list is written by hand. A new socket that nobody adds to it does not
+    /// fail this test. A rename fails it only for a name that the list takes
+    /// from the code.
+    #[test]
+    fn split_user_provider_dir_design_names_every_socket_owner_of_fixed_list() {
+        let _g = UDS_ENV_LOCK.lock().unwrap();
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/design/2026-10-25-split-user-vmm-provider-dir.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", doc_path.display()));
+
+        let file_name = |p: PathBuf| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .expect("socket path has a file name")
+                .to_string()
+        };
+        let switch_sock = file_name(crate::net::resolve_switch_sock().unwrap());
+        let gvproxy_yaml = file_name(
+            crate::net::GvproxyConfig::new(
+                PathBuf::from("gvproxy"),
+                PathBuf::from("/provider").join(&switch_sock),
+            )
+            .config_path()
+            .to_path_buf(),
+        );
+        // The entries in the provider dir and in its `vmm/` subdirectory,
+        // the entries the VMM child or `prepare_socket_dir` creates, and
+        // the sockets the VMM child opens, each with the user that must
+        // create it. A name comes from the code where this
+        // module can reach a constant or a resolver for it, so a rename of
+        // that name fails this test. `boot.log`, `data-vol.raw` and
+        // `gvproxy-bep.sock` are literals, because no reachable item names
+        // them. The entries `minimal-vmm` creates sit in `vmm/`, because
+        // `minimal-vmm` cannot write the provider dir. gvproxy runs as a
+        // third user, `minimal-gvproxy`, so it shares no writable state
+        // with `bep serve` and only the egress gate reaches it. Its switch
+        // socket sits in the gvproxy dir, and `gvproxy.yaml` in the gvproxy
+        // config dir, both outside the provider dir. The egress gate and
+        // `switch::bep_host` run in an EGW process as `minimal-gvproxy`
+        // (Gatehouse 6.10 line 831). So the EGW process creates the gate
+        // socket in the gate dir, and dials `gvproxy-bep.sock` in the
+        // gvproxy config dir, which `minimal-vmm` cannot search. The
+        // supervisor hands the EGW process its table and token on a
+        // `socketpair` with no path, which the supervisor creates.
+        let vmm = |name: String| format!("vmm/{name}");
+        let gvproxy_dir = |name: &str| format!("<gvproxy dir>/{name}");
+        let gvproxy_config_dir = |name: &str| format!("<gvproxy config dir>/{name}");
+        let gate_dir = |name: &str| format!("<gate dir>/{name}");
+        let required = [
+            ("<provider dir>/".to_string(), LOGIN),
+            ("<provider dir>/vmm/".to_string(), ROOT),
+            (vmm(paths::SSH_SOCK_FILE.to_string()), VMM),
+            (
+                vmm(file_name(crate::timekeep::resolve_timekeep_sock().unwrap())),
+                VMM,
+            ),
+            (vmm("boot.log".to_string()), VMM),
+            (vmm("data-vol.raw".to_string()), VMM),
+            (gvproxy_dir(""), ROOT),
+            (gvproxy_dir(&switch_sock), GVPROXY),
+            (gvproxy_config_dir(""), ROOT),
+            (gvproxy_config_dir(&gvproxy_yaml), LOGIN),
+            (gate_dir(""), ROOT),
+            (
+                gate_dir(&file_name(crate::net::resolve_gate_sock().unwrap())),
+                GVPROXY,
+            ),
+            (crate::control::GUEST_CONTROL_SOCK_FILE.to_string(), LOGIN),
+            (
+                crate::guest_telemetry::GUEST_TELEMETRY_SOCK_FILE.to_string(),
+                LOGIN,
+            ),
+            ("/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(), LOGIN),
+            // `cmd/run.rs` names the proxy socket beside the switch socket
+            // with this literal. No constant carries it. It moves to the
+            // gvproxy config dir, where the EGW process can reach it and
+            // the VM user cannot.
+            (gvproxy_config_dir("gvproxy-bep.sock"), LOGIN),
+            (crate::control::CONTROL_SOCK_FILE.to_string(), LOGIN),
+            (
+                "EGW channel (descriptor 0 of the EGW process)".to_string(),
+                LOGIN,
+            ),
+        ];
+
+        check_table(&doc, "Ownership model", &required);
+        // The fallback changes only the gvproxy rows. There gvproxy runs
+        // as `minimal-vmm`, so its switch socket sits in `vmm/`. The gate
+        // socket and `gvproxy-bep.sock` are named beside the switch socket
+        // today, so the fallback names them in the provider dir, where
+        // `<login>` still creates them.
+        check_table(
+            &doc,
+            "Fallback: only gvproxy runs as `minimal-vmm`",
+            &[
+                ("<provider dir>/".to_string(), LOGIN),
+                ("<provider dir>/vmm/".to_string(), ROOT),
+                (gvproxy_yaml, LOGIN),
+                (vmm(switch_sock), VMM),
+                (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
+                ("gvproxy-bep.sock".to_string(), LOGIN),
+            ],
+        );
+    }
+
+    const LOGIN: &str = "<login>";
+    const VMM: &str = "minimal-vmm";
+    const ROOT: &str = "root";
+    const GVPROXY: &str = "minimal-gvproxy";
+
+    /// The users named at the start of each comma-separated entry of `cell`,
+    /// ignoring commas inside parentheses. `None` when an entry does not
+    /// start with one of the four users the design knows.
+    fn users_in(cell: &str) -> Option<Vec<&'static str>> {
+        let mut entries = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        for (i, c) in cell.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    entries.push(&cell[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        entries.push(&cell[start..]);
+        entries
+            .into_iter()
+            .map(|entry| {
+                let token = entry.split_whitespace().next()?;
+                [LOGIN, VMM, ROOT, GVPROXY]
+                    .into_iter()
+                    .find(|u| *u == token)
+            })
+            .collect()
+    }
+
+    /// Checks that the table in the `## <heading>` section of `doc` has a
+    /// row for each name in `required`. Each row names the expected
+    /// creating user first, a four-digit octal mode that gives its owner
+    /// some access, and only known users as opening users. A mode with no
+    /// group and no other bits admits only its owner, so such a row must
+    /// name no opening user except the owner. The owner is the user after
+    /// `owner` in the mode cell, or else the creating user. The check does
+    /// not prove that a group mode names the right group for each opener.
+    fn check_table(doc: &str, heading: &str, required: &[(String, &str)]) {
+        let section = doc
+            .split("\n## ")
+            .find(|s| s.starts_with(&format!("{heading}\n")))
+            .unwrap_or_else(|| panic!("the design has a `## {heading}` section"));
+        let rows: Vec<Vec<String>> = section
+            .lines()
+            .filter(|l| l.starts_with('|') && !l.starts_with("|---"))
+            .map(|l| {
+                l.trim_matches('|')
+                    .split('|')
+                    .map(|c| c.replace('`', "").trim().to_string())
+                    .collect()
+            })
+            .filter(|cells: &Vec<String>| cells.first().is_some_and(|c| c != "Path"))
+            .collect();
+
+        for (name, creator) in required {
+            let row = rows
+                .iter()
+                .find(|cells| &cells[0] == name)
+                .unwrap_or_else(|| panic!("the {heading} table has no row for {name}"));
+            assert_eq!(row.len(), 4, "row for {name} has four columns: {row:?}");
+            let creators = users_in(&row[1])
+                .unwrap_or_else(|| panic!("row for {name} names a known creating user: {row:?}"));
+            assert_eq!(
+                creators.first(),
+                Some(creator),
+                "row for {name} is created by {creator}: {row:?}",
+            );
+            let mode = row[2].split([' ', ',']).next().unwrap_or("");
+            assert!(
+                mode.len() == 4 && mode.chars().all(|c| ('0'..='7').contains(&c)),
+                "row for {name} names a four-digit octal mode, got {:?}",
+                row[2],
+            );
+            assert_ne!(
+                &mode[1..2],
+                "0",
+                "row for {name} gives its owner some access, got {:?}",
+                row[2],
+            );
+            let openers = users_in(&row[3]).unwrap_or_else(|| {
+                panic!("row for {name} names only known opening users: {row:?}")
+            });
+            assert!(!openers.is_empty(), "row for {name} names an opening user");
+            // A 0600 entry that lists another opener contradicts itself.
+            let owner = row[2]
+                .split(',')
+                .find_map(|part| part.trim().strip_prefix("owner "))
+                .map(|rest| {
+                    users_in(rest.trim())
+                        .and_then(|users| users.first().copied())
+                        .unwrap_or_else(|| panic!("row for {name} names a known owner: {row:?}"))
+                })
+                .unwrap_or(*creator);
+            if &mode[2..] == "00" {
+                assert!(
+                    openers.iter().all(|u| *u == owner),
+                    "row for {name} has mode {mode}, so only {owner} can open it: {row:?}",
+                );
+            }
+        }
+    }
 }
