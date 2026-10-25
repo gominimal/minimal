@@ -282,6 +282,11 @@ Steering and the interception CA
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
   <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL carry from creation a git credential helper that answers `git credential fill` with the sealed value as the password for each host in the GitHub module's host set, and for no other host.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    verify: ./scripts/session-e2e.sh bep_git_credential_helper_sends_header
+    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper's configuration is included from the box's XDG git configuration, so a `~/.gitconfig` the box carries stays as it is; the helper logs one line per answer naming the host, never the value -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
