@@ -342,8 +342,10 @@ mod tests {
     }
 
     /// The split-user design (T57) names each socket and file in the list
-    /// below with an owner, a mode and the users that open it. The list is
-    /// written by hand. A new socket that nobody adds to it does not fail
+    /// below with an owner, a mode and the users that open it. The list
+    /// covers the provider dir, its `vmm/` subdirectory, and the gvproxy
+    /// dir and gvproxy config dir that `minimal-gvproxy` reads from outside
+    /// the provider dir. The list is written by hand. A new socket that nobody adds to it does not fail
     /// this test. A rename fails it only for a name the list takes from the
     /// code.
     #[test]
@@ -377,11 +379,15 @@ mod tests {
         // that name fails this test. `boot.log`, `data-vol.raw` and
         // `gvproxy-bep.sock` are literals, because no reachable item names
         // them. The entries `minimal-vmm` creates sit in `vmm/`, because
-        // `minimal-vmm` cannot write the provider dir. The switch socket
-        // stays with `<login>`, so only the egress gate reaches gvproxy
-        // (review thread 4369586576 on pull request #2546; arch has not
-        // passed the design yet).
+        // `minimal-vmm` cannot write the provider dir. gvproxy runs as a
+        // third user, `minimal-gvproxy`, so it shares no writable state
+        // with `bep serve` and only the egress gate reaches it (arch ruling
+        // C1 and C2 on pull request #2546). Its switch socket sits in the
+        // gvproxy dir, and `gvproxy.yaml` in the gvproxy config dir, both
+        // outside the provider dir.
         let vmm = |name: String| format!("vmm/{name}");
+        let gvproxy_dir = |name: &str| format!("<gvproxy dir>/{name}");
+        let gvproxy_config_dir = |name: &str| format!("<gvproxy config dir>/{name}");
         let required = [
             ("<provider dir>/".to_string(), LOGIN),
             ("<provider dir>/vmm/".to_string(), ROOT),
@@ -392,7 +398,10 @@ mod tests {
             ),
             (vmm("boot.log".to_string()), VMM),
             (vmm("data-vol.raw".to_string()), VMM),
-            (switch_sock.clone(), LOGIN),
+            (gvproxy_dir(""), ROOT),
+            (gvproxy_dir(&switch_sock), GVPROXY),
+            (gvproxy_config_dir(""), ROOT),
+            (gvproxy_config_dir(&gvproxy_yaml), LOGIN),
             (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
             (crate::control::GUEST_CONTROL_SOCK_FILE.to_string(), LOGIN),
             (
@@ -400,7 +409,6 @@ mod tests {
                 LOGIN,
             ),
             ("/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(), LOGIN),
-            (gvproxy_yaml.clone(), LOGIN),
             // `cmd/run.rs` names the proxy socket beside the switch socket
             // with this literal. No constant carries it. It stays in the
             // provider dir, out of the VM user's reach.
@@ -426,10 +434,11 @@ mod tests {
     const LOGIN: &str = "<login>";
     const VMM: &str = "minimal-vmm";
     const ROOT: &str = "root";
+    const GVPROXY: &str = "minimal-gvproxy";
 
     /// The users named at the start of each comma-separated entry of `cell`,
     /// ignoring commas inside parentheses. `None` when an entry does not
-    /// start with one of the three users the design knows.
+    /// start with one of the four users the design knows.
     fn users_in(cell: &str) -> Option<Vec<&'static str>> {
         let mut entries = Vec::new();
         let (mut depth, mut start) = (0usize, 0usize);
@@ -449,7 +458,9 @@ mod tests {
             .into_iter()
             .map(|entry| {
                 let token = entry.split_whitespace().next()?;
-                [LOGIN, VMM, ROOT].into_iter().find(|u| *u == token)
+                [LOGIN, VMM, ROOT, GVPROXY]
+                    .into_iter()
+                    .find(|u| *u == token)
             })
             .collect()
     }
