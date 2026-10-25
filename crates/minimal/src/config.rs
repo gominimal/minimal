@@ -363,8 +363,9 @@ mod tests {
                  never be sent to. Remove or change the rule.\n\
                  The secret-store rule host in {file} names the header Host, which a secret can \
                  never be sent to. Remove or change the rule.\n\
-                 The secret-store rule internal in {file} names host.min.internal, which a \
-                 secret can never be sent to. Remove or change the rule.\n"
+                 The secret-store rule internal in {file} names host.min.internal, which is \
+                 under min.internal. A secret can never be sent to min.internal or a name \
+                 under it. Remove or change the rule.\n"
             )
         );
     }
