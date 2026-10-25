@@ -200,9 +200,23 @@ impl Resolve for SystemResolver {
 pub trait AuditWriter: Send + Sync {
     /// Appends one record. A failure is the writer's to log.
     fn write(&self, decision: &Decision);
+
+    /// Appends one record and reports a failure to the caller, which logs
+    /// it. A writer that cannot fail keeps this default.
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.write(decision);
+        Ok(())
+    }
 }
 
 impl AuditWriter for Mutex<AuditLog> {
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(decision)
+            .map(drop)
+    }
+
     fn write(&self, decision: &Decision) {
         let mut log = self.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(err) = log.append(decision) {
@@ -329,7 +343,8 @@ impl Proxy {
 
     /// Serves one admitted box connection. The span carries the box id, the
     /// authority the box asked for, the upstream's validation outcome, the
-    /// last substitution decision, and the outcome. It never carries a
+    /// last substitution decision, whether an admission was
+    /// cohort-attributed, and the outcome. It never carries a
     /// credential.
     pub async fn serve<S>(&self, delivery: Delivery, stream: S)
     where
@@ -343,6 +358,7 @@ impl Proxy {
             authority = tracing::field::Empty,
             upstream_tls = tracing::field::Empty,
             substitution = tracing::field::Empty,
+            cohort_attributed = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
         async {

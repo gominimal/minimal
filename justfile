@@ -128,9 +128,17 @@ initramfs-nodocker:
 # The ad-hoc (-s -) hypervisor-entitlement codesign must be the LAST touch:
 # any later cargo call that relinks minvmd drops it (EINVAL from krun_start_enter).
 #
-# Build minvmd (debug); codesign is the last touch.
+# bep, the Box Egress Proxy, is built in its own cargo call beside minvmd:
+# minvmd starts it from its own directory (MINVMD_BEP_BIN overrides). It is
+# signed because the macOS Keychain admits its keys only to the signed
+# program that made them. An ad-hoc signature changes with each rebuild, so
+# set BEP_CODESIGN_IDENTITY to a stable identity to keep the keys usable.
+#
+# Build minvmd and bep (debug); codesign is the last touch.
 [macos]
 minvmd-build:
+    cargo build -p bep --bin bep --locked
+    codesign --force -s "${BEP_CODESIGN_IDENTITY:--}" {{minvmd-dir}}/bep
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 

@@ -694,7 +694,14 @@ fn serve_connection(
         }
     };
     let root_peer = is_root_peer(uid);
-    if !root_peer && let Err(error) = check_peer_uid(uid) {
+    // The guest door also admits the VM user's uid (BEP-047): the VMM child
+    // dials it as `minimal-vmm`. The host door keeps its check, and the
+    // door, not the peer, decides which verbs a connection can ask for.
+    let checked = match door {
+        ControlDoor::GuestReports => check_guest_peer_uid(uid),
+        ControlDoor::Host => check_peer_uid(uid),
+    };
+    if !root_peer && let Err(error) = checked {
         tracing::debug!(%error, "control-socket peer check failed");
         return Ok(());
     }
@@ -1332,6 +1339,39 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
 #[cfg(test)]
 fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
     check_peer_uid(peer_uid(stream)?)
+}
+
+/// The uid of the VM user, `minimal-vmm`: `None` on a host without that
+/// user. A uid found is kept for the process lifetime. A miss is not kept,
+/// so a daemon that starts before `min finalize-install` creates the user
+/// admits it on the next connection.
+fn vmm_uid() -> Option<u32> {
+    static VMM_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = VMM_UID.get() {
+        return Some(*uid);
+    }
+    let uid = crate::sock::user_uid(crate::sock::VMM_USER)?;
+    Some(*VMM_UID.get_or_init(|| uid))
+}
+
+/// Whether a guest door admits `peer_uid`: the daemon's own uid, or the
+/// VM user's uid (`vmm_uid`) that the VMM child runs as.
+fn guest_peer_admitted(peer_uid: u32, my_uid: u32, vmm_uid: Option<u32>) -> bool {
+    peer_uid == my_uid || vmm_uid == Some(peer_uid)
+}
+
+/// The peer check of the guest doors (`guest-control.sock` and
+/// `guest-telemetry.sock`): [`check_peer_uid`], and also the
+/// `minimal-vmm` uid.
+pub(crate) fn check_guest_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let my_uid = unsafe { libc::geteuid() };
+    // The own-uid test comes first, so the common case does no user
+    // lookup. `vmm_uid` caches only a hit.
+    if peer_uid == my_uid || guest_peer_admitted(peer_uid, my_uid, vmm_uid()) {
+        return Ok(());
+    }
+    check_peer_uid(peer_uid)
 }
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
@@ -2776,7 +2816,11 @@ impl AskAudit {
     /// The host row's facts, when there are any.
     fn with_facts(mut self, facts: Option<&crate::box_registry::AskFacts>) -> Self {
         if let Some(facts) = facts {
-            self.box_id = Some(crate::bep_attach::BoxIdText(&facts.box_id).to_string());
+            // An audit record spells the box id as 32 lowercase hex, the
+            // form `bep::listener::box_id_text` gives every BEP audit
+            // `subject` and older `box-admissions.log` lines carry. Log
+            // lines keep the hyphenated `BoxIdText`.
+            self.box_id = Some(minimald_rpc::BoxId::from_bytes(facts.box_id).simple());
             self.box_name = Some(facts.name.clone());
             self.switch_address = Some(facts.switch_address);
             self.port = Some(facts.port);
@@ -2807,6 +2851,25 @@ mod tests {
     use std::os::unix::net::UnixStream as TestStream;
     use std::sync::OnceLock;
     use std::time::Duration;
+
+    /// BEP-047: the guest door admits the `minimal-vmm` uid the VMM child
+    /// dials as, and the daemon's own; the host door admits only its own.
+    #[test]
+    fn guest_door_admits_the_vmm_uid_and_the_host_door_does_not() {
+        assert!(guest_peer_admitted(1000, 1000, Some(990)));
+        assert!(guest_peer_admitted(990, 1000, Some(990)));
+        assert!(!guest_peer_admitted(991, 1000, Some(990)));
+        assert!(!guest_peer_admitted(990, 1000, None));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        check_guest_peer_uid(me).unwrap();
+        check_peer_uid(me).unwrap();
+        let stranger = me.wrapping_add(4242);
+        assert!(check_peer_uid(stranger).is_err());
+        if vmm_uid() != Some(stranger) {
+            assert!(check_guest_peer_uid(stranger).is_err());
+        }
+    }
 
     use minimald_rpc::{
         BoxControlReply, BoxControlRequest, HoldBoxNameRequest, RegisterBoxRequest,
@@ -5402,7 +5465,7 @@ mod tests {
                 "the audit records {outcome}: {audit}"
             );
         }
-        let box_id = format!(r#""box_id":"{}""#, web.box_id);
+        let box_id = format!(r#""box_id":"{}""#, web.box_id.simple());
         for line in audit
             .lines()
             .filter(|line| !line.contains("refused_unknown_id"))
@@ -6400,5 +6463,27 @@ mod tests {
             "a refused lease publishes no row"
         );
         host.register_live("api");
+    }
+
+    /// An ask audit line spells the row's box id as 32 lowercase hex: the
+    /// spelling of every BEP audit `subject`, never the hyphenated
+    /// log-line form.
+    #[test]
+    fn ask_audit_line_spells_box_id_as_32_hex() {
+        let box_id: crate::bep_attach::BoxId = [
+            0x01, 0x9a, 0x2b, 0x3c, 0x4d, 0x5e, 0x7f, 0x60, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6,
+            0xe7, 0xf8,
+        ];
+        let facts = crate::box_registry::AskFacts {
+            name: "web".to_owned(),
+            box_id,
+            switch_address: Ipv4Addr::new(10, 0, 2, 5),
+            port: 8080,
+            proto: IpProto::Tcp,
+        };
+        let line = AskAudit::new("offered", minimald_rpc::AskId::from_bytes([9; 16]))
+            .with_facts(Some(&facts));
+        let json = serde_json::to_value(&line).expect("serialise the ask audit line");
+        assert_eq!(json["box_id"], "019a2b3c4d5e7f608192a3b4c5d6e7f8");
     }
 }

@@ -108,8 +108,9 @@ impl std::error::Error for ProjectFileInvalid {
     }
 }
 
-/// A GitHub grant the box cannot receive in its environment (BEP-007). The
-/// creation is refused with exit 3, before the box exists.
+/// A grant the box cannot receive: a GitHub grant whose value cannot land
+/// in its environment (BEP-007), or a store reference that no rule admits
+/// (BEP-035). The creation is refused with exit 3, before the box exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantNotDelivered {
     /// The grant's name is not a POSIX environment variable name, so it
@@ -123,6 +124,36 @@ pub enum GrantNotDelivered {
     NotSealed {
         /// The grant's name.
         grant: String,
+    },
+    /// No `[secret-store-rules]` rule names the item a store reference
+    /// reads, so nothing says where its value may go.
+    NoStoreRule {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "deny"`.
+    StoreReferenceDenied {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "ask"`, and the command cannot ask
+    /// (BEP-035).
+    AskWithoutTerminal {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "ask"`, and the person answered no.
+    StoreReferenceDeclined {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
     },
 }
 
@@ -142,16 +173,46 @@ impl std::fmt::Display for GrantNotDelivered {
                 "Cannot create the box: no sealed value was made for its GitHub grant \
                  {grant}, so {grant} would be empty in the box. No box was created."
             ),
+            Self::NoStoreRule { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                 reads the item {item} from the host's secret store, and no rule in \
+                 [secret-store-rules] in your config.toml names that item. Add a rule for \
+                 it, or remove the secret from {name}. Run `min dirs` to find config.toml.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreReferenceDenied { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                 reads the item {item} from the host's secret store, and the rule for that \
+                 item in [secret-store-rules] denies it. Remove the secret from {name}.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::AskWithoutTerminal { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} reads the item {item} from the \
+                 host's secret store. The rule for that item in [secret-store-rules] sets \
+                 action = \"ask\", and this command cannot ask: it has no terminal, or \
+                 --no-input is set. The secret was denied. Run the command in a terminal \
+                 without --no-input, or remove the secret from {name}.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreReferenceDeclined { grant, item } => write!(
+                f,
+                "Cannot create the box: you did not allow the secret {grant} to read the \
+                 item {item} from the host's secret store. No box was created."
+            ),
         }
     }
 }
 
 impl std::error::Error for GrantNotDelivered {}
 
-/// The project's `[session.network.bep]` settings and `[session.secrets]`
-/// grants. Only a missing project file reads as empty. A file that exists
-/// but does not load refuses the activation, so a broken file can never
-/// skip the grant checks (BEP-008).
+/// The project's `[session.network.bep]` settings, `[session.secrets]`
+/// grants, the box spec's own variable names and the `[session.network]
+/// quic443` stance. Only a missing project file reads as empty. A file that
+/// exists but does not load refuses the activation, so a broken file can
+/// never skip the grant checks (BEP-008).
 fn project_bep_and_grants(
     project: &camino::Utf8Path,
 ) -> Result<
@@ -159,6 +220,7 @@ fn project_bep_and_grants(
         boxes::core::bep::BepSettings,
         boxes::core::bep::SecretGrants,
         Vec<String>,
+        Option<boxes::core::bep::Quic443>,
     ),
     ProjectFileInvalid,
 > {
@@ -189,11 +251,10 @@ fn project_bep_and_grants(
                     .map(|entry| entry.name().as_ref().to_string()),
             )
             .collect();
-        (
-            session.network.and_then(|n| n.bep).unwrap_or_default(),
-            session.secrets,
-            spec_env,
-        )
+        let (bep, quic443) = session
+            .network
+            .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
+        (bep, session.secrets, spec_env, quic443)
     }))
 }
 
@@ -201,7 +262,8 @@ fn project_bep_and_grants(
 /// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
 /// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
-/// ride the declaration.
+/// ride the declaration. The declared `quic443` stance does not: it rides
+/// the policy of every box (BEP-018).
 fn credentialed_upstream_for(
     flag: bool,
     bep: &boxes::core::bep::BepSettings,
@@ -257,6 +319,160 @@ fn refuse_unhonourable_grants(
         eprintln!("warning: {warning}");
     }
     Ok(plan.warnings)
+}
+
+/// The reference as the box spec writes it: `<store>:<id>` or `<id>`.
+fn store_item(reference: &boxes::core::bep::StoreReference<'_>) -> String {
+    match reference.store {
+        Some(store) => format!("{store}:{}", reference.id),
+        None => reference.id.to_owned(),
+    }
+}
+
+/// Checks the box spec's store references at creation, and gives the rules
+/// it accepts, by item. Does nothing, and reads no configuration, for a box
+/// with no store reference. Otherwise it reads the rules through
+/// [`crate::config::read_client_config_and_store_rules`], which fails
+/// closed. `can_ask` says whether the command can ask the person.
+///
+/// # Errors
+///
+/// [`boxes::core::bep::ActivationRefused`] for a reference to the GitHub
+/// sign-in item or a rule upstream outside the egress (BEP-034, BEP-036),
+/// and [`GrantNotDelivered`] for a reference with no rule or one its rule
+/// denies (BEP-035). Each ends the run with exit 3.
+fn check_store_grants(
+    global: &GlobalArgs,
+    secrets: &boxes::core::bep::SecretGrants,
+    egress: Option<&boxes::EgressPolicy>,
+    can_ask: bool,
+) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
+    if boxes::core::bep::store_references(secrets).next().is_none() {
+        return Ok(boxes::core::bep::StoreRules::new());
+    }
+    let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    accept_store_references(secrets, egress, &rules, can_ask, &mut |question| {
+        crate::cmd::confirm(question, false)
+    })
+}
+
+/// Judges each store reference in `secrets` against `rules`, and gives the
+/// rules of the references it accepts, by item. First every reference is
+/// checked against the deny set and the egress (BEP-034, BEP-036). Then a
+/// reference with no rule, a `deny` rule, or an `ask` rule without
+/// `can_ask` is refused (BEP-035). Only when no reference is refused does
+/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
+/// info line naming each reference checked and its outcome.
+///
+/// # Errors
+///
+/// As [`check_store_grants`] says. `ask`'s own error ends the check.
+fn accept_store_references(
+    secrets: &boxes::core::bep::SecretGrants,
+    egress: Option<&boxes::EgressPolicy>,
+    rules: &boxes::core::bep::StoreRules,
+    can_ask: bool,
+    ask: &mut dyn FnMut(&str) -> Result<bool, anyhow::Error>,
+) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
+    use boxes::core::bep::{StoreConsent, check_store_references, store_consent, store_references};
+    let module_hosts = crate::config::store_module_hosts();
+    let deny = crate::config::store_deny_set(&module_hosts);
+    let mut checked: Vec<String> = Vec::new();
+    let outcome = (|| {
+        if let Err(refused) = check_store_references(secrets, egress, rules, deny) {
+            checked.extend(
+                refused
+                    .refusals
+                    .iter()
+                    .map(|refusal| format!("refused: {refusal}")),
+            );
+            return Err(anyhow::Error::from(refused));
+        }
+        // Every refusal that needs no answer comes first, so the person is
+        // never asked about a creation that a later reference refuses.
+        let mut to_ask: Vec<(String, Vec<String>, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
+        let mut allowed: Vec<(String, &str, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
+        for reference in store_references(secrets) {
+            let item = store_item(&reference);
+            let grant = reference.grant.to_owned();
+            let Some(rule) = reference.rule(rules) else {
+                checked.push(format!("{item}: no rule"));
+                return Err(GrantNotDelivered::NoStoreRule { grant, item }.into());
+            };
+            match store_consent(rule, can_ask) {
+                StoreConsent::Allow => {}
+                StoreConsent::Deny if rule.action == Some(boxes::core::bep::StoreAction::Ask) => {
+                    checked.push(format!("{item}: denied, no terminal to ask"));
+                    return Err(GrantNotDelivered::AskWithoutTerminal { grant, item }.into());
+                }
+                StoreConsent::Deny => {
+                    checked.push(format!("{item}: denied by its rule"));
+                    return Err(GrantNotDelivered::StoreReferenceDenied { grant, item }.into());
+                }
+                // One question per distinct item, naming every grant that reads it.
+                StoreConsent::Ask => match to_ask.iter_mut().find(|(seen, ..)| *seen == item) {
+                    Some((_, grants, _)) => grants.push(grant),
+                    None => to_ask.push((item.clone(), vec![grant], rule)),
+                },
+            }
+            allowed.push((item, reference.id, rule));
+        }
+        for (item, grants, rule) in &to_ask {
+            let upstream: Vec<String> = rule.upstream.iter().map(|host| printable(host)).collect();
+            let names: Vec<String> = grants.iter().map(|grant| printable(grant)).collect();
+            let (subject, verbs) = if names.len() == 1 {
+                (format!("The secret {}", names[0]), ("reads", "sends"))
+            } else {
+                (
+                    format!("The secrets {}", names.join(", ")),
+                    ("read", "send"),
+                )
+            };
+            let question = format!(
+                "{subject} {} the item {} from the host's secret store and {} it to {}. \
+                 Allow it for this box?",
+                verbs.0,
+                printable(item),
+                verbs.1,
+                upstream.join(", ")
+            );
+            if !ask(&question)? {
+                checked.push(format!("{item}: declined"));
+                return Err(GrantNotDelivered::StoreReferenceDeclined {
+                    grant: grants[0].clone(),
+                    item: item.clone(),
+                }
+                .into());
+            }
+        }
+        let mut accepted = boxes::core::bep::StoreRules::new();
+        for (item, id, rule) in allowed {
+            checked.push(format!("{item}: allowed"));
+            accepted.insert(id.to_owned(), rule.clone());
+        }
+        Ok(accepted)
+    })();
+    tracing::info!(
+        references = ?checked,
+        accepted = outcome.is_ok(),
+        "checked the box's store references"
+    );
+    outcome
+}
+
+/// `text` with each control character escaped, so a name from an
+/// untrusted `minimal.toml` cannot move the cursor or fake a line in the
+/// question the person answers.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The names of the project's GitHub grants, in name order.
@@ -495,7 +711,8 @@ fn mint_grants(
     network: boxes::NetworkMode,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
-        ClientKey, ControlClient, GrantBox, MintError, ProxyRegistration, mint_and_register,
+        ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
+        local_client_key, mint_and_register,
     };
     let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
         return Ok(MintedGrants {
@@ -521,7 +738,11 @@ fn mint_grants(
     // at the proxy.
     let root_certificate = grant_root_certificate(&identity)?;
     let mut control = ControlClient::connect(&control_path)?;
-    let key = ClientKey::generate()?;
+    // BEP-063: every creation signs under the client's one kept key, so the
+    // proxy holds one registration for this client, not one for each box. A
+    // key the keychain refuses this program is replaced here, and the mint
+    // registers the replacement before any handle leaves this process.
+    let key = local_client_key(&HostClientKeyStore)?;
     let grant_box = GrantBox {
         box_id,
         grants,
@@ -814,7 +1035,8 @@ pub(crate) async fn activate_box(
             let has_ingress = !port_mappings.is_empty()
                 || args.dynamic_ingress.is_some()
                 || args.dynamic_range.is_some();
-            let (project_bep, project_secrets, project_env) = project_bep_and_grants(&utf8_path)?;
+            let (project_bep, project_secrets, project_env, project_quic443) =
+                project_bep_and_grants(&utf8_path)?;
             let policy = boxes::BoxPolicy {
                 egress,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -831,6 +1053,10 @@ pub(crate) async fn activate_box(
                     &project_bep,
                     &project_secrets,
                 ),
+                // BEP-018: the declared stance is a setting of every box, lane
+                // or not, so a declared `block` reaches the gate of a box with
+                // no credentialed upstream.
+                quic443: project_quic443,
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -849,6 +1075,14 @@ pub(crate) async fn activate_box(
                 full_breadth_acknowledged,
                 &project_env,
             )?;
+            // BEP-034/035/036: each store reference needs a rule that admits
+            // it, inside the box's egress, before anything is created.
+            let can_ask = !global.no_input && crate::can_prompt_interactively();
+            // The accepted rules wait on a sealed `store` member kind to
+            // carry their handles (#2525). The registration already carries
+            // the egress their upstreams are checked to lie within.
+            let _accepted_store_rules =
+                check_store_grants(global, &project_secrets, policy.egress.as_ref(), can_ask)?;
             // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
             // proxy, and then a held sign-in. Only the item's metadata is
             // read, and nothing asks for a sign-in.
@@ -2354,7 +2588,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -2399,7 +2633,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
             let egress = boxes::EgressPolicy {
                 allow_dns_hosts: Some(
                     bep::module::GITHUB
@@ -2445,7 +2679,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(
@@ -2475,6 +2709,227 @@ mod tests {
         assert!(credentialed_upstream_for(true, &bep, &client).is_some());
         let broker = SecretGrants::from([("GH_TOKEN".into(), grant(GrantSource::Broker))]);
         assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
+    }
+
+    /// One broker grant `OPENAI_KEY` that reads the item `openai-key`.
+    fn store_grant() -> boxes::core::bep::SecretGrants {
+        boxes::core::bep::SecretGrants::from([(
+            "OPENAI_KEY".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["openai-key".into()],
+                mode: None,
+            },
+        )])
+    }
+
+    /// A rule for `openai-key` that sends it to `api.openai.com`.
+    fn store_rule(action: Option<boxes::core::bep::StoreAction>) -> boxes::core::bep::StoreRules {
+        boxes::core::bep::StoreRules::from([(
+            "openai-key".into(),
+            boxes::core::bep::StoreRuleConfig {
+                store: None,
+                upstream: vec!["api.openai.com".into()],
+                header: Some("Authorization".into()),
+                prefix: Some("Bearer ".into()),
+                basic_auth: None,
+                action,
+            },
+        )])
+    }
+
+    fn egress_of(hosts: &[&str]) -> boxes::EgressPolicy {
+        boxes::EgressPolicy {
+            allow_dns_hosts: Some(hosts.iter().map(|h| (*h).to_owned()).collect()),
+            ..boxes::EgressPolicy::default()
+        }
+    }
+
+    fn never_ask(question: &str) -> Result<bool, anyhow::Error> {
+        panic!("asked with no terminal: {question}")
+    }
+
+    /// BEP-035: a store reference that no rule names is refused at
+    /// creation, through the reader creation uses, with exit 3. A box with
+    /// no store reference reads no configuration and passes.
+    #[test]
+    fn store_reference_without_rule_is_refused_at_creation() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let global = crate::cli::GlobalArgs {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            ..crate::cli::GlobalArgs::default()
+        };
+        let egress = egress_of(&["api.openai.com"]);
+        let err = check_store_grants(&global, &store_grant(), Some(&egress), false)
+            .expect_err("a reference with no rule is refused");
+        let refused = err
+            .downcast_ref::<GrantNotDelivered>()
+            .expect("a refusal main.rs ends with exit 3");
+        assert_eq!(
+            refused,
+            &GrantNotDelivered::NoStoreRule {
+                grant: "OPENAI_KEY".into(),
+                item: "openai-key".into(),
+            }
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("OPENAI_KEY") && text.contains("openai-key"),
+            "{text}"
+        );
+        assert!(text.contains("[secret-store-rules]"), "{text}");
+
+        let none = check_store_grants(&global, &boxes::core::bep::SecretGrants::new(), None, false)
+            .expect("no store reference, nothing to refuse");
+        assert!(none.is_empty());
+
+        // A rule in another store does not name the reference.
+        let mut other = store_rule(None);
+        other.get_mut("openai-key").expect("rule").store = Some("vault".into());
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &other, true, &mut never_ask)
+                .expect_err("a rule in another store is no rule");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::NoStoreRule { .. })
+        ));
+
+        let accepted = accept_store_references(
+            &store_grant(),
+            Some(&egress),
+            &store_rule(None),
+            false,
+            &mut never_ask,
+        )
+        .expect("a matching rule inside the egress is accepted");
+        assert_eq!(accepted, store_rule(None));
+    }
+
+    /// BEP-036: a rule whose upstream the box's egress does not admit
+    /// refuses the creation with exit 3, naming the missing host.
+    #[test]
+    fn store_rule_outside_egress_exits_3() {
+        for egress in [None, Some(egress_of(&["example.com"]))] {
+            let err = accept_store_references(
+                &store_grant(),
+                egress.as_ref(),
+                &store_rule(None),
+                true,
+                &mut never_ask,
+            )
+            .expect_err("an upstream outside the egress is refused");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .expect("an activation refusal");
+            assert_eq!(refused.exit_code(), 3);
+            assert_eq!(
+                refused.refusals,
+                [boxes::core::bep::BepRefusal::StoreHostsOutsideEgress {
+                    grant: "OPENAI_KEY".into(),
+                    missing: vec!["api.openai.com".into()],
+                }]
+            );
+            assert!(err.to_string().contains("api.openai.com"), "{err}");
+        }
+    }
+
+    /// BEP-035: an `ask` rule with no terminal denies the reference, and
+    /// asks nothing. With a terminal it asks, and the answer decides.
+    #[test]
+    fn ask_rule_without_a_terminal_denies() {
+        let egress = egress_of(&["api.openai.com"]);
+        let ask = store_rule(Some(boxes::core::bep::StoreAction::Ask));
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &ask, false, &mut never_ask)
+                .expect_err("no terminal denies");
+        let refused = err.downcast_ref::<GrantNotDelivered>().expect("exit 3");
+        assert_eq!(
+            refused,
+            &GrantNotDelivered::AskWithoutTerminal {
+                grant: "OPENAI_KEY".into(),
+                item: "openai-key".into(),
+            }
+        );
+        assert!(refused.to_string().contains("--no-input"), "{refused}");
+
+        let mut questions = Vec::new();
+        let accepted =
+            accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |q| {
+                questions.push(q.to_owned());
+                Ok(true)
+            })
+            .expect("a yes accepts");
+        assert_eq!(accepted, ask);
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].contains("api.openai.com"), "{}", questions[0]);
+        assert_eq!(
+            printable("KEY\u{1b}[2K\nAllow? y"),
+            "KEY\\u{1b}[2K\\nAllow? y"
+        );
+
+        let err = accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |_| {
+            Ok(false)
+        })
+        .expect_err("a no refuses");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDeclined { .. })
+        ));
+
+        let deny = store_rule(Some(boxes::core::bep::StoreAction::Deny));
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &deny, true, &mut never_ask)
+                .expect_err("a deny rule refuses");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDenied { .. })
+        ));
+
+        // A deny after an ask asks nothing: every refusal comes first.
+        let mut two = store_grant();
+        two.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["other-key".into()],
+                mode: None,
+            },
+        );
+        let mut ask_then_deny = ask.clone();
+        let mut denied = deny["openai-key"].clone();
+        denied.upstream = vec!["api.openai.com".into()];
+        ask_then_deny.insert("other-key".into(), denied);
+        let err =
+            accept_store_references(&two, Some(&egress), &ask_then_deny, true, &mut never_ask)
+                .expect_err("the deny refuses before any question");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDenied { .. })
+        ));
+
+        // One item under two grants is asked once, and names both grants.
+        let mut shared = store_grant();
+        shared.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["openai-key".into()],
+                mode: None,
+            },
+        );
+        let mut questions = Vec::new();
+        let accepted = accept_store_references(&shared, Some(&egress), &ask, true, &mut |q| {
+            questions.push(q.to_owned());
+            Ok(true)
+        })
+        .expect("a yes accepts both grants");
+        assert_eq!(accepted, ask);
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(
+            questions[0].contains("OPENAI_KEY") && questions[0].contains("ZZ_TOKEN"),
+            "{}",
+            questions[0]
+        );
     }
 
     /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with

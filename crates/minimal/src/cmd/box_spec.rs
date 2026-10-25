@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, refusals,
+    SecretGrant, SecretGrants, Steering, StoreAction, StoreReference, StoreRules, refusals,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -35,6 +35,9 @@ pub(crate) struct SpecInputs<'a> {
     pub acknowledged: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
+    /// The client's `[secret-store-rules]`, merged and with refused rules
+    /// left out.
+    pub store_rules: &'a StoreRules,
 }
 
 /// Writes the `min box spec` rows for `inputs`.
@@ -113,9 +116,26 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
             }
         }
         for scope in grant.scopes.iter().filter(|s| !s.starts_with("github:")) {
-            // No store has registered hosts yet (the `[secret-store-rules]`
-            // slice adds them).
-            writeln!(out, "store  {scope}  {name}  no hosts registered")?;
+            // BEP-038, BEP-063: the authorities the matching rule registers
+            // are the upstream the store handle carries.
+            // A deny rule never redeems the reference, whatever upstream it
+            // keeps, so the row says it is denied and lists no authorities.
+            match StoreReference::parse(name, scope).rule(inputs.store_rules) {
+                Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
+                    out,
+                    "store  {scope}  {name}  denied by its rule in [secret-store-rules] in config.toml"
+                )?,
+                Some(rule) if !rule.upstream.is_empty() => writeln!(
+                    out,
+                    "store  {scope}  {name}  upstream {}",
+                    rule.upstream.join(", ")
+                )?,
+                Some(_) => writeln!(out, "store  {scope}  {name}  no upstream registered")?,
+                None => writeln!(
+                    out,
+                    "store  {scope}  {name}  no rule in [secret-store-rules] in config.toml"
+                )?,
+            }
         }
     }
 
@@ -190,6 +210,14 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
         )
     });
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
+    let store_rules = if boxes::core::bep::store_references(&secrets)
+        .next()
+        .is_some()
+    {
+        crate::config::read_client_config_and_store_rules(global)?.1
+    } else {
+        StoreRules::new()
+    };
     let root = root_fingerprint(identity_path().as_deref());
     tracing::debug!(
         project = %project.display(),
@@ -210,6 +238,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             secrets: &secrets,
             acknowledged,
             github_hosts: &github_hosts,
+            store_rules: &store_rules,
         },
         &mut stdout,
     )?;
@@ -258,10 +287,79 @@ mod tests {
                 secrets,
                 acknowledged,
                 github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
             },
             &mut out,
         )?;
         Ok(String::from_utf8(out).expect("utf-8"))
+    }
+
+    /// BEP-038, BEP-063: a store reference prints the authorities its
+    /// matching rule registers, and only a rule for the same store matches.
+    #[test]
+    fn box_spec_lists_store_references_with_their_authorities() {
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), grant(&["keychain:claude"]))]);
+        let rule = |store: &str| boxes::core::bep::StoreRuleConfig {
+            store: Some(store.to_string()),
+            upstream: vec![
+                "api.anthropic.com".into(),
+                "console.anthropic.com:8443".into(),
+            ],
+            header: Some("x-api-key".into()),
+            prefix: None,
+            basic_auth: None,
+            action: None,
+        };
+        let render_with = |rules: &StoreRules| {
+            let mut out = Vec::new();
+            render(
+                &SpecInputs {
+                    root_fingerprint: Some("abc123"),
+                    bep: &proxy_env(),
+                    quic443: None,
+                    secrets: &secrets,
+                    acknowledged: false,
+                    github_hosts: HOSTS,
+                    store_rules: rules,
+                },
+                &mut out,
+            )
+            .expect("renders");
+            String::from_utf8(out).expect("utf-8")
+        };
+
+        let rules = StoreRules::from([("claude".to_string(), rule("keychain"))]);
+        let text = render_with(&rules);
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  upstream api.anthropic.com, \
+                 console.anthropic.com:8443\n"
+            ),
+            "{text}"
+        );
+
+        // A rule for another store does not match the reference.
+        let other = StoreRules::from([("claude".to_string(), rule("vault"))]);
+        let text = render_with(&other);
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
+            ),
+            "{text}"
+        );
+
+        // A deny rule lists no authorities, even when it keeps an upstream.
+        let mut denied = rule("keychain");
+        denied.action = Some(StoreAction::Deny);
+        let text = render_with(&StoreRules::from([("claude".to_string(), denied)]));
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  denied by its rule in [secret-store-rules] in \
+                 config.toml\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("api.anthropic.com"), "{text}");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
@@ -278,7 +376,7 @@ mod tests {
             "root CA  certificate SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
-             store  keychain:npm  NPM_TOKEN  no hosts registered\n\
+             store  keychain:npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
              steering  proxy_env\n\
              quic443  allowed (HTTP/3 bypasses the proxy)\n"
         );
@@ -295,6 +393,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
             },
             &mut out,
         )
@@ -358,6 +457,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
             },
             &mut out,
         )

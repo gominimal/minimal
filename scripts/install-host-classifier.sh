@@ -92,6 +92,15 @@ readonly DAEMON_LEAF=daemon
 readonly BOXES_DIR=boxes
 readonly DENY_DIR=deny
 readonly ALLOW_DIR=allow
+# The host-address cohort's blocked leaf (BEP-018): a delegated leaf
+# directly under the cohort, beside its two subtrees. The daemon moves the
+# processes of the cohort's allow-subtree boxes in here while any resident
+# member's resolved quic443 stance is blocked, and back to their own leaves
+# when the last blocking member stops. The one rule keyed on it rejects UDP
+# to port 443, so the table is never edited at launch or stop: membership
+# is the switch. It is directly under the cohort, so the cohort's
+# source-identity match still covers it.
+readonly QUIC443_BLOCKED_DIR=quic443-blocked
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -397,7 +406,8 @@ do_check() {
     # its declaration picked.
     for cgroup in \
         "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+        "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
     do
         path="$tree_root$cgroup"
         if [ ! -d "$path" ]; then
@@ -432,7 +442,7 @@ do_check() {
     fi
     [ "$problems" -eq 0 ] || die "$problems problem(s): the tree is not installed as minimald needs it"
     note "tree:     $tree_root"
-    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR and its $DENY_DIR and $ALLOW_DIR subtrees, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR, its $DENY_DIR and $ALLOW_DIR subtrees and its $QUIC443_BLOCKED_DIR leaf, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
     note "table:    $tree_root/$TABLE_MARKER (the loaded table's marker; minimald records a per-box verdict only while it is there)"
     note "ct-mark:  ${recorded:-<none recorded>} (the mask the table classifies cohort and node plane with, recorded beside the marker)"
     note "the cgroup2 mount above the slice stays root-owned"
@@ -593,6 +603,7 @@ compute_cgroup_paths() {
         die "$tree_root is the cgroup2 mount root itself; the classifier needs a slice below the mount root to key its rules on"
     deny_path="$rel/$BOXES_DIR/$DENY_DIR"
     boxes_path="$rel/$BOXES_DIR"
+    quic443_blocked_path="$rel/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 }
 
 # cgroup_level <path> — the nft socket match compares that many leading
@@ -640,6 +651,13 @@ cgroup_level() {
 # rate-limited, so a diagnostics bundle's daemon log tail carries the
 # refused connections themselves.
 #
+# The output chain's second rule is the cohort's QUIC stance (BEP-018): a
+# socket in the cohort's blocked leaf that sends UDP to port 443 gets ICMP
+# port unreachable, an active reject, so a client falls back to TCP at once.
+# The rule is fixed with the table like every other. The daemon decides
+# who it reaches by moving the cohort's processes into that leaf and out of
+# it, a cgroup.procs write inside the delegated slice.
+#
 # The classify chain is where a flow is classed, at the mangle priority —
 # ahead of the dstnat and filter chains, and the last place the kernel
 # admits a socket-cgroup match at all, which is why the classification
@@ -685,6 +703,7 @@ table inet $TABLE_NAME {
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
+        socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
     }
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
@@ -923,6 +942,7 @@ if [ "$mode" = uninstall ]; then
     done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true
+    rmdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR" 2>/dev/null || true
     if rmdir "$tree_root" 2>/dev/null; then
         note "removed the classifier tree at $tree_root"
@@ -958,6 +978,9 @@ mkdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null ||
 mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
     [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR" ] ||
     die "cannot create $tree_root/$BOXES_DIR/$ALLOW_DIR"
+mkdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null ||
+    [ -d "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" ] ||
+    die "cannot create $tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 
 # Delegate each cgroup this script lays out — the slice first, because a
 # migration between two of its leaves is a write to the slice's own
@@ -969,7 +992,8 @@ mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
 # touched — the mount root stays root-owned, which is the barrier.
 for cgroup in \
     "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+    "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 do
     dir="$tree_root$cgroup"
     for file in cgroup.procs cgroup.threads cgroup.subtree_control; do
@@ -1048,6 +1072,7 @@ note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
 note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
+note "  $BOXES_DIR/$QUIC443_BLOCKED_DIR/   the host-address boxes while one of them blocks QUIC: UDP to port 443 is refused"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
 note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
 if [ -n "$cohort_address" ]; then

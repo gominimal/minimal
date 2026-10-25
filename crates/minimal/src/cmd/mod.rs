@@ -28,6 +28,7 @@ mod finalize_install;
 mod list;
 mod net;
 mod project;
+mod secret;
 mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
@@ -36,13 +37,14 @@ mod session;
 pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
-pub use auth::{cmd_auth_login, cmd_auth_status};
+pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 pub use box_audit::AuditSelfUnsupportedUnenrolled;
 pub use box_verbs::*;
 pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
 pub use project::*;
+pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
@@ -252,6 +254,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Auth(AuthArgs { command })) => match command {
             AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
             AuthCommand::Status => cmd_auth_status(&cli.global_args),
+            AuthCommand::Logout => cmd_auth_logout(&cli.global_args).await,
+        },
+        Some(Command::Secret(SecretArgs { command })) => match command {
+            SecretCommand::Set(args) => cmd_secret_set(&cli.global_args, args),
+            SecretCommand::List(args) => cmd_secret_list(&cli.global_args, args),
+            SecretCommand::Rm(args) => cmd_secret_rm(&cli.global_args, args),
         },
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await

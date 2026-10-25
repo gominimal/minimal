@@ -34,6 +34,15 @@ pub struct Config {
     /// secrets.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// `[secret-store-rules]` section: the operator's store rules, by item
+    /// identifier. A reader that does not use them still parses the file.
+    /// The client checks them against the deny set (BEP-034) before use.
+    #[serde(
+        default,
+        rename = "secret-store-rules",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub secret_store_rules: crate::core::bep::StoreRules,
 }
 
 /// The `[secrets]` section.
@@ -294,7 +303,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_file(dir.path(), "config.toml", "# empty");
         let cfg = read_config_file(&path).unwrap();
-        assert!(cfg.loadouts.default_loadouts.is_empty());
+        assert!(
+            cfg.loadouts.default_loadouts.is_empty(),
+            "expected empty, got {:?}",
+            cfg.loadouts.default_loadouts
+        );
     }
 
     /// Unknown top-level keys are rejected so a typo (`loadout`
