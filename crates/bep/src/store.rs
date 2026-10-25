@@ -836,9 +836,12 @@ mod host {
     }
 
     /// The codes that mean the item does not let this program read it:
-    /// `errSecAuthFailed`, `errSecNoAccessForItem`, `errSecUserCanceled` and
-    /// `errSecInteractionNotAllowed`.
-    const DENIED: [i32; 4] = [-25293, -25243, -128, -25308];
+    /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
+    const DENIED: [i32; 3] = [-25293, -25243, -128];
+    /// `errSecInteractionNotAllowed`. With prompts off, a locked keychain
+    /// and an item that does not trust the proxy both return it, so the
+    /// read cannot say which cause it is.
+    const INTERACTION_NOT_ALLOWED: i32 = -25308;
     /// `errSecItemNotFound`.
     const ITEM_NOT_FOUND: i32 = -25300;
 
@@ -867,6 +870,15 @@ mod host {
             Ok(value) => Ok(Zeroizing::new(value)),
             Err(e) if e.code() == ITEM_NOT_FOUND => Err(ReadError::Deleted(id.to_owned())),
             Err(e) if DENIED.contains(&e.code()) => Err(ReadError::Disabled(id.to_owned())),
+            Err(e) if e.code() == INTERACTION_NOT_ALLOWED => {
+                Err(ReadError::Store(StoreError::Refused {
+                    store: NATIVE_STORE,
+                    action: "read the secret",
+                    detail: format!(
+                        "the keychain is locked, or the secret {id} does not let the Box Egress Proxy read it without a prompt"
+                    ),
+                }))
+            }
             Err(e) => Err(ReadError::Store(StoreError::Refused {
                 store: NATIVE_STORE,
                 action: "read the secret",
