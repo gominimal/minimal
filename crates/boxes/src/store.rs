@@ -1798,12 +1798,12 @@ mod tests {
             .find_by_id(&old_record.id)
             .unwrap()
             .expect("the old record is indexed");
-        let loaded = loader.get(&key).unwrap().record().clone();
-        assert_eq!(loaded.box_type, None);
-        assert_eq!(loaded.parent, None);
-        assert_eq!(loaded.project_root, None);
+        let read_back = loader.get(&key).unwrap().record().clone();
+        assert_eq!(read_back.box_type, None);
+        assert_eq!(read_back.parent, None);
+        assert_eq!(read_back.project_root, None);
         assert_eq!(
-            loaded,
+            read_back,
             Record {
                 box_type: None,
                 parent: None,
