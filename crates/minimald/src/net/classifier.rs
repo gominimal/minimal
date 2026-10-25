@@ -4154,10 +4154,20 @@ mod tests {
             );
         }
         let output = chain_rules(&ruleset, "output");
+        let jumps: Vec<_> = output.iter().filter(|rule| rule.contains("jump")).collect();
         assert_eq!(
-            output.len(),
+            jumps.len(),
             1,
-            "the output chain does one thing, route a cgroup to its chain: {output:?}"
+            "the output chain routes one cgroup to its chain: {output:?}"
+        );
+        // Its one other rule is the cohort's UDP 443 reject (BEP-018),
+        // which decides nothing else.
+        assert!(
+            output
+                .iter()
+                .filter(|rule| !rule.contains("jump"))
+                .all(|rule| rule.contains(QUIC443_BLOCKED_DIR) && rule.contains("udp dport 443")),
+            "every other output rule is the blocked leaf's UDP 443 reject: {output:?}"
         );
         assert!(
             output[0].contains(sandbox::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
@@ -4402,12 +4412,21 @@ mod tests {
         // `enter_daemon_leaf` performs is what makes that so.
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
+        // Two rules: the deny subtree's refusal first, and the cohort's
+        // UDP 443 rule on its blocked leaf (BEP-018), which the daemon's
+        // leaf is outside of too.
         assert_eq!(
             output.len(),
-            1,
-            "one rule refuses, the deny subtree's: {output:?}"
+            2,
+            "the deny subtree's rule and the blocked leaf's: {output:?}"
         );
         let refusing = output[0];
+        assert!(
+            !cgroup_match_covers(output[1], &daemon_path),
+            "the blocked leaf's rule cannot reach the daemon's leaf \
+             ({daemon_path}): {}",
+            output[1]
+        );
         let deny_subtree = rendered(
             resident
                 .parent()
