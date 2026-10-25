@@ -17,10 +17,18 @@
 //!
 //! The client's key is registered with the proxy over the proxy's control
 //! socket before any handle signed under it leaves this process (BEP-063).
-//! The proxy keeps the registration across its restarts. A client keeps one
-//! local key in a [`ClientKeyStore`]. When the store refuses this program
-//! that key, [`local_client_key`] replaces it, and the mint registers the
-//! replacement before it delivers a handle.
+//! The proxy keeps the registration across its restarts. The target is one
+//! local key that a [`ClientKeyStore`] keeps. When the store refuses this
+//! program that key, [`local_client_key`] replaces it, and the mint registers
+//! the replacement before it delivers a handle.
+//!
+//! Interim: no production code calls [`local_client_key`] or
+//! [`mint_store_handle`] yet. Box creation (`mint_grants` in
+//! `cmd/boxes/create.rs`) calls [`ClientKey::generate`] for each box, so each
+//! creation registers a new key, and the proxy keeps that key permanently.
+//! The flip is that `mint_grants` reads [`local_client_key`] with a keychain
+//! store. It is a residual of #2288, with the keychain store, the `store`
+//! member kind in `bep::seal` and the `min box spec` store references.
 //!
 //! A mint refuses a root CA whose validity ended: every handle minted under
 //! it would be expired already.
@@ -115,7 +123,7 @@ pub enum MintError {
         not(test),
         expect(
             dead_code,
-            reason = "box creation reads the client key store and store rules in a later task"
+            reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
         )
     )]
     KeyStore(String),
@@ -194,6 +202,10 @@ impl std::error::Error for MintError {}
 
 /// The client's handle-signing key. [`local_client_key`] gives the one key a
 /// [`ClientKeyStore`] keeps.
+///
+/// Interim: box creation (`mint_grants` in `cmd/boxes/create.rs`) still
+/// calls [`ClientKey::generate`] for each box. The flip is that `mint_grants`
+/// reads [`local_client_key`] with a keychain store, a residual of #2288.
 pub struct ClientKey(SigningKey);
 
 impl fmt::Debug for ClientKey {
@@ -227,7 +239,7 @@ impl ClientKey {
         not(test),
         expect(
             dead_code,
-            reason = "box creation reads the client key store and store rules in a later task"
+            reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
         )
     )]
     #[must_use]
@@ -241,7 +253,7 @@ impl ClientKey {
         not(test),
         expect(
             dead_code,
-            reason = "box creation reads the client key store and store rules in a later task"
+            reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
         )
     )]
     pub fn secret(&self) -> Zeroizing<[u8; 32]> {
@@ -267,7 +279,7 @@ impl ClientKey {
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +296,7 @@ pub enum ClientKeyError {
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 pub trait ClientKeyStore {
@@ -317,7 +329,7 @@ pub trait ClientKeyStore {
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintError> {
@@ -713,7 +725,7 @@ pub fn mint_and_register(
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 #[must_use]
@@ -743,7 +755,7 @@ pub fn store_claims(
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 pub struct StoreHandle {
@@ -785,7 +797,7 @@ impl fmt::Debug for StoreHandle {
     not(test),
     expect(
         dead_code,
-        reason = "box creation reads the client key store and store rules in a later task"
+        reason = "interim: box creation does not read the key store or mint store handles yet (#2288)"
     )
 )]
 pub fn mint_store_handle(
@@ -844,7 +856,10 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 /// behind (BEP-003).
 ///
 /// The client's key stays registered: the control socket has no request
-/// that withdraws a key, and the client keeps the key for its next mint.
+/// that withdraws a key. Until `mint_grants` reads [`local_client_key`], each
+/// creation registers a new key, and that key stays at the proxy
+/// permanently. After that flip, a residual of #2288, the client keeps the
+/// key for its next mint.
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box

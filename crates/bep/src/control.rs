@@ -45,6 +45,12 @@
 //! store references after it (BEP-063). The file holds public keys only. It
 //! is mode `0600`, and the bind refuses a file that another user owns or
 //! that other users can write.
+//!
+//! Interim: the client does not keep one key yet. Each `min` box creation
+//! registers a new key, so the file gets one line for each creation, and
+//! nothing removes a line. The client flips to one kept key in a residual
+//! of #2288. Then a creation registers a key that the file already holds,
+//! and the file stops growing.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};

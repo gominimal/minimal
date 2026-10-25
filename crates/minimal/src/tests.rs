@@ -298,6 +298,10 @@ fn every_daemon_connection_is_classified() {
             "dash/rpc.rs::connect_missing = gated",
             "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
+            // Test-only: the BEP-063 mint test registers a key with a proxy
+            // control socket it serves itself, so no daemon is involved.
+            "mint.rs::store_handle_signed_and_key_registered = ungated",
+            "mint.rs::store_handle_signed_and_key_registered = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
             // the selected daemon — but connections all the same, and the
