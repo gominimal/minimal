@@ -56,12 +56,16 @@ use crate::module::Module;
 /// tracking issue. Each entry covers the endpoints in its comment.
 ///
 /// The built-in baseline of an un-enrolled host
-/// (`NodePlaneBaseline::built_in`) is addresses, not names. The root
-/// excludes every IP address, so no entry here is needed for those
-/// addresses. A deployment can configure a baseline set with named
-/// endpoints. This set does not cover those names. Only `min.internal`
-/// under `.internal` is denied. The module host sets stay in the union: the store-rule check
-/// refuses a rule that names them, but the root permits them.
+/// (`NodePlaneBaseline::built_in` in `crates/minvmd/src/net/baseline.rs`)
+/// is addresses, not names. The root excludes every IP address, so no
+/// entry here is needed for those addresses. A deployment can configure a
+/// baseline set with named endpoints, such as Sigstore, time and the
+/// provider control plane. This set does not cover those names. That gap
+/// is residual, and it waits on #2441 with the domain mapping.
+///
+/// Only `min.internal` under `.internal` is denied. The module host sets
+/// stay in the union: the store-rule check refuses a rule that names them,
+/// but the root permits them.
 ///
 /// Keep one quoted name on each line: the `boxes` tests read this list from
 /// the source text.
