@@ -18,6 +18,7 @@ pub mod control;
 pub mod forward;
 pub mod handle;
 pub mod http;
+pub mod inject;
 pub mod keys;
 pub mod listener;
 pub mod module;
