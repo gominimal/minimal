@@ -83,11 +83,17 @@ fn helper_entries() -> Vec<(String, String)> {
 /// the box with home `home` (BEP-015): `GIT_CONFIG_COUNT` and a
 /// `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` pair for each entry of
 /// [`helper_entries`]. The pairs start at index `first`, so the entries that
-/// the box environment already holds stay in front of them. Empty when the
-/// box home holds no helper that [`install`] wrote, so a box without a
-/// usable grant keeps its own helpers.
-pub(crate) fn launch_git_config_env(home: &Path, first: usize) -> Vec<(String, String)> {
-    if !is_installed(home) {
+/// the box environment already holds stay in front of them. `sealed` is the
+/// sealed values this launch places in the box environment. Empty when the
+/// box home holds no helper that answers with one of them, so a box without
+/// a usable grant keeps its own helpers. A helper that an earlier start
+/// wrote, and that this start did not replace or remove, does not count.
+pub(crate) fn launch_git_config_env<'a>(
+    home: &Path,
+    first: usize,
+    sealed: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, String)> {
+    if !holds_current_helper(home, sealed) {
         return Vec::new();
     }
     let entries = helper_entries();
@@ -106,13 +112,22 @@ pub(crate) fn launch_git_config_env(home: &Path, first: usize) -> Vec<(String, S
     env
 }
 
-/// Whether the box home `home` holds the helper as a regular file, under
-/// directories that are not symbolic links.
-fn is_installed(home: &Path) -> bool {
+/// The largest helper file that [`holds_current_helper`] reads.
+const HELPER_READ_MAX_BYTES: u64 = 64 * 1024;
+
+/// Whether the box home `home` holds, as a regular file under directories
+/// that are not symbolic links, the helper that [`install`] writes for one
+/// of the sealed values `sealed`.
+fn holds_current_helper<'a>(home: &Path, sealed: impl IntoIterator<Item = &'a str>) -> bool {
     let Ok(Some(dir)) = real_dir(home, HELPER_DIR_REL, false) else {
         return false;
     };
-    dir.is_file(file_name(HELPER_REL))
+    let Ok(body) = dir.read_file(file_name(HELPER_REL), HELPER_READ_MAX_BYTES) else {
+        return false;
+    };
+    sealed
+        .into_iter()
+        .any(|value| is_inert(value) && body == helper_script(value).as_bytes())
 }
 
 /// What [`install`] did.
@@ -329,29 +344,29 @@ impl DirFd {
         Ok(())
     }
 
-    /// Whether `name` in this directory is a regular file. A symbolic link
-    /// is not followed.
-    fn is_file(&self, name: &str) -> bool {
-        let Ok(name) = c_name(name) else {
-            return false;
-        };
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `self.0` is an open descriptor, `name` is a valid C string
-        // and `stat` has room for the result.
-        let ret = unsafe {
-            libc::fstatat(
+    /// Reads at most `max` bytes of the regular file `name` in this
+    /// directory. A symbolic link gives `ELOOP`. Anything that is not a
+    /// regular file gives an error, and a FIFO does not block the open.
+    fn read_file(&self, name: &str, max: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let name = c_name(name)?;
+        // SAFETY: `self.0` is an open descriptor and `name` is a valid C
+        // string. A returned descriptor is new and owned by nobody else.
+        let fd = check(unsafe {
+            libc::openat(
                 self.0.as_raw_fd(),
                 name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
-        };
-        if ret != 0 {
-            return false;
+        })?;
+        // SAFETY: `fd` is the new descriptor from `openat` above.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
         }
-        // SAFETY: `fstatat` returned 0, so it filled `stat`.
-        let stat = unsafe { stat.assume_init() };
-        stat.st_mode & libc::S_IFMT == libc::S_IFREG
+        let mut body = Vec::new();
+        file.take(max).read_to_end(&mut body)?;
+        Ok(body)
     }
 
     /// Writes `body` to a new file in this directory with mode `mode`, and

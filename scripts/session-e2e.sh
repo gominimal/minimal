@@ -11871,6 +11871,7 @@ proof_bep_git_credential_helper_sends_header() {
     echo "git ${gh_step%%:*}: OK"
   done
 
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
   gh_log="$(mnl session exec "$gh_sid" sh -c \
     'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
   mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true

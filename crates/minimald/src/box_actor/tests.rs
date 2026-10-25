@@ -11900,7 +11900,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     let credentials = home.path().join(".git-credentials");
 
     // No helper yet, so the launch sets no git configuration.
-    assert!(launch_git_config_env(home.path(), 0).is_empty());
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
     assert_eq!(
         install(home.path(), &[delivery(SEALED)]).unwrap(),
         Installed::Written
@@ -11913,7 +11913,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     assert!(!home.path().join(".config/git/config").exists());
 
     // The pairs follow the ones the box environment already holds.
-    let shifted = launch_git_config_env(home.path(), 2);
+    let shifted = launch_git_config_env(home.path(), 2, [SEALED]);
     assert!(
         shifted.contains(&(
             "GIT_CONFIG_COUNT".to_string(),
@@ -11925,7 +11925,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
         shifted.iter().any(|(key, _)| key == "GIT_CONFIG_KEY_2"),
         "{shifted:?}"
     );
-    let git_env = launch_git_config_env(home.path(), 0);
+    let git_env = launch_git_config_env(home.path(), 0, [SEALED]);
     assert!(
         git_env.contains(&(
             "GIT_CONFIG_COUNT".to_string(),
@@ -12026,7 +12026,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
         Installed::Refused
     );
     assert!(!plain.path().join(HELPER_REL).exists());
-    assert!(launch_git_config_env(plain.path(), 0).is_empty());
+    assert!(launch_git_config_env(plain.path(), 0, [SEALED]).is_empty());
 
     // A start that no longer has a usable grant removes the helper an
     // earlier start wrote.
@@ -12036,7 +12036,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
     assert!(!home.path().join(HELPER_REL).exists());
     assert!(!home.path().join(HELPER_CONFIG_REL).exists());
-    assert!(launch_git_config_env(home.path(), 0).is_empty());
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
     assert_eq!(
         install(home.path(), &[delivery(SEALED)]).unwrap(),
         Installed::Written
@@ -12054,8 +12054,19 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     std::fs::create_dir_all(home.path().join(HELPER_CONFIG_REL).join("blocker")).unwrap();
     assert!(install(home.path(), &[delivery(SEALED)]).is_err());
     assert!(!home.path().join(HELPER_REL).exists());
-    assert!(launch_git_config_env(home.path(), 0).is_empty());
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
     std::fs::remove_dir_all(home.path().join(HELPER_CONFIG_REL)).unwrap();
+
+    // A helper that this start did not write does not count: the launch
+    // names the helper only when it answers with a value this launch
+    // places, as when a removal after a failed write fails too.
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert!(launch_git_config_env(home.path(), 0, ["eyJuZXcifQ..bmV3.dmFs.dGFn"]).is_empty());
+    assert!(launch_git_config_env(home.path(), 0, std::iter::empty()).is_empty());
+    assert!(!launch_git_config_env(home.path(), 0, ["GH_HOST", SEALED]).is_empty());
 
     // The box's user owns its home. A symbolic link on a path the helper
     // writes is refused, and nothing is written through it.
@@ -12066,7 +12077,7 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     assert!(install(linked_dir.path(), &[delivery(SEALED)]).is_err());
     assert!(install(linked_dir.path(), &[]).is_err());
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-    assert!(launch_git_config_env(linked_dir.path(), 0).is_empty());
+    assert!(launch_git_config_env(linked_dir.path(), 0, [SEALED]).is_empty());
 
     let linked_helper = tempfile::tempdir().unwrap();
     let helper_target = outside.path().join("helper");
