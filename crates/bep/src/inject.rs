@@ -19,7 +19,9 @@
 //! and a form that names no valid header or field.
 //!
 //! No function here logs, copies to a file, or keeps the value. Each copy it
-//! makes is zeroized when dropped.
+//! makes is zeroized when dropped, except the header [`inject`] writes. That
+//! header moves into the request, and the caller zeroizes it once the
+//! request is written.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -138,7 +140,7 @@ pub fn inject(
     if sealed >= request.headers.len() {
         return Err(INJECTION_INVALID);
     }
-    let (name, header_value) = header_for(form, value, other)?;
+    let (name, mut header_value) = header_for(form, value, other)?;
     let mut at = 0usize;
     let mut kept = Vec::with_capacity(request.headers.len());
     for (index, mut header) in std::mem::take(&mut request.headers).into_iter().enumerate() {
@@ -158,7 +160,8 @@ pub fn inject(
         at,
         Header {
             name,
-            value: header_value.to_vec(),
+            // Moved, not copied, so no unzeroized copy is left behind.
+            value: std::mem::take(&mut *header_value),
         },
     );
     request.headers = kept;

@@ -312,23 +312,33 @@ pub trait Redeemer: Send + Sync {
         sealed: &str,
     ) -> Verdict;
 
-    /// Decides one request that carries `sealed`, as [`Self::redeem`] does,
-    /// with an admitted store reference as [`Redeemed::Store`]. The
-    /// forwarder calls this one.
+    /// Decides one request that carries `sealed` in the header named
+    /// `header`, as [`Self::redeem`] does, with an admitted store reference
+    /// as [`Redeemed::Store`]. The forwarder calls this one.
     ///
-    /// The default gives [`Self::redeem`]'s verdict, so a redeemer that
-    /// admits no store reference implements `redeem` alone.
+    /// The default admits no store reference, so a redeemer without store
+    /// references implements `redeem` alone. A sign-in credential goes in
+    /// `Authorization` only. So the default refuses a sealed value in any
+    /// other header as [`SEALED_HEADER_MISPLACED`], before [`Self::redeem`]
+    /// runs, and nothing is renewed for it. Otherwise it gives
+    /// [`Self::redeem`]'s verdict.
     ///
-    /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet.
-    /// `BoxRedeemer` (`redeemer.rs`) must override this to admit a store
-    /// reference, in a follow-up task outside T28.
+    /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet,
+    /// because no store rule is read
+    /// (<https://github.com/gominimal/minimal/issues/2280>). This changes
+    /// when `BoxRedeemer` (`redeemer.rs`) overrides this method to return
+    /// [`Redeemed::Store`] for an admitted store member.
     fn redeem_reference(
         &self,
         box_id: &str,
         authority: &Authority<String>,
         request: &RequestAuthority<String>,
         sealed: &str,
+        header: &str,
     ) -> Redeemed {
+        if !header.eq_ignore_ascii_case("authorization") {
+            return Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED));
+        }
         Redeemed::Verdict(self.redeem(box_id, authority, request, sealed))
     }
 }
@@ -489,7 +499,7 @@ impl Redeemer for Unwired {
 /// Where a sealed value sits in a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedAt {
-    /// The index of the `Authorization` header.
+    /// The index of the header that carries the sealed value.
     header: usize,
     /// How the header carries the value.
     form: Form,
@@ -772,9 +782,11 @@ impl Flow {
     /// [`STORE_ITEM_UNREADABLE`].
     ///
     /// Interim: `bep serve` does not call this yet, so a served flow has no
-    /// store. The serve path must open the store and pass it here, in a
-    /// follow-up task outside T28, together with the `BoxRedeemer` override
-    /// of [`Redeemer::redeem_reference`].
+    /// store, with the store rules
+    /// (<https://github.com/gominimal/minimal/issues/2280>). This changes
+    /// when the `bep serve` path calls this method with the host store,
+    /// together with the `BoxRedeemer` override of
+    /// [`Redeemer::redeem_reference`].
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn ValueReader>) -> Self {
         self.store = Some(store);
@@ -790,12 +802,15 @@ impl Flow {
     ///
     /// A sealed value that is not where the injection form puts the value is
     /// refused as [`SEALED_HEADER_MISPLACED`], before the store is read.
+    ///
+    /// Gives the lowercase name of the header that now holds the value, for
+    /// the caller to zeroize once the request is written.
     fn inject_store(
         &self,
         request: &mut Request,
         at: &SealedAt,
         admit: StoreAdmit,
-    ) -> Result<(), &'static str> {
+    ) -> Result<String, &'static str> {
         let span = tracing::Span::current();
         let identifier = admit.identifier();
         let header = match &admit.inject {
@@ -861,7 +876,7 @@ impl Flow {
                     Some(identifier),
                     admit.mapping,
                 );
-                Ok(())
+                Ok(header)
             }
             Err(marker) => {
                 span.record("substitution", "refused");
@@ -905,6 +920,13 @@ impl Flow {
     ///
     /// The audit marker of a refusal.
     pub fn decide(&self, request: &mut Request) -> Result<(), &'static str> {
+        self.decide_injected(request).map(|_| ())
+    }
+
+    /// Decides one request, as [`Self::decide`] does. Gives the lowercase
+    /// name of the header a store value was injected in, if any, for the
+    /// caller to zeroize once the request is written.
+    fn decide_injected(&self, request: &mut Request) -> Result<Option<String>, &'static str> {
         let span = tracing::Span::current();
         // The egress and request-authority checks hold for every request,
         // sealed or not, before any redeemer sees it (BEP-022, BEP-023).
@@ -925,13 +947,20 @@ impl Flow {
         }
         match carried(request) {
             Carried::Sealed(at) => {
+                let header = request
+                    .headers
+                    .get(at.header)
+                    .map_or("", |h| h.name.as_str());
                 let verdict = match self.redeemer.redeem_reference(
                     &self.box_id,
                     &self.authority,
                     &plain.request,
                     &at.value,
+                    header,
                 ) {
-                    Redeemed::Store(admit) => return self.inject_store(request, &at, admit),
+                    Redeemed::Store(admit) => {
+                        return self.inject_store(request, &at, admit).map(Some);
+                    }
                     Redeemed::Verdict(verdict) => verdict,
                 };
                 match verdict {
@@ -977,7 +1006,7 @@ impl Flow {
                         span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
                         self.record(Outcome::Admit, admitted, Some(identifier), mapping);
-                        Ok(())
+                        Ok(None)
                     }
                     Verdict::Refuse(marker) => {
                         span.record("substitution", "refused");
@@ -1003,7 +1032,7 @@ impl Flow {
                 let marker = (carried == Carried::Foreign).then_some(FOREIGN_CREDENTIAL);
                 span.record("substitution", marker.unwrap_or("passthrough"));
                 self.record(Outcome::Admit, marker, None, Mapping::ModuleUnmapped);
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -1066,17 +1095,25 @@ pub fn forward_requests<R: Read, W: Write>(
                 break HalfEnd::Closed(reason);
             }
         };
-        if let Err(marker) = flow.decide(&mut request) {
-            break HalfEnd::Refused(Refusal {
-                marker,
-                body: flow.refusal_body(marker),
-                after_forwarded: forwarded_any,
-            });
-        }
+        let injected = match flow.decide_injected(&mut request) {
+            Ok(injected) => injected,
+            Err(marker) => {
+                break HalfEnd::Refused(Refusal {
+                    marker,
+                    body: flow.refusal_body(marker),
+                    after_forwarded: forwarded_any,
+                });
+            }
+        };
         let mut head = Zeroizing::new(request.serialize());
-        // The head holds the credential after a substitution.
+        // The head holds the credential after a substitution, and the stored
+        // value after an injection in a header of any name.
         for header in &mut request.headers {
-            if header.name.eq_ignore_ascii_case("authorization") {
+            if header.name.eq_ignore_ascii_case("authorization")
+                || injected
+                    .as_deref()
+                    .is_some_and(|name| header.name.eq_ignore_ascii_case(name))
+            {
                 header.value.zeroize();
             }
         }
@@ -2207,6 +2244,7 @@ mod tests {
             _authority: &Authority<String>,
             _request: &RequestAuthority<String>,
             _sealed: &str,
+            _header: &str,
         ) -> Redeemed {
             Redeemed::Store(StoreAdmit {
                 store: crate::store::NATIVE_STORE.to_owned(),
@@ -2473,6 +2511,78 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, Outcome::Refuse);
         assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+    }
+
+    // A sign-in value outside `Authorization` is refused before the
+    // redeemer runs, so no sign-in token is renewed for it.
+    #[test]
+    fn sign_in_reference_outside_authorization_is_not_redeemed() {
+        let sealed = sealed_text();
+        let (records, audit) = memory_audit();
+        let redeemer = Arc::new(Admitting::default());
+        let flow = Flow::new(
+            "b",
+            Authority {
+                host: "api.github.com".to_owned(),
+                port: 443,
+            },
+            audit,
+            redeemer.clone(),
+            Validated::unchecked(()).proof(),
+        );
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: b"api.github.com".to_vec(),
+                },
+                http::Header {
+                    name: "x-api-key".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(flow.decide(&mut req), Err(SEALED_HEADER_MISPLACED));
+        assert_eq!(redeemer.0.load(Ordering::SeqCst), 0, "the redeemer ran");
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+    }
+
+    // The forwarder learns which header holds an injected value, so it can
+    // zeroize a header of any name, not only `Authorization`.
+    #[test]
+    fn injected_header_is_named_for_zeroizing() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-stored-key");
+        let (_, audit) = memory_audit();
+        let x_api_key = Inject::Header {
+            name: "X-Api-Key".to_owned(),
+            prefix: None,
+        };
+        let flow = store_flow(&store, x_api_key, audit);
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: STORE_HOST.as_bytes().to_vec(),
+                },
+                http::Header {
+                    name: "x-api-key".into(),
+                    value: sealed.into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(
+            flow.decide_injected(&mut req),
+            Ok(Some("x-api-key".to_owned()))
+        );
     }
 
     // BEP-045: a deleted item refuses the next request that would inject it,
