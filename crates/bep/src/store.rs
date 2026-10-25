@@ -32,14 +32,26 @@ pub const PROXY_BIN_ENV: &str = "MINVMD_BEP_BIN";
 /// The longest identifier a secret can have.
 pub const MAX_ID_LEN: usize = 128;
 
+/// The keychain service that holds the new value while `set` replaces an
+/// item. The proxy reads no item under it, and a listing shows none.
+pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
+
 /// The proxy binary that an item's access control names: the path in
-/// [`PROXY_BIN_ENV`] when it is set and not empty, else `bep` beside `exe`.
-/// The VM host daemon resolves the proxy it starts in the same way.
+/// [`PROXY_BIN_ENV`] when it is set and not empty, else `bep` beside
+/// `minvmd`.
+///
+/// `minvmd` is the path of the VM host daemon program that `min` starts:
+/// the first `minvmd` on `PATH`, as `Command::new("minvmd")` in the CLI's
+/// autospawn finds it. That daemon starts the proxy from the same variable,
+/// else from `bep` beside its own executable (`resolve_bep_binary` in
+/// `crates/minvmd/src/cmd/run.rs`). So the access control names the program
+/// that the running daemon starts. The two functions are copies of one
+/// rule, and they must change together.
 #[must_use]
-pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, exe: &Path) -> PathBuf {
+pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBuf {
     match env.filter(|v| !v.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => exe.with_file_name("bep"),
+        None => minvmd.with_file_name("bep"),
     }
 }
 
@@ -220,6 +232,11 @@ impl SecretStore for MemorySecretStore {
 ///
 /// When `proxy` holds a character that the line cannot quote.
 pub fn keychain_add_line(id: &str, value: &[u8], proxy: &Path) -> Result<String, StoreError> {
+    add_line(SERVICE, id, value, proxy)
+}
+
+/// [`keychain_add_line`] under `service`.
+fn add_line(service: &str, id: &str, value: &[u8], proxy: &Path) -> Result<String, StoreError> {
     let proxy_text = proxy.to_string_lossy();
     if proxy_text.contains(['"', '\\', '\n', '\r']) {
         return Err(StoreError::ProxyPath(proxy.to_path_buf()));
@@ -231,7 +248,7 @@ pub fn keychain_add_line(id: &str, value: &[u8], proxy: &Path) -> Result<String,
     }
     // `id` is checked by `valid_id`, so it needs no quoting.
     let line = format!(
-        "add-generic-password -s {SERVICE} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
+        "add-generic-password -s {service} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
     );
     hex.zeroize();
     Ok(line)
@@ -244,6 +261,11 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// that allows `decrypt` lists `proxy` among its applications.
 #[must_use]
 pub fn parse_dump(dump: &str, proxy: &Path) -> Vec<ItemInfo> {
+    parse_dump_service(dump, SERVICE, proxy)
+}
+
+/// [`parse_dump`] for the items under `service`.
+fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> {
     let proxy = proxy.to_string_lossy();
     let mut items = Vec::new();
     for record in dump.split("\nkeychain: ") {
@@ -254,7 +276,7 @@ pub fn parse_dump(dump: &str, proxy: &Path) -> Vec<ItemInfo> {
                 Some(rest.strip_suffix('"')?.to_owned())
             })
         };
-        if attr("svce").as_deref() != Some(SERVICE) {
+        if attr("svce").as_deref() != Some(service) {
             continue;
         }
         let Some(id) = attr("acct") else { continue };
@@ -289,6 +311,92 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
     decrypt && listed
 }
 
+/// The keychain operations that [`set_item`] puts in order.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+trait Keychain {
+    /// Add an item under `service` and `id` that names `proxy` as its one
+    /// trusted application. On success, what the tool printed as a warning.
+    fn add(
+        &self,
+        service: &str,
+        id: &str,
+        value: &[u8],
+        proxy: &Path,
+    ) -> Result<String, StoreError>;
+
+    /// The items under `service`, with whether each one admits `proxy`.
+    fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError>;
+
+    /// Delete the item under `service` and `id`. `false` when none was held.
+    fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError>;
+}
+
+/// Store `value` under `id` with a fresh access control for `proxy`.
+///
+/// An update in place keeps the old item's access control, so a held item
+/// is deleted and added again. The new value goes first into an item under
+/// [`STAGING_SERVICE`], and is read back there. Only then does the old item
+/// go. So when the keychain refuses the new item, the old one stays.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn set_item(kc: &impl Keychain, id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
+    let held = kc.items(SERVICE, proxy)?.iter().any(|item| item.id == id);
+    if !held {
+        return add_checked(kc, SERVICE, id, value, proxy);
+    }
+    // A failed run can leave a staged item behind. The add below refuses a
+    // duplicate, so that item goes first.
+    kc.delete(STAGING_SERVICE, id)?;
+    if let Err(e) = add_checked(kc, STAGING_SERVICE, id, value, proxy) {
+        let _ = kc.delete(STAGING_SERVICE, id);
+        return Err(e);
+    }
+    let result = match kc.delete(SERVICE, id) {
+        // The old item is still held, so the error needs no addition.
+        Err(e) => Err(e),
+        Ok(_) => add_checked(kc, SERVICE, id, value, proxy).map_err(|mut e| {
+            if let StoreError::Refused { detail, .. } = &mut e {
+                detail.push_str(&format!(
+                    ". The old value of {id} is removed. Run `min secret set {id}` again to store a value"
+                ));
+            }
+            e
+        }),
+    };
+    let _ = kc.delete(STAGING_SERVICE, id);
+    result
+}
+
+/// Add the item, then read it back with its access control.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn add_checked(
+    kc: &impl Keychain,
+    service: &str,
+    id: &str,
+    value: &[u8],
+    proxy: &Path,
+) -> Result<(), StoreError> {
+    let warnings = kc.add(service, id, value, proxy)?;
+    // `security -i` can exit 0 after a refused command, and it can warn on
+    // stderr after a write that succeeded. So the item itself, read back
+    // with its access control, decides the result.
+    let stored = kc
+        .items(service, proxy)?
+        .iter()
+        .any(|item| item.id == id && item.proxy_access);
+    if stored {
+        return Ok(());
+    }
+    Err(StoreError::Refused {
+        store: NATIVE_STORE,
+        action: "store the secret",
+        detail: if warnings.is_empty() {
+            "the keychain holds no item for it that the proxy can read".into()
+        } else {
+            warnings
+        },
+    })
+}
+
 /// The native store of this host: the macOS Keychain through
 /// `/usr/bin/security`. Other hosts refuse every operation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -314,7 +422,10 @@ impl SecretStore for HostStore {
 
 #[cfg(target_os = "macos")]
 mod host {
-    use super::{ItemInfo, NATIVE_STORE, SERVICE, StoreError, keychain_add_line, parse_dump};
+    use super::{
+        ItemInfo, Keychain, NATIVE_STORE, SERVICE, StoreError, add_line, parse_dump,
+        parse_dump_service, set_item,
+    };
     use std::io::Write as _;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -359,52 +470,64 @@ mod host {
         }
     }
 
-    pub(super) fn set(id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
-        let mut line = keychain_add_line(id, value, proxy)?;
-        // An update in place keeps the old item's access control, so the
-        // old item goes first and the new one carries a fresh one.
-        if let Err(e) = remove(id) {
+    /// The keychain through `/usr/bin/security`.
+    struct SecurityTool;
+
+    impl Keychain for SecurityTool {
+        fn add(
+            &self,
+            service: &str,
+            id: &str,
+            value: &[u8],
+            proxy: &Path,
+        ) -> Result<String, StoreError> {
+            let mut line = add_line(service, id, value, proxy)?;
+            let out = run("store the secret", &["-i"], Some(&line));
             line.zeroize();
-            return Err(e);
-        }
-        let out = run("store the secret", &["-i"], Some(&line));
-        line.zeroize();
-        let out = out?;
-        if !out.status.success() {
-            return Err(refused("store the secret", &out.stderr));
-        }
-        // `security -i` can exit 0 after a refused command, and it can warn
-        // on stderr after a write that succeeded. So the item itself, read
-        // back with its access control, decides the result.
-        let stored = list(proxy)?
-            .iter()
-            .any(|item| item.id == id && item.proxy_access);
-        if !stored {
-            let mut err = refused("store the secret", &out.stderr);
-            if let StoreError::Refused { detail, .. } = &mut err
-                && detail.is_empty()
-            {
-                *detail = "the keychain holds no item for it that the proxy can read".into();
+            let out = out?;
+            if !out.status.success() {
+                return Err(refused("store the secret", &out.stderr));
             }
-            return Err(err);
+            Ok(String::from_utf8_lossy(&out.stderr).trim().to_owned())
         }
-        Ok(())
+
+        fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+            let out = dump()?;
+            Ok(parse_dump_service(&out, service, proxy))
+        }
+
+        fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
+            delete(service, id)
+        }
     }
 
-    pub(super) fn list(proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+    pub(super) fn set(id: &str, value: &[u8], proxy: &Path) -> Result<(), StoreError> {
+        set_item(&SecurityTool, id, value, proxy)
+    }
+
+    /// The output of `dump-keychain -a`.
+    fn dump() -> Result<String, StoreError> {
         // `dump-keychain` without `-d` decrypts nothing, so it prints no
         // value and asks for no access.
         let out = run("list the secrets", &["dump-keychain", "-a"], None)?;
         if !out.status.success() {
             return Err(refused("list the secrets", &out.stderr));
         }
-        Ok(parse_dump(&String::from_utf8_lossy(&out.stdout), proxy))
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    pub(super) fn list(proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+        Ok(parse_dump(&dump()?, proxy))
     }
 
     pub(super) fn remove(id: &str) -> Result<bool, StoreError> {
+        delete(SERVICE, id)
+    }
+
+    fn delete(service: &str, id: &str) -> Result<bool, StoreError> {
         let out = run(
             "remove the secret",
-            &["delete-generic-password", "-s", SERVICE, "-a", id],
+            &["delete-generic-password", "-s", service, "-a", id],
             None,
         )?;
         if out.status.code() == Some(NOT_FOUND) {
@@ -432,5 +555,197 @@ mod host {
 
     pub(super) fn remove(_: &str) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// Items by service and account: the value, and whether the proxy reads
+    /// it without a prompt.
+    type FakeItems = BTreeMap<(String, String), (Vec<u8>, bool)>;
+
+    /// A keychain in memory that refuses the add that `fail` names, or
+    /// stores an item whose access control the proxy does not pass.
+    #[derive(Default)]
+    struct FakeKeychain {
+        items: RefCell<FakeItems>,
+        adds: Cell<usize>,
+        /// The 1-based add that the keychain refuses.
+        refuse_add: Option<usize>,
+        /// The 1-based add that stores an item the proxy cannot read.
+        lose_access_on: Option<usize>,
+    }
+
+    impl FakeKeychain {
+        fn holding(id: &str, value: &[u8]) -> Self {
+            let kc = Self::default();
+            kc.items
+                .borrow_mut()
+                .insert((SERVICE.into(), id.into()), (value.to_vec(), true));
+            kc
+        }
+
+        fn value(&self, service: &str, id: &str) -> Option<Vec<u8>> {
+            self.items
+                .borrow()
+                .get(&(service.to_owned(), id.to_owned()))
+                .map(|(v, _)| v.clone())
+        }
+    }
+
+    impl Keychain for FakeKeychain {
+        fn add(
+            &self,
+            service: &str,
+            id: &str,
+            value: &[u8],
+            _proxy: &Path,
+        ) -> Result<String, StoreError> {
+            let n = self.adds.get() + 1;
+            self.adds.set(n);
+            if self.refuse_add == Some(n) {
+                return Err(StoreError::Refused {
+                    store: NATIVE_STORE,
+                    action: "store the secret",
+                    detail: "User canceled the operation.".into(),
+                });
+            }
+            let key = (service.to_owned(), id.to_owned());
+            let mut items = self.items.borrow_mut();
+            assert!(!items.contains_key(&key), "duplicate add of {key:?}");
+            items.insert(key, (value.to_vec(), self.lose_access_on != Some(n)));
+            Ok(String::new())
+        }
+
+        fn items(&self, service: &str, _proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+            Ok(self
+                .items
+                .borrow()
+                .iter()
+                .filter(|((s, _), _)| s == service)
+                .map(|((_, id), (_, access))| ItemInfo {
+                    id: id.clone(),
+                    proxy_access: *access,
+                })
+                .collect())
+        }
+
+        fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
+            Ok(self
+                .items
+                .borrow_mut()
+                .remove(&(service.to_owned(), id.to_owned()))
+                .is_some())
+        }
+    }
+
+    const PROXY: &str = "/opt/minimal/bin/bep";
+
+    // Review finding 4369062269: a failed `set` never destroys a working
+    // secret.
+    #[test]
+    fn secret_set_failure_keeps_the_old_secret() {
+        let proxy = Path::new(PROXY);
+
+        // The keychain refuses the new item: the old one stays.
+        let kc = FakeKeychain {
+            refuse_add: Some(1),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let err = set_item(&kc, "claude", b"new", proxy).expect_err("refused");
+        assert!(err.to_string().contains("User canceled"), "{err}");
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"old"[..]));
+        assert!(kc.value(STAGING_SERVICE, "claude").is_none());
+
+        // The new item reads back without the proxy's access: the old one
+        // stays.
+        let kc = FakeKeychain {
+            lose_access_on: Some(1),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let err = set_item(&kc, "claude", b"new", proxy).expect_err("refused");
+        assert!(err.to_string().contains("no item for it"), "{err}");
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"old"[..]));
+        assert!(kc.value(STAGING_SERVICE, "claude").is_none());
+
+        // A replace that succeeds leaves one item, with the new value, and
+        // no staged item.
+        let kc = FakeKeychain::holding("claude", b"old");
+        kc.items.borrow_mut().insert(
+            (STAGING_SERVICE.into(), "claude".into()),
+            (b"stale".to_vec(), true),
+        );
+        set_item(&kc, "claude", b"new", proxy).expect("stored");
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+        assert!(kc.value(STAGING_SERVICE, "claude").is_none());
+        assert_eq!(kc.items.borrow().len(), 1);
+
+        // The keychain takes the staged item and then refuses the final
+        // one: the error says that the old value is removed.
+        let kc = FakeKeychain {
+            refuse_add: Some(2),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let err = set_item(&kc, "claude", b"new", proxy).expect_err("refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("The old value of claude is removed"),
+            "{text}"
+        );
+        assert!(text.contains("min secret set claude"), "{text}");
+        assert!(kc.items.borrow().is_empty());
+
+        // A first set stores the item directly.
+        let kc = FakeKeychain::default();
+        set_item(&kc, "claude", b"new", proxy).expect("stored");
+        assert_eq!(kc.adds.get(), 1);
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"new"[..]));
+    }
+
+    /// The BEP-051 leg on a real keychain: set, list, set again and remove
+    /// on [`HostStore`]. Run it on a Mac with
+    /// `cargo nextest run -p bep host_store_set_list_rm_round_trip --run-ignored only`.
+    /// It names `/usr/bin/true` as the proxy, so no prompt shows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login keychain of a real Mac"]
+    fn host_store_set_list_rm_round_trip() {
+        let store = HostStore;
+        let proxy = Path::new("/usr/bin/true");
+        let id = format!("minimal-round-trip-{}", std::process::id());
+        let mine = |items: Vec<ItemInfo>| -> Vec<ItemInfo> {
+            items.into_iter().filter(|item| item.id == id).collect()
+        };
+
+        store.set(&id, b"first", proxy).expect("first set");
+        let items = mine(store.list(proxy).expect("list"));
+        println!("after set: {items:?}");
+        assert_eq!(
+            items,
+            vec![ItemInfo {
+                id: id.clone(),
+                proxy_access: true
+            }]
+        );
+
+        store.set(&id, b"second", proxy).expect("second set");
+        let items = mine(store.list(proxy).expect("list"));
+        println!("after set again: {items:?}");
+        assert_eq!(
+            items,
+            vec![ItemInfo {
+                id: id.clone(),
+                proxy_access: true
+            }]
+        );
+
+        assert!(store.remove(&id).expect("remove"), "the item was held");
+        let items = mine(store.list(proxy).expect("list"));
+        println!("after remove: {items:?}");
+        assert!(items.is_empty());
+        assert!(!store.remove(&id).expect("remove again"));
     }
 }
