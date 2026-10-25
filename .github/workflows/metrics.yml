@@ -64,10 +64,32 @@ jobs:
           # coverage builds instrumented, so nothing in this job shares an
           # artifact with another job class.
           shared-key: metrics
-      - name: Install just and cargo-binstall
+      - name: Install just
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
-          tool: just@1.58.0,cargo-binstall@1.24.0
+          # No cargo-binstall: without it install-tools.sh builds every tool
+          # with `cargo install --locked`, from crates.io sources checked
+          # against the index, rather than running release-page binaries
+          # that nothing checks a digest of.
+          tool: just@1.58.0
+      - name: Restore the metrics tools
+        # The binaries built at these pins, so a run compiles only what a
+        # pin change moved. Keyed on the pins and the toolchain; written by
+        # main alone (the save step below).
+        id: tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-llvm-cov
+            ~/.cargo/bin/cargo-modules
+            ~/.cargo/bin/cargo-shear
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-crap
+            ~/.cargo/bin/tokei
+            ~/.cargo/bin/rustqual
+            ~/.cargo/bin/cargo-anatomy
+          key: ${{ runner.os }}-metrics-tools-${{ hashFiles('scripts/metrics/install-tools.sh', 'rust-toolchain.toml') }}
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
       - name: Install the pinned metrics tools
@@ -77,6 +99,22 @@ jobs:
         # binaries); a failed install leaves their blocks not measured, which
         # the snapshot says, rather than failing the run.
         run: scripts/metrics/install-tools.sh --experimental || echo "experimental tools not installed; recorded as not measured"
+      - name: Save the metrics tools
+        # Main only, so a branch's build never becomes what main restores.
+        if: github.ref == 'refs/heads/main' && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-llvm-cov
+            ~/.cargo/bin/cargo-modules
+            ~/.cargo/bin/cargo-shear
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-crap
+            ~/.cargo/bin/tokei
+            ~/.cargo/bin/rustqual
+            ~/.cargo/bin/cargo-anatomy
+          key: ${{ steps.tools-cache.outputs.cache-primary-key }}
       - name: Check out the snapshot history
         # The checkout fetches with the token but keeps none; the branch is
         # missing on the first run, and the dashboard then renders this run

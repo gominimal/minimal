@@ -933,6 +933,12 @@ nightly_budget_is_declared() {   # QM-N02: the nightly job's wall clock is the s
     printf '%s\n' "$publisher" | grep -q 'contents: write' && printf '%s\n' "$publisher" | grep -q "github.ref == 'refs/heads/main'" \
         && printf '%s\n' "$publisher" | grep -q 'publish-snapshot.sh' \
         && ok "publish alone holds the write token, on main only" || bad "publish job shape"
+    # The tools build from crates.io sources, and only main writes the
+    # cache of them that every run restores.
+    ! printf '%s\n' "$collector" | grep -q 'cargo-binstall@' \
+        && ok "the collector installs its tools from source" || bad "the collector installs cargo-binstall"
+    printf '%s\n' "$collector" | awk '/actions\/cache\/save@/{print prev} {prev=$0}' | grep -q "github.ref == 'refs/heads/main'" \
+        && ok "the tools cache is saved on main only" || bad "the tools cache save is not limited to main"
     grep -q '^  workflow_dispatch:' "$wf" && grep -q '^  workflow_call:' "$wf" && ok "the workflow runs alone and when called" || bad "metrics.yml lacks workflow_dispatch or workflow_call"
     [ -f "$nightly" ] || { echo "skip - no nightly workflow in this tree"; return; }
     awk '/^  metrics:$/{p=1} /^  notify:$/{p=0} p' "$nightly" | grep -q 'uses: ./.github/workflows/metrics.yml' && ok "the nightly calls metrics.yml" || bad "nightly-tests does not call metrics.yml"
