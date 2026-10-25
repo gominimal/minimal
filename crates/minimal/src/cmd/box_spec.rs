@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreReference, StoreRules, refusals,
+    SecretGrant, SecretGrants, Steering, StoreAction, StoreReference, StoreRules, refusals,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -118,7 +118,13 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         for scope in grant.scopes.iter().filter(|s| !s.starts_with("github:")) {
             // BEP-038, BEP-063: the authorities the matching rule registers
             // are the upstream the store handle carries.
+            // A deny rule never redeems the reference, whatever upstream it
+            // keeps, so the row says it is denied and lists no authorities.
             match StoreReference::parse(name, scope).rule(inputs.store_rules) {
+                Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
+                    out,
+                    "store  {scope}  {name}  denied by its rule in [secret-store-rules] in config.toml"
+                )?,
                 Some(rule) if !rule.upstream.is_empty() => writeln!(
                     out,
                     "store  {scope}  {name}  upstream {}",
@@ -341,6 +347,19 @@ mod tests {
             ),
             "{text}"
         );
+
+        // A deny rule lists no authorities, even when it keeps an upstream.
+        let mut denied = rule("keychain");
+        denied.action = Some(StoreAction::Deny);
+        let text = render_with(&StoreRules::from([("claude".to_string(), denied)]));
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  denied by its rule in [secret-store-rules] in \
+                 config.toml\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("api.anthropic.com"), "{text}");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
