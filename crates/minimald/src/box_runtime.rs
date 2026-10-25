@@ -269,6 +269,70 @@ pub(crate) struct HostParams {
     pub name_marker: Option<NameMarker>,
 }
 
+/// The classifier leaf a process injected into the box `box_id` joins
+/// (BEP-018): the `host_ip` cohort's blocked leaf while the cohort blocks
+/// UDP 443 and moves this box's processes, else `own`, the box's own leaf.
+/// `true` comes with the blocked leaf: the shim's pid must then be recorded
+/// under the box ([`report_spawned_pid`]).
+pub(crate) fn injection_leaf(
+    box_id: &str,
+    own: Option<sandbox::config::ClassifierLeaf>,
+    cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+) -> (Option<sandbox::config::ClassifierLeaf>, bool) {
+    let cohort = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match cohort.injection_leaf(box_id) {
+        Some(blocked) if own.is_some() => {
+            (Some(sandbox::config::ClassifierLeaf::new(blocked)), true)
+        }
+        _ => (own, false),
+    }
+}
+
+/// Arranges for `cmd`'s child to send its pid to `on_pid` once it is
+/// spawned. The child sends it from a `pre_exec` hook, before it execs,
+/// and a thread of its own reads it. A command dropped unspawned, or a
+/// spawn that fails before the hook, calls nothing.
+///
+/// # Errors
+///
+/// The socket pair or the reading thread could not be made.
+pub(crate) fn report_spawned_pid(
+    cmd: &mut std::process::Command,
+    on_pid: impl FnOnce(i32) + Send + 'static,
+) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Both ends are close-on-exec: the child's end closes when it execs,
+    // and a command dropped unspawned closes the parent's copy.
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    std::thread::Builder::new()
+        .name("injected-pid".to_string())
+        .spawn(move || {
+            let mut pid = [0_u8; 4];
+            if ours.read_exact(&mut pid).is_ok() {
+                on_pid(i32::from_ne_bytes(pid));
+            }
+        })?;
+    // SAFETY: the hook runs in the forked child before exec, and calls only
+    // getpid(2) and send(2), which are async-signal-safe. It allocates
+    // nothing and takes no lock. MSG_NOSIGNAL keeps a closed reader from
+    // raising SIGPIPE in the child, and a failed send is ignored.
+    unsafe {
+        cmd.pre_exec(move || {
+            let pid = libc::getpid().to_ne_bytes();
+            let _ = libc::send(
+                theirs.as_raw_fd(),
+                pid.as_ptr().cast(),
+                pid.len(),
+                libc::MSG_NOSIGNAL,
+            );
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 /// The sealed values a host launch of the box places in its environment
 /// (BEP-007): the ones its record holds, which the create copied from the
 /// request. [`place_launch_deliveries`] places them.
@@ -577,8 +641,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             .with_env(vars);
         // NET-079: the box's leaf, so the injected process joins it in the
         // shim before it joins the namespaces — the only place the join can
-        // happen from (see [`Injection::with_classifier_leaf`]).
-        let injection = match self.leaf.clone() {
+        // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
+        // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
+        // leaf instead, so an exec or a hook cannot escape the block.
+        let box_id = self.session_id.to_string();
+        let (leaf, adopt) = injection_leaf(
+            &box_id,
+            self.leaf.clone(),
+            crate::net::classifier::cohort_quic443(),
+        );
+        let injection = match leaf {
             Some(leaf) => injection.with_classifier_leaf(leaf),
             None => injection,
         };
@@ -591,7 +663,25 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         } else {
             injection
         };
-        injection.command()
+        let mut command = injection.command()?;
+        // BEP-018: the shim in the blocked leaf is recorded under this box,
+        // so it and the program it forks go home when the block lifts.
+        if adopt
+            && let Err(error) = report_spawned_pid(&mut command, move |pid| {
+                crate::net::classifier::cohort_quic443()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt_injected(&box_id, pid, &crate::net::classifier::KernelMoves);
+            })
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                %error,
+                "cannot record a process injected under the host-address cohort's UDP 443 \
+                 block; it stays blocked when the block lifts"
+            );
+        }
+        Ok(command)
     }
 
     /// Under test, build a plain host-side command instead of injecting into
@@ -1907,5 +1997,80 @@ mod proxy_env_tests {
         );
         assert_eq!(kept.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(kept.len(), 5, "{kept:?}");
+    }
+}
+
+#[cfg(test)]
+mod quic443_injection_tests {
+    use super::{injection_leaf, report_spawned_pid};
+    use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
+    use sandbox::config::ClassifierLeaf;
+
+    /// BEP-018, arch C1: an exec or a hook injected into a member while the
+    /// cohort blocks gets the blocked leaf, and its shim's pid comes back
+    /// for the record that sends it home when the block lifts.
+    #[test]
+    fn host_ip_cohort_join_block_leave_drives_the_rule_for_injected_processes() {
+        let tree = tempfile::tempdir().unwrap();
+        let blocked = quic443_blocked_leaf(tree.path());
+        std::fs::create_dir_all(&blocked).unwrap();
+        let own = ClassifierLeaf::new(tree.path().join("plain"));
+        let moves = StandinMoves::default();
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        {
+            let mut guard = cohort.lock().unwrap();
+            guard.learn_blocked_leaf(blocked.clone());
+            guard
+                .admit("plain", Some(own.dir().to_path_buf()), false, &moves)
+                .unwrap();
+        }
+
+        let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+        assert_eq!(leaf.as_ref().map(ClassifierLeaf::dir), Some(own.dir()));
+        assert!(
+            !adopt,
+            "an unblocked cohort injects into the box's own leaf"
+        );
+
+        cohort
+            .lock()
+            .unwrap()
+            .admit("grant", None, true, &moves)
+            .unwrap();
+        let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+        assert_eq!(
+            leaf.as_ref().map(ClassifierLeaf::dir),
+            Some(blocked.as_path())
+        );
+        assert!(adopt, "the shim in the blocked leaf is recorded");
+        let (leaf, adopt) = injection_leaf("plain", None, &cohort);
+        assert!(leaf.is_none() && !adopt, "a box with no leaf gets none");
+
+        // The child's own pid comes back from its pre-exec hook.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut cmd = std::process::Command::new("true");
+        report_spawned_pid(&mut cmd, move |pid| {
+            let _ = tx.send(pid);
+        })
+        .unwrap();
+        let mut child = cmd.spawn().unwrap();
+        let reported = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the child reports its pid");
+        assert_eq!(u32::try_from(reported).unwrap(), child.id());
+        assert!(child.wait().unwrap().success());
+
+        // A command dropped unspawned reports nothing, and its thread ends.
+        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        let mut cmd = std::process::Command::new("true");
+        report_spawned_pid(&mut cmd, move |pid| {
+            let _ = tx.send(pid);
+        })
+        .unwrap();
+        drop(cmd);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

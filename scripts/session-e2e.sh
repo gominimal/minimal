@@ -11704,13 +11704,10 @@ proof_bep_box_env_holds_sealed_value_only() {
 # lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
 # T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
 #
-# Known gap: git sends an Authorization header only when a credential helper
-# gives it one, and no box ships a git credential helper yet. Gatehouse
-# requires the shipped git-credential-helper. #2499
-# (https://github.com/gominimal/minimal/issues/2499) tracks the helper and
-# the spec requirement for it. Until #2499 lands, the clone
-# step fails against a private repository on a lane that runs this case.
-# The case does not configure a helper of its own: that hides the gap.
+# git sends an Authorization header only when a credential helper gives it
+# one. The box answers with the git credential helper it carries from
+# creation (#2499). The case configures no helper of its own.
+# bep_git_credential_helper_sends_header proves the helper alone.
 proof_bep_git_and_gh_against_private_repo() {
   echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
   local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
@@ -11781,6 +11778,114 @@ proof_bep_git_and_gh_against_private_repo() {
   fi
   rm -f "$WORK/$gg_case".*
   echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
+  echo "::endgroup::"
+}
+
+# The shipped git credential helper (BEP-015, Gatehouse §6.4): a GitHub grant
+# box with no git configuration of its own clones the private repository
+# E2E_BEP_PRIVATE_REPO and pushes a throwaway branch to it, which a second
+# push deletes again. git sends an Authorization header only when a helper
+# answers, so the clone of a private repository is the proof that git sent
+# the sealed value and the proxy substituted it. The case first checks that
+# the one helper git finds for github.com is the one the box carries, that
+# it answers with the box's sealed GH_TOKEN, and afterwards that its log
+# names github.com and never the value. A lane off macOS, without a sign-in
+# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# that runs it.
+proof_bep_git_credential_helper_sends_header() {
+  echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
+  local gh_case=bep_git_credential_helper_sends_header gh_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gh_out gh_sid gh_branch gh_step gh_helpers gh_fill gh_sealed gh_log
+  if [ -z "$gh_repo" ]; then
+    not_run "$gh_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gh_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gh_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gh_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gh_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-credential-helper \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gh_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gh_out"
+    echo "--- stderr ---"; cat "$WORK/$gh_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
+  gh_branch="e2e-bep-helper-$(date +%s)-$$"
+
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
+  gh_helpers="$(mnl session exec "$gh_sid" sh -c \
+    "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
+    2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
+    || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
+    echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
+    printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # It answers with the box's sealed value.
+  gh_sealed="$(mnl session exec "$gh_sid" sh -c 'printenv GH_TOKEN' 2>/dev/null | tr -d '\r')"
+  gh_fill="$(mnl session exec "$gh_sid" sh -c \
+    'printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' \
+    2>"$WORK/$gh_case.fill.err" | tr -d '\r')"
+  if [ -z "$gh_sealed" ] || [[ "$gh_fill" != *"password=$gh_sealed"* ]]; then
+    echo "::error::'git credential fill' for github.com in the grant box does not answer with the box's sealed GH_TOKEN"
+    cat "$WORK/$gh_case.fill.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # Each step runs on its own, so a failure names the step. The prompt
+  # switch only keeps a refused git from waiting on a terminal.
+  for gh_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gh_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gh_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gh_branch"; do
+    if ! mnl session exec "$gh_sid" sh -c "${gh_step#*:}" \
+      >"$WORK/$gh_case.${gh_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gh_step%%:*}' against the private repository $gh_repo failed in the grant box with the shipped helper"
+      cat "$WORK/$gh_case.${gh_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gh_step%%:*}: OK"
+  done
+
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
+  gh_log="$(mnl session exec "$gh_sid" sh -c \
+    'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
+  mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+  if [[ "$gh_log" != *"answered for host github.com"* ]]; then
+    echo "::error::the git credential helper's log names no answer for github.com"
+    printf '%s\n' "$gh_log"
+    fail
+  fi
+  if [[ "$gh_log" == *"$gh_sealed"* ]]; then
+    echo "::error::the git credential helper's log holds the sealed value"
+    fail
+  fi
+  rm -f "$WORK/$gh_case".*
+  echo "grant box with the shipped helper: git clone and git push against the private repository $gh_repo"
   echo "::endgroup::"
 }
 
@@ -12006,6 +12111,164 @@ proof_bep_first_slice_end_to_end() {
   echo "::endgroup::"
 }
 
+# A signing rotation under a running grant box (BEP-061, T52): one grant box
+# clones and pushes, `bep --rotate-signing` rotates the proxy's signing
+# certificate, and the same box clones and pushes again. The box is never
+# re-created: every step runs in the box id the activation printed, and the
+# case checks that the box is still listed under that id after the rotation.
+# `min box spec` prints the root CA fingerprint before and after the
+# rotation, and the two must match: a rotation changes the certificate below
+# the root, never the root the box trusts. The case needs the sign-in a
+# person made with `min auth login` and the private repository
+# E2E_BEP_PRIVATE_REPO, and records NOT RUN without them, as
+# bep_first_slice_end_to_end does. The clone meets the same known gap as
+# that case: no box ships a git credential helper until #2499 lands.
+proof_bep_signing_rotation_keeps_running_box_working() {
+  echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
+  local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep sr_ls
+  local sr_name=e2e-bep-signing-rotation
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock"
+  if [ -z "$sr_repo" ]; then
+    not_run "$sr_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$sr_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$sr_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$sr_case" || { echo "::endgroup::"; return 0; }
+
+  # The bep binary the VM host daemon starts: MINVMD_BEP_BIN, else the bep
+  # beside minvmd (crates/minvmd/src/cmd/run.rs, resolve_bep_binary).
+  sr_bep="${MINVMD_BEP_BIN:-}"
+  if [ -z "$sr_bep" ]; then
+    sr_bep="$(command -v minvmd 2>/dev/null || true)"
+    sr_bep="${sr_bep%/*}/bep"
+  fi
+  if [ ! -x "$sr_bep" ]; then
+    echo "::error::no bep binary at '$sr_bep': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+    fail
+  fi
+
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID=""
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    sr_cleanup
+    fail
+  }
+  # The root CA fingerprint from `min box spec` of the project ($1 = the
+  # round, for the error).
+  sr_root_fingerprint() {
+    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+      echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
+      cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r' \
+      | sed -n 's/^root CA  certificate \(SHA256:[0-9A-Fa-f:]*\)$/\1/p' | head -n1)"
+    if [ -z "$sr_spec" ]; then
+      echo "::error::'min box spec' of the grant project prints no root CA fingerprint $1 the rotation" >&2
+      return 1
+    fi
+    printf '%s\n' "$sr_spec"
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlrotate.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  sr_root_before="$(sr_root_fingerprint before)" || sr_fail
+  echo "root CA before the rotation: $sr_root_before"
+
+  # The grant box, headless: a sign-in prompt has no terminal to ask on.
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the grant box $sr_name failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+  echo "grant box: $SR_SID"
+
+  for sr_round in before after; do
+    if [ "$sr_round" = after ]; then
+      # The rotation, through the serving proxy's control socket.
+      if ! sr_out="$("$sr_bep" --rotate-signing --control "$sr_control" \
+        </dev/null 2>"$WORK/$sr_case.rotate.err")"; then
+        echo "::error::'bep --rotate-signing' failed"
+        cat "$WORK/$sr_case.rotate.err" 2>/dev/null || true
+        sr_fail
+      fi
+      if [[ "$sr_out" != "Signing certificate rotated from "* ]]; then
+        echo "::error::'bep --rotate-signing' did not report a rotation"
+        printf '%s\n' "$sr_out"
+        sr_fail
+      fi
+      echo "rotation: $sr_out"
+      # The same box, under the same id: the rotation re-created nothing.
+      # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit
+      # SIGPIPEs the pipeline under pipefail and fails a healthy box.
+      sr_ls="$(mnl ls </dev/null 2>/dev/null)"
+      sr_ls="${sr_ls//$'\r'/}"
+      if [[ "$sr_ls" != *"$SR_SID"* ]]; then
+        echo "::error::'min ls' does not list the grant box $SR_SID after the rotation"
+        printf '%s\n' "$sr_ls"
+        sr_fail
+      fi
+    fi
+    # Each step runs on its own, so a failure names the tool that failed. The
+    # prompt switch only keeps a refused git from waiting on a terminal: it
+    # gives git no credential.
+    sr_branch="e2e-bep-rotate-$sr_round-$(date +%s)-$$"
+    for sr_step in \
+      "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$sr_repo /tmp/bep-repo" \
+      "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$sr_branch" \
+      "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $sr_branch"; do
+      if ! mnl session exec "$SR_SID" sh -c "${sr_step#*:}" \
+        >"$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>&1; then
+        echo "::error::'git ${sr_step%%:*}' against $sr_repo failed in the grant box $sr_round the rotation"
+        cat "$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>/dev/null || true
+        sr_fail
+      fi
+      echo "git ${sr_step%%:*} $sr_round the rotation: OK"
+    done
+  done
+
+  sr_root_after="$(sr_root_fingerprint after)" || sr_fail
+  echo "root CA after the rotation: $sr_root_after"
+  if [ "$sr_root_after" != "$sr_root_before" ]; then
+    echo "::error::the root CA fingerprint changed across the signing rotation: $sr_root_before before, $sr_root_after after"
+    sr_fail
+  fi
+
+  sr_cleanup
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Box Egress Proxy signing rotation OK (the box $SR_SID cloned and pushed $sr_repo before and after the rotation, never re-created, root CA $sr_root_before unchanged)"
+  echo "::endgroup::"
+}
+
 # Logout proof (BEP-044): `min auth logout` deletes the sign-in item, and
 # every running box's next GitHub request is refused, while the boxes keep
 # running. Two boxes that declare a GitHub grant each answer `gh api user`
@@ -12139,6 +12402,206 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
   lo_cleanup
   rm -f "${WORK:?}/${lo_case:?}".*
   echo "Logout proof OK (both boxes refused at their next request after 'min auth logout'). Run 'min auth login' to sign this machine in again."
+  echo "::endgroup::"
+}
+
+# DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
+# the gvproxy switch. A box on a credentialed lane with the default `dns`
+# steering and `quic443 = "block"` starts. Then the case stops the Box Egress
+# Proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
+# runs and it is down from the start) and, from inside the box:
+#   1. an A lookup of api.github.com, a steered name, must be answered
+#      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
+#   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
+#      answers (BEP-078, NET-136);
+#   3. a UDP datagram to port 443 must be rejected at once: the switch
+#      answers ICMP port unreachable, so socat reads "Connection refused"
+#      well inside its 5 s wait (BEP-018).
+# Legs 2 and 3 are hard assertions. Leg 1 is a KNOWN GAP while
+# https://github.com/gominimal/minimal/issues/2523 is open: no production
+# code wires the steering into the relay's DNS gate yet, so the lookup is
+# forwarded. When that issue lands, change its known_gap to a fail.
+# Admission refuses `dns` steering for a box with a broker secret on every
+# host today (no box-zone resolver, BEP-017), so the lane comes from
+# --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
+# (its `auto` blocks only with a credentialed secret).
+# Diagnostics: the pair restarts with the relay's switch and DNS gate records
+# at debug, so on a failure the `min bug` bundle's daemon-log tail carries the
+# SERVFAIL warnings and the rejected datagrams. On a pass, the case prints the
+# same two records out of a bundle it writes itself.
+proof_bep_dns_steering_fails_closed_end_to_end() {
+  echo "::group::DNS steering fails closed while the Box Egress Proxy is down"
+  local ds_case=bep_dns_steering_fails_closed_end_to_end
+  local ds_sid ds_out ds_ns ds_resolv ds_ans ds_rc ds_q ds_quic ds_ms
+  local ds_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  local ds_bundle ds_lines
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$ds_case" "no MINVMD_GVPROXY_BIN: the steered lookups and the UDP 443 rejection run on the VM host's switch, and this target has none"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # A fresh pair: without MINVMD_BEP_STUB (the stand-in is not the proxy) and
+  # with the switch's debug records, which the UDP 443 rejection writes. The
+  # guest daemon takes its filter from the RUST_LOG minvmd starts with.
+  unset MINVMD_BEP_STUB
+  BEP_LIVE_DAEMON=""
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! RUST_LOG="$RUST_LOG,minimald::net::switch=debug,minimald::net::dns_gate=debug" \
+    mnl ls >/dev/null 2>"$WORK/$ds_case.up.err"; then
+    echo "::error::the daemon did not start for $ds_case"
+    cat "$WORK/$ds_case.up.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: ds_cleanup reads it.
+  DS_SID=""
+  ds_cleanup() {
+    [ -n "$DS_SID" ] && mnl session destroy --force "$DS_SID" >/dev/null 2>&1
+    DS_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # The proxy is stopped: the next live case restarts the pair.
+    BEP_LIVE_DAEMON=""
+    return 0
+  }
+  ds_fail() {
+    ds_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlsteer.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  ds_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-dns-steering --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    </dev/null 2>"$WORK/$ds_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for the DNS steering box"
+    echo "--- stdout ---"; printf '%s\n' "$ds_out"
+    echo "--- stderr ---"; cat "$WORK/$ds_case.err" 2>/dev/null || true
+    ds_fail
+  }
+  DS_SID="$(printf '%s\n' "$ds_out" | tail -n1 | tr -d '\r')"
+  ds_sid="$DS_SID"
+  mnl session exec "$ds_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the DNS steering box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    ds_fail
+  }
+
+  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
+  # proxy stays down for the rest of the case.
+  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
+    for _ in $(seq 1 20); do
+      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
+      ds_fail
+    fi
+    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
+  else
+    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
+  fi
+
+  ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
+  ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$ds_ns" ]; then
+    echo "::error::the DNS steering box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$ds_resolv"
+    ds_fail
+  fi
+
+  # A raw query from inside the box, the way the NET-141 legs send one:
+  # built and parsed host-side with python3, carried as base64. Prints
+  # "rcode ancount" for a reply to the query's own id, or nothing.
+  ds_dns() { # $1 name, $2 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e32, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$ds_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$ds_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/$ds_case.dns.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  }
+
+  # Leg 1: the steered A lookup fails closed.
+  ds_ans="$(ds_dns api.github.com 1)"
+  echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
+  ds_a_gap=""
+  if [ "${ds_ans%% *}" = 2 ]; then
+    echo "steered A lookup: SERVFAIL while the proxy is down"
+  else
+    ds_a_gap=1
+    known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
+  fi
+
+  # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
+  for ds_q in AAAA:28 HTTPS:65 SVCB:64; do
+    ds_ans="$(ds_dns api.github.com "${ds_q#*:}")"
+    echo "${ds_q%%:*} api.github.com -> rcode and answers: ${ds_ans:-no reply}"
+    if [ "$ds_ans" != "0 0" ]; then
+      echo "::error::the ${ds_q%%:*} lookup of the steered name api.github.com was not answered NODATA (rcode 0, no answers): got '${ds_ans:-no reply}'"
+      cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+      ds_fail
+    fi
+  done
+
+  # Leg 3: UDP to port 443 is rejected at once. 192.0.2.1 is TEST-NET-1: the
+  # switch answers before any egress verdict, so nothing leaves the host.
+  # Without the rejection socat waits its full 5 s and exits 0.
+  # shellcheck disable=SC2016
+  ds_quic="$(mnl session exec "$ds_sid" \
+    's=$(date +%s%N); printf q | /usr/bin/socat -t 5 -T 5 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>&1 | tr -d '\r')" || true
+  ds_rc="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+  ds_ms="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+  echo "UDP 192.0.2.1:443 from the blocked box -> exit ${ds_rc:-?} after ${ds_ms:-?} ms"
+  if [ -z "$ds_rc" ] || [ "$ds_rc" = 0 ] || ! printf '%s\n' "$ds_quic" | grep -q 'Connection refused' \
+    || [ -z "$ds_ms" ] || [ "$ds_ms" -ge 2000 ]; then
+    echo "::error::UDP to port 443 from a box with quic443 = \"block\" was not rejected at once (expected 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$ds_quic"
+    ds_fail
+  fi
+
+  # The daemon's records of the run, from the bundle a person attaches to a
+  # report. A note only: the bundle carries a tail of the log.
+  ds_bundle="${WORK:?}/$ds_case.tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$ds_bundle" >/dev/null 2>&1; then
+    ds_lines="$(zstd -dc "$ds_bundle" 2>/dev/null | tar -xOf - 2>/dev/null \
+      | grep -a -e 'answered SERVFAIL for a steered name' -e 'rejected UDP to port 443' | tail -n4)"
+    echo "daemon records in the min bug bundle:"
+    printf '%s\n' "${ds_lines:-(none found)}"
+  else
+    echo "(min bug produced no bundle)"
+  fi
+  rm -f "${WORK:?}/${ds_case:?}".*
+
+  ds_cleanup
+  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
+  # the known gap, the steered A lookup did not fail closed.
+  if [ -n "$ds_a_gap" ]; then
+    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  else
+    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  fi
   echo "::endgroup::"
 }
 
@@ -23696,13 +24159,16 @@ case "${1:-}" in
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
+    proof_bep_git_credential_helper_sends_header
     proof_bep_first_slice_end_to_end
+    proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
     proof_bep_root_ca_present_in_box_trust_store
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
     proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -23761,13 +24227,16 @@ case "${1:-}" in
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
+    | bep_git_credential_helper_sends_header \
     | bep_first_slice_end_to_end \
+    | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
     | bep_root_ca_present_in_box_trust_store \
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
-    | bep_logout_refuses_every_reference_at_next_request)
+    | bep_logout_refuses_every_reference_at_next_request \
+    | bep_dns_steering_fails_closed_end_to_end)
     "proof_$1"
     ;;
   *)
@@ -23804,12 +24273,14 @@ case "${1:-}" in
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
-    echo "         bep_git_and_gh_against_private_repo"
+    echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
     echo "         bep_first_slice_end_to_end"
+    echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
+    echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;
 esac

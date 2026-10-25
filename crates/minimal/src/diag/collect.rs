@@ -459,10 +459,21 @@ async fn bep_audit(w: &mut BundleWriter, dir: Option<&Path>, tail_bytes: u64) {
         w.skip("bep/audit/", "no home directory, so no audit log location");
         return;
     };
-    let segments = match bep::audit::segments(dir) {
-        Ok(segments) => segments,
-        Err(e) => {
+    // The listing is synchronous, so it runs on a blocking thread, as
+    // `state`'s does: a wedged filesystem strands that thread, not the
+    // worker whose collect_step! timeout is the failsafe.
+    let listed = {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || bep::audit::segments(&dir)).await
+    };
+    let segments = match listed {
+        Ok(Ok(segments)) => segments,
+        Ok(Err(e)) => {
             w.skip("bep/audit/", format!("unreadable: {e}"));
+            return;
+        }
+        Err(e) => {
+            w.skip("bep/audit/", format!("listing worker: {e}"));
             return;
         }
     };

@@ -28,7 +28,10 @@ pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
 /// stderr, as [`read_client_config_and_store_rules`] does, once per file
 /// in a process. These callers use no store rules, so an organization
 /// file that is not read or does not parse does not fail them: its error
-/// prints once on stderr and its rules are left out.
+/// prints once on stderr and its rules are left out. Box creation reads
+/// the rules for a box that declares a store reference through
+/// [`read_client_config_and_store_rules`], so this reader never decides
+/// a store reference.
 pub fn read_client_config(
     global: &GlobalArgs,
 ) -> Result<boxes::client::config::Config, anyhow::Error> {
@@ -209,16 +212,8 @@ pub fn read_config_parts(
 /// each refusal to `out` for the person, logs one debug line naming each
 /// refused rule and why, and returns the rules that pass.
 pub fn refuse_store_rules(rules: StoreRules, path: &Path, out: &mut impl Write) -> StoreRules {
-    let module_hosts: Vec<&str> = bep::module::GITHUB
-        .hosts
-        .iter()
-        .map(|authority| authority.host)
-        .collect();
-    let deny = StoreDenySet {
-        module_hosts: &module_hosts,
-        infrastructure: bep::ca::DENY_SET,
-        sign_in_items: &[bep::signin::SERVICE, bep::signin::META_SERVICE],
-    };
+    let module_hosts = store_module_hosts();
+    let deny = store_deny_set(&module_hosts);
     let file = path.display().to_string();
     let (accepted, refused) = check_store_rules(rules, &file, deny);
     tracing::debug!(
@@ -234,6 +229,28 @@ pub fn refuse_store_rules(rules: StoreRules, path: &Path, out: &mut impl Write) 
         let _ = writeln!(out, "{refusal}");
     }
     accepted
+}
+
+/// The hosts of every deep module, for [`store_deny_set`].
+#[must_use]
+pub fn store_module_hosts() -> Vec<&'static str> {
+    bep::module::GITHUB
+        .hosts
+        .iter()
+        .map(|authority| authority.host)
+        .collect()
+}
+
+/// What a store rule or a store reference can never name (BEP-034), over
+/// the module hosts [`store_module_hosts`] gives. Reading the
+/// configuration and creating a box judge against this one set.
+#[must_use]
+pub fn store_deny_set<'a>(module_hosts: &'a [&'a str]) -> StoreDenySet<'a> {
+    StoreDenySet {
+        module_hosts,
+        infrastructure: bep::ca::DENY_SET,
+        sign_in_items: &[bep::signin::SERVICE, bep::signin::META_SERVICE],
+    }
 }
 
 /// Read the user policy from `<config>/minimal/user_policy.toml`.
