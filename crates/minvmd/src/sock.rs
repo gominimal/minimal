@@ -341,10 +341,11 @@ mod tests {
         verify_provider_dir_ownership(&dir).unwrap();
     }
 
-    /// The split-user design (T57) names every socket and file that
-    /// `prepare_socket_dir` and the VMM child create or open with an owner, a
-    /// mode and the users that open it. A new socket in the provider dir
-    /// fails this test until the design's ownership table names it.
+    /// The split-user design (T57) names each socket and file in the list
+    /// below with an owner, a mode and the users that open it. The list is
+    /// written by hand. A new socket that nobody adds to it does not fail
+    /// this test. A rename fails it only for a name the list takes from the
+    /// code.
     #[test]
     fn split_user_provider_dir_design_names_every_socket_owner() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
@@ -368,13 +369,18 @@ mod tests {
             .config_path()
             .to_path_buf(),
         );
-        // Every entry in the provider dir and in its `vmm/` subdirectory,
-        // every entry the VMM child or `prepare_socket_dir` creates, and
-        // every socket the VMM child opens, each with the user that must
-        // create it. Derived from the code where the crate names the file,
-        // so a rename breaks this test. The entries `minimal-vmm` creates
-        // sit in `vmm/`, because `minimal-vmm` cannot write the provider
-        // dir (arch ruling C1 on the split-user design).
+        // The entries in the provider dir and in its `vmm/` subdirectory,
+        // the entries the VMM child or `prepare_socket_dir` creates, and
+        // the sockets the VMM child opens, as of this commit, each with the
+        // user that must create it. A name comes from the code where this
+        // module can reach a constant or a resolver for it, so a rename of
+        // that name fails this test. `boot.log`, `data-vol.raw` and
+        // `gvproxy-bep.sock` are literals, because no reachable item names
+        // them. The entries `minimal-vmm` creates sit in `vmm/`, because
+        // `minimal-vmm` cannot write the provider dir. The switch socket
+        // stays with `<login>`, so only the egress gate reaches gvproxy
+        // (review thread 4369586576 on pull request #2546; arch has not
+        // passed the design yet).
         let vmm = |name: String| format!("vmm/{name}");
         let required = [
             ("<provider dir>/".to_string(), LOGIN),
@@ -386,7 +392,7 @@ mod tests {
             ),
             (vmm("boot.log".to_string()), VMM),
             (vmm("data-vol.raw".to_string()), VMM),
-            (vmm(switch_sock.clone()), VMM),
+            (switch_sock.clone(), LOGIN),
             (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
             (crate::control::GUEST_CONTROL_SOCK_FILE.to_string(), LOGIN),
             (
@@ -403,8 +409,8 @@ mod tests {
         ];
 
         check_table(&doc, "Ownership model", &required);
-        // The fallback changes only the gvproxy rows, and it keeps the
-        // same subdirectory for the switch socket.
+        // The fallback changes only the gvproxy rows. There gvproxy runs
+        // as `minimal-vmm`, so its switch socket sits in `vmm/`.
         check_table(
             &doc,
             "Fallback: only gvproxy runs as `minimal-vmm`",
