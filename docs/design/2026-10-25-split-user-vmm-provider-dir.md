@@ -1,25 +1,28 @@
 # Split-user VMM: provider directory and socket ownership
 
-Status: proposed, with the placement that arch ruled at `4308298d`. Arch
-reviewed this document on pull request #2546. Its review at `52231ae0`
-accepted the model with a
-separate directory for the VM user and set the file-mode condition. Its
-review at `e8be045a` accepted the file modes and the reason to keep
-gvproxy away from the VM user. It did not accept gvproxy as `<login>`,
-the user of `bep serve`. Gatehouse section 6.10 (line 831) separates
-"the BEP role and the EGW/gvproxy role", and gives the surface that parses
-guest frames to the EGW process. So arch ruled a third user,
-`minimal-gvproxy`, for gvproxy (C1), and a gvproxy directory outside the
-provider directory (C2). Its review at `391f1317` confirmed both rulings.
-The provider directory stays writable only by `<login>`. Every entry that
-`minimal-vmm` creates goes into `<provider dir>/vmm/`, which `minimal-vmm`
-owns. Its review at `4308298d` confirmed the round-5 conditions and ruled
-the placement of the egress gate and `switch::bep_host`. Gatehouse section
-6.10 line 831 gives the frame-parsing surface and the forwarding state to
-the EGW process, and the access to the store providers to the BEP. So the
-egress gate and `switch::bep_host` run in an EGW process as
-`minimal-gvproxy`, and `bep serve` stays with `<login>`. The open items are
-at the end of this document.
+Status: proposed. Arch reviews this document on
+[pull request #2546](https://github.com/gominimal/minimal/pull/2546), and its
+review comments there carry each ruling:
+
+- The model with a separate directory for the VM user, and the file-mode
+  condition, at `52231ae0`. The file modes, and the reason to keep gvproxy
+  away from the VM user, at `e8be045a`. A third user, `minimal-gvproxy`, for
+  gvproxy, and a gvproxy directory outside the provider directory, at
+  `e8be045a`, confirmed at `391f1317`. These rulings are in the arch reviews
+  of those commits on the pull request.
+- The placement of the egress gate and `switch::bep_host` in an EGW process
+  as `minimal-gvproxy`, at `4308298d`:
+  [arch C1 on the placement](https://github.com/gominimal/minimal/pull/2546#discussion_r4369852941).
+- The channel from the supervisor to the EGW process, and the token on it,
+  at `c8ffab40`:
+  [arch C1 on the channel](https://github.com/gominimal/minimal/pull/2546#discussion_r4369886051)
+  and [arch C1 on the token](https://github.com/gominimal/minimal/pull/2546#discussion_r4369886053).
+  The EGW behaviour before the first table and after the channel closes:
+  [arch C2](https://github.com/gominimal/minimal/pull/2546#discussion_r4369886054).
+  This revision answers those three conditions, and arch has not ruled on
+  the answer yet.
+
+The open items are at the end of this document.
 
 ## Question
 
@@ -172,16 +175,17 @@ This list comes from `sock.rs`, `vm.rs`, `image.rs`, `volume.rs`,
    socket that the caller bound. Only a user that can write the directory
    can replace it after that.
 8. `sudo` resets the environment and closes inherited descriptors above 2 by
-   default. The VMM child reads `MINVMD_MARKER_SOCK`,
-   `MINVMD_GUEST_REPORT_SOCK`, `MINVMD_GUEST_TELEMETRY_SOCK` and the state
-   identity from its environment. It also inherits the alive lock descriptor
-   (`alive_lock.inherit_into`). The drop-in keeps `env_reset` and never
-   keeps the caller's environment wholesale. It lists by name, in an
-   `env_keep` allow-list for the VMM child spawn, only the variables that
-   spawn reads. The spawn can also pass a value as a fixed argument in
-   place of a variable. The alive lock descriptor needs `closefrom_override`
-   in the rule, or the spawn passes the lock another way. T38 picks one and
-   pins it in a test.
+   default. It passes descriptors 0, 1 and 2 to the command. With
+   `use_pty` set, it puts a pseudo-terminal in place of them, so a rule
+   that hands a pipe or a socket on descriptor 0 sets `!use_pty`. Today the
+   VMM child reads `MINVMD_MARKER_SOCK`, `MINVMD_GUEST_REPORT_SOCK`,
+   `MINVMD_GUEST_TELEMETRY_SOCK`, the image and volume overrides, the trace
+   context and the state identity from its environment. It also inherits
+   the alive lock descriptor (`alive_lock.inherit_into`). Under the split,
+   the spawn passes these values on descriptor 0 (the section on per-run
+   values). The alive lock descriptor needs `closefrom_override` in the
+   rule, or the spawn passes the lock another way. T38 picks one and pins
+   it in a test.
 9. `sudo -n` never prompts. When no rule admits the command without a
    password, it exits non-zero at once.
 10. gvproxy v0.8.9 only listens on its switch socket. `-listen` is its one
@@ -242,16 +246,20 @@ spawn:
   directory above it, is owned by root and not writable by any other user.
   A binary path that `<login>` can write lets `<login>` run any code as
   `minimal-vmm`.
-- The rule names the fixed arguments of the spawn. It does not allow a
-  wildcard or any other argument.
-- The rule keeps `env_reset`. It allows, by name, only the variables that
-  the spawn reads (fact 8). It never keeps the caller's environment
-  wholesale.
+- The rule names every argument of the spawn as a literal. It has no
+  wildcard, so it admits no other argument and no extra flag. Each
+  argument is the same on every run of one VM, so the rule can name it
+  (the section on per-run values).
+- The rule keeps `env_reset`, and its `env_keep` list is empty. A value
+  that changes between runs reaches the spawn on descriptor 0, never in the
+  environment or the arguments (fact 8).
+- The VMM child rule and the EGW rule set `!use_pty`, so descriptor 0 is
+  the pipe or the socket that the supervisor hands over (fact 8).
 - The gvproxy rule sets `umask=0077` and `umask_override` (fact 11).
-- The EGW process needs the token of `gvproxy-bep.sock`. The spawn never
-  passes the token as an argument, because any user can read the arguments
-  of a process. T38 picks how the token reaches the EGW process, and pins
-  it in a test.
+- The EGW process gets the token of `gvproxy-bep.sock` on the supervisor
+  channel, with the box table (the section on the supervisor channel). The
+  token is never in the arguments, which any user can read, or in the
+  environment.
 - The drop-in permits nothing else.
 
 The supervisor runs the spawns as `sudo -n -u minimal-vmm` and
@@ -291,6 +299,7 @@ user that opens it. A path that starts with `vmm/` is in `<provider dir>/vmm/`.
 | `<gvproxy config dir>/gvproxy.yaml` | `<login>` (supervisor, `write_config`) | 0640, group `minimal-gvproxy` | `minimal-gvproxy` (gvproxy) |
 | `<gvproxy config dir>/gvproxy-bep.sock` | `<login>` (`bep serve`; `chown` and `chmod` on the path after `bind`) | 0660, group `minimal-gvproxy` | `minimal-gvproxy` (EGW process, `switch::bep_host`) |
 | `control.sock` | `<login>` (supervisor) | 0600 | `<login>` (`min`) |
+| EGW channel (descriptor 0 of the EGW process) | `<login>` (supervisor, `socketpair(2)` before the EGW spawn) | 0777, as `fstat` reports a `socketpair` end on Linux; it has no path, so only the two descriptors reach it | `minimal-gvproxy` (EGW process, descriptor 0 through `sudo`), `<login>` (supervisor, the other end) |
 
 Notes on the table:
 
@@ -348,6 +357,85 @@ Notes on the table:
   cannot write the provider directory, and `/tmp` is sticky. So nobody else
   can replace the path between the bind and the `chown` (fact 7).
 
+## The supervisor channel to the EGW process
+
+Today the egress gate and `switch::bep_host` read the live `BoxTable`, the
+row withdrawals, the `Attachments` and the token in the supervisor process.
+In the EGW process they get these from the supervisor channel:
+
+- Kind: a `socketpair(2)` of `AF_UNIX` `SOCK_STREAM` sockets, with
+  length-framed messages. It has no path in any directory, so no other
+  process can connect to it, and no file mode applies to it.
+- Descriptor: the supervisor creates the pair before the EGW spawn. One end
+  becomes descriptor 0 of the EGW process through
+  `sudo -n -u minimal-gvproxy`, and the rule sets `!use_pty` (fact 8). The
+  supervisor closes its copy of that end after the spawn, and keeps the
+  other end.
+- Creating user: `<login>` (the supervisor). Opening users:
+  `minimal-gvproxy` (the EGW process) and `<login>` (the supervisor).
+- Direction, supervisor to EGW: first the token, then the first complete
+  table, then each change in the apply order of the control doors. The
+  first complete table is every row of the `BoxTable` and every entry of
+  the `Attachments`, and a last message that ends it. A change is a row
+  registration, a row withdrawal or an attachment change, each with a
+  sequence number.
+- Direction, EGW to supervisor: only the sequence number of each change
+  that the EGW process applied. The supervisor answers a withdrawal on its
+  control door only after the EGW process acknowledges it, so a withdrawn
+  row admits no frame after the answer. The supervisor closes the channel
+  on any other message.
+- Peer check: the EGW process reads the peer credentials of descriptor 0
+  (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS). For a `socketpair`
+  end, they are the credentials of the process that created the pair. The
+  EGW process requires a socket, and a peer uid equal to the `SUDO_UID`
+  that `sudo` sets. Otherwise it exits non-zero before it binds the gate
+  socket. The supervisor does no peer check, because no other process can
+  hold an end of the pair.
+
+Until the EGW process holds the first complete table, the egress gate drops
+every frame, and it refuses every publish request. When the channel closes,
+or a message does not parse, the EGW process stops the gate, closes every
+relay and exits non-zero. A supervisor that exits closes its end, so an EGW
+process never outlives it.
+
+The supervisor handles that exit on the path that handles an unexpected
+gvproxy exit today. `supervise_switch` in `net.rs` holds the child, and an
+exit without a stop fires the exit notification. The `tokio::select!` in
+`HostGvproxy::spawn_inner` then logs an error and drops the egress handles.
+For an EGW exit, that arm also stops gvproxy. The guest then has no egress
+until the next boot, as after an unexpected gvproxy exit today (Gatehouse
+section 4.3, lines 83 and 85).
+
+## Values that change between runs
+
+No sudoers rule has an argument that changes between runs, so no rule
+needs a wildcard or a wrapper that checks its arguments:
+
+- gvproxy: `GvproxyConfig::argv` gives `-config`, `-listen` and
+  `-ssh-port -1`. The first two name `<gvproxy config dir>/gvproxy.yaml`
+  and `unix://<gvproxy dir>/gvproxy-switch.sock`. Root creates those
+  directories at fixed paths for each login and VM, so the rule names each
+  argument as a literal. The subnet and the leases are in `gvproxy.yaml`,
+  not in the arguments.
+- The EGW process: the arguments are a fixed `minvmd` subcommand and the VM
+  name. The EGW process finds the gate socket, the switch socket and
+  `gvproxy-bep.sock` from the VM name. The token and the table come on the
+  supervisor channel.
+- The VMM child: the arguments are `__krun-vmm` and the VM name. Every
+  other value that it reads from its environment today comes on
+  descriptor 0, from a pipe, as one length-framed record. That includes the
+  marker socket path with its pid and nonce, the door paths, the proxy
+  port and the trace context. The child reads the record to its end and
+  closes the pipe before it registers a vsock port.
+- The VMM child accepts a marker path only in the form
+  `/tmp/minvmd-marker-<pid>-<nonce>.sock`. Before it connects, it `lstat`s
+  the path and requires a socket that the `SUDO_UID` user owns, with group
+  `minimal-vmm` and mode 0660. Under the split it refuses a boot log or a
+  data volume path outside `vmm/`.
+
+`min finalize-install` writes one rule for each spawn of each VM, with the
+literal arguments for that VM.
+
 ## What a compromised VMM can reach
 
 A VMM child that the guest takes over runs as `minimal-vmm`.
@@ -366,6 +454,7 @@ A VMM child that the guest takes over runs as `minimal-vmm`.
 - It cannot search `<gvproxy config dir>`. So it cannot connect to
   `gvproxy-bep.sock` or read `gvproxy.yaml`.
 - It cannot connect to `control.sock`, and it cannot write `<gate dir>`.
+- It cannot reach the supervisor channel, because the channel has no path.
 - It cannot signal or trace the supervisor, `bep serve` or `min`, because
   they run as `<login>`. It cannot signal or trace gvproxy or the EGW
   process, because they run as `minimal-gvproxy`.
@@ -394,6 +483,9 @@ over either one runs as `minimal-gvproxy`.
   `control.sock`, the doors or `vmm/`.
 - It cannot write `<gvproxy config dir>`, so it cannot replace
   `gvproxy-bep.sock` with its own.
+- It can read every row that the supervisor channel carries. It can write
+  only sequence numbers to the supervisor, which closes the channel on any
+  other message. It cannot change a row in the supervisor.
 
 So the frame-parsing surface and the forwarding state run as
 `minimal-gvproxy`, and the access to the store providers stays with
@@ -567,9 +659,12 @@ change while root works there.
   move out of the supervisor into the EGW process. The supervisor spawns it
   through `sudo -n -u minimal-gvproxy`, as a fixed `minvmd` subcommand
   that T38 names. The rule names the root-owned absolute path of `minvmd`
-  and the fixed arguments. The EGW process binds the gate socket, sets 0660
-  on it, and dials the switch socket and `gvproxy-bep.sock`. A test pins
-  the 0660 mode and the `minimal-vmm` group of the gate socket.
+  and the literal arguments. The supervisor hands the EGW process the
+  supervisor channel on descriptor 0. The EGW process binds the gate
+  socket, sets 0660 on it, and dials the switch socket and
+  `gvproxy-bep.sock`. Tests pin the 0660 mode and the `minimal-vmm` group
+  of the gate socket, the dropped frames and refused publish requests
+  before the first complete table, and the exit when the channel closes.
 - `bep serve` binds `gvproxy-bep.sock` with group `minimal-gvproxy` and
   mode 0660, in place of `bind_owner_only`. The `listener.rs` peer check
   admits the `minimal-gvproxy` uid in place of its own uid, and keeps the
@@ -595,10 +690,11 @@ change while root works there.
   model, because the EGW process and `bep serve` run as different users.
   The fallback does not conform.
 - The supervisor spawns the VMM child through `sudo -n -u minimal-vmm`.
-  The drop-in names the root-owned absolute path of `minvmd` and the fixed
-  arguments of the spawn. It keeps `env_reset` and allows by name only the
-  variables that fact 8 names. When `sudo -n` fails, the start refuses with
-  the error in the ownership model.
+  The drop-in names the root-owned absolute path of `minvmd` and the
+  literal arguments of the spawn. It keeps `env_reset` with an empty
+  `env_keep` list, and the child reads its per-run values on descriptor 0.
+  When `sudo -n` fails, the start refuses with the error in the ownership
+  model.
 
 ## Fallback: only gvproxy runs as `minimal-vmm`
 
@@ -612,8 +708,15 @@ only gvproxy runs as `minimal-vmm`. The same subdirectory carries the model:
 | `<provider dir>/vmm/` | `root` (`min finalize-install`, which gives it to `minimal-vmm`) | 0750, owner `minimal-vmm`, group `minimal-vmm` | `minimal-vmm` (gvproxy), `<login>` (supervisor; read and search only) |
 | `gvproxy.yaml` | `<login>` (supervisor) | 0640, group `minimal-vmm` | `minimal-vmm` (gvproxy) |
 | `vmm/gvproxy-switch.sock` | `minimal-vmm` (gvproxy `-listen`) | 0660 | `<login>` (supervisor, egress gate) |
+| `gvproxy-gate.sock` | `<login>` (supervisor, egress gate) | 0600 | `<login>` (VMM child, libkrun shuttle) |
+| `gvproxy-bep.sock` | `<login>` (`bep serve`, `bind_owner_only`) | 0600 | `<login>` (supervisor, `switch::bep_host`) |
 
-Every other entry keeps the owner, the mode and the path it has today.
+Today `net.rs` names the gate socket, and `cmd/run.rs` names
+`gvproxy-bep.sock`, beside the switch socket. In the fallback the switch
+socket is in `vmm/`, which `<login>` cannot write. So T38 names both
+sockets from the provider directory, and they keep the path, the owner and
+the mode they have today. Every other entry keeps the owner, the mode and
+the path it has today.
 `minimal-vmm` cannot write the provider directory here either. The drop-in
 permits only the gvproxy spawn, with the same rules for the path, the
 arguments and the environment. The `sudo -n` refusal is the same.
@@ -642,9 +745,12 @@ run in the EGW process as `minimal-gvproxy`. These items stay open:
   `minimal-gvproxy` to the drop-in.
 - A named VM needs its own `vmm/`, `<gvproxy dir>`,
   `<gvproxy config dir>` and `<gate dir>`, and only root can create them.
-  The gvproxy and EGW process arguments name paths for each VM, so the
-  rules name each VM. T19 decides
+  The gvproxy, EGW process and VMM child arguments name the VM, so
+  `min finalize-install` writes literal rules for each VM. T19 decides
   whether `min finalize-install` takes the VM name.
+- Confirm that macOS `LOCAL_PEERCRED` reports the creating process for a
+  `socketpair` end. If it does not, T38 picks another peer check for the
+  supervisor channel and records it in this document.
 - The tree has no sudoers drop-in and no `min finalize-install` command
   today. The task that installs them (T19 in this plan) must land first.
   That task must create the `minimal-vmm` and `minimal-gvproxy` users and

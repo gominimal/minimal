@@ -343,11 +343,12 @@ mod tests {
 
     /// The split-user design (T57) names each socket and file in the list
     /// below with an owner, a mode and the users that open it. The list
-    /// covers the provider dir, its `vmm/` subdirectory, and the gvproxy
-    /// dir, gvproxy config dir and gate dir that `minimal-gvproxy` uses
-    /// outside the provider dir. The list is written by hand. A new socket
-    /// that nobody adds to it does not fail this test. A rename fails it only for a name the list takes from the
-    /// code.
+    /// covers the provider dir, its `vmm/` subdirectory, the gvproxy dir,
+    /// gvproxy config dir and gate dir that `minimal-gvproxy` uses outside
+    /// the provider dir, and the supervisor channel to the EGW process. The
+    /// list is written by hand. A new socket that nobody adds to it does not
+    /// fail this test. A rename fails it only for a name that the list takes
+    /// from the code.
     #[test]
     fn split_user_provider_dir_design_names_every_socket_owner() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
@@ -373,22 +374,23 @@ mod tests {
         );
         // The entries in the provider dir and in its `vmm/` subdirectory,
         // the entries the VMM child or `prepare_socket_dir` creates, and
-        // the sockets the VMM child opens, as of this commit, each with the
-        // user that must create it. A name comes from the code where this
+        // the sockets the VMM child opens, each with the user that must
+        // create it. A name comes from the code where this
         // module can reach a constant or a resolver for it, so a rename of
         // that name fails this test. `boot.log`, `data-vol.raw` and
         // `gvproxy-bep.sock` are literals, because no reachable item names
         // them. The entries `minimal-vmm` creates sit in `vmm/`, because
         // `minimal-vmm` cannot write the provider dir. gvproxy runs as a
         // third user, `minimal-gvproxy`, so it shares no writable state
-        // with `bep serve` and only the egress gate reaches it (arch ruling
-        // C1 and C2 on pull request #2546). Its switch socket sits in the
-        // gvproxy dir, and `gvproxy.yaml` in the gvproxy config dir, both
-        // outside the provider dir. The egress gate and `switch::bep_host`
-        // run in an EGW process as `minimal-gvproxy` (Gatehouse 6.10 line
-        // 831, arch ruling at 4308298d). So the EGW process creates the gate
+        // with `bep serve` and only the egress gate reaches it. Its switch
+        // socket sits in the gvproxy dir, and `gvproxy.yaml` in the gvproxy
+        // config dir, both outside the provider dir. The egress gate and
+        // `switch::bep_host` run in an EGW process as `minimal-gvproxy`
+        // (Gatehouse 6.10 line 831). So the EGW process creates the gate
         // socket in the gate dir, and dials `gvproxy-bep.sock` in the
-        // gvproxy config dir, which `minimal-vmm` cannot search.
+        // gvproxy config dir, which `minimal-vmm` cannot search. The
+        // supervisor hands the EGW process its table and token on a
+        // `socketpair` with no path, which the supervisor creates.
         let vmm = |name: String| format!("vmm/{name}");
         let gvproxy_dir = |name: &str| format!("<gvproxy dir>/{name}");
         let gvproxy_config_dir = |name: &str| format!("<gvproxy config dir>/{name}");
@@ -424,11 +426,18 @@ mod tests {
             // the VM user cannot.
             (gvproxy_config_dir("gvproxy-bep.sock"), LOGIN),
             (crate::control::CONTROL_SOCK_FILE.to_string(), LOGIN),
+            (
+                "EGW channel (descriptor 0 of the EGW process)".to_string(),
+                LOGIN,
+            ),
         ];
 
         check_table(&doc, "Ownership model", &required);
         // The fallback changes only the gvproxy rows. There gvproxy runs
-        // as `minimal-vmm`, so its switch socket sits in `vmm/`.
+        // as `minimal-vmm`, so its switch socket sits in `vmm/`. The gate
+        // socket and `gvproxy-bep.sock` are named beside the switch socket
+        // today, so the fallback names them in the provider dir, where
+        // `<login>` still creates them.
         check_table(
             &doc,
             "Fallback: only gvproxy runs as `minimal-vmm`",
@@ -437,6 +446,8 @@ mod tests {
                 ("<provider dir>/vmm/".to_string(), ROOT),
                 (gvproxy_yaml, LOGIN),
                 (vmm(switch_sock), VMM),
+                (file_name(crate::net::resolve_gate_sock().unwrap()), LOGIN),
+                ("gvproxy-bep.sock".to_string(), LOGIN),
             ],
         );
     }
