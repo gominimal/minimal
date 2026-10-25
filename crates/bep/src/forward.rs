@@ -1032,7 +1032,7 @@ impl Flow {
             )
         } else if marker == INJECTION_INVALID {
             format!(
-                "The Box Egress Proxy refused the request to {authority}, because the stored secret or the prefix set for it contains a line break."
+                "The Box Egress Proxy refused the request to {authority}, because the stored secret and the form that its secret store rule sets do not make a valid request header."
             )
         } else if marker == Check::HostMismatch.marker() {
             format!(
@@ -2561,6 +2561,14 @@ mod tests {
         let (upstream, end) = send_store(&flow, &header);
         assert_eq!(refusal(&end), Some(INJECTION_INVALID));
         assert!(upstream.is_empty());
+        // The text holds for each cause the marker covers, not a line
+        // break alone.
+        let body = flow.refusal_body(INJECTION_INVALID);
+        assert!(
+            body.ends_with("because the stored secret and the form that its secret store rule sets do not make a valid request header."),
+            "{body}"
+        );
+        assert!(!body.contains("line break"));
 
         let records = records.lock().unwrap().clone();
         assert_eq!(records.len(), 2);
