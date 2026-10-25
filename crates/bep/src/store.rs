@@ -46,7 +46,8 @@ pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
 /// else from `bep` beside its own executable (`resolve_bep_binary` in
 /// `crates/minvmd/src/cmd/run.rs`). So the access control names the program
 /// that the running daemon starts. The two functions are copies of one
-/// rule, and they must change together.
+/// rule, and they must change together until one owner holds the rule:
+/// <https://github.com/gominimal/minimal/issues/2527>.
 #[must_use]
 pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBuf {
     match env.filter(|v| !v.is_empty()) {
@@ -708,13 +709,37 @@ mod tests {
     /// The BEP-051 leg on a real keychain: set, list, set again and remove
     /// on [`HostStore`]. Run it on a Mac with
     /// `cargo nextest run -p bep host_store_set_list_rm_round_trip --run-ignored only`.
-    /// It names `/usr/bin/true` as the proxy, so no prompt shows.
+    /// It names a copy of the built `bep` in a temporary directory as the
+    /// proxy, so the access control is the one the proxy gets: an unsigned
+    /// program at a path, not an Apple-signed one.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes to the login keychain of a real Mac"]
     fn host_store_set_list_rm_round_trip() {
         let store = HostStore;
-        let proxy = Path::new("/usr/bin/true");
+        // Cargo names the built binary for this test when it can. Else the
+        // binary is beside `deps/`, where this test binary is.
+        let built = option_env!("CARGO_BIN_EXE_bep").map_or_else(
+            || {
+                let exe = std::env::current_exe().expect("test binary path");
+                exe.parent()
+                    .and_then(Path::parent)
+                    .expect("target directory")
+                    .join("bep")
+            },
+            PathBuf::from,
+        );
+        assert!(built.is_file(), "build `bep` first: {}", built.display());
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let proxy_copy = dir.path().join("bep");
+        std::fs::copy(&built, &proxy_copy).expect("copy of bep");
+        let proxy_copy = std::fs::canonicalize(&proxy_copy).expect("canonical path");
+        println!(
+            "proxy: {} (copied from {})",
+            proxy_copy.display(),
+            built.display()
+        );
+        let proxy = proxy_copy.as_path();
         let id = format!("minimal-round-trip-{}", std::process::id());
         let mine = |items: Vec<ItemInfo>| -> Vec<ItemInfo> {
             items.into_iter().filter(|item| item.id == id).collect()
