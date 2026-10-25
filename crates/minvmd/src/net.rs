@@ -262,7 +262,10 @@ impl GvproxyConfig {
     /// written, or `PermissionDenied` when the path holds an entry that is
     /// a symlink or has another owner.
     pub fn write_config(&self, leases: &[(Ipv4Addr, MacAddr)]) -> io::Result<()> {
-        self.write_config_with(leases, crate::sock::held_group_gid(crate::sock::GVPROXY_USER))
+        self.write_config_with(
+            leases,
+            crate::sock::held_group_gid(crate::sock::GVPROXY_USER),
+        )
     }
 
     /// [`write_config`](Self::write_config) with the group to set, `None`
@@ -1238,7 +1241,9 @@ mod tests {
         std::fs::write(&target, "keep").expect("target");
         std::fs::remove_file(cfg.config_path()).expect("remove config");
         std::os::unix::fs::symlink(&target, cfg.config_path()).expect("symlink");
-        let err = cfg.write_config_with(&[], Some(gid)).expect_err("symlink refused");
+        let err = cfg
+            .write_config_with(&[], Some(gid))
+            .expect_err("symlink refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read_to_string(&target).expect("target"), "keep");
     }
