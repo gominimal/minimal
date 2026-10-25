@@ -359,7 +359,17 @@ mod tests {
                 .expect("socket path has a file name")
                 .to_string()
         };
-        // Every entry the VMM child or `prepare_socket_dir` creates, and
+        let switch_sock = file_name(crate::net::resolve_switch_sock().unwrap());
+        let gvproxy_yaml = file_name(
+            crate::net::GvproxyConfig::new(
+                PathBuf::from("gvproxy"),
+                PathBuf::from("/provider").join(&switch_sock),
+            )
+            .config_path()
+            .to_path_buf(),
+        );
+        // Every entry in the provider dir, every entry the VMM child or
+        // `prepare_socket_dir` creates, and
         // every socket the VMM child opens. Derived from the code where the
         // crate names the file, so a rename breaks this test.
         let required = [
@@ -372,12 +382,32 @@ mod tests {
             "/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(),
             "boot.log".to_string(),
             "data-vol.raw".to_string(),
+            gvproxy_yaml.clone(),
+            switch_sock.clone(),
+            // `cmd/run.rs` names the proxy socket beside the switch socket
+            // with this literal. No constant carries it.
+            "gvproxy-bep.sock".to_string(),
+            crate::control::CONTROL_SOCK_FILE.to_string(),
         ];
 
+        check_table(&doc, "Ownership model", &required);
+        // The fallback changes only the gvproxy rows, and it names the
+        // directory mode it needs for them.
+        check_table(
+            &doc,
+            "Fallback: only gvproxy runs as `minimal-vmm`",
+            &["<provider dir>/".to_string(), gvproxy_yaml, switch_sock],
+        );
+    }
+
+    /// Checks that the table in the `## <heading>` section of `doc` has a
+    /// row for each name in `required`. Each row names a creating user, a
+    /// four-digit octal mode and an opening user.
+    fn check_table(doc: &str, heading: &str, required: &[String]) {
         let section = doc
             .split("\n## ")
-            .find(|s| s.starts_with("Ownership model\n"))
-            .expect("the design has an `## Ownership model` section");
+            .find(|s| s.starts_with(&format!("{heading}\n")))
+            .unwrap_or_else(|| panic!("the design has a `## {heading}` section"));
         let rows: Vec<Vec<String>> = section
             .lines()
             .filter(|l| l.starts_with('|') && !l.starts_with("|---"))
@@ -391,11 +421,11 @@ mod tests {
             .collect();
 
         let names_a_user = |cell: &str| cell.contains("<login>") || cell.contains("minimal-vmm");
-        for name in &required {
+        for name in required {
             let row = rows
                 .iter()
                 .find(|cells| &cells[0] == name)
-                .unwrap_or_else(|| panic!("the ownership table has no row for {name}"));
+                .unwrap_or_else(|| panic!("the {heading} table has no row for {name}"));
             assert_eq!(row.len(), 4, "row for {name} has four columns: {row:?}");
             assert!(
                 names_a_user(&row[1]),
