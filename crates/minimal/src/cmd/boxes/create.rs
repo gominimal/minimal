@@ -359,10 +359,10 @@ fn check_store_grants(
 /// Judges each store reference in `secrets` against `rules`, and gives the
 /// rules of the references it accepts, by item. First every reference is
 /// checked against the deny set and the egress (BEP-034, BEP-036). Then a
-/// reference with no rule is refused, and the rule's action decides the
-/// rest: `ask` calls `ask` with the question when `can_ask` is set, and
-/// denies when it is not (BEP-035). Logs one info line naming each
-/// reference checked and its outcome.
+/// reference with no rule, a `deny` rule, or an `ask` rule without
+/// `can_ask` is refused (BEP-035). Only when no reference is refused does
+/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
+/// info line naming each reference checked and its outcome.
 ///
 /// # Errors
 ///
@@ -388,7 +388,10 @@ fn accept_store_references(
             );
             return Err(anyhow::Error::from(refused));
         }
-        let mut accepted = boxes::core::bep::StoreRules::new();
+        // Every refusal that needs no answer comes first, so the person is
+        // never asked about a creation that a later reference refuses.
+        let mut to_ask: Vec<(String, Vec<String>, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
+        let mut allowed: Vec<(String, &str, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
         for reference in store_references(secrets) {
             let item = store_item(&reference);
             let grant = reference.grant.to_owned();
@@ -396,8 +399,8 @@ fn accept_store_references(
                 checked.push(format!("{item}: no rule"));
                 return Err(GrantNotDelivered::NoStoreRule { grant, item }.into());
             };
-            let allowed = match store_consent(rule, can_ask) {
-                StoreConsent::Allow => true,
+            match store_consent(rule, can_ask) {
+                StoreConsent::Allow => {}
                 StoreConsent::Deny if rule.action == Some(boxes::core::bep::StoreAction::Ask) => {
                     checked.push(format!("{item}: denied, no terminal to ask"));
                     return Err(GrantNotDelivered::AskWithoutTerminal { grant, item }.into());
@@ -406,25 +409,46 @@ fn accept_store_references(
                     checked.push(format!("{item}: denied by its rule"));
                     return Err(GrantNotDelivered::StoreReferenceDenied { grant, item }.into());
                 }
-                StoreConsent::Ask => {
-                    let upstream: Vec<String> =
-                        rule.upstream.iter().map(|host| printable(host)).collect();
-                    let question = format!(
-                        "The secret {} reads the item {} from the host's secret \
-                         store and sends it to {}. Allow it for this box?",
-                        printable(&grant),
-                        printable(&item),
-                        upstream.join(", ")
-                    );
-                    ask(&question)?
-                }
-            };
-            if !allowed {
-                checked.push(format!("{item}: declined"));
-                return Err(GrantNotDelivered::StoreReferenceDeclined { grant, item }.into());
+                // One question per distinct item, naming every grant that reads it.
+                StoreConsent::Ask => match to_ask.iter_mut().find(|(seen, ..)| *seen == item) {
+                    Some((_, grants, _)) => grants.push(grant),
+                    None => to_ask.push((item.clone(), vec![grant], rule)),
+                },
             }
+            allowed.push((item, reference.id, rule));
+        }
+        for (item, grants, rule) in &to_ask {
+            let upstream: Vec<String> = rule.upstream.iter().map(|host| printable(host)).collect();
+            let names: Vec<String> = grants.iter().map(|grant| printable(grant)).collect();
+            let (subject, verbs) = if names.len() == 1 {
+                (format!("The secret {}", names[0]), ("reads", "sends"))
+            } else {
+                (
+                    format!("The secrets {}", names.join(", ")),
+                    ("read", "send"),
+                )
+            };
+            let question = format!(
+                "{subject} {} the item {} from the host's secret store and {} it to {}. \
+                 Allow it for this box?",
+                verbs.0,
+                printable(item),
+                verbs.1,
+                upstream.join(", ")
+            );
+            if !ask(&question)? {
+                checked.push(format!("{item}: declined"));
+                return Err(GrantNotDelivered::StoreReferenceDeclined {
+                    grant: grants[0].clone(),
+                    item: item.clone(),
+                }
+                .into());
+            }
+        }
+        let mut accepted = boxes::core::bep::StoreRules::new();
+        for (item, id, rule) in allowed {
             checked.push(format!("{item}: allowed"));
-            accepted.insert(reference.id.to_owned(), rule.clone());
+            accepted.insert(id.to_owned(), rule.clone());
         }
         Ok(accepted)
     })();
@@ -2855,6 +2879,52 @@ mod tests {
             err.downcast_ref::<GrantNotDelivered>(),
             Some(GrantNotDelivered::StoreReferenceDenied { .. })
         ));
+
+        // A deny after an ask asks nothing: every refusal comes first.
+        let mut two = store_grant();
+        two.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["other-key".into()],
+                mode: None,
+            },
+        );
+        let mut ask_then_deny = ask.clone();
+        let mut denied = deny["openai-key"].clone();
+        denied.upstream = vec!["api.openai.com".into()];
+        ask_then_deny.insert("other-key".into(), denied);
+        let err =
+            accept_store_references(&two, Some(&egress), &ask_then_deny, true, &mut never_ask)
+                .expect_err("the deny refuses before any question");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDenied { .. })
+        ));
+
+        // One item under two grants is asked once, and names both grants.
+        let mut shared = store_grant();
+        shared.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["openai-key".into()],
+                mode: None,
+            },
+        );
+        let mut questions = Vec::new();
+        let accepted = accept_store_references(&shared, Some(&egress), &ask, true, &mut |q| {
+            questions.push(q.to_owned());
+            Ok(true)
+        })
+        .expect("a yes accepts both grants");
+        assert_eq!(accepted, ask);
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(
+            questions[0].contains("OPENAI_KEY") && questions[0].contains("ZZ_TOKEN"),
+            "{}",
+            questions[0]
+        );
     }
 
     /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with
