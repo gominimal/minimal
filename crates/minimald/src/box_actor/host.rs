@@ -224,11 +224,8 @@ pub(super) fn watch_quic443_exit(
     crate::traced::spawn_detached(root, async move {
         let result = task.await;
         abort_loop.disarm();
-        let result = match result {
-            Ok(result) => result,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => Err(std::io::Error::other(error)),
-        };
+        // Leave before a panic unwinds: a loop that panicked still ends the
+        // launch, and a blocking member must not keep the block in place.
         exit_quic443_launch(
             &exit.box_id,
             exit.launch,
@@ -236,7 +233,11 @@ pub(super) fn watch_quic443_exit(
             exit.cohort,
             exit.moves,
         );
-        result
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
     })
 }
 
@@ -1493,7 +1494,12 @@ mod quic443_cohort_tests {
             join_quic443_cohort(record, record.host_ip_enforcement, root, cohort, moves)
                 .expect("the box is placed");
             let (exit, exited) = tokio::sync::oneshot::channel::<i32>();
-            let task = crate::traced::spawn(async move { Ok(exited.await.unwrap_or(137)) });
+            // A negative code stands in for a loop that panics.
+            let task = crate::traced::spawn(async move {
+                let code = exited.await.unwrap_or(137);
+                assert!(code >= 0, "the host loop panics");
+                Ok(code)
+            });
             let watched = watch_quic443_exit(
                 task,
                 Quic443Exit {
@@ -1545,6 +1551,16 @@ mod quic443_cohort_tests {
             .await
             .expect("the loop under the watcher is aborted too");
         assert!(cohort.lock().unwrap().blocked(), "the stop's to lift");
+
+        // A loop that panics still ends the launch: the box leaves before
+        // the panic reaches the watched handle, and the block lifts.
+        let (_, panic_exit, panic_task) = launch(&strict, 500);
+        assert_eq!(moves.where_is(100), blocked_leaf);
+        moves.kill(500);
+        panic_exit.send(-1).unwrap();
+        assert!(panic_task.await.unwrap_err().is_panic());
+        assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
+        assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
         plain_task.abort();
     }
 }
