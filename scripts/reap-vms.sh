@@ -100,13 +100,15 @@ minvmd_pat() {
 # The `pkill -f` pattern for this checkout's gvproxy switches. A named VM's
 # switch is the one whose argv carries that VM's per-name socket directory.
 # `gvproxy` must sit in the executable's own path, the first word of the
-# cmdline: a `bep serve` of this checkout names gvproxy only in its
-# listener's path, and is not a switch.
+# cmdline, so the pattern is anchored at its start: `pkill -f` matches
+# anywhere, and a `bep serve` of this checkout names gvproxy only in its
+# listener's path, which can sit under the checkout too. gvproxy is spawned
+# from its full path, so its cmdline starts with it.
 gvproxy_pat() {
   if [ -n "$VM" ]; then
-    printf '%s/[^ ]*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT_RE" "$(ere_quote "$VM")"
+    printf '^%s/[^ ]*gvproxy.*local-minvmd[0-9]+/%s/' "$ROOT_RE" "$(ere_quote "$VM")"
   else
-    printf '%s/[^ ]*gvproxy' "$ROOT_RE"
+    printf '^%s/[^ ]*gvproxy' "$ROOT_RE"
   fi
 }
 
