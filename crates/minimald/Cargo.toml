@@ -72,6 +72,7 @@ rand_core = { workspace = true, optional = true }
 
 args.workspace = true
 async-dialog.workspace = true
+bep = { path = "../bep" }
 check.workspace = true
 common.workspace = true
 diagnostics.workspace = true

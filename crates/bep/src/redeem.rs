@@ -37,8 +37,10 @@
 //!    equals the rule's (BEP-064). A sign-in reference's rule is the module.
 //!    The shell reads the handle from the opened member with
 //!    [`crate::handle::read_opened`], so the handle is sealed with the value.
-//!    The member gives the handle's kind. A sealed member has no store kind
-//!    yet, so today every handle is a sign-in reference.
+//!    The member gives the handle's kind: a `store` member is a store
+//!    handle, verified under a registered client key and resolved to the
+//!    store and identifier it names. A `signin` member is a sign-in
+//!    reference.
 //!    For a store handle, the shell gives the handle's `upstream` as the
 //!    bound set and the rule's authorities as the current set, so checks 8
 //!    to 10 read them where they read a module's host sets (BEP-032).
@@ -1516,6 +1518,163 @@ mod tests {
                 "store_handle_invalid",
             ]
         );
+    }
+
+    /// A store item's handle, signed under client key `seed`, for box `b1`
+    /// on Box Host `host`, sealed as a store member and opened for GitHub.
+    fn sealed_store_member(seed: u8) -> Opened {
+        use crate::handle::{Claims, sign};
+        use p256::ecdsa::SigningKey;
+
+        let client = SigningKey::from_slice(&[seed; 32]).expect("a valid scalar");
+        let jws = sign(
+            &client,
+            &Claims {
+                sub: "b1".into(),
+                node_id: "host".into(),
+                store: "keychain".into(),
+                id: "anthropic".into(),
+                upstream: vec!["api.anthropic.com".into()],
+                inject: Some(bearer()),
+                iat: 1_000,
+                exp: 2_000,
+                jti: "jti-store".into(),
+            },
+        );
+        let proxy = key([5; 32]).expect("a proxy key");
+        let context = Context {
+            box_id: "b1".into(),
+            host: "host".into(),
+            module: "github".into(),
+            host_set_version: 1,
+            mode: Mode::User,
+            iat: 1_000,
+            expiry: 2_000,
+            kid: proxy.public().kid(),
+        };
+        let members = MemberList {
+            members: vec![Member {
+                kind: MemberKind::Store,
+                breadth: Breadth::Full,
+                jws: Zeroizing::new(jws),
+                exp: None,
+            }],
+            default_owner: None,
+        };
+        let sealed = seal(&proxy.public(), &context, &members).expect("seal");
+        open(
+            &proxy,
+            &sealed,
+            &Binding {
+                box_id: "b1".into(),
+                host: "host".into(),
+                module: "github".into(),
+                now: 1_500,
+            },
+        )
+        .expect("the store member opens")
+    }
+
+    fn bearer() -> Inject {
+        Inject::Header {
+            name: "Authorization".into(),
+            prefix: Some("Bearer ".into()),
+        }
+    }
+
+    /// The redemption the shell builds for `opened`, sent from box `b1` to
+    /// `api.anthropic.com:443`, with the handle read under `keys`. For a
+    /// store handle the bound set is the handle's `upstream` and the current
+    /// set is the rule's authorities.
+    fn store_redemption(
+        opened: &Opened,
+        keys: &crate::handle::ClientKeys,
+    ) -> (crate::handle::Read, Redemption<String, String>) {
+        use crate::handle::{StoreRule, read_opened};
+        use crate::module::GITHUB;
+
+        let rules = vec![StoreRule {
+            store: "keychain".into(),
+            id: "anthropic".into(),
+            upstream: vec!["api.anthropic.com:443".into()],
+            inject: bearer(),
+        }];
+        let read = read_opened(opened, keys, &rules, &GITHUB, 1_500);
+        let api = Authority {
+            host: "api.anthropic.com".to_owned(),
+            port: 443,
+        };
+        let redemption = Redemption {
+            unsealed: Unsealed::from_open(Ok(opened.clone())).expect("opened"),
+            attribution: Attribution::OwnIp("b1".to_owned()),
+            named_box_in_cohort: false,
+            now: 1_500,
+            revoked: Vec::new(),
+            authority: api.clone(),
+            bound_set: read.handle.upstream.clone(),
+            current_set: read
+                .handle
+                .rule
+                .as_ref()
+                .map(|rule| rule.upstream.clone())
+                .unwrap_or_default(),
+            request: RequestAuthority {
+                host: Some(api.clone()),
+                target: None,
+            },
+            egress: vec![api],
+            handle: read.handle.clone(),
+        };
+        (read, redemption)
+    }
+
+    /// BEP-063: a store handle sealed as a `store` member comes out of the
+    /// envelope as the same kind and the same handle. Its handle verifies
+    /// under the registered client key, resolves to the store reference it
+    /// names, and the redemption is admitted.
+    #[test]
+    fn a_store_member_round_trips_sealed() {
+        use crate::handle::ClientKeys;
+        use p256::ecdsa::SigningKey;
+
+        let opened = sealed_store_member(7);
+        assert_eq!(opened.member.kind, MemberKind::Store);
+        assert_eq!(opened.member.breadth, Breadth::Full);
+
+        let client = SigningKey::from_slice(&[7; 32]).expect("a valid scalar");
+        let mut keys = ClientKeys::new();
+        keys.register(&client.verifying_key().to_sec1_bytes())
+            .expect("register");
+        let (read, redemption) = store_redemption(&opened, &keys);
+        assert_eq!(read.identifier.as_deref(), Some("keychain:anthropic"));
+        assert_eq!(read.jti.as_deref(), Some("jti-store"));
+        assert!(read.handle.verified);
+        assert_eq!(read.handle.inject, Some(bearer()));
+        assert!(matches!(decide(&redemption), Decision::Admit { .. }));
+    }
+
+    /// BEP-063: a store member whose handle is signed under a key the proxy
+    /// never registered is refused as `store_handle_invalid`. The refusal
+    /// still names the store reference for the audit.
+    #[test]
+    fn a_store_handle_with_an_unregistered_key_is_refused() {
+        use crate::handle::ClientKeys;
+        use p256::ecdsa::SigningKey;
+
+        let opened = sealed_store_member(7);
+        let other = SigningKey::from_slice(&[9; 32]).expect("a valid scalar");
+        let mut keys = ClientKeys::new();
+        keys.register(&other.verifying_key().to_sec1_bytes())
+            .expect("register");
+        for keys in [ClientKeys::new(), keys] {
+            let (read, redemption) = store_redemption(&opened, &keys);
+            assert_eq!(read.identifier.as_deref(), Some("keychain:anthropic"));
+            assert!(!read.handle.verified);
+            assert_eq!(
+                decide(&redemption),
+                Decision::Refuse(Check::StoreHandleInvalid)
+            );
+        }
     }
 }
 

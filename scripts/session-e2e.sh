@@ -11704,13 +11704,10 @@ proof_bep_box_env_holds_sealed_value_only() {
 # lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
 # T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
 #
-# Known gap: git sends an Authorization header only when a credential helper
-# gives it one, and no box ships a git credential helper yet. Gatehouse
-# requires the shipped git-credential-helper. #2499
-# (https://github.com/gominimal/minimal/issues/2499) tracks the helper and
-# the spec requirement for it. Until #2499 lands, the clone
-# step fails against a private repository on a lane that runs this case.
-# The case does not configure a helper of its own: that hides the gap.
+# git sends an Authorization header only when a credential helper gives it
+# one. The box answers with the git credential helper it carries from
+# creation (#2499). The case configures no helper of its own.
+# bep_git_credential_helper_sends_header proves the helper alone.
 proof_bep_git_and_gh_against_private_repo() {
   echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
   local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
@@ -11781,6 +11778,114 @@ proof_bep_git_and_gh_against_private_repo() {
   fi
   rm -f "$WORK/$gg_case".*
   echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
+  echo "::endgroup::"
+}
+
+# The shipped git credential helper (BEP-015, Gatehouse §6.4): a GitHub grant
+# box with no git configuration of its own clones the private repository
+# E2E_BEP_PRIVATE_REPO and pushes a throwaway branch to it, which a second
+# push deletes again. git sends an Authorization header only when a helper
+# answers, so the clone of a private repository is the proof that git sent
+# the sealed value and the proxy substituted it. The case first checks that
+# the one helper git finds for github.com is the one the box carries, that
+# it answers with the box's sealed GH_TOKEN, and afterwards that its log
+# names github.com and never the value. A lane off macOS, without a sign-in
+# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# that runs it.
+proof_bep_git_credential_helper_sends_header() {
+  echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
+  local gh_case=bep_git_credential_helper_sends_header gh_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gh_out gh_sid gh_branch gh_step gh_helpers gh_fill gh_sealed gh_log
+  if [ -z "$gh_repo" ]; then
+    not_run "$gh_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gh_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gh_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gh_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gh_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-credential-helper \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gh_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gh_out"
+    echo "--- stderr ---"; cat "$WORK/$gh_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
+  gh_branch="e2e-bep-helper-$(date +%s)-$$"
+
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
+  gh_helpers="$(mnl session exec "$gh_sid" sh -c \
+    "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
+    2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
+    || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
+    echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
+    printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # It answers with the box's sealed value.
+  gh_sealed="$(mnl session exec "$gh_sid" sh -c 'printenv GH_TOKEN' 2>/dev/null | tr -d '\r')"
+  gh_fill="$(mnl session exec "$gh_sid" sh -c \
+    'printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' \
+    2>"$WORK/$gh_case.fill.err" | tr -d '\r')"
+  if [ -z "$gh_sealed" ] || [[ "$gh_fill" != *"password=$gh_sealed"* ]]; then
+    echo "::error::'git credential fill' for github.com in the grant box does not answer with the box's sealed GH_TOKEN"
+    cat "$WORK/$gh_case.fill.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # Each step runs on its own, so a failure names the step. The prompt
+  # switch only keeps a refused git from waiting on a terminal.
+  for gh_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gh_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gh_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gh_branch"; do
+    if ! mnl session exec "$gh_sid" sh -c "${gh_step#*:}" \
+      >"$WORK/$gh_case.${gh_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gh_step%%:*}' against the private repository $gh_repo failed in the grant box with the shipped helper"
+      cat "$WORK/$gh_case.${gh_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gh_step%%:*}: OK"
+  done
+
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
+  gh_log="$(mnl session exec "$gh_sid" sh -c \
+    'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
+  mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+  if [[ "$gh_log" != *"answered for host github.com"* ]]; then
+    echo "::error::the git credential helper's log names no answer for github.com"
+    printf '%s\n' "$gh_log"
+    fail
+  fi
+  if [[ "$gh_log" == *"$gh_sealed"* ]]; then
+    echo "::error::the git credential helper's log holds the sealed value"
+    fail
+  fi
+  rm -f "$WORK/$gh_case".*
+  echo "grant box with the shipped helper: git clone and git push against the private repository $gh_repo"
   echo "::endgroup::"
 }
 
@@ -12003,6 +12108,254 @@ proof_bep_first_slice_end_to_end() {
   fs_cleanup
   rm -f "${WORK:?}/${fs_case:?}".*
   echo "Box Egress Proxy first slice OK (spec, gh, clone and push of $fs_repo, a copied value refused on the host and in a second box, both boxes audited)"
+  echo "::endgroup::"
+}
+
+# Destroy-revocation proofs (BEP-043, BEP-067). A grant box "web" and a
+# second grant box start. The case copies web's sealed GH_TOKEN value, and
+# then runs 'min session destroy' on web. The proxy refuses the copied value,
+# and the refusal stays in force after the destroy.
+#   - With the proxy up, `min box audit` on web shows a `revocation` record
+#     within 60 s of the destroy, and the copied value is refused from the
+#     second box.
+#   - With the proxy down, the destroy still completes, and minvmd logs one
+#     warning. After the proxy comes back, a new box sends the copied value,
+#     and the proxy refuses it: no live box holds web's attachment. Web's
+#     trail holds no revocation record.
+# Both need a live proxy, so bep_live_gate records them NOT RUN elsewhere.
+# The value is never printed: the transcript names only its length.
+
+# Starts one grant box named $2 for case $1, headless, and prints its
+# session id. Needs GRANT_SEED_DIR.
+bep_revoke_activate() {
+  local ra_out
+  ra_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$1.$2.err")" || {
+    echo "::error::'min session activate' of the GitHub grant box $2 failed" >&2
+    echo "--- stdout ---" >&2; printf '%s\n' "$ra_out" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/$1.$2.err" >&2 2>/dev/null || true
+    return 1
+  }
+  printf '%s\n' "$ra_out" | tail -n1 | tr -d '\r'
+}
+
+# Writes the grant seed for case $1 into a new GRANT_SEED_DIR.
+bep_revoke_seed() {
+  GRANT_SEED_DIR="$(hook_mktemp "/tmp/mnlrevoke.XXXXXX")"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+}
+
+# Prints the sealed GH_TOKEN value of the box $2 for case $1, after one
+# 'gh api user' in the box answers with it.
+bep_revoke_copy_value() {
+  local cv_value
+  if ! mnl session exec "$2" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$1.before" 2>&1; then
+    echo "::error::'gh api user' failed in the box web before the destroy, so the case proves nothing" >&2
+    cat "$WORK/$1.before" >&2 2>/dev/null || true
+    return 1
+  fi
+  if ! mnl session exec "$2" sh -c 'env' >"$WORK/$1.env" 2>"$WORK/$1.env.err"; then
+    echo "::error::'min session exec' in the box web failed" >&2
+    cat "$WORK/$1.env.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  cv_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$1.env" | tr -d '\r' | head -n1)"
+  rm -f "${WORK:?}/${1:?}.env"
+  if ! [[ "$cv_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the box web is not a sealed value (${#cv_value} characters)" >&2
+    return 1
+  fi
+  printf '%s\n' "$cv_value"
+}
+
+# Counts the records of kind $2 in the jsonl file $1.
+bep_revoke_count() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if line and json.loads(line).get("kind") == sys.argv[2]:
+            n += 1
+print(n)
+PY
+}
+
+proof_bep_destroyed_box_values_refused_within_60s() {
+  echo "::group::min session destroy: a value copied from the box is refused within 60 s"
+  local dv_case=bep_destroyed_box_values_refused_within_60s
+  local dv_web=e2e-bep-revoke-web dv_other=e2e-bep-revoke-other
+  local dv_value dv_try dv_count=0 dv_out
+  bep_live_gate "$dv_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: dv_cleanup reads them.
+  DV_SID="" DV_SID2=""
+  dv_cleanup() {
+    [ -n "$DV_SID" ] && mnl session destroy --force "$DV_SID" >/dev/null 2>&1
+    [ -n "$DV_SID2" ] && mnl session destroy --force "$DV_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  dv_fail() { dv_cleanup; fail; }
+
+  bep_revoke_seed "$dv_case"
+  DV_SID="$(bep_revoke_activate "$dv_case" "$dv_web")" || dv_fail
+  DV_SID2="$(bep_revoke_activate "$dv_case" "$dv_other")" || dv_fail
+  dv_value="$(bep_revoke_copy_value "$dv_case" "$DV_SID")" || dv_fail
+  echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#dv_value} characters)"
+
+  if ! mnl session destroy --force "$DV_SID" </dev/null >/dev/null 2>"$WORK/$dv_case.destroy.err"; then
+    echo "::error::'min session destroy' of the box web failed"
+    cat "$WORK/$dv_case.destroy.err" 2>/dev/null || true
+    dv_fail
+  fi
+  DV_SID=""
+
+  # The revocation record, within 60 s of the destroy.
+  for dv_try in $(seq 1 12); do
+    [ "$dv_try" -gt 1 ] && sleep 5
+    mnl box audit "$dv_web" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
+      || continue
+    dv_count="$(bep_revoke_count "$WORK/$dv_case.audit" revocation)"
+    [ "$dv_count" -ge 1 ] && break
+  done
+  if [ "$dv_count" != 1 ]; then
+    echo "::error::'min box audit $dv_web' shows $dv_count revocation records 60 s after the destroy, not 1"
+    echo "--- min box audit $dv_web -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
+    cat "$WORK/$dv_case.audit.err" 2>/dev/null || true
+    dv_fail
+  fi
+  echo "min box audit $dv_web: 1 revocation record within 60 s of the destroy"
+
+  # The copied value, from the second box, after the destroy.
+  if mnl session exec "$DV_SID2" sh -c "GH_TOKEN='$dv_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$dv_case.after" 2>&1; then
+    echo "::error::'gh api user' in the second box succeeded with the value copied from the destroyed box web"
+    dv_fail
+  fi
+  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>&1 \
+    || ! dv_out="$(bep_slice_jsonl_check "$WORK/$dv_case.audit2" cross_box)"; then
+    echo "::error::'min box audit $dv_other' shows no refusal of the copied value: $dv_out"
+    cat "$WORK/$dv_case.audit2" 2>/dev/null || true
+    dv_fail
+  fi
+  echo "copied value in the second box after the destroy: 'gh api user' failed, and min box audit shows $dv_out"
+
+  dv_cleanup
+  rm -f "${WORK:?}/${dv_case:?}".*
+  echo "Destroy revocation OK (one revocation record within 60 s, and the copied value refused)"
+  echo "::endgroup::"
+}
+
+proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
+  echo "::group::min session destroy with the proxy down: the destroy completes, and the value is refused"
+  local pd_case=bep_destroy_with_proxy_down_refuses_by_attachment
+  local pd_web=e2e-bep-down-web pd_probe=e2e-bep-down-probe
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local pd_control="$HOME/.minimal/bep/control.sock"
+  local pd_value pd_pids pd_try pd_count pd_out pd_id
+  bep_live_gate "$pd_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: pd_cleanup reads them.
+  PD_SID="" PD_SID2=""
+  pd_cleanup() {
+    [ -n "$PD_SID" ] && mnl session destroy --force "$PD_SID" >/dev/null 2>&1
+    [ -n "$PD_SID2" ] && mnl session destroy --force "$PD_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  pd_fail() { pd_cleanup; fail; }
+
+  bep_revoke_seed "$pd_case"
+  PD_SID="$(bep_revoke_activate "$pd_case" "$pd_web")" || pd_fail
+  pd_value="$(bep_revoke_copy_value "$pd_case" "$PD_SID")" || pd_fail
+  echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#pd_value} characters)"
+
+  # Stop the proxy. minvmd does not restart it, so it stays down.
+  pd_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+  if [ -z "$pd_pids" ]; then
+    echo "::error::no 'bep serve' process runs, though the proxy answered on $pd_control"
+    pd_fail
+  fi
+  # shellcheck disable=SC2086
+  kill -KILL $pd_pids 2>/dev/null || true
+  for pd_try in $(seq 1 20); do
+    bep_control_live "$pd_control" || break
+    sleep 0.5
+  done
+  if bep_control_live "$pd_control"; then
+    echo "::error::the proxy still answers on $pd_control after its process was killed"
+    pd_fail
+  fi
+  BEP_LIVE_DAEMON=""
+  echo "the proxy is down"
+
+  if ! mnl session destroy --force "$PD_SID" </dev/null >/dev/null 2>"$WORK/$pd_case.destroy.err"; then
+    echo "::error::'min session destroy' of the box web failed with the proxy down: the destroy must complete"
+    cat "$WORK/$pd_case.destroy.err" 2>/dev/null || true
+    pd_fail
+  fi
+  PD_SID=""
+  echo "min session destroy of web completed with the proxy down"
+  for pd_try in $(seq 1 20); do
+    [ "$pd_try" -gt 1 ] && sleep 0.5
+    pd_out="$(minvmd_log_lines 'the destroy completed without a revocation from the Box Egress Proxy' | tail -n1)"
+    [ -n "$pd_out" ] && break
+  done
+  if [ -z "$pd_out" ]; then
+    echo "::error::minvmd logged no warning that the destroy completed without a revocation from the proxy"
+    pd_fail
+  fi
+  echo "minvmd log: the destroy completed without a revocation from the proxy"
+
+  # The proxy comes back with the restarted daemon pair. A new box sends
+  # the copied value, and the proxy refuses it.
+  bep_live_gate "$pd_case" || pd_fail
+  PD_SID2="$(bep_revoke_activate "$pd_case" "$pd_probe")" || pd_fail
+  if mnl session exec "$PD_SID2" sh -c "GH_TOKEN='$pd_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$pd_case.after" 2>&1; then
+    echo "::error::'gh api user' in a new box succeeded with the value copied from the destroyed box web"
+    pd_fail
+  fi
+  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>&1 \
+    || ! pd_out="$(bep_slice_jsonl_check "$WORK/$pd_case.audit2" cross_box)"; then
+    echo "::error::'min box audit $pd_probe' shows no refusal of the copied value: $pd_out"
+    cat "$WORK/$pd_case.audit2" 2>/dev/null || true
+    pd_fail
+  fi
+  echo "copied value in a new box: 'gh api user' failed, and min box audit shows $pd_out"
+
+  # No revocation was recorded: the refusal is the withdrawn attachment's.
+  if ! mnl box audit "$pd_web" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
+    echo "::error::'min box audit $pd_web' failed"
+    cat "$WORK/$pd_case.audit.err" 2>/dev/null || true
+    pd_fail
+  fi
+  pd_count="$(bep_revoke_count "$WORK/$pd_case.audit" revocation)"
+  if [ "$pd_count" != 0 ]; then
+    echo "::error::'min box audit $pd_web' shows $pd_count revocation records, though the proxy was down at the destroy"
+    pd_fail
+  fi
+  pd_id="$(bep_revoke_count "$WORK/$pd_case.audit" decision)"
+  echo "min box audit $pd_web: $pd_id decision records and no revocation record"
+
+  pd_cleanup
+  rm -f "${WORK:?}/${pd_case:?}".*
+  echo "Destroy with the proxy down OK (the destroy completed, and the copied value was refused after the proxy came back)"
   echo "::endgroup::"
 }
 
@@ -24047,6 +24400,7 @@ case "${1:-}" in
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
+    proof_bep_git_credential_helper_sends_header
     proof_bep_first_slice_end_to_end
     proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
@@ -24054,6 +24408,8 @@ case "${1:-}" in
     proof_bep_root_ca_present_in_box_trust_store
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
+    proof_bep_destroyed_box_values_refused_within_60s
+    proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_logout_refuses_every_reference_at_next_request
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
@@ -24114,6 +24470,7 @@ case "${1:-}" in
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
+    | bep_git_credential_helper_sends_header \
     | bep_first_slice_end_to_end \
     | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
@@ -24121,6 +24478,8 @@ case "${1:-}" in
     | bep_root_ca_present_in_box_trust_store \
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
+    | bep_destroyed_box_values_refused_within_60s \
+    | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
     | bep_dns_steering_fails_closed_end_to_end)
     "proof_$1"
@@ -24159,13 +24518,14 @@ case "${1:-}" in
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
-    echo "         bep_git_and_gh_against_private_repo"
+    echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
     echo "         bep_first_slice_end_to_end"
     echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
+    echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
     echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;
