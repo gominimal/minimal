@@ -154,6 +154,8 @@ impl BoxActor {
                 .as_utf8_path()
                 .as_std_path()
                 .to_path_buf(),
+            // BEP-011: the root the record holds, for a box that gets one.
+            root_certificate: box_runtime::launch_root_certificate(record),
         })
     }
 

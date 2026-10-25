@@ -14,15 +14,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, refusals,
+    SecretGrant, SecretGrants, Steering, StoreAction, StoreReference, StoreRules, refusals,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
 
 /// What [`render`] reads.
 pub(crate) struct SpecInputs<'a> {
-    /// The root CA key's RFC 7638 JWK thumbprint under SHA-256, or `None` when the proxy has
-    /// not published it.
+    /// The SHA-256 fingerprint of the proxy's root certificate, as colon
+    /// separated hex pairs, or `None` when the proxy has not published it.
     pub root_fingerprint: Option<&'a str>,
     /// `[session.network.bep]`.
     pub bep: &'a BepSettings,
@@ -35,6 +35,9 @@ pub(crate) struct SpecInputs<'a> {
     pub acknowledged: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
+    /// The client's `[secret-store-rules]`, merged and with refused rules
+    /// left out.
+    pub store_rules: &'a StoreRules,
 }
 
 /// Writes the `min box spec` rows for `inputs`.
@@ -76,10 +79,9 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     match inputs.root_fingerprint {
-        // The proxy issues no root certificate yet, so this is the key's
-        // RFC 7638 thumbprint, not a certificate fingerprint. The label says so.
-        // Interim: the root key's RFC 7638 thumbprint until the root certificate exists (#2437); the certificate fingerprint is gominimal/minimal#2446.
-        Some(fingerprint) => writeln!(out, "root CA  key thumbprint SHA256:{fingerprint}")?,
+        // #2446: the fingerprint of the published root certificate, in the
+        // form `openssl x509 -noout -fingerprint -sha256` prints for it.
+        Some(fingerprint) => writeln!(out, "root CA  certificate SHA256:{fingerprint}")?,
         None => writeln!(
             out,
             "root CA  not published yet. The proxy publishes it when it starts."
@@ -114,9 +116,26 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
             }
         }
         for scope in grant.scopes.iter().filter(|s| !s.starts_with("github:")) {
-            // No store has registered hosts yet (the `[secret-store-rules]`
-            // slice adds them).
-            writeln!(out, "store  {scope}  {name}  no hosts registered")?;
+            // BEP-038, BEP-063: the authorities the matching rule registers
+            // are the upstream the store handle carries.
+            // A deny rule never redeems the reference, whatever upstream it
+            // keeps, so the row says it is denied and lists no authorities.
+            match StoreReference::parse(name, scope).rule(inputs.store_rules) {
+                Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
+                    out,
+                    "store  {scope}  {name}  denied by its rule in [secret-store-rules] in config.toml"
+                )?,
+                Some(rule) if !rule.upstream.is_empty() => writeln!(
+                    out,
+                    "store  {scope}  {name}  upstream {}",
+                    rule.upstream.join(", ")
+                )?,
+                Some(_) => writeln!(out, "store  {scope}  {name}  no upstream registered")?,
+                None => writeln!(
+                    out,
+                    "store  {scope}  {name}  no rule in [secret-store-rules] in config.toml"
+                )?,
+            }
         }
     }
 
@@ -150,14 +169,14 @@ fn identity_path() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".minimal/bep/identity.json"))
 }
 
-/// The published root CA fingerprint, or `None` with a debug line saying
-/// why.
-fn root_fingerprint(path: Option<&Path>) -> Option<String> {
+/// The published root certificate's fingerprint, or `None` with a debug
+/// line saying why.
+pub(crate) fn root_fingerprint(path: Option<&Path>) -> Option<String> {
     let path = path?;
     match bep::publish::Identity::read(path)
-        .and_then(|identity| identity.key(bep::keys::Role::Root))
+        .and_then(|identity| identity.root_certificate_fingerprint())
     {
-        Ok(key) => Some(key.kid()),
+        Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             tracing::debug!(path = %path.display(), %error, "no published root CA");
             None
@@ -191,6 +210,14 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
         )
     });
     let acknowledged = crate::config::full_breadth_acknowledged(global)?;
+    let store_rules = if boxes::core::bep::store_references(&secrets)
+        .next()
+        .is_some()
+    {
+        crate::config::read_client_config_and_store_rules(global)?.1
+    } else {
+        StoreRules::new()
+    };
     let root = root_fingerprint(identity_path().as_deref());
     tracing::debug!(
         project = %project.display(),
@@ -211,6 +238,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             secrets: &secrets,
             acknowledged,
             github_hosts: &github_hosts,
+            store_rules: &store_rules,
         },
         &mut stdout,
     )?;
@@ -259,10 +287,79 @@ mod tests {
                 secrets,
                 acknowledged,
                 github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
             },
             &mut out,
         )?;
         Ok(String::from_utf8(out).expect("utf-8"))
+    }
+
+    /// BEP-038, BEP-063: a store reference prints the authorities its
+    /// matching rule registers, and only a rule for the same store matches.
+    #[test]
+    fn box_spec_lists_store_references_with_their_authorities() {
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), grant(&["keychain:claude"]))]);
+        let rule = |store: &str| boxes::core::bep::StoreRuleConfig {
+            store: Some(store.to_string()),
+            upstream: vec![
+                "api.anthropic.com".into(),
+                "console.anthropic.com:8443".into(),
+            ],
+            header: Some("x-api-key".into()),
+            prefix: None,
+            basic_auth: None,
+            action: None,
+        };
+        let render_with = |rules: &StoreRules| {
+            let mut out = Vec::new();
+            render(
+                &SpecInputs {
+                    root_fingerprint: Some("abc123"),
+                    bep: &proxy_env(),
+                    quic443: None,
+                    secrets: &secrets,
+                    acknowledged: false,
+                    github_hosts: HOSTS,
+                    store_rules: rules,
+                },
+                &mut out,
+            )
+            .expect("renders");
+            String::from_utf8(out).expect("utf-8")
+        };
+
+        let rules = StoreRules::from([("claude".to_string(), rule("keychain"))]);
+        let text = render_with(&rules);
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  upstream api.anthropic.com, \
+                 console.anthropic.com:8443\n"
+            ),
+            "{text}"
+        );
+
+        // A rule for another store does not match the reference.
+        let other = StoreRules::from([("claude".to_string(), rule("vault"))]);
+        let text = render_with(&other);
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
+            ),
+            "{text}"
+        );
+
+        // A deny rule lists no authorities, even when it keeps an upstream.
+        let mut denied = rule("keychain");
+        denied.action = Some(StoreAction::Deny);
+        let text = render_with(&StoreRules::from([("claude".to_string(), denied)]));
+        assert!(
+            text.contains(
+                "store  keychain:claude  CLAUDE  denied by its rule in [secret-store-rules] in \
+                 config.toml\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("api.anthropic.com"), "{text}");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
@@ -276,10 +373,10 @@ mod tests {
         let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
         assert_eq!(
             text,
-            "root CA  key thumbprint SHA256:abc123\n\
+            "root CA  certificate SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
-             store  keychain:npm  NPM_TOKEN  no hosts registered\n\
+             store  keychain:npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
              steering  proxy_env\n\
              quic443  allowed (HTTP/3 bypasses the proxy)\n"
         );
@@ -296,6 +393,7 @@ mod tests {
                 secrets: &secrets,
                 acknowledged: false,
                 github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
             },
             &mut out,
         )
@@ -329,6 +427,60 @@ mod tests {
         // `proxy_env` writes no warning.
         let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
         assert!(!text.contains("warning  "), "{text}");
+    }
+
+    /// #2446, BEP-072: the root row is the fingerprint of the root
+    /// certificate the proxy published, read from its identity file. An
+    /// identity with no certificate reads as not published.
+    #[test]
+    fn box_spec_shows_the_root_certificate_fingerprint() {
+        let der = b"0\x82\x01\x0a a root certificate's DER".to_vec();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = bep::publish::Identity::default();
+        identity
+            .clone()
+            .with_root_certificate(&der)
+            .publish(&path)
+            .expect("publishes");
+
+        let fingerprint = root_fingerprint(Some(&path)).expect("a published root");
+        assert_eq!(fingerprint, bep::publish::certificate_fingerprint(&der));
+        let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&["github:user-token"]))]);
+        let bep = proxy_env();
+        let mut out = Vec::new();
+        render(
+            &SpecInputs {
+                root_fingerprint: Some(&fingerprint),
+                bep: &bep,
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                github_hosts: HOSTS,
+                store_rules: &StoreRules::new(),
+            },
+            &mut out,
+        )
+        .expect("renders");
+        let text = String::from_utf8(out).unwrap();
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, format!("root CA  certificate SHA256:{fingerprint}"));
+        assert!(!text.contains("thumbprint"), "{text}");
+        // 32 bytes as uppercase hex pairs joined by colons.
+        let hex = first.trim_start_matches("root CA  certificate SHA256:");
+        assert_eq!(hex.split(':').count(), 32, "{hex}");
+        assert!(
+            hex.split(':').all(|pair| pair.len() == 2
+                && pair
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())),
+            "{hex}"
+        );
+
+        // An identity with no certificate gives no fingerprint.
+        identity.publish(&path).expect("publishes");
+        assert_eq!(root_fingerprint(Some(&path)), None);
+        assert_eq!(root_fingerprint(None), None);
     }
 
     /// BEP-038: a `full` member is marked `full` beside its declared scope.

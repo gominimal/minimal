@@ -418,6 +418,8 @@ RECOVER_HOLDER_PID="" # the port holder the recovery proof starts; killed
 RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
+GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
@@ -737,8 +739,21 @@ elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1 \
   :
 else
   min_cli_dir=""
+  # A dir counts only with BOTH halves of the pair: a shared target dir can
+  # hold a 'min' from an earlier build and no daemon, and taking it skips the
+  # build below and dies at the daemon gate.
+  # A pair whose halves report different versions is not one build: an
+  # earlier build of one half ran from a dirty tree, say. The CLI refuses
+  # such a daemon at the first activate, so rebuild the pair below instead.
+  min_skewed_pair=""
   for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-    if [ -x "$d/min" ]; then
+    if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
+      if [ "$("$d/min" --version 2>/dev/null | awk '{print $NF}')" \
+           != "$("$d/$min_daemon" --version 2>/dev/null | awk '{print $NF}')" ]; then
+        echo "the 'min' and '$min_daemon' under $d report different versions; rebuilding the pair"
+        min_skewed_pair=1
+        continue
+      fi
       min_cli_dir="$d"
       break
     fi
@@ -757,17 +772,22 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    echo "no usable 'min' and '$min_daemon' pair on PATH or under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
     # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
+    # The version build script reruns only on a git change, so a skewed pair
+    # keeps its skew through a rebuild unless the script is made to rerun.
+    if [ -n "$min_skewed_pair" ]; then
+      touch "$ROOT/crates/version/build.rs"
+    fi
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
         && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-        if [ -x "$d/min" ]; then
+        if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
           min_cli_dir="$d"
           break
         fi
@@ -989,6 +1009,8 @@ teardown() {
   [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -11100,6 +11122,7 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   BEP_SEED_DIR="$(hook_mktemp /tmp/mnlbep.XXXXXX)"
   hook_seed_preamble > "$BEP_SEED_DIR/minimal.toml"
@@ -11481,11 +11504,1388 @@ proof_published_proxy_routes_from_host() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# The live Box Egress Proxy gate (BEP-015, #2275). The VM host daemon starts
+# `bep serve` beside gvproxy on a production boot, and the proxy opens its
+# control socket under the real home. Records case $1 as NOT RUN and returns
+# 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
+# Keychain), without gvproxy (the daemon starts the proxy beside it) or
+# without a GitHub sign-in a person made with `min auth login`. Everywhere
+# else the proxy must come up, so a proxy that does not is a failure, never
+# NOT RUN.
+#
+# A daemon an earlier case started under MINVMD_BEP_STUB runs the stand-in
+# in place of the proxy, so the first live case restarts the daemon pair
+# without the flag; BEP_LIVE_DAEMON records that the running pair has the
+# proxy, and every case that exports MINVMD_BEP_STUB clears it.
+BEP_LIVE_DAEMON=""
+bep_control_live() {
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+bep_live_gate() {
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
+  local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    return 1
+  fi
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 1
+  fi
+  lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
+    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+    return 1
+  fi
+  if [ "$BEP_LIVE_DAEMON" != 1 ]; then
+    unset MINVMD_BEP_STUB
+    mnl stop --force >/dev/null 2>&1 || true
+    minvmd stop >/dev/null 2>&1 || true
+    if ! mnl ls >/dev/null 2>"$WORK/bep-live-up.err"; then
+      echo "::error::the daemon did not start for $1"
+      cat "$WORK/bep-live-up.err" 2>/dev/null || true
+      fail
+    fi
+  fi
+  for lg_try in $(seq 1 60); do
+    [ "$lg_try" -gt 1 ] && sleep 1
+    bep_control_live "$lg_control" && break
+  done
+  if ! bep_control_live "$lg_control"; then
+    echo "::error::the Box Egress Proxy is not serving: nothing answers on $lg_control 60 s after the VM host daemon started (it starts 'bep serve' beside gvproxy)"
+    echo "--- $lg_log (tail) ---"; tail -40 "$lg_log" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  BEP_LIVE_DAEMON=1
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The proxy_sees_each_vm_box_by_its_switch_address case, which the dispatch
 # runs after this one, stops and respawns both daemons for its own filter
 # and stand-in.
+# ---------------------------------------------------------------------------
+# GitHub grant proof (BEP-003, BEP-005): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and neither asks for a sign-in. Each creation mints a
+# sealed sign-in reference and registers the box with the proxy, so the second
+# box reuses the sign-in the first one found. `bep serve` runs on macOS only,
+# and the case needs a sign-in a person made with `min auth login`, so a lane
+# without both records it as NOT RUN.
+proof_bep_second_box_needs_no_sign_in() {
+  echo "::group::GitHub grant boxes: the second box needs no sign-in"
+  bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  for bep_name in e2e-bep-first e2e-bep-second; do
+    # Headless: stdin from /dev/null and --no-prompt. A sign-in prompt has
+    # no terminal to ask on, so a box that needed one fails here.
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-$bep_name.err"
+      fail
+    fi
+    bep_sids="$bep_sids $(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "GitHub grant proof OK (two grant boxes started headless, with no sign-in prompt)"
+  echo "::endgroup::"
+}
+
+# Sealed-value placement proof (BEP-007): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and each box's GH_TOKEN holds a sealed value and no
+# plaintext token. Each box's value names its own box, so the two differ.
+# The case looks for a plaintext token by its GitHub shape (ghp_, gho_, ghu_,
+# ghs_, ghr_ or github_pat_) in the box's whole environment. The same gates
+# as the second-box proof above record a lane without the proxy as NOT RUN.
+proof_bep_box_env_holds_sealed_value_only() {
+  echo "::group::GitHub grant boxes: the grant's variable holds a sealed value only"
+  bep_live_gate bep_box_env_holds_sealed_value_only || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  bep_values=""
+  for bep_name in e2e-bep-env-first e2e-bep-env-second; do
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-env-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-env-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-env-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-env-$bep_name.err"
+      fail
+    fi
+    bep_sid="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+    bep_sids="$bep_sids $bep_sid"
+    if ! mnl session exec "$bep_sid" sh -c 'env' \
+      >"$WORK/bep-env-$bep_name.env" 2>"$WORK/bep-env-$bep_name.exec.err"; then
+      echo "::error::'min session exec' in the GitHub grant box $bep_name failed"
+      cat "$WORK/bep-env-$bep_name.exec.err" 2>/dev/null || true
+      fail
+    fi
+    # The value itself is never printed: the transcript names only its length.
+    bep_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/bep-env-$bep_name.env" | tr -d '\r' | head -n1)"
+    if [ -z "$bep_value" ]; then
+      echo "::error::the GitHub grant box $bep_name has no value in GH_TOKEN"
+      fail
+    fi
+    # A sealed value is a compact JWE, header..iv.ciphertext.tag, the form
+    # bep::seal returns.
+    if ! [[ "$bep_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+      echo "::error::the GH_TOKEN value of the GitHub grant box $bep_name is not a sealed value: it is not in the compact JWE form header..iv.ciphertext.tag"
+      fail
+    fi
+    if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/bep-env-$bep_name.env"; then
+      echo "::error::the environment of the GitHub grant box $bep_name holds a plaintext GitHub token"
+      fail
+    fi
+    case " $bep_values " in
+      *" $bep_value "*)
+        echo "::error::the GitHub grant box $bep_name holds the same GH_TOKEN value as an earlier box, so the value does not name its box"
+        fail
+        ;;
+    esac
+    bep_values="$bep_values $bep_value"
+    rm -f "$WORK/bep-env-$bep_name.env"
+    echo "$bep_name: GH_TOKEN holds a sealed value (${#bep_value} characters), and no plaintext token"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
+# git and gh through the live proxy (BEP-015): a proxy_env box that holds a
+# sealed GitHub member clones a private repository of the signed-in account,
+# pushes to it and reads it with `gh api`, with no tool configured in the box
+# beyond what it carries at creation. E2E_BEP_PRIVATE_REPO names the
+# repository as <owner>/<name>: private, with at least one commit, and one
+# the signed-in account can push to. The push makes a throwaway branch from
+# the cloned HEAD and the case deletes it again with a second push. A lane
+# without the proxy, or without a repository named, records NOT RUN.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS
+# lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
+# T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
+#
+# git sends an Authorization header only when a credential helper gives it
+# one. The box answers with the git credential helper it carries from
+# creation (#2499). The case configures no helper of its own.
+# bep_git_credential_helper_sends_header proves the helper alone.
+proof_bep_git_and_gh_against_private_repo() {
+  echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
+  local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gg_out gg_sid gg_branch gg_step gg_private
+  if [ -z "$gg_repo" ]; then
+    not_run "$gg_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gg_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gg_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gg_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gg_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-and-gh \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gg_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gg_out"
+    echo "--- stderr ---"; cat "$WORK/$gg_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gg_sid="$(printf '%s\n' "$gg_out" | tail -n1 | tr -d '\r')"
+  gg_branch="e2e-bep-$(date +%s)-$$"
+
+  # Each step runs on its own, so a failure names the tool that failed. The
+  # prompt switch only keeps a refused git from waiting on a terminal: it
+  # gives git no credential.
+  for gg_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gg_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gg_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gg_branch"; do
+    if ! mnl session exec "$gg_sid" sh -c "${gg_step#*:}" \
+      >"$WORK/$gg_case.${gg_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gg_step%%:*}' against the private repository $gg_repo failed in the proxy_env box"
+      cat "$WORK/$gg_case.${gg_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gg_step%%:*}: OK"
+  done
+  if ! gg_private="$(mnl session exec "$gg_sid" sh -c \
+    "timeout 60 gh api repos/$gg_repo --jq .private" 2>"$WORK/$gg_case.gh.err")"; then
+    echo "::error::'gh api repos/$gg_repo' failed in the proxy_env box"
+    cat "$WORK/$gg_case.gh.err" 2>/dev/null || true
+    mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  gg_private="$(printf '%s' "$gg_private" | tr -d '\r' | tail -n1)"
+  mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+  if [ "$gg_private" != true ]; then
+    echo "::error::'gh api repos/$gg_repo' answered private='$gg_private': the case needs a private repository"
+    fail
+  fi
+  rm -f "$WORK/$gg_case".*
+  echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
+  echo "::endgroup::"
+}
+
+# The shipped git credential helper (BEP-015, Gatehouse §6.4): a GitHub grant
+# box with no git configuration of its own clones the private repository
+# E2E_BEP_PRIVATE_REPO and pushes a throwaway branch to it, which a second
+# push deletes again. git sends an Authorization header only when a helper
+# answers, so the clone of a private repository is the proof that git sent
+# the sealed value and the proxy substituted it. The case first checks that
+# the one helper git finds for github.com is the one the box carries, that
+# it answers with the box's sealed GH_TOKEN, and afterwards that its log
+# names github.com and never the value. A lane off macOS, without a sign-in
+# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# that runs it.
+proof_bep_git_credential_helper_sends_header() {
+  echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
+  local gh_case=bep_git_credential_helper_sends_header gh_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gh_out gh_sid gh_branch gh_step gh_helpers gh_fill gh_sealed gh_log
+  if [ -z "$gh_repo" ]; then
+    not_run "$gh_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gh_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gh_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gh_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gh_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-credential-helper \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gh_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gh_out"
+    echo "--- stderr ---"; cat "$WORK/$gh_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
+  gh_branch="e2e-bep-helper-$(date +%s)-$$"
+
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
+  gh_helpers="$(mnl session exec "$gh_sid" sh -c \
+    "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
+    2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
+    || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
+    echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
+    printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # It answers with the box's sealed value.
+  gh_sealed="$(mnl session exec "$gh_sid" sh -c 'printenv GH_TOKEN' 2>/dev/null | tr -d '\r')"
+  gh_fill="$(mnl session exec "$gh_sid" sh -c \
+    'printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' \
+    2>"$WORK/$gh_case.fill.err" | tr -d '\r')"
+  if [ -z "$gh_sealed" ] || [[ "$gh_fill" != *"password=$gh_sealed"* ]]; then
+    echo "::error::'git credential fill' for github.com in the grant box does not answer with the box's sealed GH_TOKEN"
+    cat "$WORK/$gh_case.fill.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # Each step runs on its own, so a failure names the step. The prompt
+  # switch only keeps a refused git from waiting on a terminal.
+  for gh_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gh_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gh_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gh_branch"; do
+    if ! mnl session exec "$gh_sid" sh -c "${gh_step#*:}" \
+      >"$WORK/$gh_case.${gh_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gh_step%%:*}' against the private repository $gh_repo failed in the grant box with the shipped helper"
+      cat "$WORK/$gh_case.${gh_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gh_step%%:*}: OK"
+  done
+
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
+  gh_log="$(mnl session exec "$gh_sid" sh -c \
+    'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
+  mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+  if [[ "$gh_log" != *"answered for host github.com"* ]]; then
+    echo "::error::the git credential helper's log names no answer for github.com"
+    printf '%s\n' "$gh_log"
+    fail
+  fi
+  if [[ "$gh_log" == *"$gh_sealed"* ]]; then
+    echo "::error::the git credential helper's log holds the sealed value"
+    fail
+  fi
+  rm -f "$WORK/$gh_case".*
+  echo "grant box with the shipped helper: git clone and git push against the private repository $gh_repo"
+  echo "::endgroup::"
+}
+
+# The first slice end to end (BEP, T19): one case that walks the slice the
+# way a person does. It needs the sign-in a person made with `min auth
+# login` (the live gate below records NOT RUN without one), then:
+#   1. `min box spec` on the demo project shows the root CA fingerprint, the
+#      grant `github:user-token` marked `full` with the four GitHub hosts,
+#      and the steering `proxy_env`.
+#   2. The demo box starts headless on a credentialed lane, and its GH_TOKEN
+#      holds a sealed value.
+#   3. In that box, `gh api user` answers, and git clones the private
+#      repository E2E_BEP_PRIVATE_REPO and pushes a throwaway branch, which
+#      a second push deletes again.
+#   4. The value copied to the host shell is refused: GitHub answers 401 to
+#      it. The host has no way to reach the proxy itself (BEP-026).
+#   5. The value copied into a second box is refused by the proxy, because
+#      the value names the first box (BEP-020).
+#   6. `min box audit` shows the first box's admits for github.com and
+#      api.github.com, and the second box's refusal marked `cross_box`.
+# The value is never printed: the transcript names only its length.
+# The clone meets the same known gap as the private-repository case above:
+# no box ships a git credential helper until #2499 lands, so the clone fails
+# on a lane that runs this case, and the case does not hide it.
+bep_slice_jsonl_check() { # $1 = the jsonl file, $2 = admit or cross_box
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+decisions = [r for r in records if r.get("kind") == "decision"]
+if want == "admit":
+    admits = [r for r in decisions if r.get("decision") == "admit"]
+    seen = {r.get("upstream") for r in admits}
+    missing = [a for a in ("github.com:443", "api.github.com:443") if a not in seen]
+    if missing:
+        print("no admit record for: " + ", ".join(missing))
+        sys.exit(1)
+    if not any(r.get("upstream") == "api.github.com:443"
+               and r.get("identifier") not in (None, "none") for r in admits):
+        print("no admit record for api.github.com:443 names a member: the sealed value was not redeemed")
+        sys.exit(1)
+    print("%d admit record(s), for %s" % (len(admits), ", ".join(sorted(seen))))
+else:
+    hits = [r for r in decisions if r.get("decision") == "refuse" and r.get("marker") == want]
+    if not hits:
+        print("no refuse record marked %s" % want)
+        sys.exit(1)
+    print("%d refuse record(s) marked %s, for %s" % (
+        len(hits), want, ", ".join(sorted({r.get("upstream") for r in hits}))))
+PY
+}
+
+proof_bep_first_slice_end_to_end() {
+  echo "::group::Box Egress Proxy first slice: spec, gh, clone, push, a copied value refused, audit"
+  local fs_case=bep_first_slice_end_to_end fs_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local fs_out fs_value fs_branch fs_step fs_spec fs_code fs_check
+  local fs_name=e2e-bep-slice-demo fs_name2=e2e-bep-slice-second
+  if [ -z "$fs_repo" ]; then
+    not_run "$fs_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$fs_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$fs_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$fs_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: fs_cleanup and fs_fail read them.
+  FS_SID="" FS_SID2=""
+  fs_cleanup() {
+    [ -n "$FS_SID" ] && mnl session destroy --force "$FS_SID" >/dev/null 2>&1
+    [ -n "$FS_SID2" ] && mnl session destroy --force "$FS_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  fs_fail() {
+    # The proxy's connection spans, which name the box id, the authority and
+    # the outcome of each request (no credential).
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    fs_cleanup
+    fail
+  }
+
+  # The demo project: the GitHub grant spelt `github:user-token`, proxy_env
+  # steering, and the tools the steps below run.
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlslice.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # 1. `min box spec` (BEP-038).
+  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+    echo "::error::'min box spec' of the demo project failed"
+    cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_spec="$(printf '%s\n' "$fs_spec" | tr -d '\r')"
+  for fs_check in \
+    '^root CA  certificate SHA256:[0-9A-Fa-f:]+$' \
+    '^grant  github:user-token  full  GH_TOKEN  hosts github\.com, api\.github\.com, uploads\.github\.com, codeload\.github\.com$' \
+    '^steering  proxy_env$'; do
+    if ! printf '%s\n' "$fs_spec" | grep -Eq -- "$fs_check"; then
+      echo "::error::'min box spec' of the demo project has no line matching: $fs_check"
+      echo "--- min box spec ---"; printf '%s\n' "$fs_spec"
+      fs_fail
+    fi
+  done
+  echo "min box spec: root CA fingerprint, grant github:user-token marked full with the four GitHub hosts, steering proxy_env"
+
+  # 2. The demo box and the second box, headless: a sign-in prompt has no
+  # terminal to ask on. Both stay up until step 6, so the second box's
+  # refusal is cross_box and not revoked.
+  for fs_step in "$fs_name" "$fs_name2"; do
+    fs_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$fs_step" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$fs_case.$fs_step.err")" || {
+      echo "::error::'min session activate' of the box $fs_step failed"
+      echo "--- stdout ---"; printf '%s\n' "$fs_out"
+      echo "--- stderr ---"; cat "$WORK/$fs_case.$fs_step.err" 2>/dev/null || true
+      fs_fail
+    }
+    if [ "$fs_step" = "$fs_name" ]; then
+      FS_SID="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    else
+      FS_SID2="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    fi
+  done
+
+  if ! mnl session exec "$FS_SID" sh -c 'env' \
+    >"$WORK/$fs_case.env" 2>"$WORK/$fs_case.env.err"; then
+    echo "::error::'min session exec' in the demo box failed"
+    cat "$WORK/$fs_case.env.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$fs_case.env" | tr -d '\r' | head -n1)"
+  if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/$fs_case.env"; then
+    rm -f "${WORK:?}/${fs_case:?}.env"
+    echo "::error::the environment of the demo box holds a plaintext GitHub token"
+    fs_fail
+  fi
+  rm -f "${WORK:?}/${fs_case:?}.env"
+  if ! [[ "$fs_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the demo box is not a sealed value (${#fs_value} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
+    fs_fail
+  fi
+  echo "demo box: GH_TOKEN holds a sealed value (${#fs_value} characters), and no plaintext token"
+
+  # 3. gh, clone and push from the demo box. Each step runs on its own, so a
+  # failure names the tool that failed. The prompt switch only keeps a
+  # refused git from waiting on a terminal: it gives git no credential.
+  fs_branch="e2e-bep-slice-$(date +%s)-$$"
+  for fs_step in \
+    "gh:timeout 60 gh api user --jq .login" \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$fs_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$fs_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $fs_branch"; do
+    if ! mnl session exec "$FS_SID" sh -c "${fs_step#*:}" \
+      >"$WORK/$fs_case.${fs_step%%:*}.out" 2>&1; then
+      echo "::error::'${fs_step%%:*}' against $fs_repo failed in the demo box"
+      cat "$WORK/$fs_case.${fs_step%%:*}.out" 2>/dev/null || true
+      fs_fail
+    fi
+    echo "${fs_step%%:*} in the demo box: OK"
+  done
+
+  # 4. The copied value on the host shell. GitHub sees the sealed value
+  # itself, never a token, and answers 401.
+  fs_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -H "Authorization: token $fs_value" https://api.github.com/user 2>"$WORK/$fs_case.host.err")" || {
+    echo "::error::the host request to api.github.com with the copied value did not complete"
+    cat "$WORK/$fs_case.host.err" 2>/dev/null || true
+    fs_fail
+  }
+  if [ "$fs_code" != 401 ]; then
+    echo "::error::GitHub answered $fs_code, not 401, to the value copied out of the demo box onto the host"
+    fs_fail
+  fi
+  echo "copied value on the host: GitHub answered 401"
+
+  # 5. The copied value in the second box. The proxy refuses it, because the
+  # value names the demo box and the request comes from another box.
+  if mnl session exec "$FS_SID2" sh -c "GH_TOKEN='$fs_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$fs_case.cross.out" 2>&1; then
+    echo "::error::'gh api user' in the second box succeeded with the value copied out of the demo box"
+    fs_fail
+  fi
+  echo "copied value in the second box: 'gh api user' failed"
+
+  # 6. `min box audit` for each box, by name (BEP-042, BEP-039).
+  for fs_step in "$fs_name:admit" "$fs_name2:cross_box"; do
+    if ! mnl box audit "${fs_step%%:*}" -o jsonl </dev/null \
+      >"$WORK/$fs_case.audit" 2>"$WORK/$fs_case.audit.err"; then
+      echo "::error::'min box audit ${fs_step%%:*}' failed"
+      cat "$WORK/$fs_case.audit.err" 2>/dev/null || true
+      fs_fail
+    fi
+    if ! fs_out="$(bep_slice_jsonl_check "$WORK/$fs_case.audit" "${fs_step#*:}")"; then
+      echo "::error::'min box audit ${fs_step%%:*}': $fs_out"
+      echo "--- min box audit ${fs_step%%:*} -o jsonl ---"; cat "$WORK/$fs_case.audit"
+      fs_fail
+    fi
+    echo "min box audit ${fs_step%%:*}: $fs_out"
+  done
+
+  fs_cleanup
+  rm -f "${WORK:?}/${fs_case:?}".*
+  echo "Box Egress Proxy first slice OK (spec, gh, clone and push of $fs_repo, a copied value refused on the host and in a second box, both boxes audited)"
+  echo "::endgroup::"
+}
+
+# A signing rotation under a running grant box (BEP-061, T52): one grant box
+# clones and pushes, `bep --rotate-signing` rotates the proxy's signing
+# certificate, and the same box clones and pushes again. The box is never
+# re-created: every step runs in the box id the activation printed, and the
+# case checks that the box is still listed under that id after the rotation.
+# `min box spec` prints the root CA fingerprint before and after the
+# rotation, and the two must match: a rotation changes the certificate below
+# the root, never the root the box trusts. The case needs the sign-in a
+# person made with `min auth login` and the private repository
+# E2E_BEP_PRIVATE_REPO, and records NOT RUN without them, as
+# bep_first_slice_end_to_end does. The clone meets the same known gap as
+# that case: no box ships a git credential helper until #2499 lands.
+proof_bep_signing_rotation_keeps_running_box_working() {
+  echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
+  local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep sr_ls
+  local sr_name=e2e-bep-signing-rotation
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock"
+  if [ -z "$sr_repo" ]; then
+    not_run "$sr_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$sr_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$sr_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$sr_case" || { echo "::endgroup::"; return 0; }
+
+  # The bep binary the VM host daemon starts: MINVMD_BEP_BIN, else the bep
+  # beside minvmd (crates/minvmd/src/cmd/run.rs, resolve_bep_binary).
+  sr_bep="${MINVMD_BEP_BIN:-}"
+  if [ -z "$sr_bep" ]; then
+    sr_bep="$(command -v minvmd 2>/dev/null || true)"
+    sr_bep="${sr_bep%/*}/bep"
+  fi
+  if [ ! -x "$sr_bep" ]; then
+    echo "::error::no bep binary at '$sr_bep': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+    fail
+  fi
+
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID=""
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    sr_cleanup
+    fail
+  }
+  # The root CA fingerprint from `min box spec` of the project ($1 = the
+  # round, for the error).
+  sr_root_fingerprint() {
+    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+      echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
+      cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r' \
+      | sed -n 's/^root CA  certificate \(SHA256:[0-9A-Fa-f:]*\)$/\1/p' | head -n1)"
+    if [ -z "$sr_spec" ]; then
+      echo "::error::'min box spec' of the grant project prints no root CA fingerprint $1 the rotation" >&2
+      return 1
+    fi
+    printf '%s\n' "$sr_spec"
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlrotate.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  sr_root_before="$(sr_root_fingerprint before)" || sr_fail
+  echo "root CA before the rotation: $sr_root_before"
+
+  # The grant box, headless: a sign-in prompt has no terminal to ask on.
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the grant box $sr_name failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+  echo "grant box: $SR_SID"
+
+  for sr_round in before after; do
+    if [ "$sr_round" = after ]; then
+      # The rotation, through the serving proxy's control socket.
+      if ! sr_out="$("$sr_bep" --rotate-signing --control "$sr_control" \
+        </dev/null 2>"$WORK/$sr_case.rotate.err")"; then
+        echo "::error::'bep --rotate-signing' failed"
+        cat "$WORK/$sr_case.rotate.err" 2>/dev/null || true
+        sr_fail
+      fi
+      if [[ "$sr_out" != "Signing certificate rotated from "* ]]; then
+        echo "::error::'bep --rotate-signing' did not report a rotation"
+        printf '%s\n' "$sr_out"
+        sr_fail
+      fi
+      echo "rotation: $sr_out"
+      # The same box, under the same id: the rotation re-created nothing.
+      # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit
+      # SIGPIPEs the pipeline under pipefail and fails a healthy box.
+      sr_ls="$(mnl ls </dev/null 2>/dev/null)"
+      sr_ls="${sr_ls//$'\r'/}"
+      if [[ "$sr_ls" != *"$SR_SID"* ]]; then
+        echo "::error::'min ls' does not list the grant box $SR_SID after the rotation"
+        printf '%s\n' "$sr_ls"
+        sr_fail
+      fi
+    fi
+    # Each step runs on its own, so a failure names the tool that failed. The
+    # prompt switch only keeps a refused git from waiting on a terminal: it
+    # gives git no credential.
+    sr_branch="e2e-bep-rotate-$sr_round-$(date +%s)-$$"
+    for sr_step in \
+      "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$sr_repo /tmp/bep-repo" \
+      "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$sr_branch" \
+      "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $sr_branch"; do
+      if ! mnl session exec "$SR_SID" sh -c "${sr_step#*:}" \
+        >"$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>&1; then
+        echo "::error::'git ${sr_step%%:*}' against $sr_repo failed in the grant box $sr_round the rotation"
+        cat "$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>/dev/null || true
+        sr_fail
+      fi
+      echo "git ${sr_step%%:*} $sr_round the rotation: OK"
+    done
+  done
+
+  sr_root_after="$(sr_root_fingerprint after)" || sr_fail
+  echo "root CA after the rotation: $sr_root_after"
+  if [ "$sr_root_after" != "$sr_root_before" ]; then
+    echo "::error::the root CA fingerprint changed across the signing rotation: $sr_root_before before, $sr_root_after after"
+    sr_fail
+  fi
+
+  sr_cleanup
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Box Egress Proxy signing rotation OK (the box $SR_SID cloned and pushed $sr_repo before and after the rotation, never re-created, root CA $sr_root_before unchanged)"
+  echo "::endgroup::"
+}
+
+# Logout proof (BEP-044): `min auth logout` deletes the sign-in item, and
+# every running box's next GitHub request is refused, while the boxes keep
+# running. Two boxes that declare a GitHub grant each answer `gh api user`
+# through the proxy. Then `min auth logout` runs, `min auth status` reports
+# no sign-in, and `gh api user` fails in both boxes. `min box audit` shows a
+# refusal marked `github_sign_in_required` for each box. The case signs this
+# machine out of GitHub, so it runs only with E2E_BEP_LOGOUT=1, and the
+# whole-lane run orders it after every other live proxy case. Sign in again
+# with `min auth login` after it. That a later sign-in revives none of the
+# refused references is proven by the unit test
+# sign_in_after_logout_revives_no_earlier_reference: a sign-in needs a
+# person at the device flow, and this script has none.
+proof_bep_logout_refuses_every_reference_at_next_request() {
+  echo "::group::min auth logout: every box's next GitHub request is refused"
+  local lo_case=bep_logout_refuses_every_reference_at_next_request
+  local lo_out lo_name lo_sid lo_sids="" lo_status
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$lo_case" "the case signs this machine out of GitHub: set E2E_BEP_LOGOUT=1 to run it, then run 'min auth login' again"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$lo_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: lo_cleanup reads them.
+  LO_SIDS=""
+  lo_cleanup() {
+    local c_sid
+    for c_sid in $LO_SIDS; do
+      mnl session destroy --force "$c_sid" >/dev/null 2>&1
+    done
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  lo_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    lo_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnllogout.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # Two grant boxes, headless. Each answers `gh api user` before the logout,
+  # so a refusal after it is the logout's.
+  for lo_name in e2e-bep-logout-first e2e-bep-logout-second; do
+    lo_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$lo_name" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$lo_case.$lo_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $lo_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$lo_out"
+      echo "--- stderr ---"; cat "$WORK/$lo_case.$lo_name.err" 2>/dev/null || true
+      lo_fail
+    }
+    lo_sid="$(printf '%s\n' "$lo_out" | tail -n1 | tr -d '\r')"
+    LO_SIDS="$LO_SIDS $lo_sid"
+    lo_sids="$lo_sids $lo_name:$lo_sid"
+    if ! mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.before" 2>&1; then
+      echo "::error::'gh api user' failed in the box $lo_name before the logout, so the case proves nothing"
+      cat "$WORK/$lo_case.$lo_name.before" 2>/dev/null || true
+      lo_fail
+    fi
+    echo "$lo_name before the logout: 'gh api user' answered"
+  done
+
+  # The logout. It succeeds whether or not GitHub confirms the revocation.
+  if ! lo_out="$(mnl auth logout </dev/null 2>"$WORK/$lo_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$lo_out"
+    echo "--- stderr ---"; cat "$WORK/$lo_case.logout.err" 2>/dev/null || true
+    lo_fail
+  fi
+  lo_out="$(printf '%s\n' "$lo_out" | tr -d '\r')"
+  if [ "$lo_out" != "Signed out of GitHub. Boxes created before now lose GitHub access at their next request." ]; then
+    echo "::error::'min auth logout' printed an unexpected line on stdout"
+    printf '%s\n' "$lo_out"
+    lo_fail
+  fi
+  if grep -qF "GitHub did not confirm the sign-out" "$WORK/$lo_case.logout.err"; then
+    echo "min auth logout: the sign-in is deleted, and GitHub did not confirm the revocation"
+  else
+    echo "min auth logout: the sign-in is deleted, and GitHub confirmed the revocation"
+  fi
+  lo_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$lo_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$lo_status"
+    lo_fail
+  fi
+
+  # The next request of each box is refused, and each box keeps running.
+  for lo_sid in $lo_sids; do
+    lo_name="${lo_sid%%:*}"
+    lo_sid="${lo_sid#*:}"
+    if mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.after" 2>&1; then
+      echo "::error::'gh api user' in the box $lo_name succeeded after 'min auth logout'"
+      cat "$WORK/$lo_case.$lo_name.after" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl session exec "$lo_sid" true >/dev/null 2>"$WORK/$lo_case.$lo_name.alive"; then
+      echo "::error::the box $lo_name does not run a command after the logout: the logout must keep the box's processes running"
+      cat "$WORK/$lo_case.$lo_name.alive" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl box audit "$lo_name" -o jsonl </dev/null \
+      >"$WORK/$lo_case.audit" 2>"$WORK/$lo_case.audit.err"; then
+      echo "::error::'min box audit $lo_name' failed"
+      cat "$WORK/$lo_case.audit.err" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! lo_out="$(bep_slice_jsonl_check "$WORK/$lo_case.audit" github_sign_in_required)"; then
+      echo "::error::'min box audit $lo_name': $lo_out"
+      echo "--- min box audit $lo_name -o jsonl ---"; cat "$WORK/$lo_case.audit"
+      lo_fail
+    fi
+    echo "$lo_name after the logout: 'gh api user' failed, the box still runs, and min box audit shows $lo_out"
+  done
+
+  lo_cleanup
+  rm -f "${WORK:?}/${lo_case:?}".*
+  echo "Logout proof OK (both boxes refused at their next request after 'min auth logout'). Run 'min auth login' to sign this machine in again."
+  echo "::endgroup::"
+}
+
+# DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
+# the gvproxy switch. A box on a credentialed lane with the default `dns`
+# steering and `quic443 = "block"` starts. Then the case stops the Box Egress
+# Proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
+# runs and it is down from the start) and, from inside the box:
+#   1. an A lookup of api.github.com, a steered name, must be answered
+#      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
+#   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
+#      answers (BEP-078, NET-136);
+#   3. a UDP datagram to port 443 must be rejected at once: the switch
+#      answers ICMP port unreachable, so socat reads "Connection refused"
+#      well inside its 5 s wait (BEP-018).
+# Legs 2 and 3 are hard assertions. Leg 1 is a KNOWN GAP while
+# https://github.com/gominimal/minimal/issues/2523 is open: no production
+# code wires the steering into the relay's DNS gate yet, so the lookup is
+# forwarded. When that issue lands, change its known_gap to a fail.
+# Admission refuses `dns` steering for a box with a broker secret on every
+# host today (no box-zone resolver, BEP-017), so the lane comes from
+# --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
+# (its `auto` blocks only with a credentialed secret).
+# Diagnostics: the pair restarts with the relay's switch and DNS gate records
+# at debug, so on a failure the `min bug` bundle's daemon-log tail carries the
+# SERVFAIL warnings and the rejected datagrams. On a pass, the case prints the
+# same two records out of a bundle it writes itself.
+proof_bep_dns_steering_fails_closed_end_to_end() {
+  echo "::group::DNS steering fails closed while the Box Egress Proxy is down"
+  local ds_case=bep_dns_steering_fails_closed_end_to_end
+  local ds_sid ds_out ds_ns ds_resolv ds_ans ds_rc ds_q ds_quic ds_ms
+  local ds_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  local ds_bundle ds_lines
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$ds_case" "no MINVMD_GVPROXY_BIN: the steered lookups and the UDP 443 rejection run on the VM host's switch, and this target has none"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # A fresh pair: without MINVMD_BEP_STUB (the stand-in is not the proxy) and
+  # with the switch's debug records, which the UDP 443 rejection writes. The
+  # guest daemon takes its filter from the RUST_LOG minvmd starts with.
+  unset MINVMD_BEP_STUB
+  BEP_LIVE_DAEMON=""
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! RUST_LOG="$RUST_LOG,minimald::net::switch=debug,minimald::net::dns_gate=debug" \
+    mnl ls >/dev/null 2>"$WORK/$ds_case.up.err"; then
+    echo "::error::the daemon did not start for $ds_case"
+    cat "$WORK/$ds_case.up.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: ds_cleanup reads it.
+  DS_SID=""
+  ds_cleanup() {
+    [ -n "$DS_SID" ] && mnl session destroy --force "$DS_SID" >/dev/null 2>&1
+    DS_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # The proxy is stopped: the next live case restarts the pair.
+    BEP_LIVE_DAEMON=""
+    return 0
+  }
+  ds_fail() {
+    ds_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlsteer.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  ds_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-dns-steering --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    </dev/null 2>"$WORK/$ds_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for the DNS steering box"
+    echo "--- stdout ---"; printf '%s\n' "$ds_out"
+    echo "--- stderr ---"; cat "$WORK/$ds_case.err" 2>/dev/null || true
+    ds_fail
+  }
+  DS_SID="$(printf '%s\n' "$ds_out" | tail -n1 | tr -d '\r')"
+  ds_sid="$DS_SID"
+  mnl session exec "$ds_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the DNS steering box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    ds_fail
+  }
+
+  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
+  # proxy stays down for the rest of the case.
+  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
+    for _ in $(seq 1 20); do
+      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
+      ds_fail
+    fi
+    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
+  else
+    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
+  fi
+
+  ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
+  ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$ds_ns" ]; then
+    echo "::error::the DNS steering box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$ds_resolv"
+    ds_fail
+  fi
+
+  # A raw query from inside the box, the way the NET-141 legs send one:
+  # built and parsed host-side with python3, carried as base64. Prints
+  # "rcode ancount" for a reply to the query's own id, or nothing.
+  ds_dns() { # $1 name, $2 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e32, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$ds_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$ds_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/$ds_case.dns.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  }
+
+  # Leg 1: the steered A lookup fails closed.
+  ds_ans="$(ds_dns api.github.com 1)"
+  echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
+  ds_a_gap=""
+  if [ "${ds_ans%% *}" = 2 ]; then
+    echo "steered A lookup: SERVFAIL while the proxy is down"
+  else
+    ds_a_gap=1
+    known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
+  fi
+
+  # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
+  for ds_q in AAAA:28 HTTPS:65 SVCB:64; do
+    ds_ans="$(ds_dns api.github.com "${ds_q#*:}")"
+    echo "${ds_q%%:*} api.github.com -> rcode and answers: ${ds_ans:-no reply}"
+    if [ "$ds_ans" != "0 0" ]; then
+      echo "::error::the ${ds_q%%:*} lookup of the steered name api.github.com was not answered NODATA (rcode 0, no answers): got '${ds_ans:-no reply}'"
+      cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+      ds_fail
+    fi
+  done
+
+  # Leg 3: UDP to port 443 is rejected at once. 192.0.2.1 is TEST-NET-1: the
+  # switch answers before any egress verdict, so nothing leaves the host.
+  # Without the rejection socat waits its full 5 s and exits 0.
+  # shellcheck disable=SC2016
+  ds_quic="$(mnl session exec "$ds_sid" \
+    's=$(date +%s%N); printf q | /usr/bin/socat -t 5 -T 5 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>&1 | tr -d '\r')" || true
+  ds_rc="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+  ds_ms="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+  echo "UDP 192.0.2.1:443 from the blocked box -> exit ${ds_rc:-?} after ${ds_ms:-?} ms"
+  if [ -z "$ds_rc" ] || [ "$ds_rc" = 0 ] || ! printf '%s\n' "$ds_quic" | grep -q 'Connection refused' \
+    || [ -z "$ds_ms" ] || [ "$ds_ms" -ge 2000 ]; then
+    echo "::error::UDP to port 443 from a box with quic443 = \"block\" was not rejected at once (expected 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$ds_quic"
+    ds_fail
+  fi
+
+  # The daemon's records of the run, from the bundle a person attaches to a
+  # report. A note only: the bundle carries a tail of the log.
+  ds_bundle="${WORK:?}/$ds_case.tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$ds_bundle" >/dev/null 2>&1; then
+    ds_lines="$(zstd -dc "$ds_bundle" 2>/dev/null | tar -xOf - 2>/dev/null \
+      | grep -a -e 'answered SERVFAIL for a steered name' -e 'rejected UDP to port 443' | tail -n4)"
+    echo "daemon records in the min bug bundle:"
+    printf '%s\n' "${ds_lines:-(none found)}"
+  else
+    echo "(min bug produced no bundle)"
+  fi
+  rm -f "${WORK:?}/${ds_case:?}".*
+
+  ds_cleanup
+  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
+  # the known gap, the steered A lookup did not fail closed.
+  if [ -n "$ds_a_gap" ]; then
+    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  else
+    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  fi
+  echo "::endgroup::"
+}
+
+# Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
+# is proxy_env starts on an own-address credentialed lane, and its
+# environment points at the Box Egress Proxy. The two cases share one box
+# start. The lane needs a switch, so a target without one records the case
+# as NOT RUN. The box declares no grant, so the case needs no sign-in and no
+# running proxy: it reads the variables, never a connection through them.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
+bep_proxy_env_box_env() {
+  local pe_case="$1" pe_sid pe_out
+  PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\nno_proxy = ["e2e-direct.example", "10.0.0.0/8"]\n'
+  } > "$PROXY_ENV_SEED_DIR/minimal.toml"
+  mkdir "$PROXY_ENV_SEED_DIR/.git"
+  pe_out="$(cd "$PROXY_ENV_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$pe_case" | tr '_' '-' | cut -c1-40)" \
+    --network own_ip --credentialed-upstream \
+    </dev/null 2>"$WORK/$pe_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    echo "--- stdout ---"; printf '%s\n' "$pe_out"
+    echo "--- stderr ---"; cat "$WORK/$pe_case.err" 2>/dev/null || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  }
+  pe_sid="$(printf '%s\n' "$pe_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$pe_sid" sh -c 'env' \
+    >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
+    echo "::error::'min session exec' in the proxy_env box failed"
+    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  fi
+  tr -d '\r' <"$WORK/$pe_case.env" >"$WORK/$pe_case.env.tmp" && mv "$WORK/$pe_case.env.tmp" "$WORK/$pe_case.env"
+  mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+  rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+}
+
+# The value of variable $2 in the env dump $1, or nothing.
+bep_env_value() {
+  sed -n "s/^$2=//p" "$1" | head -n1
+}
+
+proof_bep_proxy_env_and_no_proxy_are_set() {
+  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_https pe_http pe_no
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
+  pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
+  pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
+  pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
+  pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
+  # The proxy's address is the switch subnet's broadcast - 3, and its
+  # listener port is 8118 (boxes::core::egress::PROXY_LISTENER_PORT).
+  if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the proxy's address on the switch at port 8118"
+    fail
+  fi
+  if [ "$pe_http" != "$pe_https" ]; then
+    echo "::error::the proxy_env box's HTTP_PROXY is '${pe_http:-<unset>}', not its HTTPS_PROXY '$pe_https'"
+    fail
+  fi
+  if [ "$pe_no" != ".min.internal,host.min.internal,localhost,127.0.0.1,e2e-direct.example,10.0.0.0/8" ]; then
+    echo "::error::the proxy_env box's NO_PROXY is '${pe_no:-<unset>}', not the local zone, loopback and the seed's no_proxy entries"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: HTTPS_PROXY=HTTP_PROXY=$pe_https, NO_PROXY=$pe_no"
+  echo "::endgroup::"
+}
+
+proof_bep_proxy_env_sets_node_use_env_proxy() {
+  echo "::group::proxy_env box: NODE_USE_ENV_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_node
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
+  pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
+  pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
+  if [ "$pe_node" != "1" ]; then
+    echo "::error::the proxy_env box's NODE_USE_ENV_PROXY is '${pe_node:-<unset>}', not 1"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: NODE_USE_ENV_PROXY=1"
+  echo "::endgroup::"
+}
+
+# Trust-store proofs (BEP-011). A GitHub grant box gets the proxy's root in
+# its own CA bundle copy and in /etc/ssl/certs under its subject hash, and
+# the trust variables point at them. A box with no grant, from the same
+# packages, gets none of it. Both seeds add ca-certificates, so the grant
+# box's bundle holds the system roots beside the root.
+BEP_TRUST_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+BEP_TRUST_ROOT=/etc/ssl/certs/minimal-box-egress-proxy-root.pem
+
+# Records case $1 as NOT RUN and returns 1 when this target cannot start a
+# GitHub grant box: the same gates as the sealed-value proof.
+bep_trust_grant_gate() {
+  bep_live_gate "$1"
+}
+
+# Removes the files bep_trust_box_files left for case $1.
+bep_trust_clean() {
+  local tc_ext
+  for tc_ext in env root bundle links err exec.err; do
+    rm -f "${WORK:?}/${1:?}.$tc_ext"
+  done
+}
+
+# Starts a box from a seed with ca-certificates, copies its trust store out
+# and destroys it. $1: the case name. $2: "grant" for a box with a GitHub
+# grant, "plain" for a box with none. Leaves $WORK/$1.env (the box's trust
+# variables), $WORK/$1.root and $WORK/$1.bundle (the files, empty when
+# absent) and $WORK/$1.links (each hashed-directory link and its target).
+bep_trust_box_files() {
+  local tb_case="$1" tb_kind="$2" tb_seed tb_out tb_sid tb_file
+  local -a tb_egress
+  tb_seed="$(hook_mktemp /tmp/mnltrust.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["ca-certificates"]\n'
+    if [ "$tb_kind" = grant ]; then
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    fi
+  } > "$tb_seed/minimal.toml"
+  mkdir "$tb_seed/.git"
+  # Only the grant box declares the GitHub hosts its grant needs. A box with
+  # no grant declares no egress rules: a --network host_ip box on a VM host
+  # refuses hostname rules at the start, and that box needs none.
+  tb_egress=()
+  if [ "$tb_kind" = grant ]; then
+    tb_egress=(--allow-dns-hosts github.com --allow-dns-hosts api.github.com
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com)
+  fi
+  tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$tb_case" | tr '_' '-' | cut -c1-36)-$tb_kind" \
+    ${tb_egress[@]+"${tb_egress[@]}"} \
+    </dev/null 2>"$WORK/$tb_case.err")" || {
+    echo "::error::'min session activate' of the $tb_kind box for $tb_case failed"
+    echo "--- stdout ---"; printf '%s\n' "$tb_out"
+    echo "--- stderr ---"; cat "$WORK/$tb_case.err" 2>/dev/null || true
+    rm -rf "${tb_seed:?}"
+    fail
+  }
+  rm -rf "${tb_seed:?}"
+  tb_sid="$(printf '%s\n' "$tb_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$tb_sid" sh -c 'env' >"$WORK/$tb_case.env" 2>"$WORK/$tb_case.exec.err"; then
+    echo "::error::'min session exec' in the $tb_kind box for $tb_case failed"
+    cat "$WORK/$tb_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # The grant's sealed value is never kept: only the trust variables are.
+  grep -E '^(SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS)=' "$WORK/$tb_case.env" \
+    | tr -d '\r' >"$WORK/$tb_case.env.tmp" || true
+  mv "$WORK/$tb_case.env.tmp" "$WORK/$tb_case.env"
+  for tb_file in root:"$BEP_TRUST_ROOT" bundle:"$BEP_TRUST_BUNDLE"; do
+    mnl session exec "$tb_sid" sh -c "cat '${tb_file#*:}' 2>/dev/null || true" \
+      2>/dev/null | tr -d '\r' >"$WORK/$tb_case.${tb_file%%:*}" || true
+  done
+  # shellcheck disable=SC2016 # expanded inside the box
+  mnl session exec "$tb_sid" sh -c \
+    'for f in /etc/ssl/certs/*.[0-9]; do [ -L "$f" ] && printf "%s %s\n" "${f##*/}" "$(readlink "$f")"; done; true' \
+    2>/dev/null | tr -d '\r' >"$WORK/$tb_case.links" || true
+  mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+}
+
+# The number of certificates in the PEM file $1.
+bep_trust_cert_count() {
+  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null || true
+}
+
+proof_bep_root_ca_present_in_box_trust_store() {
+  echo "::group::GitHub grant box: the proxy's root in both trust-store forms (BEP-011)"
+  bep_trust_grant_gate bep_root_ca_present_in_box_trust_store || { echo "::endgroup::"; return 0; }
+  local tp_case=bep_root_ca_present_in_box_trust_store tp_hash tp_size tp_count
+  bep_trust_box_files "$tp_case" grant
+  if [ "$(bep_trust_cert_count "$WORK/$tp_case.root")" != 1 ]; then
+    echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if ! openssl x509 -noout -subject -in "$WORK/$tp_case.root" | grep -q 'Minimal Box Egress Proxy Root CA'; then
+    echo "::error::the certificate at $BEP_TRUST_ROOT in the grant box is not the proxy's root"
+    fail
+  fi
+  # The bundle is the system roots with the root appended.
+  tp_size="$(wc -c <"$WORK/$tp_case.root" | tr -d ' ')"
+  if ! tail -c "$tp_size" "$WORK/$tp_case.bundle" | cmp -s - "$WORK/$tp_case.root"; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE does not end with the proxy's root"
+    fail
+  fi
+  tp_count="$(bep_trust_cert_count "$WORK/$tp_case.bundle")"
+  if [ "${tp_count:-0}" -lt 2 ]; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE holds ${tp_count:-0} certificates, so the system roots are not beside the root"
+    fail
+  fi
+  # The hashed directory links the root under its subject hash.
+  tp_hash="$(openssl x509 -noout -subject_hash -in "$WORK/$tp_case.root")"
+  if ! grep -Eq "^$tp_hash\.[0-9] ${BEP_TRUST_ROOT##*/}\$" "$WORK/$tp_case.links"; then
+    echo "::error::the grant box's /etc/ssl/certs has no link $tp_hash.N to ${BEP_TRUST_ROOT##*/}"
+    echo "--- links ---"; cat "$WORK/$tp_case.links"
+    fail
+  fi
+  bep_trust_clean "$tp_case"
+  echo "grant box: the root is at $BEP_TRUST_ROOT, at the end of $BEP_TRUST_BUNDLE beside $((tp_count - 1)) system roots, and linked as $tp_hash"
+  echo "::endgroup::"
+}
+
+proof_bep_root_ca_absent_from_box_without_credentialed_upstream() {
+  echo "::group::box with no grant: no proxy root in its trust store (BEP-011)"
+  local ta_case=bep_root_ca_absent_from_box_without_credentialed_upstream ta_grant=""
+  # With a grant box from the same packages first, the plain box proves that
+  # the grant box's root did not reach the shared packages.
+  if bep_trust_grant_gate "${ta_case}_beside_a_grant_box"; then
+    bep_trust_box_files "${ta_case}_grant" grant
+    if [ "$(bep_trust_cert_count "$WORK/${ta_case}_grant.root")" != 1 ]; then
+      echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+      fail
+    fi
+    ta_grant="$WORK/${ta_case}_grant.root"
+  fi
+  bep_trust_box_files "$ta_case" plain
+  if [ -s "$WORK/$ta_case.root" ]; then
+    echo "::error::the box with no grant has a file at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if grep -q " ${BEP_TRUST_ROOT##*/}\$" "$WORK/$ta_case.links"; then
+    echo "::error::the box with no grant links ${BEP_TRUST_ROOT##*/} in /etc/ssl/certs"
+    fail
+  fi
+  if [ -n "$ta_grant" ] && grep -qFf <(grep -v -- '-----' "$ta_grant") "$WORK/$ta_case.bundle"; then
+    echo "::error::the $BEP_TRUST_BUNDLE of the box with no grant holds the grant box's root"
+    fail
+  fi
+  if [ -s "$WORK/$ta_case.env" ]; then
+    echo "::error::the box with no grant has trust variables set:"
+    cat "$WORK/$ta_case.env"
+    fail
+  fi
+  bep_trust_clean "$ta_case"
+  bep_trust_clean "${ta_case}_grant"
+  if [ -n "$ta_grant" ]; then
+    echo "box with no grant: no proxy root in its trust store, beside a grant box from the same packages"
+  else
+    echo "box with no grant: no proxy root in its trust store"
+  fi
+  echo "::endgroup::"
+}
+
+proof_bep_trust_env_points_at_bundle_and_root() {
+  echo "::group::GitHub grant box: SSL_CERT_FILE, REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS (BEP-011)"
+  bep_trust_grant_gate bep_trust_env_points_at_bundle_and_root || { echo "::endgroup::"; return 0; }
+  local te_case=bep_trust_env_points_at_bundle_and_root te_var te_want te_got
+  bep_trust_box_files "$te_case" grant
+  for te_var in SSL_CERT_FILE:"$BEP_TRUST_BUNDLE" REQUESTS_CA_BUNDLE:"$BEP_TRUST_BUNDLE" \
+    NODE_EXTRA_CA_CERTS:"$BEP_TRUST_ROOT"; do
+    te_want="${te_var#*:}"
+    te_got="$(bep_env_value "$WORK/$te_case.env" "${te_var%%:*}")"
+    if [ "$te_got" != "$te_want" ]; then
+      echo "::error::the grant box's ${te_var%%:*} is '${te_got:-<unset>}', not $te_want"
+      fail
+    fi
+  done
+  if [ "$(bep_trust_cert_count "$WORK/$te_case.root")" != 1 ] || [ ! -s "$WORK/$te_case.bundle" ]; then
+    echo "::error::the files the grant box's trust variables name are not in the box"
+    fail
+  fi
+  bep_trust_clean "$te_case"
+  echo "grant box: SSL_CERT_FILE=REQUESTS_CA_BUNDLE=$BEP_TRUST_BUNDLE, NODE_EXTRA_CA_CERTS=$BEP_TRUST_ROOT"
+  echo "::endgroup::"
+}
+
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -13042,6 +14442,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   # The filter the daemon this case autospawns will read its log at. The
   # lane runs the whole script under `warn,minimald::exec=info`, and the
@@ -13556,6 +14957,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
 
   local proxy_ip proxy_port host_alias lane_sid lane_ip sock sock_wait
@@ -13931,6 +15333,7 @@ proof_proxy_sees_boxes_by_address() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
   # One directive wider than cred_begin's: the pool's per-delivery record is
   # a DEBUG one, and the delivery assertions below read it, so widen the
@@ -22753,6 +24156,19 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
     proof_github_only_allowlist
+    proof_bep_second_box_needs_no_sign_in
+    proof_bep_box_env_holds_sealed_value_only
+    proof_bep_git_and_gh_against_private_repo
+    proof_bep_git_credential_helper_sends_header
+    proof_bep_first_slice_end_to_end
+    proof_bep_signing_rotation_keeps_running_box_working
+    proof_bep_proxy_env_and_no_proxy_are_set
+    proof_bep_proxy_env_sets_node_use_env_proxy
+    proof_bep_root_ca_present_in_box_trust_store
+    proof_bep_root_ca_absent_from_box_without_credentialed_upstream
+    proof_bep_trust_env_points_at_bundle_and_root
+    proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -22807,7 +24223,20 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | host_ip_deny_all \
-    | daemon_fetch_under_deny_all_host_address_box)
+    | daemon_fetch_under_deny_all_host_address_box \
+    | bep_second_box_needs_no_sign_in \
+    | bep_box_env_holds_sealed_value_only \
+    | bep_git_and_gh_against_private_repo \
+    | bep_git_credential_helper_sends_header \
+    | bep_first_slice_end_to_end \
+    | bep_signing_rotation_keeps_running_box_working \
+    | bep_proxy_env_and_no_proxy_are_set \
+    | bep_proxy_env_sets_node_use_env_proxy \
+    | bep_root_ca_present_in_box_trust_store \
+    | bep_root_ca_absent_from_box_without_credentialed_upstream \
+    | bep_trust_env_points_at_bundle_and_root \
+    | bep_logout_refuses_every_reference_at_next_request \
+    | bep_dns_steering_fails_closed_end_to_end)
     "proof_$1"
     ;;
   *)
@@ -22842,6 +24271,16 @@ case "${1:-}" in
     echo "         escape_reaches_only_declared_union"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
+    echo "         bep_second_box_needs_no_sign_in"
+    echo "         bep_box_env_holds_sealed_value_only"
+    echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
+    echo "         bep_first_slice_end_to_end"
+    echo "         bep_signing_rotation_keeps_running_box_working"
+    echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
+    echo "         bep_root_ca_present_in_box_trust_store"
+    echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
+    echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
+    echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;
 esac

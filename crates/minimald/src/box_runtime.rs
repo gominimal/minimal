@@ -269,6 +269,270 @@ pub(crate) struct HostParams {
     pub name_marker: Option<NameMarker>,
 }
 
+/// The classifier leaf a process injected into the box `box_id` joins
+/// (BEP-018): the `host_ip` cohort's blocked leaf while the cohort blocks
+/// UDP 443 and moves this box's processes, else `own`, the box's own leaf.
+/// `true` comes with the blocked leaf: the shim's pid must then be recorded
+/// under the box ([`report_spawned_pid`]).
+pub(crate) fn injection_leaf(
+    box_id: &str,
+    own: Option<sandbox::config::ClassifierLeaf>,
+    cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+) -> (Option<sandbox::config::ClassifierLeaf>, bool) {
+    let cohort = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match cohort.injection_leaf(box_id) {
+        Some(blocked) if own.is_some() => {
+            (Some(sandbox::config::ClassifierLeaf::new(blocked)), true)
+        }
+        _ => (own, false),
+    }
+}
+
+/// Arranges for `cmd`'s child to send its pid to `on_pid` once it is
+/// spawned. The child sends it from a `pre_exec` hook, before it execs,
+/// and a thread of its own reads it. A command dropped unspawned, or a
+/// spawn that fails before the hook, calls nothing.
+///
+/// # Errors
+///
+/// The socket pair or the reading thread could not be made.
+pub(crate) fn report_spawned_pid(
+    cmd: &mut std::process::Command,
+    on_pid: impl FnOnce(i32) + Send + 'static,
+) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Both ends are close-on-exec: the child's end closes when it execs,
+    // and a command dropped unspawned closes the parent's copy.
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    std::thread::Builder::new()
+        .name("injected-pid".to_string())
+        .spawn(move || {
+            let mut pid = [0_u8; 4];
+            if ours.read_exact(&mut pid).is_ok() {
+                on_pid(i32::from_ne_bytes(pid));
+            }
+        })?;
+    // SAFETY: the hook runs in the forked child before exec, and calls only
+    // getpid(2) and send(2), which are async-signal-safe. It allocates
+    // nothing and takes no lock. MSG_NOSIGNAL keeps a closed reader from
+    // raising SIGPIPE in the child, and a failed send is ignored.
+    unsafe {
+        cmd.pre_exec(move || {
+            let pid = libc::getpid().to_ne_bytes();
+            let _ = libc::send(
+                theirs.as_raw_fd(),
+                pid.as_ptr().cast(),
+                pid.len(),
+                libc::MSG_NOSIGNAL,
+            );
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+/// The sealed values a host launch of the box places in its environment
+/// (BEP-007): the ones its record holds, which the create copied from the
+/// request. [`place_launch_deliveries`] places them.
+pub(crate) fn launch_deliveries(record: &boxes::Record) -> Vec<boxes::SealedDelivery> {
+    record.sealed_deliveries.clone()
+}
+
+/// Places the grants' sealed values in a launch's connection layer
+/// (BEP-007), before the launcher builds the shell from `attach_env`, so the
+/// values exist before the shell's entrypoint runs. Returns the placed
+/// connection layer for the host to keep, layer onto what it runs in the box
+/// and republish for the shell to re-read. Logs once per variable, through
+/// [`place_sealed_deliveries`].
+pub(crate) fn place_launch_deliveries(
+    attach_env: &mut AttachEnv,
+    session_id: boxes::SessionId,
+    deliveries: &[boxes::SealedDelivery],
+) -> ConnectionEnv {
+    let mut connection_env = attach_env.connection_env();
+    place_sealed_deliveries(&mut connection_env, session_id, deliveries);
+    attach_env.connection = connection_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    connection_env
+}
+
+/// Places each grant's sealed value in the grant's environment variable
+/// (BEP-007), over any value `env` held there, so the variable holds the
+/// sealed value and nothing else. The daemon never holds a plaintext token:
+/// a sealed value is all a create request carries. Logs one debug line per
+/// variable, naming the box and the variable, never the value.
+pub(crate) fn place_sealed_deliveries(
+    env: &mut ConnectionEnv,
+    session_id: boxes::SessionId,
+    deliveries: &[boxes::SealedDelivery],
+) {
+    for delivery in deliveries {
+        // The create refuses such a name. A record that holds one anyway
+        // places nothing, because the name is written unquoted into the
+        // file the box's shell sources.
+        if boxes::core::primitives::StrictVarName::try_new(delivery.variable.as_str()).is_err() {
+            tracing::warn!(
+                session_id = %session_id,
+                variable = ?delivery.variable,
+                "skipped a grant's sealed value: its name is not a variable name"
+            );
+            continue;
+        }
+        env.insert(delivery.variable.clone(), delivery.sealed.clone());
+        tracing::debug!(
+            session_id = %session_id,
+            variable = %delivery.variable,
+            "placed a grant's sealed value in the box environment"
+        );
+    }
+}
+
+/// Where a box with the proxy's root (BEP-011) finds its CA bundle: the
+/// box's own copy of the system roots with the root appended. The bundle a
+/// package ships can be the package store's own file, so the launch writes
+/// a new file here and never writes into the one it replaces.
+pub(crate) const BOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// The hashed certificate directory the root is linked in under its
+/// subject hash (BEP-011), beside the system roots.
+pub(crate) const BOX_CA_DIR: &str = "/etc/ssl/certs";
+
+/// Where a box with the proxy's root (BEP-011) finds the root alone, for
+/// `NODE_EXTRA_CA_CERTS` and as the target of its hashed-directory link.
+pub(crate) const BOX_ROOT_CERTIFICATE: &str = "/etc/ssl/certs/minimal-box-egress-proxy-root.pem";
+
+/// The root certificate a host launch of the box adds to the box's trust
+/// store (BEP-011): the one its record holds, when the box declares a
+/// credentialed upstream and its steering is not `off`. `None` for every
+/// other box, so a box with no grant gets no root, whichever packages it
+/// shares with a box that has one.
+pub(crate) fn launch_root_certificate(record: &boxes::Record) -> Option<String> {
+    use boxes::core::bep::Steering;
+    let upstream = record.policy.credentialed_upstream.as_ref()?;
+    if upstream.bep.resolved_steering() == Steering::Off {
+        return None;
+    }
+    record.root_certificate.clone()
+}
+
+/// The trust variables a launch sets for a box whose trust store has the
+/// root (BEP-011): `NODE_EXTRA_CA_CERTS` at the root, and, when the box has
+/// its own CA bundle, `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at it. A box
+/// whose packages ship no bundle gets no bundle, so those two stay unset and
+/// a tool that reads them keeps its own public roots. Empty when the root is
+/// not injected.
+pub(crate) fn launch_trust_env(root_injected: bool, bundle: bool) -> Vec<(String, String)> {
+    if !root_injected {
+        return Vec::new();
+    }
+    let mut vars = Vec::new();
+    if bundle {
+        vars.push(("SSL_CERT_FILE".to_string(), BOX_CA_BUNDLE.to_string()));
+        vars.push(("REQUESTS_CA_BUNDLE".to_string(), BOX_CA_BUNDLE.to_string()));
+    }
+    vars.push((
+        "NODE_EXTRA_CA_CERTS".to_string(),
+        BOX_ROOT_CERTIFICATE.to_string(),
+    ));
+    vars
+}
+
+/// Adds the [`launch_trust_env`] variables to `vars`, the box's composed
+/// environment, below every variable it already holds: a box spec that
+/// sets one of them keeps its own value.
+pub(crate) fn layer_trust_env(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    root_injected: bool,
+    bundle: bool,
+) {
+    for (name, value) in launch_trust_env(root_injected, bundle) {
+        vars.entry(name).or_insert(value);
+    }
+}
+
+/// The `NO_PROXY` entries every box whose environment points at the proxy
+/// carries (BEP-012), ahead of the box's own `[network.bep] no_proxy`
+/// entries: the local zone and loopback, so in-box and peer traffic never
+/// goes through the proxy.
+const NO_PROXY_DEFAULTS: [&str; 4] = [
+    ".min.internal",
+    "host.min.internal",
+    "localhost",
+    "127.0.0.1",
+];
+
+/// The proxy variables a launch of the box sets (BEP-012), in a fixed order:
+/// `HTTPS_PROXY` and `HTTP_PROXY` at the Box Egress Proxy's listener on
+/// `subnet`, `NO_PROXY`, and `NODE_USE_ENV_PROXY=1`, which Node's built-in
+/// `fetch` needs before it reads the other three.
+///
+/// Empty unless the box's steering is `proxy_env` or `both`, or its
+/// `[network.bep] proxy_env` is true. Also empty when the box declares no
+/// credentialed upstream, or its network mode puts the lane out of effect:
+/// such a box cannot reach the proxy's address, so the variables would send
+/// all of its HTTP traffic to an address that drops it.
+pub(crate) fn launch_proxy_env(
+    record: &boxes::Record,
+    subnet: switch::SwitchSubnet,
+) -> Vec<(String, String)> {
+    use boxes::core::bep::Steering;
+    let Some(upstream) = record.policy.credentialed_upstream.as_ref() else {
+        return Vec::new();
+    };
+    let bep = &upstream.bep;
+    let steered =
+        matches!(bep.resolved_steering(), Steering::ProxyEnv | Steering::Both) || bep.proxy_env;
+    if !steered || !boxes::CredentialedUpstream::in_effect(record.network) {
+        return Vec::new();
+    }
+    let proxy = format!(
+        "http://{}:{}",
+        subnet.box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT
+    );
+    let no_proxy = NO_PROXY_DEFAULTS
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .chain(bep.no_proxy.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        ("HTTPS_PROXY".to_string(), proxy.clone()),
+        ("HTTP_PROXY".to_string(), proxy),
+        ("NO_PROXY".to_string(), no_proxy),
+        ("NODE_USE_ENV_PROXY".to_string(), "1".to_string()),
+    ]
+}
+
+/// Places the proxy variables (BEP-012) in a launch's connection layer, over
+/// any value the layer held there, so the shell's launch environment and
+/// everything the host runs in the box carry them. Call it before
+/// [`place_launch_deliveries`], which keeps the layer it reads. Logs one
+/// debug line for the box, naming the variables set.
+pub(crate) fn place_launch_proxy_env(
+    attach_env: &mut AttachEnv,
+    session_id: boxes::SessionId,
+    vars: &[(String, String)],
+) {
+    if vars.is_empty() {
+        return;
+    }
+    for (name, value) in vars {
+        attach_env.connection.retain(|(k, _)| k != name);
+        attach_env.connection.push((name.clone(), value.clone()));
+    }
+    let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+    tracing::debug!(
+        session_id = %session_id,
+        variables = %names.join(","),
+        "set the proxy variables in the box environment"
+    );
+}
+
 /// The host's half of the name lifecycle (NET-128): the registry and the
 /// stable session id, so the host can mark its box's name running when it
 /// starts and stopped when it exits. Held by [`HostParams`] and copied into
@@ -377,8 +641,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             .with_env(vars);
         // NET-079: the box's leaf, so the injected process joins it in the
         // shim before it joins the namespaces — the only place the join can
-        // happen from (see [`Injection::with_classifier_leaf`]).
-        let injection = match self.leaf.clone() {
+        // happen from (see [`Injection::with_classifier_leaf`]). BEP-018:
+        // while the `host_ip` cohort blocks UDP 443, the cohort's blocked
+        // leaf instead, so an exec or a hook cannot escape the block.
+        let box_id = self.session_id.to_string();
+        let (leaf, adopt) = injection_leaf(
+            &box_id,
+            self.leaf.clone(),
+            crate::net::classifier::cohort_quic443(),
+        );
+        let injection = match leaf {
             Some(leaf) => injection.with_classifier_leaf(leaf),
             None => injection,
         };
@@ -391,7 +663,25 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         } else {
             injection
         };
-        injection.command()
+        let mut command = injection.command()?;
+        // BEP-018: the shim in the blocked leaf is recorded under this box,
+        // so it and the program it forks go home when the block lifts.
+        if adopt
+            && let Err(error) = report_spawned_pid(&mut command, move |pid| {
+                crate::net::classifier::cohort_quic443()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .adopt_injected(&box_id, pid, &crate::net::classifier::KernelMoves);
+            })
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                %error,
+                "cannot record a process injected under the host-address cohort's UDP 443 \
+                 block; it stays blocked when the block lifts"
+            );
+        }
+        Ok(command)
     }
 
     /// Under test, build a plain host-side command instead of injecting into
@@ -625,7 +915,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let master = {
             set_nonblocking(master.as_raw_fd())?;
             let file = unsafe { std::fs::File::from_raw_fd(master.into_raw_fd()) };
-            AsyncFd::new(file)?
+            // SAFETY: the `AsyncFd` owns `file` for its whole life, and nothing
+            // reaches the `File` through it to close or replace its fd, so the
+            // fd stays open and names the same PTY master until it is dropped.
+            unsafe { AsyncFd::register(file) }?
         };
 
         let mut host = Host {
@@ -1565,3 +1858,220 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
 
 #[cfg(test)]
 mod tests;
+
+// BEP-012: which boxes get the proxy variables, and what each one holds.
+#[cfg(test)]
+mod proxy_env_tests {
+    use super::*;
+    use boxes::core::bep::{BepSettings, Steering};
+
+    fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
+        boxes::Record {
+            id: boxes::SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network,
+            policy: boxes::BoxPolicy {
+                credentialed_upstream: bep.map(|bep| boxes::CredentialedUpstream {
+                    bep,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: boxes::BoxState::default(),
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: None,
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            ends_with_run: false,
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    fn steering(steering: Steering) -> BepSettings {
+        BepSettings {
+            steering: Some(steering),
+            ..BepSettings::default()
+        }
+    }
+
+    fn get<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        vars.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn proxy_env_and_no_proxy_are_set() {
+        let bep = BepSettings {
+            no_proxy: vec!["example.internal".to_string(), "10.0.0.0/8".to_string()],
+            ..steering(Steering::ProxyEnv)
+        };
+        let vars = launch_proxy_env(
+            &record(NetworkMode::OwnIp, Some(bep)),
+            switch::DEFAULT_SUBNET,
+        );
+        assert_eq!(
+            get(&vars, "HTTPS_PROXY"),
+            Some("http://100.64.255.252:8118")
+        );
+        assert_eq!(get(&vars, "HTTP_PROXY"), Some("http://100.64.255.252:8118"));
+        assert_eq!(
+            get(&vars, "NO_PROXY"),
+            Some(".min.internal,host.min.internal,localhost,127.0.0.1,example.internal,10.0.0.0/8")
+        );
+        assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"));
+        assert_eq!(vars.len(), 4, "{vars:?}");
+    }
+
+    #[test]
+    fn proxy_env_follows_steering_and_the_proxy_env_setting() {
+        for bep in [
+            steering(Steering::ProxyEnv),
+            steering(Steering::Both),
+            BepSettings {
+                proxy_env: true,
+                ..steering(Steering::Dns)
+            },
+        ] {
+            let vars = launch_proxy_env(
+                &record(NetworkMode::OwnIp, Some(bep.clone())),
+                switch::DEFAULT_SUBNET,
+            );
+            assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"), "{bep:?}");
+        }
+        for bep in [
+            BepSettings::default(),
+            steering(Steering::Dns),
+            steering(Steering::Off),
+        ] {
+            let vars = launch_proxy_env(
+                &record(NetworkMode::OwnIp, Some(bep.clone())),
+                switch::DEFAULT_SUBNET,
+            );
+            assert!(vars.is_empty(), "{bep:?}: {vars:?}");
+        }
+        // No credentialed upstream, or a network mode with no lane.
+        assert!(
+            launch_proxy_env(&record(NetworkMode::OwnIp, None), switch::DEFAULT_SUBNET).is_empty()
+        );
+        assert!(
+            launch_proxy_env(
+                &record(NetworkMode::HostNet, Some(steering(Steering::ProxyEnv))),
+                switch::DEFAULT_SUBNET,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn proxy_env_reaches_the_connection_layer_over_an_old_value() {
+        let mut attach_env = AttachEnv {
+            inherited: vec![],
+            connection: vec![
+                ("TERM".to_string(), "xterm-256color".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://elsewhere:3128".to_string(),
+                ),
+            ],
+        };
+        let vars = launch_proxy_env(
+            &record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv))),
+            switch::DEFAULT_SUBNET,
+        );
+        place_launch_proxy_env(&mut attach_env, boxes::SessionId::nil(), &vars);
+        let kept = place_launch_deliveries(&mut attach_env, boxes::SessionId::nil(), &[]);
+        assert_eq!(
+            kept.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://100.64.255.252:8118")
+        );
+        assert_eq!(
+            kept.get("NODE_USE_ENV_PROXY").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(kept.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(kept.len(), 5, "{kept:?}");
+    }
+}
+
+#[cfg(test)]
+mod quic443_injection_tests {
+    use super::{injection_leaf, report_spawned_pid};
+    use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
+    use sandbox::config::ClassifierLeaf;
+
+    /// BEP-018, arch C1: an exec or a hook injected into a member while the
+    /// cohort blocks gets the blocked leaf, and its shim's pid comes back
+    /// for the record that sends it home when the block lifts.
+    #[test]
+    fn host_ip_cohort_join_block_leave_drives_the_rule_for_injected_processes() {
+        let tree = tempfile::tempdir().unwrap();
+        let blocked = quic443_blocked_leaf(tree.path());
+        std::fs::create_dir_all(&blocked).unwrap();
+        let own = ClassifierLeaf::new(tree.path().join("plain"));
+        let moves = StandinMoves::default();
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        {
+            let mut guard = cohort.lock().unwrap();
+            guard.learn_blocked_leaf(blocked.clone());
+            guard
+                .admit("plain", Some(own.dir().to_path_buf()), false, &moves)
+                .unwrap();
+        }
+
+        let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+        assert_eq!(leaf.as_ref().map(ClassifierLeaf::dir), Some(own.dir()));
+        assert!(
+            !adopt,
+            "an unblocked cohort injects into the box's own leaf"
+        );
+
+        cohort
+            .lock()
+            .unwrap()
+            .admit("grant", None, true, &moves)
+            .unwrap();
+        let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+        assert_eq!(
+            leaf.as_ref().map(ClassifierLeaf::dir),
+            Some(blocked.as_path())
+        );
+        assert!(adopt, "the shim in the blocked leaf is recorded");
+        let (leaf, adopt) = injection_leaf("plain", None, &cohort);
+        assert!(leaf.is_none() && !adopt, "a box with no leaf gets none");
+
+        // The child's own pid comes back from its pre-exec hook.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut cmd = std::process::Command::new("true");
+        report_spawned_pid(&mut cmd, move |pid| {
+            let _ = tx.send(pid);
+        })
+        .unwrap();
+        let mut child = cmd.spawn().unwrap();
+        let reported = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the child reports its pid");
+        assert_eq!(u32::try_from(reported).unwrap(), child.id());
+        assert!(child.wait().unwrap().success());
+
+        // A command dropped unspawned reports nothing, and its thread ends.
+        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        let mut cmd = std::process::Command::new("true");
+        report_spawned_pid(&mut cmd, move |pid| {
+            let _ = tx.send(pid);
+        })
+        .unwrap();
+        drop(cmd);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+}

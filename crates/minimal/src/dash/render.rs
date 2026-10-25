@@ -1049,6 +1049,8 @@ mod tests {
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: std::collections::BTreeMap::new(),
         };
         let mut model = Model::new(Utc::now());
@@ -1095,6 +1097,7 @@ mod tests {
                     }),
                     ingress: None,
                     credentialed_upstream: None,
+                    quic443: None,
                 },
             )
         };
@@ -1121,6 +1124,7 @@ mod tests {
             egress: Some(boxes::EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            quic443: None,
         };
         let unlaned = boxes::BoxPolicy {
             credentialed_upstream: None,

@@ -281,6 +281,18 @@ pub enum Attributed {
     Cohort,
 }
 
+impl Attributed {
+    /// The audit record's marker for this attribution, or `None` when the
+    /// source is the named box's own address (BEP-028).
+    #[must_use]
+    pub fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::OwnBox => None,
+            Self::Cohort => Some("cohort_attributed"),
+        }
+    }
+}
+
 /// The check that refused a redemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Check {
@@ -356,6 +368,34 @@ pub enum Decision {
     },
     /// The first check that failed.
     Refuse(Check),
+}
+
+impl Decision {
+    /// The audit record's marker for this decision: the failed check's
+    /// marker for a refusal, and the attribution's marker for an admission.
+    /// An admission from the named box's own address carries no marker.
+    #[must_use]
+    pub fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::Admit { attributed, .. } => attributed.marker(),
+            Self::Refuse(check) => Some(check.marker()),
+        }
+    }
+
+    /// Whether this decision admits a `host_ip` sender for another live
+    /// `host_ip` box of this host (BEP-028). This is the cohort flag for the
+    /// connection span: the forwarder records it as `cohort_attributed` on
+    /// the `box_connection` span.
+    #[must_use]
+    pub fn cohort_attributed(self) -> bool {
+        matches!(
+            self,
+            Self::Admit {
+                attributed: Attributed::Cohort,
+                ..
+            }
+        )
+    }
 }
 
 /// Decides one redemption. Pure: the result depends only on `redemption`.
@@ -1363,6 +1403,69 @@ mod tests {
                 breadth: Breadth::Full,
             })
         );
+    }
+
+    /// BEP-028: a `host_ip` sender that presents a value naming another
+    /// live `host_ip` box of this host is admitted once the remaining checks
+    /// pass. The admission is attributed to the cohort, and its audit marker
+    /// is `cohort_attributed`. The same value from the `own_ip` address of
+    /// another box, or with the named box outside the cohort, is refused as
+    /// `cross_box`.
+    #[test]
+    fn host_ip_redemption_is_cohort_attributed() {
+        const NAMED: u8 = 7;
+        let cohort = Redemption {
+            attribution: Attribution::HostIpCohort,
+            named_box_in_cohort: true,
+            ..own(NAMED)
+        };
+        let decision = decide(&cohort);
+        assert_eq!(
+            decision,
+            Decision::Admit {
+                attributed: Attributed::Cohort,
+                mode: Mode::User,
+                breadth: Breadth::Full,
+            }
+        );
+        assert_eq!(decision.marker(), Some("cohort_attributed"));
+        assert!(decision.cohort_attributed());
+
+        // The named box's own address is no cohort redemption.
+        let own_box = decide(&own(NAMED));
+        assert_eq!(own_box.marker(), None);
+        assert!(!own_box.cohort_attributed());
+
+        // The `own_ip` address of another box is not the named box.
+        let other_box = decide(&Redemption {
+            attribution: Attribution::OwnIp(NAMED + 1),
+            ..own(NAMED)
+        });
+        assert_eq!(other_box, Decision::Refuse(Check::CrossBox));
+        assert_eq!(other_box.marker(), Some("cross_box"));
+        assert!(!other_box.cohort_attributed());
+
+        // The named box is not a live `host_ip` box of this host.
+        let outside = decide(&Redemption {
+            named_box_in_cohort: false,
+            ..cohort.clone()
+        });
+        assert_eq!(outside, Decision::Refuse(Check::CrossBox));
+        assert_eq!(outside.marker(), Some("cross_box"));
+        assert!(!outside.cohort_attributed());
+
+        // The remaining checks still bind a cohort sender.
+        let expired = decide(&Redemption {
+            now: 2_000,
+            ..cohort.clone()
+        });
+        assert_eq!(expired, Decision::Refuse(Check::Expired));
+        let revoked = decide(&Redemption {
+            revoked: vec![NAMED],
+            ..cohort
+        });
+        assert_eq!(revoked, Decision::Refuse(Check::Revoked));
+        assert!(!revoked.cohort_attributed());
     }
 
     /// An unsupported header is not a value sealed to another key, so the

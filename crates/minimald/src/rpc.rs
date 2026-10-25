@@ -260,18 +260,30 @@ async fn serve_get_session_record(
     GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
-            Ok(GetSessionRecordResponse {
-                daemon_version: Some(OWN_VERSION.to_string()),
-                record: mngr
-                    .get_record(match req {
-                        GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
-                        GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
-                    })
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?,
-            })
+            let record = mngr
+                .get_record(match req {
+                    GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
+                    GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
+                })
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            Ok(session_record_response(record))
         })
         .await
+}
+
+/// The [`GetSessionRecord`] reply for a stored record. The reply never
+/// carries the box's sealed values (BEP-007): only the daemon's own launch
+/// reads them, so a daemon client does not read another box's values. The
+/// store keeps them.
+pub(crate) fn session_record_response(record: Option<boxes::Record>) -> GetSessionRecordResponse {
+    GetSessionRecordResponse {
+        daemon_version: Some(OWN_VERSION.to_string()),
+        record: record.map(|mut record| {
+            record.sealed_deliveries.clear();
+            record
+        }),
+    }
 }
 
 /// Stand-in for `session_name` on the lifecycle records when the session
@@ -1206,14 +1218,33 @@ async fn serve_destroy_session(
                 .ok()
                 .flatten()
                 .and_then(|record| record.name);
-            match mngr.delete_session(req.id).await {
-                Ok(hook_failures) => {
+            let outcome = if req.only_if_unfinalized {
+                mngr.delete_session_if_unfinalized(req.id).await
+            } else {
+                mngr.delete_session(req.id).await.map(Some)
+            };
+            match outcome {
+                Ok(Some(hook_failures)) => {
                     tracing::info!(
                         session_id = %req.id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session destroyed"
                     );
-                    Ok(Errorable::Ok(DestroySessionResponse { hook_failures }))
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures,
+                        kept: false,
+                    }))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        "kept the session a cleanup destroy was sent for: it finished activating"
+                    );
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures: Vec::new(),
+                        kept: true,
+                    }))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -2871,7 +2902,13 @@ mod trace_tests {
             .unwrap()
             .id;
         client
-            .call_with_env::<DestroySession>(&env(), &DestroySessionRequest { id })
+            .call_with_env::<DestroySession>(
+                &env(),
+                &DestroySessionRequest {
+                    id,
+                    only_if_unfinalized: false,
+                },
+            )
             .await
             .unwrap();
 

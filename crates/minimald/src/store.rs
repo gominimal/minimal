@@ -443,6 +443,8 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             // No run ever minted these records, so none ends with one.
             ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
             attrs: Default::default(),
         }
     }

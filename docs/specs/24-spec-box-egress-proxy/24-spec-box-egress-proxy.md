@@ -225,10 +225,11 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p boxes spec_trust_env_shadows_platform_with_warning
 
-- **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
+- **BEP-012** WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
-  - WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
+  <!-- the lane gate: a box with no credentialed upstream in effect cannot reach the proxy's address (networking §7.1), so a proxy variable there points at nothing -->
+  - WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_proxy_env_sets_node_use_env_proxy
     <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md; Node reads the variable from v22.21.0 on the 22.x line and from v24.0.0, and an older Node ignores it: under `dns` or `both` steering the box resolver still sends its credentialed names to the proxy, and under `proxy_env` alone it connects directly and the upstream refuses the unsubstituted handle, so a box that runs an older Node client uses `both` -->
@@ -281,6 +282,15 @@ Steering and the interception CA
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
   <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL carry from creation a git credential helper that answers `git credential fill` with the sealed value as the password for each host in the GitHub module's host set, and for no other host.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    verify: ./scripts/session-e2e.sh bep_git_credential_helper_sends_header
+    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper logs one line per answer naming the host, never the value -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL make the shipped git credential helper git's sole credential helper for each host in the GitHub module's host set, so that a `store` or `cache` helper that the box configures does not run for those hosts.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    <!-- Gatehouse §6.4 (line 718): the helper is the sole helper, with `store` and `cache` disabled; the launch sets the helper's entries at command scope (`GIT_CONFIG_COUNT`), which git reads after `~/.gitconfig` and the repository configuration, as an empty `helper` that clears the list and then the shipped helper; the host set is `bep::module::GITHUB`'s (Gatehouse §6.10 line 851); no git configuration file in the box is changed; the test puts a `store` helper in `~/.gitconfig` and in a repository configuration, and `git credential fill` and `git credential approve` for each grant host write nothing to `~/.git-credentials` -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
