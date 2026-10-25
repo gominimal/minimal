@@ -96,8 +96,7 @@ pub fn is_zone_name(name: &str) -> bool {
 /// A new state is *down*. A steered name fails closed until the listener
 /// is reported live, so no lookup answered before the first report can
 /// fall back to real DNS.
-// The relay's gate construction does not hand a state to the DNS gate yet,
-// so outside the tests nothing builds one.
+// Interim until https://github.com/gominimal/minimal/issues/2523: no production code builds a state yet. Remove the allow when BoxGate::for_session passes one to the gate.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProxyListenerState {

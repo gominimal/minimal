@@ -498,8 +498,9 @@ impl DnsGate {
     /// never forwarded: an A lookup gets `proxy` while the listener is live
     /// and SERVFAIL while it is down, and every other record type gets
     /// NODATA.
-    // The relay's gate construction (`BoxGate::for_session`) does not call
-    // this yet, so outside the tests it has no caller.
+    // Interim until https://github.com/gominimal/minimal/issues/2523: no
+    // production code calls this yet. Remove the allow when
+    // BoxGate::for_session calls it with a shared ProxyListenerState.
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn with_steering(
@@ -575,7 +576,9 @@ impl DnsGate {
     /// zone suffix not in exact lowercase — is answered NXDOMAIN (NET-006).
     /// Then a query is answered NODATA when any question is an AAAA, HTTPS
     /// or SVCB (NET-136), or a zone name of any type but A (NET-006), since
-    /// the switch answers only a zone A itself.
+    /// the switch answers only a zone A itself. A query that holds a steered
+    /// A question skips that NODATA rule and goes to the steered rule
+    /// (BEP-062), so its A question is never answered NODATA.
     ///
     /// `None` is also the answer for anything that does not parse as a
     /// standard query: forwarding stays the default on every failure, so a
@@ -610,17 +613,29 @@ impl DnsGate {
             return None;
         }
         if let Some((question, rcode)) = self.decide(&query) {
-            let name = normalized(&question.name().to_lowercase().to_string());
-            let rtype = question.query_type();
-            return self.answer(query, rcode, &name, rtype);
+            // A steered A question outranks the NODATA rule (BEP-062): the
+            // query goes to the steered rule, so the A fails closed while the
+            // proxy is down. REFUSED and NXDOMAIN still come first.
+            let steered_a = rcode == ResponseCode::NoError
+                && query
+                    .queries
+                    .iter()
+                    .any(|q| q.query_type() == RecordType::A && self.steers(q));
+            if !steered_a {
+                let name = normalized(&question.name().to_lowercase().to_string());
+                let rtype = question.query_type();
+                return self.answer(query, rcode, &name, rtype);
+            }
         }
         self.answer_steered(query)
     }
 
     /// The reply for a query that asks for a steered name (BEP-062), or
     /// `None` when no question in it does. Read after [`Self::decide`], so
-    /// its REFUSED, NXDOMAIN and NODATA rules come first: an AAAA, HTTPS or
-    /// SVCB question of a steered name is answered NODATA there (BEP-078).
+    /// its REFUSED and NXDOMAIN rules come first. Its NODATA rule also comes
+    /// first, except for a query that holds a steered A question: a query of
+    /// only AAAA, HTTPS or SVCB questions of steered names is answered
+    /// NODATA there (BEP-078).
     ///
     /// A steered query is never forwarded. While the proxy's listener is
     /// down it is answered SERVFAIL, and a rate-limited warning names the
@@ -3697,6 +3712,38 @@ pub(crate) mod tests {
         assert!(listener.set_live(false));
         let reply = steered_reply(&gate, "github.com.", RecordType::A).expect("answered here");
         assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        // A steered A question beside an AAAA, HTTPS or SVCB question is
+        // SERVFAIL while the proxy is down, never NODATA. While the proxy is
+        // live, the A question gets the proxy's address.
+        for other in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+            let mut query = Message::query();
+            query.add_query(Query::query(
+                Name::from_utf8("github.com.").unwrap(),
+                RecordType::A,
+            ));
+            query.add_query(Query::query(Name::from_utf8("github.com.").unwrap(), other));
+            let bytes = query.to_vec().unwrap();
+            for live in [false, true] {
+                listener.set_live(live);
+                let reply = gate
+                    .intercept_query(&SocketAddrV4::new(RESOLVER, 53), &bytes)
+                    .expect("a mixed-type steered query is answered at the gate");
+                let reply = Message::from_vec(&reply).unwrap();
+                if live {
+                    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                    assert_eq!(reply.answers.len(), 1, "{other:?}: only the A is answered");
+                } else {
+                    assert_eq!(
+                        reply.metadata.response_code,
+                        ResponseCode::ServFail,
+                        "{other:?}: the steered A fails closed"
+                    );
+                    assert!(reply.answers.is_empty());
+                }
+            }
+        }
+        listener.set_live(false);
 
         // A box whose steering does not use DNS is not steered here.
         for steering in [
