@@ -1406,10 +1406,11 @@ pub struct Record {
     pub root_certificate: Option<String>,
 
     /// The Box Type this box was created as (BOX-001): the type the
-    /// creating verb names, [`SESSION_BOX_TYPE`] for every box
-    /// `min session activate` creates. Daemon-owned: the create stamps it
-    /// and no client field carries it. `None` for a record that predates
-    /// the field.
+    /// creating verb names: [`SESSION_BOX_TYPE`] for every box
+    /// `min session activate` creates, and [`TASK_BOX_TYPE`] for every box
+    /// `min task run` creates. Daemon-owned: the create stamps it from
+    /// the request's creating verb, and no client field names the type.
+    /// `None` for a record that predates the field.
     #[serde(default)]
     pub box_type: Option<String>,
 
@@ -1435,6 +1436,9 @@ pub struct Record {
 
 /// The Box Type of a box `min session activate` creates (BOX-001).
 pub const SESSION_BOX_TYPE: &str = "session";
+
+/// The Box Type of a box `min task run` creates (BOX-001).
+pub const TASK_BOX_TYPE: &str = "task";
 
 impl Record {
     /// [`Record::validate_policy`] plus the checks a record must pass only

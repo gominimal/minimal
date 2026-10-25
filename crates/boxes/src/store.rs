@@ -859,9 +859,12 @@ impl DiskLoader {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidInput` for the nil id or an invalid name,
-    /// `AlreadyExists` when another session holds the name, and an I/O
-    /// error if the session directory, record, or index cannot be written.
+    /// Returns `InvalidInput` for the nil id or an invalid name, `Other`
+    /// when the index already holds the id, `AlreadyExists` when another
+    /// session holds the name, and an I/O error if the session directory,
+    /// record, or index cannot be written. A held id is never
+    /// `AlreadyExists`: a caller reads that kind as a name collision and
+    /// retries under another name.
     ///
     /// # Panics
     ///
@@ -873,6 +876,18 @@ impl DiskLoader {
                 std::io::ErrorKind::InvalidInput,
                 "a box record cannot be filed under the nil id",
             ));
+        }
+        // BOX-001: an id names one box. A handed id that the index already
+        // holds fails closed here, before anything is written.
+        if self.index.short_by_id(&record.id).is_some() {
+            tracing::warn!(
+                box_id = %record.id,
+                "refused to file a box record: the index already holds its id"
+            );
+            return Err(std::io::Error::other(format!(
+                "the box id {} is already in use by another box",
+                record.id
+            )));
         }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
@@ -1262,6 +1277,25 @@ mod tests {
                 .into_iter()
                 .collect(),
         }
+    }
+
+    /// BOX-001: `create_with_id` refuses an id the index already holds,
+    /// with a kind that is not `AlreadyExists`, and writes nothing.
+    #[test]
+    fn create_with_id_refuses_an_id_the_index_holds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let held = loader.create(sample_record()).unwrap();
+
+        let mut again = sample_record();
+        again.id = held.session_id;
+        again.name = Some("another-name".to_string());
+        let err = loader.create_with_id(again).unwrap_err();
+
+        assert_ne!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.keys().count(), 1, "nothing new is filed");
+        assert_eq!(loader.find_by_name("another-name").unwrap(), None);
+        assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
     }
 
     #[test]
