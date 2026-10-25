@@ -4755,3 +4755,76 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         "the random fields are not a counter, got {tails:08x?}"
     );
 }
+
+/// BEP-070: a minted box id that a retained record already names refuses
+/// the creation. The host's half — the registry refuses the colliding mint
+/// before it spends an address — is `minvmd`'s `colliding_box_id_refused`.
+/// A real mint does not collide, and no public door fixes the id the host
+/// mints. So this test stands in for the host on the control socket and
+/// answers the CLI's registration with the exact refusal the host sends for
+/// a collision. The CLI must refuse the creation: the activation fails with
+/// the refusal, which names the colliding id, and no box id comes back.
+#[tokio::test]
+async fn colliding_box_id_refuses_creation() {
+    use minimal_client::box_registration::register_box_for_activation;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+
+    // The id a retained record already holds, and the refusal the host's
+    // control server replies with when a mint lands on it.
+    let held = minvmd::bep_attach::mint_box_id();
+    let refusal = minvmd::box_registry::AllocationError::CollidingBoxId { id: held }.to_string();
+    let held_text = minimald_rpc::BoxId::from_bytes(held).to_string();
+    assert!(
+        refusal.contains(&held_text),
+        "the host's refusal names the colliding id {held_text}, got {refusal:?}"
+    );
+
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the CLI connects");
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the CLI sends a control request");
+        assert!(
+            matches!(request, minimald_rpc::BoxControlRequest::Register(_)),
+            "the CLI asks the host to register the box, got {request:?}"
+        );
+        let mut reply =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error { error: refusal })
+                .unwrap();
+        reply.push('\n');
+        stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+    });
+
+    let err = register_box_for_activation(
+        paths::ProviderKind::Minvmd,
+        Some(dir.path()),
+        boxes::NetworkMode::OwnIp,
+        "web",
+        &policy,
+    )
+    .await
+    .expect_err("a colliding box id refuses the creation; the box gets no id");
+    host.await.expect("the stand-in host answered");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains(&held_text),
+        "the refusal names the colliding id {held_text}, got {chain:?}"
+    );
+    assert!(
+        chain.contains("does not start"),
+        "the activation ends on the refusal, so no box is created, got {chain:?}"
+    );
+}
