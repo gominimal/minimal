@@ -1366,7 +1366,9 @@ fn guest_peer_admitted(peer_uid: u32, my_uid: u32, vmm_uid: Option<u32>) -> bool
 pub(crate) fn check_guest_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
-    if guest_peer_admitted(peer_uid, my_uid, vmm_uid()) {
+    // The own-uid test comes first, so the common case does no user
+    // lookup. `vmm_uid` caches only a hit.
+    if peer_uid == my_uid || guest_peer_admitted(peer_uid, my_uid, vmm_uid()) {
         return Ok(());
     }
     check_peer_uid(peer_uid)

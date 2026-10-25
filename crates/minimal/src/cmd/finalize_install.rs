@@ -1687,16 +1687,24 @@ pub(crate) mod linux {
             Ok(path) => path,
             Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
         };
+        // The script prints the provider path inside double quotes, where
+        // `$`, a backtick and `\` keep a meaning to the shell. So those
+        // characters are refused too.
         let paths_quotable = [&facts.layout.provider_dir, &facts.layout.vm_dir]
             .iter()
-            .all(|p| p.to_str().is_some_and(|s| sudoers_arg(s).is_some()));
+            .all(|p| {
+                p.to_str()
+                    .is_some_and(|s| sudoers_arg(s).is_some() && !s.contains(['$', '`', '\\']))
+            });
         let Some(drop_in) = sudoers_drop_in(op, &facts.vm, &facts.layout, minvmd, gvproxy)
             .filter(|_| paths_quotable)
         else {
             return Item::cannot(
                 VM_USERS_ID,
                 VM_USERS_LABEL,
-                "a path the sudo rules must name holds a space, a quote or a newline".to_string(),
+                "a path the sudo rules or the setup script must name holds a space, a quote, \
+                 a newline, a `$`, a backtick or a backslash"
+                    .to_string(),
             );
         };
 
@@ -1842,6 +1850,9 @@ pub(crate) mod linux {
         .as_utf8_path()
         .as_std_path()
         .to_path_buf();
+        // The script refuses a symlink in the path, and `/home` is a
+        // symlink on some hosts. So the item works on the real path.
+        let provider_dir = std::fs::canonicalize(&provider_dir).unwrap_or(provider_dir);
         let vm = paths::provider_instance_name(paths::ProviderKind::Minvmd, 0);
         let layout = VmUsersLayout::new(provider_dir, &operator, &vm);
         let facts = VmUsersFacts {
@@ -3089,6 +3100,17 @@ mod tests {
         let not_yet = vm_users_item_over(&no_provider);
         assert_eq!(not_yet.state, ItemState::Cannot);
         assert!(not_yet.script.is_none());
+        // The script prints the provider path in double quotes, so a path
+        // the shell expands there is refused, and root runs nothing.
+        for active in ["/home/$(id)/p", "/home/`id`/p", "/home/a\\b/p"] {
+            let unsafe_path = VmUsersFacts {
+                layout: VmUsersLayout::new(PathBuf::from(active), "alice", "local-minvmd0"),
+                ..fresh.clone()
+            };
+            let refused = vm_users_item_over(&unsafe_path);
+            assert_eq!(refused.state, ItemState::Cannot, "{active}");
+            assert!(refused.script.is_none(), "{active}");
+        }
         assert_eq!(sudoers_arg("a b"), None);
         for wild in ["/opt/m*/minvmd", "/opt/m?", "/opt/[ab]", "!minvmd"] {
             assert_eq!(sudoers_arg(wild), None, "{wild}");
