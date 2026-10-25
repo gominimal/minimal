@@ -57,8 +57,7 @@ use crate::module::Module;
 /// the source text.
 pub const DENY_SET: &[&str] = &[
     // The box-internal names: `host.min.internal`, `minimald.min.internal`,
-    // the services under them, the proxy's in-box address, and the
-    // node-plane baseline names.
+    // the services under them, and the proxy's in-box address.
     "min.internal",
     // Minimal's own infrastructure: the tenant issuer, the registry, the
     // build cache (`cache.minimal.dev`) and the installer.
