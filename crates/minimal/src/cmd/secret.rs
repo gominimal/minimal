@@ -215,6 +215,9 @@ pub(crate) fn run_set(
             bep::store::PROXY_BIN_ENV
         );
     }
+    // Review finding 4369438785: the access control trusts this program, so
+    // nobody but the current user or root can change it.
+    bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     let value = match source {
         ValueSource::Absent => bail!(
             "min secret set has no value to store: there is no terminal, and standard input is empty. \

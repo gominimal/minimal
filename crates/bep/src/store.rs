@@ -56,6 +56,88 @@ pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBu
     }
 }
 
+/// Refuse a proxy binary that a user other than the current one or root
+/// can change, since the item's access control trusts it.
+///
+/// `path` is a regular file, not a symbolic link, owned by the current user
+/// or by root, and not writable by group or others. Its parent directory is
+/// not writable by group or others, so nobody else can put a program in its
+/// place. Pass the canonical path.
+///
+/// # Errors
+///
+/// [`StoreError::ProxyUnsafe`] that names the check that failed, or
+/// [`StoreError::Refused`] when the file cannot be read.
+#[cfg(unix)]
+pub fn check_proxy_binary(path: &Path) -> Result<(), StoreError> {
+    check_proxy_binary_as(path, effective_uid())
+}
+
+/// The effective user id of this process.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no argument, reads process state and cannot
+    // fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`check_proxy_binary`] for the user `uid`.
+#[cfg(unix)]
+fn check_proxy_binary_as(path: &Path, uid: u32) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let unsafe_because = |reason: String| StoreError::ProxyUnsafe {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let meta = std::fs::symlink_metadata(path).map_err(|e| StoreError::Refused {
+        store: NATIVE_STORE,
+        action: "read the proxy program",
+        detail: format!("{}: {e}", path.display()),
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(unsafe_because("it is not a regular file".into()));
+    }
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err(unsafe_because(format!(
+            "it is owned by user id {}, not by you or root",
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(unsafe_because(format!(
+            "group or others can write to it (mode {mode:04o})"
+        )));
+    }
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Err(unsafe_because("it has no parent directory".into()));
+    };
+    let dir_meta = std::fs::metadata(dir).map_err(|e| StoreError::Refused {
+        store: NATIVE_STORE,
+        action: "read the proxy program",
+        detail: format!("{}: {e}", dir.display()),
+    })?;
+    let dir_mode = dir_meta.mode() & 0o7777;
+    if dir_mode & 0o022 != 0 {
+        return Err(unsafe_because(format!(
+            "group or others can write to its directory {} (mode {dir_mode:04o})",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// [`check_proxy_binary`] on a host without Unix file modes: no check.
+///
+/// # Errors
+///
+/// Never.
+#[cfg(not(unix))]
+pub fn check_proxy_binary(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
 /// Whether `id` is an identifier a secret can have: 1 to [`MAX_ID_LEN`]
 /// ASCII letters, digits, `.`, `_` and `-`, not starting with `-`.
 #[must_use]
@@ -101,6 +183,17 @@ pub enum StoreError {
         "The proxy path {0} contains a quote, a backslash or a line break, so the keychain cannot name it."
     )]
     ProxyPath(PathBuf),
+    /// A user other than the current one or root can change the proxy
+    /// program, so the item's access control cannot trust it.
+    #[error(
+        "The Box Egress Proxy program {path} is not safe to trust, because {reason}. Only that program can read the stored secret without a prompt. Reinstall Minimal with its installer, or set {PROXY_BIN_ENV} to a `bep` program that only you or root can change, and run the command again."
+    )]
+    ProxyUnsafe {
+        /// The proxy program.
+        path: PathBuf,
+        /// The check that failed.
+        reason: String,
+    },
     /// The identifier is not one that [`valid_id`] admits.
     #[error(
         "`{0}` is not a name a secret can have. Use 1 to {MAX_ID_LEN} letters, digits, `.`, `_` and `-`, not starting with `-`."
@@ -440,14 +533,24 @@ fn add_checked(
     if stored {
         return Ok(());
     }
+    let mut detail = if warnings.is_empty() {
+        "the keychain holds no item for it that the proxy can read".to_owned()
+    } else {
+        warnings
+    };
+    // Review finding 4369438788: an item whose access control the read-back
+    // did not confirm holds the value, so it goes. A staged item that stays
+    // is the caller's to report.
+    if kc.delete(service, id).is_err() && service != STAGING_SERVICE {
+        detail.push_str(&format!(
+            ". The value can remain in the keychain under {service}. \
+             Remove it with `security delete-generic-password -s {service} -a {id}`"
+        ));
+    }
     Err(StoreError::Refused {
         store: NATIVE_STORE,
         action: "store the secret",
-        detail: if warnings.is_empty() {
-            "the keychain holds no item for it that the proxy can read".into()
-        } else {
-            warnings
-        },
+        detail,
     })
 }
 
@@ -826,6 +929,94 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(&remedy), "{text}");
+    }
+
+    // Review finding 4369438788: a first add that reads back without the
+    // proxy's access leaves no item that holds the value.
+    #[test]
+    fn secret_set_first_add_without_proxy_access_leaves_no_item() {
+        let kc = FakeKeychain {
+            lose_access_on: Some(1),
+            ..FakeKeychain::default()
+        };
+        let err = set_item(&kc, "claude", b"new", Path::new(PROXY)).expect_err("refused");
+        assert!(err.to_string().contains("no item for it"), "{err}");
+        assert!(!err.to_string().contains("can remain"), "{err}");
+        assert!(kc.value(SERVICE, "claude").is_none());
+        assert!(kc.items.borrow().is_empty());
+    }
+
+    /// A proxy program `bep` in a fresh directory, with the file and
+    /// directory modes given.
+    #[cfg(unix)]
+    fn proxy_with_modes(file: u32, dir: u32) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let bep = bin.join("bep");
+        std::fs::write(&bep, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bep, std::fs::Permissions::from_mode(file)).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(dir)).unwrap();
+        (tmp, bep)
+    }
+
+    // Review finding 4369438785: the access control trusts only a proxy
+    // that nobody but the current user or root can change.
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_admits_a_private_program() {
+        let (_tmp, bep) = proxy_with_modes(0o755, 0o755);
+        check_proxy_binary(&bep).expect("admitted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_a_group_writable_file() {
+        let (_tmp, bep) = proxy_with_modes(0o775, 0o755);
+        let err = check_proxy_binary(&bep).expect_err("refused");
+        let text = err.to_string();
+        assert!(matches!(err, StoreError::ProxyUnsafe { .. }), "{text}");
+        assert!(text.contains(&bep.display().to_string()), "{text}");
+        assert!(text.contains("mode 0775"), "{text}");
+        assert!(text.contains("Reinstall Minimal"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_a_world_writable_directory() {
+        let (_tmp, bep) = proxy_with_modes(0o755, 0o777);
+        let err = check_proxy_binary(&bep).expect_err("refused");
+        let text = err.to_string();
+        assert!(matches!(err, StoreError::ProxyUnsafe { .. }), "{text}");
+        let dir = bep.parent().unwrap().display().to_string();
+        assert!(
+            text.contains(&format!("its directory {dir} (mode 0777)")),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_another_owner() {
+        if effective_uid() == 0 {
+            // Root owns the file, and root is always admitted.
+            return;
+        }
+        let (_tmp, bep) = proxy_with_modes(0o755, 0o755);
+        let err = check_proxy_binary_as(&bep, effective_uid() + 1).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("owned by user id"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_a_symbolic_link() {
+        let (tmp, bep) = proxy_with_modes(0o755, 0o755);
+        let link = tmp.path().join("bin").join("link");
+        std::os::unix::fs::symlink(&bep, &link).unwrap();
+        let err = check_proxy_binary(&link).expect_err("refused");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     // Review finding 4369348721: the line that `security -i` parses never
