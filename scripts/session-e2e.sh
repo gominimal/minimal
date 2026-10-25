@@ -11831,11 +11831,12 @@ proof_bep_git_credential_helper_sends_header() {
   gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
   gh_branch="e2e-bep-helper-$(date +%s)-$$"
 
-  # Every helper git finds is the shipped one, and one is for github.com.
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
   gh_helpers="$(mnl session exec "$gh_sid" sh -c \
     "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
     2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
-  if printf '%s\n' "$gh_helpers" | grep -v 'git-credential.gitconfig' | grep -q . \
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
     || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
     echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
     printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true

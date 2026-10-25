@@ -286,7 +286,11 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
     verify: ./scripts/session-e2e.sh bep_git_credential_helper_sends_header
-    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper's configuration is included from the box's XDG git configuration, so a `~/.gitconfig` the box carries stays as it is; the helper logs one line per answer naming the host, never the value -->
+    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper logs one line per answer naming the host, never the value -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL make the shipped git credential helper git's sole credential helper for each host in the GitHub module's host set, so that a `store` or `cache` helper that the box configures does not run for those hosts.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    <!-- Gatehouse §6.4 (line 718): the helper is the sole helper, with `store` and `cache` disabled; the launch sets the helper's entries at command scope (`GIT_CONFIG_COUNT`), which git reads after `~/.gitconfig` and the repository configuration, as an empty `helper` that clears the list and then the shipped helper; the host set is `bep::module::GITHUB`'s (Gatehouse §6.10 line 851); no git configuration file in the box is changed; the test puts a `store` helper in `~/.gitconfig` and in a repository configuration, and `git credential fill` and `git credential approve` for each grant host write nothing to `~/.git-credentials` -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
