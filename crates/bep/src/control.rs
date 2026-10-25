@@ -63,7 +63,11 @@
 //!
 //! The socket's owner can revoke a key by its `kid`. A client whose keychain
 //! refuses its key registers the replacement and revokes every other key in
-//! one request, because the old key is out of its reach. A revoked key leaves
+//! one request, because the old key is out of its reach. This assumes one
+//! client for each socket owner: the client keeps its key in one keychain
+//! item with a fixed service and account, so one user has one client key.
+//! A second client of the same user that replaces its key revokes the key
+//! of the first, and the proxy does not tell the first. A revoked key leaves
 //! the registry and the file before the proxy replies, so no store handle
 //! signed under it verifies again, after a restart included:
 //!
@@ -77,7 +81,9 @@
 //! The registry is bounded ([`KeyBound`]): it holds at most a set count of
 //! keys, and drops the key registered least recently to stay inside it. With
 //! an idle period set, it also drops a key that nobody registered for that
-//! long.
+//! long. The proxy binary has no setting for the bound. It uses
+//! [`KeyBound::default`]: a fixed count and no idle period. Only an embedder
+//! that calls [`Control::with_key_bound`] sets another bound.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -351,8 +357,10 @@ pub struct KeyBound {
 }
 
 impl KeyBound {
-    /// The count [`KeyBound::default`] holds. The client keeps one key, so
-    /// this leaves room for many clients of one operator.
+    /// The count [`KeyBound::default`] holds. The client keeps one key for
+    /// each user, and a replacement revokes every other key, so the registry
+    /// usually holds one. The count bounds the keys that other registrations
+    /// on the socket can add.
     pub const DEFAULT_MAX_KEYS: usize = 16;
 }
 
@@ -523,7 +531,9 @@ impl KeyFile {
     }
 
     /// Keeps `entry` and registers it in `registry`, at `now`. With
-    /// `replace`, every other key is revoked. Returns the revoked `kid`s.
+    /// `replace`, every other key is revoked: the registry serves one client
+    /// for each socket owner (see the module docs). Returns the revoked
+    /// `kid`s.
     fn register(
         &self,
         entry: Entry,
@@ -846,7 +856,8 @@ impl Control {
     }
 
     /// Bounds the client key registry by `bound` in place of
-    /// [`KeyBound::default`], and drops at once each kept key past it.
+    /// [`KeyBound::default`], and drops at once each kept key past it. The
+    /// proxy binary does not call it, so its bound is the fixed default.
     #[must_use]
     pub fn with_key_bound(mut self, bound: KeyBound) -> Self {
         let mut keys = KeyFile::new(self.keys.path.clone());
