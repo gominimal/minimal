@@ -44,13 +44,23 @@ use crate::module::Module;
 ///
 /// This is the one definition of the set. The store-rule check of BEP-034
 /// reads it too: the client passes it as the `infrastructure` part of
-/// `boxes::core::bep::StoreDenySet`. The set follows the owner's ruling of
-/// 2026-10-24 on <https://github.com/gominimal/minimal/issues/2441>. Each
-/// entry covers the endpoints in its comment. The node-plane baseline set is
-/// addresses, not names. The root excludes every IP address, so no entry
-/// here is needed for those addresses. `localhost`, `.local`, `home.arpa`
-/// and `.internal` stay allowed: only `min.internal` under `.internal` is
-/// denied. The module host sets stay in the union: the store-rule check
+/// `boxes::core::bep::StoreDenySet`.
+///
+/// The task text gives the categories of the set: `min.internal`,
+/// `minimal.dev`, the tenant issuer, the BEP, EGW and relay endpoints, the
+/// registry and build cache, and the node-plane baseline set. It also keeps
+/// `localhost`, `.local`, `home.arpa` and `.internal` allowed. The mapping
+/// of each category to a domain, and the `minimal.farm` entry, are this
+/// change's reading of those categories. That reading waits for a
+/// confirmation on <https://github.com/gominimal/minimal/issues/2441>, the
+/// tracking issue. Each entry covers the endpoints in its comment.
+///
+/// The built-in baseline of an un-enrolled host
+/// (`NodePlaneBaseline::built_in`) is addresses, not names. The root
+/// excludes every IP address, so no entry here is needed for those
+/// addresses. A deployment can configure a baseline set with named
+/// endpoints. This set does not cover those names. Only `min.internal`
+/// under `.internal` is denied. The module host sets stay in the union: the store-rule check
 /// refuses a rule that names them, but the root permits them.
 ///
 /// Keep one quoted name on each line: the `boxes` tests read this list from
@@ -64,6 +74,8 @@ pub const DENY_SET: &[&str] = &[
     "minimal.dev",
     // Minimal's hosted endpoints: the BEP, EGW and relay endpoints, the
     // hosted build cache (`cache.minimal.farm`) and the agent runtime.
+    // This entry is this change's reading. No design line names this
+    // domain, so the entry waits for the confirmation on #2441.
     "minimal.farm",
 ];
 
