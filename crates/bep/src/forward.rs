@@ -1062,6 +1062,10 @@ impl Flow {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because the stored secret that its sealed credential refers to does not let the proxy read it."
             )
+        } else if marker == STORE_ITEM_UNREADABLE {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because it was not able to read the stored secret that its sealed credential refers to."
+            )
         } else if marker == INJECTION_INVALID {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because the stored secret and the form that its secret store rule sets do not make a valid request header."
@@ -2439,6 +2443,13 @@ mod tests {
         let (upstream, end) = send_store(&flow, &format!("Authorization: Bearer {sealed}"));
         assert_eq!(refusal(&end), Some(STORE_ITEM_UNREADABLE));
         assert!(upstream.is_empty());
+        if let HalfEnd::Refused(refused) = &end {
+            assert!(
+                refused.body.contains("not able to read the stored secret"),
+                "{}",
+                refused.body
+            );
+        }
         assert_eq!(
             records.lock().unwrap()[0].marker.as_deref(),
             Some(STORE_ITEM_UNREADABLE)

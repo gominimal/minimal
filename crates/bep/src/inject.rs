@@ -136,8 +136,16 @@ pub fn header_for(
             pair.extend_from_slice(user);
             pair.push(b':');
             pair.extend_from_slice(pass);
-            let mut out = Zeroizing::new(b"Basic ".to_vec());
-            out.extend_from_slice(STANDARD.encode(pair.as_slice()).as_bytes());
+            // Encode into the zeroizing buffer itself. It is sized once, so
+            // no unzeroized copy of the encoded value is left behind.
+            const SCHEME: &[u8] = b"Basic ";
+            let encoded = base64::encoded_len(pair.len(), true).ok_or(INJECTION_INVALID)?;
+            let mut out = Zeroizing::new(vec![0u8; SCHEME.len() + encoded]);
+            out[..SCHEME.len()].copy_from_slice(SCHEME);
+            let written = STANDARD
+                .encode_slice(pair.as_slice(), &mut out[SCHEME.len()..])
+                .map_err(|_| INJECTION_INVALID)?;
+            debug_assert_eq!(written, encoded);
             Ok(("authorization".to_owned(), out))
         }
     }
