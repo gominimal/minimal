@@ -40,6 +40,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             );
             let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
             box_via_ssh(
+                daemon_provider_kind(global),
                 &sock,
                 entry.id,
                 None,
