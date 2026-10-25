@@ -63,6 +63,10 @@ use crate::module::Module;
 /// endpoint outside its domains, a gap that waits on
 /// <https://github.com/gominimal/minimal/issues/2441>.
 ///
+/// The `minimal.dev` entry covers the hosted tenant issuers only. A
+/// self-hosted Gatehouse issuer (Gatehouse §2.1 F14) is under no entry.
+/// That gap is residual on <https://github.com/gominimal/minimal/issues/2441>.
+///
 /// Only `min.internal` under `.internal` is denied. The module host sets
 /// stay in the union: the store-rule check refuses a rule that names them,
 /// but the root permits them.
@@ -73,9 +77,14 @@ pub const DENY_SET: &[&str] = &[
     // The box-internal names: `host.min.internal`, `minimald.min.internal`,
     // the services under them, and the proxy's in-box address.
     "min.internal",
-    // Minimal's own infrastructure: the tenant issuer, the registry, the
-    // build cache (`cache.minimal.dev`) and the installer.
+    // Minimal's own infrastructure: the hosted tenant issuers, the
+    // registry, the build cache (`cache.minimal.dev`) and the installer.
+    // A self-hosted issuer is not under this entry (#2441).
     "minimal.dev",
+    // The build cache by the name the design gives it (architecture.md
+    // line 844). Gatehouse §6.10 refuses an upstream that names it. Only
+    // this host is denied, not the rest of `gominimal.dev`.
+    "cache.gominimal.dev",
     // Minimal's hosted endpoints: the BEP, EGW and relay endpoints, the
     // hosted build cache (`cache.minimal.farm`) and the agent runtime.
     // This entry is this change's reading. No design line names this
@@ -1039,7 +1048,15 @@ mod tests {
     // the ruling leaves allowed stay registrable.
     #[test]
     fn root_excludes_every_deny_set_name() {
-        assert_eq!(DENY_SET, ["min.internal", "minimal.dev", "minimal.farm"]);
+        assert_eq!(
+            DENY_SET,
+            [
+                "min.internal",
+                "minimal.dev",
+                "cache.gominimal.dev",
+                "minimal.farm"
+            ]
+        );
         let (root_key, signing_key) = keys();
         let allowed = ["printer.local", "nas.home.arpa", "svc.corp.internal"];
         let registered: Vec<String> = DENY_SET

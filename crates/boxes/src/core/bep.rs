@@ -2210,7 +2210,15 @@ mod tests {
     #[test]
     fn every_deny_set_name_is_refused_as_a_store_rule() {
         let set = infrastructure_deny_set();
-        assert_eq!(set, ["min.internal", "minimal.dev", "minimal.farm"]);
+        assert_eq!(
+            set,
+            [
+                "min.internal",
+                "minimal.dev",
+                "cache.gominimal.dev",
+                "minimal.farm"
+            ]
+        );
         for entry in set {
             let upper = entry.to_ascii_uppercase();
             for host in [
