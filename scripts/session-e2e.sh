@@ -11704,13 +11704,10 @@ proof_bep_box_env_holds_sealed_value_only() {
 # lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
 # T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
 #
-# Known gap: git sends an Authorization header only when a credential helper
-# gives it one, and no box ships a git credential helper yet. Gatehouse
-# requires the shipped git-credential-helper. #2499
-# (https://github.com/gominimal/minimal/issues/2499) tracks the helper and
-# the spec requirement for it. Until #2499 lands, the clone
-# step fails against a private repository on a lane that runs this case.
-# The case does not configure a helper of its own: that hides the gap.
+# git sends an Authorization header only when a credential helper gives it
+# one. The box answers with the git credential helper it carries from
+# creation (#2499). The case configures no helper of its own.
+# bep_git_credential_helper_sends_header proves the helper alone.
 proof_bep_git_and_gh_against_private_repo() {
   echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
   local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
@@ -11781,6 +11778,114 @@ proof_bep_git_and_gh_against_private_repo() {
   fi
   rm -f "$WORK/$gg_case".*
   echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
+  echo "::endgroup::"
+}
+
+# The shipped git credential helper (BEP-015, Gatehouse §6.4): a GitHub grant
+# box with no git configuration of its own clones the private repository
+# E2E_BEP_PRIVATE_REPO and pushes a throwaway branch to it, which a second
+# push deletes again. git sends an Authorization header only when a helper
+# answers, so the clone of a private repository is the proof that git sent
+# the sealed value and the proxy substituted it. The case first checks that
+# the one helper git finds for github.com is the one the box carries, that
+# it answers with the box's sealed GH_TOKEN, and afterwards that its log
+# names github.com and never the value. A lane off macOS, without a sign-in
+# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# that runs it.
+proof_bep_git_credential_helper_sends_header() {
+  echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
+  local gh_case=bep_git_credential_helper_sends_header gh_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gh_out gh_sid gh_branch gh_step gh_helpers gh_fill gh_sealed gh_log
+  if [ -z "$gh_repo" ]; then
+    not_run "$gh_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gh_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gh_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gh_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gh_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-credential-helper \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gh_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gh_out"
+    echo "--- stderr ---"; cat "$WORK/$gh_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
+  gh_branch="e2e-bep-helper-$(date +%s)-$$"
+
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
+  gh_helpers="$(mnl session exec "$gh_sid" sh -c \
+    "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
+    2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
+    || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
+    echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
+    printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # It answers with the box's sealed value.
+  gh_sealed="$(mnl session exec "$gh_sid" sh -c 'printenv GH_TOKEN' 2>/dev/null | tr -d '\r')"
+  gh_fill="$(mnl session exec "$gh_sid" sh -c \
+    'printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' \
+    2>"$WORK/$gh_case.fill.err" | tr -d '\r')"
+  if [ -z "$gh_sealed" ] || [[ "$gh_fill" != *"password=$gh_sealed"* ]]; then
+    echo "::error::'git credential fill' for github.com in the grant box does not answer with the box's sealed GH_TOKEN"
+    cat "$WORK/$gh_case.fill.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # Each step runs on its own, so a failure names the step. The prompt
+  # switch only keeps a refused git from waiting on a terminal.
+  for gh_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gh_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gh_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gh_branch"; do
+    if ! mnl session exec "$gh_sid" sh -c "${gh_step#*:}" \
+      >"$WORK/$gh_case.${gh_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gh_step%%:*}' against the private repository $gh_repo failed in the grant box with the shipped helper"
+      cat "$WORK/$gh_case.${gh_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gh_step%%:*}: OK"
+  done
+
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
+  gh_log="$(mnl session exec "$gh_sid" sh -c \
+    'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
+  mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+  if [[ "$gh_log" != *"answered for host github.com"* ]]; then
+    echo "::error::the git credential helper's log names no answer for github.com"
+    printf '%s\n' "$gh_log"
+    fail
+  fi
+  if [[ "$gh_log" == *"$gh_sealed"* ]]; then
+    echo "::error::the git credential helper's log holds the sealed value"
+    fail
+  fi
+  rm -f "$WORK/$gh_case".*
+  echo "grant box with the shipped helper: git clone and git push against the private repository $gh_repo"
   echo "::endgroup::"
 }
 
@@ -24054,6 +24159,7 @@ case "${1:-}" in
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
     proof_bep_git_and_gh_against_private_repo
+    proof_bep_git_credential_helper_sends_header
     proof_bep_first_slice_end_to_end
     proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
@@ -24121,6 +24227,7 @@ case "${1:-}" in
     | bep_second_box_needs_no_sign_in \
     | bep_box_env_holds_sealed_value_only \
     | bep_git_and_gh_against_private_repo \
+    | bep_git_credential_helper_sends_header \
     | bep_first_slice_end_to_end \
     | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
@@ -24166,7 +24273,7 @@ case "${1:-}" in
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
-    echo "         bep_git_and_gh_against_private_repo"
+    echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
     echo "         bep_first_slice_end_to_end"
     echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
