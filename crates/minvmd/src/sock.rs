@@ -340,4 +340,77 @@ mod tests {
         restrict_owned_dir(&dir).unwrap();
         verify_provider_dir_ownership(&dir).unwrap();
     }
+
+    /// The split-user design (T57) names every socket and file that
+    /// `prepare_socket_dir` and the VMM child create or open with an owner, a
+    /// mode and the users that open it. A new socket in the provider dir
+    /// fails this test until the design's ownership table names it.
+    #[test]
+    fn split_user_provider_dir_design_names_every_socket_owner() {
+        let _g = UDS_ENV_LOCK.lock().unwrap();
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/design/2026-10-25-split-user-vmm-provider-dir.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", doc_path.display()));
+
+        let file_name = |p: PathBuf| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .expect("socket path has a file name")
+                .to_string()
+        };
+        // Every entry the VMM child or `prepare_socket_dir` creates, and
+        // every socket the VMM child opens. Derived from the code where the
+        // crate names the file, so a rename breaks this test.
+        let required = [
+            "<provider dir>/".to_string(),
+            paths::SSH_SOCK_FILE.to_string(),
+            file_name(crate::timekeep::resolve_timekeep_sock().unwrap()),
+            file_name(crate::net::resolve_gate_sock().unwrap()),
+            crate::control::GUEST_CONTROL_SOCK_FILE.to_string(),
+            crate::guest_telemetry::GUEST_TELEMETRY_SOCK_FILE.to_string(),
+            "/tmp/minvmd-marker-<pid>-<nonce>.sock".to_string(),
+            "boot.log".to_string(),
+            "data-vol.raw".to_string(),
+        ];
+
+        let section = doc
+            .split("\n## ")
+            .find(|s| s.starts_with("Ownership model\n"))
+            .expect("the design has an `## Ownership model` section");
+        let rows: Vec<Vec<String>> = section
+            .lines()
+            .filter(|l| l.starts_with('|') && !l.starts_with("|---"))
+            .map(|l| {
+                l.trim_matches('|')
+                    .split('|')
+                    .map(|c| c.trim().trim_matches('`').to_string())
+                    .collect()
+            })
+            .filter(|cells: &Vec<String>| cells.first().is_some_and(|c| c != "Path"))
+            .collect();
+
+        let names_a_user = |cell: &str| cell.contains("<login>") || cell.contains("minimal-vmm");
+        for name in &required {
+            let row = rows
+                .iter()
+                .find(|cells| &cells[0] == name)
+                .unwrap_or_else(|| panic!("the ownership table has no row for {name}"));
+            assert_eq!(row.len(), 4, "row for {name} has four columns: {row:?}");
+            assert!(
+                names_a_user(&row[1]),
+                "row for {name} names its creating user"
+            );
+            let mode = row[2].split([' ', ',']).next().unwrap_or("");
+            assert!(
+                mode.len() == 4 && mode.chars().all(|c| ('0'..='7').contains(&c)),
+                "row for {name} names a four-digit octal mode, got {:?}",
+                row[2],
+            );
+            assert!(
+                names_a_user(&row[3]),
+                "row for {name} names an opening user"
+            );
+        }
+    }
 }
