@@ -1403,6 +1403,29 @@ static EXEC_INPUT_HELD_DAEMON: AtomicUsize = AtomicUsize::new(0);
 /// daemon bound is waiting on other execs, so their releases must reach it.
 static EXEC_INPUT_PROGRESS: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+/// How much of what it holds a command at a bound must read per stall
+/// window for the window to restart: a share, not a byte. A real reader
+/// clears it by orders of magnitude; a command that reads one byte per
+/// window used to keep an exec at its cap alive forever, holding its share
+/// of the daemon's budget from every other exec (#2238). An exec that holds
+/// less than this must read everything it holds.
+const EXEC_INPUT_DRAIN_QUANTUM: usize = EXEC_INPUT_HELD_MAX / 64;
+
+/// Every live exec's held input with the handle that ends it, so a pump
+/// starved at the daemon bound can end the holder that is not draining
+/// rather than itself (#2238). Entries are weak: a gone exec is skipped on
+/// the next walk, and each pump removes its own entry when it returns.
+type ExecRegistry = std::sync::Mutex<Vec<RegisteredExec>>;
+
+/// One registry entry: the exec's held input and the sender the bridge
+/// watches for how the exec is to end.
+struct RegisteredExec {
+    held: std::sync::Weak<HeldInput>,
+    end: Arc<watch::Sender<Option<ExecEnd>>>,
+}
+
+static EXEC_INPUT_REGISTRY: ExecRegistry = std::sync::Mutex::new(Vec::new());
+
 /// Which bound an exec's held input crossed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldBound {
@@ -1451,6 +1474,12 @@ struct HeldInputLimits {
     starved: Duration,
     /// The wait at a bound for a command that has not started.
     unstarted: Duration,
+    /// What a command at a bound must read per `stall` window for the window
+    /// to restart ([`EXEC_INPUT_DRAIN_QUANTUM`]), or everything it holds if
+    /// that is less.
+    quantum: usize,
+    /// The daemon's live execs, for the holder-ending walk at the daemon bound.
+    registry: &'static ExecRegistry,
 }
 
 impl HeldInputLimits {
@@ -1463,7 +1492,15 @@ impl HeldInputLimits {
             stall: EXEC_INPUT_STALL,
             starved: EXEC_INPUT_STARVED,
             unstarted: EXEC_INPUT_UNSTARTED,
+            quantum: EXEC_INPUT_DRAIN_QUANTUM,
+            registry: &EXEC_INPUT_REGISTRY,
         }
+    }
+
+    fn registry(&self) -> std::sync::MutexGuard<'_, Vec<RegisteredExec>> {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1515,6 +1552,9 @@ struct HeldInput {
     inner: std::sync::Mutex<HeldInner>,
     waker: futures::task::AtomicWaker,
     held: AtomicUsize,
+    /// Bytes ever released from `held`, monotonic: what a window's drain is
+    /// measured against.
+    released: AtomicUsize,
     limits: HeldInputLimits,
     /// Set once nothing will read what arrives: pushes are dropped uncharged.
     discarding: std::sync::atomic::AtomicBool,
@@ -1543,6 +1583,7 @@ impl HeldInput {
             }),
             waker: futures::task::AtomicWaker::new(),
             held: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
             limits,
             discarding: std::sync::atomic::AtomicBool::new(false),
             started: std::sync::atomic::AtomicBool::new(false),
@@ -1574,7 +1615,11 @@ impl HeldInput {
             None
         };
         if let Some(bound) = over {
-            self.release(n);
+            // Undo the charge only: nothing was read, so this is not a
+            // release (a refused push must not count as the window's drain,
+            // nor wake a pump as a read would).
+            self.held.fetch_sub(n, Ordering::AcqRel);
+            self.limits.daemon_held.fetch_sub(n, Ordering::AcqRel);
             return Err(bound);
         }
         self.lock().chunks.push_back(data.to_vec());
@@ -1584,6 +1629,7 @@ impl HeldInput {
 
     fn release(&self, n: usize) {
         self.held.fetch_sub(n, Ordering::AcqRel);
+        self.released.fetch_add(n, Ordering::AcqRel);
         self.limits.daemon_held.fetch_sub(n, Ordering::AcqRel);
         self.progress.notify_waiters();
         self.limits.daemon_progress.notify_waiters();
@@ -1592,6 +1638,17 @@ impl HeldInput {
     /// Bytes this exec holds unread.
     fn held_bytes(&self) -> usize {
         self.held.load(Ordering::Acquire)
+    }
+
+    /// Bytes ever released from this exec's held input.
+    fn released_bytes(&self) -> usize {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// What this exec must release over a window that starts now for the
+    /// window to count as drained: the quantum, or all it holds if less.
+    fn drain_due(&self) -> usize {
+        self.limits.quantum.min(self.held_bytes())
     }
 
     /// The command is running: from here a bound is a stall, not a wait for
@@ -1758,6 +1815,8 @@ async fn pump_channel_input<M>(
 ) where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
 {
+    let end = Arc::new(end);
+    let _registered = Registered::new(&held, &end);
     let mut open = true;
     loop {
         match msgs.next().await {
@@ -1777,6 +1836,12 @@ async fn pump_channel_input<M>(
                 let mut since = tokio::time::Instant::now();
                 let unstarted_from = since;
                 let mut starved_warned = false;
+                // The window's drain, measured from where `released` stood
+                // when it began against what was held then (#2238).
+                let mut window = DrainWindow::begin(&held);
+                // The holders a starved wait is waiting on, with where each
+                // stood when the wait began; taken once per window.
+                let mut holders: Option<Vec<HolderAtWindow>> = None;
                 loop {
                     let bound = match held.push(&data) {
                         Ok(()) => break,
@@ -1799,6 +1864,7 @@ async fn pump_channel_input<M>(
                             }
                         }
                         since = tokio::time::Instant::now();
+                        window = DrainWindow::begin(&held);
                         continue;
                     }
                     let daemon_bound = matches!(bound, HeldBound::Daemon);
@@ -1814,17 +1880,47 @@ async fn pump_channel_input<M>(
                         );
                     }
                     let allowed = if starved {
+                        if holders.is_none() {
+                            holders = Some(HolderAtWindow::snapshot(&held));
+                        }
                         held.limits.starved
                     } else {
                         held.limits.stall
                     };
                     tokio::select! {
                         _ = held.progress.notified() => {
-                            since = tokio::time::Instant::now();
+                            // The window restarts on a quantum, not a byte:
+                            // a read that drains less keeps the window where
+                            // it was, and the retry below still happens.
+                            if window.drained(&held) {
+                                since = tokio::time::Instant::now();
+                                window = DrainWindow::begin(&held);
+                            }
                             continue;
                         }
                         _ = held.limits.daemon_progress.notified(), if daemon_bound => continue,
                         () = tokio::time::sleep_until(since + allowed) => {}
+                    }
+                    // Starved by holders that are not draining: the largest
+                    // of them is the one ended, not this exec, and the wait
+                    // goes on with a fresh window. Only when every holder
+                    // is draining (a genuinely busy daemon) does the wait
+                    // end this exec, as the ceiling always did.
+                    if starved
+                        && let Some(victim) = holders.take().and_then(HolderAtWindow::not_draining)
+                    {
+                        tracing::warn!(
+                            held = victim.held.held_bytes(),
+                            waited_ms = u64::try_from(allowed.as_millis()).unwrap_or(u64::MAX),
+                            "exec: the daemon's input budget is held by an exec that read none of it for the whole window; ending that exec, not this one",
+                        );
+                        victim.held.clear();
+                        victim
+                            .end
+                            .send_replace(Some(ExecEnd::InputHeldOver(HeldBound::Daemon)));
+                        since = tokio::time::Instant::now();
+                        window = DrainWindow::begin(&held);
+                        continue;
                     }
                     tracing::warn!(
                         ?bound,
@@ -1853,6 +1949,95 @@ async fn pump_channel_input<M>(
             }
             Some(_) => {}
         }
+    }
+}
+
+/// Where an exec's drain stood when its stall window began, and what it
+/// owed: the window counts as drained once the exec has released that much
+/// since ([`HeldInput::drain_due`]).
+struct DrainWindow {
+    released_at_start: usize,
+    due: usize,
+}
+
+impl DrainWindow {
+    fn begin(held: &HeldInput) -> Self {
+        Self {
+            released_at_start: held.released_bytes(),
+            due: held.drain_due(),
+        }
+    }
+
+    fn drained(&self, held: &HeldInput) -> bool {
+        held.released_bytes().saturating_sub(self.released_at_start) >= self.due
+    }
+}
+
+/// A holder of the daemon's budget as a starved wait found it: the exec,
+/// its end handle, and the drain it owes over the wait's window.
+struct HolderAtWindow {
+    held: Arc<HeldInput>,
+    end: Arc<watch::Sender<Option<ExecEnd>>>,
+    window: DrainWindow,
+}
+
+impl HolderAtWindow {
+    /// Every other live exec holding input right now.
+    fn snapshot(waiter: &Arc<HeldInput>) -> Vec<Self> {
+        waiter
+            .limits
+            .registry()
+            .iter()
+            .filter_map(|entry| {
+                let held = entry.held.upgrade()?;
+                if Arc::ptr_eq(&held, waiter) || held.held_bytes() == 0 {
+                    return None;
+                }
+                let window = DrainWindow::begin(&held);
+                Some(Self {
+                    held,
+                    end: Arc::clone(&entry.end),
+                    window,
+                })
+            })
+            .collect()
+    }
+
+    /// The largest holder that did not drain what it owed over the window,
+    /// if any did not.
+    fn not_draining(seen: Vec<Self>) -> Option<Self> {
+        seen.into_iter()
+            .filter(|holder| holder.held.held_bytes() > 0 && !holder.window.drained(&holder.held))
+            .max_by_key(|holder| holder.held.held_bytes())
+    }
+}
+
+/// An exec's entry in its daemon's [`ExecRegistry`] for as long as its pump
+/// runs; removed when the pump returns.
+struct Registered {
+    held: std::sync::Weak<HeldInput>,
+    registry: &'static ExecRegistry,
+}
+
+impl Registered {
+    fn new(held: &Arc<HeldInput>, end: &Arc<watch::Sender<Option<ExecEnd>>>) -> Self {
+        held.limits.registry().push(RegisteredExec {
+            held: Arc::downgrade(held),
+            end: Arc::clone(end),
+        });
+        Self {
+            held: Arc::downgrade(held),
+            registry: held.limits.registry,
+        }
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| !std::sync::Weak::ptr_eq(&entry.held, &self.held));
     }
 }
 
