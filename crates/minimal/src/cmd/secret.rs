@@ -31,6 +31,8 @@ pub(crate) enum ValueSource {
     Stdin,
     /// Standard input is closed, or is `/dev/null`.
     Absent,
+    /// Standard input is a terminal, and `--no-input` forbids the prompt.
+    NoInput,
 }
 
 /// The source of the value for this process.
@@ -58,6 +60,17 @@ fn detect_source() -> ValueSource {
     ValueSource::Stdin
 }
 
+/// The source `set` uses. Review finding 4369552000: with `--no-input`, a
+/// terminal on standard input is not a source, and `run_set` refuses it
+/// before any prompt. Piped standard input still answers.
+fn value_source(no_input: bool, detected: ValueSource) -> ValueSource {
+    if no_input && detected == ValueSource::Terminal {
+        ValueSource::NoInput
+    } else {
+        detected
+    }
+}
+
 /// The proxy binary that the item's access control names.
 fn proxy_path() -> anyhow::Result<PathBuf> {
     resolve_proxy(
@@ -78,6 +91,8 @@ fn proxy_path() -> anyhow::Result<PathBuf> {
 /// trusted one. A path that exists comes back canonical. A path that does
 /// not exist comes back as is, and `run_set` refuses it.
 ///
+/// The error text names no command. `set` and `list` each add their own.
+///
 /// This rule and `resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`
 /// predict the same program. One owner for the rule:
 /// <https://github.com/gominimal/minimal/issues/2527>.
@@ -90,7 +105,7 @@ pub(crate) fn resolve_proxy(
             let env = Path::new(env);
             if !env.is_absolute() {
                 bail!(
-                    "min secret set did not read the value: {var} is the relative path {}. \
+                    "{var} is the relative path {}. \
                      Set {var} to the absolute path of the `bep` program, and run the command again.",
                     env.display(),
                     var = bep::store::PROXY_BIN_ENV
@@ -101,8 +116,8 @@ pub(crate) fn resolve_proxy(
         None => {
             let Some(minvmd) = find_on_path("minvmd", path) else {
                 bail!(
-                    "min secret set did not read the value: no `minvmd` program is on PATH, \
-                     and `min secret set` looks for the `bep` program beside it. \
+                    "no `minvmd` program is on PATH, \
+                     and `min secret` looks for the `bep` program beside it. \
                      Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
                     bep::store::PROXY_BIN_ENV
                 );
@@ -135,15 +150,16 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// `min secret set`.
-pub fn cmd_secret_set(_global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Result<()> {
+pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Result<()> {
     // The refusals that need no store run first, so a value typed on the
     // command line is refused before anything else happens.
     refuse_set_args(&args)?;
-    let source = detect_source();
+    let source = value_source(global.no_input, detect_source());
+    let proxy = proxy_path().context("min secret set did not read the value")?;
     run_set(
         &HostStore,
         &args,
-        &proxy_path()?,
+        &proxy,
         source,
         &mut || read_terminal(&args.id),
         &mut std::io::stdin().lock(),
@@ -165,27 +181,33 @@ fn refuse_set_args(args: &SecretSetArgs) -> anyhow::Result<()> {
     if args.value.is_some() || args.env.is_some() {
         bail!("{VALUE_ARGUMENT_REFUSED}");
     }
-    check_id(&args.id)?;
-    check_store(args.store.as_deref())?;
+    check_id(SET, &args.id)?;
+    check_store(SET, args.store.as_deref())?;
     Ok(())
 }
 
-fn check_id(id: &str) -> anyhow::Result<()> {
+/// The command names that the refusals print.
+const SET: &str = "min secret set";
+const LIST: &str = "min secret list";
+const RM: &str = "min secret rm";
+
+fn check_id(command: &str, id: &str) -> anyhow::Result<()> {
     if !valid_id(id) {
-        bail!(StoreError::InvalidId(id.to_owned()));
+        return Err(anyhow::Error::new(StoreError::InvalidId(id.to_owned()))
+            .context(format!("{command} refused the name")));
     }
     Ok(())
 }
 
 /// Refuse every store but the host's native one.
-fn check_store(store: Option<&str>) -> anyhow::Result<()> {
+fn check_store(command: &str, store: Option<&str>) -> anyhow::Result<()> {
     match store {
         None | Some(NATIVE_STORE) => Ok(()),
         Some("gatehouse") => bail!(
-            "min secret refused --store gatehouse. Secrets for the Gatehouse store are deposited with Gatehouse, not on this host. Run the command without --store to use the host keychain."
+            "{command} refused --store gatehouse. Secrets for the Gatehouse store are deposited with Gatehouse, not on this host. Run the command without --store to use the host keychain."
         ),
         Some(other) => bail!(
-            "min secret does not know the store `{other}`. The one store on this host is `{NATIVE_STORE}`. Run the command without --store to use it."
+            "{command} does not know the store `{other}`. The one store on this host is `{NATIVE_STORE}`. Run the command without --store to use it."
         ),
     }
 }
@@ -224,6 +246,11 @@ pub(crate) fn run_set(
              Pipe the value in, as in `printf %s \"$VALUE\" | min secret set {}`.",
             args.id
         ),
+        ValueSource::NoInput => bail!(
+            "min secret set did not prompt for the value: --no-input is set. \
+             Pipe the value in on standard input, as in `printf %s \"$VALUE\" | min secret set {}`.",
+            args.id
+        ),
         ValueSource::Terminal => terminal()?,
         ValueSource::Stdin => {
             let mut text = Zeroizing::new(String::new());
@@ -259,12 +286,15 @@ pub(crate) fn run_set(
 
 /// `min secret list`.
 pub fn cmd_secret_list(global: &GlobalArgs, args: SecretListArgs) -> anyhow::Result<()> {
-    check_store(args.store.as_deref())?;
+    check_store(LIST, args.store.as_deref())?;
     let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    // Review finding 4369551998: list only compares the proxy path, so a
+    // proxy that cannot be resolved does not stop the listing.
+    let proxy = proxy_path();
     run_list(
         &HostStore,
         &rules,
-        &proxy_path()?,
+        proxy.as_deref(),
         &mut std::io::stdout().lock(),
     )
 }
@@ -280,11 +310,13 @@ fn rule_for<'r>(rules: &'r StoreRules, store: &str, id: &str) -> Option<&'r Stor
 pub(crate) fn run_list(
     store: &dyn SecretStore,
     rules: &StoreRules,
-    proxy: &Path,
+    proxy: Result<&Path, &anyhow::Error>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    // With no proxy path, the access entries are not compared, and the
+    // access column shows unknown.
     let items = store
-        .list(proxy)
+        .list(proxy.unwrap_or(Path::new("")))
         .context("min secret list did not read the store")?;
     if items.is_empty() {
         writeln!(out, "No secrets in the {} store.", store.name())?;
@@ -308,10 +340,10 @@ pub(crate) fn run_list(
             Some(StoreAction::Ask) => "ask",
             Some(StoreAction::Deny) => "deny",
         };
-        let access = if item.proxy_access {
-            format!("yes, {}", proxy.display())
-        } else {
-            "no".to_owned()
+        let access = match proxy {
+            Err(_) => "unknown".to_owned(),
+            Ok(proxy) if item.proxy_access => format!("yes, {}", proxy.display()),
+            Ok(_) => "no".to_owned(),
         };
         writeln!(out, "{}", item.id)?;
         writeln!(out, "  store:                 {}", store.name())?;
@@ -319,6 +351,10 @@ pub(crate) fn run_list(
         writeln!(out, "  injection:             {injection}")?;
         writeln!(out, "  consent:               {consent}")?;
         writeln!(out, "  proxy reads it freely: {access}")?;
+    }
+    if let Err(e) = proxy {
+        writeln!(out)?;
+        writeln!(out, "min secret list shows proxy access as unknown: {e:#}")?;
     }
     Ok(())
 }
@@ -346,8 +382,8 @@ pub(crate) fn run_rm(
     args: &SecretRmArgs,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    check_id(&args.id)?;
-    check_store(args.store.as_deref())?;
+    check_id(RM, &args.id)?;
+    check_store(RM, args.store.as_deref())?;
     let removed = store
         .remove(&args.id)
         .with_context(|| format!("min secret rm did not remove {}", args.id))?;
@@ -500,6 +536,36 @@ mod tests {
         assert!(format!("{:#}", result.expect_err("empty")).contains("empty"));
         assert!(out.is_empty());
         assert!(store.value("claude").is_none());
+
+        // Review finding 4369552000: --no-input with a terminal on standard
+        // input refuses at once, reads nothing, and names piped input.
+        assert_eq!(
+            value_source(true, ValueSource::Terminal),
+            ValueSource::NoInput
+        );
+        assert_eq!(value_source(true, ValueSource::Stdin), ValueSource::Stdin);
+        assert_eq!(value_source(true, ValueSource::Absent), ValueSource::Absent);
+        assert_eq!(
+            value_source(false, ValueSource::Terminal),
+            ValueSource::Terminal
+        );
+        let mut out = Vec::new();
+        let err = run_set(
+            &store,
+            &set_args(&["claude"]),
+            &proxy,
+            ValueSource::NoInput,
+            &mut no_terminal,
+            &mut PanicRead,
+            &mut out,
+        )
+        .expect_err("no prompt");
+        let text = format!("{err:#}");
+        assert!(text.starts_with("min secret set did not prompt"), "{text}");
+        assert!(text.contains("--no-input"), "{text}");
+        assert!(text.contains("| min secret set claude"), "{text}");
+        assert!(out.is_empty());
+        assert!(store.value("claude").is_none());
     }
 
     /// A store that this host cannot use, as [`HostStore`] is off macOS.
@@ -564,13 +630,22 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("--store gatehouse"), "{text}");
         assert!(text.contains("not on this host"), "{text}");
+        assert!(text.starts_with("min secret set refused"), "{text}");
         assert!(store.value("claude").is_none());
         let mut out = Vec::new();
         let rm = SecretRmArgs {
             id: "claude".into(),
             store: Some("gatehouse".into()),
         };
-        assert!(run_rm(&store, &rm, &mut out).is_err());
+        let text = format!("{:#}", run_rm(&store, &rm, &mut out).expect_err("refused"));
+        assert!(text.starts_with("min secret rm refused"), "{text}");
+        let text = format!(
+            "{:#}",
+            check_store(LIST, Some("gatehouse")).expect_err("refused")
+        );
+        assert!(text.starts_with("min secret list refused"), "{text}");
+        let text = format!("{:#}", check_id(RM, "-A").expect_err("refused"));
+        assert!(text.starts_with("min secret rm refused the name"), "{text}");
     }
 
     #[test]
@@ -604,7 +679,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        run_list(&store, &rules, &proxy, &mut out).unwrap();
+        run_list(&store, &rules, Ok(&proxy), &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         for value in ["sk-ant-one", "lin-two", "sen-three"] {
             assert!(!out.contains(value), "{out}");
@@ -636,8 +711,34 @@ sentry
         assert_eq!(out, expected);
 
         let mut out = Vec::new();
-        run_list(&MemorySecretStore::default(), &rules, &proxy, &mut out).unwrap();
+        run_list(&MemorySecretStore::default(), &rules, Ok(&proxy), &mut out).unwrap();
         assert_eq!(out, b"No secrets in the keychain store.\n");
+
+        // Review finding 4369551998: with no proxy path, the listing still
+        // shows every item, with access unknown and one line that says why.
+        let none = tempfile::tempdir().unwrap();
+        let empty = std::env::join_paths([none.path()]).unwrap();
+        let missing = resolve_proxy(None, Some(&empty)).expect_err("no minvmd");
+        let mut out = Vec::new();
+        run_list(&store, &rules, Err(&missing), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        for value in ["sk-ant-one", "lin-two", "sen-three"] {
+            assert!(!out.contains(value), "{out}");
+        }
+        assert_eq!(
+            out.matches("proxy reads it freely: unknown\n").count(),
+            3,
+            "{out}"
+        );
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.starts_with(
+                "min secret list shows proxy access as unknown: no `minvmd` program is on PATH"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("min secret set"), "{out}");
+        assert!(!out.contains("did not read the value"), "{out}");
     }
 
     #[test]
