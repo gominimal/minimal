@@ -949,6 +949,24 @@ impl ActivationStep {
     }
 }
 
+/// Puts the root of the project at `dir` on the create request: the
+/// directory that holds the project's `minimal.toml`, found the way the
+/// upload finds it. The daemon records it as the box's project root
+/// (BOX-001).
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
+pub(crate) fn stamp_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let root = resolve_upload_root(dir)?;
+    request.config.project_root =
+        Some(paths::HostAbsPath::try_new(root).context("Invalid project root")?);
+    Ok(())
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1121,6 +1139,7 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
     request.config.hooks_enabled = !args.no_hooks;
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
     // outright, before it allocates anything to tear down. `None` under the
     // skew override, which is what lets an operator proceed.
@@ -1231,6 +1250,9 @@ pub(crate) async fn activate_box(
                 SyncMode::None => None,
                 SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
             };
+            // The record's project root (BOX-001) is resolved under every
+            // `--sync` mode, `none` included.
+            stamp_project_root(&mut request, &utf8_path)?;
 
             // Skip the upload without prompting when the resolved root is an
             // empty directory or `$HOME` — unless the user asked for it with an
@@ -2322,6 +2344,35 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use boxes::DynamicIngress;
+
+    /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
+    /// that holds `minimal.toml`, as the project root.
+    #[test]
+    fn create_from_a_subdirectory_sends_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "rooted",
+            paths::HostAbsPath::try_new(sub.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+
+        stamp_project_root(&mut request, &sub).unwrap();
+
+        assert_eq!(
+            request.config.project_root,
+            Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
+        );
+        assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {

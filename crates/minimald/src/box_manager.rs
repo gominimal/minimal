@@ -1431,13 +1431,7 @@ impl BoxManager {
             minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
             minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
         };
-        let record = build_record(
-            config,
-            username,
-            boxes::BoxState::Pending,
-            box_type,
-            parent,
-        )?;
+        let record = build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
         tracing::Span::current().record("box_type", box_type);
         let project_root = record.project_root.clone();
         let name = record.name.clone();
