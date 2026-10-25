@@ -12,7 +12,7 @@ use std::io::{IsTerminal as _, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use bep::store::{HostStore, NATIVE_STORE, SecretStore, proxy_binary_path, valid_id};
+use bep::store::{HostStore, NATIVE_STORE, SecretStore, StoreError, proxy_binary_path, valid_id};
 use boxes::core::bep::{StoreAction, StoreRuleConfig, StoreRules};
 use zeroize::Zeroizing;
 
@@ -172,10 +172,7 @@ fn refuse_set_args(args: &SecretSetArgs) -> anyhow::Result<()> {
 
 fn check_id(id: &str) -> anyhow::Result<()> {
     if !valid_id(id) {
-        bail!(
-            "`{id}` is not a name a secret can have. Use 1 to {} letters, digits, `.`, `_` and `-`, not starting with `-`.",
-            bep::store::MAX_ID_LEN
-        );
+        bail!(StoreError::InvalidId(id.to_owned()));
     }
     Ok(())
 }
@@ -204,6 +201,11 @@ pub(crate) fn run_set(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     refuse_set_args(args)?;
+    // Review finding 4369348711: the store and the proxy path are checked
+    // before the value is read, so nobody types a secret that is refused.
+    store
+        .check_available()
+        .context("min secret set did not read the value")?;
     if !proxy.is_absolute() || !proxy.is_file() {
         bail!(
             "min secret set did not read the value: the Box Egress Proxy program is not at {}. \
@@ -242,7 +244,11 @@ pub(crate) fn run_set(
     }
     store
         .set(&args.id, value.as_bytes(), proxy)
-        .with_context(|| format!("min secret set did not store {}", args.id))?;
+        .map_err(|e| match e {
+            // The new value is stored, so "did not store" is not true.
+            StoreError::StagingLeft { .. } => anyhow::Error::new(e),
+            e => anyhow::Error::new(e).context(format!("min secret set did not store {}", args.id)),
+        })?;
     tracing::info!(store = store.name(), id = %args.id, "secret stored");
     writeln!(out, "{}", args.id)?;
     Ok(())
@@ -491,6 +497,50 @@ mod tests {
         assert!(format!("{:#}", result.expect_err("empty")).contains("empty"));
         assert!(out.is_empty());
         assert!(store.value("claude").is_none());
+    }
+
+    /// A store that this host cannot use, as [`HostStore`] is off macOS.
+    struct NoStore;
+    impl SecretStore for NoStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, _: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
+            panic!("set was called")
+        }
+        fn list(&self, _: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            Err(StoreError::Unsupported)
+        }
+        fn remove(&self, _: &str) -> Result<bool, StoreError> {
+            Err(StoreError::Unsupported)
+        }
+        fn check_available(&self) -> Result<(), StoreError> {
+            Err(StoreError::Unsupported)
+        }
+    }
+
+    // Review finding 4369348711: no value is read when the store is not
+    // there, from the terminal or from standard input.
+    #[test]
+    fn secret_set_checks_the_store_before_it_reads() {
+        let (_dir, proxy) = proxy();
+        for source in [ValueSource::Terminal, ValueSource::Stdin] {
+            let mut out = Vec::new();
+            let err = run_set(
+                &NoStore,
+                &set_args(&["claude"]),
+                &proxy,
+                source,
+                &mut no_terminal,
+                &mut PanicRead,
+                &mut out,
+            )
+            .expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(text.contains("did not read the value"), "{text}");
+            assert!(text.contains("no secret store"), "{text}");
+            assert!(out.is_empty());
+        }
     }
 
     #[test]
