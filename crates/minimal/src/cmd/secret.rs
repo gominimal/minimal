@@ -60,11 +60,58 @@ fn detect_source() -> ValueSource {
 
 /// The proxy binary that the item's access control names.
 fn proxy_path() -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe().context("could not find the path of this `min` program")?;
-    Ok(proxy_binary_path(
+    resolve_proxy(
         std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
-        &exe,
-    ))
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// The proxy that the running `minvmd` starts: the variable's path when it
+/// is set and not empty, else `bep` beside the first `minvmd` on `path`.
+/// `autospawn` starts `minvmd` with `Command::new("minvmd")`, which finds
+/// it on `PATH` in the same way. The `minvmd` that autospawn starts gets
+/// this process's environment, so it reads the same variable.
+pub(crate) fn resolve_proxy(
+    env: Option<&std::ffi::OsStr>,
+    path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(env) = env.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(env));
+    }
+    let Some(minvmd) = find_on_path("minvmd", path) else {
+        bail!(
+            "min secret set did not read the value: no `minvmd` program is on PATH, \
+             and `min secret set` looks for the `bep` program beside it. \
+             Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
+            bep::store::PROXY_BIN_ENV
+        );
+    };
+    Ok(proxy_binary_path(None, &minvmd))
+}
+
+/// The first executable file `name` in the directories of `path`, in the
+/// order that `execvp` tries them. An empty entry is the current directory.
+fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?).find_map(|dir| {
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
+        let candidate = dir.join(name);
+        is_executable(&candidate).then_some(candidate)
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// `min secret set`.
@@ -636,19 +683,64 @@ attributes:
         assert!(text.contains("did not read the value"), "{text}");
         assert!(store.value("claude").is_none());
 
-        // The path is `bep` beside `min`, or the variable's path.
-        let exe = Path::new("/opt/minimal/bin/min");
+        // The path is `bep` beside `minvmd`, or the variable's path.
+        let minvmd = Path::new("/opt/minimal/bin/minvmd");
         assert_eq!(
-            proxy_binary_path(None, exe),
+            proxy_binary_path(None, minvmd),
             PathBuf::from("/opt/minimal/bin/bep")
         );
         assert_eq!(
-            proxy_binary_path(Some(std::ffi::OsStr::new("")), exe),
+            proxy_binary_path(Some(std::ffi::OsStr::new("")), minvmd),
             PathBuf::from("/opt/minimal/bin/bep")
         );
         assert_eq!(
-            proxy_binary_path(Some(std::ffi::OsStr::new("/x/bep")), exe),
+            proxy_binary_path(Some(std::ffi::OsStr::new("/x/bep")), minvmd),
             PathBuf::from("/x/bep")
         );
+
+        // The anchor is the first executable `minvmd` on PATH, the one that
+        // autospawn starts, and never the `min` program.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let none = tempfile::tempdir().unwrap();
+        // A `minvmd` that is not executable is not the one `execvp` runs.
+        std::fs::write(first.path().join("minvmd"), b"").unwrap();
+        for dir in [first.path(), second.path()] {
+            let bin = dir.join("minvmd");
+            std::fs::write(&bin, b"").unwrap();
+            #[cfg(unix)]
+            if dir == second.path() {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let path = std::env::join_paths([none.path(), first.path(), second.path()]).unwrap();
+        assert_eq!(
+            resolve_proxy(None, Some(&path)).unwrap(),
+            second.path().join("bep")
+        );
+        assert_eq!(
+            resolve_proxy(Some(std::ffi::OsStr::new("")), Some(&path)).unwrap(),
+            second.path().join("bep")
+        );
+        assert_eq!(
+            resolve_proxy(Some(std::ffi::OsStr::new("/x/bep")), Some(&path)).unwrap(),
+            PathBuf::from("/x/bep")
+        );
+        let exe = std::env::current_exe().unwrap();
+        assert_ne!(
+            resolve_proxy(None, Some(&path)).unwrap(),
+            exe.with_file_name("bep")
+        );
+
+        // No `minvmd` on PATH: refused, with the two remedies.
+        let empty = std::env::join_paths([none.path()]).unwrap();
+        let text = format!(
+            "{:#}",
+            resolve_proxy(None, Some(&empty)).expect_err("refused")
+        );
+        assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
+        assert!(text.contains(bep::store::PROXY_BIN_ENV), "{text}");
+        assert!(resolve_proxy(None, None).is_err());
     }
 }
