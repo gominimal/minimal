@@ -4332,6 +4332,7 @@ name = "minvmd"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "bep",
  "boxes",
  "camino",
  "clap",

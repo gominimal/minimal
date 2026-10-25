@@ -1400,7 +1400,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 /// the release workflow build only `minvmd`, so an installed `minvmd`
 /// finds no proxy and boots without a credentialed lane. #2498
 /// (https://github.com/gominimal/minimal/issues/2498) owns that release gap.
-const BEP_BIN_ENV: &str = "MINVMD_BEP_BIN";
+const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
 /// `min bug` collects it from the provider dir by the same name.
@@ -1434,14 +1434,25 @@ fn cap_bep_log(log: &std::path::Path, cap: u64) -> std::io::Result<()> {
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The `bep` binary to start: [`BEP_BIN_ENV`] verbatim, else `bep` beside
-/// this process's own binary. `None` when no such file exists.
+/// The `bep` binary to start, by the rule that `min secret` also names in
+/// an item's access control (`bep::store::proxy_binary_path`): [`BEP_BIN_ENV`]
+/// verbatim, else `bep` beside this process's own binary. `None` when no
+/// such file exists.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn resolve_bep_binary() -> Option<std::path::PathBuf> {
-    let path = match std::env::var_os(BEP_BIN_ENV).filter(|v| !v.is_empty()) {
-        Some(path) => std::path::PathBuf::from(path),
-        None => std::env::current_exe().ok()?.with_file_name("bep"),
-    };
+    bep_binary_at(std::env::var_os(BEP_BIN_ENV).as_deref(), || {
+        std::env::current_exe().ok()
+    })
+}
+
+/// [`resolve_bep_binary`] with the variable and this process's binary
+/// given, so a test can pass both.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn bep_binary_at(
+    env: Option<&std::ffi::OsStr>,
+    exe: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let path = bep::store::proxy_binary_path(env, exe)?;
     path.is_file().then_some(path)
 }
 
@@ -3211,6 +3222,37 @@ fn await_publish_report(
 mod tests {
     #[cfg(not(minvmd_libkrun))]
     use super::*;
+
+    /// BEP-051: `minvmd` starts the proxy that `min secret set` names in an
+    /// item's access control. Both take it from
+    /// `bep::store::proxy_binary_path`, for one `PATH` and one
+    /// `MINVMD_BEP_BIN`.
+    #[test]
+    fn minvmd_and_min_secret_resolve_the_same_proxy_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let minvmd = dir.path().join("minvmd");
+        let bep = dir.path().join("bep");
+        let other = dir.path().join("other-bep");
+        for file in [&minvmd, &bep, &other] {
+            std::fs::write(file, b"").unwrap();
+        }
+        let exe = || Some(minvmd.clone());
+        for env in [None, Some(""), Some(other.to_str().unwrap())] {
+            let env = env.map(std::ffi::OsStr::new);
+            let shared = ::bep::store::proxy_binary_path(env, exe);
+            assert_eq!(super::bep_binary_at(env, exe), shared, "{env:?}");
+        }
+        assert_eq!(super::bep_binary_at(None, exe), Some(bep.clone()));
+        assert_eq!(
+            super::bep_binary_at(Some(other.as_os_str()), exe),
+            Some(other.clone())
+        );
+
+        // A path that names no file starts no proxy.
+        std::fs::remove_file(&bep).unwrap();
+        assert_eq!(super::bep_binary_at(None, exe), None);
+        assert_eq!(super::bep_binary_at(None, || None), None);
+    }
 
     #[cfg(not(minvmd_libkrun))]
     #[test]

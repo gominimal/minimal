@@ -36,26 +36,32 @@ pub const MAX_ID_LEN: usize = 128;
 /// item. The proxy reads no item under it, and a listing shows none.
 pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
 
-/// The proxy binary that an item's access control names: the path in
-/// [`PROXY_BIN_ENV`] when it is set and not empty, else `bep` beside
-/// `minvmd`.
+/// The proxy binary: the path in [`PROXY_BIN_ENV`] when it is set and not
+/// empty, else `bep` beside `minvmd`. `None` when the variable is unset or
+/// empty and `minvmd` gives no path.
 ///
-/// `minvmd` is the path of the VM host daemon program that `min` starts:
-/// the first `minvmd` on `PATH`, as `Command::new("minvmd")` in the CLI's
-/// autospawn finds it. That daemon starts the proxy from the same variable,
-/// else from `bep` beside its own executable (`resolve_bep_binary` in
-/// `crates/minvmd/src/cmd/run.rs`). `current_exe()` there gives the path
-/// with symbolic links resolved, so pass `minvmd` with its links resolved
-/// too. So the access control names the program
-/// that the running daemon starts. The two functions are copies of one
-/// rule, and they must change together until one owner holds the rule:
-/// <https://github.com/gominimal/minimal/issues/2527>.
+/// This is the one definition of the rule. `minvmd` starts the proxy from
+/// it (`resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`), with
+/// `minvmd` as its own `current_exe()`. `min secret` names the same program
+/// in an item's access control (`resolve_proxy` in
+/// `crates/minimal/src/cmd/secret.rs`), with `minvmd` as the first `minvmd`
+/// on `PATH`, which is the program that the CLI's autospawn starts.
+/// `current_exe()` gives the path with symbolic links resolved on Linux, so
+/// a caller that finds `minvmd` on `PATH` resolves its links too.
+///
+/// `minvmd` runs only when the variable does not give the path. Each
+/// resolution logs one debug line that names the path.
 #[must_use]
-pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBuf {
-    match env.filter(|v| !v.is_empty()) {
+pub fn proxy_binary_path(
+    env: Option<&std::ffi::OsStr>,
+    minvmd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let path = match env.filter(|v| !v.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => minvmd.with_file_name("bep"),
-    }
+        None => minvmd()?.with_file_name("bep"),
+    };
+    tracing::debug!(proxy = %path.display(), "resolved the proxy binary path");
+    Some(path)
 }
 
 /// Refuse a proxy binary that a user other than the current one or root
