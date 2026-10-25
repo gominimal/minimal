@@ -2892,18 +2892,21 @@ pub struct BoxRegistry {
     row_epoch: Arc<AtomicU64>,
     /// The Box Egress Proxy's control socket, where the destroy of a live
     /// box with a credentialed lane records its revocation
-    /// ([`submit_revocation`], BEP-043). `None` sends nothing: a test's
-    /// registry, or a host with no home directory.
+    /// ([`submit_revocation`], BEP-043). `None` sends nothing. [`Self::new`]
+    /// sets `None`, and only the daemon's start path sets the socket
+    /// ([`Self::with_proxy_control`]).
     proxy_control: Option<Arc<std::path::PathBuf>>,
 }
 
-/// A clone shares the live rows, the hand-out book, and the withdrawal
-/// channel but not the receiver: only the registry that created the channel —
-/// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
-/// receiving end, so a clone can register, allocate, and file reports like
-/// the original but has nothing to take.
 /// The Box Egress Proxy's control socket, under the home directory.
 const PROXY_CONTROL_SOCKET: &str = ".minimal/bep/control.sock";
+
+/// The Box Egress Proxy control socket under the home directory, the one the
+/// daemon's registry sends revocations to ([`BoxRegistry::with_proxy_control`]).
+/// `None` on a host with no home directory.
+pub fn home_proxy_control() -> Option<std::path::PathBuf> {
+    std::env::home_dir().map(|home| home.join(PROXY_CONTROL_SOCKET))
+}
 
 /// How long a revocation waits for the proxy, for the connect and for each
 /// reply.
@@ -3021,6 +3024,11 @@ fn send_control(path: &std::path::Path, op: &str, id: &str) -> std::io::Result<(
     Ok(())
 }
 
+/// A clone shares the live rows, the hand-out book, and the withdrawal
+/// channel but not the receiver: only the registry that created the channel —
+/// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
+/// receiving end, so a clone can register, allocate, and file reports like
+/// the original but has nothing to take.
 impl Clone for BoxRegistry {
     fn clone(&self) -> Self {
         BoxRegistry {
@@ -3094,11 +3102,7 @@ impl BoxRegistry {
             persisted_at: None,
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
-            proxy_control: if cfg!(test) {
-                None
-            } else {
-                std::env::home_dir().map(|home| Arc::new(home.join(PROXY_CONTROL_SOCKET)))
-            },
+            proxy_control: None,
         }
     }
 
@@ -3109,6 +3113,14 @@ impl BoxRegistry {
     pub fn with_proxy_control(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.proxy_control = path.map(Arc::new);
         self
+    }
+
+    /// The Box Egress Proxy control socket this registry sends a live box's
+    /// revocation to, if any ([`Self::with_proxy_control`]).
+    pub fn proxy_control(&self) -> Option<&std::path::Path> {
+        self.proxy_control
+            .as_deref()
+            .map(std::path::PathBuf::as_path)
     }
 
     /// Sets the operator's deny-all opt-out (NET-077) this registry compiles
@@ -10260,5 +10272,20 @@ mod tests {
             lines[1],
             serde_json::json!({"op": "forget_box", "box_id": "cd".repeat(16)})
         );
+    }
+
+    // BEP-043: a registry from `new` sends no revocation, so a test's
+    // registry never reaches a developer's running proxy. Only
+    // `with_proxy_control` sets the socket, and a clone keeps it.
+    #[test]
+    fn new_registry_sends_no_revocation() {
+        let registry = BoxRegistry::new(SUBNET);
+        assert_eq!(registry.proxy_control(), None);
+        assert_eq!(registry.clone().proxy_control(), None);
+
+        let path = std::path::PathBuf::from("/run/test/control.sock");
+        let wired = BoxRegistry::new(SUBNET).with_proxy_control(Some(path.clone()));
+        assert_eq!(wired.proxy_control(), Some(path.as_path()));
+        assert_eq!(wired.clone().proxy_control(), Some(path.as_path()));
     }
 }
