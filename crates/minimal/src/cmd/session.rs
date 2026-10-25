@@ -94,8 +94,12 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     // Gated by hand for the same reason as `cmd_attach`: this hands off into a
     // live session (the daemon mints the exec channel and runs the attach
     // hooks around it), which is not something to drive on a skewed pair. The
-    // gate rides on the lookup's reply — no `GetVersion` ahead of it.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // gate rides on the lookup's reply — no `GetVersion` ahead of it. The name
+    // alone decides where to look (NET-058), as it does for attach: a box on
+    // another VM is reached over that VM's socket, with no global flag.
+    let (r, sock) =
+        resolve_named_box_version_gated(global, &mut client, sock, &args.session, "Running in")
+            .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -124,8 +128,16 @@ pub async fn cmd_session_run(
         .await
         .context("Failed to connect to minimald")?;
     // Gated by hand for the same reason as `cmd_exec`: this hands off into a
-    // live session, which is not something to drive on a skewed pair.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // live session, which is not something to drive on a skewed pair. The name
+    // alone decides where to look (NET-058), as for exec.
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running the task in",
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
