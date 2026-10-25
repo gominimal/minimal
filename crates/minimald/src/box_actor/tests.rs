@@ -11862,7 +11862,8 @@ async fn a_hook_launched_shell_of_a_registered_box_is_kept_for_a_terminal() {
 #[test]
 fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     use super::bep_git_helper::{
-        GRANT_HOSTS, HELPER_LOG_REL, HELPER_REL, Installed, XDG_GIT_CONFIG_REL, install,
+        GRANT_HOSTS, HELPER_CONFIG_REL, HELPER_DIR_REL, HELPER_LOG_REL, HELPER_REL, Installed,
+        XDG_GIT_CONFIG_REL, install,
     };
     const SEALED: &str = "eyJ0eXAiOiJ4In0..aXY.Y3Q.dGFn";
     let delivery = |sealed: &str| boxes::SealedDelivery {
@@ -11956,4 +11957,55 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
     assert!(!plain.path().join(HELPER_REL).exists());
     assert!(!plain.path().join(XDG_GIT_CONFIG_REL).exists());
+
+    // A start that no longer has a usable grant removes the helper an
+    // earlier start wrote.
+    assert_eq!(
+        install(home.path(), &[delivery("x'; touch /tmp/owned #")]).unwrap(),
+        Installed::Refused
+    );
+    assert!(!home.path().join(HELPER_REL).exists());
+    assert!(!home.path().join(HELPER_CONFIG_REL).exists());
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(install(home.path(), &[]).unwrap(), Installed::NoGrant);
+    assert!(!home.path().join(HELPER_REL).exists());
+
+    // The box's user owns its home. A symbolic link on a path the helper
+    // writes is refused, and nothing is written through it.
+    let outside = tempfile::tempdir().unwrap();
+    let linked_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(linked_dir.path().join(".local/state")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), linked_dir.path().join(HELPER_DIR_REL)).unwrap();
+    assert!(install(linked_dir.path(), &[delivery(SEALED)]).is_err());
+    assert!(install(linked_dir.path(), &[]).is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+    let linked_config = tempfile::tempdir().unwrap();
+    let target = outside.path().join("config");
+    std::fs::write(&target, "[user]\n").unwrap();
+    let config_path = linked_config.path().join(XDG_GIT_CONFIG_REL);
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &config_path).unwrap();
+    assert!(install(linked_config.path(), &[delivery(SEALED)]).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "[user]\n");
+
+    let linked_helper = tempfile::tempdir().unwrap();
+    let helper_target = outside.path().join("helper");
+    std::fs::write(&helper_target, "keep").unwrap();
+    std::fs::create_dir_all(linked_helper.path().join(HELPER_DIR_REL)).unwrap();
+    std::os::unix::fs::symlink(&helper_target, linked_helper.path().join(HELPER_REL)).unwrap();
+    assert_eq!(
+        install(linked_helper.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(std::fs::read_to_string(&helper_target).unwrap(), "keep");
+    assert!(
+        !std::fs::symlink_metadata(linked_helper.path().join(HELPER_REL))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
