@@ -19,7 +19,13 @@ review comments there carry each ruling:
   and [arch C1 on the token](https://github.com/gominimal/minimal/pull/2546#discussion_r4369886053).
   The EGW behaviour before the first table and after the channel closes:
   [arch C2](https://github.com/gominimal/minimal/pull/2546#discussion_r4369886054).
-  This revision answers those three conditions, and arch has not ruled on
+  Arch ruled at `15b77c5b` that the channel, the token and the fail-closed
+  EGW start conform.
+- The bound on the wait for a withdrawal acknowledgement, and the citation
+  of the networking design for default deny and fail closed:
+  [arch C2](https://github.com/gominimal/minimal/pull/2546#discussion_r4369951621)
+  and [arch C1](https://github.com/gominimal/minimal/pull/2546#discussion_r4369951620).
+  This revision answers those two conditions, and arch has not ruled on
   the answer yet.
 
 The open items are at the end of this document.
@@ -384,6 +390,11 @@ In the EGW process they get these from the supervisor channel:
   control door only after the EGW process acknowledges it, so a withdrawn
   row admits no frame after the answer. The supervisor closes the channel
   on any other message.
+- Bound on the acknowledgement: the supervisor waits at most 5 seconds for
+  the acknowledgement of a withdrawal. On timeout, it stops the EGW process
+  and gvproxy on the EGW exit path below, and then answers the withdrawal.
+  No gate then runs, so the withdrawn row admits no frame after the answer,
+  and the control door does not wait without end.
 - Peer check: the EGW process reads the peer credentials of descriptor 0
   (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS). For a `socketpair`
   end, they are the credentials of the process that created the pair. The
@@ -403,8 +414,9 @@ gvproxy exit today. `supervise_switch` in `net.rs` holds the child, and an
 exit without a stop fires the exit notification. The `tokio::select!` in
 `HostGvproxy::spawn_inner` then logs an error and drops the egress handles.
 For an EGW exit, that arm also stops gvproxy. The guest then has no egress
-until the next boot, as after an unexpected gvproxy exit today (Gatehouse
-section 4.3, lines 83 and 85).
+until the next boot, as after an unexpected gvproxy exit today. The
+networking design requires default deny and that the EGW fails closed
+([networking design section 4.3, lines 83 and 85](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md)).
 
 ## Values that change between runs
 
@@ -665,6 +677,9 @@ change while root works there.
   `gvproxy-bep.sock`. Tests pin the 0660 mode and the `minimal-vmm` group
   of the gate socket, the dropped frames and refused publish requests
   before the first complete table, and the exit when the channel closes.
+  A test holds back the acknowledgement of a withdrawal in a stub EGW
+  process. It pins that after 5 seconds the supervisor stops the EGW
+  process and gvproxy, and only then answers the withdrawal.
 - `bep serve` binds `gvproxy-bep.sock` with group `minimal-gvproxy` and
   mode 0660, in place of `bind_owner_only`. The `listener.rs` peer check
   admits the `minimal-gvproxy` uid in place of its own uid, and keeps the

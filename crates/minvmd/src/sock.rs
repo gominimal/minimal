@@ -350,7 +350,7 @@ mod tests {
     /// fail this test. A rename fails it only for a name that the list takes
     /// from the code.
     #[test]
-    fn split_user_provider_dir_design_names_every_socket_owner() {
+    fn split_user_provider_dir_design_names_every_socket_owner_of_fixed_list() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/design/2026-10-25-split-user-vmm-provider-dir.md");
