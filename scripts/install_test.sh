@@ -2714,6 +2714,8 @@ STUB
     run_hc unenrolled "$root/mi-on" --user "$me"
     check 0 "$rc" "install exits 0 with neither identity"
     want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
+    want_ok "the un-enrolled install lays out the QUIC block leaf" \
+        test -d "$tree/boxes/quic443-blocked"
     want_ok "the un-enrolled install writes the marker" test -d "$tree/classifier-table"
     want_err "the un-enrolled transaction carries no SNAT rule" grep -q "snat" "$nft_input"
     want_ok "the un-enrolled install says nothing is translated" \
@@ -2723,7 +2725,8 @@ STUB
     want_err "the un-enrolled install prints no placeholder" grep -q "<cohort address>" "$OUT"
     # Taken down again so the enrolled install below starts from nothing, and
     # the recorders emptied so its transaction is the only one they hold.
-    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow"; do
+    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow" \
+        "$tree/boxes/quic443-blocked"; do
         drop_cgroup_files "$_cg"
     done
     run_hc unenrolled_uninstall "$root/mi-on" --uninstall
@@ -2739,6 +2742,7 @@ STUB
     want_ok "the box cohort exists"   test -d "$tree/boxes"
     want_ok "the deny subtree exists"  test -d "$tree/boxes/deny"
     want_ok "the allow subtree exists" test -d "$tree/boxes/allow"
+    want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
     want_ok "the table's marker exists once the transaction succeeded" \
         test -d "$tree/classifier-table"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
@@ -2759,10 +2763,11 @@ STUB
     # cgroup.procs, and that ancestor is the slice itself — and never
     # reached above the slice: a box runs as the daemon's uid, so a mount
     # root owned by that account is every cgroup on the host. The two
-    # subtrees are delegated like the cohort they live under.
+    # subtrees and the QUIC block leaf are delegated like the cohort they
+    # live under.
     _o="$(id -u):$(id -g)"
     _want=""
-    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow"; do
+    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow" "/boxes/quic443-blocked"; do
         for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
             _want="$_want$_o $tree$_cg/$_f "
         done
@@ -2976,6 +2981,7 @@ still vouches for the table it loaded" \
     drop_cgroup_files "$tree/boxes"
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
+    drop_cgroup_files "$tree/boxes/quic443-blocked"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -3114,6 +3120,7 @@ still vouches for the table it loaded" \
     drop_cgroup_files "$tree/boxes"
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
+    drop_cgroup_files "$tree/boxes/quic443-blocked"
     mkdir "$tree/boxes/deny/a-session"
     run_hc uninstall_live "$root/mi-on" --uninstall
     check 1 "$rc" "uninstall dies while a box leaf survives"
