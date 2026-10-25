@@ -314,4 +314,37 @@ mod tests {
         assert_eq!(written[0].outcome, Outcome::Refuse);
         assert!(!records.handle(&revoke_line("web")).ok);
     }
+
+    /// An audit writer whose every append fails, counting the attempts.
+    #[derive(Default)]
+    struct FailingWriter {
+        attempts: AtomicUsize,
+    }
+
+    impl AuditWriter for FailingWriter {
+        fn write(&self, _: &crate::audit::Decision) {}
+
+        fn try_write(&self, _: &crate::audit::Decision) -> std::io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("the disk is full"))
+        }
+    }
+
+    // BEP-071, BEP-067: an append that fails reaches `revoke_box`, which
+    // logs the lost record. The revocation stays in force, so the reply
+    // stays `ok`, and a second revocation of the box tries no append.
+    #[test]
+    fn revocation_stays_in_force_when_its_append_fails() {
+        let writer = Arc::new(FailingWriter::default());
+        let records = Records {
+            audit: Some(writer.clone() as Arc<dyn AuditWriter>),
+            ..Records::default()
+        };
+        let web = hex([0x03; 16]);
+        assert!(records.handle(&revoke_line(&web)).ok);
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(*records.revocations.read().unwrap(), vec![web.clone()]);
+        assert!(records.handle(&revoke_line(&web)).ok);
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 1);
+    }
 }

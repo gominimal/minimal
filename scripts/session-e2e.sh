@@ -12208,14 +12208,14 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   echo "min session destroy of web completed with the proxy down"
   for pd_try in $(seq 1 20); do
     [ "$pd_try" -gt 1 ] && sleep 0.5
-    pd_out="$(minvmd_log_lines 'the destroy completed with the Box Egress Proxy unreachable' | tail -n1)"
+    pd_out="$(minvmd_log_lines 'the destroy completed without a revocation from the Box Egress Proxy' | tail -n1)"
     [ -n "$pd_out" ] && break
   done
   if [ -z "$pd_out" ]; then
-    echo "::error::minvmd logged no warning that the destroy completed with the proxy unreachable"
+    echo "::error::minvmd logged no warning that the destroy completed without a revocation from the proxy"
     pd_fail
   fi
-  echo "minvmd log: the destroy completed with the proxy unreachable"
+  echo "minvmd log: the destroy completed without a revocation from the proxy"
 
   # The proxy comes back with the restarted daemon pair. A new box sends
   # the copied value, and the proxy refuses it.

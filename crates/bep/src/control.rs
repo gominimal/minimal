@@ -486,16 +486,22 @@ impl Records {
 
 /// Appends one record of `kind` for `box_id` to `audit`. A mint carries its
 /// identifier and `admit`, and a revocation carries no identifier and
-/// `refuse`. A record names no upstream, since neither is a request.
-fn append(audit: Option<&dyn AuditWriter>, kind: Kind, box_id: &str, identifier: Option<String>) {
+/// `refuse`. A record names no upstream, since neither is a request. A
+/// failed write is the caller's to log.
+fn append(
+    audit: Option<&dyn AuditWriter>,
+    kind: Kind,
+    box_id: &str,
+    identifier: Option<String>,
+) -> io::Result<()> {
     let Some(audit) = audit else {
-        return;
+        return Ok(());
     };
     let outcome = match kind {
         Kind::Revocation => Outcome::Refuse,
         Kind::Decision | Kind::Mint => Outcome::Admit,
     };
-    audit.write(&Decision {
+    audit.try_write(&Decision {
         kind,
         box_id: box_id.to_owned(),
         authority: String::new(),
@@ -503,7 +509,7 @@ fn append(audit: Option<&dyn AuditWriter>, kind: Kind, box_id: &str, identifier:
         mapping: Mapping::ModuleUnmapped,
         outcome,
         marker: None,
-    });
+    })
 }
 
 /// Does one request line, and keeps each new client key in `keys` before
@@ -591,7 +597,14 @@ fn handle_request(
             if identifier.is_empty() {
                 return Reply::refused("the identifier is empty");
             }
-            append(audit, Kind::Mint, &box_id, Some(identifier.to_owned()));
+            if let Err(err) = append(audit, Kind::Mint, &box_id, Some(identifier.to_owned())) {
+                tracing::error!(
+                    box_id,
+                    identifier,
+                    %err,
+                    "lost a mint record: the audit log did not take it"
+                );
+            }
             Reply::done()
         }
         Request::RevokeBox { box_id } => {
@@ -600,9 +613,19 @@ fn handle_request(
             };
             // BEP-071: the revocation names the box id alone. It is in force
             // before the record is written, so no request after this reply
-            // redeems a value that names the box.
+            // redeems a value that names the box. A failed append leaves
+            // the revocation in force until the proxy stops, and the reply
+            // stays `ok` because it is in force. The error names the lost
+            // record, since a restart cannot restore it from the log.
             if crate::revoke::record(revocations, &box_id) {
-                append(audit, Kind::Revocation, &box_id, None);
+                if let Err(err) = append(audit, Kind::Revocation, &box_id, None) {
+                    tracing::error!(
+                        box_id,
+                        %err,
+                        "lost a revocation record: the audit log did not take it, so the \
+                         revocation is in force only until the proxy stops"
+                    );
+                }
                 tracing::info!(
                     box_id,
                     "recorded a revocation: every sealed value naming the box is refused"
