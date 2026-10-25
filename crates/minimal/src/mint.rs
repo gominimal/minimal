@@ -19,8 +19,9 @@
 //! socket before any handle signed under it leaves this process (BEP-063).
 //! The proxy keeps the registration across its restarts. The target is one
 //! local key that a [`ClientKeyStore`] keeps. When the store refuses this
-//! program that key, [`local_client_key`] replaces it, and the mint registers
-//! the replacement before it delivers a handle.
+//! program that key, [`local_client_key`] replaces it. The proxy registers
+//! the replacement and revokes every other client key before the store
+//! keeps it, so no handle signed under the refused key verifies again.
 //!
 //! Box creation reads that key from the host keychain
 //! ([`HostClientKeyStore`]), so every creation signs under one key and the
@@ -282,27 +283,53 @@ pub trait ClientKeyStore {
 /// The client's local key from `store`. A store that keeps no key gets a
 /// new one. A store that refuses this program its key gets a replacement
 /// (BEP-063): the key signs handles only, and every mint registers the key
-/// it signs under, so the replacement needs no step from the operator.
+/// it signs under, so the replacement needs no step from the operator. The
+/// proxy at [`control_path`] registers the replacement and revokes the key
+/// it replaces before the store keeps it.
 ///
 /// # Errors
 ///
 /// [`MintError::Random`] when the host gives no random bytes, and
-/// [`MintError::KeyStore`] when the store fails for another reason.
+/// [`MintError::KeyStore`] when the store fails for another reason. A
+/// replacement also fails with the control socket's errors.
 pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintError> {
+    let control = control_path().unwrap_or_else(|| PathBuf::from("~/.minimal/bep/control.sock"));
+    local_client_key_at(store, &control)
+}
+
+/// [`local_client_key`], with the proxy's control socket at `control`.
+///
+/// The client cannot read the key that the store refused, so it cannot name
+/// that key to the proxy. The replacement goes to the proxy with
+/// `replace_client_key`, which revokes every other registered key. It goes
+/// before the store keeps the replacement: a proxy that is down or refuses
+/// leaves the refused key in the store, and the next creation tries again.
+///
+/// # Errors
+///
+/// As [`local_client_key`].
+pub fn local_client_key_at(
+    store: &dyn ClientKeyStore,
+    control: &Path,
+) -> Result<ClientKey, MintError> {
     let store_error = |error| match error {
         ClientKeyError::Refused(detail) | ClientKeyError::Store(detail) => {
             MintError::KeyStore(detail)
         }
     };
-    match store.find() {
+    let replacing = match store.find() {
         Ok(Some(key)) => return Ok(key),
-        Ok(None) => {}
+        Ok(None) => false,
         Err(ClientKeyError::Refused(detail)) => {
             tracing::warn!(%detail, "the keychain refused the client's signing key; replacing it");
+            true
         }
         Err(error) => return Err(store_error(error)),
-    }
+    };
     let key = ClientKey::generate()?;
+    if replacing {
+        ControlClient::connect(control)?.replace_client_key(&key)?;
+    }
     store.replace(&key).map_err(store_error)?;
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
@@ -742,6 +769,36 @@ impl ControlClient {
             Err(error) => {
                 if let MintError::Refused { error: reason, .. } = &error {
                     tracing::warn!(kid, reason, "the proxy refused the client signing key");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Registers `key` with the proxy in place of every other client key,
+    /// which the proxy revokes (BEP-063).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the key or does not
+    /// record the revocation.
+    pub fn replace_client_key(&mut self, key: &ClientKey) -> Result<(), MintError> {
+        let kid = key.kid();
+        match self.ask(&Request::ReplaceClientKey { key: key.public() }, CLIENT_KEY) {
+            Ok(reply) => {
+                for revoked in &reply.revoked {
+                    tracing::info!(kid = %revoked, replacement = %kid, "revoked the replaced client signing key at the proxy");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let MintError::Refused { error: reason, .. } = &error {
+                    tracing::warn!(
+                        kid,
+                        reason,
+                        "the proxy refused the replacement client signing key"
+                    );
                 }
                 Err(error)
             }
@@ -1327,14 +1384,14 @@ mod tests {
             .unwrap();
         runtime.spawn(control.run());
 
-        // A keychain that refuses the key gets a replacement, kept for the
-        // next mint.
+        // A keychain that refuses the key gets a replacement, registered at
+        // the proxy and kept for the next mint.
         let store = RefusingOnce::default();
-        let key = local_client_key(&store).unwrap();
-        assert_eq!(local_client_key(&store).unwrap().kid(), key.kid());
-        assert!(!clients.read().unwrap().contains(&key.kid()));
+        let key = local_client_key_at(&store, &path).unwrap();
+        assert_eq!(local_client_key_at(&store, &path).unwrap().kid(), key.kid());
+        assert!(clients.read().unwrap().contains(&key.kid()));
         // A locked keychain is not a refusal: no key is replaced.
-        let err = local_client_key(&Locked).unwrap_err();
+        let err = local_client_key_at(&Locked, &path).unwrap_err();
         assert!(matches!(err, MintError::KeyStore(_)), "{err}");
 
         let (sealing, identity) = proxy_identity(ROOT_END);
@@ -1493,6 +1550,7 @@ mod tests {
             .unwrap()
             .lines()
             .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_whitespace().next())
             .map(str::to_owned)
             .collect()
     }
@@ -1505,7 +1563,7 @@ mod tests {
         path: &Path,
         box_id: &str,
     ) -> Result<(ClientKey, Vec<Minted>), MintError> {
-        let key = local_client_key(store)?;
+        let key = local_client_key_at(store, path)?;
         let mut control = ControlClient::connect(path)?;
         let minted = mint_and_register(
             &signed_in(),
@@ -1607,13 +1665,10 @@ mod tests {
         assert_eq!(minted.len(), 1);
         assert_ne!(replacement.kid(), old.kid());
         // The replacement is registered by the time the sealed value leaves
-        // the mint, and the old key still verifies the handles under it.
+        // the mint, and the proxy revoked the old key.
         assert!(clients.read().unwrap().contains(&replacement.kid()));
-        assert!(clients.read().unwrap().contains(&old.kid()));
-        assert_eq!(
-            kept_registrations(&path),
-            vec![old.public(), replacement.public()]
-        );
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert_eq!(kept_registrations(&path), vec![replacement.public()]);
         // The keychain keeps the replacement for the next creation.
         assert_eq!(local_client_key(&store).unwrap().kid(), replacement.kid());
 
@@ -1622,5 +1677,63 @@ mod tests {
         serve_refusing(&refusing);
         let err = create(&store, &identity, &refusing, BOX_ID).unwrap_err();
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
+    }
+
+    // BEP-063: a key the keychain refuses is revoked at the proxy when it is
+    // replaced. A store handle signed under it is refused, after a restart
+    // too, and a proxy that refuses the replacement leaves the store as it
+    // was, so the next creation tries again.
+    #[test]
+    fn a_replaced_client_key_is_revoked_at_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_, identity) = proxy_identity(ROOT_END);
+        let identity_path = Path::new("identity.json");
+        let old = ClientKey::generate().unwrap();
+        let mint = |key: &ClientKey| {
+            let mut control = ControlClient::connect(&path).unwrap();
+            let minted = mint_store_handle(
+                &identity,
+                identity_path,
+                &mut control,
+                key,
+                BOX_ID,
+                &rule(),
+                NOW,
+            )
+            .unwrap();
+            minted.jws.to_string()
+        };
+        let verifies = |clients: &Registry, jws: &str| {
+            bep::handle::verify(jws, &clients.read().unwrap()).is_ok()
+        };
+
+        let (runtime, clients) = serve_control(&path);
+        let before = mint(&old);
+        assert!(verifies(&clients, &before));
+
+        let store = RefusingOnce {
+            refused: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let replacement = local_client_key_at(&store, &path).unwrap();
+        assert_ne!(replacement.kid(), old.kid());
+        assert!(!verifies(&clients, &before));
+        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        drop(runtime);
+
+        let (_restarted, clients) = serve_control(&path);
+        assert!(!verifies(&clients, &before));
+        assert!(clients.read().unwrap().contains(&replacement.kid()));
+
+        let refusing = dir.path().join("refusing.sock");
+        serve_refusing(&refusing);
+        let store = RefusingOnce {
+            refused: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let err = local_client_key_at(&store, &refusing).unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert_eq!(*store.kept.borrow(), Some(*old.secret()));
     }
 }

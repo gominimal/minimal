@@ -4261,12 +4261,15 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                            bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
                         };
                         served_ops.lock().unwrap().push(op.to_owned());
                         let reply = if op == "register_client_key" {
                             bep::control::Reply {
                                 ok: false,
                                 kid: None,
+                                revoked: Vec::new(),
                                 error: Some("the key is not a P-256 public key".into()),
                             }
                         } else {
@@ -4347,6 +4350,8 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                        bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
                     let reply = bep::control::handle_line(&line, &clients, &served_boxes);
