@@ -62,13 +62,20 @@ pub const FOREIGN_CREDENTIAL: &str = "foreign_credential";
 pub const CREDENTIAL_NOT_HEADER_SAFE: &str = "credential_not_header_safe";
 
 /// The audit marker of a request with a sealed value in one `Authorization`
-/// header and another `Authorization` header beside it. The upstream can
-/// honour either header, so the request is refused.
+/// header and another `Authorization` header beside it, or with sealed values
+/// in two headers. The upstream can honour either header, so the request is
+/// refused.
 pub const MIXED_AUTHORIZATION: &str = "mixed_authorization";
 
 /// The audit marker of a substitution whose `Authorization` header is not in
 /// the request. [`carried`] gives the header, so this is not expected.
 pub const SEALED_HEADER_MISSING: &str = "sealed_header_missing";
+
+/// The audit marker of a sealed value in a header that its injection form
+/// does not name: not the registered header or `basic_auth` field of a store
+/// reference, or not `Authorization` for a sign-in. The store is not read,
+/// and no credential is put in the request.
+pub const SEALED_HEADER_MISPLACED: &str = "sealed_header_misplaced";
 
 /// The audit marker of the record a sign-in renewal writes at the proxy
 /// (BEP-069). The record is its own line, beside the request's decision.
@@ -311,6 +318,10 @@ pub trait Redeemer: Send + Sync {
     ///
     /// The default gives [`Self::redeem`]'s verdict, so a redeemer that
     /// admits no store reference implements `redeem` alone.
+    ///
+    /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet.
+    /// `BoxRedeemer` (`redeemer.rs`) must override this to admit a store
+    /// reference, in a follow-up task outside T28.
     fn redeem_reference(
         &self,
         box_id: &str,
@@ -595,6 +606,14 @@ impl SealedAt {
     }
 }
 
+/// Whether the header at `at` in `request` is named `name`.
+fn header_named(request: &Request, at: &SealedAt, name: &str) -> bool {
+    request
+        .headers
+        .get(at.header)
+        .is_some_and(|h| h.name.eq_ignore_ascii_case(name))
+}
+
 fn sealed_in(header: usize, value: &[u8]) -> Option<SealedAt> {
     let text = std::str::from_utf8(value).ok()?.trim();
     let (scheme, rest) = text.split_once(' ').unwrap_or(("", text));
@@ -751,6 +770,11 @@ impl Flow {
     /// This flow, with `store` as the store it reads a store reference's
     /// value from. With none, every store reference is refused as
     /// [`STORE_ITEM_UNREADABLE`].
+    ///
+    /// Interim: `bep serve` does not call this yet, so a served flow has no
+    /// store. The serve path must open the store and pass it here, in a
+    /// follow-up task outside T28, together with the `BoxRedeemer` override
+    /// of [`Redeemer::redeem_reference`].
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn ValueReader>) -> Self {
         self.store = Some(store);
@@ -763,6 +787,9 @@ impl Flow {
     ///
     /// The value is read now, and dropped zeroized when the request is
     /// written. It goes to no file and no log.
+    ///
+    /// A sealed value that is not where the injection form puts the value is
+    /// refused as [`SEALED_HEADER_MISPLACED`], before the store is read.
     fn inject_store(
         &self,
         request: &mut Request,
@@ -775,7 +802,15 @@ impl Flow {
             Inject::Header { name, .. } => name.to_ascii_lowercase(),
             Inject::BasicAuth { .. } => "authorization".to_owned(),
         };
-        let read = match &self.store {
+        let placed = match &admit.inject {
+            Inject::Header { name, .. } => header_named(request, at, name),
+            Inject::BasicAuth { field } => {
+                header_named(request, at, "authorization")
+                    && matches!(&at.form, Form::Basic { in_user, .. }
+                        if *in_user == (field == inject::FIELD_USER))
+            }
+        };
+        let read = || match &self.store {
             Some(store) if store.name() == admit.store => store.read(&admit.id),
             _ => Err(ReadError::Store(crate::store::StoreError::Refused {
                 store: "proxy",
@@ -783,8 +818,14 @@ impl Flow {
                 detail: format!("no store {} is open in this flow", admit.store),
             })),
         };
-        let result = read
-            .map_err(|error| match error {
+        // The store is not read for a sealed value in the wrong header.
+        let result = (if placed {
+            Ok(())
+        } else {
+            Err(SEALED_HEADER_MISPLACED)
+        })
+        .and_then(|()| {
+            read().map_err(|error| match error {
                 ReadError::Deleted(_) => STORE_ITEM_DELETED,
                 ReadError::Disabled(_) => STORE_ITEM_DISABLED,
                 ReadError::Store(error) => {
@@ -792,7 +833,8 @@ impl Flow {
                     STORE_ITEM_UNREADABLE
                 }
             })
-            .and_then(|value| {
+        })
+        .and_then(|value| {
                 inject::inject(
                     request,
                     at.header,
@@ -911,7 +953,18 @@ impl Flow {
                                 mapping.clone(),
                             );
                         }
-                        if let Err(marker) = substitute(request, &at, &credential, self.validated) {
+                        // A sign-in credential goes in `Authorization` only,
+                        // so a sealed value in another header is refused.
+                        let placed = request
+                            .headers
+                            .get(at.header)
+                            .is_none_or(|h| h.name.eq_ignore_ascii_case("authorization"));
+                        let substituted = if placed {
+                            substitute(request, &at, &credential, self.validated)
+                        } else {
+                            Err(SEALED_HEADER_MISPLACED)
+                        };
+                        if let Err(marker) = substituted {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
@@ -963,7 +1016,11 @@ impl Flow {
             )
         } else if marker == MIXED_AUTHORIZATION {
             format!(
-                "The Box Egress Proxy refused the request to {authority}, because it has more than one Authorization header. Send the sealed credential in one Authorization header."
+                "The Box Egress Proxy refused the request to {authority}, because it carries a credential in more than one header. Send one sealed credential, in one header."
+            )
+        } else if marker == SEALED_HEADER_MISPLACED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because its sealed credential is in a header that does not carry a credential to {authority}. Send the sealed credential in the header that its secret store rule names, or in the Authorization header for a GitHub sign-in."
             )
         } else if marker == STORE_ITEM_DELETED {
             format!(
@@ -2345,6 +2402,77 @@ mod tests {
             );
         }
         assert!(files > 0, "the audit log was written");
+    }
+
+    // A store reference in a header its rule does not name is refused, and
+    // the store is not read for it.
+    #[test]
+    fn store_reference_in_unregistered_header_is_refused() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-stored-key");
+        let user = Inject::BasicAuth {
+            field: "user".to_owned(),
+        };
+        let pair = STANDARD.encode(format!("me:{sealed}"));
+        let cases = [
+            (bearer_form(), format!("x-api-key: {sealed}")),
+            (bearer_form(), format!("Cookie: Bearer {sealed}")),
+            (user.clone(), format!("x-api-key: Basic {pair}")),
+            // The sealed value is the password, and the rule fills the user.
+            (user, format!("Authorization: Basic {pair}")),
+        ];
+        for (form, header) in cases {
+            let (records, audit) = memory_audit();
+            let flow = store_flow(&store, form, audit);
+            let (upstream, end) = send_store(&flow, &header);
+            assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{header}");
+            assert!(upstream.is_empty(), "{upstream}");
+            let records = records.lock().unwrap().clone();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].outcome, Outcome::Refuse);
+            assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+        }
+        assert_eq!(store.reads(), 0, "no read for a misplaced reference");
+    }
+
+    // A sign-in credential goes in `Authorization` only: a sealed value in
+    // another header is refused, and the credential goes nowhere.
+    #[test]
+    fn sign_in_reference_outside_authorization_is_refused() {
+        let sealed = sealed_text();
+        let (records, audit) = memory_audit();
+        let flow = Flow::new(
+            "b",
+            Authority {
+                host: "api.github.com".to_owned(),
+                port: 443,
+            },
+            audit,
+            Arc::new(AdmitsWith(REAL)),
+            Validated::unchecked(()).proof(),
+        );
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: b"api.github.com".to_vec(),
+                },
+                http::Header {
+                    name: "cookie".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(flow.decide(&mut req), Err(SEALED_HEADER_MISPLACED));
+        let value = String::from_utf8(req.headers[1].value.clone()).unwrap();
+        assert_eq!(value, format!("Bearer {sealed}"));
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
     }
 
     // BEP-045: a deleted item refuses the next request that would inject it,
