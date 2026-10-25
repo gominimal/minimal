@@ -44,7 +44,9 @@ pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
 /// the first `minvmd` on `PATH`, as `Command::new("minvmd")` in the CLI's
 /// autospawn finds it. That daemon starts the proxy from the same variable,
 /// else from `bep` beside its own executable (`resolve_bep_binary` in
-/// `crates/minvmd/src/cmd/run.rs`). So the access control names the program
+/// `crates/minvmd/src/cmd/run.rs`). `current_exe()` there gives the path
+/// with symbolic links resolved, so pass `minvmd` with its links resolved
+/// too. So the access control names the program
 /// that the running daemon starts. The two functions are copies of one
 /// rule, and they must change together until one owner holds the rule:
 /// <https://github.com/gominimal/minimal/issues/2527>.
@@ -434,7 +436,11 @@ pub fn parse_dump(dump: &str, proxy: &Path) -> Vec<ItemInfo> {
 /// [`parse_dump`] for the items under `service`.
 fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> {
     let proxy = proxy.to_string_lossy();
-    let mut items = Vec::new();
+    // `dump-keychain -a` lists every keychain in the search list, so one
+    // identifier can appear more than once. Review finding 4369647108: the
+    // copies merge, and the identifier has proxy access when any copy grants
+    // it.
+    let mut items: BTreeMap<String, bool> = BTreeMap::new();
     for record in dump.split("\nkeychain: ") {
         let attr = |key: &str| {
             let prefix = format!("\"{key}\"<blob>=\"");
@@ -451,11 +457,12 @@ fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> 
             .split("entry ")
             .skip(1)
             .any(|entry| entry_admits(entry, &proxy));
-        items.push(ItemInfo { id, proxy_access });
+        *items.entry(id).or_default() |= proxy_access;
     }
-    items.sort_by(|a, b| a.id.cmp(&b.id));
-    items.dedup_by(|a, b| a.id == b.id);
     items
+        .into_iter()
+        .map(|(id, proxy_access)| ItemInfo { id, proxy_access })
+        .collect()
 }
 
 /// Whether one access-control entry allows `decrypt` and lists `proxy`.

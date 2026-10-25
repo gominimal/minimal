@@ -122,10 +122,25 @@ pub(crate) fn resolve_proxy(
                     bep::store::PROXY_BIN_ENV
                 );
             };
-            proxy_binary_path(None, &minvmd)
+            proxy_binary_path(None, &exe_path(minvmd))
         }
     };
     Ok(std::fs::canonicalize(&proxy).unwrap_or(proxy))
+}
+
+/// The path that `current_exe()` gives in a program started from `path`.
+///
+/// Review finding 4369647106: the daemon takes `bep` beside its
+/// `current_exe()`. On Linux that path has its symbolic links resolved, so
+/// a `minvmd` on PATH that is a link resolves here too. On macOS
+/// `current_exe()` is `_NSGetExecutablePath`, which gives the path that
+/// started the program and can be the link itself, so the path stays as is.
+fn exe_path(path: PathBuf) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        path
+    } else {
+        std::fs::canonicalize(&path).unwrap_or(path)
+    }
 }
 
 /// The first executable file `name` in the absolute directories of `path`,
@@ -155,7 +170,7 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
     // command line is refused before anything else happens.
     refuse_set_args(&args)?;
     let source = value_source(global.no_input, detect_source());
-    let proxy = proxy_path().context("min secret set did not read the value")?;
+    let proxy = set_proxy(&HostStore, proxy_path)?;
     run_set(
         &HostStore,
         &args,
@@ -165,6 +180,19 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
     )
+}
+
+/// The proxy path for `set`, after the store check. Review finding
+/// 4369647104: a host with no store refuses with the store message, and
+/// never sends the person to put `minvmd` on PATH first.
+fn set_proxy(
+    store: &dyn SecretStore,
+    resolve: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    store
+        .check_available()
+        .context("min secret set did not read the value")?;
+    resolve().context("min secret set did not read the value")
 }
 
 /// Prompt on the terminal, with no echo.
@@ -610,6 +638,27 @@ mod tests {
             assert!(text.contains("no secret store"), "{text}");
             assert!(out.is_empty());
         }
+
+        // Review finding 4369647104: the store check runs before the proxy
+        // path is resolved, so no `minvmd` on PATH gives the store message.
+        let resolved = std::cell::Cell::new(false);
+        let text = format!(
+            "{:#}",
+            set_proxy(&NoStore, || {
+                resolved.set(true);
+                resolve_proxy(None, None)
+            })
+            .expect_err("refused")
+        );
+        assert!(!resolved.get(), "the proxy path was resolved first");
+        assert!(text.contains("no secret store"), "{text}");
+        assert!(!text.contains("minvmd"), "{text}");
+        let store = MemorySecretStore::default();
+        let text = format!(
+            "{:#}",
+            set_proxy(&store, || resolve_proxy(None, None)).expect_err("refused")
+        );
+        assert!(text.contains("no `minvmd` program is on PATH"), "{text}");
     }
 
     #[test]
@@ -812,6 +861,16 @@ access: 1 entries
         authorizations (6): decrypt derive export_clear export_wrapped mac sign
         applications (1):
             0: /usr/bin/security (OK)
+keychain: \"/Library/Keychains/System.keychain\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"claude\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        applications (1):
+            0: /usr/bin/security (OK)
 keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
 attributes:
@@ -820,7 +879,13 @@ attributes:
 ",
             p = proxy.display()
         );
+        // Review finding 4369647108: `claude` is in two keychains, and only
+        // the first copy grants the proxy access. The copies merge, in
+        // either order, and the merged item has the proxy's access.
         let items = bep::store::parse_dump(&dump, &proxy);
+        let (head, tail) = dump.split_at(dump.find("keychain: \"/Library").unwrap());
+        let reordered = format!("{tail}\n{head}");
+        assert_eq!(bep::store::parse_dump(&reordered, &proxy), items);
         assert_eq!(
             items,
             vec![
@@ -974,6 +1039,22 @@ attributes:
                 resolve_proxy(Some(link.as_os_str()), Some(&path)).unwrap(),
                 canonical
             );
+
+            // Review finding 4369647106: PATH holds a link to the real
+            // `minvmd`, beside another `bep`. The proxy is the `bep` that
+            // the daemon's `current_exe()` names: beside the real `minvmd`
+            // on Linux, and beside the link on macOS.
+            let links = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(second.path().join("minvmd"), links.path().join("minvmd"))
+                .unwrap();
+            std::fs::write(links.path().join("bep"), b"").unwrap();
+            let linked = std::env::join_paths([links.path()]).unwrap();
+            let expected = if cfg!(target_os = "macos") {
+                std::fs::canonicalize(links.path().join("bep")).unwrap()
+            } else {
+                canonical.clone()
+            };
+            assert_eq!(resolve_proxy(None, Some(&linked)).unwrap(), expected);
         }
 
         // `run_set` refuses a relative proxy path, even one that exists.
