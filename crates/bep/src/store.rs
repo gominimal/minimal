@@ -60,9 +60,11 @@ pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBu
 /// can change, since the item's access control trusts it.
 ///
 /// `path` is a regular file, not a symbolic link, owned by the current user
-/// or by root, and not writable by group or others. Its parent directory is
-/// not writable by group or others, so nobody else can put a program in its
-/// place. Pass the canonical path.
+/// or by root, and not writable by group or others. Every directory above
+/// it, up to the root, is owned by the current user or by root and is not
+/// writable by group or others, so nobody else can put a program in its
+/// place. A directory above the parent with the sticky bit, such as `/tmp`,
+/// can be writable. Pass the canonical path.
 ///
 /// # Errors
 ///
@@ -110,22 +112,62 @@ fn check_proxy_binary_as(path: &Path, uid: u32) -> Result<(), StoreError> {
             "group or others can write to it (mode {mode:04o})"
         )));
     }
-    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+    let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
         return Err(unsafe_because("it has no parent directory".into()));
     };
-    let dir_meta = std::fs::metadata(dir).map_err(|e| StoreError::Refused {
-        store: NATIVE_STORE,
-        action: "read the proxy program",
-        detail: format!("{}: {e}", dir.display()),
-    })?;
-    let dir_mode = dir_meta.mode() & 0o7777;
-    if dir_mode & 0o022 != 0 {
-        return Err(unsafe_because(format!(
-            "group or others can write to its directory {} (mode {dir_mode:04o})",
-            dir.display()
-        )));
+    // Review finding 4369498404: someone who can change any directory above
+    // the program can rename that directory and put another in its place.
+    // So every directory up to the root passes the owner and mode rules.
+    for dir in parent.ancestors().filter(|d| !d.as_os_str().is_empty()) {
+        let dir_meta = std::fs::metadata(dir).map_err(|e| StoreError::Refused {
+            store: NATIVE_STORE,
+            action: "read the proxy program",
+            detail: format!("{}: {e}", dir.display()),
+        })?;
+        let reason = directory_unsafe_because(
+            dir,
+            dir_meta.uid(),
+            dir_meta.mode() & 0o7777,
+            uid,
+            dir == parent,
+        );
+        if let Some(reason) = reason {
+            return Err(unsafe_because(reason));
+        }
     }
     Ok(())
+}
+
+/// Why the directory `dir`, owned by `owner` with mode `mode`, lets someone
+/// other than `uid` or root replace what is below it. `None` when it does
+/// not.
+///
+/// The directory is owned by `uid` or by root, and group and others cannot
+/// write to it. A directory above the parent can be writable when its
+/// sticky bit is set, as on `/tmp`: there, only the owner of an entry can
+/// rename or remove it, and the entry below passes the owner rule too.
+#[cfg(unix)]
+fn directory_unsafe_because(
+    dir: &Path,
+    owner: u32,
+    mode: u32,
+    uid: u32,
+    parent: bool,
+) -> Option<String> {
+    if owner != uid && owner != 0 {
+        return Some(format!(
+            "its directory {} is owned by user id {owner}, not by you or root",
+            dir.display()
+        ));
+    }
+    let sticky = mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && (parent || !sticky) {
+        return Some(format!(
+            "group or others can write to its directory {} (mode {mode:04o})",
+            dir.display()
+        ));
+    }
+    None
 }
 
 /// [`check_proxy_binary`] on a host without Unix file modes: no check.
@@ -526,17 +568,17 @@ fn add_checked(
     // `security -i` can exit 0 after a refused command, and it can warn on
     // stderr after a write that succeeded. So the item itself, read back
     // with its access control, decides the result.
-    let stored = kc
-        .items(service, proxy)?
-        .iter()
-        .any(|item| item.id == id && item.proxy_access);
-    if stored {
-        return Ok(());
-    }
-    let mut detail = if warnings.is_empty() {
-        "the keychain holds no item for it that the proxy can read".to_owned()
-    } else {
-        warnings
+    let mut detail = match kc.items(service, proxy) {
+        Ok(items) if items.iter().any(|item| item.id == id && item.proxy_access) => {
+            return Ok(());
+        }
+        Ok(_) if warnings.is_empty() => {
+            "the keychain holds no item for it that the proxy can read".to_owned()
+        }
+        Ok(_) => warnings,
+        // Review finding 4369498405: the add succeeded, so an item can hold
+        // the value although the read-back failed. It goes as well.
+        Err(e) => format!("the item was added, but reading it back failed: {e}"),
     };
     // Review finding 4369438788: an item whose access control the read-back
     // did not confirm holds the value, so it goes. A staged item that stays
@@ -751,6 +793,8 @@ mod tests {
         /// The 1-based delete under [`STAGING_SERVICE`] that the keychain
         /// refuses.
         refuse_staging_delete: Option<usize>,
+        /// The 1-based add after which the read-back of the items fails.
+        refuse_read_back_of: Option<usize>,
     }
 
     impl FakeKeychain {
@@ -795,6 +839,13 @@ mod tests {
         }
 
         fn items(&self, service: &str, _proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
+            if self.adds.get() > 0 && self.refuse_read_back_of == Some(self.adds.get()) {
+                return Err(StoreError::Refused {
+                    store: NATIVE_STORE,
+                    action: "list the secrets",
+                    detail: "The specified item could not be found in the keychain.".into(),
+                });
+            }
             Ok(self
                 .items
                 .borrow()
@@ -946,6 +997,30 @@ mod tests {
         assert!(kc.items.borrow().is_empty());
     }
 
+    // Review finding 4369498405: a read-back that fails after the add
+    // leaves no item behind, and the old secret stays.
+    #[test]
+    fn secret_set_read_back_failure_removes_the_new_item() {
+        let kc = FakeKeychain {
+            refuse_read_back_of: Some(1),
+            ..FakeKeychain::default()
+        };
+        let err = set_item(&kc, "claude", b"new", Path::new(PROXY)).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("reading it back failed"), "{text}");
+        assert!(!text.contains("can remain"), "{text}");
+        assert!(kc.items.borrow().is_empty());
+
+        let kc = FakeKeychain {
+            refuse_read_back_of: Some(1),
+            ..FakeKeychain::holding("claude", b"old")
+        };
+        let err = set_item(&kc, "claude", b"new", Path::new(PROXY)).expect_err("refused");
+        assert!(err.to_string().contains("reading it back failed"), "{err}");
+        assert_eq!(kc.value(SERVICE, "claude").as_deref(), Some(&b"old"[..]));
+        assert!(kc.value(STAGING_SERVICE, "claude").is_none());
+    }
+
     /// A proxy program `bep` in a fresh directory, with the file and
     /// directory modes given.
     #[cfg(unix)]
@@ -1007,6 +1082,61 @@ mod tests {
         let err = check_proxy_binary_as(&bep, effective_uid() + 1).expect_err("refused");
         let text = err.to_string();
         assert!(text.contains("owned by user id"), "{text}");
+    }
+
+    // Review finding 4369498404: a directory that another user owns can
+    // have the program replaced, at any level above it.
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_a_parent_owned_by_another_user() {
+        let uid = 1000;
+        let dir = Path::new("/opt/minimal/bin");
+        for parent in [true, false] {
+            let reason =
+                directory_unsafe_because(dir, uid + 1, 0o755, uid, parent).expect("refused");
+            assert!(
+                reason.contains("its directory /opt/minimal/bin is owned by user id 1001"),
+                "{reason}"
+            );
+        }
+        assert!(directory_unsafe_because(dir, uid, 0o755, uid, true).is_none());
+        assert!(directory_unsafe_because(dir, 0, 0o755, uid, true).is_none());
+        // A sticky directory above the parent, as `/tmp` is, is admitted.
+        assert!(directory_unsafe_because(dir, 0, 0o1777, uid, false).is_none());
+        assert!(directory_unsafe_because(dir, 0, 0o1777, uid, true).is_some());
+
+        if effective_uid() == 0 {
+            // Root can give the directory away, so the walk itself is
+            // pinned too.
+            let (_tmp, bep) = proxy_with_modes(0o755, 0o755);
+            let bin = bep.parent().unwrap();
+            let bin_c = std::ffi::CString::new(bin.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `bin_c` is a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::chown(bin_c.as_ptr(), 12345, 0) }, 0);
+            let err = check_proxy_binary(&bep).expect_err("refused");
+            assert!(err.to_string().contains("owned by user id 12345"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_proxy_check_refuses_a_group_writable_grandparent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (tmp, bep) = proxy_with_modes(0o755, 0o755);
+        let grandparent = tmp.path();
+        std::fs::set_permissions(grandparent, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = check_proxy_binary(&bep).expect_err("refused");
+        let text = err.to_string();
+        assert!(matches!(err, StoreError::ProxyUnsafe { .. }), "{text}");
+        assert!(
+            text.contains(&format!(
+                "its directory {} (mode 0775)",
+                grandparent.display()
+            )),
+            "{text}"
+        );
+        std::fs::set_permissions(grandparent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        check_proxy_binary(&bep).expect("admitted");
     }
 
     #[cfg(unix)]
