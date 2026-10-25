@@ -415,8 +415,8 @@ In the EGW process they get these from the supervisor channel:
   hold an end of the pair.
 
 Until the EGW process holds the first complete table, the egress gate drops
-every frame, and it refuses every publish request. When the channel closes,
-or a message does not parse, the EGW process stops the gate, closes every
+every frame, and it refuses every publish request. When it reads end of
+file on the channel, or a message does not parse, the EGW process stops the gate, closes every
 relay and exits non-zero. A supervisor that exits closes its end, so an EGW
 process never outlives it.
 
@@ -449,8 +449,9 @@ process before the reap.
 
 The stop sequence, for the EGW process and for gvproxy:
 
-1. The supervisor closes its end of the supervisor channel. The EGW
-   process exits when the channel closes. gvproxy has no channel.
+1. The supervisor calls `shutdown(2)` with `SHUT_WR` on its end of the
+   supervisor channel, and keeps that end open. The EGW process then
+   reads end of file and exits. gvproxy has no channel.
 2. The supervisor sends SIGTERM to `sudo`, and `sudo` relays it to the
    command. Then it waits for the exit for `term_timeout`
    (`DEFAULT_TERM_TIMEOUT`, 3 seconds).
@@ -469,7 +470,10 @@ The supervisor observes the exit of the EGW process when two things are
 true. `waitpid(2)` reports the exit of its `sudo`, and the supervisor
 reads end of file on its end of the channel. `sudo` exits only after the
 command exits, and end of file comes only when no process holds the other
-end. For gvproxy, the exit is the exit of its `sudo`.
+end. The supervisor can read that end of file because step 1 shuts down
+only the write side of its end. It closes its end only after it observes
+the exit, or after it gives the fail-closed result. For gvproxy, the exit
+is the exit of its `sudo`.
 
 Fail-closed result: when no exit comes within the 5 seconds after the
 stop rule, the supervisor cannot prove that no gate runs. Then it does
@@ -761,9 +765,12 @@ change while root works there.
   of the gate socket, the dropped frames and refused publish requests
   before the first complete table, and the exit when the channel closes.
   A test holds back the acknowledgement of a withdrawal in a stub EGW
-  process. The stub also ignores SIGTERM and the channel close. The test
-  pins that after 5 seconds the supervisor runs the stop sequence, and
-  that the stop rule ends the stub with SIGKILL. It pins that the
+  process. The stub also ignores SIGTERM and the end of file on the
+  channel. The test pins that after 5 seconds the supervisor runs the stop
+  sequence. It pins that step 1 is a `shutdown(SHUT_WR)`: the stub reads
+  end of file, and the supervisor end stays open until the supervisor
+  reads end of file after the exit. It pins that the stop rule ends the
+  stub with SIGKILL. It pins that the
   supervisor does not answer the withdrawal as done before it observes the
   exit of the stub and of gvproxy.
   A second test gives the stub a stop rule that sends no SIGKILL, so no
