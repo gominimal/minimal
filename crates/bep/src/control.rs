@@ -83,7 +83,7 @@
 //! an idle period set, it also drops a key that nobody registered for that
 //! long. The proxy binary has no setting for the bound. It uses
 //! [`KeyBound::default`]: a fixed count and no idle period. Only an embedder
-//! that calls [`Control::with_key_bound`] sets another bound.
+//! that calls [`Control::bind_with_key_bound`] sets another bound.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -830,8 +830,28 @@ impl Control {
     /// user owns, or that other users can write, is a
     /// [`io::ErrorKind::PermissionDenied`] error.
     pub fn bind(path: &Path, registry: Registry, boxes: BoxRegistry) -> io::Result<Self> {
+        Self::bind_with_key_bound(path, registry, boxes, KeyBound::default())
+    }
+
+    /// [`Control::bind`], with the client key registry bounded by `bound`
+    /// in place of [`KeyBound::default`]. The restore applies `bound`, so a
+    /// larger bound keeps each key the file holds inside it. The proxy
+    /// binary does not call it, so its bound is the fixed default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Control::bind`].
+    pub fn bind_with_key_bound(
+        path: &Path,
+        registry: Registry,
+        boxes: BoxRegistry,
+        bound: KeyBound,
+    ) -> io::Result<Self> {
         let inner = bind_owner_only(path)?;
-        let keys = KeyFile::new(client_keys_path(path));
+        let keys = KeyFile {
+            bound,
+            ..KeyFile::new(client_keys_path(path))
+        };
         let restored = keys.restore(&registry, unix_now())?;
         tracing::info!(
             restored,
@@ -852,19 +872,6 @@ impl Control {
     #[must_use]
     pub fn with_rotation(mut self, ca: Rotation) -> Self {
         self.rotation = Some(ca);
-        self
-    }
-
-    /// Bounds the client key registry by `bound` in place of
-    /// [`KeyBound::default`], and drops at once each kept key past it. The
-    /// proxy binary does not call it, so its bound is the fixed default.
-    #[must_use]
-    pub fn with_key_bound(mut self, bound: KeyBound) -> Self {
-        let mut keys = KeyFile::new(self.keys.path.clone());
-        keys.bound = bound;
-        *keys.lock() = self.keys.lock().clone();
-        keys.sweep(&self.registry, unix_now());
-        self.keys = Arc::new(keys);
         self
     }
 
@@ -1329,6 +1336,59 @@ mod tests {
         let kept = std::fs::read_to_string(client_keys_path(&path)).unwrap();
         assert_eq!(kept.lines().count(), 1, "{kept}");
         stop(third).await;
+    }
+
+    // BEP-063: the bound that the embedder sets reaches the restore, so a
+    // count larger than the default keeps every key the file holds.
+    #[tokio::test]
+    async fn a_larger_key_bound_keeps_every_key_the_file_holds() {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path.parent().unwrap())
+            .unwrap();
+        let held = KeyBound::DEFAULT_MAX_KEYS + 4;
+        let keys: Vec<String> = (1..=u8::try_from(held).unwrap())
+            .map(|byte| {
+                let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+                URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes())
+            })
+            .collect();
+        let text: String = (unix_now() - 100..)
+            .zip(&keys)
+            .map(|(seen, key)| format!("{key} {seen}\n"))
+            .collect();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(client_keys_path(&path))
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+
+        let registry = Registry::default();
+        let bound = KeyBound {
+            max_keys: held * 2,
+            idle: None,
+        };
+        let control = Control::bind_with_key_bound(
+            &path,
+            Arc::clone(&registry),
+            BoxRegistry::default(),
+            bound,
+        )
+        .unwrap();
+        let registry = registry.read().unwrap();
+        for key in &keys {
+            let kid = Entry::parse(key, 0).unwrap().kid;
+            assert!(registry.contains(&kid), "{kid} was dropped");
+        }
+        let kept = std::fs::read_to_string(client_keys_path(&path)).unwrap();
+        assert_eq!(kept, text);
+        drop(control);
     }
 
     // BEP-063: the registry never holds more keys than its count, and drops

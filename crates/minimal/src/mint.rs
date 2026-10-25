@@ -301,9 +301,17 @@ pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintErr
 ///
 /// The client cannot read the key that the store refused, so it cannot name
 /// that key to the proxy. The replacement goes to the proxy with
-/// `replace_client_key`, which revokes every other registered key. It goes
-/// before the store keeps the replacement: a proxy that is down or refuses
-/// leaves the refused key in the store, and the next creation tries again.
+/// `replace_client_key`, which revokes every other registered key. The
+/// steps go in this order:
+///
+/// 1. `register_client_key` registers the replacement and revokes nothing.
+///    A proxy that is down or refuses leaves the refused key in the store,
+///    and the next creation tries again.
+/// 2. The store keeps the replacement. A store that fails leaves every old
+///    key registered, so running boxes keep their store handles.
+/// 3. `replace_client_key` revokes every other key. A failure here leaves
+///    the replacement registered and in the store, and is logged at warn.
+///    The next creation finds the replacement in the store.
 ///
 /// # Errors
 ///
@@ -328,9 +336,19 @@ pub fn local_client_key_at(
     };
     let key = ClientKey::generate()?;
     if replacing {
-        ControlClient::connect(control)?.replace_client_key(&key)?;
+        ControlClient::connect(control)?.register_client_key(&key)?;
     }
     store.replace(&key).map_err(store_error)?;
+    if replacing
+        && let Err(error) =
+            ControlClient::connect(control).and_then(|mut client| client.replace_client_key(&key))
+    {
+        tracing::warn!(
+            kid = %key.kid(),
+            %error,
+            "did not revoke the replaced client signing keys at the proxy"
+        );
+    }
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
 }
@@ -1735,5 +1753,37 @@ mod tests {
         let err = local_client_key_at(&store, &refusing).unwrap_err();
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
         assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+    }
+
+    /// A key store that refuses its key, and then fails to keep the
+    /// replacement, as a keychain that locks between the two steps does.
+    struct RefusingThenFailing;
+
+    impl ClientKeyStore for RefusingThenFailing {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            Err(ClientKeyError::Refused("not this program".into()))
+        }
+
+        fn replace(&self, _: &ClientKey) -> Result<(), ClientKeyError> {
+            Err(ClientKeyError::Store("locked".into()))
+        }
+    }
+
+    // BEP-063: a replacement that the store does not keep revokes no key at
+    // the proxy, so running boxes keep their store handles.
+    #[test]
+    fn a_replacement_the_store_does_not_keep_revokes_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let old = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&old)
+            .unwrap();
+
+        let err = local_client_key_at(&RefusingThenFailing, &path).unwrap_err();
+        assert!(matches!(err, MintError::KeyStore(_)), "{err}");
+        assert!(clients.read().unwrap().contains(&old.kid()));
     }
 }
