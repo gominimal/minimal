@@ -184,12 +184,14 @@ Verified against the current tree; sources in parentheses.
   `MINIMAL_SPAWN_TIMEOUT_SECS` / `MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS` for
   every recipe; do the same for manual cold boots outside `just`
   (justfile header exports).
-- **Leaked VMMs hold the bridge socket.** A VM in `krun_start_enter` ignores
-  SIGTERM; a Ctrl-C'd or killed boot can leave a detached `__krun-vmm` (and
-  the gvproxy switch) alive, making every subsequent boot fail. Reap with
-  `just reap` (`scripts/reap-vms.sh`), which SIGKILLs this checkout's
-  stranded `minvmd`/`__krun-vmm`/`gvproxy` processes; matching is scoped
-  to this checkout's binaries, so parallel checkouts are safe.
+- **Leaked VMMs and proxies hold their sockets.** A VM in `krun_start_enter`
+  ignores SIGTERM. A Ctrl-C'd or killed boot can leave a detached
+  `__krun-vmm` and the gvproxy switch alive, and then every later boot
+  fails. A `bep serve` proxy that outlives its boot holds its listener
+  socket and that boot's token. Reap with `just reap`
+  (`scripts/reap-vms.sh`), which SIGKILLs this checkout's stranded
+  `minvmd`, `__krun-vmm`, `gvproxy` and `bep serve` processes. It matches
+  only this checkout's binaries, so parallel checkouts are safe.
 - **`min` vs `minimal` naming.** The CLI crate is `minimal` but its binary is
   `min`; build with `-p minimal`, run `target/debug/min`. Cargo never
   removes old binary names, so a stale pre-rename `target/debug/minimal` can
