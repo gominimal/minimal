@@ -564,9 +564,9 @@ pub fn is_sealed(text: &str) -> bool {
 /// can come in the header its client sends a key in, such as `x-api-key`.
 ///
 /// A request with one header that holds a sealed value is
-/// [`Carried::Sealed`], unless the value is in an `Authorization` header and
-/// another `Authorization` header is beside it. That, or a second sealed
-/// value, is [`Carried::Mixed`]: the upstream can honour either header, so
+/// [`Carried::Sealed`], unless an `Authorization` header that does not hold
+/// the sealed value is beside it. That, or a second sealed value, is
+/// [`Carried::Mixed`]: the upstream can honour either header, so
 /// the decision refuses it. A request with no sealed value and an
 /// `Authorization` header is [`Carried::Foreign`].
 #[must_use]
@@ -588,7 +588,9 @@ pub fn carried(request: &Request) -> Carried {
     }
     match sealed {
         Some(_) if found > 1 => Carried::Mixed,
-        Some((_, true)) if count > 1 => Carried::Mixed,
+        // An `Authorization` header that does not hold the sealed value is
+        // the box's own credential, whichever header holds the sealed one.
+        Some((_, in_authorization)) if count > usize::from(in_authorization) => Carried::Mixed,
         Some((at, _)) => Carried::Sealed(at),
         None if count == 0 => Carried::None,
         None => Carried::Foreign,
@@ -2111,6 +2113,36 @@ mod tests {
                 assert!(!value.contains(REAL), "{value}");
             }
         }
+    }
+
+    // A sealed value in another header, such as `x-api-key`, beside the
+    // box's own `Authorization` header is mixed, in either order.
+    #[test]
+    fn sealed_in_other_header_beside_authorization_is_mixed() {
+        let sealed = sealed_text();
+        let api_key = http::Header {
+            name: "x-api-key".into(),
+            value: sealed.clone().into_bytes(),
+        };
+        let own = http::Header {
+            name: "authorization".into(),
+            value: b"Bearer sk-own".to_vec(),
+        };
+        let request = |headers: Vec<http::Header>| Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers,
+            body: http::BodyFraming::None,
+        };
+        assert!(matches!(
+            carried(&request(vec![api_key.clone()])),
+            Carried::Sealed(_)
+        ));
+        assert_eq!(
+            carried(&request(vec![api_key.clone(), own.clone()])),
+            Carried::Mixed
+        );
+        assert_eq!(carried(&request(vec![own, api_key])), Carried::Mixed);
     }
 
     // A substitution with no header at its index changes nothing and fails.
