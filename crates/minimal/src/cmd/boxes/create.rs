@@ -711,7 +711,8 @@ fn mint_grants(
     network: boxes::NetworkMode,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
-        ClientKey, ControlClient, GrantBox, MintError, ProxyRegistration, mint_and_register,
+        ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
+        local_client_key, mint_and_register,
     };
     let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
         return Ok(MintedGrants {
@@ -737,7 +738,11 @@ fn mint_grants(
     // at the proxy.
     let root_certificate = grant_root_certificate(&identity)?;
     let mut control = ControlClient::connect(&control_path)?;
-    let key = ClientKey::generate()?;
+    // BEP-063: every creation signs under the client's one kept key, so the
+    // proxy holds one registration for this client, not one for each box. A
+    // key the keychain refuses this program is replaced here, and the mint
+    // registers the replacement before any handle leaves this process.
+    let key = local_client_key(&HostClientKeyStore)?;
     let grant_box = GrantBox {
         box_id,
         grants,
@@ -1073,9 +1078,9 @@ pub(crate) async fn activate_box(
             // BEP-034/035/036: each store reference needs a rule that admits
             // it, inside the box's egress, before anything is created.
             let can_ask = !global.no_input && crate::can_prompt_interactively();
-            // The accepted rules wait on the store-handle mint (#2524). The
-            // registration already carries the egress their upstreams are
-            // checked to lie within.
+            // The accepted rules wait on a sealed `store` member kind to
+            // carry their handles (#2525). The registration already carries
+            // the egress their upstreams are checked to lie within.
             let _accepted_store_rules =
                 check_store_grants(global, &project_secrets, policy.egress.as_ref(), can_ask)?;
             // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local

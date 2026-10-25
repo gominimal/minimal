@@ -22,14 +22,12 @@
 //! program that key, [`local_client_key`] replaces it, and the mint registers
 //! the replacement before it delivers a handle.
 //!
-//! Interim: no production code calls [`local_client_key`] or
-//! [`mint_store_handle`] yet. Box creation (`mint_grants` in
-//! `cmd/boxes/create.rs`) calls [`ClientKey::generate`] for each box, so each
-//! creation registers a new key, and the proxy keeps that key permanently.
-//! The flip is that `mint_grants` reads [`local_client_key`] with a keychain
-//! store. <https://github.com/gominimal/minimal/issues/2524> owns the flip
-//! and the keychain store. <https://github.com/gominimal/minimal/issues/2525>
-//! owns the `store` member kind in `bep::seal`.
+//! Box creation reads that key from the host keychain
+//! ([`HostClientKeyStore`]), so every creation signs under one key and the
+//! proxy keeps one registration for this client.
+//! [`mint_store_handle`] has no caller yet: the sealed member list has no
+//! `store` kind to carry a handle to the box.
+//! <https://github.com/gominimal/minimal/issues/2525> owns that kind, and
 //! <https://github.com/gominimal/minimal/issues/2526> owns the
 //! `min box spec` store references.
 //!
@@ -61,7 +59,7 @@ use bep::publish::{Identity, PublishError};
 use bep::seal::{Breadth, Context, Member, MemberKind, MemberList, Mode};
 use bep::signin::{Keychain, SignInError};
 use p256::ecdsa::SigningKey;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// How long a control socket request waits for the proxy.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,13 +120,6 @@ pub enum MintError {
     /// The root CA's validity ended at or before the mint.
     RootExpired,
     /// The client key store failed for a reason other than a refusal.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-        )
-    )]
     KeyStore(String),
 }
 
@@ -204,12 +195,8 @@ impl fmt::Display for MintError {
 impl std::error::Error for MintError {}
 
 /// The client's handle-signing key. [`local_client_key`] gives the one key a
-/// [`ClientKeyStore`] keeps.
-///
-/// Interim: box creation (`mint_grants` in `cmd/boxes/create.rs`) still
-/// calls [`ClientKey::generate`] for each box. The flip is that `mint_grants`
-/// reads [`local_client_key`] with a keychain store:
-/// <https://github.com/gominimal/minimal/issues/2524>.
+/// [`ClientKeyStore`] keeps, and box creation reads it from
+/// [`HostClientKeyStore`].
 pub struct ClientKey(SigningKey);
 
 impl fmt::Debug for ClientKey {
@@ -239,13 +226,6 @@ impl ClientKey {
 
     /// The key from its 32-byte secret scalar, as a [`ClientKeyStore`] keeps
     /// it. `None` when the bytes are not a valid scalar.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-        )
-    )]
     #[must_use]
     pub fn from_secret(bytes: &[u8; 32]) -> Option<Self> {
         SigningKey::from_bytes(&(*bytes).into()).ok().map(Self)
@@ -253,13 +233,6 @@ impl ClientKey {
 
     /// The 32-byte secret scalar, for a [`ClientKeyStore`] to keep.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-        )
-    )]
     pub fn secret(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.0.to_bytes().into())
     }
@@ -279,13 +252,6 @@ impl ClientKey {
 }
 
 /// Why a [`ClientKeyStore`] did not give the client's key.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientKeyError {
     /// The store holds the key and refused this program its use.
@@ -296,13 +262,6 @@ pub enum ClientKeyError {
 
 /// The store that keeps the client's one handle-signing key across
 /// creations, the host keychain on a laptop.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-    )
-)]
 pub trait ClientKeyStore {
     /// The key the store keeps, or `None` when it keeps none.
     ///
@@ -329,13 +288,6 @@ pub trait ClientKeyStore {
 ///
 /// [`MintError::Random`] when the host gives no random bytes, and
 /// [`MintError::KeyStore`] when the store fails for another reason.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
-    )
-)]
 pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintError> {
     let store_error = |error| match error {
         ClientKeyError::Refused(detail) | ClientKeyError::Store(detail) => {
@@ -354,6 +306,220 @@ pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintErr
     store.replace(&key).map_err(store_error)?;
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
+}
+
+/// The keychain item that keeps the client's key: its service.
+const CLIENT_KEY_SERVICE: &str = "dev.minimal.client-key";
+
+/// The keychain item that keeps the client's key: its account.
+const CLIENT_KEY_ACCOUNT: &str = "minimal";
+
+/// The keychain item that keeps the client's key: its label.
+const CLIENT_KEY_LABEL: &str = "Minimal client signing key";
+
+/// The host keychain as a [`ClientKeyStore`]: the login keychain through
+/// `/usr/bin/security` on macOS, the Secret Service through `secret-tool`
+/// on Linux. The item holds the key's secret scalar, unpadded base64url.
+/// The secret goes to the tool on its stdin, never on a command line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HostClientKeyStore;
+
+impl HostClientKeyStore {
+    /// The key from the item's text. An item that holds no valid key is
+    /// refused, so [`local_client_key`] replaces it.
+    fn decode(text: &mut Vec<u8>) -> Result<ClientKey, ClientKeyError> {
+        let decoded = std::str::from_utf8(text)
+            .ok()
+            .and_then(|text| URL_SAFE_NO_PAD.decode(text.trim()).ok())
+            .map(Zeroizing::new);
+        text.zeroize();
+        decoded
+            .and_then(|bytes| {
+                <[u8; 32]>::try_from(bytes.as_slice())
+                    .ok()
+                    .map(Zeroizing::new)
+            })
+            .and_then(|bytes| ClientKey::from_secret(&bytes))
+            .ok_or_else(|| ClientKeyError::Refused("the kept item holds no valid key".into()))
+    }
+}
+
+impl ClientKeyStore for HostClientKeyStore {
+    fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+        match host_key::find()? {
+            Some(mut text) => Self::decode(&mut text).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
+        let secret = Zeroizing::new(URL_SAFE_NO_PAD.encode(key.secret().as_slice()));
+        host_key::store(&secret)?;
+        // Read the key back: a keychain tool can exit 0 and store nothing.
+        match self.find() {
+            Ok(Some(kept)) if kept.kid() == key.kid() => Ok(()),
+            _ => Err(ClientKeyError::Store(
+                "the keychain does not hold the new key after the write".into(),
+            )),
+        }
+    }
+}
+
+/// Runs a keychain tool with `stdin` on its standard input, and gives its
+/// output.
+fn run_key_tool(
+    tool: &str,
+    mut cmd: std::process::Command,
+    stdin: Option<&str>,
+) -> Result<std::process::Output, ClientKeyError> {
+    use std::process::Stdio;
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ClientKeyError::Store(format!("`{tool}` is not installed"))
+        } else {
+            ClientKeyError::Store(format!("`{tool}` did not start: {error}"))
+        }
+    })?;
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(input.as_bytes())
+            .map_err(|error| ClientKeyError::Store(error.to_string()))?;
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| ClientKeyError::Store(error.to_string()))
+}
+
+/// The text a keychain tool printed on its standard error.
+fn key_tool_error(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).trim().to_owned()
+}
+
+#[cfg(target_os = "macos")]
+mod host_key {
+    use std::process::Command;
+
+    use zeroize::{Zeroize as _, Zeroizing};
+
+    use super::{
+        CLIENT_KEY_ACCOUNT, CLIENT_KEY_LABEL, CLIENT_KEY_SERVICE, ClientKeyError, key_tool_error,
+        run_key_tool,
+    };
+
+    const SECURITY: &str = "/usr/bin/security";
+    /// `security` exits with the low byte of the keychain status. No item
+    /// matched: `errSecItemNotFound`.
+    const NOT_FOUND: i32 = 44;
+    /// The keychain holds the item and refused it to this program:
+    /// `errSecAuthFailed`, `errSecNoAccessForItem` and `userCanceled`.
+    const REFUSED: [i32; 3] = [51, 101, 128];
+
+    pub(super) fn find() -> Result<Option<Vec<u8>>, ClientKeyError> {
+        let mut cmd = Command::new(SECURITY);
+        cmd.args([
+            "find-generic-password",
+            "-s",
+            CLIENT_KEY_SERVICE,
+            "-a",
+            CLIENT_KEY_ACCOUNT,
+            "-w",
+        ]);
+        let mut out = run_key_tool(SECURITY, cmd, None)?;
+        match out.status.code() {
+            _ if out.status.success() => Ok(Some(out.stdout)),
+            Some(NOT_FOUND) => {
+                out.stdout.zeroize();
+                Ok(None)
+            }
+            Some(code) if REFUSED.contains(&code) => {
+                out.stdout.zeroize();
+                Err(ClientKeyError::Refused(key_tool_error(&out.stderr)))
+            }
+            _ => {
+                out.stdout.zeroize();
+                Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
+            }
+        }
+    }
+
+    pub(super) fn store(secret: &str) -> Result<(), ClientKeyError> {
+        // `-U` updates the item in place when it exists. Every part is
+        // quoted, and none carries a quote or a backslash: the names are
+        // fixed, and the secret is base64url.
+        let line = Zeroizing::new(format!(
+            "add-generic-password -U -s \"{CLIENT_KEY_SERVICE}\" -a \"{CLIENT_KEY_ACCOUNT}\" \
+             -l \"{CLIENT_KEY_LABEL}\" -w \"{secret}\"\n"
+        ));
+        let mut cmd = Command::new(SECURITY);
+        cmd.arg("-i");
+        let out = run_key_tool(SECURITY, cmd, Some(&line))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod host_key {
+    use std::process::Command;
+
+    use zeroize::Zeroize as _;
+
+    use super::{
+        CLIENT_KEY_ACCOUNT, CLIENT_KEY_LABEL, CLIENT_KEY_SERVICE, ClientKeyError, key_tool_error,
+        run_key_tool,
+    };
+
+    const SECRET_TOOL: &str = "secret-tool";
+
+    pub(super) fn find() -> Result<Option<Vec<u8>>, ClientKeyError> {
+        let mut cmd = Command::new(SECRET_TOOL);
+        cmd.args([
+            "lookup",
+            "service",
+            CLIENT_KEY_SERVICE,
+            "account",
+            CLIENT_KEY_ACCOUNT,
+        ]);
+        let mut out = run_key_tool(SECRET_TOOL, cmd, None)?;
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(Some(out.stdout));
+        }
+        out.stdout.zeroize();
+        // `secret-tool` exits 1 with nothing on stderr when no item matches.
+        if out.stderr.is_empty() {
+            Ok(None)
+        } else {
+            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
+        }
+    }
+
+    pub(super) fn store(secret: &str) -> Result<(), ClientKeyError> {
+        // The Secret Service replaces the item whose attributes all match.
+        let mut cmd = Command::new(SECRET_TOOL);
+        cmd.args([
+            "store",
+            &format!("--label={CLIENT_KEY_LABEL}"),
+            "service",
+            CLIENT_KEY_SERVICE,
+            "account",
+            CLIENT_KEY_ACCOUNT,
+        ]);
+        let out = run_key_tool(SECRET_TOOL, cmd, Some(secret))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
+        }
+    }
 }
 
 /// The end of the root CA's validity, the expiry of every handle minted
@@ -452,7 +618,9 @@ impl ControlClient {
             CLIENT_KEY,
         ) {
             Ok(_) => {
-                tracing::info!(kid, "registered the client signing key with the proxy");
+                // The info line is at the key's first use, in
+                // [`local_client_key`]. Each mint registers the key again.
+                tracing::debug!(kid, "registered the client signing key with the proxy");
                 Ok(())
             }
             Err(error) => {
@@ -729,7 +897,7 @@ pub fn mint_and_register(
     not(test),
     expect(
         dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
+        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
     )
 )]
 #[must_use]
@@ -759,7 +927,7 @@ pub fn store_claims(
     not(test),
     expect(
         dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
+        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
     )
 )]
 pub struct StoreHandle {
@@ -801,7 +969,7 @@ impl fmt::Debug for StoreHandle {
     not(test),
     expect(
         dead_code,
-        reason = "interim: box creation does not read the key store or mint store handles yet (https://github.com/gominimal/minimal/issues/2524)"
+        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
     )
 )]
 pub fn mint_store_handle(
@@ -860,10 +1028,7 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 /// behind (BEP-003).
 ///
 /// The client's key stays registered: the control socket has no request
-/// that withdraws a key. Until `mint_grants` reads [`local_client_key`], each
-/// creation registers a new key, and that key stays at the proxy
-/// permanently. After that flip, the client keeps the key for its next
-/// mint. <https://github.com/gominimal/minimal/issues/2524> owns the flip.
+/// that withdraws a key. The client keeps that key for its next mint.
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box
@@ -1143,5 +1308,165 @@ mod tests {
             err.to_string(),
             "The proxy did not accept this client's signing key, so the box was not created."
         );
+    }
+
+    /// A key store that keeps its key in memory.
+    #[derive(Default)]
+    struct Kept(RefCell<Option<[u8; 32]>>);
+
+    impl ClientKeyStore for Kept {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            Ok(self.0.borrow().and_then(|b| ClientKey::from_secret(&b)))
+        }
+
+        fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
+            *self.0.borrow_mut() = Some(*key.secret());
+            Ok(())
+        }
+    }
+
+    fn signed_in() -> bep::signin::MemoryKeychain {
+        use bep::signin::{Completed, Flow, Material, MemoryKeychain, store_sign_in};
+        let keychain = MemoryKeychain::default();
+        store_sign_in(
+            &keychain,
+            &Completed {
+                account: "octocat".into(),
+                flow: Flow::Device,
+                material: Material {
+                    instance: String::new(),
+                    access_token: "ghu_secret_token_value".into(),
+                    refresh_token: "ghr_secret_refresh_value".into(),
+                },
+                token_expires_at: NOW + 3_600,
+                refresh_expires_at: NOW + 86_400,
+            },
+        )
+        .unwrap();
+        keychain
+    }
+
+    fn grant_box(box_id: &str) -> GrantBox {
+        GrantBox {
+            box_id: box_id.into(),
+            grants: vec!["GH_TOKEN".into()],
+            egress: vec!["github.com".into(), "api.github.com".into()],
+            stance: Stance::OwnIp,
+        }
+    }
+
+    /// A control socket at `path` on a runtime of its own, and the client
+    /// keys it registers.
+    fn serve_control(path: &Path) -> (tokio::runtime::Runtime, Registry) {
+        let clients = Registry::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async { Control::bind(path, Arc::clone(&clients), BoxRegistry::default()) })
+            .unwrap();
+        runtime.spawn(control.run());
+        (runtime, clients)
+    }
+
+    /// The client keys the proxy at `path` keeps across its restarts.
+    fn kept_registrations(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(bep::control::client_keys_path(path))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One creation as `mint_grants` does it: the key from `store`, then
+    /// the mint and the registrations over a new connection.
+    fn create(
+        store: &dyn ClientKeyStore,
+        identity: &Identity,
+        path: &Path,
+        box_id: &str,
+    ) -> Result<(ClientKey, Vec<Minted>), MintError> {
+        let key = local_client_key(store)?;
+        let mut control = ControlClient::connect(path)?;
+        let minted = mint_and_register(
+            &signed_in(),
+            identity,
+            Path::new("identity.json"),
+            &mut control,
+            &key,
+            &grant_box(box_id),
+            NOW,
+        )?;
+        Ok((key, minted))
+    }
+
+    // BEP-063: every creation signs under the client's one kept key, so two
+    // creations leave one client key at the proxy, not one for each box.
+    #[test]
+    fn two_creations_register_one_client_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let (_, identity) = proxy_identity(ROOT_END);
+        let store = Kept::default();
+
+        let (first, minted) = create(&store, &identity, &path, BOX_ID).unwrap();
+        assert_eq!(minted.len(), 1);
+        let (second, minted) = create(
+            &store,
+            &identity,
+            &path,
+            "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f6",
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 1);
+
+        assert_eq!(first.kid(), second.kid());
+        assert!(clients.read().unwrap().contains(&first.kid()));
+        assert_eq!(kept_registrations(&path), vec![first.public()]);
+    }
+
+    // BEP-063: a key the keychain refuses this program is replaced, kept for
+    // the next creation, and registered before the mint gives a sealed value.
+    #[test]
+    fn a_refused_client_key_is_replaced_and_registered_before_the_mint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let (_, identity) = proxy_identity(ROOT_END);
+
+        // An earlier creation kept and registered this key.
+        let old = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&old)
+            .unwrap();
+        let store = RefusingOnce {
+            refused: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+
+        let (replacement, minted) = create(&store, &identity, &path, BOX_ID).unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(replacement.kid(), old.kid());
+        // The replacement is registered by the time the sealed value leaves
+        // the mint, and the old key still verifies the handles under it.
+        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        assert!(clients.read().unwrap().contains(&old.kid()));
+        assert_eq!(
+            kept_registrations(&path),
+            vec![old.public(), replacement.public()]
+        );
+        // The keychain keeps the replacement for the next creation.
+        assert_eq!(local_client_key(&store).unwrap().kid(), replacement.kid());
+
+        // A proxy that refuses the replacement gets no sealed value.
+        let refusing = dir.path().join("refusing.sock");
+        serve_refusing(&refusing);
+        let err = create(&store, &identity, &refusing, BOX_ID).unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
     }
 }

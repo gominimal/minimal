@@ -56,11 +56,11 @@
 //! is mode `0600`, and the bind refuses a file that another user owns or
 //! that other users can write.
 //!
-//! Interim: the client does not keep one key yet. Each `min` box creation
-//! registers a new key, so the file gets one line for each creation, and
-//! nothing removes a line. The client flips to one kept key in
-//! <https://github.com/gominimal/minimal/issues/2524>. Then a creation
-//! registers a key that the file already holds, and the file stops growing.
+//! The client keeps one key in its host keychain and registers it at each
+//! box creation. A key that the registry already holds is not appended
+//! again, so the file holds one line for each client key, not one for each
+//! box. A client whose keychain refuses its key registers a replacement,
+//! and the file then holds both keys. Nothing removes a line.
 
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -437,7 +437,13 @@ fn handle(
             let mut registry = registry.write().unwrap_or_else(PoisonError::into_inner);
             match registry.register(&sec1) {
                 Ok(kid) => {
-                    tracing::info!(kid, "registered a client key");
+                    // One info line for each client key, not one for each
+                    // box that registers it again.
+                    if known {
+                        tracing::debug!(kid, "the client key is already registered");
+                    } else {
+                        tracing::info!(kid, "registered a client key");
+                    }
                     Reply {
                         ok: true,
                         kid: Some(kid),
