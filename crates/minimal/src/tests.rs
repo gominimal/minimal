@@ -303,6 +303,7 @@ fn every_daemon_connection_is_classified() {
             "mint.rs::a_refused_client_key_is_replaced_and_registered_before_the_mint = ungated",
             "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy = ungated",
             "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations = ungated",
             "mint.rs::a_replacement_the_store_does_not_keep_revokes_no_key = ungated",
             "mint.rs::create = ungated",
             // The proxy's control socket, not the daemon: a replaced client
