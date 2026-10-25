@@ -1535,7 +1535,8 @@ pub(crate) mod linux {
     /// The script block that creates the users, the directories and the
     /// drop-in. The provider dir and `vmm/` sit in the login's state dir,
     /// which the login can change while root works there. So root reaches
-    /// them by `cd -P`, checks the owner of `.`, and changes only `.`.
+    /// them by `cd -P`, checks that `pwd -P` is the path it means and
+    /// checks the owner of `.`, and changes only `.`.
     fn vm_users_script(facts: &VmUsersFacts, drop_in: &str) -> String {
         let op = &facts.operator;
         let layout = &facts.layout;
@@ -1550,15 +1551,22 @@ pub(crate) mod linux {
             .collect();
         let last = components.len();
         let mut walk = String::new();
+        let mut here = String::new();
         for (i, name) in components.iter().enumerate() {
             let want = if i + 1 == last {
                 "[ \"$owner\" = \"$op_uid\" ]"
             } else {
                 "[ \"$owner\" = 0 ] || [ \"$owner\" = \"$op_uid\" ]"
             };
+            here.push('/');
+            here.push_str(name);
+            // The login can swap the entry for a symlink between the `-L`
+            // test and the `cd`, so the physical path is checked after it:
+            // `.` is then the directory at the path, whatever was swapped.
             walk.push_str(&format!(
                 "  [ ! -L '{name}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 cd -P -- '{name}'\n\
+                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 owner=$(stat -c %u .)\n\
                  \x20 {want} || {{ echo \"{provider}: a component has another owner\" >&2; exit 1; }}\n"
             ));
@@ -1578,7 +1586,7 @@ pub(crate) mod linux {
              gpasswd -M '{op}' {VMM_USER} >/dev/null\n\
              gpasswd -M '{op}' {GVPROXY_USER} >/dev/null\n\
              # The provider dir and its vmm/ subdirectory, reached from / one checked\n\
-             # component at a time; only . is changed, never a path {op} can swap.\n\
+             # component at a time and checked with pwd -P; only . is changed.\n\
              (\n\
              \x20 op_uid=$(id -u '{op}')\n\
              \x20 cd /\n\
@@ -1588,6 +1596,8 @@ pub(crate) mod linux {
              \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
              \x20 [ ! -L vmm ] || {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 cd -P vmm\n\
+             \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
+             {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 owner=$(stat -c %u .)\n\
              \x20 [ \"$owner\" = 0 ] || [ \"$owner\" = \"$(id -u {VMM_USER})\" ] || \
              {{ echo \"{provider}/vmm has another owner\" >&2; exit 1; }}\n\
@@ -2862,6 +2872,18 @@ mod tests {
         // entered with `cd -P` after a symlink check, and only `.` changes.
         assert!(script.contains("  [ ! -L 'home' ] ||"), "{script}");
         assert!(script.contains("  cd -P -- 'local-minvmd0'\n"), "{script}");
+        // A component swapped for a symlink after the `-L` test fails the
+        // physical path check, before root changes anything.
+        assert!(
+            script.contains("  [ \"$(pwd -P)\" = '/home' ] ||"),
+            "{script}"
+        );
+        let vmm_check = "[ \"$(pwd -P)\" = \
+                         '/home/alice/.local/state/minimal/providers/local-minvmd0/vmm' ] ||";
+        assert!(
+            script.contains(vmm_check),
+            "missing {vmm_check:?} in:\n{script}"
+        );
         assert!(!script.contains("chmod 0710 /home"), "{script}");
 
         let drop_in = sudoers_drop_in(
