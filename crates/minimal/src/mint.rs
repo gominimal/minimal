@@ -522,17 +522,38 @@ mod host_key {
     }
 
     pub(super) fn store(secret: &str) -> Result<(), ClientKeyError> {
-        // `-U` updates the item in place when it exists. Every part is
-        // quoted, and none carries a quote or a backslash: the names are
-        // fixed, and the secret is base64url.
+        // A replacement follows only a missing or a refused item. An item
+        // whose access list refuses this program can refuse an update in
+        // place too, so the old item goes first and a new one is added.
+        delete()?;
+        // Every part is quoted, and none carries a quote or a backslash:
+        // the names are fixed, and the secret is base64url.
         let line = Zeroizing::new(format!(
-            "add-generic-password -U -s \"{CLIENT_KEY_SERVICE}\" -a \"{CLIENT_KEY_ACCOUNT}\" \
+            "add-generic-password -s \"{CLIENT_KEY_SERVICE}\" -a \"{CLIENT_KEY_ACCOUNT}\" \
              -l \"{CLIENT_KEY_LABEL}\" -w \"{secret}\"\n"
         ));
         let mut cmd = Command::new(SECURITY);
         cmd.arg("-i");
         let out = run_key_tool(SECURITY, cmd, Some(&line))?;
         if out.status.success() {
+            Ok(())
+        } else {
+            Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
+        }
+    }
+
+    /// Deletes the kept item. No item to delete is no error.
+    fn delete() -> Result<(), ClientKeyError> {
+        let mut cmd = Command::new(SECURITY);
+        cmd.args([
+            "delete-generic-password",
+            "-s",
+            CLIENT_KEY_SERVICE,
+            "-a",
+            CLIENT_KEY_ACCOUNT,
+        ]);
+        let out = run_key_tool(SECURITY, cmd, None)?;
+        if out.status.success() || out.status.code() == Some(NOT_FOUND) {
             Ok(())
         } else {
             Err(ClientKeyError::Store(key_tool_error(&out.stderr)))
