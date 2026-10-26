@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
-use bep::control::{Control, Registry, RotationReply, RotationRequest};
+use bep::control::{Control, KeyBound, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
@@ -101,6 +101,40 @@ struct ServeArgs {
     /// supervisor exits, even when it is killed.
     #[arg(long)]
     exit_on_stdin_close: bool,
+
+    /// The most client keys the control socket keeps. A new key past it
+    /// drops the key registered least recently. Give 1 or more.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = KeyBound::DEFAULT_MAX_KEYS,
+        value_parser = parse_max_client_keys
+    )]
+    max_client_keys: usize,
+}
+
+impl ServeArgs {
+    /// The client key bound of the control socket (BEP-063). The idle
+    /// period stays `None` until gominimal/arch#85 decides the root's
+    /// validity.
+    fn key_bound(&self) -> KeyBound {
+        KeyBound {
+            max_keys: self.max_client_keys,
+            idle: None,
+        }
+    }
+}
+
+/// Reads `--max-client-keys`: a whole number of 1 or more.
+fn parse_max_client_keys(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err(
+            "give 1 or more. The control socket always keeps the key that `min` registers."
+                .to_owned(),
+        ),
+        Ok(count) => Ok(count),
+        Err(_) => Err(format!("`{value}` is not a whole number. Give 1 or more.")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -644,12 +678,21 @@ impl Wiring {
     /// The control socket at `path`, which registers into this wiring and
     /// appends its mint and revocation records to `audit`, the log the
     /// proxy's decisions go to (BEP-067).
-    fn control(&self, path: &Path, audit: Arc<dyn AuditWriter>) -> io::Result<Control> {
-        Ok(
-            Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))?
-                .with_revocations(Arc::clone(&self.revocations))
-                .with_audit(audit),
-        )
+    /// The registry keeps at most the keys that `bound` admits.
+    fn control(
+        &self,
+        path: &Path,
+        audit: Arc<dyn AuditWriter>,
+        bound: KeyBound,
+    ) -> io::Result<Control> {
+        Ok(Control::bind_with_key_bound(
+            path,
+            Arc::clone(&self.clients),
+            Arc::clone(&self.boxes),
+            bound,
+        )?
+        .with_revocations(Arc::clone(&self.revocations))
+        .with_audit(audit))
     }
 }
 
@@ -721,6 +764,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     } else {
         None
     };
+    let key_bound = args.key_bound();
     let control = args.control.clone().or_else(default_control).ok_or(
         "bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.",
     )?;
@@ -783,7 +827,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // The same socket takes `bep --rotate-signing`, which rotates the
         // signing CA the proxy signs leaves with (BEP-061).
         let control_socket = wiring
-            .control(&control, log)
+            .control(&control, log, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
         tracing::warn!("A store-handle member is not admitted until #2280 lands.");
@@ -792,6 +836,11 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             control = %control.display(),
             audit = %segment.display(),
             "the proxy is serving"
+        );
+        tracing::info!(
+            max_client_keys = key_bound.max_keys,
+            idle = ?key_bound.idle,
+            "the control socket keeps at most max_client_keys client keys"
         );
         let served = tokio::select! {
             served = listener.run(move |delivery, stream| {
@@ -1557,7 +1606,11 @@ mod tests {
         let _proxy = wiring.install(proxy, &path);
         tokio::spawn(
             wiring
-                .control(&path, Arc::new(Mutex::new(Vec::<Decision>::new())))
+                .control(
+                    &path,
+                    Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    KeyBound::default(),
+                )
                 .unwrap()
                 .run(),
         );
@@ -1666,6 +1719,78 @@ mod tests {
         };
         assert!(!parsed(&[]), "a hand-run proxy outlives its input");
         assert!(parsed(&["--exit-on-stdin-close"]));
+    }
+
+    // BEP-063: `bep serve --max-client-keys` bounds the control socket's
+    // client key registry, and a bound of zero or a word is refused before
+    // the proxy starts.
+    #[tokio::test]
+    async fn serve_passes_its_key_bound_to_the_control_socket() {
+        let serve_args = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["bep", "serve", "--listener", "/tmp/bep.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .map(|args| match args.command {
+                Some(Command::Serve(serve)) => serve,
+                None => panic!("no serve command"),
+            })
+        };
+        assert_eq!(serve_args(&[]).unwrap().key_bound(), KeyBound::default());
+        for bad in ["0", "-1", "many"] {
+            assert!(
+                serve_args(&["--max-client-keys", bad]).is_err(),
+                "{bad} is refused"
+            );
+        }
+        let serve = serve_args(&["--max-client-keys", "2"]).unwrap();
+        assert_eq!(
+            serve.key_bound(),
+            KeyBound {
+                max_keys: 2,
+                idle: None
+            }
+        );
+
+        let key = TestKey(SecretKey::from_slice(&[5u8; 32]).unwrap());
+        let wiring = wire(
+            key,
+            MemoryKeychain::default(),
+            Arc::new(signin::NoTokenEndpoint),
+            Vec::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        tokio::spawn(
+            wiring
+                .control(
+                    &path,
+                    Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    serve.key_bound(),
+                )
+                .unwrap()
+                .run(),
+        );
+
+        let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        let mut kids = Vec::new();
+        for byte in [11u8, 12, 13] {
+            let client = SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            let registered = ask(
+                &mut stream,
+                &Request::RegisterClientKey {
+                    key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                },
+            )
+            .await;
+            assert!(registered.ok, "{registered:?}");
+            kids.push(handle::kid(client.verifying_key()));
+        }
+        let clients = wiring.clients.read().unwrap();
+        assert!(!clients.contains(&kids[0]), "the oldest key is dropped");
+        assert!(clients.contains(&kids[1]));
+        assert!(clients.contains(&kids[2]));
     }
 
     /// #2501: the serve loop stops when the supervisor's pipe closes, and
