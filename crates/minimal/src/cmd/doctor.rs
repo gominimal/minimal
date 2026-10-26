@@ -14,29 +14,35 @@ use crate::task::TaskExit;
 
 /// The result lines of the audit chain check, as `min doctor` prints them.
 // The two outcome lines are fixed by the plan's diagnostics for BEP-049.
-// The lines after "chain verified." name each file where the check starts
-// again, because the files before it are missing (the BEP-049 residual).
+// A log with missing files (the BEP-049 residual) has its own first line, so
+// a script that reads the first line never sees "chain verified." for it.
+// It still exits 0: a prune also removes old files, and the check cannot
+// tell a prune from a deletion.
 fn audit_lines(check: &LogCheck) -> Vec<String> {
     match &check.broken {
         Some((segment, record)) => vec![format!(
             "Audit log: the hash chain breaks at record {record} of {}; a record was changed or removed.",
             segment.display()
         )],
-        None if check.records == 0 => vec!["Audit log: no records yet.".to_owned()],
-        None => {
-            let mut lines = vec!["Audit log: chain verified.".to_owned()];
+        None if !check.restarts.is_empty() => {
+            let mut lines = vec![
+                "Audit log: some audit files are missing. The chain in the files that remain verifies."
+                    .to_owned(),
+            ];
             for segment in &check.restarts {
                 lines.push(format!(
                     "Audit log: the files before {} are missing, so the check starts again there.",
                     segment.display()
                 ));
-                lines.push(
-                    "Audit log: min removes old audit files, so the check cannot tell if a person removed them."
-                        .to_owned(),
-                );
             }
+            lines.push(
+                "Audit log: min removes old audit files, so the check cannot tell if a person removed them."
+                    .to_owned(),
+            );
             lines
         }
+        None if check.records == 0 => vec!["Audit log: no records yet.".to_owned()],
+        None => vec!["Audit log: chain verified.".to_owned()],
     }
 }
 
@@ -154,18 +160,38 @@ mod tests {
             )
         );
 
-        // With the oldest file gone, the rest verifies, and the check says
-        // where it starts again.
+        // With the oldest file gone, the rest verifies. The first line is not
+        // "chain verified.", and the check says where it starts again.
         std::fs::remove_file(&segments[0]).unwrap();
         assert_eq!(
             run_to_string(&dir),
             (
                 true,
                 format!(
-                    "Audit log: chain verified.\n\
+                    "Audit log: some audit files are missing. The chain in the files that remain verifies.\n\
                      Audit log: the files before {} are missing, so the check starts again there.\n\
                      Audit log: min removes old audit files, so the check cannot tell if a person removed them.\n",
                     segments[1].display()
+                )
+            )
+        );
+
+        // With only an empty file left past the gap, the check still says
+        // that files are missing, not "no records yet.".
+        let last = segments.last().unwrap();
+        for segment in &segments[1..segments.len() - 1] {
+            std::fs::remove_file(segment).unwrap();
+        }
+        std::fs::write(last, "").unwrap();
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                true,
+                format!(
+                    "Audit log: some audit files are missing. The chain in the files that remain verifies.\n\
+                     Audit log: the files before {} are missing, so the check starts again there.\n\
+                     Audit log: min removes old audit files, so the check cannot tell if a person removed them.\n",
+                    last.display()
                 )
             )
         );
