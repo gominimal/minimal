@@ -1758,6 +1758,7 @@ mod tests {
             key,
             MemoryKeychain::default(),
             Arc::new(signin::NoTokenEndpoint),
+            Vec::new(),
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
