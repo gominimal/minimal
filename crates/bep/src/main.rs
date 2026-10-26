@@ -111,6 +111,13 @@ struct ServeArgs {
         value_parser = parse_max_client_keys
     )]
     max_client_keys: usize,
+
+    /// Move each audit log segment that holds a line bep cannot read into
+    /// the `quarantine` directory beside the log, then start. bep records
+    /// again the revocations it can read in a moved segment. A destroyed
+    /// box that only an unreadable line records is no longer refused.
+    #[arg(long)]
+    quarantine_unreadable: bool,
 }
 
 impl ServeArgs {
@@ -699,8 +706,10 @@ impl Wiring {
 /// Refuses the start when the audit log holds a complete line that does not
 /// parse. That line can be a revocation, and a start without it redeems a
 /// value for a destroyed box (BEP-068). The partial last line of a torn
-/// write is cut when the log opens, so it is not counted here.
-fn refuse_unreadable(restored: &revoke::Restored) -> Result<(), String> {
+/// write is cut when the log opens, so it is not counted here. The refusal
+/// names `--quarantine-unreadable`, which moves those segments aside
+/// (BEP-068), in place of a hand edit of the log.
+fn refuse_unreadable(restored: &revoke::Restored, dir: &Path) -> Result<(), String> {
     if restored.skipped == 0 {
         return Ok(());
     }
@@ -714,18 +723,59 @@ fn refuse_unreadable(restored: &revoke::Restored) -> Result<(), String> {
         .iter()
         .map(|path| format!("  {}", path.display()))
         .collect();
-    let (lines, these) = if restored.skipped == 1 {
-        ("1 line".to_owned(), "that line")
+    let lines = if restored.skipped == 1 {
+        "1 line".to_owned()
     } else {
-        (format!("{} lines", restored.skipped), "those lines")
+        format!("{} lines", restored.skipped)
+    };
+    let these = if restored.unreadable.len() == 1 {
+        "that segment"
+    } else {
+        "those segments"
     };
     Err(format!(
         "bep did not start. The audit log has {lines} that bep cannot read, in:\n{}\n\
          A line that bep cannot read can record a destroyed box. \
          Without it, bep cannot keep refusing that box.\n\
-         Repair or remove {these}, then run `bep serve` again.",
-        segments.join("\n")
+         To move {these} into {} and start, run `bep serve` again with `--quarantine-unreadable`.\n\
+         bep then records again the revocations it can read there. \
+         A destroyed box that only an unreadable line records is no longer refused.",
+        segments.join("\n"),
+        dir.join(audit::QUARANTINE_DIR).display()
     ))
+}
+
+/// Opens the audit log in `dir` and reads the revocations it records, for
+/// `bep serve`. With `quarantine`, the segments that hold an unreadable
+/// line move aside first, and the log is read again. Without it, such a
+/// line refuses the start.
+fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Restored), String> {
+    // Locked first, so no other writer rotates the segments under the read.
+    let mut log = open_audit_log(dir)?;
+    let read = |dir: &Path| {
+        revoke::restore(dir)
+            .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))
+    };
+    // BEP-068: the log rotates its segments, and the revocations in every
+    // retained segment are in force again from this start.
+    let mut restored = read(dir)?;
+    if quarantine && restored.skipped > 0 {
+        log.quarantine_unreadable().map_err(|err| {
+            format!(
+                "bep did not move the audit log segments it cannot read into {}: {err}",
+                dir.join(audit::QUARANTINE_DIR).display()
+            )
+        })?;
+        restored = read(dir)?;
+    }
+    tracing::info!(
+        count = restored.box_ids.len(),
+        box_ids = ?restored.box_ids,
+        audit = %dir.display(),
+        "restored the revocations recorded in the audit log"
+    );
+    refuse_unreadable(&restored, dir)?;
+    Ok((log, restored))
 }
 
 /// Opens the audit log in `dir` for `bep serve`. The log holds the
@@ -770,19 +820,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
-    // Locked first, so no other writer rotates the segments under the read.
-    let log = open_audit_log(&dir)?;
-    // BEP-068: the log rotates its segments, and the revocations in every
-    // retained segment are in force again from this start.
-    let restored = revoke::restore(&dir)
-        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?;
-    tracing::info!(
-        count = restored.box_ids.len(),
-        box_ids = ?restored.box_ids,
-        audit = %dir.display(),
-        "restored the revocations recorded in the audit log"
-    );
-    refuse_unreadable(&restored)?;
+    let (log, restored) = start_audit_log(&dir, args.quarantine_unreadable)?;
     let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
@@ -1230,21 +1268,119 @@ mod tests {
     // fails closed and names the segment that holds it.
     #[test]
     fn serve_refuses_start_on_unreadable_audit_line() {
-        assert_eq!(refuse_unreadable(&revoke::Restored::default()), Ok(()));
+        let dir = Path::new("/audit");
+        assert_eq!(refuse_unreadable(&revoke::Restored::default(), dir), Ok(()));
         let restored = revoke::Restored {
             box_ids: Vec::new(),
             skipped: 2,
             unreadable: vec![PathBuf::from("/audit/audit-0.jsonl")],
         };
-        let err = refuse_unreadable(&restored).unwrap_err();
+        let err = refuse_unreadable(&restored, dir).unwrap_err();
         assert_eq!(
             err,
             "bep did not start. The audit log has 2 lines that bep cannot read, in:\n  \
              /audit/audit-0.jsonl\n\
              A line that bep cannot read can record a destroyed box. \
              Without it, bep cannot keep refusing that box.\n\
-             Repair or remove those lines, then run `bep serve` again."
+             To move that segment into /audit/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n\
+             bep then records again the revocations it can read there. \
+             A destroyed box that only an unreadable line records is no longer refused."
         );
+    }
+
+    // BEP-068: `bep serve --quarantine-unreadable` moves a segment with an
+    // unreadable line aside and starts. The quarantine record bridges the
+    // gap, so the chain verifies across it, and a revocation read in the
+    // moved segment stays in force at the next start.
+    #[test]
+    fn quarantine_keeps_the_chain_and_starts() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome, Record};
+        let decision = |kind: Kind, box_id: &str| Decision {
+            kind,
+            box_id: box_id.to_owned(),
+            authority: String::new(),
+            identifier: None,
+            // A mint or a revocation carries no handle. The test's
+            // decisions carry none either.
+            jti: String::new(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: if kind == Kind::Revocation {
+                Outcome::Refuse
+            } else {
+                Outcome::Admit
+            },
+            marker: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Three segments of one chain. The middle one holds a revocation,
+        // and its last line is then made unreadable.
+        let plan: [&[(Kind, &str)]; 3] = [
+            &[(Kind::Decision, "box-a"), (Kind::Mint, "box-a")],
+            &[(Kind::Revocation, "box-a"), (Kind::Decision, "box-b")],
+            &[(Kind::Decision, "box-b")],
+        ];
+        let mut head = audit::ZERO_HASH.to_owned();
+        let mut files = Vec::new();
+        for records in plan {
+            let mut lines = Vec::new();
+            for (kind, box_id) in records {
+                let line = Record::from_decision(&decision(*kind, box_id), &head).to_line();
+                head = audit::line_hash(&line);
+                lines.push(line);
+            }
+            files.push(lines);
+        }
+        // A record of a kind this bep does not know, chained in place, is
+        // no unreadable line.
+        let future = format!(
+            "{{\"schema\":\"{}\",\"kind\":\"future_kind\",\"previous_hash\":\"{head}\"}}",
+            audit::SCHEMA
+        );
+        files[2].push(future);
+        files[1][1] = "{\"schema\":\"min/v1/audit\",\"kind\":\"decis".to_owned();
+        for (n, lines) in files.iter().enumerate() {
+            std::fs::write(
+                dir.join(audit::segment_name(n as u64)),
+                lines
+                    .iter()
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        assert!(audit::verify_chain(&dir).unwrap().is_err());
+
+        let refused = start_audit_log(&dir, false).unwrap_err();
+        assert!(refused.contains("--quarantine-unreadable"), "{refused}");
+
+        let (mut log, restored) = start_audit_log(&dir, true).unwrap();
+        assert_eq!(restored.box_ids, vec!["box-a".to_owned()]);
+        assert_eq!(restored.skipped, 0);
+        assert!(!dir.join("audit-1.jsonl").exists());
+        assert!(dir.join("quarantine/audit-1.jsonl").exists());
+        // The revocation recorded again carries a marker, so it does not
+        // read as a second destroy of box-a.
+        let restated: Vec<_> = audit::LogReader::new(&dir)
+            .read_new()
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.record.kind == Kind::Revocation)
+            .collect();
+        assert_eq!(restated.len(), 1);
+        assert_eq!(restated[0].record.marker.as_deref(), Some(audit::RESTATED));
+        let verified = audit::verify_chain(&dir).unwrap();
+        assert!(verified.is_ok(), "{verified:?}");
+        log.append(&decision(Kind::Decision, "box-c")).unwrap();
+        assert!(audit::verify_chain(&dir).unwrap().is_ok());
+        drop(log);
+
+        // The next start needs no flag, and box-a is still revoked.
+        let (_, restored) = start_audit_log(&dir, false).unwrap();
+        assert_eq!(restored.box_ids, vec!["box-a".to_owned()]);
     }
 
     // BEP-068: a second `bep serve` on the same audit directory is refused,
