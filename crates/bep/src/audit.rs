@@ -761,6 +761,8 @@ impl AuditLog {
         };
         let found = numbered_segments(&dir)?;
         let quarantine_dir = dir.join(QUARANTINE_DIR);
+        // The plan reads every segment and changes nothing, so an error in
+        // it leaves the log as it was.
         let mut moved = Vec::new();
         let mut active_moved = false;
         // The hash the chain carries out of the segment before this one.
@@ -798,7 +800,6 @@ impl AuditLog {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            create_private_dir(&quarantine_dir)?;
             let moved_to = quarantine_dir.join(&name);
             if fs::symlink_metadata(&moved_to).is_ok() {
                 return Err(io::Error::new(
@@ -806,14 +807,6 @@ impl AuditLog {
                     format!("{} exists already", moved_to.display()),
                 ));
             }
-            fs::rename(path, &moved_to)?;
-            tracing::warn!(
-                segment = %path.display(),
-                moved_to = %moved_to.display(),
-                unreadable,
-                final_hash = %final_hash,
-                "moved an audit segment with unreadable lines to quarantine"
-            );
             active_moved |= *n == active;
             let mut revoked: Vec<String> = Vec::new();
             for line in &lines {
@@ -840,11 +833,20 @@ impl AuditLog {
                 revoked,
             });
         }
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+        create_private_dir(&quarantine_dir)?;
         if active_moved {
-            // The moved segment's file is the one this log writes, so the
-            // log goes on in a new segment, chained to its head.
+            // The log writes the records below to a segment that stays, so
+            // it goes on in a new segment, chained to its head, before it
+            // moves the active one.
             self.open_next()?;
         }
+        // Each segment's record and revocations go to the log before the
+        // segment moves. A failure or a crash between the two leaves the
+        // segment in place, and the next quarantine moves it. It never
+        // leaves a moved segment without its record or its revocations.
         for quarantined in &mut moved {
             self.prepare()?;
             quarantined.record.previous_hash = self.head.clone();
@@ -860,6 +862,14 @@ impl AuditLog {
                     marker: None,
                 })?;
             }
+            fs::rename(&quarantined.segment, &quarantined.moved_to)?;
+            tracing::warn!(
+                segment = %quarantined.segment.display(),
+                moved_to = %quarantined.moved_to.display(),
+                unreadable = quarantined.record.unreadable,
+                final_hash = %quarantined.record.final_hash,
+                "moved an audit segment with unreadable lines to quarantine"
+            );
         }
         Ok(moved)
     }
@@ -1757,6 +1767,60 @@ mod tests {
         assert_eq!(verify_chain(&audit).unwrap(), Ok(3));
         let batch = LogReader::new(&audit).read_new().unwrap();
         assert_eq!((batch.skipped, batch.other_kinds), (0, 1));
+        assert!(
+            batch
+                .entries
+                .iter()
+                .any(|entry| entry.record.kind == Kind::Revocation)
+        );
+    }
+
+    // BEP-068: a quarantine that fails part way moves no segment it did
+    // not record, so a revocation in a bad segment stays in the log.
+    #[test]
+    fn quarantine_that_fails_leaves_no_moved_segment_unrecorded() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        log.append(&revocation("box-gone")).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&admit()).unwrap();
+        drop(log);
+        for n in [0, 1] {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(audit.join(segment_name(n)))
+                .unwrap();
+            file.write_all(b"not a record\n").unwrap();
+        }
+        // A file in the way of the second move.
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        let blocker = audit.join(QUARANTINE_DIR).join(segment_name(1));
+        fs::write(&blocker, b"").unwrap();
+        let before: Vec<Vec<u8>> = (0..3)
+            .map(|n| fs::read(audit.join(segment_name(n))).unwrap())
+            .collect();
+
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let err = log.quarantine_unreadable().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        drop(log);
+        assert!(!audit.join(QUARANTINE_DIR).join(segment_name(0)).exists());
+        let after: Vec<Vec<u8>> = (0..3)
+            .map(|n| fs::read(audit.join(segment_name(n))).unwrap())
+            .collect();
+        assert_eq!(after, before);
+
+        fs::remove_file(&blocker).unwrap();
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let moved = log.quarantine_unreadable().unwrap();
+        assert_eq!(moved.len(), 2);
+        assert_eq!(moved[0].revoked, vec!["box-gone".to_owned()]);
+        drop(log);
+        assert!(verify_chain(&audit).unwrap().is_ok());
+        let batch = LogReader::new(&audit).read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
         assert!(
             batch
                 .entries
