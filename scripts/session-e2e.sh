@@ -419,6 +419,7 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+SR_ID="" # the store-reference proof's Keychain item; removed on teardown
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1010,6 +1011,11 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  # The store-reference proof's Keychain item is in the developer's real
+  # Keychain, not under $WORK. Its rule is in $XDG_CONFIG_HOME, which the
+  # `rm -rf "$WORK"` below removes. `min secret rm` uses only the host store
+  # and starts no daemon, so it runs after the stop above.
+  [ -n "$SR_ID" ] && mnl secret rm "$SR_ID" </dev/null >/dev/null 2>&1
   [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
