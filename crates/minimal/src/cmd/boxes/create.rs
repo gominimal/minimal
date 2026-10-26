@@ -1004,6 +1004,11 @@ pub(crate) fn put_spec(
 /// mode, policy and hooks choice as the flags. A project with no
 /// `minimal.toml` has no `[session]` table.
 ///
+/// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
+/// builds its own `CreateSessionRequest` and does not call this yet, so a
+/// session box created from `min dash` has no stored spec. That file is
+/// outside this change. A follow-up must call this function there.
+///
 /// # Errors
 ///
 /// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
