@@ -254,6 +254,12 @@ pub(crate) fn render(
                 if let Some(marker) = &record.marker {
                     write!(out, "  {}", printable(marker))?;
                 }
+                // BEP-067: the handle's correlation id, when the record has
+                // one. A request with no handle, or a handle that does not
+                // parse, has none.
+                if !record.jti.is_empty() {
+                    write!(out, "  jti={}", printable(&record.jti))?;
+                }
                 writeln!(out)?;
             }
         }
@@ -534,6 +540,7 @@ mod tests {
             box_id: box_id.to_owned(),
             authority: authority.to_owned(),
             identifier: None,
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some("off_module".to_owned()),

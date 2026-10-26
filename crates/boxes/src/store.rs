@@ -851,11 +851,44 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-impl Loader for DiskLoader {
-    type Key = DiskBoxKey;
-    type Object = DiskBox;
-
-    fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+impl DiskLoader {
+    /// Files `record` under the id it already carries, which the caller
+    /// minted: [`Loader::create`] mints one, and the daemon's store mints
+    /// its own and refuses an id a retained record names before it calls
+    /// this (BOX-001). The name checks are the same as [`Loader::create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for the nil id or an invalid name, `Other`
+    /// when the index already holds the id, `AlreadyExists` when another
+    /// session holds the name, and an I/O error if the session directory,
+    /// record, or index cannot be written. A held id is never
+    /// `AlreadyExists`: a caller reads that kind as a name collision and
+    /// retries under another name.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the directory key is always five hex digits, a
+    /// valid relative path.
+    pub fn create_with_id(&mut self, record: Record) -> Result<DiskBoxKey, std::io::Error> {
+        if record.id.is_nil() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a box record cannot be filed under the nil id",
+            ));
+        }
+        // BOX-001: an id names one box. A handed id that the index already
+        // holds fails closed here, before anything is written.
+        if self.index.short_by_id(&record.id).is_some() {
+            tracing::warn!(
+                box_id = %record.id,
+                "refused to file a box record: the index already holds its id"
+            );
+            return Err(std::io::Error::other(format!(
+                "the box id {} is already in use by another box",
+                record.id
+            )));
+        }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
             if let Some(existing_id) = self.index.find_by_name_folded(name) {
@@ -873,11 +906,7 @@ impl Loader for DiskLoader {
             }
         }
 
-        // The box id is the record's one key, minted here: a client never
-        // names it, so `record.id` is overwritten whatever it held.
-        let id = SessionId::mint();
-        record.id = id;
-
+        let id = record.id;
         let id_hex = id.simple();
         let mut short = id_hex[id_hex.len() - 5..].to_string();
         // We got unlucky and the short name collided, 20 bits of entropy
@@ -898,6 +927,18 @@ impl Loader for DiskLoader {
             session_id: id,
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
+    }
+}
+
+impl Loader for DiskLoader {
+    type Key = DiskBoxKey;
+    type Object = DiskBox;
+
+    fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+        // The box id is the record's one key, minted here: a client never
+        // names it, so `record.id` is overwritten whatever it held.
+        record.id = SessionId::mint();
+        self.create_with_id(record)
     }
 
     fn keys(&self) -> impl Iterator<Item = Self::Key> {
@@ -1227,10 +1268,34 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            // Set, so a field dropped on write shows up as a diff: `None` is
+            // the serde default of all three.
+            box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+            parent: Some(SessionId::mint()),
+            project_root: Some(HostAbsPath::try_new("/home/alice/proj").unwrap()),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
         }
+    }
+
+    /// BOX-001: `create_with_id` refuses an id the index already holds,
+    /// with a kind that is not `AlreadyExists`, and writes nothing.
+    #[test]
+    fn create_with_id_refuses_an_id_the_index_holds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let held = loader.create(sample_record()).unwrap();
+
+        let mut again = sample_record();
+        again.id = held.session_id;
+        again.name = Some("another-name".to_string());
+        let err = loader.create_with_id(again).unwrap_err();
+
+        assert_ne!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.keys().count(), 1, "nothing new is filed");
+        assert_eq!(loader.find_by_name("another-name").unwrap(), None);
+        assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
     }
 
     #[test]
@@ -1735,6 +1800,76 @@ mod tests {
         promoted.status = BoxState::Active;
         loader.save(&key, &promoted).unwrap();
         assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    /// BOX-001: a record written before `box_type`, `parent` and
+    /// `project_root` existed still loads, with all three absent and every
+    /// other field as it was written. A record written now carries all
+    /// three keys, `parent` as `null` when the box has none.
+    #[test]
+    fn records_without_the_new_fields_still_load() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let old_short = "0ld00";
+        let old_dir = root.as_utf8_path().join("sessions").join(old_short);
+        std::fs::create_dir_all(old_dir.as_std_path()).unwrap();
+        let mut old_record = sample_record();
+        old_record.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        let mut raw = serde_json_lenient::to_value(&old_record).unwrap();
+        let object = raw.as_object_mut().unwrap();
+        for key in ["box_type", "parent", "project_root"] {
+            assert!(object.remove(key).is_some(), "{key} is written today");
+        }
+        std::fs::write(
+            old_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_id(&old_record.id)
+            .unwrap()
+            .expect("the old record is indexed");
+        let read_back = loader.get(&key).unwrap().record().clone();
+        assert_eq!(read_back.box_type, None);
+        assert_eq!(read_back.parent, None);
+        assert_eq!(read_back.project_root, None);
+        assert_eq!(
+            read_back,
+            Record {
+                box_type: None,
+                parent: None,
+                project_root: None,
+                ..old_record
+            },
+            "every other field loads as it was written"
+        );
+
+        let mut fresh = sample_record();
+        fresh.name = Some("fresh".to_string());
+        fresh.parent = None;
+        let fresh_key = loader.create(fresh).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(
+                loader_dir(&tmp)
+                    .as_utf8_path()
+                    .join("sessions")
+                    .join(fresh_key.dir_key.as_str())
+                    .join("record.json")
+                    .as_std_path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "session");
+        assert!(written["parent"].is_null());
+        assert!(
+            written.as_object().unwrap().contains_key("parent"),
+            "no parent is written as null, not left out"
+        );
+        assert_eq!(written["project_root"], "/home/alice/proj");
     }
 
     #[test]
