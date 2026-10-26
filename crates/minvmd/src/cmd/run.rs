@@ -3293,9 +3293,10 @@ mod tests {
     use super::*;
 
     /// BEP-051: `minvmd` starts the proxy that `min secret set` names in an
-    /// item's access control. Both take it from
-    /// `bep::store::proxy_binary_path`, for one `PATH` and one
-    /// `MINVMD_BEP_BIN`.
+    /// item's access control, for one `PATH` and one `MINVMD_BEP_BIN`.
+    /// `min secret` resolves through `bep::store::proxy_binary_on_path`,
+    /// which `resolve_proxy` in `crates/minimal/src/cmd/secret.rs` calls with
+    /// the process's `PATH`. `minvmd` resolves from its own `current_exe()`.
     #[test]
     fn minvmd_and_min_secret_resolve_the_same_proxy_binary() {
         let dir = tempfile::tempdir().unwrap();
@@ -3305,16 +3306,53 @@ mod tests {
         for file in [&minvmd, &bep, &other] {
             std::fs::write(file, b"").unwrap();
         }
-        let exe = || Some(minvmd.clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&minvmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bep = std::fs::canonicalize(&bep).unwrap();
+        let other = std::fs::canonicalize(&other).unwrap();
+        // The `minvmd` that autospawn starts from this PATH, with the path
+        // its own `current_exe()` gives.
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path(), dir.path()]).unwrap();
+        let started = std::fs::canonicalize(&minvmd).unwrap();
+        let exe = || Some(started.clone());
         for env in [None, Some(""), Some(other.to_str().unwrap())] {
             let env = env.map(std::ffi::OsStr::new);
-            let shared = ::bep::store::proxy_binary_path(env, exe);
-            assert_eq!(super::bep_binary_at(env, exe), shared, "{env:?}");
+            let min_secret = ::bep::store::proxy_binary_on_path(env, Some(&path)).unwrap();
+            assert_eq!(super::bep_binary_at(env, exe), Some(min_secret), "{env:?}");
         }
         assert_eq!(super::bep_binary_at(None, exe), Some(bep.clone()));
         assert_eq!(
             super::bep_binary_at(Some(other.as_os_str()), exe),
             Some(other.clone())
+        );
+
+        // PATH that reaches `minvmd` through a link: on Linux both take the
+        // `bep` beside the real `minvmd`.
+        #[cfg(target_os = "linux")]
+        {
+            let links = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&minvmd, links.path().join("minvmd")).unwrap();
+            std::fs::write(links.path().join("bep"), b"").unwrap();
+            let linked = std::env::join_paths([links.path()]).unwrap();
+            assert_eq!(
+                super::bep_binary_at(None, exe),
+                Some(::bep::store::proxy_binary_on_path(None, Some(&linked)).unwrap())
+            );
+        }
+
+        // A relative variable or a relative PATH entry names no proxy for
+        // `min secret`, so it never trusts a program the daemon cannot find.
+        assert_eq!(
+            ::bep::store::proxy_binary_on_path(Some(std::ffi::OsStr::new("bep")), Some(&path)),
+            Err(::bep::store::ProxyLookupError::RelativeEnv("bep".into()))
+        );
+        assert_eq!(
+            ::bep::store::proxy_binary_on_path(None, Some(std::ffi::OsStr::new("bin"))),
+            Err(::bep::store::ProxyLookupError::NoMinvmd)
         );
 
         // A path that names no file starts no proxy.

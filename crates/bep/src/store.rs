@@ -43,11 +43,9 @@ pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
 /// This is the one definition of the rule. `minvmd` starts the proxy from
 /// it (`resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`), with
 /// `minvmd` as its own `current_exe()`. `min secret` names the same program
-/// in an item's access control (`resolve_proxy` in
-/// `crates/minimal/src/cmd/secret.rs`), with `minvmd` as the first `minvmd`
-/// on `PATH`, which is the program that the CLI's autospawn starts.
-/// `current_exe()` gives the path with symbolic links resolved on Linux, so
-/// a caller that finds `minvmd` on `PATH` resolves its links too.
+/// in an item's access control, through [`proxy_binary_on_path`], with
+/// `minvmd` as the first `minvmd` on `PATH`, which is the program that the
+/// CLI's autospawn starts.
 ///
 /// `minvmd` runs only when the variable does not give the path. Each
 /// resolution logs one debug line that names the path.
@@ -62,6 +60,77 @@ pub fn proxy_binary_path(
     };
     tracing::debug!(proxy = %path.display(), "resolved the proxy binary path");
     Some(path)
+}
+
+/// Why [`proxy_binary_on_path`] gives no proxy path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyLookupError {
+    /// [`PROXY_BIN_ENV`] holds this relative path.
+    RelativeEnv(PathBuf),
+    /// The variable gives no path, and no executable `minvmd` is on `PATH`.
+    NoMinvmd,
+}
+
+/// The proxy that a `minvmd` started from `path` starts, by
+/// [`proxy_binary_path`]. `min secret` names this path in an item's access
+/// control. `minvmd` is the first executable `minvmd` in an absolute entry
+/// of `path`, which is the program that `Command::new("minvmd")` starts.
+///
+/// The access control trusts this path, so it is absolute. A relative
+/// variable is refused, and an empty or relative `PATH` entry is skipped,
+/// so a program in the current directory never becomes the trusted one.
+/// The `minvmd` that is found takes the path that its `current_exe()`
+/// gives: links resolved on Linux, as is on macOS. A proxy path that
+/// exists comes back canonical, and one that does not comes back as is.
+///
+/// # Errors
+///
+/// [`ProxyLookupError`] when the variable is relative, or when it gives no
+/// path and no `minvmd` is on `path`.
+pub fn proxy_binary_on_path(
+    env: Option<&std::ffi::OsStr>,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, ProxyLookupError> {
+    let env = env.filter(|v| !v.is_empty());
+    if let Some(env) = env.map(Path::new)
+        && !env.is_absolute()
+    {
+        return Err(ProxyLookupError::RelativeEnv(env.to_path_buf()));
+    }
+    let proxy = proxy_binary_path(env, || find_on_path("minvmd", path).map(exe_path))
+        .ok_or(ProxyLookupError::NoMinvmd)?;
+    Ok(std::fs::canonicalize(&proxy).unwrap_or(proxy))
+}
+
+/// The path that `current_exe()` gives in a program started from `path`.
+/// On Linux that path has its symbolic links resolved. On macOS
+/// `current_exe()` is `_NSGetExecutablePath`, which gives the path that
+/// started the program and can be the link itself.
+fn exe_path(path: PathBuf) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        path
+    } else {
+        std::fs::canonicalize(&path).unwrap_or(path)
+    }
+}
+
+/// The first executable `name` in an absolute entry of `path`.
+fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Refuse a proxy binary that a user other than the current one or root
