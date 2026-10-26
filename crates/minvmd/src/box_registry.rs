@@ -3118,10 +3118,15 @@ fn audit_revocation_holding(
         } else {
             format!("{} lines", batch.skipped)
         };
+        // `bep serve --quarantine-unreadable` moves those segments aside and
+        // records again the revocations it reads there (BEP-068), so the
+        // refusal names it as the way out.
         return Err(unread(format!(
             "{lines} in {} did not parse, and a line that does not parse can record a destroyed \
-             box",
-            segments.join(", ")
+             box. To move those segments into {} and start the proxy, run `bep serve` with \
+             `--quarantine-unreadable`",
+            segments.join(", "),
+            audit.join(bep::audit::QUARANTINE_DIR).display()
         )));
     }
     Ok(None)
@@ -4589,8 +4594,6 @@ impl BoxRegistry {
             Ok(revoked) => Ok(revoked
                 .contains(&box_id_hex(id))
                 .then_some(IdHolder::RevocationRecord)),
-            // No proxy serves the socket, so no revocation is in force for
-            // any value to be redeemed against.
             // No proxy serves the socket, so the check reads the revocation
             // records the proxy's audit log retains: the ones its next start
             // puts back in force (BEP-068).
@@ -10799,6 +10802,10 @@ mod tests {
             matches!(&refused, AllocationError::AuditUnread { id: refused_id, why, .. }
                 if *refused_id == other && why.contains(&segment.display().to_string())),
             "got {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("--quarantine-unreadable"),
+            "the refusal names the way out: {refused}"
         );
 
         // The id the record holds is still refused: the record still reads.
