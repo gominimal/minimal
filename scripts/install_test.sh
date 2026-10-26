@@ -2625,6 +2625,8 @@ STUB
             NFT_RULESET="${NFT_RULESET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
+            MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
+            MINIMAL_OVERRIDE_QUIC443_SUDOERS="${HC_SUDOERS:-}" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
         set -e
@@ -2735,8 +2737,14 @@ STUB
 
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
+    # The QUIC block helper and its sudoers rule go under the scratch root,
+    # through the step's own override knobs: a rehearsal writes nothing to
+    # /usr/local or /etc.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
     check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
     want_ok "the daemon leaf exists" test -d "$tree/daemon"
     want_ok "the box cohort exists"   test -d "$tree/boxes"
@@ -2848,6 +2856,49 @@ originates is refused" \
         [ "$(grep -c '^list ruleset' "$nft_calls")" -eq 1 ]
     want_ok "the install records the ct-mark mask beside the marker" \
         test -d "$tree/ct-mark-mask-0x30000000"
+
+    # BEP-018: a socket keeps the cgroup it was created in, so the table
+    # also rejects UDP 443 from a socket whose box leaf is in the
+    # blocked-leaves set, declared before the rule that names it.
+    want_ok "the table declares the blocked-leaves set of box leaves" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 1 && /typeof socket cgroupv2 level 4$/ {ok = 1}
+             /chain output \{/ {o = NR}
+             END {exit !(ok && s < o)}' "$nft_input"
+    want_ok "the output chain rejects UDP 443 from a leaf in the set" \
+        grep -q 'socket cgroupv2 level 4 @quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable' "$nft_input"
+    hc_helper="$root/hclib/quic443-leaf"
+    want_ok "the install writes the QUIC block helper" test -x "$hc_helper"
+    want_ok "the sudoers rule lets the account run the helper alone" \
+        grep -qx "#$me ALL=(root) NOPASSWD: $hc_helper" "$root/hcsudoers/minimal-quic443-leaf"
+    want_ok "the install names the helper it wrote" grep -q "installed $hc_helper" "$OUT"
+    # run_helper <label> <verb> <leaf> ; sets rc, output in $OUT.
+    run_helper() {
+        OUT="$root/helper.$1"
+        set +e
+        env -i PATH="$hcbin:/usr/bin:/bin" NFT_CALLS="$nft_calls" \
+            "$hc_helper" "$2" "$3" </dev/null >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+    mkdir -p "$tree/boxes/allow/grant"
+    : >"$nft_calls"
+    run_helper add add "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper adds a box leaf under the allow subtree"
+    run_helper remove remove "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper removes a box leaf under the allow subtree"
+    check 'add element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }
+delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }' \
+        "$(cat "$nft_calls")" "the helper changes one element of the set"
+    : >"$nft_calls"
+    for _leaf in "$cg" "/etc" "$tree/daemon" "$tree/boxes/deny" "$tree/boxes/quic443-blocked" \
+        "$tree/boxes/allow" "$tree/boxes/allow/../deny" "$tree/boxes/allow/grant/x"; do
+        run_helper refused add "$_leaf"
+        check 2 "$rc" "the helper refuses $_leaf"
+        want_ok "the refusal for $_leaf says so" grep -q "refused" "$OUT"
+    done
+    rmdir "$tree/boxes/allow/grant"
+    want_ok "no refused path reaches nft" [ ! -s "$nft_calls" ]
 
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
