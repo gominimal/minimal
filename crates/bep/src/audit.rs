@@ -132,6 +132,11 @@ pub struct Decision {
     pub identifier: Option<String>,
     /// The handle's `jti`, the audit correlation id. Empty when the request
     /// carries no handle, or when the handle does not parse.
+    ///
+    /// On an admitted record the handle's signature verified, so the `jti`
+    /// is the signer's. On a refused record it is the value the handle
+    /// claims, and the signature can be invalid. The refusal keeps it, so a
+    /// forged or tampered handle still correlates.
     pub jti: String,
     /// The mapped resource and permission.
     pub mapping: Mapping,
@@ -159,7 +164,9 @@ pub struct Record {
     /// The member or store identifier, or [`NONE`].
     pub identifier: String,
     /// The handle's `jti`, or empty. A record written before the field
-    /// existed reads as empty.
+    /// existed reads as empty. Only an admitted record's `jti` is verified.
+    /// A refused record's `jti` is the handle's claim, as [`Decision::jti`]
+    /// says.
     #[serde(default)]
     pub jti: String,
     /// The mapped resource, or [`MODULE_UNMAPPED`].

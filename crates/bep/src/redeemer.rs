@@ -288,7 +288,10 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                     handle::read_opened(opened, &clients, rules, &self.module, now)
                 };
                 // Gatehouse §6.10: the audit record carries the handle's
-                // `jti` as its correlation id.
+                // `jti` as its correlation id. The `jti` is the claim even
+                // when the signature does not verify, so a refusal of a
+                // forged handle still correlates. `decide` admits only a
+                // verified handle, so an admitted record's `jti` is verified.
                 (
                     bound_set,
                     read.handle,
