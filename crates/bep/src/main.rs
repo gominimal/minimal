@@ -1301,6 +1301,9 @@ mod tests {
             box_id: box_id.to_owned(),
             authority: String::new(),
             identifier: None,
+            // A mint or a revocation carries no handle. The test's
+            // decisions carry none either.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: if kind == Kind::Revocation {
                 Outcome::Refuse
