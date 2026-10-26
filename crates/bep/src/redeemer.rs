@@ -115,11 +115,9 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// is the system clock.
     ///
     /// A `revoke_box` request on the control socket puts a revocation in
-    /// force ([`crate::revoke::record`]). Interim: the redeemer starts with
-    /// no revocation in force. T33
-    /// (<https://github.com/gominimal/minimal/issues/2290>) restores them
-    /// from every retained audit segment at start, the BEP-068
-    /// restore-on-start sub-requirement. That is the one interim left.
+    /// force ([`crate::revoke::record`]). `bep serve` passes the
+    /// revocations restored from every retained audit segment through
+    /// [`with_revocations`](Self::with_revocations) (BEP-068).
     #[must_use]
     pub fn new(
         key: K,
@@ -240,14 +238,15 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     ///
     /// The revoked set is the revocations in force that cover the box id
     /// the value names ([`crate::revoke::in_force_for`]). A `revoke_box` request on the
-    /// control socket puts one in force. The set is empty at start until
-    /// T33 (#2290) restores it from the audit log.
+    /// control socket puts one in force. `bep serve` passes the
+    /// revocations restored from every retained audit segment through
+    /// [`with_revocations`](Self::with_revocations) (BEP-068).
     ///
     /// For a store member, the bound set is the handle's `upstream` and the
     /// current set is the current rule's authorities, so the checks that
     /// read a module's host sets read those (BEP-032, BEP-064). The rules
     /// are the ones [`Self::with_rules`] gives. `bep serve` gives none until
-    /// T25 (<https://github.com/gominimal/minimal/issues/2280>) reads
+    /// <https://github.com/gominimal/minimal/issues/2599> gives it the
     /// `[secret-store-rules]`.
     fn facts(
         &self,
