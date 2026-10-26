@@ -235,10 +235,57 @@ pub struct DiskBox {
     record: Record,
 }
 
+/// The name of the file beside `record.json` that holds the box's spec as
+/// its creating client sent it (BOX-068).
+pub const SPEC_FILE: &str = "spec.json";
+
 impl DiskBox {
     fn root_path(&self) -> DaemonAbsPath {
         sub_path!(self.minimal_state_dir, "sessions")
             .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
+    }
+
+    /// The path of the box's spec file, [`SPEC_FILE`], beside its record.
+    pub fn spec_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "spec.json")
+    }
+
+    /// Writes the box's spec beside its record (BOX-068), atomically (tmp +
+    /// rename, the same crash safety as the record). The bytes are stored
+    /// as given: the spec's shape belongs to its builder, not to the store.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the box's directory or the file cannot be written.
+    pub fn store_spec(&self, spec: &[u8]) -> Result<(), std::io::Error> {
+        let dir = self.root_path();
+        let dir = dir.as_utf8_path();
+        std::fs::create_dir_all(dir)?;
+        let dest = dir.join(SPEC_FILE);
+        let tmp = dir.join("spec.json.tmp");
+        std::fs::write(&tmp, spec)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, &dest)?;
+
+        Ok(())
+    }
+
+    /// Reads the box's spec from beside its record. `Ok(None)` for a box
+    /// with no spec file: one created before specs were stored, or by a
+    /// client that sent none.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the spec file exists but cannot be read.
+    pub fn load_spec(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        match std::fs::read(self.spec_path().as_utf8_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1296,6 +1343,38 @@ mod tests {
         assert_eq!(loader.keys().count(), 1, "nothing new is filed");
         assert_eq!(loader.find_by_name("another-name").unwrap(), None);
         assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
+    }
+
+    /// BOX-068: a box's spec is stored beside its record, in the box's
+    /// own directory, and is read back as it was written. A box with no
+    /// spec file reads as none, and deleting the box removes the file.
+    #[test]
+    fn spec_file_is_stored_beside_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(object.load_spec().unwrap(), None);
+
+        let spec = br#"{"type":"session","v":0}"#;
+        object.store_spec(spec).unwrap();
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.spec_path().as_utf8_path(),
+            record_dir.join(SPEC_FILE)
+        );
+        assert!(record_dir.join("record.json").exists());
+        assert_eq!(
+            loader.get(&key).unwrap().load_spec().unwrap().as_deref(),
+            Some(&spec[..])
+        );
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(SPEC_FILE).exists());
     }
 
     #[test]

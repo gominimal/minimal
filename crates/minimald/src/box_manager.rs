@@ -200,6 +200,69 @@ struct CreateSessionMsg {
     responder: Responder<SessionId>,
 }
 
+/// A create that carries the box's spec (BOX-068): the create itself and
+/// the spec the client sent on its request.
+#[derive(Debug)]
+struct CreateBoxMsg {
+    create: CreateSessionMsg,
+    spec: Option<serde_json_lenient::Value>,
+}
+
+impl BoxManagerHandle {
+    /// [`Self::create_session_by`] for a create request that carries the
+    /// box's spec (BOX-068). The manager checks the spec before it files
+    /// the record, and writes it beside the record before the box's actor
+    /// starts. A create whose spec is refused files nothing.
+    pub async fn create_box_with_spec(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::CreateBox(Box::new(CreateBoxMsg {
+                create: CreateSessionMsg {
+                    config,
+                    username,
+                    creator,
+                    responder: send,
+                },
+                spec,
+            })))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+}
+
+/// The bytes the daemon stores for a box's spec (BOX-068): the spec the
+/// client sent, serialized with its keys in order. A spec must be a JSON
+/// object whose `v` is a whole number, the spec's version.
+///
+/// # Errors
+///
+/// `InvalidInput`, naming the problem, for a spec that is not such an
+/// object.
+fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerError> {
+    let has_version = spec
+        .as_object()
+        .and_then(|object| object.get("v"))
+        .is_some_and(serde_json_lenient::Value::is_u64);
+    if !has_version {
+        return Err(BoxManagerError::new(
+            std::io::ErrorKind::InvalidInput,
+            "The create request carries a box spec without a version. \
+             The daemon accepts a spec that is a JSON object with a whole number `v`. \
+             No box was created.",
+        ));
+    }
+    serde_json_lenient::to_vec(spec)
+        .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
@@ -232,6 +295,8 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningIds(Responder<Vec<SessionId>>),
     CreateSession(Box<CreateSessionMsg>),
+    /// A create that carries the box's spec (BOX-068).
+    CreateBox(Box<CreateBoxMsg>),
     /// Destroy a session; with `true`, only if it has not finished
     /// activating (`None` when it was kept).
     DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
@@ -263,6 +328,7 @@ impl ManagerMessage {
             #[cfg(test)]
             Self::RunningIds(..) => "RunningIds",
             Self::CreateSession(..) => "CreateSession",
+            Self::CreateBox(..) => "CreateBox",
             Self::DeleteSession(..) => "DeleteSession",
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
@@ -1365,11 +1431,13 @@ impl BoxManager {
             box_id = tracing::field::Empty,
             box_type = tracing::field::Empty,
             parent = tracing::field::Empty,
+            spec_bytes = tracing::field::Empty,
         )
     )]
     async fn create_session(
         &mut self,
         config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -1410,6 +1478,22 @@ impl BoxManager {
                  this host's classifier cannot enforce"
             );
             return Err(refusal);
+        }
+        // BOX-068: the spec is checked before the record exists, so a
+        // refused spec leaves no record, id or name behind.
+        let spec = match spec.as_ref().map(spec_bytes).transpose() {
+            Ok(spec) => spec,
+            Err(refusal) => {
+                tracing::info!(
+                    session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                    refusal = %refusal,
+                    "refused the box spec on a create"
+                );
+                return Err(refusal);
+            }
+        };
+        if let Some(bytes) = &spec {
+            tracing::Span::current().record("spec_bytes", bytes.len());
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
@@ -1480,6 +1564,42 @@ impl BoxManager {
             project_root = ?project_root.as_ref().map(paths::HostAbsPath::as_str),
             "filed the box record"
         );
+
+        // BOX-068: the spec is written beside the record before the actor
+        // starts. A spec that cannot be written takes the record with it:
+        // the caller never received the id, so nothing else could reach it.
+        if let Some(bytes) = &spec {
+            let stored = match handle.object().await {
+                Ok(object) => object.store_spec(bytes).map(|()| object.spec_path()),
+                Err(e) => Err(e),
+            };
+            match stored {
+                Ok(path) => tracing::info!(
+                    session_id = %session_id,
+                    spec_bytes = bytes.len(),
+                    spec_path = %path.as_str(),
+                    "stored the box spec"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "could not store the box spec; deleting the record"
+                    );
+                    if let Err(del_err) = handle.delete().await
+                        && del_err.kind() != NotFound
+                    {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %del_err,
+                            "failed to delete the session record after the spec \
+                             was not stored; it will linger until it is deleted explicitly",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         let mut seed = self.session_config(handle.clone());
         seed.creator = creator;
@@ -1672,7 +1792,21 @@ impl BoxManager {
                     creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, username, creator).await;
+                let created = self.create_session(config, None, username, creator).await;
+                responder.handle(async move { created }).await;
+            }
+            ManagerMessage::CreateBox(msg) => {
+                let CreateBoxMsg {
+                    create:
+                        CreateSessionMsg {
+                            config,
+                            username,
+                            creator,
+                            responder,
+                        },
+                    spec,
+                } = *msg;
+                let created = self.create_session(config, spec, username, creator).await;
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: tears down its running host and actor (if
@@ -2104,6 +2238,70 @@ mod create_stamp_tests {
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
         }
+    }
+
+    /// The bytes of the spec file beside the record of box `id`, if any.
+    fn stored_spec(state: &TempDir, id: SessionId) -> Option<Vec<u8>> {
+        for dir in std::fs::read_dir(state.path().join("sessions")).unwrap() {
+            let dir = dir.unwrap().path();
+            let Ok(record) = std::fs::read_to_string(dir.join("record.json")) else {
+                continue;
+            };
+            if record.contains(&id.to_string()) {
+                return std::fs::read(dir.join(boxes::store::SPEC_FILE)).ok();
+            }
+        }
+        None
+    }
+
+    /// BOX-068: the spec on the create request is stored beside the new
+    /// box's record. A create with no spec stores none, and a spec without
+    /// a version is refused before any record is filed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_the_spec_beside_the_record() {
+        let (state, _cache, mngr) = manager().await;
+        let spec = serde_json_lenient::json!({
+            "v": 0,
+            "type": "session",
+            "entry": "default",
+            "packages": ["git"],
+        });
+        let id = mngr
+            .create_box_with_spec(
+                config("specced", "/home/dev/proj"),
+                Some(spec.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = stored_spec(&state, id).expect("the spec is stored beside the record");
+        let stored: serde_json_lenient::Value = serde_json_lenient::from_slice(&stored).unwrap();
+        assert_eq!(stored, spec);
+
+        let id = mngr
+            .create_box_with_spec(config("no-spec", "/home/dev/proj"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored_spec(&state, id), None);
+
+        let err = mngr
+            .create_box_with_spec(
+                config("bad-spec", "/home/dev/proj"),
+                Some(serde_json_lenient::json!({"type": "session"})),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            mngr.get_record(BoxKeyPredicate::Name("bad-spec".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused spec files no record"
+        );
     }
 
     async fn record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {
