@@ -312,16 +312,33 @@ pub trait Redeemer: Send + Sync {
         sealed: &str,
     ) -> Verdict;
 
+    /// Decides one sealed value as [`Redeemer::redeem`] does, and gives the
+    /// handle's `jti` for the audit record. The `jti` is empty when the
+    /// handle does not parse.
+    fn redeem_with_jti(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+    ) -> (Verdict, String) {
+        (
+            self.redeem(box_id, authority, request, sealed),
+            String::new(),
+        )
+    }
+
     /// Decides one request that carries `sealed` in the header named
     /// `header`, as [`Self::redeem`] does, with an admitted store reference
-    /// as [`Redeemed::Store`]. The forwarder calls this one.
+    /// as [`Redeemed::Store`], and the handle's `jti` for the audit record
+    /// as [`Self::redeem_with_jti`] gives it. The forwarder calls this one.
     ///
     /// The default admits no store reference, so a redeemer without store
     /// references implements `redeem` alone. A sign-in credential goes in
     /// `Authorization` only. So the default refuses a sealed value in any
     /// other header as [`SEALED_HEADER_MISPLACED`], before [`Self::redeem`]
     /// runs, and nothing is renewed for it. Otherwise it gives
-    /// [`Self::redeem`]'s verdict.
+    /// [`Self::redeem_with_jti`]'s verdict and `jti`.
     ///
     /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet,
     /// so `bep serve` does not inject a store value
@@ -337,11 +354,15 @@ pub trait Redeemer: Send + Sync {
         request: &RequestAuthority<String>,
         sealed: &str,
         header: &str,
-    ) -> Redeemed {
+    ) -> (Redeemed, String) {
         if !header.eq_ignore_ascii_case("authorization") {
-            return Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED));
+            return (
+                Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
+                String::new(),
+            );
         }
-        Redeemed::Verdict(self.redeem(box_id, authority, request, sealed))
+        let (verdict, jti) = self.redeem_with_jti(box_id, authority, request, sealed);
+        (Redeemed::Verdict(verdict), jti)
     }
 }
 
@@ -813,6 +834,7 @@ impl Flow {
         request: &mut Request,
         at: &SealedAt,
         admit: StoreAdmit,
+        jti: &str,
     ) -> Result<String, &'static str> {
         let span = tracing::Span::current();
         let identifier = admit.identifier();
@@ -877,6 +899,7 @@ impl Flow {
                     Outcome::Admit,
                     admit.marker,
                     Some(identifier),
+                    jti,
                     admit.mapping,
                 );
                 Ok(header)
@@ -887,6 +910,7 @@ impl Flow {
                     Outcome::Refuse,
                     Some(marker),
                     Some(identifier),
+                    jti,
                     admit.mapping,
                 );
                 Err(marker)
@@ -903,6 +927,7 @@ impl Flow {
         outcome: Outcome,
         marker: Option<&str>,
         identifier: Option<String>,
+        jti: &str,
         mapping: Mapping,
     ) {
         self.audit.write(&Decision {
@@ -910,6 +935,7 @@ impl Flow {
             box_id: self.box_id.clone(),
             authority: self.authority_text(),
             identifier,
+            jti: jti.to_owned(),
             mapping,
             outcome,
             marker: marker.map(str::to_owned),
@@ -944,6 +970,7 @@ impl Flow {
                 Outcome::Refuse,
                 Some(check.marker()),
                 None,
+                "",
                 Mapping::ModuleUnmapped,
             );
             return Err(check.marker());
@@ -954,15 +981,16 @@ impl Flow {
                     .headers
                     .get(at.header)
                     .map_or("", |h| h.name.as_str());
-                let verdict = match self.redeemer.redeem_reference(
+                let (redeemed, jti) = self.redeemer.redeem_reference(
                     &self.box_id,
                     &self.authority,
                     &plain.request,
                     &at.value,
                     header,
-                ) {
+                );
+                let verdict = match redeemed {
                     Redeemed::Store(admit) => {
-                        return self.inject_store(request, &at, admit).map(Some);
+                        return self.inject_store(request, &at, admit, &jti).map(Some);
                     }
                     Redeemed::Verdict(verdict) => verdict,
                 };
@@ -982,6 +1010,7 @@ impl Flow {
                                 Outcome::Admit,
                                 Some(SIGN_IN_RENEWED),
                                 Some(identifier.clone()),
+                                &jti,
                                 mapping.clone(),
                             );
                         }
@@ -1000,7 +1029,13 @@ impl Flow {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
-                            self.record(Outcome::Refuse, Some(marker), Some(identifier), mapping);
+                            self.record(
+                                Outcome::Refuse,
+                                Some(marker),
+                                Some(identifier),
+                                &jti,
+                                mapping,
+                            );
                             return Err(marker);
                         }
                         span.record("substitution", "substituted");
@@ -1008,12 +1043,18 @@ impl Flow {
                         // substitution never shows the cohort flag.
                         span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
-                        self.record(Outcome::Admit, admitted, Some(identifier), mapping);
+                        self.record(Outcome::Admit, admitted, Some(identifier), &jti, mapping);
                         Ok(None)
                     }
                     Verdict::Refuse(marker) => {
                         span.record("substitution", "refused");
-                        self.record(Outcome::Refuse, Some(marker), None, Mapping::ModuleUnmapped);
+                        self.record(
+                            Outcome::Refuse,
+                            Some(marker),
+                            None,
+                            &jti,
+                            Mapping::ModuleUnmapped,
+                        );
                         Err(marker)
                     }
                 }
@@ -1026,6 +1067,7 @@ impl Flow {
                     Outcome::Refuse,
                     Some(MIXED_AUTHORIZATION),
                     None,
+                    "",
                     Mapping::ModuleUnmapped,
                 );
                 Err(MIXED_AUTHORIZATION)
@@ -1034,7 +1076,7 @@ impl Flow {
                 // BEP-030: forwarded unmodified, and audited.
                 let marker = (carried == Carried::Foreign).then_some(FOREIGN_CREDENTIAL);
                 span.record("substitution", marker.unwrap_or("passthrough"));
-                self.record(Outcome::Admit, marker, None, Mapping::ModuleUnmapped);
+                self.record(Outcome::Admit, marker, None, "", Mapping::ModuleUnmapped);
                 Ok(None)
             }
         }
@@ -1097,7 +1139,13 @@ pub fn forward_requests<R: Read, W: Write>(
             Ok(head) => head,
             Err(reason) => {
                 if let Some(marker) = reason.audit_marker() {
-                    flow.record(Outcome::Refuse, Some(marker), None, Mapping::ModuleUnmapped);
+                    flow.record(
+                        Outcome::Refuse,
+                        Some(marker),
+                        None,
+                        "",
+                        Mapping::ModuleUnmapped,
+                    );
                 }
                 break HalfEnd::Closed(reason);
             }
@@ -2282,15 +2330,18 @@ mod tests {
             _request: &RequestAuthority<String>,
             _sealed: &str,
             _header: &str,
-        ) -> Redeemed {
-            Redeemed::Store(StoreAdmit {
-                store: crate::store::NATIVE_STORE.to_owned(),
-                id: self.id.to_owned(),
-                inject: self.inject.clone(),
-                mapping: Mapping::ModuleUnmapped,
-                marker: None,
-                cohort_attributed: false,
-            })
+        ) -> (Redeemed, String) {
+            (
+                Redeemed::Store(StoreAdmit {
+                    store: crate::store::NATIVE_STORE.to_owned(),
+                    id: self.id.to_owned(),
+                    inject: self.inject.clone(),
+                    mapping: Mapping::ModuleUnmapped,
+                    marker: None,
+                    cohort_attributed: false,
+                }),
+                String::new(),
+            )
         }
     }
 

@@ -12259,6 +12259,144 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   echo "::endgroup::"
 }
 
+# Re-creation proof (BEP-070). A grant box starts under a name, and the case
+# copies its sealed GH_TOKEN value. 'min session destroy' removes the box, and
+# a new grant box starts under the same name.
+#   - 'min box audit <name>' names a different box id for each box: the name
+#     is an alias, and each creation gets an id of its own.
+#   - In the new box, 'gh api user' answers with the box's own value, and
+#     'min box audit' shows an admit record for api.github.com that names a
+#     member: the proxy redeemed the new value.
+#   - The value copied from the destroyed box is refused in the new box,
+#     though both boxes have one name: the value names the old id.
+# It needs a live proxy, so bep_live_gate records it NOT RUN elsewhere. The
+# values are never printed: the transcript names only their lengths.
+
+# Prints the box id that 'min box audit $2' names for case $1, from its
+# "Showing <name> (box <id>)." line.
+bep_recreate_audited_id() {
+  local ai_err
+  if ! mnl box audit "$2" -o jsonl </dev/null >"$WORK/$1.$2.audit" 2>"$WORK/$1.$2.audit.err"; then
+    echo "::error::'min box audit $2' failed" >&2
+    cat "$WORK/$1.$2.audit.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  ai_err="$(cat "$WORK/$1.$2.audit.err" 2>/dev/null || true)"
+  if ! [[ "$ai_err" =~ \(box\ ([0-9a-fA-F-]+)\)\. ]]; then
+    echo "::error::'min box audit $2' names no box id" >&2
+    printf '%s\n' "$ai_err" >&2
+    return 1
+  fi
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+proof_bep_box_recreated_under_its_name_redeems() {
+  echo "::group::a box re-created under its name redeems its own values, and the old value stays refused"
+  local rc_case=bep_box_recreated_under_its_name_redeems
+  local rc_name=e2e-bep-recreate
+  local rc_old_value rc_new_value rc_old_id rc_new_id rc_try rc_count=0 rc_out
+  bep_live_gate "$rc_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: rc_cleanup reads it.
+  RC_SID=""
+  rc_cleanup() {
+    [ -n "$RC_SID" ] && mnl session destroy --force "$RC_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  rc_fail() { rc_cleanup; fail; }
+
+  # The first box under the name, and the value copied from it.
+  bep_revoke_seed "$rc_case"
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_old_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || rc_fail
+  rc_old_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  echo "first $rc_name (box $rc_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#rc_old_value} characters)"
+
+  if ! mnl session destroy --force "$RC_SID" </dev/null >/dev/null 2>"$WORK/$rc_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $rc_name failed"
+    cat "$WORK/$rc_case.destroy.err" 2>/dev/null || true
+    rc_fail
+  fi
+  RC_SID=""
+  # The destroy's revocation record, by the old id: the name is the new
+  # box's from here on.
+  for rc_try in $(seq 1 12); do
+    [ "$rc_try" -gt 1 ] && sleep 5
+    mnl box audit "$rc_old_id" -o jsonl </dev/null >"$WORK/$rc_case.old.audit" 2>"$WORK/$rc_case.old.audit.err" \
+      || continue
+    rc_count="$(bep_revoke_count "$WORK/$rc_case.old.audit" revocation)"
+    [ "$rc_count" -ge 1 ] && break
+  done
+  if [ "$rc_count" != 1 ]; then
+    echo "::error::'min box audit $rc_old_id' shows $rc_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$rc_case.old.audit" "$WORK/$rc_case.old.audit.err" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "min box audit $rc_old_id: 1 revocation record after the destroy"
+
+  # The second box under the same name: an id of its own, and its own value
+  # redeems.
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_new_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || {
+    echo "::error::the box re-created under $rc_name did not redeem its own value"
+    rc_fail
+  }
+  rc_new_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  if [ "$rc_new_id" = "$rc_old_id" ]; then
+    echo "::error::'min box audit $rc_name' names box $rc_new_id for both boxes: the re-created box reused the destroyed box's id"
+    rc_fail
+  fi
+  if [ "$rc_new_value" = "$rc_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    rc_fail
+  fi
+  if ! rc_out="$(python3 - "$WORK/$rc_case.$rc_name.audit" <<'PY'
+import json, sys
+admits = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            admits.append(r)
+if not admits:
+    print("no admit record for api.github.com:443 names a member")
+    sys.exit(1)
+print("%d admit record(s) for api.github.com:443" % len(admits))
+PY
+)"; then
+    echo "::error::'min box audit $rc_name' shows the re-created box's value was not redeemed: $rc_out"
+    cat "$WORK/$rc_case.$rc_name.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "second $rc_name (box $rc_new_id): 'gh api user' answered with its own value (${#rc_new_value} characters), and min box audit shows $rc_out"
+
+  # The destroyed box's value, in the box that now has its name.
+  if mnl session exec "$RC_SID" sh -c "GH_TOKEN='$rc_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$rc_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    rc_fail
+  fi
+  if ! mnl box audit "$rc_new_id" -o jsonl </dev/null >"$WORK/$rc_case.new.audit" 2>&1 \
+    || ! rc_out="$(bep_slice_jsonl_check "$WORK/$rc_case.new.audit" cross_box)"; then
+    echo "::error::'min box audit $rc_new_id' shows no refusal of the destroyed box's value: $rc_out"
+    cat "$WORK/$rc_case.new.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $rc_out"
+
+  rc_cleanup
+  rm -f "${WORK:?}/${rc_case:?}".*
+  echo "Re-created box OK (a new box id under the old name, its own value redeemed, the old value refused)"
+  echo "::endgroup::"
+}
+
 proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   echo "::group::min session destroy with the proxy down: the destroy completes, and the value is refused"
   local pd_case=bep_destroy_with_proxy_down_refuses_by_attachment
@@ -24409,6 +24547,7 @@ case "${1:-}" in
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
     proof_bep_destroyed_box_values_refused_within_60s
+    proof_bep_box_recreated_under_its_name_redeems
     proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_logout_refuses_every_reference_at_next_request
     proof_bep_dns_steering_fails_closed_end_to_end
@@ -24479,6 +24618,7 @@ case "${1:-}" in
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
     | bep_destroyed_box_values_refused_within_60s \
+    | bep_box_recreated_under_its_name_redeems \
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
     | bep_dns_steering_fails_closed_end_to_end)
@@ -24526,6 +24666,7 @@ case "${1:-}" in
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
+    echo "         bep_box_recreated_under_its_name_redeems"
     echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;

@@ -138,6 +138,14 @@ pub struct Decision {
     /// The member or store identifier, or `None` when the request names
     /// none (an off-module or unsealed request).
     pub identifier: Option<String>,
+    /// The handle's `jti`, the audit correlation id. Empty when the request
+    /// carries no handle, or when the handle does not parse.
+    ///
+    /// On an admitted record the handle's signature verified, so the `jti`
+    /// is the signer's. On a refused record it is the value the handle
+    /// claims, and the signature can be invalid. The refusal keeps it, so a
+    /// forged or tampered handle still correlates.
+    pub jti: String,
     /// The mapped resource and permission.
     pub mapping: Mapping,
     /// Admit or refuse.
@@ -163,6 +171,12 @@ pub struct Record {
     pub upstream: String,
     /// The member or store identifier, or [`NONE`].
     pub identifier: String,
+    /// The handle's `jti`, or empty. A record written before the field
+    /// existed reads as empty. Only an admitted record's `jti` is verified.
+    /// A refused record's `jti` is the handle's claim, as [`Decision::jti`]
+    /// says.
+    #[serde(default)]
+    pub jti: String,
     /// The mapped resource, or [`MODULE_UNMAPPED`].
     pub resource: String,
     /// The mapped permission, or [`MODULE_UNMAPPED`].
@@ -196,6 +210,7 @@ impl Record {
                 .identifier
                 .as_deref()
                 .map_or_else(|| NONE.to_owned(), bounded),
+            jti: bounded(&decision.jti),
             resource,
             permission,
             decision: decision.outcome,
@@ -968,6 +983,7 @@ mod tests {
             box_id: "box-7f3a".into(),
             authority: "api.github.com:443".into(),
             identifier: Some("github:user-token".into()),
+            jti: "jti-7f3a".into(),
             mapping: Mapping::Mapped {
                 resource: "repo:gominimal/minimal".into(),
                 permission: "contents:read".into(),
@@ -983,6 +999,7 @@ mod tests {
             box_id: "box-7f3a".into(),
             authority: "example.com:443".into(),
             identifier: None,
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some("off_module".into()),
@@ -1071,6 +1088,7 @@ mod tests {
             "txn",
             "upstream",
             "identifier",
+            "jti",
             "resource",
             "permission",
             "decision",
@@ -1350,6 +1368,8 @@ mod tests {
             box_id: box_id.into(),
             authority: String::new(),
             identifier: None,
+            // A mint or a revocation carries no handle.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: None,
@@ -1575,16 +1595,18 @@ mod tests {
             field(),
             field(),
             proptest::option::of(field()),
+            field(),
             proptest::option::of((field(), field())),
             any::<bool>(),
             proptest::option::of(field()),
         )
             .prop_map(
-                |(kind, box_id, authority, identifier, mapping, admit, marker)| Decision {
+                |(kind, box_id, authority, identifier, jti, mapping, admit, marker)| Decision {
                     kind,
                     box_id,
                     authority,
                     identifier,
+                    jti,
                     mapping: mapping.map_or(Mapping::ModuleUnmapped, |(resource, permission)| {
                         Mapping::Mapped {
                             resource,
