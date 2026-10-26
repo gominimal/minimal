@@ -10,6 +10,14 @@ export const POINTER_BASE = "https://storage.googleapis.com/minimal-one/";
 /** How long an edge keeps a pointer. A promotion is seen within this. */
 export const POINTER_CACHE_SECONDS = 300;
 
+/**
+ * What the edge caches, by status: a pointer for POINTER_CACHE_SECONDS, a
+ * bucket error not at all. Caching every status would turn one transient
+ * 5xx from the bucket into five minutes of 503 for every client at that
+ * edge.
+ */
+export const POINTER_CACHE_BY_STATUS = { "200-299": POINTER_CACHE_SECONDS, "400-599": 0 };
+
 // A key, os, arch or install value: the installer's own charset for a
 // target or version. Bounded so a data point stays small.
 const TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
@@ -48,7 +56,7 @@ export async function latestFor(channel, fetchFn) {
   let resp;
   try {
     resp = await fetchFn(POINTER_BASE + channel, {
-      cf: { cacheTtl: POINTER_CACHE_SECONDS, cacheEverything: true },
+      cf: { cacheTtlByStatus: POINTER_CACHE_BY_STATUS, cacheEverything: true },
     });
   } catch {
     return null;

@@ -34,7 +34,7 @@ test("the channel allow-list, the charsets and the shape each refuse", () => {
 
 const pointer = (body, ok = true) => async (url, init) => {
   assert.ok(url.startsWith(POINTER_BASE), url);
-  assert.equal(init.cf.cacheTtl, 300);
+  assert.deepEqual(init.cf.cacheTtlByStatus, { "200-299": 300, "400-599": 0 }, "a pointer is cached, a bucket error is not");
   return { ok, text: async () => body };
 };
 

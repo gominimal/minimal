@@ -12,7 +12,7 @@ GET https://update.minimal.dev/v1/<channel>/<key>?os=<os>&arch=<arch>&install=<m
 ```
 
 `latest` is the channel pointer in `gs://minimal-one/<channel>`, read through
-a 5 minute edge cache. Promotion (`scripts/set-channel.sh`) stays the single
+a 5 minute edge cache (a bucket error is never cached). Promotion (`scripts/set-channel.sh`) stays the single
 source of truth; nothing here is written on release.
 
 **What `<key>` is.** The pointer the install came from, as the installer
