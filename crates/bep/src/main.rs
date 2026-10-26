@@ -403,14 +403,28 @@ fn admission(rules: &[StoreRule]) -> Admission {
 /// The client's `[secret-store-rules]` that `bep` holds: the rules in the
 /// user-level `config.toml` that `min secret set` writes, less each rule
 /// the deny set refuses (BEP-034). With no home directory there are none.
+///
+/// Two limits hold. `bep` reads the default config dir only, because
+/// `minvmd` starts `bep serve` and does not know a `min --config-dir`
+/// override, so rules written under an override are not read. `bep` reads
+/// the file once at start, so a rule written later takes effect when the
+/// proxy restarts. The start log line names the file, so both show there.
 fn client_store_rules() -> Vec<StoreRule> {
-    // `paths` stops the process when it finds no home directory.
-    if std::env::home_dir().is_none() {
-        tracing::warn!("found no home directory, so bep holds no secret-store rules");
-        return Vec::new();
+    match client_config_path() {
+        Some(path) => store_rules_in(&path),
+        None => {
+            tracing::warn!("found no home directory, so bep holds no secret-store rules");
+            Vec::new()
+        }
     }
-    let path = paths::minimal_config_dir_with_override(None).join("config.toml");
-    store_rules_in(&path)
+}
+
+/// The user-level `config.toml` in the default config dir, or `None` with
+/// no home directory.
+fn client_config_path() -> Option<PathBuf> {
+    // `paths` stops the process when it finds no home directory.
+    std::env::home_dir()?;
+    Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
 /// The store rules in the client configuration at `path`, checked as
@@ -886,9 +900,13 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     // an authority that no module and no rule admits is refused and audited
     // `off_module`.
     let admitted = admission(&rules);
+    // The file names where the rules came from: the default config dir,
+    // read once at start (see `client_store_rules`).
+    let config = client_config_path().map(|path| path.display().to_string());
     tracing::info!(
         store_rules = rules.len(),
-        "holds the secret-store rules of the client configuration"
+        file = config.as_deref().unwrap_or("none"),
+        "holds the secret-store rules of the client configuration, read once at start"
     );
     let ProxyKeys {
         sealing,
