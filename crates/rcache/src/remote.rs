@@ -21,8 +21,13 @@ use reqwest::{Client, Error as ReqwestError};
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
-    /// An error occurred with the fetcher backend.
+    /// The backend failed while sending a request or reading its response:
+    /// a transport failure, retried as transient.
     Backend(BE),
+    /// The backend could not build the request at all (a URL it cannot
+    /// represent, a client that would not construct): deterministic, so it is
+    /// never retried.
+    Request(BE),
     /// An I/O error occurred.
     IO(std::io::Error),
     /// An error occurred interacting with the local cache.
@@ -644,7 +649,9 @@ impl<B: FetchBackend> RemoteCache<B> {
         index_dir: Option<&std::path::Path>,
         fetch_op: &OpTracker,
     ) -> Result<(IndexFile, Option<i64>), Error<<B::Response as FetchResponse>::Error>> {
-        let index_req = backend.get(url.join(source.object()).unwrap())?;
+        let index_req = backend
+            .get(url.join(source.object()).unwrap())
+            .map_err(Error::Request)?;
 
         // TODO: Gotta be a better way to stream it into [IndexFile].
         let mut index_resp = backend.execute(index_req).await?;
@@ -744,23 +751,23 @@ impl<B: FetchBackend> RemoteCache<B> {
         sha256: [u8; 32],
         op: &OpTracker,
     ) -> Result<std::fs::File, Error<<B::Response as FetchResponse>::Error>> {
-        let req = self.backend.get(
-            self.base
-                .join(&format!("{}.zst", hex::encode(sha256)))
-                .unwrap(),
-        )?;
+        let req = self
+            .backend
+            .get(
+                self.base
+                    .join(&format!("{}.zst", hex::encode(sha256)))
+                    .unwrap(),
+            )
+            .map_err(Error::Request)?;
 
         let mut resp = self.backend.execute(req).await?;
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
-        // `error_for_status` classifies it here, so a refused status is a
-        // `Backend` error (retried as transient), where the index path keeps
-        // `Fetch { status }` and leaves a 4xx alone; both ride out a 5xx.
+        // Classified as the index path classifies it: `Fetch { status }`, so
+        // `is_transient` retries a 5xx and leaves a 4xx alone on both paths.
         if !resp.is_success() {
-            let status = resp.status_code();
-            return Err(match resp.error_for_status() {
-                Err(e) => Error::Backend(e),
-                Ok(_) => Error::Fetch { status },
+            return Err(Error::Fetch {
+                status: resp.status_code(),
             });
         }
         // Progress total only; tolerate a missing Content-Length (see above).
@@ -785,17 +792,17 @@ impl<B: FetchBackend> RemoteCache<B> {
         Ok(tar_file)
     }
 
-    /// Failures worth retrying: transport errors, error statuses, and hash
-    /// mismatches. A mismatch on a 200 is deliberately transient: the
-    /// observed mirror failure mode is a complete response carrying wrong
-    /// bytes, gone on refetch. Persistent corruption pays the backoff and
-    /// then surfaces as the same loud HashMismatch. Local I/O errors and a
-    /// spec absent from the index are not retried.
-    /// Whether a fetch failure is worth another try: a transport failure, a
-    /// corrupt download, or a status the remote may well answer differently
-    /// next time (a 5xx, or 429). A 4xx is an answer, not an outage: a 401,
-    /// 403 or 404 comes back the same way every time, so retrying one costs
-    /// the whole backoff and then reports "try again shortly" for a refusal.
+    /// Whether a fetch failure is worth another try. Retried: a transport
+    /// failure (`Backend`, from sending the request or reading the response),
+    /// a status the remote may well answer differently next time (`Fetch`
+    /// with a 5xx or 429), and a hash mismatch on a 200, which is the
+    /// observed mirror failure mode (a complete response with wrong bytes,
+    /// gone on refetch; persistent corruption pays the backoff and then
+    /// surfaces as the same loud `HashMismatch`). Not retried: a request that
+    /// could not be built (`Request`), a 4xx, which is an answer and comes
+    /// back the same way every time, local I/O errors, and a spec or snapshot
+    /// the index does not have. Both the index path and the artifact path
+    /// classify an error status as `Fetch { status }`, so the rule is one.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
         match e {
             Error::Backend(_) | Error::HashMismatch { .. } => true,
