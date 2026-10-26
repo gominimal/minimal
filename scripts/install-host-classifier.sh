@@ -746,8 +746,12 @@ resolve_quic443_nft() {
     local found
     found="$(command -v nft)" ||
         die "cannot install the QUIC block helper at $QUIC443_HELPER: nft is not on PATH"
-    quic443_nft="$(readlink -f "$found" 2>/dev/null)" && [ -f "$quic443_nft" ] ||
+    if ! quic443_nft="$(readlink -f "$found" 2>/dev/null)"; then
         die "cannot install the QUIC block helper at $QUIC443_HELPER: cannot resolve $found to a file"
+    fi
+    if [ ! -f "$quic443_nft" ]; then
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: cannot resolve $found to a file"
+    fi
     local why
     why="$(assert_root_only_entry "$quic443_nft")" ||
         die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
@@ -974,8 +978,12 @@ kept_quic443_leaves() {
         case "$name" in
             ''|.|..|-*|*/*|*[!A-Za-z0-9._-]*) continue ;;
         esac
-        [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ] &&
-            [ ! -L "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ] || continue
+        if [ ! -d "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ]; then
+            continue
+        fi
+        if [ -L "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ]; then
+            continue
+        fi
         printf '%s\n' "$elem"
     done
 }
