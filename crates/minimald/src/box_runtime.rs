@@ -448,16 +448,47 @@ pub(crate) fn settle_injection(
 }
 
 /// Pins `pid` as a pidfd, so a later signal cannot reach a process that
-/// reused the pid. `None` when the process is gone.
+/// reused the pid.
+///
+/// # Errors
+///
+/// The `pidfd_open(2)` error. Only `ESRCH` says the process is gone. Any
+/// other error (`EMFILE`, `ENOSYS`, `EPERM`) says nothing about it.
 #[cfg_attr(test, allow(dead_code))]
-fn pin_pid(pid: i32) -> Option<std::os::fd::OwnedFd> {
+fn pin_pid(pid: i32) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     // SAFETY: pidfd_open(2) takes a pid and a flags word and reads no user
     // memory. On success the fresh descriptor is owned by nobody else.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = i32::try_from(fd).map_err(io::Error::other)?;
     // SAFETY: `fd` is a fresh descriptor that only this value owns.
-    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether the process `pid` runs, from `/proc/<pid>/stat`: it exists and
+/// is not a zombie. The liveness check for a process that could not be
+/// pinned for a reason other than `ESRCH`.
+#[cfg_attr(test, allow(dead_code))]
+fn proc_alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        // The state follows the last `)`, which closes the command name.
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X")
+    })
+}
+
+/// Sends SIGKILL to `pid` by its number. Only for a process that could not
+/// be pinned, after the caller found it again where it expects it.
+#[cfg_attr(test, allow(dead_code))]
+fn kill_unpinned(pid: i32) {
+    // SAFETY: kill(2) takes a pid and a signal and reads no user memory.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
 }
 
 /// Whether the process `pinned` names has exited: its pidfd is readable.
@@ -503,9 +534,19 @@ fn stop_stranded(
 ) -> Vec<i32> {
     let mut stopped = Vec::new();
     for &pid in stranded {
-        let Some(pinned) = pin_pid(pid) else { continue };
+        let pinned = match pin_pid(pid) {
+            Ok(pinned) => Some(pinned),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+            // The pin failed for another reason, so the process can still
+            // run outside the block. It is stopped by its pid while `own`
+            // still holds it.
+            Err(_) => None,
+        };
         if moves.procs(own).is_ok_and(|pids| pids.contains(&pid)) {
-            kill_pinned(&pinned);
+            match &pinned {
+                Some(pinned) => kill_pinned(pinned),
+                None => kill_unpinned(pid),
+            }
             stopped.push(pid);
         }
     }
@@ -895,7 +936,15 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             && let Err(error) = report_spawned_pid(&mut command, move |pid| {
                 // Pinned first: the shim can exit and its pid be reused
                 // while the check waits.
-                let shim = pin_pid(pid);
+                // Only `ESRCH` says the shim is gone. After any other pin
+                // error the shim can still run, so `/proc` says whether it
+                // does, and a refusal stops it by its pid. The shim is the
+                // daemon's unreaped child, so its pid is not free for reuse.
+                let pin = pin_pid(pid);
+                let gone = pin
+                    .as_ref()
+                    .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH));
+                let shim = pin.ok();
                 let moves = crate::net::classifier::KernelMoves;
                 let cohort = crate::net::classifier::cohort_quic443();
                 let blocked = cohort
@@ -905,7 +954,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     .map(std::path::Path::to_path_buf);
                 let mut leaves = vec![own.as_path()];
                 leaves.extend(blocked.as_deref());
-                let alive = || shim.as_ref().is_some_and(|shim| !pinned_exited(shim));
+                let alive = || match &shim {
+                    Some(shim) => !pinned_exited(shim),
+                    None => !gone && proc_alive(pid),
+                };
                 let joined =
                     wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
                 // A shim that is gone cannot join `own` later, so what it
@@ -914,8 +966,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 if let Err(refused) =
                     settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
                 {
-                    if let Some(shim) = &shim {
-                        kill_pinned(shim);
+                    match &shim {
+                        Some(shim) => kill_pinned(shim),
+                        None if !gone => kill_unpinned(pid),
+                        None => {}
                     }
                     let stopped = stop_stranded(&refused.stranded, &own, &moves);
                     tracing::warn!(

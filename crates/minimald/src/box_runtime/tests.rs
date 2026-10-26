@@ -7316,6 +7316,29 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
     );
     moves.kill(real);
 
+    // Only `ESRCH` says a process is gone. `/proc` says whether a process
+    // that could not be pinned for another reason still runs. A zombie, an
+    // exited child not yet reaped, does not.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = i32::try_from(child.id()).unwrap();
+    assert!(proc_alive(live));
+    assert!(pin_pid(live).is_ok());
+    child.kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while proc_alive(live) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!proc_alive(live), "a zombie is not alive");
+    child.wait().unwrap();
+    assert!(!proc_alive(live));
+    assert_eq!(
+        pin_pid(live).map(drop).unwrap_err().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+
     // A shim given the own leaf while the cohort still does not block
     // stays where it is.
     cohort.lock().unwrap().depart("grant", &moves);
