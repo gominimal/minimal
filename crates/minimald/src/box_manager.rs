@@ -328,7 +328,10 @@ impl ManagerMessage {
             #[cfg(test)]
             Self::RunningIds(..) => "RunningIds",
             Self::CreateSession(..) => "CreateSession",
-            Self::CreateBox(..) => "CreateBox",
+            // A create with a spec is still the create RPC's message: the
+            // span kind stays `CreateSession`, so traces and the trace tests
+            // see one kind for every create (BOX-068).
+            Self::CreateBox(..) => "CreateSession",
             Self::DeleteSession(..) => "DeleteSession",
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
