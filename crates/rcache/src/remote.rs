@@ -592,13 +592,26 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         let fetch_start = Instant::now();
         let fetch_op = OpTracker::new_with_root(&ot).with_op(Operation::FetchIndex);
+        // Boxed: this retry loop adds one more layer to the future of every
+        // command that opens the cache, and inlined it tips `min`'s command
+        // dispatch over rustc's query depth limit (128) when the layout of
+        // that future is computed (`cmd/mod.rs`, the `run_command` box).
+        // Pinned on the heap, the loop's state is a pointer in the caller's
+        // state, and the depth stops here.
         let mut attempt = 0u32;
-        let (index, gcs_generation) = loop {
-            attempt += 1;
-            match Self::fetch_index_once(&backend, &url, &source, index_dir.as_deref(), &fetch_op)
+        let (index, gcs_generation) = Box::pin(async {
+            loop {
+                attempt += 1;
+                match Self::fetch_index_once(
+                    &backend,
+                    &url,
+                    &source,
+                    index_dir.as_deref(),
+                    &fetch_op,
+                )
                 .await
-            {
-                Ok(pair) => break pair,
+                {
+                    Ok(pair) => break Ok(pair),
                 Err(e) if attempt <= DEFAULT_FETCH_RETRIES && Self::is_transient(&e) => {
                     let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
                     tracing::warn!(
@@ -625,9 +638,11 @@ impl<B: FetchBackend> RemoteCache<B> {
                         status,
                     });
                 }
-                Err(e) => return Err(e),
+                    Err(e) => return Err(e),
+                }
             }
-        };
+        })
+        .await?;
         tracing::debug!(
             "Fetched remote-index in {}ms",
             fetch_start.elapsed().as_millis()
