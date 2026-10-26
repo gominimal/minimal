@@ -11,6 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::bep::{
+    StoreAction, StoreDenySet, StoreRuleConfig, StoreRuleRefused, StoreRules, check_store_rules,
+};
 use crate::keys;
 
 /// Root of the minimal client config.
@@ -42,7 +45,7 @@ pub struct Config {
         rename = "secret-store-rules",
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
-    pub secret_store_rules: crate::core::bep::StoreRules,
+    pub secret_store_rules: StoreRules,
 }
 
 /// The `[secrets]` section.
@@ -193,6 +196,150 @@ pub fn read_config_or_default(path: &Path) -> Result<Config, ConfigError> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// The organization-level client configuration. An administrator writes it,
+/// and it applies to every user of this machine.
+pub const ORGANIZATION_CONFIG_PATH: &str = "/etc/minimal/config.toml";
+
+/// Read the client config at `path` and take its `[secret-store-rules]`
+/// out of it. A missing file is the default config with no rules.
+///
+/// # Errors
+///
+/// See [`ConfigError`]: a file that exists but is not read, does not parse
+/// or is not valid.
+pub fn read_config_parts(path: &Path) -> Result<(Config, StoreRules), ConfigError> {
+    let mut config = read_config_or_default(path)?;
+    let rules = std::mem::take(&mut config.secret_store_rules);
+    Ok((config, rules))
+}
+
+/// What [`read_client_store_rules`] read.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct ClientStoreRules {
+    /// The user configuration, with its `[secret-store-rules]` taken out.
+    pub config: Config,
+    /// The merged store rules that the client mints under and the proxy
+    /// redeems under.
+    pub rules: StoreRules,
+    /// Each rule the deny set refused, organization file first. Each names
+    /// its file.
+    pub refused: Vec<StoreRuleRefused>,
+    /// Why the organization file was not used, when it exists and is not
+    /// read, does not parse or is not valid. Its rules are then left out of
+    /// [`Self::rules`], so a caller that enforces store rules refuses on it.
+    pub organization_error: Option<ConfigError>,
+}
+
+/// Read the `[secret-store-rules]` of the `user` and the `organization`
+/// client configuration, and merge them into the one set that `min` mints
+/// under and `bep` redeems under.
+///
+/// Each file's rules are checked against `deny` (BEP-034). A user rule
+/// replaces the fields of an organization rule for the same item, but keeps
+/// the stricter of the two actions, as [`merge_store_rules`] says. A rule
+/// that the deny set refuses still sets that floor. An item that has only
+/// refused rules gets a `deny` rule with no upstream, so a store reference
+/// to it is denied.
+///
+/// # Errors
+///
+/// A user file that exists and is not read, does not parse or is not valid.
+/// The same failure in the organization file is
+/// [`ClientStoreRules::organization_error`].
+pub fn read_client_store_rules(
+    user: &Path,
+    organization: &Path,
+    deny: StoreDenySet<'_>,
+) -> Result<ClientStoreRules, ConfigError> {
+    let (config, user_read) = read_config_parts(user)?;
+    let (org_read, organization_error) = match read_config_parts(organization) {
+        Ok((_, rules)) => (rules, None),
+        Err(e) => (StoreRules::new(), Some(e)),
+    };
+    let (org_rules, mut refused) =
+        check_store_rules(org_read.clone(), &organization.display().to_string(), deny);
+    let (user_rules, user_refused) =
+        check_store_rules(user_read.clone(), &user.display().to_string(), deny);
+    refused.extend(user_refused);
+    let merged = merge_store_rules(org_rules, user_rules);
+    let merged = keep_read_actions(&org_read, merged);
+    let merged = keep_read_actions(&user_read, merged);
+    let rules = deny_refused_items(&[&org_read, &user_read], merged);
+    Ok(ClientStoreRules {
+        config,
+        rules,
+        refused,
+        organization_error,
+    })
+}
+
+/// How strict a rule's consent is: no action and `allow` ask for nothing,
+/// `ask` asks the person, and `deny` never redeems.
+fn action_rank(action: Option<StoreAction>) -> u8 {
+    match action {
+        None | Some(StoreAction::Allow) => 0,
+        Some(StoreAction::Ask) => 1,
+        Some(StoreAction::Deny) => 2,
+    }
+}
+
+/// Merge the user's rules over the organization's. A user rule replaces
+/// the fields of an organization rule for the same item. It keeps the
+/// organization rule's action when that action is stricter, so a user
+/// file can never loosen an organization `deny` or `ask`.
+#[must_use]
+pub fn merge_store_rules(org: StoreRules, user: StoreRules) -> StoreRules {
+    let mut rules = org;
+    for (item, mut rule) in user {
+        if let Some(org_rule) = rules.get(&item)
+            && action_rank(org_rule.action) > action_rank(rule.action)
+        {
+            rule.action = org_rule.action;
+        }
+        rules.insert(item, rule);
+    }
+    rules
+}
+
+/// Raise the action of each rule in `merged` to the action of the rule for
+/// the same item in `read`, when that action is stricter. `read` holds the
+/// rules of one file as read, before the deny set refuses any of them. So a
+/// rule that is refused still keeps the rule that applies to its item from
+/// loosening its `deny` or `ask`.
+fn keep_read_actions(read: &StoreRules, mut merged: StoreRules) -> StoreRules {
+    for (item, rule) in &mut merged {
+        if let Some(read_rule) = read.get(item)
+            && action_rank(read_rule.action) > action_rank(rule.action)
+        {
+            rule.action = read_rule.action;
+        }
+    }
+    merged
+}
+
+/// Add a `deny` rule to `merged` for each item that a file in `reads` has a
+/// rule for and `merged` has none. Such an item has only refused rules. Its
+/// `deny` rule registers no upstream and no header, so a store reference to
+/// the item is denied, and is never redeemed with no rule to check.
+fn deny_refused_items(reads: &[&StoreRules], mut merged: StoreRules) -> StoreRules {
+    for read in reads {
+        for (item, rule) in *read {
+            merged
+                .entry(item.clone())
+                .or_insert_with(|| StoreRuleConfig {
+                    store: rule.store.clone(),
+                    upstream: Vec::new(),
+                    header: None,
+                    prefix: None,
+                    basic_auth: None,
+                    action: Some(StoreAction::Deny),
+                });
+        }
+    }
+    merged
 }
 
 impl Config {
@@ -570,5 +717,152 @@ mod tests {
             read_config_or_default(&path).unwrap_err(),
             ConfigError::Validation { .. }
         ));
+    }
+
+    fn rule(action: Option<StoreAction>) -> StoreRuleConfig {
+        StoreRuleConfig {
+            store: None,
+            upstream: vec!["api.example.com".to_owned()],
+            header: Some("Authorization".to_owned()),
+            prefix: None,
+            basic_auth: None,
+            action,
+        }
+    }
+
+    /// A deny set that refuses a rule on `api.github.com`.
+    fn deny() -> StoreDenySet<'static> {
+        StoreDenySet {
+            module_hosts: &["api.github.com"],
+            infrastructure: &[],
+            sign_in_items: &[],
+        }
+    }
+
+    /// The rules of `rules` that [`deny`] accepts.
+    fn accepted(rules: StoreRules) -> StoreRules {
+        check_store_rules(rules, "config.toml", deny()).0
+    }
+
+    /// A user rule replaces an organization rule's fields, but never
+    /// loosens the organization's `deny` or `ask`.
+    #[test]
+    fn user_store_rule_keeps_stricter_org_action() {
+        let org: StoreRules = [
+            ("denied".to_owned(), rule(Some(StoreAction::Deny))),
+            ("asked".to_owned(), rule(Some(StoreAction::Ask))),
+            ("loose".to_owned(), rule(None)),
+            ("org-only".to_owned(), rule(Some(StoreAction::Ask))),
+        ]
+        .into();
+        let mut user_denied = rule(None);
+        user_denied.upstream = vec!["other.example.com".to_owned()];
+        let user: StoreRules = [
+            ("denied".to_owned(), user_denied),
+            ("asked".to_owned(), rule(Some(StoreAction::Allow))),
+            ("loose".to_owned(), rule(Some(StoreAction::Deny))),
+            ("user-only".to_owned(), rule(None)),
+        ]
+        .into();
+        let merged = merge_store_rules(org, user);
+        assert_eq!(merged["denied"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["denied"].upstream, ["other.example.com"]);
+        assert_eq!(merged["asked"].action, Some(StoreAction::Ask));
+        assert_eq!(merged["loose"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["org-only"].action, Some(StoreAction::Ask));
+        assert_eq!(merged["user-only"].action, None);
+    }
+
+    /// An organization `deny` rule that the deny set refuses still keeps a
+    /// user rule for the same item from loosening it.
+    #[test]
+    fn refused_org_rule_keeps_its_action_over_user_rule() {
+        let mut refused = rule(Some(StoreAction::Deny));
+        refused.upstream = vec!["api.github.com".to_owned()];
+        let org_read: StoreRules = [("item".to_owned(), refused)].into();
+        let org = accepted(org_read.clone());
+        assert!(org.is_empty());
+        let user: StoreRules = [("item".to_owned(), rule(Some(StoreAction::Allow)))].into();
+        let merged = keep_read_actions(&org_read, merge_store_rules(org, user));
+        assert_eq!(merged["item"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["item"].upstream, ["api.example.com"]);
+    }
+
+    /// An item whose only rules the deny set refuses gets a `deny` rule with
+    /// no upstream, so a store reference to it is denied. A refused user
+    /// `deny` rule also keeps its action over an organization rule.
+    #[test]
+    fn refused_only_item_is_denied() {
+        let mut refused = rule(None);
+        refused.upstream = vec!["api.github.com".to_owned()];
+        let mut refused_deny = refused.clone();
+        refused_deny.action = Some(StoreAction::Deny);
+        let org_read: StoreRules = [
+            ("org-refused".to_owned(), refused.clone()),
+            ("shared".to_owned(), rule(Some(StoreAction::Allow))),
+        ]
+        .into();
+        let user_read: StoreRules = [
+            ("user-refused".to_owned(), refused_deny.clone()),
+            ("shared".to_owned(), refused_deny),
+        ]
+        .into();
+        let org = accepted(org_read.clone());
+        let user = accepted(user_read.clone());
+        let merged = merge_store_rules(org, user);
+        let merged = keep_read_actions(&org_read, merged);
+        let merged = keep_read_actions(&user_read, merged);
+        let merged = deny_refused_items(&[&org_read, &user_read], merged);
+        for item in ["org-refused", "user-refused"] {
+            assert_eq!(merged[item].action, Some(StoreAction::Deny), "{item}");
+            assert!(merged[item].upstream.is_empty(), "{item}");
+            assert_eq!(merged[item].header, None, "{item}");
+        }
+        assert_eq!(merged["shared"].action, Some(StoreAction::Deny));
+        assert_eq!(merged["shared"].upstream, ["api.example.com"]);
+        let rule = &merged["org-refused"];
+        assert_eq!(
+            crate::core::bep::store_consent(rule, true),
+            crate::core::bep::StoreConsent::Deny
+        );
+    }
+
+    /// The one reader merges both files: an organization `deny` holds
+    /// against a user `allow`, refusals name their file, and an
+    /// organization file that does not parse is reported, with its rules
+    /// left out.
+    #[test]
+    fn read_client_store_rules_keeps_the_organization_deny() {
+        let dir = TempDir::new().unwrap();
+        let org = write_file(
+            dir.path(),
+            "org.toml",
+            "[secret-store-rules.item]\nupstream = [\"api.example.com\"]\n\
+             header = \"x-key\"\naction = \"deny\"\n",
+        );
+        let user = write_file(
+            dir.path(),
+            "user.toml",
+            "[secret-store-rules.item]\nupstream = [\"api.example.com\"]\n\
+             header = \"x-key\"\naction = \"allow\"\n\
+             [secret-store-rules.leak]\nupstream = [\"api.github.com\"]\n\
+             header = \"x-key\"\n",
+        );
+        let read = read_client_store_rules(&user, &org, deny()).unwrap();
+        assert!(read.organization_error.is_none());
+        assert_eq!(read.rules["item"].action, Some(StoreAction::Deny));
+        assert_eq!(read.rules["leak"].action, Some(StoreAction::Deny));
+        assert!(read.rules["leak"].upstream.is_empty());
+        assert_eq!(read.refused.len(), 1);
+        assert_eq!(read.refused[0].file, user.display().to_string());
+
+        let broken = write_file(dir.path(), "broken.toml", "not toml [");
+        let read = read_client_store_rules(&user, &broken, deny()).unwrap();
+        assert!(matches!(
+            read.organization_error,
+            Some(ConfigError::Parse { .. })
+        ));
+        assert_eq!(read.rules["item"].action, Some(StoreAction::Allow));
+        assert!(read_client_store_rules(&broken, &org, deny()).is_err());
     }
 }
