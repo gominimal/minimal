@@ -185,6 +185,7 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
         Some(RuleTarget {
             path: &path,
             confirm: &mut confirm,
+            notice: &mut std::io::stderr(),
         }),
     )
 }
@@ -280,7 +281,8 @@ pub(crate) const PRESETS: [Preset; 5] = [
 ];
 
 /// The rule the flags of `args` ask `set` to write, or `None` when no rule
-/// flag is given. The rule carries no consent `action` (BEP-079).
+/// flag is given. No flag sets a consent `action` or a `store`, so the
+/// rule carries neither (BEP-079). `plan_rule` keeps those of a current rule.
 fn requested_rule(args: &SecretSetArgs) -> anyhow::Result<Option<StoreRuleConfig>> {
     if let Some(name) = &args.preset {
         let Some(preset) = PRESETS.iter().find(|p| p.name == name) else {
@@ -367,6 +369,8 @@ pub(crate) struct RuleTarget<'a> {
     /// Show the change and ask the person at the terminal. `true` replaces
     /// the rule.
     pub confirm: &'a mut dyn FnMut(&str) -> anyhow::Result<bool>,
+    /// Where `--yes` says which rule it replaces and what changes.
+    pub notice: &'a mut dyn Write,
 }
 
 /// The fields of `rule`, one per line, as the change prompt shows them.
@@ -394,14 +398,37 @@ fn rule_change(id: &str, path: &Path, current: &StoreRuleConfig, new: &StoreRule
     )
 }
 
-/// Decide whether `set` writes `rule` for `args.id` to `target`, before
+/// The fields that differ from `current` to `new`, as the `--yes` line
+/// names them.
+fn rule_diff(current: &StoreRuleConfig, new: &StoreRuleConfig) -> String {
+    let mut changes = Vec::new();
+    if current.upstream != new.upstream {
+        changes.push(format!(
+            "upstream {} becomes {}",
+            current.upstream.join(", "),
+            new.upstream.join(", ")
+        ));
+    }
+    let (from, to) = (injection(current), injection(new));
+    if from != to {
+        changes.push(format!("injection {from} becomes {to}"));
+    }
+    changes.join(", and ")
+}
+
+/// Decide whether `set` writes a rule for `args.id` to `target`, before
 /// the value is read. `None` when the file already holds that rule.
+///
+/// Review findings 4371881769 and 4371881775: when a rule for the id
+/// exists, the new rule keeps its `action` and its `store`, because no
+/// flag sets them. A hand-set `deny` or `ask` is never dropped. With
+/// `--yes`, one line on `target.notice` names the rule and the change.
 fn plan_rule(
     args: &SecretSetArgs,
-    rule: StoreRuleConfig,
+    mut rule: StoreRuleConfig,
     source: ValueSource,
     target: &mut RuleTarget<'_>,
-) -> anyhow::Result<Option<StoreRuleConfig>> {
+) -> anyhow::Result<Option<(StoreRuleConfig, Option<String>)>> {
     let id = &args.id;
     check_new_rule(id, &rule, target.path)?;
     let (_, mut rules) = crate::config::read_config_parts(target.path).with_context(|| {
@@ -411,13 +438,20 @@ fn plan_rule(
         )
     })?;
     let Some(current) = rules.remove(id) else {
-        return Ok(Some(rule));
+        return Ok(Some((rule, None)));
     };
+    rule.action = current.action;
+    rule.store.clone_from(&current.store);
     if current == rule {
         return Ok(None);
     }
     if args.yes {
-        return Ok(Some(rule));
+        let line = format!(
+            "min secret set replaces the rule for {id} in {}: {}.",
+            target.path.display(),
+            rule_diff(&current, &rule)
+        );
+        return Ok(Some((rule, Some(line))));
     }
     let change = rule_change(id, target.path, &current, &rule);
     if source != ValueSource::Terminal {
@@ -433,7 +467,7 @@ fn plan_rule(
              To keep the rule and store the value, run `min secret set {id}` without rule flags."
         );
     }
-    Ok(Some(rule))
+    Ok(Some((rule, None)))
 }
 
 /// The command names that the refusals print.
@@ -577,11 +611,12 @@ pub(crate) fn run_set_with_rule(
     bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
     // BEP-079: the rule is checked, and any change confirmed, before the
     // value is read.
-    let write = match (rule, target.as_mut()) {
+    let mut write = match (rule, target.as_mut()) {
         (None, _) => None,
-        (Some(rule), Some(target)) => {
-            plan_rule(args, rule, source, target)?.map(|rule| (target.path, rule))
-        }
+        (Some(rule), Some(target)) => match plan_rule(args, rule, source, target)? {
+            None => None,
+            Some((rule, line)) => Some((target.path, rule, line, &mut *target.notice)),
+        },
         (Some(_), None) => bail!("min secret set has no configuration file to write the rule to"),
     };
     let value = match source {
@@ -606,9 +641,12 @@ pub(crate) fn run_set_with_rule(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
-    let snapshot = match &write {
+    let snapshot = match &mut write {
         None => None,
-        Some((path, rule)) => {
+        Some((path, rule, line, notice)) => {
+            if let Some(line) = line {
+                writeln!(notice, "{line}")?;
+            }
             let snapshot =
                 crate::config::write_store_rule(path, &args.id, rule).with_context(|| {
                     format!(
@@ -1525,7 +1563,11 @@ attributes:
             &mut || Ok(Zeroizing::new("typed".to_owned())),
             &mut &b"piped\n"[..],
             &mut out,
-            Some(RuleTarget { path, confirm }),
+            Some(RuleTarget {
+                path,
+                confirm,
+                notice: &mut std::io::sink(),
+            }),
         );
         (result, String::from_utf8(out).unwrap())
     }
@@ -1783,6 +1825,7 @@ attributes:
                 Some(RuleTarget {
                     path: &path,
                     confirm: &mut no_confirm,
+                    notice: &mut std::io::sink(),
                 }),
             )
             .expect_err("refused");
@@ -1868,6 +1911,7 @@ attributes:
                     Some(RuleTarget {
                         path: &path,
                         confirm: &mut no_confirm,
+                        notice: &mut std::io::sink(),
                     }),
                 )
                 .expect_err("refused");
@@ -1919,7 +1963,7 @@ attributes:
             [format!(
                 "{} has a different secret-store rule for claude.\n\
                  Current rule:\n  upstream:  api.anthropic.com\n  injection: header x-api-key\n  consent:   ask\n\
-                 New rule:\n  upstream:  api.anthropic.com\n  injection: header Authorization, prefix \"Bearer \"\n  consent:   none",
+                 New rule:\n  upstream:  api.anthropic.com\n  injection: header Authorization, prefix \"Bearer \"\n  consent:   ask",
                 path.display()
             )]
         );
@@ -1943,13 +1987,13 @@ attributes:
         assert_eq!(out, "claude\n");
         assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
         let rules = written_rules(&path);
+        // The hand-set `ask` stays (review finding 4371881769).
         assert_eq!(
             rules.get("claude"),
-            Some(&header_rule(
-                "api.anthropic.com",
-                "Authorization",
-                Some("Bearer ")
-            ))
+            Some(&StoreRuleConfig {
+                action: Some(StoreAction::Ask),
+                ..header_rule("api.anthropic.com", "Authorization", Some("Bearer "))
+            })
         );
         assert!(rules.contains_key("other"));
 
@@ -1992,6 +2036,7 @@ attributes:
                 Some(RuleTarget {
                     path: &path,
                     confirm: &mut no_confirm,
+                    notice: &mut std::io::sink(),
                 }),
             )
             .expect_err("refused");
@@ -2032,14 +2077,79 @@ attributes:
             result.unwrap();
             assert_eq!(out, "claude\n");
             let rules = written_rules(&path);
-            // The hand-set `ask` is gone: the written rule has no action.
+            // The hand-set `ask` stays (review finding 4371881769).
             assert_eq!(
                 rules.get("claude"),
-                Some(&header_rule("api.anthropic.com", "x-api-key", None))
+                Some(&StoreRuleConfig {
+                    action: Some(StoreAction::Ask),
+                    ..header_rule("api.anthropic.com", "x-api-key", None)
+                })
             );
             assert!(rules.contains_key("other"));
         }
         assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
+    }
+
+    /// Review findings 4371881769 and 4371881775: `--yes` with new rule
+    /// flags keeps a hand-set `deny` and `store`, and one line names the
+    /// rule and what changes.
+    #[test]
+    fn secret_set_yes_replaces_rule_without_asking_keeps_consent_and_store() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[secret-store-rules.claude]\nstore = \"keychain\"\n\
+             upstream = [\"api.anthropic.com\"]\nheader = \"x-api-key\"\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let store = MemorySecretStore::default();
+        let mut out = Vec::new();
+        let mut notice = Vec::new();
+        run_set_with_rule(
+            &store,
+            &set_args(&[
+                "claude",
+                "--upstream",
+                "api.example.com",
+                "--header",
+                "Authorization",
+                "--prefix",
+                "Bearer ",
+                "--yes",
+            ]),
+            &proxy,
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut &b"piped\n"[..],
+            &mut out,
+            Some(RuleTarget {
+                path: &path,
+                confirm: &mut no_confirm,
+                notice: &mut notice,
+            }),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "claude\n");
+        assert_eq!(store.value("claude").as_deref(), Some(&b"piped"[..]));
+        assert_eq!(
+            written_rules(&path).get("claude"),
+            Some(&StoreRuleConfig {
+                store: Some("keychain".to_owned()),
+                action: Some(StoreAction::Deny),
+                ..header_rule("api.example.com", "Authorization", Some("Bearer "))
+            })
+        );
+        assert_eq!(
+            String::from_utf8(notice).unwrap(),
+            format!(
+                "min secret set replaces the rule for claude in {}: \
+                 upstream api.anthropic.com becomes api.example.com, \
+                 and injection header x-api-key becomes header Authorization, prefix \"Bearer \".\n",
+                path.display()
+            )
+        );
     }
 
     /// A store whose `set` always fails.
