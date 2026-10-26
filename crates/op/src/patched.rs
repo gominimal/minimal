@@ -76,7 +76,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                                         .await
                                     {
                                         Ok(fetched) => fetched,
-                                        Err(rcache::Error::NotFound) => {
+                                        Err(rcache::Error::NotFound { .. }) => {
                                             // A plain miss: the dependency is
                                             // reported in the final error.
                                             missing.push(dep_build.name.clone());

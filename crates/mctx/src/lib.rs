@@ -1152,9 +1152,14 @@ impl Context {
                 // from the activation that needed it.
                 let fetch = async move {
                     let sema = semaphore.acquire().await;
+                    let package = name.clone();
                     let res = rc_clone
                         .materialize(&spec_hash, &cache_clone, &name)
                         .await
+                        // The error names the package, not just the object:
+                        // "the remote cache has no artifact for ..." alone
+                        // tells the user nothing about which package.
+                        .map_err(move |e| anyhow::anyhow!("{package}: {e}"))
                         .map(|(t, d)| {
                             (
                                 d,
@@ -1182,7 +1187,7 @@ impl Context {
         while let Some(result) = task_set.join_next().await {
             let (pending_dir, meta) = result
                 .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+                .map_err(Error::Other)?;
             pending_dir
                 .finalize(meta)
                 .map_err(|e| Error::Other(e.into()))?;

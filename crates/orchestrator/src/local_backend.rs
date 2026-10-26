@@ -300,7 +300,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 let (fetch_time, pending_dir) = remote_cache
                     .materialize(&spec_hash, &shared.cache, build.name.as_str())
                     .await
-                    .map_err(|e| Error::Other(e.into()))?;
+                    .map_err(|e| Error::Other(anyhow::anyhow!("{}: {e}", build.name)))?;
 
                 Ok(Either::Left((
                     pending_dir,
