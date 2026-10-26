@@ -2940,9 +2940,32 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     # vouches for a table this step did not render. The tree's half is
     # already done, and stays.
     NFT_FAIL=1
+    # The pair from the first install is in place. A failed load must leave
+    # it as it was: mv replaces a file's inode, so the same inode says the
+    # install did not write it again.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    _helper_ino="$(ls -i "$HC_HELPER")"
+    _sudoers_ino="$(ls -i "$HC_SUDOERS")"
     run_hc reload_failed "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 1 "$rc" "a re-install whose nft transaction dies exits 1"
+    check "$_helper_ino" "$(ls -i "$HC_HELPER")" \
+        "a failed re-load leaves the existing QUIC block helper as it was"
+    check "$_sudoers_ino" "$(ls -i "$HC_SUDOERS")" \
+        "a failed re-load leaves the existing sudoers rule as it was"
+    # A first install whose load dies writes neither the helper nor its
+    # passwordless sudoers rule.
+    HC_HELPER="$root/hcfresh/lib/quic443-leaf"
+    HC_SUDOERS="$root/hcfresh/sudoers/minimal-quic443-leaf"
+    run_hc load_failed_fresh "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "an install whose nft transaction dies exits 1"
+    want_err "a failed load writes no QUIC block helper" test -e "$HC_HELPER"
+    want_err "a failed load writes no sudoers rule for it" test -e "$HC_SUDOERS"
+    want_ok "a failed load leaves no staging file for either" \
+        [ -z "$(ls -A "$root/hcfresh" 2>/dev/null)" ]
+    unset HC_HELPER HC_SUDOERS
     want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
     want_err "a failed re-load leaves no ct-mark mask record either" \
         test -e "$tree/ct-mark-mask-0x30000000"

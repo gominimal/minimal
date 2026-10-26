@@ -1227,9 +1227,6 @@ for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT
     rmdir "$stale_record" 2>/dev/null ||
         die "cannot remove the previous record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
-# The helper goes in before the load, so a host whose helper cannot be
-# installed loads nothing new and writes no marker.
-install_quic443_helper
 # Render into a variable first, so nothing that touches a disk can sit between
 # rendering and loading. The captured text is byte for byte what render_ruleset
 # wrote: `read -d ''` with an empty delimiter reads without a terminator, so
@@ -1239,6 +1236,11 @@ IFS= read -r -d '' ruleset < <(render_ruleset) || true
 ruleset_sha256="$(sha256_of "$ruleset")"
 printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
 note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
+# The helper and its sudoers rule go in only after the load succeeded, so a
+# load that fails writes neither and leaves a pair from an earlier install as
+# it was. They still go in before the marker, so a host whose helper cannot
+# be installed writes no marker.
+install_quic443_helper
 
 # The presence marker the daemon probes at start, and the ct-mark mask
 # recorded beside it: on real cgroupfs a plain file cannot exist, so each
