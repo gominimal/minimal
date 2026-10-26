@@ -6,7 +6,20 @@
 //! `[session]` table or a declared `[tasks.<name>]` entry, and from the
 //! command-line flags of the creating command. It serializes under the
 //! `box.toml` tables: `box.type`, `io.pty_enabled`, `install.packages`,
-//! `network.mode`, `network.egress.*` and `network.ingress`.
+//! `network.mode` and `network.egress.*`.
+//!
+//! The v0 bytes also carry keys that `box.toml` does not have. #2410 ends
+//! each of these exceptions when it bumps [`BOX_SPEC_VERSION`]:
+//!
+//! - The top-level keys `v`, `entry` and `hooks_enabled`. #2410 removes them
+//!   or maps them to `box.toml` tables.
+//! - `network.ingress` keeps the [`boxes::IngressPolicy`] shape
+//!   (`port_mappings`, `dynamic_allowed_range`, `dynamic_ingress`), not the
+//!   `box.toml` `[{proto, port}]` list.
+//! - A declared `credentialed_upstream` writes under `[network]`. In
+//!   `box.toml` that set comes from `[secrets]` and is never declared.
+//!
+//! A reader of a stored spec branches on `v` before it reads anything else.
 //!
 //! [`BoxSpec::for_session`] and [`BoxSpec::for_task`] are an interim
 //! builder. #2410 (T16, BOX-064) replaces them with the expansion over the
@@ -50,6 +63,12 @@ pub struct BoxSpec {
 /// The network half of a [`BoxSpec`]. It serializes as the `[network]`
 /// table: `mode`, then the policy's `egress` and `ingress` tables, and its
 /// `credentialed_upstream` and `quic443` when it sets them.
+///
+/// This is a v0 exception to `box.toml`, which #2410 ends. `ingress` keeps
+/// the [`boxes::IngressPolicy`] shape (`port_mappings`,
+/// `dynamic_allowed_range`, `dynamic_ingress`), not the `box.toml` shape.
+/// A declared `credentialed_upstream` writes under `[network]`, but
+/// `box.toml` derives that set from `[secrets]` and never declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecNetwork {
     /// The network isolation mode. Serialized as its spec word: `none`,
@@ -61,7 +80,9 @@ pub struct SpecNetwork {
 
 /// What the creating command's flags set on the spec. This is the last
 /// layer, so each value here replaces the one an entry sets.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// The default has hooks on, as a plain create request does.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecFlags {
     /// The network mode, from `--network`.
     pub network: boxes::NetworkMode,
@@ -70,6 +91,16 @@ pub struct SpecFlags {
     pub policy: boxes::BoxPolicy,
     /// Cleared by `--no-hooks`.
     pub hooks_enabled: bool,
+}
+
+impl Default for SpecFlags {
+    fn default() -> Self {
+        Self {
+            network: boxes::NetworkMode::default(),
+            policy: boxes::BoxPolicy::default(),
+            hooks_enabled: true,
+        }
+    }
 }
 
 impl BoxSpec {
@@ -137,6 +168,10 @@ impl BoxSpec {
 
 /// The serialized shape of a [`BoxSpec`], under the `box.toml` tables.
 /// Plain values come before tables, so the shape also writes as TOML.
+///
+/// `v`, `entry` and `hooks_enabled` are v0 keys that `box.toml` does not
+/// have. #2410 removes or maps them when it bumps [`BOX_SPEC_VERSION`], so
+/// a reader of a stored spec branches on `v`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpecDoc {
@@ -172,30 +207,48 @@ struct DocInstall {
 /// The `[network]` table. The policy's own keys are `egress`, `ingress`,
 /// and `credentialed_upstream` and `quic443` when it sets them, so it is
 /// flattened in beside `mode`. The policy refuses an unknown key.
+///
+/// The flatten puts every [`boxes::BoxPolicy`] key beside `mode`. This is
+/// the same v0 exception as on [`SpecNetwork`]: `ingress` keeps the
+/// [`boxes::IngressPolicy`] shape, and `credentialed_upstream` is declared
+/// here. #2410 ends the interim.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DocNetwork {
-    mode: DocNetworkMode,
+    #[serde(with = "mode_word")]
+    mode: boxes::NetworkMode,
     #[serde(flatten)]
     policy: boxes::BoxPolicy,
 }
 
-/// The spec words of [`boxes::NetworkMode`], as [`boxes::NetworkMode::word`]
-/// documents them. They are not its serde form.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DocNetworkMode {
-    None,
-    HostIp,
-    OwnIp,
+/// The `mode` key in its spec word, [`boxes::NetworkMode::word`], not the
+/// mode's serde form. `NetworkMode` is `#[non_exhaustive]`, so a match on it
+/// here needs a wildcard. Writing through `word`, whose match in `boxes` is
+/// exhaustive, stores a new mode under its own word, never as `host_ip`.
+mod mode_word {
+    const WORDS: &[&str] = &["none", "host_ip", "own_ip"];
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        mode: &boxes::NetworkMode,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(mode.word())
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<boxes::NetworkMode, D::Error> {
+        let word = <String as serde::Deserialize>::deserialize(deserializer)?;
+        match word.as_str() {
+            "none" => Ok(boxes::NetworkMode::NoNet),
+            "host_ip" => Ok(boxes::NetworkMode::HostNet),
+            "own_ip" => Ok(boxes::NetworkMode::OwnIp),
+            other => Err(serde::de::Error::unknown_variant(other, WORDS)),
+        }
+    }
 }
 
 impl From<BoxSpec> for SpecDoc {
     fn from(spec: BoxSpec) -> Self {
-        let mode = match spec.network.mode {
-            boxes::NetworkMode::NoNet => DocNetworkMode::None,
-            boxes::NetworkMode::OwnIp => DocNetworkMode::OwnIp,
-            _ => DocNetworkMode::HostIp,
-        };
         Self {
             v: spec.v,
             entry: spec.entry,
@@ -210,7 +263,7 @@ impl From<BoxSpec> for SpecDoc {
                 packages: spec.packages,
             },
             network: DocNetwork {
-                mode,
+                mode: spec.network.mode,
                 policy: spec.network.policy,
             },
         }
@@ -219,11 +272,6 @@ impl From<BoxSpec> for SpecDoc {
 
 impl From<SpecDoc> for BoxSpec {
     fn from(doc: SpecDoc) -> Self {
-        let mode = match doc.network.mode {
-            DocNetworkMode::None => boxes::NetworkMode::NoNet,
-            DocNetworkMode::HostIp => boxes::NetworkMode::HostNet,
-            DocNetworkMode::OwnIp => boxes::NetworkMode::OwnIp,
-        };
         Self {
             v: doc.v,
             box_type: doc.box_table.box_type,
@@ -232,7 +280,7 @@ impl From<SpecDoc> for BoxSpec {
             pty_enabled: doc.io.pty_enabled,
             hooks_enabled: doc.hooks_enabled,
             network: SpecNetwork {
-                mode,
+                mode: doc.network.mode,
                 policy: doc.network.policy,
             },
         }
@@ -292,6 +340,7 @@ mod tests {
         let empty = BoxSpec::for_session(None, SpecFlags::default());
         assert!(empty.packages.is_empty());
         assert_eq!(empty.network.mode, boxes::NetworkMode::default());
+        assert!(empty.hooks_enabled, "the default flags leave hooks on");
 
         let lint = BoxSpec::for_task("lint", &file.tasks["lint"], flags.clone())
             .expect("a task that is not interactive has a spec");

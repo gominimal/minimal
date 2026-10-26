@@ -246,6 +246,8 @@ impl DiskBox {
     }
 
     /// The path of the box's spec file, [`SPEC_FILE`], beside its record.
+    /// `sub_path!` takes only a literal, so a test pins the literal to
+    /// [`SPEC_FILE`].
     pub fn spec_path(&self) -> DaemonAbsPath {
         sub_path!(self.root_path(), "spec.json")
     }
@@ -261,14 +263,17 @@ impl DiskBox {
         let dir = self.root_path();
         let dir = dir.as_utf8_path();
         std::fs::create_dir_all(dir)?;
-        let dest = dir.join(SPEC_FILE);
+        // One source for the path: the file this writes is the one
+        // `spec_path` reports and the daemon logs.
+        let dest = self.spec_path();
+        let dest = dest.as_utf8_path();
         let tmp = dir.join("spec.json.tmp");
         std::fs::write(&tmp, spec)?;
 
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, dest)?;
 
         Ok(())
     }
@@ -1216,7 +1221,7 @@ impl Loader for DiskLoader {
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, dest)?;
 
         Ok(())
     }
@@ -1252,7 +1257,7 @@ impl Loader for DiskLoader {
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, dest)?;
 
         Ok(())
     }

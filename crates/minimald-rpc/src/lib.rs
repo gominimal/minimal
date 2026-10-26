@@ -1746,8 +1746,9 @@ pub struct CreateSessionRequest {
     /// the command's flags (BOX-068): a JSON object whose `v` names the
     /// spec's shape. The daemon stores it beside the box's record before the
     /// box starts, and refuses a create whose spec is not such an object.
-    /// `None` from a client that predates the field, and the daemon then
-    /// stores no spec.
+    /// `None` comes from three senders: a client that predates the field,
+    /// the dashboard create (#2635), and `min task run` of an interactive
+    /// task (#2411). The daemon then files a record with no stored spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json_lenient::Value>,
 }
