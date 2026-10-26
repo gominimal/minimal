@@ -12200,7 +12200,9 @@ proof_bep_store_reference_end_to_end() {
   }
   sr_fail() {
     # The proxy's connection spans name the box, the authority and the
-    # outcome of each request, never a value.
+    # outcome of each request, never a value. They do not name the store or
+    # the identifier yet: the `box_connection` span in crates/bep/src/proxy.rs
+    # has no field for them. The audit record in step 5 carries both.
     echo "--- bep.log (box connections, tail) ---"
     grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
       | grep -vF -- "$sr_value" | tail -20 || true
@@ -12249,6 +12251,11 @@ proof_bep_store_reference_end_to_end() {
 
   # 2. The box spec references the identifier (BEP-032), and `min box spec`
   # shows the reference with its upstream (BEP-038).
+  # Interim spelling: BEP-032 and Gatehouse 6.10 write a store reference as
+  # `source = "store"` with `store` and `id`. GrantSource in
+  # crates/boxes/src/core/bep.rs refuses `store` today, so this seed writes
+  # the identifier as a broker scope. When GrantSource accepts `store`, this
+  # seed writes `source = "store"`, `store = "keychain"` and `id`.
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlstore.XXXXXX)"
   {
     hook_seed_preamble
@@ -12340,6 +12347,7 @@ proof_bep_store_reference_end_to_end() {
   # grep exits 2 when it cannot read a file, even after it lists matches.
   # So the host keeps the match list whatever the exit status, and fails on
   # a match first. grep's own errors name paths only, never file content.
+  # shellcheck disable=SC2016 # $? and $s expand in the box's shell
   sr_hits="$(mnl session exec "$SR_SID" sh -c \
     'timeout 600 grep -rlIE "mne2e[0-9a-f]{32}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev; s=$?; [ "$s" -le 1 ] || exit "$s"' \
     </dev/null 2>"$WORK/$sr_case.scan.err")"
