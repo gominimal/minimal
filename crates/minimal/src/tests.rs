@@ -4732,13 +4732,17 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
             "creation {creation}: the id carries the RFC 9562 variant, got {id}"
         );
         // Its 48-bit timestamp is the clock at the mint, not a counter.
+        // The mint can take the millisecond after the process's last mint
+        // when that is ahead of the clock, so the upper bound allows one
+        // second of lead over the clock after the registration.
         let mut stamp = [0u8; 8];
         stamp[2..].copy_from_slice(&bytes[..6]);
         let stamp = u64::from_be_bytes(stamp);
+        let latest = after + 1_000;
         assert!(
-            (before..=after).contains(&stamp),
+            (before..=latest).contains(&stamp),
             "creation {creation}: the timestamp {stamp} of id {id} is the clock at the \
-             mint, between {before} and {after}"
+             mint, between {before} and {latest}"
         );
 
         ids.push(bytes);
