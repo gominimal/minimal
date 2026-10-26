@@ -866,6 +866,9 @@ impl KeyFile {
         }
         let before = entries.len();
         retire_unused(&mut entries);
+        // The end of the box takes effect in memory first, as a revocation
+        // does in `replace`, so a failed write leaves no retired key
+        // verifying in this process. The next write records it.
         if entries.len() != before {
             install(&entries, registry);
         }
