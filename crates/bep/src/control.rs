@@ -95,13 +95,27 @@
 //! < {"ok":true,"kid":"<new kid>","revoked":["<kid>"]}
 //! ```
 //!
+//! A registration can name the box that the client signs handles for under
+//! the key. The proxy keeps each key's running boxes in the file, and a
+//! `forget_box` ends the box's use of every key. A replacement does not
+//! revoke a key that a running box uses. It retires the key: the key keeps
+//! verifying until the last box that uses it is forgotten, and then the
+//! proxy revokes it (the ruling on gominimal/arch#144):
+//!
+//! ```text
+//! > {"op":"register_client_key","key":"<key>","box_id":"<id>"}
+//! < {"ok":true,"kid":"<kid>"}
+//! ```
+//!
 //! The registry is bounded ([`KeyBound`]): it holds at most a set count of
-//! keys, and drops the key registered least recently to stay inside it. With
-//! an idle period set, it also drops a key that nobody registered for that
-//! long. The proxy binary has no setting for the bound. It uses
+//! keys, and drops the key registered least recently that no running box
+//! uses to stay inside it. When running boxes use every key, it refuses a
+//! new key with [`KEYS_IN_USE`]. With an idle period set, it also drops a
+//! key that no running box uses and nobody registered for that long. The proxy binary has no setting for the bound. It uses
 //! [`KeyBound::default`]: a fixed count and no idle period. Only an embedder
 //! that calls [`Control::bind_with_key_bound`] sets another bound.
 
+use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,6 +152,11 @@ pub enum Request {
     RegisterClientKey {
         /// The SEC1 encoding of the P-256 public key, unpadded base64url.
         key: String,
+        /// The box whose store handles or sign-in references the client
+        /// signs under the key. The proxy keeps a key that a running box
+        /// uses until the box is forgotten.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        box_id: Option<String>,
     },
     /// Register a box with its declared egress and its address stance. A
     /// second registration of the same box replaces the first.
@@ -449,6 +468,12 @@ struct Entry {
     sec1: Vec<u8>,
     /// When the key was last registered, in seconds since the epoch.
     seen: u64,
+    /// The running boxes whose handles are signed under the key. The bound
+    /// never drops a key that a running box uses.
+    boxes: BTreeSet<String>,
+    /// Whether a replacement revoked the key while running boxes used it.
+    /// A retired key stays until the last of those boxes is forgotten.
+    retired: bool,
 }
 
 impl Entry {
@@ -461,19 +486,39 @@ impl Entry {
             kid: handle::kid(&verifying),
             sec1,
             seen,
+            boxes: BTreeSet::new(),
+            retired: false,
         })
+    }
+
+    /// Whether a running box uses the key.
+    fn in_use(&self) -> bool {
+        !self.boxes.is_empty()
     }
 }
 
+/// The start of the refusal of a registration that passes the bound when
+/// running boxes use every registered key. The bound follows it.
+pub const KEYS_IN_USE: &str =
+    "every registered client key is in use by a running box, and the bound is ";
+
+/// The bound that a refusal starting with [`KEYS_IN_USE`] names, or `None`
+/// for any other refusal.
+#[must_use]
+pub fn keys_in_use_bound(error: &str) -> Option<usize> {
+    error.strip_prefix(KEYS_IN_USE)?.trim().parse().ok()
+}
+
 /// Drops from `entries` each key that `bound` does not admit at `now`, and
-/// returns the dropped `kid`s. The key `keep` is never dropped. A warn line
-/// names each dropped key.
+/// returns the dropped `kid`s. The key `keep` and every key that a running
+/// box uses are never dropped, so the entries can stay above the bound. A
+/// warn line names each dropped key.
 fn enforce(entries: &mut Vec<Entry>, bound: KeyBound, now: u64, keep: Option<&str>) -> Vec<String> {
     let mut dropped = Vec::new();
     if let Some(idle) = bound.idle {
         entries.retain(|entry| {
             let idle_for = now.saturating_sub(entry.seen);
-            if Some(entry.kid.as_str()) == keep || idle_for < idle.as_secs() {
+            if Some(entry.kid.as_str()) == keep || entry.in_use() || idle_for < idle.as_secs() {
                 return true;
             }
             tracing::warn!(
@@ -487,12 +532,12 @@ fn enforce(entries: &mut Vec<Entry>, bound: KeyBound, now: u64, keep: Option<&st
     }
     let max = bound.max_keys.max(1);
     while entries.len() > max {
-        // The least recently registered key goes first. A tie goes to the
-        // key that is earlier in the file.
+        // The least recently registered key that no running box uses goes
+        // first. A tie goes to the key that is earlier in the file.
         let Some((index, _)) = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| Some(entry.kid.as_str()) != keep)
+            .filter(|(_, entry)| Some(entry.kid.as_str()) != keep && !entry.in_use())
             .min_by_key(|(_, entry)| entry.seen)
         else {
             break;
@@ -519,6 +564,21 @@ fn within(entries: &[Entry], bound: KeyBound, now: u64) -> bool {
         })
 }
 
+/// Removes from `entries` each retired key that no running box uses, with
+/// an info line that names it.
+fn retire_unused(entries: &mut Vec<Entry>) {
+    entries.retain(|entry| {
+        if entry.retired && !entry.in_use() {
+            tracing::info!(
+                kid = %entry.kid,
+                "revoked a replaced client key: the last box created under it ended"
+            );
+            return false;
+        }
+        true
+    });
+}
+
 /// Makes `registry` hold exactly the keys of `entries`.
 fn install(entries: &[Entry], registry: &RwLock<ClientKeys>) {
     let mut fresh = ClientKeys::new();
@@ -531,7 +591,9 @@ fn install(entries: &[Entry], registry: &RwLock<ClientKeys>) {
 
 /// The registrations file: one kept key per line, as the request carried
 /// it, then a space and the time it was last registered. A line with no
-/// time is a key registered at the restore.
+/// time is a key registered at the restore. A key that running boxes use
+/// adds ` boxes=<id>,<id>`, and a key that a replacement retired adds
+/// ` retired` before it.
 #[derive(Debug)]
 struct KeyFile {
     path: PathBuf,
@@ -582,7 +644,7 @@ impl KeyFile {
                 let mut fields = line.split_whitespace();
                 let Some(key) = fields.next() else { continue };
                 let seen = fields.next().and_then(|t| t.parse().ok()).unwrap_or(now);
-                let Some(entry) = Entry::parse(key, seen) else {
+                let Some(mut entry) = Entry::parse(key, seen) else {
                     tracing::warn!(
                         path = %self.path.display(),
                         line = number + 1,
@@ -590,13 +652,30 @@ impl KeyFile {
                     );
                     continue;
                 };
+                for field in fields {
+                    if field == "retired" {
+                        entry.retired = true;
+                    } else if let Some(ids) = field.strip_prefix("boxes=") {
+                        entry
+                            .boxes
+                            .extend(ids.split(',').filter_map(normalise_box_id));
+                    }
+                }
                 match entries.iter_mut().find(|e| e.kid == entry.kid) {
-                    Some(kept) => kept.seen = kept.seen.max(entry.seen),
+                    Some(kept) => {
+                        kept.seen = kept.seen.max(entry.seen);
+                        kept.retired &= entry.retired;
+                        kept.boxes.extend(entry.boxes);
+                    }
                     None => entries.push(entry),
                 }
             }
         }
-        if !enforce(&mut entries, self.bound, now, None).is_empty() {
+        // A retired key whose boxes all ended is revoked.
+        let before = entries.len();
+        retire_unused(&mut entries);
+        let retired = entries.len() != before;
+        if !enforce(&mut entries, self.bound, now, None).is_empty() || retired {
             self.write(&entries)?;
         }
         install(&entries, registry);
@@ -615,10 +694,8 @@ impl KeyFile {
         }
     }
 
-    /// Keeps `entry` and registers it in `registry`, at `now`. With
-    /// `replace`, every other key is revoked: the registry serves one client
-    /// for each socket owner (see the module docs). Returns the revoked
-    /// `kid`s.
+    /// [`KeyFile::register_for`], for no box.
+    #[cfg(test)]
     fn register(
         &self,
         entry: Entry,
@@ -626,8 +703,32 @@ impl KeyFile {
         now: u64,
         replace: bool,
     ) -> Result<Vec<String>, String> {
+        self.register_for(entry, registry, now, replace, None)
+    }
+
+    /// Keeps `entry` and registers it in `registry`, at `now`, as a key that
+    /// the box `user` uses. With `replace`, every other key is revoked: the
+    /// registry serves one client for each socket owner (see the module
+    /// docs). A key that a running box uses is retired, not revoked: it
+    /// stays until the last such box is forgotten ([`KeyFile::release`]).
+    /// Returns the revoked `kid`s.
+    ///
+    /// A new key that passes the bound when running boxes use every other
+    /// key is refused with [`KEYS_IN_USE`].
+    fn register_for(
+        &self,
+        entry: Entry,
+        registry: &RwLock<ClientKeys>,
+        now: u64,
+        replace: bool,
+        user: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         let mut entries = self.lock();
-        let known = entries.iter().any(|e| e.kid == entry.kid);
+        let kept = entries.iter().find(|e| e.kid == entry.kid);
+        let known = kept.is_some();
+        // A new user or a retired key changes what the file keeps.
+        let unchanged = kept
+            .is_some_and(|kept| !kept.retired && user.is_none_or(|user| kept.boxes.contains(user)));
         // A known key inside the bound changes only its time. The file
         // takes that time at the next write, and the write waits until the
         // last one is older than the refresh interval.
@@ -635,7 +736,7 @@ impl KeyFile {
             .filter(|&last| last != NEVER_WRITTEN)
             .and_then(|last| now.checked_sub(last))
             .is_some_and(|since| since < self.seen_refresh().as_secs());
-        if known && !replace && recent && within(&entries, self.bound, now) {
+        if unchanged && !replace && recent && within(&entries, self.bound, now) {
             if let Some(kept) = entries.iter_mut().find(|e| e.kid == entry.kid) {
                 kept.seen = now;
             }
@@ -644,9 +745,19 @@ impl KeyFile {
         let kid = entry.kid.clone();
         let mut next = entries.clone();
         let mut revoked = Vec::new();
+        let mut retiring = Vec::new();
         if replace {
-            next.retain(|e| {
+            next.retain_mut(|e| {
                 if e.kid == kid {
+                    return true;
+                }
+                if e.in_use() {
+                    // The ruling on gominimal/arch#144: a replaced key keeps
+                    // verifying until the boxes created under it end.
+                    if !e.retired {
+                        retiring.push((e.kid.clone(), e.boxes.len()));
+                    }
+                    e.retired = true;
                     return true;
                 }
                 revoked.push(e.kid.clone());
@@ -654,10 +765,32 @@ impl KeyFile {
             });
         }
         match next.iter_mut().find(|e| e.kid == kid) {
-            Some(kept) => kept.seen = now,
-            None => next.push(Entry { seen: now, ..entry }),
+            Some(kept) => {
+                kept.seen = now;
+                // A key that a client registers again signs handles again.
+                kept.retired = false;
+                if let Some(user) = user {
+                    kept.boxes.insert(user.to_owned());
+                }
+            }
+            None => {
+                let mut entry = Entry { seen: now, ..entry };
+                if let Some(user) = user {
+                    entry.boxes.insert(user.to_owned());
+                }
+                next.push(entry);
+            }
         }
         enforce(&mut next, self.bound, now, Some(&kid));
+        let max = self.bound.max_keys.max(1);
+        if !known && next.len() > max {
+            tracing::warn!(
+                kid,
+                max_keys = max,
+                "refused a client key: running boxes use every registered key"
+            );
+            return Err(format!("{KEYS_IN_USE}{max}"));
+        }
         if !known && !replace {
             // A new key is kept before it is registered, so a key the proxy
             // accepts is a key the next start restores.
@@ -676,6 +809,14 @@ impl KeyFile {
         install(&entries, registry);
         for gone in &revoked {
             tracing::info!(kid = %gone, replacement = %kid, "revoked a client key that the client replaced");
+        }
+        for (kept, boxes) in &retiring {
+            tracing::info!(
+                kid = %kept,
+                replacement = %kid,
+                boxes,
+                "kept a replaced client key until the running boxes that use it end"
+            );
         }
         match self.write(&entries) {
             Ok(()) => self.written.store(now, Ordering::Relaxed),
@@ -710,6 +851,27 @@ impl KeyFile {
             )
         })?;
         Ok(true)
+    }
+
+    /// Records that the box `box_id` ended: no key is in use by it any more.
+    /// A retired key that no running box uses then is revoked.
+    fn release(&self, box_id: &str, registry: &RwLock<ClientKeys>) {
+        let mut entries = self.lock();
+        let mut changed = false;
+        for entry in entries.iter_mut() {
+            changed |= entry.boxes.remove(box_id);
+        }
+        if !changed {
+            return;
+        }
+        let before = entries.len();
+        retire_unused(&mut entries);
+        if entries.len() != before {
+            install(&entries, registry);
+        }
+        if let Err(err) = self.write(&entries) {
+            tracing::error!(path = %self.path.display(), %err, "did not record the end of a box that uses a client key");
+        }
     }
 
     /// Opens the file for reading, without following a symlink, and checks
@@ -764,6 +926,13 @@ impl KeyFile {
             text.push_str(&entry.key);
             text.push(' ');
             text.push_str(&entry.seen.to_string());
+            if entry.retired {
+                text.push_str(" retired");
+            }
+            if entry.in_use() {
+                text.push_str(" boxes=");
+                text.push_str(&entry.boxes.iter().cloned().collect::<Vec<_>>().join(","));
+            }
             text.push('\n');
         }
         file.write_all(text.as_bytes())?;
@@ -869,10 +1038,15 @@ fn handle_request(
         Err(err) => return Reply::refused(format!("the request is not valid: {err}")),
     };
     match request {
-        Request::RegisterClientKey { key } => {
+        Request::RegisterClientKey { key, box_id } => {
             let entry = match parse_key(&key) {
                 Ok(entry) => entry,
                 Err(reply) => return reply,
+            };
+            let user = match box_id.as_deref().map(normalise_box_id) {
+                None => None,
+                Some(Some(user)) => Some(user),
+                Some(None) => return Reply::refused("the box id is not 32 hex digits"),
             };
             let kid = entry.kid.clone();
             let known = registry
@@ -881,7 +1055,9 @@ fn handle_request(
                 .contains(&kid);
             match keys {
                 Some(keys) => {
-                    if let Err(error) = keys.register(entry, registry, unix_now(), false) {
+                    if let Err(error) =
+                        keys.register_for(entry, registry, unix_now(), false, user.as_deref())
+                    {
                         return Reply::refused(error);
                     }
                 }
@@ -910,7 +1086,7 @@ fn handle_request(
                 Err(reply) => return reply,
             };
             let kid = entry.kid.clone();
-            match keys.register(entry, registry, unix_now(), true) {
+            match keys.register_for(entry, registry, unix_now(), true, None) {
                 Ok(revoked) => {
                     tracing::info!(
                         kid,
@@ -959,6 +1135,11 @@ fn handle_request(
                 return Reply::refused("the box id is not 32 hex digits");
             };
             boxes.forget(&box_id);
+            // The box ended, so the keys it used are free for the bound, and
+            // a retired key it was the last user of is revoked.
+            if let Some(keys) = keys {
+                keys.release(&box_id, registry);
+            }
             Reply::done()
         }
         Request::RecordMint { box_id, identifier } => {
@@ -1229,6 +1410,7 @@ mod tests {
         let sec1 = key.verifying_key().to_sec1_bytes();
         let line = serde_json::to_string(&Request::RegisterClientKey {
             key: URL_SAFE_NO_PAD.encode(&sec1),
+            box_id: None,
         })
         .unwrap();
 
@@ -1273,6 +1455,7 @@ mod tests {
     async fn register(path: &Path, key: &p256::ecdsa::SigningKey) -> Reply {
         let line = serde_json::to_string(&Request::RegisterClientKey {
             key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+            box_id: None,
         })
         .unwrap();
         let stream = UnixStream::connect(path).await.unwrap();
@@ -1445,6 +1628,7 @@ mod tests {
         let other = p256::ecdsa::SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
         let line = serde_json::to_string(&Request::RegisterClientKey {
             key: URL_SAFE_NO_PAD.encode(other.verifying_key().to_sec1_bytes()),
+            box_id: None,
         })
         .unwrap();
         let mut stream = UnixStream::connect(&listener_path).await.unwrap();
@@ -1694,5 +1878,111 @@ mod tests {
         assert_eq!(held(&restored), [false, false, true]);
         assert_eq!(restarted.restore(&restored, 1_000).unwrap(), 0);
         assert_eq!(held(&restored), [false, false, false]);
+    }
+
+    // BEP-063: the bound drops the least recently registered key that no
+    // running box uses, and refuses a new key when running boxes use every
+    // key. A forgotten box frees its key, and a restart keeps the use.
+    #[test]
+    fn the_registry_bound_never_drops_a_key_a_running_box_uses() {
+        const BOX_X: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+        const BOX_Y: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFile {
+            bound: KeyBound {
+                max_keys: 2,
+                idle: None,
+            },
+            ..KeyFile::new(dir.path().join("control.sock.client-keys"))
+        };
+        let registry = RwLock::new(ClientKeys::new());
+        let entry = |byte: u8| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                0,
+            )
+            .unwrap()
+        };
+        let (a, b, c, d) = (entry(1), entry(2), entry(3), entry(4));
+        let held = |registry: &RwLock<ClientKeys>| {
+            let registry = registry.read().unwrap();
+            [&a, &b, &c, &d].map(|e| registry.contains(&e.kid))
+        };
+
+        // `a` is the least recently registered key, but box X uses it, so
+        // the bound drops `b`.
+        keys.register_for(a.clone(), &registry, 10, false, Some(BOX_X))
+            .unwrap();
+        keys.register(b.clone(), &registry, 20, false).unwrap();
+        keys.register_for(c.clone(), &registry, 30, false, Some(BOX_Y))
+            .unwrap();
+        assert_eq!(held(&registry), [true, false, true, false]);
+
+        // Running boxes use both keys, so a new key is refused and no key
+        // is dropped.
+        let error = keys.register(d.clone(), &registry, 40, false).unwrap_err();
+        assert_eq!(keys_in_use_bound(&error), Some(2), "{error}");
+        assert_eq!(held(&registry), [true, false, true, false]);
+
+        // The use survives a restart.
+        let restarted = KeyFile {
+            bound: keys.bound,
+            ..KeyFile::new(keys.path.clone())
+        };
+        let restored = RwLock::new(ClientKeys::new());
+        assert_eq!(restarted.restore(&restored, 50).unwrap(), 2);
+        let error = restarted
+            .register(d.clone(), &restored, 50, false)
+            .unwrap_err();
+        assert_eq!(keys_in_use_bound(&error), Some(2), "{error}");
+
+        // Box X ends, so `a` is free, and the bound drops it for `d`.
+        restarted.release(BOX_X, &restored);
+        restarted.register(d.clone(), &restored, 60, false).unwrap();
+        assert_eq!(held(&restored), [false, false, true, true]);
+    }
+
+    // BEP-063: a replacement retires a key that a running box uses, and the
+    // proxy revokes it when the last such box is forgotten.
+    #[test]
+    fn a_replaced_key_stays_until_its_last_box_is_forgotten() {
+        const BOX_X: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+        let dir = tempfile::tempdir().unwrap();
+        let keys = KeyFile::new(dir.path().join("control.sock.client-keys"));
+        let registry = RwLock::new(ClientKeys::new());
+        let entry = |byte: u8| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                0,
+            )
+            .unwrap()
+        };
+        let (used, unused, replacement) = (entry(1), entry(2), entry(3));
+        keys.register_for(used.clone(), &registry, 10, false, Some(BOX_X))
+            .unwrap();
+        keys.register(unused.clone(), &registry, 20, false).unwrap();
+        let revoked = keys
+            .register(replacement.clone(), &registry, 30, true)
+            .unwrap();
+        assert_eq!(revoked, vec![unused.kid.clone()]);
+        let held = |registry: &RwLock<ClientKeys>| {
+            let registry = registry.read().unwrap();
+            [&used, &unused, &replacement].map(|e| registry.contains(&e.kid))
+        };
+        assert_eq!(held(&registry), [true, false, true]);
+
+        // A forget of another box changes nothing.
+        keys.release("0192f0c17a2b7c3d8e4fa0b1c2d3e4f6", &registry);
+        assert_eq!(held(&registry), [true, false, true]);
+        keys.release(BOX_X, &registry);
+        assert_eq!(held(&registry), [false, false, true]);
+
+        let restored = RwLock::new(ClientKeys::new());
+        KeyFile::new(keys.path.clone())
+            .restore(&restored, 40)
+            .unwrap();
+        assert_eq!(held(&restored), [false, false, true]);
     }
 }
