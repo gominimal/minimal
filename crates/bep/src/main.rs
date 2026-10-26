@@ -406,15 +406,15 @@ fn admission(rules: &[StoreRule]) -> Admission {
 /// The client's `[secret-store-rules]` that `bep` holds: the rules of the
 /// user-level `config.toml` that `min secret set` writes, merged over the
 /// organization's `/etc/minimal/config.toml` as `min` merges them, less
-/// each rule the deny set refuses (BEP-034). With no home directory there
-/// are none.
+/// each rule the deny set refuses (BEP-034). With no config dir (no
+/// absolute `XDG_CONFIG_HOME` and no home directory) there are none.
 ///
 /// The redeemer asks the source at each request, and the source re-reads
 /// the files when one changes, so an edited rule decides the next
 /// redemption (BEP-032). Two limits hold. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
-/// read. The root's names and the admitted CONNECT set take the rules at
+/// read: <https://github.com/gominimal/minimal/issues/2620>. The root's names and the admitted CONNECT set take the rules at
 /// start only, so a rule that adds an upstream reaches them when the proxy
 /// restarts: <https://github.com/gominimal/minimal/issues/2618>. The start
 /// log line names the file, so both show there.
@@ -426,16 +426,22 @@ fn client_store_rules() -> ClientRules {
         )
     });
     if paths.is_none() {
-        tracing::warn!("found no home directory, so bep holds no secret-store rules");
+        tracing::warn!(
+            "found no XDG_CONFIG_HOME and no home directory, so bep holds no secret-store rules"
+        );
     }
     ClientRules::new(paths)
 }
 
-/// The user-level `config.toml` in the default config dir, or `None` with
-/// no home directory.
+/// The user-level `config.toml` in the default config dir, or `None` when
+/// neither an absolute `XDG_CONFIG_HOME` nor a home directory names it.
 fn client_config_path() -> Option<PathBuf> {
-    // `paths` stops the process when it finds no home directory.
-    std::env::home_dir()?;
+    // `paths` takes an absolute `XDG_CONFIG_HOME` first, and stops the
+    // process when it then finds no home directory. Check the same order.
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").is_some_and(|dir| Path::new(&dir).is_absolute());
+    if !xdg {
+        std::env::home_dir()?;
+    }
     Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
