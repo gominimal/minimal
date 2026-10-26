@@ -810,6 +810,10 @@ pub struct LogCheck {
     /// Where the chain breaks: the segment, and the record in it, counted
     /// from 1. `None` when the whole log verifies.
     pub broken: Option<(PathBuf, usize)>,
+    /// The segments, other than segment 0, where the chain starts again
+    /// with no hash to carry on from, because the segments before them are
+    /// missing. A prune and a deletion both leave one.
+    pub restarts: Vec<PathBuf>,
 }
 
 /// Verifies the hash chain of every segment of the log in `dir`, oldest
@@ -826,11 +830,23 @@ pub struct LogCheck {
 /// chain. After a segment with a revocation, the segment past the gap
 /// starts the chain again. A missing directory is an empty log that
 /// verifies.
+///
+/// Only a line that parses as a revocation record counts here. A line that
+/// does not parse is not one the writer wrote, so it never excuses a gap.
+///
+/// Residual: a gap after a revocation segment, and a missing run of the
+/// oldest segments, look the same whether [`prune`] or a person removed the
+/// segments. The chain carries no record of a prune, so this check cannot
+/// tell the two apart. It lists every segment where the chain starts again
+/// in [`LogCheck::restarts`], so the caller can say so. A log removed whole
+/// reads as an empty log. Both are the T31 residual, with an edit followed
+/// by recomputation and the removal of the last record.
 pub fn verify_dir(dir: impl AsRef<Path>) -> io::Result<LogCheck> {
     let mut check = LogCheck {
         segments: Vec::new(),
         records: 0,
         broken: None,
+        restarts: Vec::new(),
     };
     // The previous segment's number, head, and whether it holds a
     // revocation record.
@@ -843,11 +859,14 @@ pub fn verify_dir(dir: impl AsRef<Path>) -> io::Result<LogCheck> {
             Some((_, head, false)) => head.clone(),
             _ => None,
         };
+        if start.is_none() {
+            check.restarts.push(path.clone());
+        }
         check.segments.push(path.clone());
         match verify_chain(start.as_deref(), &contents) {
             ChainCheck::Verified { head, records } => {
                 check.records += records;
-                previous = Some((n, head, bytes_hold_revocation(&contents)));
+                previous = Some((n, head, bytes_hold_parsed_revocation(&contents)));
             }
             ChainCheck::Broken { record } => {
                 check.records += record - 1;
@@ -901,6 +920,18 @@ fn bytes_hold_revocation(bytes: &[u8]) -> bool {
         !raw.is_empty()
             && serde_json::from_slice::<Record>(raw)
                 .map_or(true, |record| record.kind == Kind::Revocation)
+    })
+}
+
+/// Whether the bytes of one segment hold a complete line that parses as a
+/// revocation record. Unlike [`bytes_hold_revocation`], a line that does
+/// not parse counts as none, so an edited line cannot excuse a gap in
+/// [`verify_dir`].
+fn bytes_hold_parsed_revocation(bytes: &[u8]) -> bool {
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+    bytes[..complete].split(|&b| b == b'\n').any(|raw| {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        serde_json::from_slice::<Record>(raw).is_ok_and(|record| record.kind == Kind::Revocation)
     })
 }
 
@@ -1933,6 +1964,10 @@ mod tests {
         assert_eq!(kept[0], all[0]);
         let check = verify_dir(&log_dir).unwrap();
         assert_eq!(check.broken, None, "{check:?}");
+        // The segment past the gap starts the chain again, and the check
+        // says so.
+        let past_gap = kept[1].clone();
+        assert_eq!(check.restarts, vec![past_gap], "{check:?}");
 
         // Deleting a middle segment of a log without a revocation leaves a
         // gap after a segment that a prune removes, so the chain breaks.
@@ -1946,6 +1981,26 @@ mod tests {
         let all = segments(&log_dir2).unwrap();
         fs::remove_file(&all[1]).unwrap();
         let check = verify_dir(&log_dir2).unwrap();
+        assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
+        assert!(check.restarts.is_empty(), "{check:?}");
+
+        // A revocation record garbled so that it no longer parses, its
+        // `previous_hash` kept, does not excuse a deleted segment after it.
+        let dir3 = TempDir::new();
+        let log_dir3 = dir3.log().parent().unwrap().join("garbled");
+        let mut log = AuditLog::open_dir(&log_dir3, rotation(1, usize::MAX, 3600)).unwrap();
+        log.append(&revocation("box-a")).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir3).unwrap();
+        let first = fs::read_to_string(&all[0]).unwrap();
+        let garbled = first.replace("\"kind\":\"revocation\"", "\"kind\":\"revocatio\"");
+        assert_ne!(first, garbled, "the record carries its kind");
+        fs::write(&all[0], garbled).unwrap();
+        fs::remove_file(&all[1]).unwrap();
+        let check = verify_dir(&log_dir3).unwrap();
         assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
     }
 }
