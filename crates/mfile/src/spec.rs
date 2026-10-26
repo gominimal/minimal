@@ -179,7 +179,10 @@ mod tests {
         assert_eq!(lint.box_type, "task");
         assert_eq!(lint.entry, "lint");
         assert_eq!(lint.packages, vec!["rust".to_string()]);
-        assert!(!lint.pty_enabled, "a task that is not interactive has no terminal");
+        assert!(
+            !lint.pty_enabled,
+            "a task that is not interactive has no terminal"
+        );
         assert_eq!(lint.network.policy, policy);
 
         let tui = BoxSpec::for_task("tui", &file.tasks["tui"], flags);
