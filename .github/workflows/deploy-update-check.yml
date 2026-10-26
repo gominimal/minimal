@@ -1,0 +1,397 @@
+# Deploy the update-check Cloudflare Worker (workers/update-check, the version
+# endpoint of min's daily update check, inbox#589) when its code changes on
+# main. A merged change under workers/update-check/ that is not deployed
+# leaves the edge drifted from the repo; this job closes that gap.
+#
+# This is gominimal/webapp's .github/workflows/deploy-worker.yml with the
+# Worker, the task and the changed-paths list swapped; the gate (a green CI
+# run on the exact commit, first-party push only, main's history only) is
+# kept verbatim, and the reasons it is shaped that way are in that file.
+#
+# Required repo secrets:
+#   CLOUDFLARE_WORKER_DEPLOY_TOKEN — API token scoped to exactly:
+#     Account → Workers Scripts:Edit (upload), Zone(minimal.dev) → Workers
+#     Routes:Edit + Zone:Read (wrangler syncs the route declared in
+#     wrangler.toml on every deploy).
+#   CLOUDFLARE_ACCOUNT_ID — the target account.
+name: Deploy update-check Worker
+
+# Every entry point is gated on a green CI run for the exact commit being
+# deployed — see the `gate` job. Code pushes reach this workflow only through
+# `workflow_run`: CI completing on main. Do not re-add a `push` trigger.
+#
+# `workflow_run` carries no path filter, so the `push: paths:` list this
+# workflow used to be scoped by moved into the gate's changed-paths step,
+# which diffs the validated commit against the last green main commit.
+#
+# `workflow_run` is the pwn-request trigger: it runs in this repository's
+# context with the Cloudflare deploy token, and this workflow then checks out
+# the commit the triggering run used. That is only safe because the `gate` job
+# refuses every run whose triggering CI was not a `push` on this repository —
+# a push to a branch here requires write access, so the checked-out tree is
+# never attacker-supplied, and the sha is re-checked against main's history
+# before anything is uploaded.
+#
+# The ignore below anchors to the `on:` key, so it silences that audit for
+# EVERY trigger in this block, not just `workflow_run`. Do not add
+# `pull_request_target` here — it would be added to a credentialed workflow
+# with no audit noise at all.
+on:  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Break-glass redeploy, gated the same way but NOT changed-paths filtered —
+  # an operator asking for a deploy gets one. This is the recovery path for any
+  # failed run of this workflow whose commit main has since moved past, which
+  # the `deploy` job's re-run guard refuses to retry and which no later merge
+  # picks up (see the changed-paths step). The ref picked in the UI selects
+  # which version of this workflow file runs — the commit deployed is always
+  # main's HEAD.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve the commit this run deploys, prove CI passed on it, and decide
+  # whether it touched the Worker. The deploy job reads `needs.gate.outputs.sha`
+  # rather than `github.sha`: on a `workflow_run` event GITHUB_SHA is "last
+  # commit on the default branch", which is not necessarily the commit CI
+  # validated.
+  gate:
+    name: Gate on CI
+    runs-on: ubuntu-latest
+    # Bounds the dispatch-path wait below (the workflow_run path never waits).
+    # Stays above WAIT_SECONDS so the wait fails first, with its own message.
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      # Read the CI workflow's runs: for a commit's conclusion, and for the
+      # previous green main commit the changed-paths diff bases on.
+      actions: read
+    # `workflow_run` also fires for CI runs triggered by `pull_request`, and a
+    # PR whose head branch is itself named `main` passes the `branches: [main]`
+    # trigger filter — including one from a fork, whose head_sha is attacker
+    # controlled. Requiring event == push and a head repository that is this
+    # repository keeps the deploy path on first-party main commits only.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'success')
+    outputs:
+      # The wait step can re-target main's HEAD mid-poll, so its sha wins when
+      # it ran; it is skipped on `workflow_run`, so resolve's value carries.
+      sha: ${{ steps.wait.outputs.sha || steps.resolve.outputs.sha }}
+      # Empty when the changed-paths step is skipped — the dispatch path, which
+      # deploys unconditionally.
+      changed: ${{ steps.paths.outputs.changed || 'true' }}
+      # Set only by the resolve step's superseded-commit refusal, whose non-zero
+      # exit is a designed outcome rather than a malfunction — the edge is ahead
+      # of that commit. The `notify` job must not page for it.
+      superseded: ${{ steps.resolve.outputs.superseded }}
+    steps:
+      - name: Resolve the commit to deploy
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          # Empty on the dispatch path, which deploys main's current HEAD.
+          CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Also empty on the dispatch path; 1 on a CI run's first attempt.
+          CI_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          sha="${CI_HEAD_SHA}"
+          if [[ -z "${sha}" ]]; then
+            sha=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          fi
+          # An unexpected API shape yields the literal `null` or an empty
+          # string, and checkout with an empty `ref:` silently falls back to
+          # main's HEAD — a different commit than the one that was gated.
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved commit '${sha}' is not a 40-hex-digit sha." \
+              "Refusing to deploy."
+            exit 1
+          fi
+          # Second, independent barrier to the job-level `if:` guard: only a
+          # commit on main's own history may be deployed, so a foreign sha
+          # fails closed even if that guard is ever weakened.
+          status=$(gh api "repos/${REPOSITORY}/compare/main...${sha}" --jq '.status')
+          if [[ "${status}" != "identical" && "${status}" != "behind" ]]; then
+            echo "::error::Commit ${sha} is '${status}' relative to main, not part of" \
+              "its history. Refusing to deploy."
+            exit 1
+          fi
+          # Covers the re-run-CI door: that replays `workflow_run` for whatever
+          # commit the CI run was for, in a brand-new deploy run whose own
+          # attempt is 1, so the CI attempt is the only tell. The deploy job's
+          # first step covers re-runs of the deploy itself.
+          # String comparison, not `-gt`: `[[ ]]` evaluates `-gt` operands in
+          # arithmetic context, which executes an embedded substitution.
+          if [[ -n "${CI_RUN_ATTEMPT}" && "${CI_RUN_ATTEMPT}" != "1" ]]; then
+            head=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            if [[ "${sha}" != "${head}" ]]; then
+              # Not "re-run CI on main's HEAD" as the Cloud Run gate advises:
+              # that path is changed-paths filtered, so the re-run's own base
+              # becomes this superseded commit and the diff comes back empty.
+              echo "::error::Re-run is for superseded commit ${sha}, but main's HEAD is" \
+                "${head}. Deploying it would roll the Worker back. Run this workflow" \
+                "from the Actions tab instead — it deploys ${head}."
+              echo "superseded=true" >> "${GITHUB_OUTPUT}"
+              exit 1
+            fi
+          fi
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "Deploying ${sha}"
+
+      # Only the dispatch path needs this: on `workflow_run` the job-level
+      # `if:` above already asserted the conclusion for this exact commit.
+      - name: Require a green CI run for that commit
+        id: wait
+        if: github.event_name != 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          # ci.yml serializes push runs on main, so a dispatch landing in a
+          # merge window waits for the run ahead of its target and then for the
+          # target's own — and re-targets if further merges supersede it. The
+          # budget covers a few such rounds, not one run's duration.
+          WAIT_SECONDS: "3600"
+          POLL_SECONDS: "20"
+        run: |
+          set -euo pipefail
+          # `event=push` selects main's own push run rather than any other run
+          # reporting against the same commit; that run's verdict is the gate.
+          query="branch=main&event=push&head_sha=${SHA}&status=completed&per_page=1"
+          deadline=$((SECONDS + WAIT_SECONDS))
+          while :; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::No completed CI run for ${SHA} after" \
+                "${WAIT_SECONDS}s. Refusing to deploy — check CI on main."
+              exit 1
+            fi
+            # A rate limit or 5xx must not end the wait: retry within the
+            # budget. Still fail-closed — only an explicit `success` deploys.
+            if ! conclusion=$(gh api \
+              "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?${query}" \
+              --jq '.workflow_runs[0].conclusion // ""'); then
+              echo "::warning::Could not read CI runs for ${SHA}; retrying in ${POLL_SECONDS}s"
+              sleep "${POLL_SECONDS}"
+              continue
+            fi
+            if [[ "${conclusion}" == "success" ]]; then
+              echo "CI passed on ${SHA}"
+              echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            # ci.yml's main group cancels a run left *pending* when a newer push
+            # queues, so `cancelled` normally means main moved on, not that main
+            # is broken. Re-target the new HEAD; a run cancelled while its commit
+            # is still HEAD is a real stop and falls through below.
+            if [[ "${conclusion}" == "cancelled" ]]; then
+              if ! head=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha'); then
+                echo "::warning::Could not read main's HEAD; retrying in ${POLL_SECONDS}s"
+                sleep "${POLL_SECONDS}"
+                continue
+              fi
+              if [[ "${head}" =~ ^[0-9a-f]{40}$ && "${head}" != "${SHA}" ]]; then
+                echo "CI run for ${SHA} was cancelled because main advanced to ${head};" \
+                  "waiting on the new HEAD instead"
+                SHA="${head}"
+                query="branch=main&event=push&head_sha=${SHA}&status=completed&per_page=1"
+                sleep "${POLL_SECONDS}"
+                continue
+              fi
+            fi
+            if [[ -n "${conclusion}" ]]; then
+              echo "::error::CI concluded '${conclusion}' on ${SHA}." \
+                "Refusing to deploy — fix main, then re-run CI on it."
+              exit 1
+            fi
+            echo "CI has not finished on ${SHA}; re-checking in ${POLL_SECONDS}s"
+            sleep "${POLL_SECONDS}"
+          done
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: github.event_name == 'workflow_run'
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          persist-credentials: false
+          # The diff below reaches back to an earlier main commit, which a
+          # shallow clone would not carry.
+          fetch-depth: 0
+
+      - name: Detect Worker-relevant changes
+        id: paths
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The `push: paths:` filter this replaced diffed the push's own
+          # before..after range; `workflow_run` carries no such range. The base
+          # is instead the newest green-CI ancestor, so the diff spans
+          # everything merged since — including commits whose own CI run went
+          # red or was cancelled.
+          #
+          # Green CI is not the same as a successful deploy, and that gap is the
+          # one way a Worker change still goes out undeployed: a deploy-worker
+          # run that failed (here or at the upload), or a red or cancelled CI
+          # run re-run to green after main moved on, leaves its commit eligible
+          # as a later base, dropping its change from every later diff. Recover
+          # with a dispatch — both are red runs on main, not silent ones.
+          runs="repos/${REPOSITORY}/actions/workflows/ci.yml/runs"
+          query="branch=main&event=push&status=success&per_page=20"
+          # Distinguished from an empty result below so the log names the real
+          # cause; both land on the same fail-open deploy.
+          if ! candidates=$(gh api "${runs}?${query}" --jq '.workflow_runs[].head_sha'); then
+            echo "::warning::Could not list CI runs to pick a diff base; deploying" \
+              "${SHA} rather than risk skipping a Worker change."
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          base=""
+          for candidate in ${candidates}; do
+            if [[ "${candidate}" == "${SHA}" ]]; then
+              continue
+            fi
+            # Skips a candidate that is not an ancestor — a newer commit whose
+            # CI is already green, or one a force-push orphaned.
+            if git merge-base --is-ancestor "${candidate}" "${SHA}" 2>/dev/null; then
+              base="${candidate}"
+              break
+            fi
+          done
+          # Fail open, not closed: an undeployed Worker change is the drift this
+          # workflow exists to prevent, while a redundant deploy re-uploads an
+          # identical bundle.
+          if [[ -z "${base}" ]]; then
+            echo "No earlier green main commit to diff against; deploying ${SHA}."
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          changed=$(git diff --name-only "${base}" "${SHA}" -- \
+            workers/update-check \
+            .github/workflows/deploy-update-check.yml)
+          if [[ -z "${changed}" ]]; then
+            echo "No Worker-relevant change in ${base}..${SHA}; skipping the deploy."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "Worker-relevant changes in ${base}..${SHA}:"
+          echo "${changed}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: gate
+    # `result` explicitly, not just the output: only a successful gate has a
+    # resolved sha behind `changed`, and checkout with an empty `ref:` falls
+    # back to main's HEAD rather than failing. Today the implicit `success()`
+    # already skips a failed gate; this keeps it skipped if someone adds
+    # `always()` here.
+    if: needs.gate.result == 'success' && needs.gate.outputs.changed == 'true'
+    # Bounds how long a wedged upload can hold the serialized slot below —
+    # without it the job would sit on GitHub's 6-hour default. Well above a
+    # real run (run-task fetching mip plus a wrangler upload, single-digit minutes).
+    timeout-minutes: 15
+    # Serialize deploys; never cancel an in-flight one (a killed wrangler
+    # upload can't corrupt a Worker, but the last-writer-wins semantics are
+    # clearer when deploys apply in order). Scoped to this job rather than the
+    # whole workflow so a `gate` waiting on an in-flight CI run can't hold the
+    # slot and delay another commit's deploy.
+    concurrency:
+      group: deploy-update-check
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    outputs:
+      # Set only by the re-run guard's superseded-commit refusal, whose non-zero
+      # exit is a designed outcome rather than a malfunction — the edge is ahead
+      # of that commit. The `notify` job must not page for it.
+      superseded: ${{ steps.rerun_guard.outputs.superseded }}
+    env:
+      # The gated commit, for the shell steps below.
+      DEPLOY_SHA: ${{ needs.gate.outputs.sha }}
+    # No job-level `working-directory`: the deploy runs via `min run`, which
+    # anchors at the repo root (that's where .minimal/minimal.toml lives), and
+    # [tasks.deploy-update-check] cds into workers/update-check itself.
+    steps:
+      # Covers the re-run-the-deploy door: "Re-run failed jobs" and "Re-run
+      # this job" skip `gate` and carry its resolved sha forward, so this is
+      # the only step every attempt runs through. Before checkout so a
+      # refused re-run does no work.
+      - name: Refuse a re-run of a commit main has moved past
+        id: rerun_guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # String comparison for the same arithmetic-context reason as the
+          # gate's guard.
+          if [[ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]]; then
+            head=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            if [[ "${DEPLOY_SHA}" != "${head}" ]]; then
+              echo "::error::Re-run is for superseded commit ${DEPLOY_SHA}, but main's" \
+                "HEAD is ${head}. Uploading it would roll the Worker back. Run this" \
+                "workflow from the Actions tab instead — it deploys ${head}."
+              echo "superseded=true" >> "${GITHUB_OUTPUT}"
+              exit 1
+            fi
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      # Fail fast, and loudly, on missing credentials. Split from the deploy
+      # itself because that step is now a `uses:` action, which cannot carry a
+      # `run:` guard — and an annotated error here is far more legible than
+      # wrangler's own auth failure surfacing from inside a sandbox.
+      - name: Check Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKER_DEPLOY_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN}" || -z "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            # Not "re-run": the guard above refuses a re-run once main has moved
+            # past this commit, and a dispatch always deploys main's HEAD.
+            echo "::error::CLOUDFLARE_WORKER_DEPLOY_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets" \
+              "are not set — the Worker on the edge is now drifted from main. Set the" \
+              "secrets, then run this workflow from the Actions tab."
+            exit 1
+          fi
+
+      # Repo-standard plumbing for every gominimal/run-task call site: frees
+      # disk, restores build caches, enables unprivileged user namespaces
+      # (which the Minimal sandbox needs on ubuntu-latest), and routes package
+      # reads through the R2 mirror. Runs after the credentials check so the
+      # cheap fail-fast still fires first.
+
+      # wrangler comes from the Minimal catalog via [tasks.deploy-worker], not
+      # from `npx` — so the binary is content-addressed and pinned by
+      # .minimal/minimal.toml's `locked_commit` rather than resolved off the npm
+      # registry at deploy time. The catalog pins 4.108.0, the same version that
+      # performed the initial manual deploy, so the deployed artifact is
+      # unchanged; only how wrangler is obtained changed. Bump by moving
+      # `locked_commit` (`mip update`), deliberately.
+      - name: Deploy update-check Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKER_DEPLOY_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        uses: gominimal/run-task@e95aa1a7f5999ade16393d1975018ec18bd6638e  # main 2026-07-16
+        with:
+          task: deploy-update-check
+          channel: unstable  # the channel ci.yml's run-task steps use
+
+  # webapp's deploy-worker.yml pages when a deploy did not ship; this repo
+  # has no paging action, so a failed or gated-out run here is a red run in
+  # the Actions tab. Add paging once this Worker carries a public promise.

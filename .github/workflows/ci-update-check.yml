@@ -1,0 +1,33 @@
+# Tests the update-check Worker (workers/update-check, inbox#589) when its
+# tree changes. Node's built-in runner, through the catalog-pinned node of
+# the `test-update-check` task: no lockfile, no package manager.
+name: CI update-check
+
+on:
+  pull_request:
+    paths:
+      - "workers/update-check/**"
+      - ".github/workflows/ci-update-check.yml"
+      - ".minimal/minimal.toml"
+  push:
+    branches: [main]
+    paths:
+      - "workers/update-check/**"
+      - ".github/workflows/ci-update-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: update-check worker tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: gominimal/run-task@a5ed123f612b9774e3d6eaa7af45370e33aa1116 # v1
+        with:
+          channel: unstable
+          task: test-update-check

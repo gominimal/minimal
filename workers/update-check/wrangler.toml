@@ -1,0 +1,27 @@
+# update-check Worker — the version endpoint of the daily update check
+# (gominimal/inbox#589). The client side is crates/minimal/src/update_check.rs.
+#
+# GET /v1/<channel>/<key>?os&arch&install&id answers {"channel","latest"} with
+# the channel's current pointer, read from the public minimal-one bucket with
+# a 5 minute edge cache, and writes one Analytics Engine data point per
+# request: the eight request fields plus country and ASN, never the address.
+#
+# Deploys run from CI once a main commit touching this tree has a green CI
+# run (.github/workflows/deploy-update-check.yml), through the pinned
+# wrangler of the `deploy-update-check` task in .minimal/minimal.toml.
+# Manual deploy: `min run deploy-update-check` with CLOUDFLARE_API_TOKEN and
+# CLOUDFLARE_ACCOUNT_ID in the environment.
+name = "update-check"
+main = "src/index.js"
+compatibility_date = "2026-06-29"
+
+# The route lives here, as landing-edge's does in gominimal/webapp; the
+# proxied AAAA record for update.minimal.dev is Pulumi's in gominimal/infra
+# (cloudflare/main.go). account_id comes from CLOUDFLARE_ACCOUNT_ID.
+routes = [{ pattern = "update.minimal.dev/*", zone_name = "minimal.dev" }]
+
+# One data point per request. The dataset is created on first write; the
+# SQL API over it is the install count (README.md has the queries).
+[[analytics_engine_datasets]]
+binding = "UPDATE_CHECKS"
+dataset = "update_checks"

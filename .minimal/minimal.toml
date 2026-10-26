@@ -61,6 +61,24 @@ command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
 cargo mutants -p graph -f wire.rs --timeout 120
 """
 
+# The update-check Worker (workers/update-check, inbox#589): its tests run on
+# Node's own runner, so no package manager or lockfile enters this repo.
+[tasks.test-update-check]
+description = "Tests the update-check Worker's logic with node --test"
+packages = ["node-lts"]
+inherit_cwd = true
+bash = "cd workers/update-check && node --test \"test/**/*.test.js\""
+
+# Deploys it. wrangler is pinned through the catalog's locked_commit rather
+# than a devDependency (webapp's deploy-worker task is the precedent).
+[tasks.deploy-update-check]
+description = "Deploys the update-check Worker with the pinned wrangler"
+packages = ["wrangler"]
+env_vars.CLOUDFLARE_API_TOKEN = { inherit = true }
+env_vars.CLOUDFLARE_ACCOUNT_ID = { inherit = true }
+inherit_cwd = true
+bash = "cd workers/update-check && wrangler deploy"
+
 [tasks.ci]
 inherit_cwd = true
 bash = """
