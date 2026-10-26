@@ -468,7 +468,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let held = {
-            let (store, ids) = store_seeded_with(&dir, [record_named("held")]).await;
+            // Seed a record that already names its box type, so the
+            // one-time migration at the reopen below leaves it unchanged.
+            let seed = Record {
+                box_type: Some(boxes::SESSION_BOX_TYPE.to_string()),
+                ..record_named("held")
+            };
+            let (store, ids) = store_seeded_with(&dir, [seed]).await;
             let held = open(&store, RecordPredicate::Id(ids[0]))
                 .await
                 .record()
