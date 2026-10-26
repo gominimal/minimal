@@ -8,7 +8,9 @@
 //!
 //! The stored [`BoxState`] does not yet hold `stopped` or `exited`: every
 //! stored record projects onto `pending`, `materializing` or `running`
-//! through [`RecordState::from`].
+//! through [`RecordState::from`]. Until the store holds an ending, the
+//! `state_is_exactly_one` harness runs over [`RecordState`], not over
+//! the stored [`crate::Record`] that the BOX-011 harness line names.
 
 use serde::{Deserialize, Serialize};
 
@@ -152,19 +154,22 @@ impl From<BoxState> for RecordState {
 
 /// What a daemon restart does to a store (BOX-012).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestartReap<T> {
+pub struct RestartReap<C> {
     /// The records the restart keeps, in store order.
-    pub kept: Vec<T>,
+    pub kept: C,
     /// The records the restart reaps, in store order.
-    pub reaped: Vec<T>,
+    pub reaped: C,
 }
 
 /// Split `records` into the ones a restart keeps and the ones it reaps,
 /// by the state `state_of` reads from each.
-pub fn restart_reap<T>(
+///
+/// The output collection is generic so that the Kani harness can run
+/// this function into a fixed buffer with no heap. Callers use `Vec<T>`.
+pub fn restart_reap<T, C: Default + Extend<T>>(
     records: impl IntoIterator<Item = T>,
     state_of: impl Fn(&T) -> RecordState,
-) -> RestartReap<T> {
+) -> RestartReap<C> {
     let (reaped, kept) = records
         .into_iter()
         .partition(|record| state_of(record).reaped_at_restart());
@@ -208,19 +213,15 @@ fn holds_one_state_with_its_ending(state: &RecordState) -> bool {
 /// The BOX-012 property for one store: the restart reaps exactly the
 /// `pending` and `materializing` records, keeps every other, and loses
 /// none.
-#[cfg(any(test, kani))]
+#[cfg(test)]
 fn reaps_exactly_the_unfinished(store: &[RecordState]) -> bool {
-    let indexed: Vec<(usize, RecordState)> = store.iter().copied().enumerate().collect();
-    let outcome = restart_reap(indexed, |(_, state)| *state);
+    let unfinished =
+        |s: &RecordState| matches!(s, RecordState::Pending | RecordState::Materializing);
+    let outcome: RestartReap<Vec<RecordState>> = restart_reap(store.iter().copied(), |s| *s);
     outcome.kept.len() + outcome.reaped.len() == store.len()
-        && outcome
-            .reaped
-            .iter()
-            .all(|(_, state)| matches!(state, RecordState::Pending | RecordState::Materializing))
-        && outcome
-            .kept
-            .iter()
-            .all(|(_, state)| !matches!(state, RecordState::Pending | RecordState::Materializing))
+        && outcome.reaped.len() == store.iter().filter(|s| unfinished(s)).count()
+        && outcome.reaped.iter().all(unfinished)
+        && outcome.kept.iter().all(|s| !unfinished(s))
 }
 
 #[cfg(test)]
@@ -357,7 +358,7 @@ mod tests {
             ("d", RecordState::Stopped(StopEnding::AtDaemonStart)),
             ("e", RecordState::Exited(ExitEnding::Oom)),
         ];
-        let outcome = restart_reap(store, |(_, state)| *state);
+        let outcome: RestartReap<Vec<_>> = restart_reap(store, |(_, state)| *state);
         assert_eq!(names(&outcome.reaped), ["a", "c"]);
         assert_eq!(names(&outcome.kept), ["b", "d", "e"]);
 
@@ -418,20 +419,53 @@ mod kani_proofs {
         assert!(holds_one_state_with_its_ending(&state));
     }
 
+    /// A fixed buffer of at most 4 records. The harness runs
+    /// `restart_reap` into it, so CBMC sees no heap and no reallocation.
+    #[derive(Default)]
+    struct Four {
+        items: [Option<RecordState>; 4],
+        len: usize,
+    }
+
+    impl Extend<RecordState> for Four {
+        fn extend<I: IntoIterator<Item = RecordState>>(&mut self, iter: I) {
+            for state in iter {
+                assert!(self.len < 4);
+                self.items[self.len] = Some(state);
+                self.len += 1;
+            }
+        }
+    }
+
+    impl Four {
+        fn get(&self, i: usize) -> RecordState {
+            self.items[i].expect("held")
+        }
+    }
+
     /// BOX-012: over every store of at most 4 records, restart reaps
-    /// exactly the `pending` and `materializing` ones. A loop over 4
-    /// records needs a bound of 5 to prove it ends.
+    /// exactly the `pending` and `materializing` ones, in store order,
+    /// and keeps every other one. A loop over 4 records needs a bound of
+    /// 5 to prove it ends.
     #[kani::proof]
     #[kani::unwind(5)]
     fn restart_reaps_only_pending_or_materializing() {
         let len: usize = kani::any();
         kani::assume(len <= 4);
-        let all = [
-            kani::any::<RecordState>(),
-            kani::any::<RecordState>(),
-            kani::any::<RecordState>(),
-            kani::any::<RecordState>(),
-        ];
-        assert!(reaps_exactly_the_unfinished(&all[..len]));
+        let all: [RecordState; 4] = kani::any();
+        let store = &all[..len];
+        let outcome: RestartReap<Four> = restart_reap(store.iter().copied(), |s| *s);
+        assert!(outcome.kept.len + outcome.reaped.len == len);
+        let (mut k, mut r) = (0, 0);
+        for state in store {
+            if matches!(state, RecordState::Pending | RecordState::Materializing) {
+                assert!(r < outcome.reaped.len && outcome.reaped.get(r) == *state);
+                r += 1;
+            } else {
+                assert!(k < outcome.kept.len && outcome.kept.get(k) == *state);
+                k += 1;
+            }
+        }
+        assert!(k == outcome.kept.len && r == outcome.reaped.len);
     }
 }
