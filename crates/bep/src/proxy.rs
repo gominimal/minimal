@@ -66,6 +66,7 @@ use crate::http::{self, CloseReason, Parse};
 use crate::listener::Delivery;
 use crate::module::Module;
 use crate::redeem;
+use crate::store::HostStore;
 
 /// The one ALPN protocol both TLS legs offer.
 pub const ALPN_HTTP11: &[u8] = b"http/1.1";
@@ -200,9 +201,23 @@ impl Resolve for SystemResolver {
 pub trait AuditWriter: Send + Sync {
     /// Appends one record. A failure is the writer's to log.
     fn write(&self, decision: &Decision);
+
+    /// Appends one record and reports a failure to the caller, which logs
+    /// it. A writer that cannot fail keeps this default.
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.write(decision);
+        Ok(())
+    }
 }
 
 impl AuditWriter for Mutex<AuditLog> {
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(decision)
+            .map(drop)
+    }
+
     fn write(&self, decision: &Decision) {
         let mut log = self.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(err) = log.append(decision) {
@@ -449,6 +464,8 @@ impl Proxy {
             box_id: box_id.to_owned(),
             authority: authority.to_owned(),
             identifier: None,
+            // Refused before any sealed value is read.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some(marker.to_owned()),
@@ -631,7 +648,10 @@ impl Proxy {
             Arc::clone(&self.audit),
             Arc::clone(&self.redeemer),
             upstream.proof(),
-        );
+        )
+        // An admitted store reference reads its value from this host's
+        // store, per request (BEP-032, BEP-033).
+        .with_store(Arc::new(HostStore));
         relay(flow, boxed, upstream, IDLE_TIMEOUT).await;
         Ended::Relayed
     }

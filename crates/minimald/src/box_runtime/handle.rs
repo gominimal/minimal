@@ -276,6 +276,10 @@ impl HostHandle {
         }
     }
 
+    // `Err(())` means one thing on every HostHandle method: the host's loop is
+    // gone or wedged (a teardown race), which callers discard or read as
+    // unavailable. A named error type would be better; until then, allowed.
+    #[allow(clippy::result_unit_err)]
     pub async fn kill(&self, for_shutdown: bool) -> Result<(), ()> {
         match self
             .sender
@@ -420,6 +424,10 @@ impl HostHandle {
     /// send and the reply reads as `Err(())` rather than a panic: the loop
     /// can drop a queued responder on its way out, and that is a teardown
     /// race, not a bug in the caller.
+    // `Err(())` means one thing on every HostHandle method: the host's loop is
+    // gone or wedged (a teardown race), which callers discard or read as
+    // unavailable. A named error type would be better; until then, allowed.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -432,6 +440,10 @@ impl HostHandle {
 
     /// Returns a snapshot of the terminal screen. A dead host reads as
     /// `Err(())` rather than a panic, matching [`Self::get_attrs`].
+    // `Err(())` means one thing on every HostHandle method: the host's loop is
+    // gone or wedged (a teardown race), which callers discard or read as
+    // unavailable. A named error type would be better; until then, allowed.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_screen(&self) -> Result<minimald_rpc::ScreenSnapshot, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.

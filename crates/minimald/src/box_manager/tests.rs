@@ -135,6 +135,8 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         attrs: Default::default(),
         sealed_deliveries: Vec::new(),
         root_certificate: None,
+        creating_verb: minimald_rpc::CreatingVerb::Session,
+        project_root: None,
     }
 }
 

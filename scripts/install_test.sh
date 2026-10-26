@@ -2606,10 +2606,18 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
+    [ -n "${NFT_LEAF_SET:-}" ] || exit 1
+    cat "$NFT_LEAF_SET"
+    exit 0
+fi
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
-    chmod +x "$hcbin/nft"
+    # The helper runs this nft as root, so the install checks that only its
+    # owner can write it and its directory. The modes are set here, not left
+    # to the umask.
+    chmod 0755 "$hcbin" "$hcbin/nft"
 
     # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
     run_hc() {
@@ -2617,14 +2625,17 @@ STUB
         OUT="$root/hc.$label"
         set +e
         env -i \
-            PATH="$hcbin:/usr/bin:/bin" \
+            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
+            NFT_LEAF_SET="${NFT_LEAF_SET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
+            MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
+            MINIMAL_OVERRIDE_QUIC443_SUDOERS="${HC_SUDOERS:-}" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
         set -e
@@ -2735,8 +2746,14 @@ STUB
 
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
+    # The QUIC block helper and its sudoers rule go under the scratch root,
+    # through the step's own override knobs: a rehearsal writes nothing to
+    # /usr/local or /etc.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
     check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
     want_ok "the daemon leaf exists" test -d "$tree/daemon"
     want_ok "the box cohort exists"   test -d "$tree/boxes"
@@ -2849,6 +2866,49 @@ originates is refused" \
     want_ok "the install records the ct-mark mask beside the marker" \
         test -d "$tree/ct-mark-mask-0x30000000"
 
+    # BEP-018: a socket keeps the cgroup it was created in, so the table
+    # also rejects UDP 443 from a socket whose box leaf is in the
+    # blocked-leaves set, declared before the rule that names it.
+    want_ok "the table declares the blocked-leaves set of box leaves" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 1 && /typeof socket cgroupv2 level 4$/ {ok = 1}
+             /chain output \{/ {o = NR}
+             END {exit !(ok && s < o)}' "$nft_input"
+    want_ok "the output chain rejects UDP 443 from a leaf in the set" \
+        grep -q 'socket cgroupv2 level 4 @quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable' "$nft_input"
+    hc_helper="$root/hclib/quic443-leaf"
+    want_ok "the install writes the QUIC block helper" test -x "$hc_helper"
+    want_ok "the sudoers rule lets the account run the helper alone" \
+        grep -qx "#$me ALL=(root) NOPASSWD: $hc_helper" "$root/hcsudoers/minimal-quic443-leaf"
+    want_ok "the install names the helper it wrote" grep -q "installed $hc_helper" "$OUT"
+    # run_helper <label> <verb> <leaf> ; sets rc, output in $OUT.
+    run_helper() {
+        OUT="$root/helper.$1"
+        set +e
+        env -i PATH="$hcbin:/usr/bin:/bin" NFT_CALLS="$nft_calls" \
+            "$hc_helper" "$2" "$3" </dev/null >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+    mkdir -p "$tree/boxes/allow/grant"
+    : >"$nft_calls"
+    run_helper add add "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper adds a box leaf under the allow subtree"
+    run_helper remove remove "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper removes a box leaf under the allow subtree"
+    check 'add element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }
+delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }' \
+        "$(cat "$nft_calls")" "the helper changes one element of the set"
+    : >"$nft_calls"
+    for _leaf in "$cg" "/etc" "$tree/daemon" "$tree/boxes/deny" "$tree/boxes/quic443-blocked" \
+        "$tree/boxes/allow" "$tree/boxes/allow/../deny" "$tree/boxes/allow/grant/x"; do
+        run_helper refused add "$_leaf"
+        check 2 "$rc" "the helper refuses $_leaf"
+        want_ok "the refusal for $_leaf says so" grep -q "refused" "$OUT"
+    done
+    rmdir "$tree/boxes/allow/grant"
+    want_ok "no refused path reaches nft" [ ! -s "$nft_calls" ]
+
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
     # cannot drift.
@@ -2889,9 +2949,32 @@ originates is refused" \
     # vouches for a table this step did not render. The tree's half is
     # already done, and stays.
     NFT_FAIL=1
+    # The pair from the first install is in place. A failed load must leave
+    # it as it was: mv replaces a file's inode, so the same inode says the
+    # install did not write it again.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    _helper_ino="$(ls -i "$HC_HELPER")"
+    _sudoers_ino="$(ls -i "$HC_SUDOERS")"
     run_hc reload_failed "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 1 "$rc" "a re-install whose nft transaction dies exits 1"
+    check "$_helper_ino" "$(ls -i "$HC_HELPER")" \
+        "a failed re-load leaves the existing QUIC block helper as it was"
+    check "$_sudoers_ino" "$(ls -i "$HC_SUDOERS")" \
+        "a failed re-load leaves the existing sudoers rule as it was"
+    # A first install whose load dies writes neither the helper nor its
+    # passwordless sudoers rule.
+    HC_HELPER="$root/hcfresh/lib/quic443-leaf"
+    HC_SUDOERS="$root/hcfresh/sudoers/minimal-quic443-leaf"
+    run_hc load_failed_fresh "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "an install whose nft transaction dies exits 1"
+    want_err "a failed load writes no QUIC block helper" test -e "$HC_HELPER"
+    want_err "a failed load writes no sudoers rule for it" test -e "$HC_SUDOERS"
+    want_ok "a failed load leaves no staging file for either" \
+        [ -z "$(ls -A "$root/hcfresh" 2>/dev/null)" ]
+    unset HC_HELPER HC_SUDOERS
     want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
     want_err "a failed re-load leaves no ct-mark mask record either" \
         test -e "$tree/ct-mark-mask-0x30000000"
@@ -2899,6 +2982,26 @@ originates is refused" \
         grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
     want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
     NFT_FAIL=0
+
+    # --- Root runs the helper for the delegated account, so the install
+    # refuses a helper directory that another account can write: that
+    # account could replace the helper, or plant its staging name.
+    mkdir -p "$root/hcopen"
+    chmod 0777 "$root/hcopen"
+    HC_HELPER="$root/hcopen/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc open_helper_dir "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    check 1 "$rc" "an install whose helper directory others can write exits 1"
+    want_ok "the refusal names the directory and the fix" \
+        grep -q "$(cd -P "$root/hcopen" && pwd -P) can be written by accounts other than its owner (mode 777)" "$OUT"
+    want_err "no helper is written into a directory others can write" \
+        test -e "$root/hcopen/quic443-leaf"
+    want_ok "no staging file is left behind either" \
+        [ -z "$(ls -A "$root/hcopen")" ]
+    rmdir "$root/hcopen"
+
     run_hc reloaded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "the next good re-install exits 0"
@@ -2906,6 +3009,86 @@ originates is refused" \
         test -d "$tree/classifier-table"
     want_ok "the next good re-install restores the mask record beside it" \
         test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- The helper runs nft as root for the delegated account, so the
+    # install refuses an nft that another account can write, or one in a
+    # directory another account can write. It refuses before the load.
+    for _open in dir file; do
+        _nftdir="$root/hcnft-$_open"
+        mkdir -p "$_nftdir"
+        cp "$hcbin/nft" "$_nftdir/nft"
+        if [ "$_open" = dir ]; then
+            chmod 0777 "$_nftdir"; chmod 0755 "$_nftdir/nft"; _named="$_nftdir"
+        else
+            chmod 0755 "$_nftdir"; chmod 0777 "$_nftdir/nft"; _named="$_nftdir/nft"
+        fi
+        # The install names the nft by its physical path: on macOS the
+        # scratch root sits under /var, a symlink to /private/var.
+        _named="$(cd -P "$_nftdir" && pwd -P)${_named#"$_nftdir"}"
+        : >"$nft_input"
+        HC_PATH_PREFIX="$_nftdir"
+        HC_HELPER="$root/hcnftlib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        run_hc "open_nft_$_open" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        unset HC_PATH_PREFIX HC_HELPER HC_SUDOERS
+        check 1 "$rc" "an install whose nft $_open others can write exits 1"
+        want_ok "the refusal names the writable nft $_open and the fix" \
+            grep -q "cannot install the QUIC block helper at $root/hcnftlib/quic443-leaf: $_named can be written by accounts other than its owner (mode 777)" "$OUT"
+        want_err "no helper runs an nft $_open others can write" \
+            test -e "$root/hcnftlib/quic443-leaf"
+        want_ok "a refused nft $_open loads no table" [ ! -s "$nft_input" ]
+        rm -rf "$_nftdir"
+    done
+
+    # --- A re-install while the daemon runs keeps the leaves in the
+    # blocked-leaves set: the set is declared with them in the same
+    # transaction that replaces the table. A leaf whose directory is gone,
+    # and a path outside the allow subtree, are not carried over.
+    mkdir -p "$tree/boxes/allow/grant"
+    nft_leaf_set="$root/nft-leaf-set.json"
+    printf '%s' '{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "name": "quic443_blocked_leaves", "table": "minimal_class", "type": "cgroupsv2", "handle": 4, "elem": ["minimald.slice/boxes/allow/grant", "minimald.slice/boxes/allow/gone", "minimald.slice/boxes/deny"]}}]}' \
+        >"$nft_leaf_set"
+    : >"$nft_input"
+    NFT_LEAF_SET="$nft_leaf_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc reload_kept "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset NFT_LEAF_SET HC_HELPER HC_SUDOERS
+    check 0 "$rc" "a re-install with a leaf in the blocked-leaves set exits 0"
+    # shellcheck disable=SC2016 # $0 is awk's line, not a shell expansion
+    want_ok "the re-install declares the set with the leaf still in it" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 2 && $0 == "        elements = { \"minimald.slice/boxes/allow/grant\" }" {ok = 1}
+             END {exit !ok}' "$nft_input"
+    want_ok "the leaf is kept in the same transaction that deletes the table" \
+        [ "$(grep -c '^delete table inet minimal_class$' "$nft_input")" -eq 1 ]
+    want_ok "the re-install names the leaf it kept" \
+        grep -q "kept the box leaves that are refused UDP to port 443: minimald.slice/boxes/allow/grant$" "$OUT"
+    rmdir "$tree/boxes/allow/grant"
+
+    # --- A set listing that fails while the loaded table declares the set
+    # stops the install before the load: rendering the set empty would let
+    # a blocked box send UDP to port 443 again. The stub's `-j list set`
+    # fails when NFT_LEAF_SET is unset.
+    nft_ruleset_with_set="$root/nft-ruleset-with-set"
+    printf '%s\n' 'table inet minimal_class {' '	set quic443_blocked_leaves {' \
+        '		typeof socket cgroupv2 level 4' '	}' '}' >"$nft_ruleset_with_set"
+    : >"$nft_input"
+    NFT_RULESET="$nft_ruleset_with_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc leaf_set_unreadable "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    NFT_RULESET=
+    check 1 "$rc" "an install that cannot list the declared blocked-leaves set exits 1"
+    want_ok "the refusal says it cannot read the blocked box leaves" \
+        grep -q "cannot read the box leaves that are refused UDP to port 443 from inet minimal_class: nft -j list set inet minimal_class quic443_blocked_leaves failed" "$OUT"
+    want_ok "the refusal says the loaded table is unchanged" \
+        grep -q "The loaded table is unchanged.$" "$OUT"
+    want_ok "an unreadable blocked-leaves set loads no table" [ ! -s "$nft_input" ]
 
     # --- The ct-mark bits are a shared namespace: a component already
     # classing with one of them would be silently overwritten by the

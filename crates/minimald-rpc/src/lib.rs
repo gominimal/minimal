@@ -526,6 +526,29 @@ pub struct BoxConfig {
     /// reads nothing from it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_certificate: Option<String>,
+    /// The client verb that asked for the box. The daemon stamps the
+    /// record's Box Type from it. A client that predates the field sends
+    /// none, and the box is a session.
+    #[serde(default)]
+    pub creating_verb: CreatingVerb,
+    /// The root of the project the box comes from: the directory that
+    /// holds the project's `minimal.toml`, which can be a parent of
+    /// [`Self::project_path`]. `None` from a client that predates the
+    /// field. The daemon then records `project_path` as the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
+/// A closed set: a value outside it does not deserialize.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreatingVerb {
+    /// `min session activate`, or the dashboard's create.
+    #[default]
+    Session,
+    /// `min task run`.
+    Task,
 }
 
 /// Serde default for [`BoxConfig::hooks_enabled`]. See
@@ -1309,6 +1332,14 @@ pub enum BoxControlRequest {
     /// ([`RowStandingRequest`]): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::RowStanding`].
     RowStanding(RowStandingRequest),
+    /// The in-VM daemon's read of whether the Box Egress Proxy's listener is
+    /// live on the host (BEP-062): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::ProxyListening`]. A read,
+    /// never a report: the proxy runs on the host, outside the VM, so the
+    /// guest can only ask. The DNS gate of a `dns` or `both` box answers a
+    /// steered name with the proxy's address only while the answer is
+    /// `true`, and SERVFAIL otherwise.
+    ProxyListening,
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1677,6 +1708,14 @@ pub enum BoxControlReply {
         /// Whether a row stands at it.
         row_standing: bool,
     },
+    /// The proxy-listening read's answer: whether the Box Egress Proxy's
+    /// listener is live on the host. `false` when the host runs no proxy.
+    /// `listening` is required — the marker that keeps this document from
+    /// decoding as any other reply.
+    ProxyListening {
+        /// Whether the proxy's listener is live.
+        listening: bool,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -1710,7 +1749,8 @@ impl CreateSessionRequest {
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, no attrs, no sealed deliveries, no root
-    /// certificate, and no version assertion.
+    /// certificate, the session verb, no project root, and no version
+    /// assertion.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1730,6 +1770,8 @@ impl CreateSessionRequest {
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
+                creating_verb: CreatingVerb::default(),
+                project_root: None,
             },
             must_match_version: None,
         }

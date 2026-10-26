@@ -87,10 +87,18 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// The `CreateSession` handler always persists the record as
 /// `Pending`; the session actor's create flow promotes it to
 /// `Active` once composition finalizes.
+///
+/// The daemon stamps the box's type, parent and project root here
+/// (BOX-001): `box_type` is the creating verb's, `parent` is `parent`, which
+/// the caller derives from the creating connection and never from the
+/// request, and `project_root` is the project root the client resolved,
+/// or the project path when an older client sends no root.
 fn build_record(
     config: minimald_rpc::BoxConfig,
     username: Option<String>,
     status: boxes::BoxState,
+    box_type: &str,
+    parent: Option<SessionId>,
 ) -> Result<boxes::Record, std::io::Error> {
     // BEP-007: a delivery's variable is written into the box's environment
     // and into the file its shell sources, so a name that is not a POSIX
@@ -110,6 +118,14 @@ fn build_record(
         id: SessionId::nil(),
         name: config.name,
         username,
+        // The root the client resolved from the project's `minimal.toml`.
+        // A client that predates the field sends none: the working path is
+        // the best root the daemon has then.
+        project_root: Some(
+            config
+                .project_root
+                .unwrap_or_else(|| config.project_path.clone()),
+        ),
         project_path: config.project_path,
         network: config.network,
         policy: config.policy,
@@ -139,6 +155,8 @@ fn build_record(
         // host launch of the box, after a daemon restart included, adds it
         // to the box's own trust store.
         root_certificate: config.root_certificate,
+        box_type: Some(box_type.to_string()),
+        parent,
         attrs: config.attrs,
     };
     record
@@ -1339,6 +1357,16 @@ impl BoxManager {
     /// never received an id, so nothing else could ever reach the session to
     /// abort it, and a `Pending` record left parked would hold its name
     /// hostage.
+    #[tracing::instrument(
+        level = "info",
+        name = "box.create",
+        skip_all,
+        fields(
+            box_id = tracing::field::Empty,
+            box_type = tracing::field::Empty,
+            parent = tracing::field::Empty,
+        )
+    )]
     async fn create_session(
         &mut self,
         config: minimald_rpc::BoxConfig,
@@ -1391,7 +1419,21 @@ impl BoxManager {
         // record under the handed id). Elsewhere the
         // record key is the box id.
         let handed_box_id = config.box_id;
-        let record = build_record(config, username, boxes::BoxState::Pending)?;
+        // BOX-001, BOX-140: no caller reaches this daemon from inside a box
+        // (a host with no nesting carries no per-box caller identity), so
+        // every box created here has no parent. A parent comes from the
+        // creating connection once one can carry that identity, never from
+        // the request body.
+        let parent = None;
+        // BOX-001: the type is the creating verb's. A client that predates
+        // the field sends none, which reads as the session verb.
+        let box_type = match config.creating_verb {
+            minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+            minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+        };
+        let record = build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        tracing::Span::current().record("box_type", box_type);
+        let project_root = record.project_root.clone();
         let name = record.name.clone();
         let retry = record.clone();
         let handle = match self.store.create(record).await {
@@ -1426,9 +1468,16 @@ impl BoxManager {
         };
         let session_id = *handle.id();
         let box_id = handed_box_id.unwrap_or(session_id);
+        let parent_field = parent.map_or_else(|| "none".to_string(), |p: SessionId| p.to_string());
+        let span = tracing::Span::current();
+        span.record("box_id", tracing::field::display(box_id));
+        span.record("parent", parent_field.as_str());
         tracing::info!(
             session_id = %session_id,
             box_id = %box_id,
+            box_type = %box_type,
+            parent = %parent_field,
+            project_root = ?project_root.as_ref().map(paths::HostAbsPath::as_str),
             "filed the box record"
         );
 
@@ -1992,3 +2041,151 @@ impl Drop for TearingDown {
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// The create path's stamping (BOX-001), driven through the manager actor
+/// the `CreateSession` handler calls.
+#[cfg(test)]
+mod create_stamp_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// A manager over fresh state and cache directories, its sessions on
+    /// the mock launcher, so no create here starts a real box.
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = BoxManager::init(
+            daemon_abs(state.path()),
+            daemon_abs(cache.path()),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap();
+        (state, cache, mngr)
+    }
+
+    /// A create request that tries to assert a parent and a type through
+    /// the one free-form field a client fills.
+    fn config(name: &str, project: &str) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new(project).unwrap(),
+            network: boxes::NetworkMode::default(),
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            attrs: [
+                ("parent".to_string(), SessionId::mint().to_string()),
+                ("box_type".to_string(), "task".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    async fn record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the created record is filed")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_assigns_uuidv7_id_type_and_parent() {
+        let (_state, _cache, mngr) = manager().await;
+        let first = mngr
+            .create_session(config("first", "/home/dev/proj"), None)
+            .await
+            .unwrap();
+        let second = mngr
+            .create_session(config("second", "/home/dev/proj"), None)
+            .await
+            .unwrap();
+        assert_ne!(first, second, "each create mints its own id");
+
+        for id in [first, second] {
+            let record = record(&mngr, id).await;
+            assert_eq!(record.id, id);
+            assert_eq!(
+                record.id.as_ref().get_version(),
+                Some(uuid::Version::SortRand),
+                "the box id is a UUIDv7"
+            );
+            assert_eq!(record.box_type.as_deref(), Some(boxes::SESSION_BOX_TYPE));
+            assert_eq!(
+                record.parent, None,
+                "a caller outside any box creates a box with no parent, \
+                 whatever the request carries"
+            );
+        }
+    }
+
+    /// BOX-001: the record's type is the creating verb's, one box per verb.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_create_path_records_type_from_creating_verb() {
+        let (_state, _cache, mngr) = manager().await;
+        for (name, verb, expected) in [
+            (
+                "by-session",
+                minimald_rpc::CreatingVerb::Session,
+                boxes::SESSION_BOX_TYPE,
+            ),
+            (
+                "by-task",
+                minimald_rpc::CreatingVerb::Task,
+                boxes::TASK_BOX_TYPE,
+            ),
+        ] {
+            let mut config = config(name, "/home/dev/proj");
+            config.creating_verb = verb;
+            let id = mngr.create_session(config, None).await.unwrap();
+            assert_eq!(record(&mngr, id).await.box_type.as_deref(), Some(expected));
+        }
+    }
+
+    /// BOX-001: the record holds the project root the client resolved, not
+    /// the working path. A client that sends no root gets the working path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_records_project_root() {
+        let (_state, _cache, mngr) = manager().await;
+        let mut rooted = config("rooted", "/home/dev/proj/sub");
+        rooted.project_root = Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap());
+        let id = mngr.create_session(rooted, None).await.unwrap();
+        assert_eq!(
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap())
+        );
+
+        let id = mngr
+            .create_session(config("older-client", "/home/dev/proj/sub"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
+        );
+    }
+}
