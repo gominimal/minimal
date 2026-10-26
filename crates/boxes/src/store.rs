@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
-    Record, SessionId,
+    Record, SESSION_BOX_TYPE, SessionId,
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
 };
 
@@ -389,6 +389,19 @@ fn is_valid_short(short: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether a stored record predates `box_type` and `parent` (BOX-003): it
+/// has no `box_type`, or a null one, or no `parent` key. A record with no
+/// parent writes the key as `null`, so only an absent key reads as old.
+fn record_predates_box_types(raw: &serde_json_lenient::Value) -> bool {
+    let Some(fields) = raw.as_object() else {
+        return false;
+    };
+    fields
+        .get("box_type")
+        .is_none_or(serde_json_lenient::Value::is_null)
+        || !fields.contains_key("parent")
+}
+
 /// Read `record_file` and compare its name against `index_name` to
 /// decide what pass B should do with this index entry. Returns `None`
 /// when the record exists, parses, and agrees with the index.
@@ -496,7 +509,81 @@ impl DiskLoader {
         let session_dirs = enumerate_session_dirs(&sessions_dir)?;
         self.heal_reconcile_index(&sessions_dir, &mut changed);
         self.heal_reindex_orphans(&session_dirs, &reaped, &mut changed);
+        self.heal_migrate_untyped_records(&sessions_dir, &mut changed);
         Ok(changed)
+    }
+
+    /// Pass D (BOX-003): migrate each indexed record written before the
+    /// record carried `box_type` and `parent`. Such a record becomes a
+    /// `session` box with no parent, and it gets a fresh id only when its
+    /// stored id is nil. A migrated record carries both keys, so a later
+    /// start leaves it unchanged. A record that cannot be read or written
+    /// is logged and left for the next start.
+    fn heal_migrate_untyped_records(
+        &mut self,
+        sessions_dir: &camino::Utf8Path,
+        changed: &mut bool,
+    ) {
+        let indexed: Vec<(String, SessionId)> = self
+            .index
+            .iter()
+            .map(|(short, id)| (short.clone(), *id))
+            .collect();
+        for (short, indexed_id) in indexed {
+            let record_file = sessions_dir.join(&short).join("record.json");
+            // Pass B already logged a record it could not read.
+            let Ok(raw) = std::fs::File::open(&record_file).and_then(|f| {
+                serde_json_lenient::from_reader::<_, serde_json_lenient::Value>(f)
+                    .map_err(std::io::Error::from)
+            }) else {
+                continue;
+            };
+            if !record_predates_box_types(&raw) {
+                continue;
+            }
+            let mut record: Record = match serde_json_lenient::from_value(raw) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "could not migrate a box record without box_type or parent: \
+                         record.json does not parse; leaving it unchanged",
+                    );
+                    continue;
+                }
+            };
+            let stored_id = record.id;
+            record.box_type = Some(SESSION_BOX_TYPE.to_string());
+            record.parent = None;
+            if record.id.is_nil() {
+                record.id = SessionId::mint();
+            }
+            if let Err(e) = self.write_record(&short, &record) {
+                tracing::warn!(
+                    short = %short,
+                    box_id = %record.id,
+                    error = %e,
+                    "could not write a migrated box record; it migrates on the next start",
+                );
+                continue;
+            }
+            if record.id != indexed_id {
+                self.index.short_to_id.insert(short.clone(), record.id);
+                if let Some(name) = &record.name {
+                    self.index.name_to_id.insert(name.clone(), record.id);
+                }
+                *changed = true;
+            }
+            tracing::info!(
+                short = %short,
+                box_id = %record.id,
+                stored_id = %stored_id,
+                box_type = SESSION_BOX_TYPE,
+                "migrated a box record without box_type or parent: \
+                 box_type = session, no parent",
+            );
+        }
     }
 
     /// Pass A: reap any session dir whose external `.deleting-<short>`
@@ -1833,13 +1920,14 @@ mod tests {
             .unwrap()
             .expect("the old record is indexed");
         let read_back = loader.get(&key).unwrap().record().clone();
-        assert_eq!(read_back.box_type, None);
+        // BOX-003: the start migrated the record to a session box.
+        assert_eq!(read_back.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
         assert_eq!(read_back.parent, None);
         assert_eq!(read_back.project_root, None);
         assert_eq!(
             read_back,
             Record {
-                box_type: None,
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
                 parent: None,
                 project_root: None,
                 ..old_record
@@ -1870,6 +1958,120 @@ mod tests {
             "no parent is written as null, not left out"
         );
         assert_eq!(written["project_root"], "/home/alice/proj");
+    }
+
+    /// Writes `raw` as the record of a session dir the index does not
+    /// hold yet, the way a record from an older daemon sits on disk.
+    fn write_raw_record(root: &DaemonAbsPath, short: &str, raw: &serde_json_lenient::Value) {
+        let dir = root.as_utf8_path().join("sessions").join(short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(raw).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Every file under the sessions dir, with its bytes.
+    fn sessions_tree(root: &DaemonAbsPath) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut dirs = vec![root.as_utf8_path().join("sessions").into_std_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    // BOX-003: a record without box_type or parent becomes a session box
+    // with no parent, a nil id is replaced, and a later start changes
+    // nothing.
+    #[test]
+    fn restart_migrates_records_missing_type_or_parent_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // An old session with an id, and neither key.
+        let mut old = sample_record();
+        old.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        old.name = Some("old".to_string());
+        let mut raw_old = serde_json_lenient::to_value(&old).unwrap();
+        for key in ["box_type", "parent"] {
+            raw_old.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "0ld00", &raw_old);
+
+        // An older one still: no id, and no box_type.
+        let mut idless = sample_record();
+        idless.name = Some("idless".to_string());
+        let mut raw_idless = serde_json_lenient::to_value(&idless).unwrap();
+        for key in ["id", "box_type"] {
+            raw_idless.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "1d1e5", &raw_idless);
+
+        // A task box that carries both keys is left as it is.
+        let mut task = sample_record();
+        task.id = SessionId::mint();
+        task.name = Some("task".to_string());
+        task.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        task.parent = None;
+        let raw_task = serde_json_lenient::to_value(&task).unwrap();
+        write_raw_record(&root, "7a5c0", &raw_task);
+        let task_bytes = serde_json_lenient::to_vec(&raw_task).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+
+        let key = loader.find_by_id(&old.id).unwrap().expect("old is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(
+            migrated,
+            Record {
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+                parent: None,
+                ..old
+            },
+            "only the type and the parent change, and the id is kept"
+        );
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0ld00").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(written["parent"].is_null());
+        assert!(written.as_object().unwrap().contains_key("parent"));
+
+        let key = loader
+            .find_by_name("idless")
+            .unwrap()
+            .expect("the idless record is still found by its name");
+        let fresh = loader.get(&key).unwrap().record().clone();
+        assert!(!fresh.id.is_nil(), "a nil id is replaced");
+        assert_eq!(*key.id(), fresh.id, "the index files it under the new id");
+        assert_eq!(loader.find_by_id(&SessionId::nil()).unwrap(), None);
+        assert_eq!(fresh.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
+        assert_eq!(fresh.parent, None);
+
+        assert_eq!(
+            std::fs::read(session_dir_path(&root, "7a5c0").join("record.json")).unwrap(),
+            task_bytes,
+            "a record with both keys is not rewritten"
+        );
+
+        let after_first = sessions_tree(&root);
+        drop(loader);
+        let again = DiskLoader::new(root.clone()).unwrap();
+        assert_eq!(
+            sessions_tree(&root),
+            after_first,
+            "a later start leaves every migrated record unchanged"
+        );
+        assert_eq!(again.find_by_name("idless").unwrap(), Some(key));
     }
 
     #[test]

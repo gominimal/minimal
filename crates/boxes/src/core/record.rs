@@ -213,12 +213,14 @@ fn reaps_exactly_the_unfinished(store: &[RecordState]) -> bool {
     let indexed: Vec<(usize, RecordState)> = store.iter().copied().enumerate().collect();
     let outcome = restart_reap(indexed, |(_, state)| *state);
     outcome.kept.len() + outcome.reaped.len() == store.len()
-        && outcome.reaped.iter().all(|(_, state)| {
-            matches!(state, RecordState::Pending | RecordState::Materializing)
-        })
-        && outcome.kept.iter().all(|(_, state)| {
-            !matches!(state, RecordState::Pending | RecordState::Materializing)
-        })
+        && outcome
+            .reaped
+            .iter()
+            .all(|(_, state)| matches!(state, RecordState::Pending | RecordState::Materializing))
+        && outcome
+            .kept
+            .iter()
+            .all(|(_, state)| !matches!(state, RecordState::Pending | RecordState::Materializing))
 }
 
 #[cfg(test)]
@@ -236,7 +238,9 @@ mod tests {
             RecordState::Exited(ExitEnding::Oom),
         ];
         for n in [0, 1, 2, 9, 15, 137, 255, -1, i32::MAX, i32::MIN] {
-            states.push(RecordState::Stopped(StopEnding::ExitedFirst { exit_code: n }));
+            states.push(RecordState::Stopped(StopEnding::ExitedFirst {
+                exit_code: n,
+            }));
             states.push(RecordState::Stopped(StopEnding::Signalled { signal: n }));
             states.push(RecordState::Exited(ExitEnding::Exit { exit_code: n }));
         }
@@ -248,7 +252,13 @@ mod tests {
     fn record_state_is_one_of_five_with_exit_reason() {
         let rows = [
             (RecordState::Pending, "pending", None, None, None),
-            (RecordState::Materializing, "materializing", None, None, None),
+            (
+                RecordState::Materializing,
+                "materializing",
+                None,
+                None,
+                None,
+            ),
             (RecordState::Running, "running", None, None, None),
             (
                 RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
