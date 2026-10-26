@@ -1982,7 +1982,15 @@ struct HolderAtWindow {
 }
 
 impl HolderAtWindow {
-    /// Every other live exec holding input right now.
+    /// Every other live exec holding input right now, whose command is
+    /// running. One whose command has not started holds input it cannot read
+    /// yet and is under its own `unstarted` grace, which ends it on its own
+    /// terms; it is not a holder another exec may end.
+    ///
+    /// The registry spans every session of this daemon, and the daemon
+    /// serves one user: every exec here is that user's, so ending the one
+    /// that is not reading is a fairness rule among their own commands, not
+    /// a boundary between tenants.
     fn snapshot(waiter: &Arc<HeldInput>) -> Vec<Self> {
         waiter
             .limits
@@ -1990,7 +1998,7 @@ impl HolderAtWindow {
             .iter()
             .filter_map(|entry| {
                 let held = entry.held.upgrade()?;
-                if Arc::ptr_eq(&held, waiter) || held.held_bytes() == 0 {
+                if Arc::ptr_eq(&held, waiter) || held.held_bytes() == 0 || !held.started() {
                     return None;
                 }
                 let window = DrainWindow::begin(&held);

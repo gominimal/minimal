@@ -2145,6 +2145,62 @@ async fn a_reader_draining_a_quantum_per_window_is_never_ended() {
     assert_eq!(held.held_bytes(), 0);
 }
 
+/// A holder whose command has not started is under its own `unstarted`
+/// grace and is never another exec's victim: the starved exec waits its
+/// ceiling out and ends itself, as before.
+#[tokio::test]
+async fn an_unstarted_holder_is_not_a_victim() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(30),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    // Only the waiter's command runs; the holder's is still starting.
+    pumps[1].3.command_started();
+    pumps[0].0.send(data(200, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 200)
+        .await
+    );
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved by an unstarted holder
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("the starved exec ends itself at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "the unstarted holder is untouched"
+    );
+    assert_eq!(pumps[0].3.held_bytes(), 200);
+}
+
 /// #2238's daemon half: the exec that would cross the daemon's budget
 /// while holding nothing is not the one at fault. After its wait, the
 /// largest holder that read none of what it owed over the window is the
