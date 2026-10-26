@@ -814,28 +814,40 @@ pub struct LogCheck {
 
 /// Verifies the hash chain of every segment of the log in `dir`, oldest
 /// first (BEP-049). Segment 0 starts at [`ZERO_HASH`]. A segment starts at
-/// the head of the segment numbered just before it. When that segment is
-/// gone, because a rotation pruned it, the segment's first record starts
-/// the chain again. A missing directory is an empty log that verifies.
+/// the head of the segment before it. The oldest surviving segment, when
+/// it is not segment 0, starts the chain again, because a rotation pruned
+/// the segments before it.
+///
+/// A gap in the numbers after a surviving segment is a prune only when
+/// that segment holds a revocation record: [`prune`] removes every older
+/// segment except one that holds a revocation, and keeps the newest ones
+/// whole. So after a segment without a revocation, the next segment must
+/// carry its head, gap or not, and a deleted segment there breaks the
+/// chain. After a segment with a revocation, the segment past the gap
+/// starts the chain again. A missing directory is an empty log that
+/// verifies.
 pub fn verify_dir(dir: impl AsRef<Path>) -> io::Result<LogCheck> {
     let mut check = LogCheck {
         segments: Vec::new(),
         records: 0,
         broken: None,
     };
-    let mut previous: Option<(u64, Option<String>)> = None;
+    // The previous segment's number, head, and whether it holds a
+    // revocation record.
+    let mut previous: Option<(u64, Option<String>, bool)> = None;
     for (n, path) in numbered_segments(dir.as_ref())? {
         let contents = fs::read(&path)?;
         let start = match &previous {
             _ if n == 0 => Some(ZERO_HASH.to_owned()),
-            Some((m, head)) if m.checked_add(1) == Some(n) => head.clone(),
+            Some((m, head, _)) if m.checked_add(1) == Some(n) => head.clone(),
+            Some((_, head, false)) => head.clone(),
             _ => None,
         };
         check.segments.push(path.clone());
         match verify_chain(start.as_deref(), &contents) {
             ChainCheck::Verified { head, records } => {
                 check.records += records;
-                previous = Some((n, head));
+                previous = Some((n, head, bytes_hold_revocation(&contents)));
             }
             ChainCheck::Broken { record } => {
                 check.records += record - 1;
@@ -878,14 +890,18 @@ fn final_hash(path: &Path) -> io::Result<String> {
 /// as one, so [`prune`] keeps a segment it cannot read whole. The bytes
 /// after the last newline are a partial write and count as none.
 fn holds_revocation(path: &Path) -> io::Result<bool> {
-    let bytes = fs::read(path)?;
+    Ok(bytes_hold_revocation(&fs::read(path)?))
+}
+
+/// [`holds_revocation`] over the bytes of one segment.
+fn bytes_hold_revocation(bytes: &[u8]) -> bool {
     let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
-    Ok(bytes[..complete].split(|&b| b == b'\n').any(|raw| {
+    bytes[..complete].split(|&b| b == b'\n').any(|raw| {
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         !raw.is_empty()
             && serde_json::from_slice::<Record>(raw)
                 .map_or(true, |record| record.kind == Kind::Revocation)
-    }))
+    })
 }
 
 /// Removes the segments of the log in `dir` that are older than the newest
@@ -1887,6 +1903,50 @@ mod tests {
         fs::write(&second, b"").unwrap();
         let check = verify_dir(&log_dir).unwrap();
         assert_eq!(check.broken, Some((check.segments[2].clone(), 1)));
+    }
+
+    /// A gap after a segment without a revocation is a deleted segment, and
+    /// breaks the chain. A gap that a prune leaves after a kept revocation
+    /// segment verifies.
+    #[test]
+    fn audit_chain_breaks_at_a_deleted_middle_segment() {
+        let dir = TempDir::new();
+        let log_dir = dir.log().parent().unwrap().join("gaps");
+        let mut log = AuditLog::open_dir(&log_dir, rotation(1, usize::MAX, 3600)).unwrap();
+        log.append(&revocation("box-a")).unwrap();
+        for _ in 0..5 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir).unwrap();
+        assert!(all.len() >= 5, "the log rotated: {all:?}");
+
+        // A prune keeps the revocation segment and the newest two.
+        let removed = prune(
+            &log_dir,
+            &rotation(1, 2, 3600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert!(!removed.is_empty(), "the prune removed segments");
+        let kept = segments(&log_dir).unwrap();
+        assert_eq!(kept[0], all[0]);
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, None, "{check:?}");
+
+        // Deleting a middle segment of a log without a revocation leaves a
+        // gap after a segment that a prune removes, so the chain breaks.
+        let dir2 = TempDir::new();
+        let log_dir2 = dir2.log().parent().unwrap().join("deleted");
+        let mut log = AuditLog::open_dir(&log_dir2, rotation(1, usize::MAX, 3600)).unwrap();
+        for _ in 0..4 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir2).unwrap();
+        fs::remove_file(&all[1]).unwrap();
+        let check = verify_dir(&log_dir2).unwrap();
+        assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
     }
 }
 
