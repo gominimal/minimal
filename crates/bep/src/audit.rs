@@ -1157,9 +1157,9 @@ pub struct LogCheck {
 /// starts the chain again. A missing directory is an empty log that
 /// verifies.
 ///
-/// Only a line that parses as a revocation record counts here. A line that
-/// does not parse, or a record of a kind this bep does not know, never
-/// excuses a gap ([`bytes_hold_parsed_revocation`]).
+/// A segment's last line counts here only when it parses as a revocation
+/// record. A line with a successor counts as it does for [`prune`], because
+/// the chain checks its bytes ([`bytes_hold_parsed_revocation`]).
 ///
 /// A gap that a quarantine left verifies when its quarantine records lead
 /// the chain across it, as [`verify_chain`] checks them
@@ -1310,18 +1310,35 @@ fn holds_revocation(path: &Path) -> io::Result<bool> {
     }))
 }
 
-/// Whether the bytes of one segment hold a complete line that parses as a
-/// revocation record. Unlike [`holds_revocation`], a line that does not
-/// parse counts as none, and so does a record of a kind this bep does not
-/// know, so an edited line cannot excuse a gap in [`verify_dir`]. An edit
+/// Whether the bytes of one segment, whose chain verified, can excuse a gap
+/// after it in [`verify_dir`].
+///
+/// A line with a successor in the segment carries the bytes the writer
+/// wrote, because the successor carries its hash. So it counts as
+/// [`holds_revocation`] counts it, and a corrupt line or a record of a kind
+/// this bep does not know excuses a gap, as it keeps the segment in
+/// [`prune`]. Only the last complete line has no successor to check it. It
+/// counts only when it parses as a revocation record, so an edit of that
+/// line to a corrupt line or to another kind cannot excuse a gap. An edit
 /// of `revocation` to another kind reads as such a record.
 ///
-/// Residual: [`prune`] also keeps a segment with a record of an unknown
-/// kind. When a newer bep wrote that record and a prune left a gap after
-/// it, [`verify_dir`] reports a break that is none.
+/// Residual: [`prune`] also keeps a segment whose last line is corrupt or a
+/// record of an unknown kind. When the writer wrote that line and a prune
+/// left a gap after it, [`verify_dir`] reports a break that is none.
 fn bytes_hold_parsed_revocation(bytes: &[u8]) -> bool {
-    complete_lines(bytes)
-        .any(|raw| matches!(classify(raw), Line::Record(record) if record.kind == Kind::Revocation))
+    let mut lines = complete_lines(bytes).peekable();
+    while let Some(raw) = lines.next() {
+        let last = lines.peek().is_none();
+        let counts = match classify(raw) {
+            Line::Record(record) => record.kind == Kind::Revocation,
+            Line::Corrupt | Line::OtherKind { .. } => !last,
+            Line::Quarantine(_) => false,
+        };
+        if counts {
+            return true;
+        }
+    }
+    false
 }
 
 /// Where the chain of a log stops verifying.
@@ -2761,6 +2778,54 @@ mod tests {
         fs::remove_file(&all[1]).unwrap();
         let check = verify_dir(&log_dir3).unwrap();
         assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
+    }
+
+    /// A corrupt line, or a record of a kind this bep does not know, keeps
+    /// its segment in a prune. With a successor in the segment, the chain
+    /// checks its bytes, so it excuses the gap that the prune leaves after
+    /// the segment, as a revocation does.
+    #[test]
+    fn verify_dir_crosses_a_gap_after_an_unreadable_line_with_a_successor() {
+        let schema = format!("\"schema\":\"{SCHEMA}\"");
+        let unreadable = [
+            // Corrupt: a kind that is not a string.
+            (format!("{schema},\"kind\":7"), "corrupt"),
+            // A kind this bep does not know.
+            (format!("{schema},\"kind\":\"future_kind\""), "future"),
+        ];
+        for (replacement, name) in unreadable {
+            let dir = TempDir::new();
+            let log_dir = dir.log().parent().unwrap().join(name);
+            fs::create_dir_all(&log_dir).unwrap();
+            let line = Record::from_decision(&admit(), ZERO_HASH).to_line();
+            let first = line.replacen(&format!("{schema},\"kind\":\"decision\""), &replacement, 1);
+            assert_ne!(first, line, "the line carries its schema and kind");
+            assert!(!matches!(classify(first.as_bytes()), Line::Record(_)));
+            let second = Record::from_decision(&admit(), &line_hash(&first)).to_line();
+            fs::write(
+                log_dir.join(segment_name(0)),
+                format!("{first}\n{second}\n"),
+            )
+            .unwrap();
+            // A prune removed segment 1. Segment 2 starts from a hash that
+            // is not the head of segment 0.
+            let other = "1".repeat(64);
+            let third = Record::from_decision(&admit(), &other).to_line();
+            fs::write(log_dir.join(segment_name(2)), format!("{third}\n")).unwrap();
+            let check = verify_dir(&log_dir).unwrap();
+            assert_eq!(check.broken, None, "{name}: {check:?}");
+            assert_eq!(check.restarts, vec![log_dir.join(segment_name(2))]);
+
+            // As the last line of its segment, the same line has no
+            // successor to check it, and does not excuse the gap.
+            fs::write(log_dir.join(segment_name(0)), format!("{first}\n")).unwrap();
+            let check = verify_dir(&log_dir).unwrap();
+            assert_eq!(
+                check.broken,
+                Some((log_dir.join(segment_name(2)), 1)),
+                "{name}: {check:?}"
+            );
+        }
     }
 }
 
