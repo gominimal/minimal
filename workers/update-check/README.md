@@ -15,6 +15,14 @@ GET https://update.minimal.dev/v1/<channel>/<key>?os=<os>&arch=<arch>&install=<m
 a 5 minute edge cache. Promotion (`scripts/set-channel.sh`) stays the single
 source of truth; nothing here is written on release.
 
+**What `<key>` is.** The pointer the install came from, as the installer
+recorded it in `install.toml` at install time: a version on `stable`
+(`0.7.1`) and a short commit hash on `unstable` and `nightly` (`5a93a07a`),
+since those pointers are hashes. A build with no install record sends the
+hash its version string embeds (`0.7.2-dev.12.g5a93a07a` → `5a93a07a`). Up to
+date is `key == latest`, or a whole version string whose `g<hash>` suffix is
+the pointer; nothing is ordered. A `HEAD` is answered without a data point.
+
 ## What is recorded
 
 One Workers Analytics Engine data point per answered request, dataset
@@ -35,7 +43,14 @@ One Workers Analytics Engine data point per answered request, dataset
 
 The request's address is not stored. The client makes at most one request
 per install per day, so distinct install ids over a day are the installs
-that ran `min` that day:
+that ran `min` that day. **Read the count as an upper bound**, not an exact
+figure: the endpoint has no authentication, and any caller can send a fresh
+UUID-shaped `id`, so a deliberate or accidental flood of ids inflates it. The
+only brake is the per-source rate-limit rule on `update.minimal.dev` in
+gominimal/infra (`cloudflare/main.go`, 60 requests per 10 s per colo and
+source IP), which bounds how fast one source can do that, not whether. If the
+number ever matters beyond a trend, the `id` has to become something the
+client proves (the login-verified metrics of inbox#515).
 
 ```sql
 SELECT blob2 AS channel, count(DISTINCT blob1) AS installs

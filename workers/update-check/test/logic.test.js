@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CHANNELS, POINTER_BASE, dataPoint, handle, latestFor, parseRequest } from "../src/logic.js";
+import { CHANNELS, POINTER_BASE, dataPoint, handle, latestFor, parseRequest, upToDate } from "../src/logic.js";
 
 const good = "https://update.minimal.dev/v1/stable/0.7.1?os=linux&arch=x86_64&install=installer&id=d66d041a-66bc-43f9-97c2-09f071ae7686";
 
@@ -61,6 +61,23 @@ test("an answered request records the eight fields plus country and ASN, never t
   assert.deepEqual(points[0].indexes, ["d66d041a-66bc-43f9-97c2-09f071ae7686"]);
   assert.deepEqual(points[0].doubles, [0], "0.7.1 is behind 0.7.2");
   assert.ok(!JSON.stringify(points[0]).includes("203.0.113.9"), "no address in the point");
+});
+
+test("up to date is the pointer itself, or the hash a version string embeds", () => {
+  assert.equal(upToDate("0.7.1", "0.7.1"), true, "stable: the version");
+  assert.equal(upToDate("5a93a07a", "5a93a07a"), true, "unstable and nightly: the short hash the installer recorded");
+  assert.equal(upToDate("0.7.2-dev.12.g5a93a07a", "5a93a07a"), true, "a whole version string with that hash");
+  assert.equal(upToDate("0.7.1", "0.7.2"), false);
+  assert.equal(upToDate("0.7.2-dev.12.g5a93a07a", "e8f53f6e"), false);
+  assert.equal(upToDate("5a93a07a", "0.7.1"), false, "a hash never equals a version");
+});
+
+test("a HEAD is answered without a data point", async () => {
+  const points = [];
+  const env = { UPDATE_CHECKS: { writeDataPoint: (p) => points.push(p) } };
+  const resp = await handle(new Request(good, { method: "HEAD" }), env, pointer("0.7.2"), { country: "DE", asn: 1 });
+  assert.equal(resp.status, 200);
+  assert.equal(points.length, 0, "a probe is not an install");
 });
 
 test("an up-to-date install is marked so in the point", () => {

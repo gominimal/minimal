@@ -59,6 +59,19 @@ export async function latestFor(channel, fetchFn) {
 }
 
 /**
+ * Whether `key` is the channel's current pointer. The installer records the
+ * pointer it installed as the key, so on stable that is a version (`0.7.1`)
+ * and on unstable and nightly a short commit hash (`5a93a07a`), and equality
+ * is the test. A build with no install record sends the hash its version
+ * string embeds; a client that sent the whole version string instead
+ * (`0.7.2-dev.12.g5a93a07a`) is still up to date when its `g<hash>` suffix
+ * is the pointer.
+ */
+export function upToDate(key, latest) {
+  return key === latest || key.endsWith(`.g${latest}`);
+}
+
+/**
  * The data point for one answered request: the eight fields, then what the
  * edge knows of where it came from (country, ASN). Not the address. The
  * install id is the index, so `count(DISTINCT blob1)` is the install count.
@@ -68,7 +81,7 @@ export function dataPoint(fields, cf) {
   const asn = cf && cf.asn !== undefined && cf.asn !== null ? String(cf.asn) : "";
   return {
     blobs: [fields.id, fields.channel, fields.key, fields.os, fields.arch, fields.install, country, asn],
-    doubles: [fields.key === fields.latest ? 1 : 0],
+    doubles: [upToDate(fields.key, fields.latest) ? 1 : 0],
     indexes: [fields.id],
   };
 }
@@ -86,7 +99,10 @@ export async function handle(request, env, fetchFn, cf) {
   if (fields === null) return new Response(null, { status: 404 });
   const latest = await latestFor(fields.channel, fetchFn);
   if (latest === null) return new Response(null, { status: 503, headers: { "Retry-After": "300" } });
-  if (env && env.UPDATE_CHECKS && typeof env.UPDATE_CHECKS.writeDataPoint === "function") {
+  // Only a GET is a check. A HEAD is a probe (an uptime monitor, a link
+  // checker) and is answered without a data point, so probes never count
+  // as installs.
+  if (request.method === "GET" && env && env.UPDATE_CHECKS && typeof env.UPDATE_CHECKS.writeDataPoint === "function") {
     try {
       env.UPDATE_CHECKS.writeDataPoint(dataPoint({ ...fields, latest }, cf));
     } catch {

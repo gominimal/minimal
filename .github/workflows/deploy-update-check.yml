@@ -155,10 +155,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ steps.resolve.outputs.sha }}
-          # ci.yml serializes push runs on main, so a dispatch landing in a
-          # merge window waits for the run ahead of its target and then for the
-          # target's own — and re-targets if further merges supersede it. The
-          # budget covers a few such rounds, not one run's duration.
+          # This repo's ci.yml never cancels a run on main (its concurrency
+          # group excludes main and release/*), so the `cancelled` branch
+          # below fires only when someone cancelled the run by hand; the
+          # re-target it does then is harmless. The budget covers CI's own
+          # duration with room for a queue behind it.
           WAIT_SECONDS: "3600"
           POLL_SECONDS: "20"
         run: |
@@ -370,24 +371,17 @@ jobs:
             exit 1
           fi
 
-      # Repo-standard plumbing for every gominimal/run-task call site: frees
-      # disk, restores build caches, enables unprivileged user namespaces
-      # (which the Minimal sandbox needs on ubuntu-latest), and routes package
-      # reads through the R2 mirror. Runs after the credentials check so the
-      # cheap fail-fast still fires first.
-
-      # wrangler comes from the Minimal catalog via [tasks.deploy-worker], not
-      # from `npx` — so the binary is content-addressed and pinned by
+      # wrangler comes from the Minimal catalog via [tasks.deploy-update-check],
+      # not from `npx`: the binary is content-addressed and pinned by
       # .minimal/minimal.toml's `locked_commit` rather than resolved off the npm
-      # registry at deploy time. The catalog pins 4.108.0, the same version that
-      # performed the initial manual deploy, so the deployed artifact is
-      # unchanged; only how wrangler is obtained changed. Bump by moving
-      # `locked_commit` (`mip update`), deliberately.
+      # registry at deploy time. Bump by moving `locked_commit` (`mip update`),
+      # deliberately. run-task does its own plumbing (user namespaces, the mip
+      # fetch); nothing here needs the caches a build job restores.
       - name: Deploy update-check Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKER_DEPLOY_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        uses: gominimal/run-task@e95aa1a7f5999ade16393d1975018ec18bd6638e  # main 2026-07-16
+        uses: gominimal/run-task@a5ed123f612b9774e3d6eaa7af45370e33aa1116 # v1, the pin ci.yml and ci-update-check.yml use
         with:
           task: deploy-update-check
           channel: unstable  # the channel ci.yml's run-task steps use
