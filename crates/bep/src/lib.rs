@@ -29,4 +29,5 @@ pub mod revoke;
 pub mod seal;
 pub mod signin;
 pub mod store;
+pub mod supervisor;
 pub mod upstream;

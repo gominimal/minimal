@@ -17,7 +17,9 @@
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
 //! registrations on the control socket ([`bep::control`]). It reads the
-//! per-boot token from standard input. Each request inside a box connection
+//! per-boot token from standard input. With `--exit-on-stdin-close` it
+//! stops when standard input closes, which is how a supervisor's death stops
+//! it ([`bep::supervisor`]). Each request inside a box connection
 //! goes to the redemption decision ([`bep::redeemer`]), which reads the
 //! boxes the control socket registers. The root certificate the start
 //! issued is the anchor of the CA that signs each leaf.
@@ -92,6 +94,12 @@ struct ServeArgs {
     /// [default: ~/.minimal/bep/control.sock]
     #[arg(long, value_name = "PATH")]
     control: Option<PathBuf>,
+
+    /// Stop serving when standard input closes. A supervisor keeps its end
+    /// of the pipe open after the token, so the proxy stops when the
+    /// supervisor exits, even when it is killed.
+    #[arg(long)]
+    exit_on_stdin_close: bool,
 }
 
 fn main() -> ExitCode {
@@ -648,6 +656,16 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
+    // Watched from here, so a supervisor that dies while the proxy starts
+    // stops it as soon as it serves (#2501).
+    let supervisor = if args.exit_on_stdin_close {
+        Some(
+            bep::supervisor::watch_until_closed(io::stdin())
+                .map_err(|err| format!("bep did not watch its standard input: {err}"))?,
+        )
+    } else {
+        None
+    };
     let control = args.control.clone().or_else(default_control).ok_or(
         "bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.",
     )?;
@@ -725,9 +743,30 @@ fn serve<K: CaKey + Send + Sync + 'static>(
                 async move { proxy.serve(delivery, stream).await }
             }) => served,
             served = control_socket.run() => served,
+            closed = supervised(supervisor) => {
+                match closed {
+                    Ok(()) => tracing::info!("standard input closed, so the supervisor is gone; the proxy stops"),
+                    Err(err) => tracing::warn!(%err, "standard input failed, so the supervisor is taken for gone; the proxy stops"),
+                }
+                Ok(())
+            }
         };
         served.map_err(|err| format!("bep stopped serving: {err}"))
     })
+}
+
+/// Resolves when the supervisor's pipe closes, or never when `bep serve`
+/// runs without `--exit-on-stdin-close`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn supervised(
+    watch: Option<tokio::sync::oneshot::Receiver<bep::supervisor::Closed>>,
+) -> bep::supervisor::Closed {
+    match watch {
+        // A watch thread that ended without a word cannot see the pipe any
+        // more, so it counts as closed.
+        Some(watch) => watch.await.unwrap_or(Ok(())),
+        None => std::future::pending().await,
+    }
 }
 
 /// The client id of the Minimal-published GitHub App. `min auth login`
@@ -1509,6 +1548,50 @@ mod tests {
             wiring.redeemer.redeem(BOX, &api, &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    /// #2501: a supervisor asks for the lifeline with a flag, so a person
+    /// who pipes the token in by hand keeps a proxy that outlives the pipe.
+    #[test]
+    fn serve_watches_standard_input_only_when_asked() {
+        let parsed = |extra: &[&str]| {
+            let args = Args::try_parse_from(
+                ["bep", "serve", "--listener", "/tmp/bep.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .expect("the arguments parse");
+            match args.command {
+                Some(Command::Serve(serve)) => serve.exit_on_stdin_close,
+                None => panic!("no serve command"),
+            }
+        };
+        assert!(!parsed(&[]), "a hand-run proxy outlives its input");
+        assert!(parsed(&["--exit-on-stdin-close"]));
+    }
+
+    /// #2501: the serve loop stops when the supervisor's pipe closes, and
+    /// never on that branch without the flag.
+    #[tokio::test]
+    async fn the_serve_loop_stops_when_the_supervisor_pipe_closes() {
+        let quiet = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(quiet, supervised(None)).await.is_err(),
+            "with no watch, the branch never fires"
+        );
+
+        let (reader, writer) = io::pipe().expect("pipe");
+        let watch = bep::supervisor::watch_until_closed(reader).expect("watch");
+        let mut stop = Box::pin(supervised(Some(watch)));
+        assert!(
+            tokio::time::timeout(quiet, &mut stop).await.is_err(),
+            "an open pipe keeps the proxy serving"
+        );
+        drop(writer);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+            .await
+            .expect("a closed pipe stops the proxy");
+        assert!(closed.is_ok(), "{closed:?}");
     }
 
     // BEP-069 (Gatehouse §6.10): a browser-flow sign-in renews under the
