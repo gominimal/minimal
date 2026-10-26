@@ -43,6 +43,7 @@ use bep::module::GITHUB;
 use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations};
+use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -580,9 +581,15 @@ struct Wiring {
 /// The redeemer over the proxy key `sealing` and the sign-in item in
 /// `keychain`, and the registries it reads. The Box Host a sealed value and
 /// its handle name is this proxy's sealing key fingerprint, which the
-/// published identity carries.
+/// published identity carries. `restored` is the box ids that the
+/// revocations recorded before this start name.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn wire<K, C>(sealing: K, keychain: C, endpoint: Arc<dyn TokenEndpoint>) -> Wiring
+fn wire<K, C>(
+    sealing: K,
+    keychain: C,
+    endpoint: Arc<dyn TokenEndpoint>,
+    restored: Vec<String>,
+) -> Wiring
 where
     K: HeldKey + Send + Sync + 'static,
     C: Keychain + Send + Sync + 'static,
@@ -595,12 +602,10 @@ where
     // (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
     // The revocations `revoke_box` records over the control socket, which
-    // the redeemer reads at each request (BEP-043, BEP-071). Interim: the
-    // set starts empty at each start. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores it from
-    // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement.
-    let revocations = Revocations::default();
+    // the redeemer reads at each request (BEP-043, BEP-071). The set starts
+    // with the revocations restored from every retained audit segment
+    // (BEP-068).
+    let revocations: Revocations = Arc::new(std::sync::RwLock::new(restored));
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
@@ -648,6 +653,56 @@ impl Wiring {
     }
 }
 
+/// Refuses the start when the audit log holds a complete line that does not
+/// parse. That line can be a revocation, and a start without it redeems a
+/// value for a destroyed box (BEP-068). The partial last line of a torn
+/// write is cut when the log opens, so it is not counted here.
+fn refuse_unreadable(restored: &revoke::Restored) -> Result<(), String> {
+    if restored.skipped == 0 {
+        return Ok(());
+    }
+    tracing::error!(
+        skipped = restored.skipped,
+        segments = ?restored.unreadable,
+        "refused the start: audit log lines did not parse, and one can be a revocation"
+    );
+    let segments: Vec<String> = restored
+        .unreadable
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect();
+    let (lines, these) = if restored.skipped == 1 {
+        ("1 line".to_owned(), "that line")
+    } else {
+        (format!("{} lines", restored.skipped), "those lines")
+    };
+    Err(format!(
+        "bep did not start. The audit log has {lines} that bep cannot read, in:\n{}\n\
+         A line that bep cannot read can record a destroyed box. \
+         Without it, bep cannot keep refusing that box.\n\
+         Repair or remove {these}, then run `bep serve` again.",
+        segments.join("\n")
+    ))
+}
+
+/// Opens the audit log in `dir` for `bep serve`. The log holds the
+/// directory, so a second `bep serve` on it is refused.
+fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                dir.display()
+            )
+        } else {
+            format!("bep did not open the audit log in {}: {err}", dir.display())
+        }
+    })
+}
+
 /// `bep serve`: the listener and the control socket, until one fails.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn serve<K: CaKey + Send + Sync + 'static>(
@@ -671,16 +726,20 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
-    let segment = audit::segments(&dir)
-        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?
-        .pop()
-        .unwrap_or_else(|| dir.join(audit::segment_name(0)));
-    let log = AuditLog::open(&segment).map_err(|err| {
-        format!(
-            "bep did not open the audit log {}: {err}",
-            segment.display()
-        )
-    })?;
+    // Locked first, so no other writer rotates the segments under the read.
+    let log = open_audit_log(&dir)?;
+    // BEP-068: the log rotates its segments, and the revocations in every
+    // retained segment are in force again from this start.
+    let restored = revoke::restore(&dir)
+        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?;
+    tracing::info!(
+        count = restored.box_ids.len(),
+        box_ids = ?restored.box_ids,
+        audit = %dir.display(),
+        "restored the revocations recorded in the audit log"
+    );
+    refuse_unreadable(&restored)?;
+    let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set when
@@ -712,7 +771,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         log.clone(),
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint));
+    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored.box_ids);
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
@@ -727,10 +786,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             .control(&control, log)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
-        tracing::warn!(
-            "A store-handle member is not admitted until #2280 lands. \
-             Revocations recorded before this start are not in force until #2290 lands."
-        );
+        tracing::warn!("A store-handle member is not admitted until #2280 lands.");
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
@@ -1121,6 +1177,48 @@ mod tests {
     use bep::ca::Leaf;
     use bep::proxy::LeafIssuer;
 
+    // BEP-068: a line that does not parse can be a revocation, so the start
+    // fails closed and names the segment that holds it.
+    #[test]
+    fn serve_refuses_start_on_unreadable_audit_line() {
+        assert_eq!(refuse_unreadable(&revoke::Restored::default()), Ok(()));
+        let restored = revoke::Restored {
+            box_ids: Vec::new(),
+            skipped: 2,
+            unreadable: vec![PathBuf::from("/audit/audit-0.jsonl")],
+        };
+        let err = refuse_unreadable(&restored).unwrap_err();
+        assert_eq!(
+            err,
+            "bep did not start. The audit log has 2 lines that bep cannot read, in:\n  \
+             /audit/audit-0.jsonl\n\
+             A line that bep cannot read can record a destroyed box. \
+             Without it, bep cannot keep refusing that box.\n\
+             Repair or remove those lines, then run `bep serve` again."
+        );
+    }
+
+    // BEP-068: a second `bep serve` on the same audit directory is refused,
+    // so two writers never fork the chain.
+    #[test]
+    fn serve_refuses_a_second_writer_of_the_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let first = open_audit_log(&audit).unwrap();
+        let err = open_audit_log(&audit).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                audit.display()
+            )
+        );
+        drop(first);
+        open_audit_log(&audit).unwrap();
+    }
+
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
     struct NoSigningKey;
 
@@ -1444,7 +1542,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint));
+        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint), Vec::new());
 
         let proxy = Proxy::new(
             Admission::new(&[GITHUB], [("", 0); 0]),
