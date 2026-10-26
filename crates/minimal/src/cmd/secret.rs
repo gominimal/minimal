@@ -535,6 +535,16 @@ pub(crate) fn run_set(
 /// different rule. The rule is written first and the item second. When the
 /// store refuses the item, the configuration file is put back, so a failed
 /// command leaves both as they were (BEP-079).
+///
+/// The order is deliberate. `SecretStore` has no call that reads a value
+/// back, so an item that is replaced first cannot be put back when the rule
+/// write fails. The rule file can be put back, so it goes first.
+///
+/// Review finding 4374026712: this leaves one window. If the process is
+/// killed after the rule write and before `store.set` returns, no restore
+/// runs. The old item then stays under the new rule until the next `set`
+/// or `rm`. The window is the duration of one store call. The command
+/// prints no identifier in that case, and exits non-zero or not at all.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_set_with_rule(
     store: &dyn SecretStore,
