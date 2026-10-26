@@ -1258,6 +1258,31 @@ pub struct SecretSetArgs {
     pub value: Option<String>,
     #[arg(long = "env", alias = "from-env", value_name = "VAR", hide = true)]
     pub env: Option<String>,
+    /// The host or host:port the secret is sent to; repeat for more than one.
+    /// Writes the secret's rule to your config.toml
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        conflicts_with = "preset",
+        requires = "form"
+    )]
+    pub upstream: Vec<String>,
+    /// The HTTP header that carries the secret
+    #[arg(long, value_name = "NAME", group = "form", requires = "upstream")]
+    pub header: Option<String>,
+    /// Text sent before the secret in the header, such as "Bearer "
+    #[arg(long, value_name = "TEXT", requires = "header")]
+    pub prefix: Option<String>,
+    /// Send the secret as this basic authentication field: user or password
+    #[arg(long, value_name = "FIELD", group = "form", requires = "upstream")]
+    pub basic_auth: Option<String>,
+    /// Use the upstream and header of a known service: anthropic,
+    /// anthropic-api-key, cloudflare, linear or sentry
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["header", "prefix", "basic_auth"])]
+    pub preset: Option<String>,
+    /// Replace a different rule for this secret without asking
+    #[arg(long, short)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
