@@ -532,6 +532,11 @@ impl Decision {
 /// `scripts/install-host-classifier.sh`.
 pub const QUIC443_BLOCKED_DIR: &str = "quic443-blocked";
 
+/// The name of the table's set of box leaves that are refused UDP to port
+/// 443 (BEP-018). Spelled the same as `QUIC443_LEAF_SET` in
+/// `scripts/install-host-classifier.sh`.
+pub const QUIC443_LEAF_SET: &str = "quic443_blocked_leaves";
+
 /// The cohort's blocked leaf under the classifier tree `root`:
 /// `<root>/boxes/quic443-blocked`.
 #[must_use]
@@ -563,9 +568,10 @@ pub fn resolved_quic443_blocked(policy: &boxes::BoxPolicy) -> bool {
         .blocks(credentialed, steering)
 }
 
-/// The two cgroup operations the cohort's stance is enforced with, behind a
+/// The cgroup operations the cohort's stance is enforced with, behind a
 /// seam so a test can drive them without a kernel: read a cgroup's
-/// processes, move one process into a cgroup, and name a process's parent.
+/// processes, move one process into a cgroup, name a process's parent, and
+/// add a box's own leaf to the table's blocked-leaves set or remove it.
 pub(crate) trait CgroupMoves {
     /// The pids in `leaf`'s `cgroup.procs`.
     fn procs(&self, leaf: &Path) -> std::io::Result<Vec<i32>>;
@@ -574,10 +580,27 @@ pub(crate) trait CgroupMoves {
     fn migrate(&self, pid: i32, to: &Path) -> std::io::Result<()>;
     /// The parent of `pid`, `None` once it is gone.
     fn parent(&self, pid: i32) -> Option<i32>;
+    /// Adds the box leaf `leaf` to the table's set of leaves that are
+    /// refused UDP to port 443 (BEP-018). A socket keeps the cgroup it was
+    /// created in, so this is what refuses a socket that a member opened in
+    /// its own leaf before the cohort turned blocked. The default changes
+    /// no set: [`KernelMoves`] only moves processes, and the daemon's
+    /// launch and stop paths use a seam that runs the privileged helper.
+    /// An implementation logs its own refusal.
+    fn add_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        let _ = leaf;
+        Ok(())
+    }
+    /// Removes the box leaf `leaf` from that set. The default changes no
+    /// set, as [`Self::add_blocked_leaf`] says.
+    fn remove_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        let _ = leaf;
+        Ok(())
+    }
 }
 
 /// [`CgroupMoves`] over the kernel: `cgroup.procs` reads and writes, and
-/// the `PPid` line of `/proc/<pid>/status`.
+/// the `PPid` line of `/proc/<pid>/status`. It changes no set.
 pub(crate) struct KernelMoves;
 
 impl CgroupMoves for KernelMoves {
@@ -693,7 +716,13 @@ impl std::error::Error for CohortPlaceError {
 /// of every resident member placed in the `allow` subtree are moved into
 /// the blocked leaf, and when the last blocking member leaves they are
 /// moved back to their own leaves. A move is a `cgroup.procs` write inside
-/// the delegated slice, which needs no CAP_NET_ADMIN. A member in the
+/// the delegated slice, which needs no CAP_NET_ADMIN. A moved process can
+/// still hold a socket it opened in its own leaf, and the socket keeps
+/// that leaf. So while the cohort blocks, the own leaf of each of those
+/// members is in the table's blocked-leaves set too
+/// ([`CgroupMoves::add_blocked_leaf`]): every leaf when the cohort turns
+/// blocked, a joining member's at its admit, and none once the last
+/// blocking member leaves. A member in the
 /// `deny` subtree stays where it is: its leaf already refuses everything
 /// but its resolver, UDP 443 included. The daemon's one cohort is
 /// [`cohort_quic443`].
@@ -713,6 +742,9 @@ pub struct CohortQuic443 {
     /// blocked leaf is sent home to the box whose moved pid is its own or
     /// an ancestor's.
     moved: std::collections::BTreeMap<String, std::collections::BTreeSet<i32>>,
+    /// The own leaves in the table's blocked-leaves set, by box id: the
+    /// leaves whose add succeeded and that were not removed since.
+    listed: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl CohortQuic443 {
@@ -723,6 +755,68 @@ impl CohortQuic443 {
             blocked_leaf: None,
             homes: std::collections::BTreeMap::new(),
             moved: std::collections::BTreeMap::new(),
+            listed: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The own leaves in the table's blocked-leaves set, as far as this
+    /// cohort knows: the adds that succeeded, less the removes.
+    pub fn listed_leaves(&self) -> impl Iterator<Item = &Path> {
+        self.listed.values().map(PathBuf::as_path)
+    }
+
+    /// Brings the table's blocked-leaves set in step with the cohort: the
+    /// own leaf of every resident member whose processes move while the
+    /// cohort blocks, and no leaf while it does not. Each change logs one
+    /// info line with the leaf and the blocking members. A refused add is
+    /// not recorded, so the next change tries it again. A refused remove
+    /// is dropped from the record: the box left, or its leaf did.
+    fn sync_leaf_set(&mut self, moves: &dyn CgroupMoves) {
+        let want = if self.blocked() {
+            self.homes.clone()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let stale: Vec<(String, PathBuf)> = self
+            .listed
+            .iter()
+            .filter(|(id, leaf)| want.get(*id) != Some(*leaf))
+            .map(|(id, leaf)| (id.clone(), leaf.clone()))
+            .collect();
+        for (id, leaf) in stale {
+            self.listed.remove(&id);
+            if moves.remove_blocked_leaf(&leaf).is_ok() {
+                self.log_set_change(&id, &leaf, false);
+            }
+        }
+        for (id, leaf) in want {
+            if self.listed.contains_key(&id) {
+                continue;
+            }
+            if moves.add_blocked_leaf(&leaf).is_ok() {
+                self.log_set_change(&id, &leaf, true);
+                self.listed.insert(id, leaf);
+            }
+        }
+    }
+
+    /// The one info line per change of the blocked-leaves set.
+    fn log_set_change(&self, box_id: &str, leaf: &Path, added: bool) {
+        let blocking: Vec<&str> = self.blocking_members().collect();
+        if added {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                blocking_members = ?blocking,
+                "added a host-address box's own leaf to the set that is refused UDP 443"
+            );
+        } else {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                blocking_members = ?blocking,
+                "removed a host-address box's own leaf from the set that is refused UDP 443"
+            );
         }
     }
 
@@ -839,6 +933,7 @@ impl CohortQuic443 {
         if now != was {
             self.log_flip(box_id);
         }
+        self.sync_leaf_set(moves);
         if !now {
             if was {
                 self.move_all_home(None, moves);
@@ -865,6 +960,7 @@ impl CohortQuic443 {
         let was = self.blocked();
         self.leave(box_id);
         self.homes.remove(box_id);
+        self.sync_leaf_set(moves);
         let now = self.blocked();
         if was && !now {
             self.log_flip(box_id);
@@ -1073,6 +1169,11 @@ pub(crate) struct StandinMoves {
     /// The pids a migration refuses with `EACCES`, as a write to a leaf the
     /// daemon was not delegated would.
     pub(crate) refused: std::sync::Mutex<std::collections::BTreeSet<i32>>,
+    /// The leaves in the stand-in blocked-leaves set.
+    pub(crate) listed: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// The leaves the stand-in helper refuses to add, as a host whose
+    /// helper is missing would.
+    pub(crate) unlistable: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -1128,6 +1229,19 @@ impl CgroupMoves for StandinMoves {
 
     fn parent(&self, pid: i32) -> Option<i32> {
         self.parents.lock().unwrap().get(&pid).copied()
+    }
+
+    fn add_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        if self.unlistable.lock().unwrap().contains(leaf) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        self.listed.lock().unwrap().insert(leaf.to_path_buf());
+        Ok(())
+    }
+
+    fn remove_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        self.listed.lock().unwrap().remove(leaf);
+        Ok(())
     }
 }
 
@@ -4307,8 +4421,11 @@ mod tests {
             output
                 .iter()
                 .filter(|rule| !rule.contains("jump"))
-                .all(|rule| rule.contains(QUIC443_BLOCKED_DIR) && rule.contains("udp dport 443")),
-            "every other output rule is the blocked leaf's UDP 443 reject: {output:?}"
+                .all(|rule| (rule.contains(QUIC443_BLOCKED_DIR)
+                    || rule.contains(&format!("@{QUIC443_LEAF_SET}")))
+                    && rule.contains("udp dport 443")),
+            "every other output rule is a UDP 443 reject of the blocked leaf or \
+             the blocked-leaves set: {output:?}"
         );
         assert!(
             output[0].contains(sandbox::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
@@ -4553,13 +4670,19 @@ mod tests {
         // `enter_daemon_leaf` performs is what makes that so.
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
-        // Two rules: the deny subtree's refusal first, and the cohort's
-        // UDP 443 rule on its blocked leaf (BEP-018), which the daemon's
-        // leaf is outside of too.
+        // Three rules: the deny subtree's refusal first, the cohort's UDP
+        // 443 rule on its blocked leaf (BEP-018), which the daemon's leaf is
+        // outside of too, and the same rule on the blocked-leaves set,
+        // which the helper fills with allow-subtree box leaves alone.
         assert_eq!(
             output.len(),
-            2,
+            3,
             "the deny subtree's rule and the blocked leaf's: {output:?}"
+        );
+        assert!(
+            output[2].contains(&format!("@{QUIC443_LEAF_SET}")),
+            "the third rule is keyed on the blocked-leaves set: {}",
+            output[2]
         );
         let refusing = output[0];
         assert!(
@@ -7425,6 +7548,262 @@ mod tests {
         cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves)
             .expect("the deny box needs no move");
         assert_eq!(moves.where_is(20), deny);
+    }
+
+    /// BEP-018: the table also rejects UDP to port 443 from a socket whose
+    /// own box leaf is in the blocked-leaves set, so a socket opened before
+    /// the flip is matched on the leaf it was created in. The install adds
+    /// the root-owned helper that changes that set one allow-subtree leaf at
+    /// a time, and the helper refuses every other path.
+    #[test]
+    fn the_ruleset_rejects_udp_443_from_leaves_in_the_blocked_set() {
+        let ruleset = rendered_ruleset();
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let leaf_rel = format!(
+            "{slice}/{}/{}/grant",
+            sandbox::classifier::BOXES_DIR,
+            sandbox::config::ALLOW_DIR
+        );
+        let level = leaf_rel.split('/').count();
+        let set = format!("set {QUIC443_LEAF_SET} {{");
+        let typeof_line = format!("typeof socket cgroupv2 level {level}");
+        let rule = format!(
+            "socket cgroupv2 level {level} @{QUIC443_LEAF_SET} udp dport 443 \
+             reject with icmpx port-unreachable"
+        );
+        let lines: Vec<&str> = ruleset.lines().map(str::trim).collect();
+        let at_set = lines
+            .iter()
+            .position(|line| *line == set)
+            .unwrap_or_else(|| panic!("the table declares the set: {ruleset}"));
+        assert_eq!(
+            lines.get(at_set + 1),
+            Some(&typeof_line.as_str()),
+            "the set holds box leaves, compared at a box leaf's depth: {ruleset}"
+        );
+        let at_output = lines
+            .iter()
+            .position(|line| line.starts_with("chain output "))
+            .expect("the output chain");
+        assert!(
+            at_set < at_output,
+            "the set is declared before the rule that names it: {ruleset}"
+        );
+        let output = chain_rules(&ruleset, "output");
+        assert!(
+            output.contains(&rule.as_str()),
+            "the output chain rejects UDP 443 from a leaf in the set: {output:?}"
+        );
+        let keyed: Vec<_> = output
+            .iter()
+            .filter(|r| r.contains(&format!("@{QUIC443_LEAF_SET}")))
+            .collect();
+        assert_eq!(keyed, [&rule.as_str()], "one rule on the set: {output:?}");
+
+        // The install writes the helper and the sudoers rule for it.
+        let mount = standin_mount();
+        let stub = tempfile::tempdir().expect("a dir for the recording nft");
+        let nft = recording_nft(stub.path(), &[]);
+        let scratch = tempfile::tempdir().expect("a dir for the helper");
+        let helper = scratch.path().join("lib/quic443-leaf");
+        let sudoers = scratch.path().join("sudoers.d/minimal-quic443-leaf");
+        let (uid, gid) = delegated_owner();
+        let installed = step_command(&mount, &GUEST_RESOLVER_FLAGS, Some(stub.path()))
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string())
+            .env("MINIMAL_OVERRIDE_QUIC443_HELPER", &helper)
+            .env("MINIMAL_OVERRIDE_QUIC443_SUDOERS", &sudoers)
+            .output()
+            .expect("running the install");
+        assert!(
+            installed.status.success(),
+            "the install succeeds: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        assert!(helper.is_file(), "the install wrote {}", helper.display());
+        let rule_text = std::fs::read_to_string(&sudoers).expect("the sudoers rule");
+        assert!(
+            rule_text
+                .lines()
+                .any(|line| line == format!("#{uid} ALL=(root) NOPASSWD: {}", helper.display())),
+            "the account may run the helper and nothing else: {rule_text}"
+        );
+        let calls_before = nft_calls(stub.path()).len();
+
+        // An allow-subtree leaf goes into the set and comes out of it.
+        let home = sandbox::classifier::create_box_leaf(&mount.root, "grant", Verdict::Allow)
+            .expect("the box's own leaf");
+        let run = |verb: &str, leaf: &Path| {
+            std::process::Command::new(&helper)
+                .arg(verb)
+                .arg(leaf)
+                .output()
+                .expect("running the helper")
+        };
+        for verb in ["add", "remove"] {
+            let ran = run(verb, &home);
+            assert!(
+                ran.status.success(),
+                "the helper {verb}s {}: {}",
+                home.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+        let calls = nft_calls(stub.path());
+        let element = format!("{{ \"{leaf_rel}\" }}");
+        let changes: Vec<Vec<String>> = calls[calls_before..]
+            .iter()
+            .map(|(argv, _)| argv.clone())
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                vec![
+                    "add",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    QUIC443_LEAF_SET,
+                    element.as_str()
+                ],
+                vec![
+                    "delete",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    QUIC443_LEAF_SET,
+                    element.as_str()
+                ],
+            ],
+            "the helper changes one element of the set: {}",
+            nft.display()
+        );
+
+        // Every other path is refused, and nft is not run for it.
+        let boxes = mount.root.join(sandbox::classifier::BOXES_DIR);
+        let deny = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
+            .expect("a deny box's leaf");
+        let outside = [
+            deny,
+            quic443_blocked_leaf(&mount.root),
+            boxes.join(sandbox::config::ALLOW_DIR),
+            boxes.join(sandbox::config::ALLOW_DIR).join("../deny"),
+            boxes.join(sandbox::config::ALLOW_DIR).join("grant/nested"),
+            mount.root.clone(),
+            PathBuf::from("/etc"),
+        ];
+        for leaf in &outside {
+            let ran = run("add", leaf);
+            assert_eq!(
+                ran.status.code(),
+                Some(2),
+                "the helper refuses {}: {}",
+                leaf.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&ran.stderr).contains("refused"),
+                "the refusal says so for {}",
+                leaf.display()
+            );
+        }
+        let ran = run("flush", &home);
+        assert_eq!(ran.status.code(), Some(2), "only add and remove are taken");
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            calls_before + 2,
+            "no refused call reached nft"
+        );
+    }
+
+    /// BEP-018: while the cohort blocks, the own leaf of every resident
+    /// allow-subtree member is in the blocked-leaves set: all of them at
+    /// the flip, a joining member's at its admit, and none once the last
+    /// blocking member leaves. The process moves stay.
+    #[test]
+    fn cohort_flip_puts_member_leaves_in_the_blocked_set() {
+        let (tree, mut cohort, homes) = standin_cohort(&["plain", "open", "grant", "late"]);
+        let blocked = quic443_blocked_leaf(tree.path());
+        let moves = StandinMoves::default();
+        let listed = |moves: &StandinMoves| moves.listed.lock().unwrap().clone();
+        moves.spawn_in(10, &homes[0]);
+        moves.spawn_in(20, &homes[1]);
+        moves.spawn_in(30, &homes[2]);
+
+        cohort
+            .admit("plain", Some(homes[0].clone()), false, &moves)
+            .expect("nothing moves");
+        cohort
+            .admit("open", Some(homes[1].clone()), false, &moves)
+            .expect("nothing moves");
+        // A deny-subtree member has no own leaf to move or list.
+        cohort
+            .admit("sealed", None, false, &moves)
+            .expect("nothing moves");
+        assert!(listed(&moves).is_empty(), "an open cohort lists no leaf");
+
+        // The flip lists every allow member's leaf, the flipper's too.
+        cohort
+            .admit("grant", Some(homes[2].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert_eq!(
+            listed(&moves),
+            homes[..3].iter().cloned().collect(),
+            "every allow member's own leaf is in the set"
+        );
+        assert_eq!(
+            cohort
+                .listed_leaves()
+                .map(Path::to_path_buf)
+                .collect::<std::collections::BTreeSet<_>>(),
+            listed(&moves),
+            "the cohort records what it listed"
+        );
+        for pid in [10, 20, 30] {
+            assert_eq!(moves.where_is(pid), blocked, "the moves stay");
+        }
+
+        // A member that joins while the cohort blocks is listed at admit.
+        moves.spawn_in(40, &homes[3]);
+        cohort
+            .admit("late", Some(homes[3].clone()), false, &moves)
+            .expect("the joiner moves");
+        assert!(listed(&moves).contains(&homes[3]));
+        assert_eq!(moves.where_is(40), blocked);
+
+        // A member that leaves while the cohort still blocks is unlisted.
+        cohort.depart("open", &moves);
+        assert!(cohort.blocked());
+        assert!(
+            !listed(&moves).contains(&homes[1]),
+            "a departed box is unlisted"
+        );
+        assert!(listed(&moves).contains(&homes[0]));
+
+        // The last blocker leaves: no leaf is listed, and processes go home.
+        cohort.depart("grant", &moves);
+        assert!(!cohort.blocked());
+        assert!(listed(&moves).is_empty(), "the lifted cohort lists nothing");
+        assert_eq!(cohort.listed_leaves().count(), 0);
+        assert_eq!(moves.where_is(10), homes[0]);
+        assert_eq!(moves.where_is(40), homes[3]);
+
+        // A refused add is not recorded, and the next change tries again.
+        moves.unlistable.lock().unwrap().insert(homes[0].clone());
+        cohort
+            .admit("grant", Some(homes[2].clone()), true, &moves)
+            .expect("the cohort moves");
+        assert!(!listed(&moves).contains(&homes[0]));
+        assert!(cohort.listed_leaves().all(|leaf| leaf != homes[0]));
+        moves.unlistable.lock().unwrap().clear();
+        cohort
+            .admit("late", Some(homes[3].clone()), false, &moves)
+            .expect("the joiner stays");
+        assert!(listed(&moves).contains(&homes[0]), "the retry listed it");
     }
 
     /// A cohort over a stand-in tree: its blocked leaf, learned, and a home

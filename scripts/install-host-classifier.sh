@@ -101,6 +101,20 @@ readonly ALLOW_DIR=allow
 # is the switch. It is directly under the cohort, so the cohort's
 # source-identity match still covers it.
 readonly QUIC443_BLOCKED_DIR=quic443-blocked
+# The set of box leaves whose sockets are refused UDP to port 443 as well
+# (BEP-018). A socket keeps the cgroup it was created in, so a process moved
+# into the blocked leaf still sends from the sockets it opened in its own
+# leaf. The daemon adds each allow-subtree member's own leaf to this set
+# while the cohort blocks, through the helper below, and removes it after.
+readonly QUIC443_LEAF_SET=quic443_blocked_leaves
+# The root-owned helper that adds or removes one box leaf in that set, and
+# the sudoers drop-in that lets the delegated account run it with `sudo -n`
+# and nothing else. The daemon spells the helper's path the same way
+# (QUIC443_LEAF_HELPER in crates/minimald/src/box_actor/host.rs). The
+# MINIMAL_OVERRIDE_* knobs put both under a rehearsal's scratch directory.
+readonly QUIC443_HELPER=${MINIMAL_OVERRIDE_QUIC443_HELPER:-/usr/local/lib/minimal/quic443-leaf}
+readonly QUIC443_SUDOERS=${MINIMAL_OVERRIDE_QUIC443_SUDOERS:-/etc/sudoers.d/minimal-quic443-leaf}
+readonly quic443_helper_overridden=${MINIMAL_OVERRIDE_QUIC443_HELPER:+1}
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -604,6 +618,7 @@ compute_cgroup_paths() {
     deny_path="$rel/$BOXES_DIR/$DENY_DIR"
     boxes_path="$rel/$BOXES_DIR"
     quic443_blocked_path="$rel/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
+    allow_path="$rel/$BOXES_DIR/$ALLOW_DIR"
 }
 
 # cgroup_level <path> — the nft socket match compares that many leading
@@ -612,6 +627,109 @@ compute_cgroup_paths() {
 # shifts every rule with it.
 cgroup_level() {
     awk -v p="$1" 'BEGIN { printf "%d\n", split(p, a, "/") }'
+}
+
+# box_leaf_level — the depth of a box's own leaf under the allow subtree,
+# the level the blocked-leaves set and its rule compare at.
+box_leaf_level() {
+    echo $(( $(cgroup_level "$allow_path") + 1 ))
+}
+
+# render_quic443_helper — the root-owned helper, on stdout. It takes `add`
+# or `remove` and one path, and it changes the $QUIC443_LEAF_SET set only
+# when that path is one box leaf directly under this tree's allow subtree.
+# It refuses every other path, so the account that may run it as root can
+# put no other cgroup in the set and run nothing else. The tree's paths and
+# the nft binary are written in at install: under sudo nothing in the
+# caller's environment reaches them.
+render_quic443_helper() {
+    local allow_root="$tree_root/$BOXES_DIR/$ALLOW_DIR"
+    local nft_bin
+    nft_bin="$(command -v nft)"
+    cat <<'HEAD'
+#!/bin/bash
+# Written by install-host-classifier.sh. Adds a box's own leaf to the set of
+# leaves that are refused UDP to port 443, or removes it. minimald runs this
+# with `sudo -n` while the host-address boxes block QUIC.
+set -eu
+export LC_ALL=C
+HEAD
+    printf 'readonly ALLOW_ROOT=%q
+' "$allow_root"
+    printf 'readonly ALLOW_REL=%q
+' "$allow_path"
+    printf 'readonly NFT=%q
+' "$nft_bin"
+    printf 'readonly TABLE=%q
+' "$TABLE_NAME"
+    printf 'readonly SET=%q
+' "$QUIC443_LEAF_SET"
+    cat <<'BODY'
+refuse() { printf 'error: %s
+' "$*" >&2; exit 2; }
+[ "$#" -eq 2 ] || refuse "usage: $0 add|remove <box leaf directory>"
+case "$1" in
+    add) verb=add ;;
+    remove) verb=delete ;;
+    *) refuse "refused: the first argument must be add or remove, not: $1" ;;
+esac
+leaf=$2
+name=${leaf#"$ALLOW_ROOT/"}
+[ "$name" != "$leaf" ] || refuse "refused: $leaf is not a box leaf in $ALLOW_ROOT"
+case "$name" in
+    ''|.|..|-*|*/*|*[!A-Za-z0-9._-]*)
+        refuse "refused: $leaf is not a box leaf in $ALLOW_ROOT" ;;
+esac
+if [ "$verb" = add ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
+    refuse "refused: $leaf is not a directory"
+fi
+exec "$NFT" "$verb" element inet "$TABLE" "$SET" "{ \"$ALLOW_REL/$name\" }"
+BODY
+}
+
+# install_quic443_helper — writes the helper root-owned, mode 0755, and the
+# sudoers drop-in that lets the delegated account run that one file as root
+# with no password, checked with visudo before it is put in place. A
+# rehearsal writes them only where its MINIMAL_OVERRIDE_* knobs say.
+install_quic443_helper() {
+    if [ "$rehearsal" = 1 ] && [ "$quic443_helper_overridden" != 1 ]; then
+        return 0
+    fi
+    local why
+    why="$(mkdir -p "$(dirname "$QUIC443_HELPER")" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    local staged="$QUIC443_HELPER.new"
+    why="$( { render_quic443_helper >"$staged" && chmod 0755 "$staged"; } 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    if [ "$rehearsal" != 1 ]; then
+        why="$(chown root:root "$staged" 2>&1)" ||
+            die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    fi
+    why="$(mv -f "$staged" "$QUIC443_HELPER" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+
+    why="$(mkdir -p "$(dirname "$QUIC443_SUDOERS")" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    # sudoers ignores a drop-in whose name carries a dot, so the staged
+    # copy is never read before it is checked.
+    local staged_rule="$QUIC443_SUDOERS.new"
+    why="$( {
+        printf '# Written by install-host-classifier.sh: minimald runs this one helper as root.\n'
+        printf '#%s ALL=(root) NOPASSWD: %s\n' "$owner_uid" "$QUIC443_HELPER"
+    } 2>&1 >"$staged_rule" && chmod 0440 "$staged_rule" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    if command -v visudo >/dev/null 2>&1; then
+        why="$(visudo -cf "$staged_rule" 2>&1)" || {
+            rm -f "$staged_rule"
+            die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: visudo refused it: $why"
+        }
+    fi
+    if [ "$rehearsal" != 1 ]; then
+        why="$(chown root:root "$staged_rule" 2>&1)" ||
+            die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    fi
+    why="$(mv -f "$staged_rule" "$QUIC443_SUDOERS" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
 }
 
 # render_ruleset — the one table this step owns, on stdout, as one `nft -f`
@@ -656,7 +774,12 @@ cgroup_level() {
 # port unreachable, an active reject, so a client falls back to TCP at once.
 # The rule is fixed with the table like every other. The daemon decides
 # who it reaches by moving the cohort's processes into that leaf and out of
-# it, a cgroup.procs write inside the delegated slice.
+# it, a cgroup.procs write inside the delegated slice. Its third rule is the
+# same reject for a socket created in a box leaf that is in the
+# $QUIC443_LEAF_SET set: a socket keeps the cgroup it was created in, so a
+# socket a member opened before the cohort turned blocked is matched on
+# its own leaf. The set starts empty, and only the root-owned helper the
+# install adds changes it, one leaf under the allow subtree at a time.
 #
 # The classify chain is where a flow is classed, at the mangle priority —
 # ahead of the dstnat and filter chains, and the last place the kernel
@@ -700,10 +823,14 @@ add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
 
 table inet $TABLE_NAME {
+    set $QUIC443_LEAF_SET {
+        typeof socket cgroupv2 level $(box_leaf_level)
+    }
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
         socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
+        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable
     }
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
@@ -931,6 +1058,9 @@ if [ "$mode" = uninstall ]; then
             die "cannot remove the classifier table inet $TABLE_NAME (is another nft call holding it?)"
         note "removed the classifier table inet $TABLE_NAME"
     fi
+    if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+        rm -f "$QUIC443_SUDOERS" "$QUIC443_HELPER"
+    fi
     rmdir "$tree_root/$DAEMON_LEAF" 2>/dev/null || true
     rmdir "$tree_root/$TABLE_MARKER" 2>/dev/null || true
     # The mask records go with the marker they were written beside, read
@@ -1035,6 +1165,9 @@ for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT
     rmdir "$stale_record" 2>/dev/null ||
         die "cannot remove the previous record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
+# The helper goes in before the load, so a host whose helper cannot be
+# installed loads nothing new and writes no marker.
+install_quic443_helper
 # Render into a variable first, so nothing that touches a disk can sit between
 # rendering and loading. The captured text is byte for byte what render_ruleset
 # wrote: `read -d ''` with an empty delimiter reads without a terminator, so
@@ -1073,6 +1206,9 @@ note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed
 note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "  $BOXES_DIR/$QUIC443_BLOCKED_DIR/   the host-address boxes while one of them blocks QUIC: UDP to port 443 is refused"
+if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+    note "installed $QUIC443_HELPER: account $owner_uid can run it with sudo -n to add or remove one box leaf in $ALLOW_DIR/ in the set that is refused UDP to port 443 ($QUIC443_SUDOERS)"
+fi
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
 note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
 if [ -n "$cohort_address" ]; then
