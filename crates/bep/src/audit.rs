@@ -823,6 +823,13 @@ impl AuditLog {
                     revoked.push(record.subject.clone());
                 }
             }
+            // A record of a kind this bep does not know can be a newer
+            // bep's revocation. The move cannot record it again, so it
+            // counts it for the warn line.
+            let other_kinds = lines
+                .iter()
+                .filter(|line| matches!(line, Line::OtherKind { .. }))
+                .count();
             previous_final = Some(final_hash.clone());
             moved.push(Quarantined {
                 segment: path.clone(),
@@ -837,6 +844,7 @@ impl AuditLog {
                     previous_hash: String::new(),
                 },
                 revoked,
+                other_kinds,
             });
         }
         if moved.is_empty() {
@@ -873,10 +881,12 @@ impl AuditLog {
                 segment = %quarantined.segment.display(),
                 moved_to = %quarantined.moved_to.display(),
                 unreadable = quarantined.record.unreadable,
+                other_kinds = quarantined.other_kinds,
                 final_hash = %quarantined.record.final_hash,
                 "moved an audit segment with unreadable lines to quarantine; \
-                 a revocation on an unreadable line is no longer in force, so \
-                 check the destroyed boxes that segment can record"
+                 a revocation on an unreadable line, or on a line of a kind \
+                 this bep does not know (other_kinds), is no longer in force, \
+                 so check the destroyed boxes that segment can record"
             );
         }
         Ok(moved)
@@ -966,6 +976,9 @@ pub struct Quarantined {
     /// The box ids of the revocations read in the segment, which the move
     /// appended to the log again.
     pub revoked: Vec<String>,
+    /// The lines in the segment of a kind this bep does not know. One can
+    /// be a newer bep's revocation, which the move does not record again.
+    pub other_kinds: usize,
 }
 
 /// The file name of segment `n` of a log: `audit-<n>.jsonl`. A log is the
@@ -1758,9 +1771,12 @@ mod tests {
         let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 16, 60)).unwrap();
         log.append(&admit()).unwrap();
         log.append(&revocation("box-gone")).unwrap();
+        let head = log.head().to_owned();
         drop(log);
         let active = audit.join(segment_name(0));
         let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        let other = format!(r#"{{"schema":"{SCHEMA}","kind":"future","previous_hash":"{head}"}}"#);
+        file.write_all(format!("{other}\n").as_bytes()).unwrap();
         file.write_all(b"not a record\n").unwrap();
         drop(file);
         assert_eq!(LogReader::new(&audit).read_new().unwrap().skipped, 1);
@@ -1769,6 +1785,7 @@ mod tests {
         let moved = log.quarantine_unreadable().unwrap();
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].revoked, vec!["box-gone".to_owned()]);
+        assert_eq!(moved[0].other_kinds, 1);
         assert_eq!(log.path(), audit.join(segment_name(1)));
         assert_eq!(moved[0].record.previous_hash, moved[0].record.final_hash);
         log.append(&off_module()).unwrap();
