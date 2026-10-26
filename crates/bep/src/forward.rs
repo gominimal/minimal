@@ -42,11 +42,13 @@ use tokio_rustls::client::TlsStream;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::audit::{Decision, Kind, Mapping, Outcome};
-use crate::handle::parse_authority;
+use crate::handle::{Inject, parse_authority};
 use crate::http::{self, CloseReason, Forwarded, Parse, Request};
+use crate::inject::{self, INJECTION_INVALID};
 use crate::proxy::{AuditWriter, absolute_form, respond};
 use crate::redeem::{self, Authority, Check, Plain, RequestAuthority};
 use crate::seal;
+use crate::store::{ReadError, ValueReader};
 
 /// The audit marker of an upstream leg that failed validation (BEP-055).
 pub const UPSTREAM_TLS_INVALID: &str = "upstream_tls_invalid";
@@ -60,17 +62,36 @@ pub const FOREIGN_CREDENTIAL: &str = "foreign_credential";
 pub const CREDENTIAL_NOT_HEADER_SAFE: &str = "credential_not_header_safe";
 
 /// The audit marker of a request with a sealed value in one `Authorization`
-/// header and another `Authorization` header beside it. The upstream can
-/// honour either header, so the request is refused.
+/// header and another `Authorization` header beside it, or with sealed values
+/// in two headers. The upstream can honour either header, so the request is
+/// refused.
 pub const MIXED_AUTHORIZATION: &str = "mixed_authorization";
 
 /// The audit marker of a substitution whose `Authorization` header is not in
 /// the request. [`carried`] gives the header, so this is not expected.
 pub const SEALED_HEADER_MISSING: &str = "sealed_header_missing";
 
+/// The audit marker of a sealed value in a header that its injection form
+/// does not name: not the registered header or `basic_auth` field of a store
+/// reference, or not `Authorization` for a sign-in. The store is not read,
+/// and no credential is put in the request.
+pub const SEALED_HEADER_MISPLACED: &str = "sealed_header_misplaced";
+
 /// The audit marker of the record a sign-in renewal writes at the proxy
 /// (BEP-069). The record is its own line, beside the request's decision.
 pub const SIGN_IN_RENEWED: &str = "github_sign_in_renewed";
+
+/// The audit marker of an admitted store reference whose item is no longer
+/// stored (BEP-045).
+pub const STORE_ITEM_DELETED: &str = "store_item_deleted";
+
+/// The audit marker of an admitted store reference whose item does not let
+/// the proxy read it (BEP-045).
+pub const STORE_ITEM_DISABLED: &str = "store_item_disabled";
+
+/// The audit marker of an admitted store reference whose store failed the
+/// read, or that names a store the flow cannot read.
+pub const STORE_ITEM_UNREADABLE: &str = "store_item_unreadable";
 
 /// The size of one read on the response half.
 const RESPONSE_CHUNK: usize = 16 * 1024;
@@ -236,6 +257,42 @@ impl std::fmt::Debug for Verdict {
     }
 }
 
+/// An admitted store reference (BEP-032). The forwarder reads the value
+/// from the store for this request and injects it in `inject`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreAdmit {
+    /// The store, as the reference names it.
+    pub store: String,
+    /// The item's identifier in the store.
+    pub id: String,
+    /// The injection form the rule registers.
+    pub inject: Inject,
+    /// The resource and permission, for the audit.
+    pub mapping: Mapping,
+    /// The admission's audit marker, as [`Verdict::Admit`] carries it.
+    pub marker: Option<&'static str>,
+    /// Whether the admission is cohort-attributed.
+    pub cohort_attributed: bool,
+}
+
+impl StoreAdmit {
+    /// The identifier an audit record carries: `<store>:<id>`.
+    #[must_use]
+    pub fn identifier(&self) -> String {
+        format!("{}:{}", self.store, self.id)
+    }
+}
+
+/// What the decision gives for a sealed value: a verdict on a credential to
+/// put in place of the value, or an admitted store reference.
+#[derive(Debug)]
+pub enum Redeemed {
+    /// A [`Verdict`].
+    Verdict(Verdict),
+    /// An admitted store reference.
+    Store(StoreAdmit),
+}
+
 /// The per-request decision.
 pub trait Redeemer: Send + Sync {
     /// The authorities the box's declared egress admits (BEP-022).
@@ -254,6 +311,38 @@ pub trait Redeemer: Send + Sync {
         request: &RequestAuthority<String>,
         sealed: &str,
     ) -> Verdict;
+
+    /// Decides one request that carries `sealed` in the header named
+    /// `header`, as [`Self::redeem`] does, with an admitted store reference
+    /// as [`Redeemed::Store`]. The forwarder calls this one.
+    ///
+    /// The default admits no store reference, so a redeemer without store
+    /// references implements `redeem` alone. A sign-in credential goes in
+    /// `Authorization` only. So the default refuses a sealed value in any
+    /// other header as [`SEALED_HEADER_MISPLACED`], before [`Self::redeem`]
+    /// runs, and nothing is renewed for it. Otherwise it gives
+    /// [`Self::redeem`]'s verdict.
+    ///
+    /// Interim: no redeemer in this crate returns [`Redeemed::Store`] yet,
+    /// so `bep serve` does not inject a store value
+    /// (<https://github.com/gominimal/minimal/issues/2586>). This changes
+    /// when `BoxRedeemer` (`redeemer.rs`) overrides this method to return
+    /// [`Redeemed::Store`] for an admitted store member, and `proxy.rs`
+    /// calls [`Flow::with_store`] with the host store. Remove this note
+    /// when both land.
+    fn redeem_reference(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> Redeemed {
+        if !header.eq_ignore_ascii_case("authorization") {
+            return Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED));
+        }
+        Redeemed::Verdict(self.redeem(box_id, authority, request, sealed))
+    }
 }
 
 /// What [`SingleFlight::run`] gave its caller.
@@ -412,7 +501,7 @@ impl Redeemer for Unwired {
 /// Where a sealed value sits in a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedAt {
-    /// The index of the `Authorization` header.
+    /// The index of the header that carries the sealed value.
     header: usize,
     /// How the header carries the value.
     form: Form,
@@ -471,35 +560,72 @@ pub fn is_sealed(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The credential `request` carries in its `Authorization` headers.
+/// The credential `request` carries in its headers.
 ///
-/// Only `Authorization` is searched. A store reference injected in a
-/// registered header of its own is #2292's (T28). Until then, a sealed value
-/// in any other header is not found, and the request is decided as plain.
+/// Every header is searched for a sealed value, because a store reference
+/// can come in the header its client sends a key in, such as `x-api-key`.
 ///
-/// A request with one `Authorization` header that holds a sealed value is
-/// [`Carried::Sealed`]. A sealed value beside any other `Authorization`
-/// header is [`Carried::Mixed`]: the upstream can honour either header, so
-/// the decision refuses it.
+/// A request with one header that holds a sealed value is
+/// [`Carried::Sealed`], unless an `Authorization` header that does not hold
+/// the sealed value is beside it. That, or a second sealed value, is
+/// [`Carried::Mixed`]: the upstream can honour either header, so
+/// the decision refuses it. A request with no sealed value and an
+/// `Authorization` header is [`Carried::Foreign`].
 #[must_use]
 pub fn carried(request: &Request) -> Carried {
-    let mut sealed = None;
+    let mut sealed: Option<(SealedAt, bool)> = None;
+    let mut found = 0usize;
     let mut count = 0usize;
     for (index, header) in request.headers.iter().enumerate() {
-        if !header.name.eq_ignore_ascii_case("authorization") {
-            continue;
+        let authorization = header.name.eq_ignore_ascii_case("authorization");
+        if authorization {
+            count += 1;
         }
-        count += 1;
-        if sealed.is_none() {
-            sealed = sealed_in(index, &header.value);
+        if let Some(at) = sealed_in(index, &header.value) {
+            found += 1;
+            if sealed.is_none() {
+                sealed = Some((at, authorization));
+            }
         }
     }
-    match (sealed, count) {
-        (Some(at), 1) => Carried::Sealed(at),
-        (Some(_), _) => Carried::Mixed,
-        (None, 0) => Carried::None,
-        (None, _) => Carried::Foreign,
+    match sealed {
+        Some(_) if found > 1 => Carried::Mixed,
+        // An `Authorization` header that does not hold the sealed value is
+        // the box's own credential, whichever header holds the sealed one.
+        Some((_, in_authorization)) if count > usize::from(in_authorization) => Carried::Mixed,
+        Some((at, _)) => Carried::Sealed(at),
+        None if count == 0 => Carried::None,
+        None => Carried::Foreign,
     }
+}
+
+impl SealedAt {
+    /// The `Basic` field the box sent beside the sealed value, or empty when
+    /// the value is not in a `Basic` header.
+    fn other_basic_field(&self) -> &[u8] {
+        match &self.form {
+            Form::Basic {
+                user,
+                pass,
+                in_user,
+            } => {
+                if *in_user {
+                    pass.as_bytes()
+                } else {
+                    user.as_bytes()
+                }
+            }
+            Form::Token(_) | Form::Bare => &[],
+        }
+    }
+}
+
+/// Whether the header at `at` in `request` is named `name`.
+fn header_named(request: &Request, at: &SealedAt, name: &str) -> bool {
+    request
+        .headers
+        .get(at.header)
+        .is_some_and(|h| h.name.eq_ignore_ascii_case(name))
 }
 
 fn sealed_in(header: usize, value: &[u8]) -> Option<SealedAt> {
@@ -602,6 +728,7 @@ pub struct Flow {
     audit: Arc<dyn AuditWriter>,
     redeemer: Arc<dyn Redeemer>,
     validated: ValidatedUpstream,
+    store: Option<Arc<dyn ValueReader>>,
 }
 
 impl std::fmt::Debug for Flow {
@@ -650,6 +777,120 @@ impl Flow {
             audit,
             redeemer,
             validated,
+            store: None,
+        }
+    }
+
+    /// This flow, with `store` as the store it reads a store reference's
+    /// value from. With none, every store reference is refused as
+    /// [`STORE_ITEM_UNREADABLE`].
+    ///
+    /// Interim: `bep serve` does not call this yet, so a served flow has no
+    /// store (<https://github.com/gominimal/minimal/issues/2586>). This
+    /// changes when `proxy.rs` calls this method with the host store,
+    /// together with the `BoxRedeemer` override of
+    /// [`Redeemer::redeem_reference`]. Remove this note when both land.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn ValueReader>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Reads the value of the admitted store reference `admit` for this
+    /// request, and injects it in place of the sealed value at `at`
+    /// (BEP-032, BEP-033, BEP-045, BEP-065, BEP-066).
+    ///
+    /// The value is read now, and dropped zeroized when the request is
+    /// written. It goes to no file and no log.
+    ///
+    /// A sealed value that is not where the injection form puts the value is
+    /// refused as [`SEALED_HEADER_MISPLACED`], before the store is read.
+    ///
+    /// Gives the lowercase name of the header that now holds the value, for
+    /// the caller to zeroize once the request is written.
+    fn inject_store(
+        &self,
+        request: &mut Request,
+        at: &SealedAt,
+        admit: StoreAdmit,
+    ) -> Result<String, &'static str> {
+        let span = tracing::Span::current();
+        let identifier = admit.identifier();
+        let header = match &admit.inject {
+            Inject::Header { name, .. } => name.to_ascii_lowercase(),
+            Inject::BasicAuth { .. } => "authorization".to_owned(),
+        };
+        let placed = match &admit.inject {
+            Inject::Header { name, .. } => header_named(request, at, name),
+            Inject::BasicAuth { field } => {
+                header_named(request, at, "authorization")
+                    && matches!(&at.form, Form::Basic { in_user, .. }
+                        if *in_user == (field == inject::FIELD_USER))
+            }
+        };
+        let read = || match &self.store {
+            Some(store) if store.name() == admit.store => store.read(&admit.id),
+            _ => Err(ReadError::Store(crate::store::StoreError::Refused {
+                store: "proxy",
+                action: "read the secret",
+                detail: format!("no store {} is open in this flow", admit.store),
+            })),
+        };
+        // The store is not read for a sealed value in the wrong header.
+        let result = (if placed {
+            Ok(())
+        } else {
+            Err(SEALED_HEADER_MISPLACED)
+        })
+        .and_then(|()| {
+            read().map_err(|error| match error {
+                ReadError::Deleted(_) => STORE_ITEM_DELETED,
+                ReadError::Disabled(_) => STORE_ITEM_DISABLED,
+                ReadError::Store(error) => {
+                    tracing::warn!(store = %admit.store, id = %admit.id, %error, "the stored secret was not read");
+                    STORE_ITEM_UNREADABLE
+                }
+            })
+        })
+        .and_then(|value| {
+                inject::inject(
+                    request,
+                    at.header,
+                    &admit.inject,
+                    &value,
+                    at.other_basic_field(),
+                )
+            });
+        // One line per injection. It names no value.
+        tracing::debug!(
+            store = %admit.store,
+            id = %admit.id,
+            header = %header,
+            outcome = result.err().unwrap_or("injected"),
+            "store value injection"
+        );
+        match result {
+            Ok(()) => {
+                span.record("substitution", "substituted");
+                span.record("cohort_attributed", admit.cohort_attributed);
+                self.record(
+                    Outcome::Admit,
+                    admit.marker,
+                    Some(identifier),
+                    admit.mapping,
+                );
+                Ok(header)
+            }
+            Err(marker) => {
+                span.record("substitution", "refused");
+                self.record(
+                    Outcome::Refuse,
+                    Some(marker),
+                    Some(identifier),
+                    admit.mapping,
+                );
+                Err(marker)
+            }
         }
     }
 
@@ -682,6 +923,13 @@ impl Flow {
     ///
     /// The audit marker of a refusal.
     pub fn decide(&self, request: &mut Request) -> Result<(), &'static str> {
+        self.decide_injected(request).map(|_| ())
+    }
+
+    /// Decides one request, as [`Self::decide`] does. Gives the lowercase
+    /// name of the header a store value was injected in, if any, for the
+    /// caller to zeroize once the request is written.
+    fn decide_injected(&self, request: &mut Request) -> Result<Option<String>, &'static str> {
         let span = tracing::Span::current();
         // The egress and request-authority checks hold for every request,
         // sealed or not, before any redeemer sees it (BEP-022, BEP-023).
@@ -702,10 +950,23 @@ impl Flow {
         }
         match carried(request) {
             Carried::Sealed(at) => {
-                match self
-                    .redeemer
-                    .redeem(&self.box_id, &self.authority, &plain.request, &at.value)
-                {
+                let header = request
+                    .headers
+                    .get(at.header)
+                    .map_or("", |h| h.name.as_str());
+                let verdict = match self.redeemer.redeem_reference(
+                    &self.box_id,
+                    &self.authority,
+                    &plain.request,
+                    &at.value,
+                    header,
+                ) {
+                    Redeemed::Store(admit) => {
+                        return self.inject_store(request, &at, admit).map(Some);
+                    }
+                    Redeemed::Verdict(verdict) => verdict,
+                };
+                match verdict {
                     Verdict::Admit {
                         credential,
                         identifier,
@@ -724,7 +985,18 @@ impl Flow {
                                 mapping.clone(),
                             );
                         }
-                        if let Err(marker) = substitute(request, &at, &credential, self.validated) {
+                        // A sign-in credential goes in `Authorization` only,
+                        // so a sealed value in another header is refused.
+                        let placed = request
+                            .headers
+                            .get(at.header)
+                            .is_none_or(|h| h.name.eq_ignore_ascii_case("authorization"));
+                        let substituted = if placed {
+                            substitute(request, &at, &credential, self.validated)
+                        } else {
+                            Err(SEALED_HEADER_MISPLACED)
+                        };
+                        if let Err(marker) = substituted {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
@@ -737,7 +1009,7 @@ impl Flow {
                         span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
                         self.record(Outcome::Admit, admitted, Some(identifier), mapping);
-                        Ok(())
+                        Ok(None)
                     }
                     Verdict::Refuse(marker) => {
                         span.record("substitution", "refused");
@@ -763,7 +1035,7 @@ impl Flow {
                 let marker = (carried == Carried::Foreign).then_some(FOREIGN_CREDENTIAL);
                 span.record("substitution", marker.unwrap_or("passthrough"));
                 self.record(Outcome::Admit, marker, None, Mapping::ModuleUnmapped);
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -776,7 +1048,27 @@ impl Flow {
             )
         } else if marker == MIXED_AUTHORIZATION {
             format!(
-                "The Box Egress Proxy refused the request to {authority}, because it has more than one Authorization header. Send the sealed credential in one Authorization header."
+                "The Box Egress Proxy refused the request to {authority}, because it carries a credential in more than one header. Send one sealed credential, in one header."
+            )
+        } else if marker == SEALED_HEADER_MISPLACED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because its sealed credential is in a header that does not carry a credential to {authority}. Send the sealed credential in the header that its secret store rule names, or in the Authorization header for a GitHub sign-in."
+            )
+        } else if marker == STORE_ITEM_DELETED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the secret that its sealed credential refers to is no longer stored."
+            )
+        } else if marker == STORE_ITEM_DISABLED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the stored secret that its sealed credential refers to does not let the proxy read it."
+            )
+        } else if marker == STORE_ITEM_UNREADABLE {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because it was not able to read the stored secret that its sealed credential refers to."
+            )
+        } else if marker == INJECTION_INVALID {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the stored secret and the form that its secret store rule sets do not make a valid request header."
             )
         } else if marker == Check::HostMismatch.marker() {
             format!(
@@ -810,17 +1102,25 @@ pub fn forward_requests<R: Read, W: Write>(
                 break HalfEnd::Closed(reason);
             }
         };
-        if let Err(marker) = flow.decide(&mut request) {
-            break HalfEnd::Refused(Refusal {
-                marker,
-                body: flow.refusal_body(marker),
-                after_forwarded: forwarded_any,
-            });
-        }
+        let injected = match flow.decide_injected(&mut request) {
+            Ok(injected) => injected,
+            Err(marker) => {
+                break HalfEnd::Refused(Refusal {
+                    marker,
+                    body: flow.refusal_body(marker),
+                    after_forwarded: forwarded_any,
+                });
+            }
+        };
         let mut head = Zeroizing::new(request.serialize());
-        // The head holds the credential after a substitution.
+        // The head holds the credential after a substitution, and the stored
+        // value after an injection in a header of any name.
         for header in &mut request.headers {
-            if header.name.eq_ignore_ascii_case("authorization") {
+            if header.name.eq_ignore_ascii_case("authorization")
+                || injected
+                    .as_deref()
+                    .is_some_and(|name| header.name.eq_ignore_ascii_case(name))
+            {
                 header.value.zeroize();
             }
         }
@@ -1820,6 +2120,36 @@ mod tests {
         }
     }
 
+    // A sealed value in another header, such as `x-api-key`, beside the
+    // box's own `Authorization` header is mixed, in either order.
+    #[test]
+    fn sealed_in_other_header_beside_authorization_is_mixed() {
+        let sealed = sealed_text();
+        let api_key = http::Header {
+            name: "x-api-key".into(),
+            value: sealed.clone().into_bytes(),
+        };
+        let own = http::Header {
+            name: "authorization".into(),
+            value: b"Bearer sk-own".to_vec(),
+        };
+        let request = |headers: Vec<http::Header>| Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers,
+            body: http::BodyFraming::None,
+        };
+        assert!(matches!(
+            carried(&request(vec![api_key.clone()])),
+            Carried::Sealed(_)
+        ));
+        assert_eq!(
+            carried(&request(vec![api_key.clone(), own.clone()])),
+            Carried::Mixed
+        );
+        assert_eq!(carried(&request(vec![own, api_key])), Carried::Mixed);
+    }
+
     // A substitution with no header at its index changes nothing and fails.
     #[test]
     fn substitution_without_its_header_fails() {
@@ -1920,5 +2250,626 @@ mod tests {
             assert_eq!(leader.join().unwrap(), Ran::Led(7));
         });
         assert_eq!(flights.run("item", || 9), Ran::Led(9));
+    }
+
+    /// A redeemer that admits every sealed value as a store reference to
+    /// `keychain:<id>`, in `inject`, within `egress`.
+    struct AdmitsStore {
+        id: &'static str,
+        inject: Inject,
+        egress: Vec<Authority<String>>,
+    }
+
+    impl Redeemer for AdmitsStore {
+        fn egress(&self, _box_id: &str) -> Vec<Authority<String>> {
+            self.egress.clone()
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &Authority<String>,
+            _request: &RequestAuthority<String>,
+            _sealed: &str,
+        ) -> Verdict {
+            unreachable!("the forwarder asks for the reference")
+        }
+
+        fn redeem_reference(
+            &self,
+            _box_id: &str,
+            _authority: &Authority<String>,
+            _request: &RequestAuthority<String>,
+            _sealed: &str,
+            _header: &str,
+        ) -> Redeemed {
+            Redeemed::Store(StoreAdmit {
+                store: crate::store::NATIVE_STORE.to_owned(),
+                id: self.id.to_owned(),
+                inject: self.inject.clone(),
+                mapping: Mapping::ModuleUnmapped,
+                marker: None,
+                cohort_attributed: false,
+            })
+        }
+    }
+
+    const STORE_HOST: &str = "api.openai.com";
+    const STORE_ID: &str = "openai";
+
+    fn store_authority() -> Authority<String> {
+        Authority {
+            host: STORE_HOST.to_owned(),
+            port: 443,
+        }
+    }
+
+    fn bearer_form() -> Inject {
+        Inject::Header {
+            name: "Authorization".to_owned(),
+            prefix: Some("Bearer ".to_owned()),
+        }
+    }
+
+    /// The program the store's items trust in these tests.
+    fn proxy_program() -> std::path::PathBuf {
+        std::path::PathBuf::from("/opt/minimal/bin/bep")
+    }
+
+    /// A memory store holding `value` under [`STORE_ID`] for the proxy.
+    fn store_with(value: &[u8]) -> Arc<crate::store::MemorySecretStore> {
+        use crate::store::SecretStore as _;
+        let store = Arc::new(crate::store::MemorySecretStore::default());
+        store.set(STORE_ID, value, &proxy_program()).unwrap();
+        store
+    }
+
+    /// A flow from box `b` to [`STORE_HOST`] whose redeemer admits a store
+    /// reference in `inject`, and that reads values from `store`.
+    fn store_flow(
+        store: &Arc<crate::store::MemorySecretStore>,
+        inject: Inject,
+        audit: Arc<dyn AuditWriter>,
+    ) -> Flow {
+        Flow::new(
+            "b",
+            store_authority(),
+            audit,
+            Arc::new(AdmitsStore {
+                id: STORE_ID,
+                inject,
+                egress: vec![store_authority()],
+            }),
+            Validated::unchecked(()).proof(),
+        )
+        .with_store(Arc::new(crate::store::MemoryReader {
+            store: Arc::clone(store),
+            app: proxy_program(),
+        }))
+    }
+
+    /// Sends one request with `sealed_header` carrying the sealed value on
+    /// `flow`. Gives what reached the upstream and how the half ended.
+    fn send_store(flow: &Flow, sealed_header: &str) -> (String, HalfEnd) {
+        let request =
+            format!("GET /v1/models HTTP/1.1\r\nHost: {STORE_HOST}\r\n{sealed_header}\r\n\r\n");
+        let mut client = std::io::Cursor::new(request.into_bytes());
+        let mut upstream = Vec::new();
+        let end = forward_requests(flow, &mut client, &mut upstream);
+        (String::from_utf8(upstream).unwrap(), end)
+    }
+
+    fn refusal(end: &HalfEnd) -> Option<&'static str> {
+        match end {
+            HalfEnd::Refused(refusal) => Some(refusal.marker),
+            HalfEnd::Closed(_) => None,
+        }
+    }
+
+    fn memory_audit() -> (Arc<Mutex<Vec<Decision>>>, Arc<dyn AuditWriter>) {
+        let records = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let audit: Arc<dyn AuditWriter> = records.clone();
+        (records, audit)
+    }
+
+    // BEP-032: an admitted store reference reaches the rule's upstream with
+    // the stored value in the registered header, the sealed value gone, and
+    // an audit record naming the store and the identifier, not the value.
+    #[test]
+    fn store_reference_injects_in_registered_form() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-stored-key");
+        let (records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let (upstream, end) = send_store(&flow, &format!("Authorization: Bearer {sealed}"));
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(
+            upstream.contains("\r\nauthorization: Bearer sk-stored-key\r\n"),
+            "{upstream}"
+        );
+        assert!(!upstream.contains(&sealed));
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].identifier.as_deref(), Some("keychain:openai"));
+        assert!(!format!("{records:?}").contains("sk-stored-key"));
+
+        // A rule with a header of its own: the sealed value the client sent
+        // in that header is found there, and replaced.
+        let (_, audit) = memory_audit();
+        let x_api_key = Inject::Header {
+            name: "x-api-key".to_owned(),
+            prefix: None,
+        };
+        let flow = store_flow(&store, x_api_key, audit);
+        let (upstream, end) = send_store(&flow, &format!("x-api-key: {sealed}"));
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(
+            upstream.contains("\r\nx-api-key: sk-stored-key\r\n"),
+            "{upstream}"
+        );
+        assert!(!upstream.contains(&sealed));
+        assert!(!upstream.contains("authorization"));
+
+        // A basic_auth rule fills the password and keeps the box's user.
+        let (_, audit) = memory_audit();
+        let basic = Inject::BasicAuth {
+            field: "password".to_owned(),
+        };
+        let flow = store_flow(&store, basic, audit);
+        let pair = STANDARD.encode(format!("me:{sealed}"));
+        let (upstream, end) = send_store(&flow, &format!("Authorization: Basic {pair}"));
+        assert_eq!(refusal(&end), None, "{end:?}");
+        let want = STANDARD.encode("me:sk-stored-key");
+        assert!(
+            upstream.contains(&format!("\r\nauthorization: Basic {want}\r\n")),
+            "{upstream}"
+        );
+
+        // A flow with no store to read refuses the reference, and sends
+        // nothing upstream.
+        let (records, audit) = memory_audit();
+        let flow = Flow::new(
+            "b",
+            store_authority(),
+            audit,
+            Arc::new(AdmitsStore {
+                id: STORE_ID,
+                inject: bearer_form(),
+                egress: vec![store_authority()],
+            }),
+            Validated::unchecked(()).proof(),
+        );
+        let (upstream, end) = send_store(&flow, &format!("Authorization: Bearer {sealed}"));
+        assert_eq!(refusal(&end), Some(STORE_ITEM_UNREADABLE));
+        assert!(upstream.is_empty());
+        if let HalfEnd::Refused(refused) = &end {
+            assert!(
+                refused.body.contains("not able to read the stored secret"),
+                "{}",
+                refused.body
+            );
+        }
+        assert_eq!(
+            records.lock().unwrap()[0].marker.as_deref(),
+            Some(STORE_ITEM_UNREADABLE)
+        );
+    }
+
+    // BEP-033: each request reads the store once, and the value goes to no
+    // file: not to the audit log, and nowhere else under its directory.
+    #[test]
+    fn store_value_read_per_request_never_written() {
+        let sealed = sealed_text();
+        let value = "sk-never-on-disk-5150";
+        let store = store_with(value.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let flow = store_flow(&store, bearer_form(), audit_log(&dir));
+        assert_eq!(store.reads(), 0);
+        for n in 1..=2 {
+            let (upstream, end) = send_store(&flow, &format!("Authorization: Bearer {sealed}"));
+            assert_eq!(refusal(&end), None, "{end:?}");
+            assert!(upstream.contains(value));
+            assert_eq!(store.reads(), n, "one read for each request");
+        }
+        let records = audited(dir.path());
+        assert_eq!(records.len(), 2);
+        let mut files = 0;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            files += 1;
+            assert!(
+                !bytes.windows(value.len()).any(|w| w == value.as_bytes()),
+                "the value is in a file"
+            );
+        }
+        assert!(files > 0, "the audit log was written");
+    }
+
+    // A store reference in a header its rule does not name is refused, and
+    // the store is not read for it.
+    #[test]
+    fn store_reference_in_unregistered_header_is_refused() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-stored-key");
+        let user = Inject::BasicAuth {
+            field: "user".to_owned(),
+        };
+        let pair = STANDARD.encode(format!("me:{sealed}"));
+        let cases = [
+            (bearer_form(), format!("x-api-key: {sealed}")),
+            (bearer_form(), format!("Cookie: Bearer {sealed}")),
+            (user.clone(), format!("x-api-key: Basic {pair}")),
+            // The sealed value is the password, and the rule fills the user.
+            (user, format!("Authorization: Basic {pair}")),
+        ];
+        for (form, header) in cases {
+            let (records, audit) = memory_audit();
+            let flow = store_flow(&store, form, audit);
+            let (upstream, end) = send_store(&flow, &header);
+            assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{header}");
+            assert!(upstream.is_empty(), "{upstream}");
+            let records = records.lock().unwrap().clone();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].outcome, Outcome::Refuse);
+            assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+        }
+        assert_eq!(store.reads(), 0, "no read for a misplaced reference");
+    }
+
+    // A sign-in credential goes in `Authorization` only: a sealed value in
+    // another header is refused, and the credential goes nowhere.
+    #[test]
+    fn sign_in_reference_outside_authorization_is_refused() {
+        let sealed = sealed_text();
+        let (records, audit) = memory_audit();
+        let flow = Flow::new(
+            "b",
+            Authority {
+                host: "api.github.com".to_owned(),
+                port: 443,
+            },
+            audit,
+            Arc::new(AdmitsWith(REAL)),
+            Validated::unchecked(()).proof(),
+        );
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: b"api.github.com".to_vec(),
+                },
+                http::Header {
+                    name: "cookie".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(flow.decide(&mut req), Err(SEALED_HEADER_MISPLACED));
+        let value = String::from_utf8(req.headers[1].value.clone()).unwrap();
+        assert_eq!(value, format!("Bearer {sealed}"));
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+    }
+
+    // A sign-in value outside `Authorization` is refused before the
+    // redeemer runs, so no sign-in token is renewed for it.
+    #[test]
+    fn sign_in_reference_outside_authorization_is_not_redeemed() {
+        let sealed = sealed_text();
+        let (records, audit) = memory_audit();
+        let redeemer = Arc::new(Admitting::default());
+        let flow = Flow::new(
+            "b",
+            Authority {
+                host: "api.github.com".to_owned(),
+                port: 443,
+            },
+            audit,
+            redeemer.clone(),
+            Validated::unchecked(()).proof(),
+        );
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: b"api.github.com".to_vec(),
+                },
+                http::Header {
+                    name: "x-api-key".into(),
+                    value: format!("Bearer {sealed}").into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(flow.decide(&mut req), Err(SEALED_HEADER_MISPLACED));
+        assert_eq!(redeemer.0.load(Ordering::SeqCst), 0, "the redeemer ran");
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].marker.as_deref(), Some(SEALED_HEADER_MISPLACED));
+    }
+
+    // The forwarder learns which header holds an injected value, so it can
+    // zeroize a header of any name, not only `Authorization`.
+    #[test]
+    fn injected_header_is_named_for_zeroizing() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-stored-key");
+        let (_, audit) = memory_audit();
+        let x_api_key = Inject::Header {
+            name: "X-Api-Key".to_owned(),
+            prefix: None,
+        };
+        let flow = store_flow(&store, x_api_key, audit);
+        let mut req = Request {
+            method: "GET".into(),
+            target: "/".into(),
+            headers: vec![
+                http::Header {
+                    name: "host".into(),
+                    value: STORE_HOST.as_bytes().to_vec(),
+                },
+                http::Header {
+                    name: "x-api-key".into(),
+                    value: sealed.into_bytes(),
+                },
+            ],
+            body: http::BodyFraming::None,
+        };
+        assert_eq!(
+            flow.decide_injected(&mut req),
+            Ok(Some("x-api-key".to_owned()))
+        );
+    }
+
+    // BEP-045: a deleted item refuses the next request that would inject it,
+    // and so does an item that no longer lets the proxy read it.
+    #[test]
+    fn deleted_keychain_item_refuses_next_injection() {
+        use crate::store::SecretStore as _;
+        let sealed = sealed_text();
+        let header = format!("Authorization: Bearer {sealed}");
+        let store = store_with(b"sk-stored-key");
+        let (records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let (_, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), None, "{end:?}");
+
+        assert!(store.remove(STORE_ID).unwrap());
+        let (upstream, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), Some(STORE_ITEM_DELETED));
+        assert!(upstream.is_empty());
+        if let HalfEnd::Refused(refused) = &end {
+            assert!(
+                refused.body.contains("no longer stored"),
+                "{}",
+                refused.body
+            );
+        }
+
+        // An item whose access control no longer names the proxy.
+        store
+            .set(STORE_ID, b"sk-stored-key", &proxy_program())
+            .unwrap();
+        store.set_trusted(STORE_ID, Vec::new());
+        let (upstream, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), Some(STORE_ITEM_DISABLED));
+        assert!(upstream.is_empty());
+
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].outcome, Outcome::Refuse);
+        assert_eq!(records[1].marker.as_deref(), Some(STORE_ITEM_DELETED));
+        assert_eq!(records[1].identifier.as_deref(), Some("keychain:openai"));
+        assert_eq!(records[2].marker.as_deref(), Some(STORE_ITEM_DISABLED));
+    }
+
+    // BEP-054: a replaced item's new value goes in the next request, on the
+    // same flow, with nothing restarted.
+    #[test]
+    fn replaced_secret_is_injected_on_next_request() {
+        use crate::store::SecretStore as _;
+        let sealed = sealed_text();
+        let header = format!("Authorization: Bearer {sealed}");
+        let store = store_with(b"sk-old-key");
+        let (_, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let (upstream, _) = send_store(&flow, &header);
+        assert!(upstream.contains("Bearer sk-old-key"), "{upstream}");
+
+        store
+            .set(STORE_ID, b"sk-new-key", &proxy_program())
+            .unwrap();
+        let (upstream, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(upstream.contains("Bearer sk-new-key"), "{upstream}");
+        assert!(!upstream.contains("sk-old-key"));
+    }
+
+    // BEP-066: a stored value or a prefix with a line break is refused, and
+    // the audit record is marked `injection_invalid`.
+    #[test]
+    fn crlf_in_value_or_prefix_refuses_injection_and_is_audited() {
+        let sealed = sealed_text();
+        let header = format!("Authorization: Bearer {sealed}");
+        let store = store_with(b"sk-key\r\nx-smuggled: 1");
+        let (records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let (upstream, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), Some(INJECTION_INVALID));
+        assert!(upstream.is_empty());
+
+        let store = store_with(b"sk-key");
+        let prefix = Inject::Header {
+            name: "authorization".to_owned(),
+            prefix: Some("Bearer\n".to_owned()),
+        };
+        let flow = store_flow(&store, prefix, Arc::clone(&records) as Arc<dyn AuditWriter>);
+        let (upstream, end) = send_store(&flow, &header);
+        assert_eq!(refusal(&end), Some(INJECTION_INVALID));
+        assert!(upstream.is_empty());
+        // The text holds for each cause the marker covers, not a line
+        // break alone.
+        let body = flow.refusal_body(INJECTION_INVALID);
+        assert!(
+            body.ends_with("because the stored secret and the form that its secret store rule sets do not make a valid request header."),
+            "{body}"
+        );
+        assert!(!body.contains("line break"));
+
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record.outcome, Outcome::Refuse);
+            assert_eq!(record.marker.as_deref(), Some(INJECTION_INVALID));
+            assert_eq!(record.identifier.as_deref(), Some("keychain:openai"));
+        }
+    }
+
+    // BEP-045: a sign-in reference that names an instance the held sign-in
+    // item does not carry is refused, and nothing goes upstream. The same
+    // reference is redeemed while its own sign-in is held.
+    #[test]
+    fn reference_to_another_sign_in_instance_is_refused() {
+        use p256::ecdsa::SigningKey;
+
+        use crate::boxes::{BoxRegistry, Boxes, Stance};
+        use crate::handle::{Claims, ClientKeys};
+        use crate::keys::memory::MemoryStore;
+        use crate::keys::{HeldKey as _, KeyStore as _, Role};
+        use crate::redeemer::{BoxRedeemer, SIGN_IN_REQUIRED};
+        use crate::seal::{Breadth, Context, Member, MemberKind, MemberList, Mode};
+        use crate::signin::{
+            Flow as SignInFlow, Keychain as _, Material, MemoryKeychain, Metadata,
+        };
+
+        const NOW: u64 = 1_800_000_000;
+        const NODE: &str = "node-1";
+        const MINTED: &str = "0123456789abcdef0123456789abcdef";
+        const TOKEN: &str = "ghu_the_real_token";
+
+        let hold = |keychain: &MemoryKeychain, instance: &str| {
+            keychain
+                .write(
+                    &Metadata {
+                        account: "octocat".into(),
+                        instance: instance.into(),
+                        flow: SignInFlow::Device,
+                        token_expires_at: NOW + 3600,
+                        refresh_expires_at: NOW + 7200,
+                    },
+                    &Material {
+                        instance: instance.into(),
+                        access_token: TOKEN.into(),
+                        refresh_token: "ghr_refresh".into(),
+                    },
+                )
+                .unwrap();
+        };
+
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let sealing = key.public();
+        let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let mut keys = ClientKeys::new();
+        keys.register(&client.verifying_key().to_sec1_bytes())
+            .unwrap();
+        let boxes: BoxRegistry = Arc::new(Boxes::new());
+        let api = Authority {
+            host: "api.github.com".to_owned(),
+            port: 443,
+        };
+        boxes.register("b1", vec![api.clone()], Stance::OwnIp);
+        let keychain = Arc::new(MemoryKeychain::default());
+        hold(&keychain, MINTED);
+        let redeemer = BoxRedeemer::new(
+            key,
+            NODE,
+            GITHUB,
+            Arc::new(std::sync::RwLock::new(keys)),
+            boxes,
+            Arc::clone(&keychain),
+        )
+        .with_clock(Arc::new(|| NOW));
+
+        let jws = crate::handle::sign(
+            &client,
+            &Claims {
+                sub: "b1".into(),
+                node_id: NODE.into(),
+                store: GITHUB.id.into(),
+                id: MINTED.into(),
+                upstream: GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect(),
+                inject: None,
+                iat: NOW - 10,
+                exp: NOW + 3600,
+                jti: "jti-1".into(),
+            },
+        );
+        let sealed = seal::seal(
+            &sealing,
+            &Context {
+                box_id: "b1".into(),
+                host: NODE.into(),
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: NOW - 10,
+                expiry: NOW + 600,
+                kid: sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::SignIn,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap();
+
+        let (records, audit) = memory_audit();
+        let flow = Flow::new(
+            "b1",
+            api,
+            audit,
+            Arc::new(redeemer),
+            Validated::unchecked(()).proof(),
+        );
+        let send = || {
+            let request = format!(
+                "GET /user HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer {sealed}\r\n\r\n"
+            );
+            let mut client = std::io::Cursor::new(request.into_bytes());
+            let mut upstream = Vec::new();
+            let end = forward_requests(&flow, &mut client, &mut upstream);
+            (String::from_utf8(upstream).unwrap(), end)
+        };
+
+        let (upstream, end) = send();
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(upstream.contains(TOKEN));
+
+        // A sign-in after a logout is a new instance. The reference minted
+        // before it names the old one, and is refused.
+        keychain.clear();
+        hold(&keychain, "fedcba9876543210fedcba9876543210");
+        let (upstream, end) = send();
+        assert_eq!(refusal(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.last().unwrap().outcome, Outcome::Refuse);
+        assert_eq!(
+            records.last().unwrap().marker.as_deref(),
+            Some(SIGN_IN_REQUIRED)
+        );
     }
 }
