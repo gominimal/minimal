@@ -65,13 +65,13 @@ pub(crate) fn run(dir: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
 
 /// `min doctor`. Exits 1, with no further message, when a check fails.
 pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
-    // Interim (BEP-042): the client reads the proxy's log files on the host
-    // directly, as `min box audit` does. The architecture's audit paragraph
-    // and Gatehouse §6.10 put the un-enrolled read behind the proxy's local
-    // socket. Flip to that read when the proxy serves it, and drop this
-    // direct read.
-    // Tracked by https://github.com/gominimal/minimal/issues/2459, ended by
-    // https://github.com/gominimal/minimal/issues/2463.
+    // Interim (BEP-042), as for `min box audit`: the client reads the
+    // operator-owned log files under file mode, on the host. The design
+    // reads over the proxy's local socket (ruled on gominimal/arch#137;
+    // architecture, audit paragraph; Gatehouse §6.10). The interim is
+    // https://github.com/gominimal/minimal/issues/2459, and it ends when
+    // https://github.com/gominimal/minimal/issues/2463 serves the read.
+    // Flip: read the chain over that socket, and drop this direct read.
     let dir = bep::audit::default_dir()
         .context("cannot find the home directory, so the audit log cannot be found")?;
     if run(&dir, &mut std::io::stdout().lock())? {
@@ -92,6 +92,7 @@ mod tests {
             box_id: "01920000-0000-7000-8000-000000000001".to_owned(),
             authority: "api.github.com".to_owned(),
             identifier: None,
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some("off_module".to_owned()),

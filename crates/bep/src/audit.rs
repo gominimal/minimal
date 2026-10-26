@@ -1320,9 +1320,8 @@ fn holds_revocation(path: &Path) -> io::Result<bool> {
 /// kind. When a newer bep wrote that record and a prune left a gap after
 /// it, [`verify_dir`] reports a break that is none.
 fn bytes_hold_parsed_revocation(bytes: &[u8]) -> bool {
-    complete_lines(bytes).any(|raw| {
-        matches!(classify(raw), Line::Record(record) if record.kind == Kind::Revocation)
-    })
+    complete_lines(bytes)
+        .any(|raw| matches!(classify(raw), Line::Record(record) if record.kind == Kind::Revocation))
 }
 
 /// Where the chain of a log stops verifying.
