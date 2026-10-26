@@ -324,6 +324,10 @@ pub(crate) fn wait_for_injection_join(
     }
 }
 
+/// How many passes the check after an injected shim's join takes at most
+/// to empty the box's own leaf. It is the bound an admit's move takes.
+const INJECTION_MOVE_PASSES: usize = 8;
+
 /// Why the check after an injected shim's join refused the injection
 /// (BEP-018): a process of it could not be moved into the blocked leaf.
 #[derive(Debug)]
@@ -333,6 +337,9 @@ pub(crate) struct InjectionRefused {
     /// The failure.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) error: std::io::Error,
+    /// The processes still in the box's own leaf when the check refused.
+    /// They are outside the block, so the caller stops each of them.
+    pub(crate) stranded: Vec<i32>,
 }
 
 /// The check after the injected shim `pid` joined its leaf (BEP-018). It
@@ -344,16 +351,18 @@ pub(crate) struct InjectionRefused {
 /// blocks for the box, the shim and everything in `own` move into the
 /// blocked leaf and are recorded. Returns how many processes moved.
 ///
-/// `joined` says whether the shim was seen in its leaf. A shim given `own`
-/// that did not join yet can still join `own` after a move, and so leave the
-/// blocked leaf. While the cohort blocks for the box, that injection is
-/// refused.
+/// `joined` says whether the shim cannot join a leaf any more: it was seen
+/// in its leaf, or it is gone. A live shim given `own` that did not join yet
+/// can still join `own` after a move, and so leave the blocked leaf. While
+/// the cohort blocks for the box, that injection is refused.
 ///
 /// # Errors
 ///
 /// [`InjectionRefused`] when `own` cannot be read, a live process cannot be
-/// moved, or the shim did not join `own` while the cohort blocks. The caller
-/// must stop the shim, so the block never fails open.
+/// moved, `own` is not empty after [`INJECTION_MOVE_PASSES`] passes, or the
+/// shim did not join `own` while the cohort blocks. The refusal carries what
+/// is still in `own`. The caller must stop the shim and each of those, so
+/// the block never fails open.
 pub(crate) fn settle_injection(
     box_id: &str,
     pid: i32,
@@ -376,30 +385,34 @@ pub(crate) fn settle_injection(
     else {
         return Ok(0);
     };
+    // Still under the lock, so what is read here is what escapes the block.
+    let refuse = |pid, error| InjectionRefused {
+        pid,
+        error,
+        stranded: moves.procs(own).unwrap_or_default(),
+    };
     if !joined {
         // A move now is undone when the shim joins `own` later.
-        return Err(InjectionRefused {
+        return Err(refuse(
             pid,
-            error: io::Error::new(
+            io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the injected process did not join its classifier leaf in time",
             ),
-        });
+        ));
     }
     let mut moved = 0;
     let mut first = true;
     // A process that forks while the move runs leaves its child in `own`,
     // so `own` is read again until it is empty, as an admit's move does.
-    for _ in 0..8 {
-        let mut pids = moves
-            .procs(own)
-            .map_err(|error| InjectionRefused { pid, error })?;
+    for _ in 0..INJECTION_MOVE_PASSES {
+        let mut pids = moves.procs(own).map_err(|error| refuse(pid, error))?;
         if first && !pids.contains(&pid) {
             pids.push(pid);
         }
         first = false;
         if pids.is_empty() {
-            break;
+            return Ok(moved);
         }
         for each in pids {
             match moves.migrate(each, &blocked) {
@@ -417,11 +430,86 @@ pub(crate) fn settle_injection(
                     moved += 1;
                 }
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                Err(error) => return Err(InjectionRefused { pid: each, error }),
+                Err(error) => return Err(refuse(each, error)),
             }
         }
     }
-    Ok(moved)
+    match moves.procs(own) {
+        Ok(left) if left.is_empty() => Ok(moved),
+        Ok(left) => Err(InjectionRefused {
+            pid: left[0],
+            error: io::Error::other(
+                "the box's own classifier leaf is not empty after the last move pass",
+            ),
+            stranded: left,
+        }),
+        Err(error) => Err(refuse(pid, error)),
+    }
+}
+
+/// Pins `pid` as a pidfd, so a later signal cannot reach a process that
+/// reused the pid. `None` when the process is gone.
+#[cfg_attr(test, allow(dead_code))]
+fn pin_pid(pid: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open(2) takes a pid and a flags word and reads no user
+    // memory. On success the fresh descriptor is owned by nobody else.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: `fd` is a fresh descriptor that only this value owns.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether the process `pinned` names has exited: its pidfd is readable.
+#[cfg_attr(test, allow(dead_code))]
+fn pinned_exited(pinned: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: pinned.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` is one valid pollfd that lives across the call.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    ready > 0 && poll.revents & libc::POLLIN != 0
+}
+
+/// Sends SIGKILL to the process `pinned` names. A pidfd names one process,
+/// so the signal never reaches a process that reused its pid.
+#[cfg_attr(test, allow(dead_code))]
+fn kill_pinned(pinned: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: pidfd_send_signal(2) with a null siginfo reads no user memory.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pinned.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+}
+
+/// Stops the processes a refused injection left in the box's own leaf
+/// `own`. Each pid is pinned first and then found in `own` again, so the
+/// pinned process is the one the leaf holds, not a later process with its
+/// pid. Returns the pids it stopped.
+#[cfg_attr(test, allow(dead_code))]
+fn stop_stranded(
+    stranded: &[i32],
+    own: &std::path::Path,
+    moves: &dyn crate::net::classifier::CgroupMoves,
+) -> Vec<i32> {
+    let mut stopped = Vec::new();
+    for &pid in stranded {
+        let Some(pinned) = pin_pid(pid) else { continue };
+        if moves.procs(own).is_ok_and(|pids| pids.contains(&pid)) {
+            kill_pinned(&pinned);
+            stopped.push(pid);
+        }
+    }
+    stopped
 }
 
 /// Arranges for `cmd`'s child to send its pid to `on_pid` once it is
@@ -805,6 +893,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // blocking member's admit ran between `injection_leaf` and the join.
         if let Some(own) = self.leaf.as_ref().map(|leaf| leaf.dir().to_path_buf())
             && let Err(error) = report_spawned_pid(&mut command, move |pid| {
+                // Pinned first: the shim can exit and its pid be reused
+                // while the check waits.
+                let shim = pin_pid(pid);
                 let moves = crate::net::classifier::KernelMoves;
                 let cohort = crate::net::classifier::cohort_quic443();
                 let blocked = cohort
@@ -814,32 +905,28 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     .map(std::path::Path::to_path_buf);
                 let mut leaves = vec![own.as_path()];
                 leaves.extend(blocked.as_deref());
-                let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
-                let joined = wait_for_injection_join(
-                    pid,
-                    &leaves,
-                    &moves,
-                    || proc_dir.exists(),
-                    INJECTION_JOIN_WAIT,
-                );
+                let alive = || shim.as_ref().is_some_and(|shim| !pinned_exited(shim));
+                let joined =
+                    wait_for_injection_join(pid, &leaves, &moves, alive, INJECTION_JOIN_WAIT);
+                // A shim that is gone cannot join `own` later, so what it
+                // forked before it went is still moved.
+                let joined = joined || !alive();
                 if let Err(refused) =
                     settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
                 {
+                    if let Some(shim) = &shim {
+                        kill_pinned(shim);
+                    }
+                    let stopped = stop_stranded(&refused.stranded, &own, &moves);
                     tracing::warn!(
                         box_id,
                         shim_pid = pid,
                         pid = refused.pid,
                         error = %refused.error,
+                        ?stopped,
                         "cannot move a process injected into a host-address box into the \
                          UDP 443 blocked leaf; the injection is stopped"
                     );
-                    // SAFETY: kill(2) takes no pointer. The failed move
-                    // found the process alive, and the shim is this daemon's
-                    // child, so neither pid is free for reuse yet.
-                    unsafe {
-                        libc::kill(refused.pid, libc::SIGKILL);
-                        libc::kill(pid, libc::SIGKILL);
-                    }
                 }
             })
         {

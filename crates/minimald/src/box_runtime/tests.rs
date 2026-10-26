@@ -7243,7 +7243,13 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
     let refused = settle_injection("plain", late, false, true, own.dir(), &cohort, &moves)
         .expect_err("a process that cannot move refuses the injection");
     assert_eq!(refused.pid, late);
+    assert_eq!(
+        refused.stranded,
+        vec![late],
+        "the caller stops what stays in own"
+    );
     assert_eq!(moves.where_is(late), own.dir());
+    moves.kill(late);
 
     // A shim that did not join its own leaf in time while the cohort
     // blocks is refused: a move now is undone by its later join.
@@ -7252,6 +7258,63 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
         .expect_err("a shim that did not join in time refuses the injection");
     assert_eq!(refused.pid, slow);
     assert_eq!(refused.error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(refused.stranded.is_empty());
+
+    // A fork storm that refills the own leaf on every pass outlasts the
+    // move's passes: the check refuses, and names what is left in own.
+    struct Storm<'a> {
+        moves: &'a StandinMoves,
+        own: &'a std::path::Path,
+        next: std::sync::atomic::AtomicI32,
+    }
+    impl crate::net::classifier::CgroupMoves for Storm<'_> {
+        fn procs(&self, leaf: &std::path::Path) -> std::io::Result<Vec<i32>> {
+            self.moves.procs(leaf)
+        }
+        fn migrate(&self, pid: i32, to: &std::path::Path) -> std::io::Result<()> {
+            self.moves.migrate(pid, to)?;
+            let child = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.moves.spawn_in(child, self.own);
+            Ok(())
+        }
+        fn parent(&self, pid: i32) -> Option<i32> {
+            self.moves.parent(pid)
+        }
+    }
+    let storm = Storm {
+        moves: &moves,
+        own: own.dir(),
+        next: std::sync::atomic::AtomicI32::new(5000),
+    };
+    let forker = 4900;
+    moves.spawn_in(forker, own.dir());
+    let refused = settle_injection("plain", forker, false, true, own.dir(), &cohort, &storm)
+        .expect_err("an own leaf still full after the last pass refuses the injection");
+    assert!(!refused.stranded.is_empty());
+    for pid in &refused.stranded {
+        assert_eq!(&moves.where_is(*pid), own.dir());
+    }
+    assert_eq!(refused.pid, refused.stranded[0]);
+    for pid in refused.stranded {
+        moves.kill(pid);
+    }
+
+    // The caller stops a stranded process through a pidfd, and only while
+    // the own leaf still holds that pid.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let real = i32::try_from(child.id()).unwrap();
+    assert!(stop_stranded(&[real], own.dir(), &moves).is_empty());
+    moves.spawn_in(real, own.dir());
+    assert_eq!(stop_stranded(&[real], own.dir(), &moves), vec![real]);
+    let status = child.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    moves.kill(real);
 
     // A shim given the own leaf while the cohort still does not block
     // stays where it is.
