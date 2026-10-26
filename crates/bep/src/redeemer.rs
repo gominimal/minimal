@@ -488,7 +488,7 @@ where
                 }
             }
         };
-        tracing::debug!(box_id, ?verdict, jti = %facts.jti, "sealed value decided");
+        tracing::debug!(box_id, ?verdict, jti = ?facts.jti, "sealed value decided");
         (verdict, facts.jti)
     }
 }
