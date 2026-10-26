@@ -1880,6 +1880,7 @@ mod tests {
             &mut stream,
             &Request::RegisterClientKey {
                 key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                box_id: None,
             },
         )
         .await;
@@ -2340,6 +2341,7 @@ mod tests {
                 &mut stream,
                 &Request::RegisterClientKey {
                     key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                    box_id: None,
                 },
             )
             .await;

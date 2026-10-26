@@ -2221,6 +2221,9 @@ mod proxy_env_tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: BTreeMap::new(),
         }
     }

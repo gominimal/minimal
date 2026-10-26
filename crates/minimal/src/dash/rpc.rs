@@ -520,6 +520,15 @@ pub async fn activate(
     // has no `--no-hooks` of its own, and a session created here is
     // attachable later like any other.
     request.config.name = name;
+    // The upload-root walk and VCS-root stat are blocking filesystem
+    // traversals; run them off the async worker so a stalled mount can't
+    // stall the runtime. They run once: the root is both the box's project
+    // root on the create and the upload root after it.
+    let (upload_root, is_repo) = resolve_project_off_worker(project_path.as_utf8_path()).await?;
+    // The directory that holds the project's `minimal.toml`, as `min session
+    // activate` sends it. The daemon records it as the box's project root
+    // (BOX-001), and falls back to the form's path only for older clients.
+    set_project_root(&mut request, &upload_root)?;
     // A daemon of another build refuses this before it allocates anything;
     // `None` under the skew override, which is how an operator still gets
     // through.
@@ -559,17 +568,6 @@ pub async fn activate(
     // the VM host daemon to withdraw the row on the lease's close.
     let lease = row.take_lease();
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
-        // The upload-root walk and VCS-root stat are blocking filesystem
-        // traversals; run them off the async worker so a stalled mount
-        // can't stall the runtime.
-        let dir = project_path.as_utf8_path().to_path_buf();
-        let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
-            let root = resolve_upload_root(&dir)?;
-            let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
-            Ok::<_, anyhow::Error>((root, repo))
-        })
-        .await
-        .context("resolving the upload root")??;
         if !is_repo {
             anyhow::bail!(
                 "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
@@ -826,6 +824,32 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
         boxes::EgressDefaultPhase::Announced => false,
         boxes::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
     }
+}
+
+/// Resolves the upload root of `dir` and whether it is a VCS root, on a
+/// blocking thread. The root is the directory that holds the project's
+/// `minimal.toml`, or `dir` when there is none.
+async fn resolve_project_off_worker(
+    dir: &camino::Utf8Path,
+) -> Result<(camino::Utf8PathBuf, bool), anyhow::Error> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let root = resolve_upload_root(&dir)?;
+        let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
+        Ok::<_, anyhow::Error>((root, repo))
+    })
+    .await
+    .context("resolving the upload root")?
+}
+
+/// Puts `root` on the create request as the box's project root (BOX-001).
+fn set_project_root(
+    request: &mut CreateSessionRequest,
+    root: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    request.config.project_root =
+        Some(paths::HostAbsPath::try_new(root.to_path_buf()).context("Invalid project root")?);
+    Ok(())
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -1291,6 +1315,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         }
     }
@@ -1348,6 +1375,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         };
         settle_destroyed_box(&ssh_sock, record.id, &record).await;
@@ -1370,6 +1400,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("sub")).unwrap();
         assert_eq!(resolve_upload_root(&path).unwrap(), path);
+    }
+
+    /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
+    /// `<root>`, the directory that holds `minimal.toml`, as the project
+    /// root, the same stamp `activate` puts on its request.
+    #[tokio::test]
+    async fn dashboard_create_from_a_subdirectory_sends_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let project_path = paths::HostAbsPath::try_new(sub.clone()).unwrap();
+        let mut request = CreateSessionRequest::new(
+            String::new(),
+            project_path.clone(),
+            NetworkMode::HostNet,
+            BoxPolicy::default(),
+        );
+
+        let (upload_root, _) = resolve_project_off_worker(project_path.as_utf8_path())
+            .await
+            .unwrap();
+        set_project_root(&mut request, &upload_root).unwrap();
+
+        assert_eq!(
+            request.config.project_root,
+            Some(paths::HostAbsPath::try_new(root).unwrap())
+        );
+        assert_eq!(request.config.project_path.as_str(), sub.as_str());
     }
 
     /// `resolve_upload_root` walks up to the nearest mfile and returns its
