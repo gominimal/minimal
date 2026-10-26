@@ -488,6 +488,13 @@ mod tests {
         let store = Store::init_with_mint(daemon_dir(&dir), mint_the_held_id)
             .await
             .unwrap();
+        // Read the held record after the reopen, so the start-up migration
+        // is not part of what the refused create must leave unchanged.
+        let before = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
+            .await
+            .unwrap();
         let err = store
             .create(record_named("other"))
             .await
@@ -511,7 +518,7 @@ mod tests {
             .record()
             .await
             .unwrap();
-        assert_eq!(after, held, "the retained record is unchanged");
+        assert_eq!(after, before, "the retained record is unchanged");
     }
 
     /// Resolve a handle to a record expected to exist.
