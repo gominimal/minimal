@@ -10,10 +10,48 @@
 //! request and gives it to [`crate::redeem::decide`], which refuses a
 //! covered value before the redeemer resolves any reference or renews any
 //! sign-in ([`crate::redeemer`], step 4).
+//!
+//! At start, [`restore`] reads every revocation record in every retained
+//! audit segment, so a revocation stays in force across a restart
+//! (BEP-068). A segment that holds one is retained until every value
+//! naming its box has expired ([`crate::audit::prune`]).
 
+use std::io;
+use std::path::Path;
 use std::sync::PoisonError;
 
+use crate::audit::{Kind, LogReader};
 use crate::redeemer::Revocations;
+
+/// What [`restore`] read from the log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Restored {
+    /// The box ids the revocation records name, oldest first and each once.
+    pub box_ids: Vec<String>,
+    /// The complete lines that did not parse as a record. Each one can be a
+    /// revocation that is not in force after this start.
+    pub skipped: usize,
+    /// The segments that hold a skipped line, oldest first.
+    pub unreadable: Vec<std::path::PathBuf>,
+}
+
+/// The box ids that the revocation records in every retained segment of
+/// the log in `dir` name, with the count of lines it could not read. A
+/// missing directory holds none.
+pub fn restore(dir: impl AsRef<Path>) -> io::Result<Restored> {
+    let batch = LogReader::new(dir.as_ref()).read_new()?;
+    let mut box_ids: Vec<String> = Vec::new();
+    for entry in batch.entries {
+        if entry.record.kind == Kind::Revocation && !covers(&box_ids, &entry.record.subject) {
+            box_ids.push(entry.record.subject);
+        }
+    }
+    Ok(Restored {
+        box_ids,
+        skipped: batch.skipped,
+        unreadable: batch.skipped_in,
+    })
+}
 
 /// True when a revocation in `revoked` covers a value that names `box_id`:
 /// some revocation names exactly that id (BEP-071).
@@ -313,6 +351,97 @@ mod tests {
         assert_eq!(written[0].box_id, web);
         assert_eq!(written[0].outcome, Outcome::Refuse);
         assert!(!records.handle(&revoke_line("web")).ok);
+    }
+
+    // BEP-068: the revocations recorded in every retained segment are in
+    // force again after a restart, and the restored set records none of
+    // them a second time.
+    #[test]
+    fn revocations_restored_from_every_segment_on_start() {
+        use crate::audit::{AuditLog, Rotation, segment_name, segments};
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let rotation = Rotation {
+            bound: 1,
+            retain: 100,
+            ..Rotation::default()
+        };
+        let log = Arc::new(std::sync::Mutex::new(
+            AuditLog::open_dir(&audit, rotation).unwrap(),
+        ));
+        let records = Records {
+            audit: Some(log.clone() as Arc<dyn AuditWriter>),
+            ..Records::default()
+        };
+        let (first, second) = (hex([0x04; 16]), hex([0x05; 16]));
+        assert!(records.handle(&revoke_line(&first)).ok);
+        assert!(records.handle(&revoke_line(&hyphenated([0x05; 16]))).ok);
+        drop(records);
+        drop(log);
+        // A bound of one byte puts each revocation in its own segment.
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(0)), audit.join(segment_name(1))]
+        );
+
+        // The restart.
+        let restored = restore(&audit).unwrap();
+        assert_eq!(restored.box_ids, vec![first.clone(), second.clone()]);
+        assert_eq!(restored.skipped, 0);
+        let log = Arc::new(std::sync::Mutex::new(
+            AuditLog::open_dir(&audit, rotation).unwrap(),
+        ));
+        let records = Records {
+            audit: Some(log.clone() as Arc<dyn AuditWriter>),
+            revocations: Arc::new(RwLock::new(restored.box_ids)),
+            ..Records::default()
+        };
+        let revoked = records.revocations.read().unwrap().clone();
+        assert!(covers(&revoked, &first) && covers(&revoked, &second));
+        assert!(!covers(&revoked, &hex([0x06; 16])));
+        // The destroyed box is revoked already, so no record is appended.
+        assert!(records.handle(&revoke_line(&first)).ok);
+        drop(records);
+        drop(log);
+        assert_eq!(segments(&audit).unwrap().len(), 2);
+
+        // A missing log restores none.
+        assert_eq!(
+            restore(dir.path().join("missing")).unwrap(),
+            Restored::default()
+        );
+    }
+
+    // BEP-068: a complete line that does not parse can be a revocation, so
+    // restore counts it for the start to report. A partial last line is a
+    // torn write and is not counted.
+    #[test]
+    fn restore_reports_skipped_lines() {
+        use crate::audit::{AuditLog, Rotation, segment_name};
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let log = Arc::new(std::sync::Mutex::new(
+            AuditLog::open_dir(&audit, Rotation::default()).unwrap(),
+        ));
+        let records = Records {
+            audit: Some(log.clone() as Arc<dyn AuditWriter>),
+            ..Records::default()
+        };
+        let first = hex([0x07; 16]);
+        assert!(records.handle(&revoke_line(&first)).ok);
+        drop(records);
+        drop(log);
+        let segment = audit.join(segment_name(0));
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes.extend_from_slice(b"{\"kind\":\"revoc\nnot a record\n{\"torn");
+        std::fs::write(&segment, bytes).unwrap();
+
+        let restored = restore(&audit).unwrap();
+        assert_eq!(restored.box_ids, vec![first]);
+        assert_eq!(restored.skipped, 2);
+        assert_eq!(restored.unreadable, vec![segment]);
     }
 
     /// An audit writer whose every append fails, counting the attempts.
