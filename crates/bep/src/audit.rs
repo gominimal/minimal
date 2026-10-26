@@ -1,4 +1,4 @@
-//! The proxy's audit log (BEP-039, BEP-040, BEP-041, BEP-048).
+//! The proxy's audit log (BEP-039, BEP-040, BEP-041, BEP-048, BEP-049).
 //!
 //! The log is JSONL under the proxy's state directory: one line for each
 //! decision, in the `min/v1` audit schema. The proxy is the log's only
@@ -19,8 +19,9 @@
 //! The first record of a log carries the all-zero hash (BEP-048). The hash
 //! covers the whole previous line, its own `previous_hash` included. The
 //! chain functions ([`line_hash`], [`Record::from_decision`],
-//! [`Record::to_line`]) are pure over bytes, and separate from the file
-//! writer [`AuditLog`].
+//! [`Record::to_line`]) and the verifier ([`verify_chain`]) are pure over
+//! bytes, and separate from the file writer [`AuditLog`]. [`verify_dir`]
+//! runs the verifier over every segment, for `min doctor` (BEP-049).
 //!
 //! [`AuditLog::open`] opens the file for append only, never for write or
 //! truncate, so it cannot modify or remove an existing record (BEP-041).
@@ -235,6 +236,92 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .find(|line| !line.is_empty())
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
+}
+
+/// The bytes that open the last field of every record line. [`Record`]
+/// declares `previous_hash` last, so its line ends in this prefix, the
+/// 64-character hash, and `"}`.
+const PREVIOUS_HASH_FIELD: &[u8] = b"\"previous_hash\":\"";
+
+/// The `previous_hash` that the record line `line` carries, or `None` when
+/// `line` does not end in that field. It reads only the line's end, so it
+/// is pure over bytes and needs no JSON parser.
+pub fn carried_hash(line: &[u8]) -> Option<&[u8]> {
+    let body = line.strip_suffix(b"\"}")?;
+    let split = body.len().checked_sub(64)?;
+    let (head, hash) = body.split_at(split);
+    head.ends_with(PREVIOUS_HASH_FIELD).then_some(hash)
+}
+
+/// The outcome of [`verify_chain`] over one run of lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainCheck {
+    /// Every line carries the hash of the line before it. `head` is the hash
+    /// the next line must carry: the last line's hash, or `start` when there
+    /// is no line. `records` counts the lines.
+    Verified {
+        head: Option<String>,
+        records: usize,
+    },
+    /// The line at `record`, counted from 1, does not carry the hash of the
+    /// line before it, or carries no hash. A record before it was changed
+    /// or removed, or this record was.
+    Broken { record: usize },
+}
+
+/// Verifies the hash chain of `contents`, the bytes of one segment (BEP-049).
+///
+/// `start` is the hash the first record must carry: [`ZERO_HASH`] for the
+/// first segment of a log, or the previous segment's head. With `None`,
+/// the first record's own `previous_hash` is the start, because the
+/// segment before it is gone. A last line without its newline never formed
+/// a record (the writer cuts it), so it is not checked. The chain hashes
+/// each line as [`line_hash`] and [`head_hash`] do, with a trailing `\r`
+/// cut.
+///
+/// What the chain detects is a record that was changed or removed and
+/// whose successors still carry the old hashes. An edit followed by a
+/// recomputation of every later hash, and the change or removal of the
+/// last record, verify.
+pub fn verify_chain(start: Option<&str>, contents: impl AsRef<[u8]>) -> ChainCheck {
+    verify_chain_with(start, contents.as_ref(), |line| line_hash(line))
+}
+
+/// [`verify_chain`] with `hash` in place of [`line_hash`]. A proof harness
+/// passes a model of the hash, because no bounded check can show SHA-256
+/// free of collisions.
+pub fn verify_chain_with(
+    start: Option<&str>,
+    contents: &[u8],
+    hash: impl Fn(&[u8]) -> String,
+) -> ChainCheck {
+    let complete = contents
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(&contents[..0], |n| &contents[..n]);
+    let mut expected: Option<String> = start.map(str::to_owned);
+    let mut records = 0;
+    for line in complete.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        records += 1;
+        let Some(carried) = carried_hash(line) else {
+            return ChainCheck::Broken { record: records };
+        };
+        if expected
+            .as_deref()
+            .is_some_and(|hash| hash.as_bytes() != carried)
+        {
+            return ChainCheck::Broken { record: records };
+        }
+        expected = Some(hash(line));
+    }
+    ChainCheck::Verified {
+        head: expected,
+        records,
+    }
 }
 
 /// Creates `dir` and its parents when absent. A directory this call creates
@@ -710,6 +797,54 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
         .into_iter()
         .map(|(_, path)| path)
         .collect())
+}
+
+/// The outcome of [`verify_dir`] over every segment of a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCheck {
+    /// The segments the check read, oldest first. On a break, the last one
+    /// is the segment that breaks.
+    pub segments: Vec<PathBuf>,
+    /// The records that verified, across every segment.
+    pub records: usize,
+    /// Where the chain breaks: the segment, and the record in it, counted
+    /// from 1. `None` when the whole log verifies.
+    pub broken: Option<(PathBuf, usize)>,
+}
+
+/// Verifies the hash chain of every segment of the log in `dir`, oldest
+/// first (BEP-049). Segment 0 starts at [`ZERO_HASH`]. A segment starts at
+/// the head of the segment numbered just before it. When that segment is
+/// gone, because a rotation pruned it, the segment's first record starts
+/// the chain again. A missing directory is an empty log that verifies.
+pub fn verify_dir(dir: impl AsRef<Path>) -> io::Result<LogCheck> {
+    let mut check = LogCheck {
+        segments: Vec::new(),
+        records: 0,
+        broken: None,
+    };
+    let mut previous: Option<(u64, Option<String>)> = None;
+    for (n, path) in numbered_segments(dir.as_ref())? {
+        let contents = fs::read(&path)?;
+        let start = match &previous {
+            _ if n == 0 => Some(ZERO_HASH.to_owned()),
+            Some((m, head)) if m.checked_add(1) == Some(n) => head.clone(),
+            _ => None,
+        };
+        check.segments.push(path.clone());
+        match verify_chain(start.as_deref(), &contents) {
+            ChainCheck::Verified { head, records } => {
+                check.records += records;
+                previous = Some((n, head));
+            }
+            ChainCheck::Broken { record } => {
+                check.records += record - 1;
+                check.broken = Some((path, record));
+                break;
+            }
+        }
+    }
+    Ok(check)
 }
 
 /// Every segment of the log in `dir` with its number, oldest first.
@@ -1658,5 +1793,177 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The lines of a log of `decisions`, chained from the zero hash, each
+    /// without its newline.
+    fn chained_lines(decisions: &[Decision]) -> Vec<String> {
+        let mut head = ZERO_HASH.to_owned();
+        decisions
+            .iter()
+            .map(|decision| {
+                let line = Record::from_decision(decision, &head).to_line();
+                head = line_hash(&line);
+                line
+            })
+            .collect()
+    }
+
+    fn joined(lines: &[Vec<u8>]) -> Vec<u8> {
+        lines
+            .iter()
+            .flat_map(|l| l.iter().copied().chain(*b"\n"))
+            .collect()
+    }
+
+    proptest! {
+        // BEP-049: a chain built by the writer's construction verifies, and
+        // altering or removing one record that has a successor, without
+        // recomputing the hashes that follow, fails verification.
+        #[test]
+        fn prop_audit_chain_detects_unrecomputed_edit(
+            decisions in proptest::collection::vec(decision_strategy(), 2..8),
+            pick in any::<prop::sample::Index>(),
+            at in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            remove in any::<bool>(),
+        ) {
+            let lines: Vec<Vec<u8>> = chained_lines(&decisions)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+            let whole = joined(&lines);
+            let verified = verify_chain(Some(ZERO_HASH), &whole);
+            prop_assert_eq!(
+                verified,
+                ChainCheck::Verified {
+                    head: Some(head_hash(&whole)),
+                    records: lines.len(),
+                }
+            );
+
+            // Only a record with a successor: the last one is the residual.
+            let i = pick.index(lines.len() - 1);
+            let mut edited = lines.clone();
+            if remove {
+                edited.remove(i);
+            } else {
+                let j = at.index(edited[i].len());
+                let byte = edited[i][j] ^ mask;
+                prop_assume!(byte != b'\n');
+                edited[i][j] = byte;
+            }
+            match verify_chain(Some(ZERO_HASH), joined(&edited)) {
+                ChainCheck::Broken { record } => prop_assert!(record == i + 1 || record == i + 2),
+                verified => prop_assert!(false, "the edit at record {} verified: {:?}", i + 1, verified),
+            }
+        }
+    }
+
+    /// A torn last line and the segments of a rotated log: the chain runs on
+    /// across segments, and a break names its segment and record.
+    #[test]
+    fn audit_chain_verifies_across_segments_and_names_the_break() {
+        let dir = TempDir::new();
+        let path = dir.log();
+        let log_dir = path.parent().unwrap().join("segments");
+        let rotation = Rotation {
+            bound: 1,
+            ..Rotation::default()
+        };
+        let mut log = AuditLog::open_dir(&log_dir, rotation).unwrap();
+        for _ in 0..4 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, None);
+        assert_eq!(check.records, 4);
+        assert!(check.segments.len() > 1, "the log rotated: {check:?}");
+
+        // Remove the second segment's record: the third segment's first
+        // record carries a hash that no longer matches.
+        let second = check.segments[1].clone();
+        fs::write(&second, b"").unwrap();
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, Some((check.segments[2].clone(), 1)));
+    }
+}
+
+/// The audit chain's harness (BEP-049), over the pure verifier with a model
+/// of the hash that is free of collisions over the lines it sees.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{ChainCheck, ZERO_HASH, verify_chain_with};
+
+    const MAX_RECORDS: usize = 4;
+    const MAX_PAYLOAD: usize = 64;
+
+    /// The model hash of position `k`: 64 hex digits, distinct per `k`.
+    fn code(k: usize) -> String {
+        let mut out = String::from(ZERO_HASH);
+        out.replace_range(62..64, &format!("{:02x}", k + 1));
+        out
+    }
+
+    fn line(payload: &[u8], previous: &str) -> Vec<u8> {
+        let mut out = payload.to_vec();
+        out.extend_from_slice(b"\"previous_hash\":\"");
+        out.extend_from_slice(previous.as_bytes());
+        out.extend_from_slice(b"\"}");
+        out
+    }
+
+    #[kani::proof]
+    #[kani::unwind(70)]
+    fn kani_audit_chain_detects_edit() {
+        let n: usize = kani::any();
+        kani::assume((2..=MAX_RECORDS).contains(&n));
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut previous = String::from(ZERO_HASH);
+        for k in 0..n {
+            let len: usize = kani::any();
+            kani::assume(len <= MAX_PAYLOAD);
+            let payload: [u8; MAX_PAYLOAD] = kani::any();
+            for &b in &payload[..len] {
+                kani::assume(b != b'\n');
+            }
+            lines.push(line(&payload[..len], &previous));
+            previous = code(k);
+        }
+        let originals = lines.clone();
+        // Collision-free over the original lines: each one hashes to its
+        // position's code, and any other line to a code no line carries.
+        let hash = |l: &[u8]| {
+            originals
+                .iter()
+                .position(|o| o.as_slice() == l)
+                .map_or_else(|| "f".repeat(64), code)
+        };
+        let joined = |ls: &[Vec<u8>]| -> Vec<u8> {
+            ls.iter()
+                .flat_map(|l| l.iter().copied().chain(*b"\n"))
+                .collect()
+        };
+        assert!(matches!(
+            verify_chain_with(Some(ZERO_HASH), &joined(&lines), hash),
+            ChainCheck::Verified { .. }
+        ));
+
+        let i: usize = kani::any();
+        kani::assume(i + 1 < n);
+        if kani::any() {
+            lines.remove(i);
+        } else {
+            let j: usize = kani::any();
+            kani::assume(j < lines[i].len());
+            let byte: u8 = kani::any();
+            kani::assume(byte != lines[i][j] && byte != b'\n');
+            lines[i][j] = byte;
+        }
+        assert!(matches!(
+            verify_chain_with(Some(ZERO_HASH), &joined(&lines), hash),
+            ChainCheck::Broken { .. }
+        ));
     }
 }

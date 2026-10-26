@@ -12,7 +12,9 @@
 # value, an authority outside the box's declared egress and a request
 # whose Host differs from its connection are refused, a store handle
 # that does not verify or disagrees with its current rule is refused, and
-# the decision admits exactly when every check passes).
+# the decision admits exactly when every check passes; and the audit
+# chain: an edit or removal of a record with a successor fails
+# verification).
 #
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
@@ -278,4 +280,4 @@ expect boxes 10
 expect rcache 3
 expect mlog 9
 expect minvmd 5
-expect bep 10
+expect bep 11
