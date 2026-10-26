@@ -12138,10 +12138,11 @@ proof_bep_first_slice_end_to_end() {
 #      value.
 # The case needs no GitHub sign-in. The value is never printed: the
 # transcript names only its length. The case removes the item at the end.
-bep_store_jsonl_check() { # $1 = the jsonl file, $2 = the upstream authority, $3 = the identifier
-  python3 - "$1" "$2" "$3" <<'PY'
+bep_store_jsonl_check() { # $1 = the jsonl file, $2 = the upstream authority, $3 = the store, $4 = the identifier
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
-path, upstream, ident = sys.argv[1], sys.argv[2], sys.argv[3]
+path, upstream, store, ident = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+want = store + ":" + ident
 records = []
 with open(path) as f:
     for line in f:
@@ -12151,11 +12152,11 @@ with open(path) as f:
 hits = [r for r in records
         if r.get("kind") == "decision" and r.get("decision") == "admit"
         and r.get("upstream") == upstream
-        and (r.get("identifier") == ident or str(r.get("identifier", "")).endswith(":" + ident))]
+        and r.get("identifier") == want]
 if not hits:
     seen = sorted({"%s %s %s" % (r.get("decision"), r.get("upstream"), r.get("identifier"))
                    for r in records if r.get("kind") == "decision"})
-    print("no admit record for %s names %s (decisions: %s)" % (upstream, ident, "; ".join(seen) or "none"))
+    print("no admit record for %s names %s (decisions: %s)" % (upstream, want, "; ".join(seen) or "none"))
     sys.exit(1)
 print("%d admitted injection(s) for %s, by %s" % (
     len(hits), upstream, ", ".join(sorted({r.get("identifier") for r in hits}))))
@@ -12353,7 +12354,7 @@ proof_bep_store_reference_end_to_end() {
     echo "::error::'min box audit $sr_name' holds the stored value"
     sr_fail
   fi
-  if ! sr_audit="$(bep_store_jsonl_check "$WORK/$sr_case.audit" "$sr_host:443" "$sr_id")"; then
+  if ! sr_audit="$(bep_store_jsonl_check "$WORK/$sr_case.audit" "$sr_host:443" keychain "$sr_id")"; then
     echo "::error::'min box audit $sr_name': $sr_audit"
     sr_fail
   fi
