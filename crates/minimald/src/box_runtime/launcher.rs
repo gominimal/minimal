@@ -1256,11 +1256,42 @@ impl BoxLauncher for SandboxLauncher {
             .filter(|d| !d.is_empty());
         // BEP-011: the env build adds the trust variables below these, once
         // it knows whether the box's packages ship a CA bundle.
+        //
+        // BEP-015: a box whose grant gave it the git credential helper gets
+        // the helper as git's sole helper for the grant hosts, at command
+        // scope, which git reads after every configuration file. The pairs
+        // follow any that the composition sets. A count that is not a
+        // number adds no pairs, so the pairs the box set stay as they are.
+        let mut connection = attach_env.connection;
+        let git_config_count = composition_vars
+            .iter()
+            .chain(&connection)
+            .rev()
+            .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+            .map(|(_, value)| value.parse::<usize>());
+        match git_config_count.unwrap_or(Ok(0)) {
+            Ok(first) => {
+                let sealed = connection
+                    .iter()
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>();
+                let git_env = crate::box_actor::bep_git_helper::launch_git_config_env(
+                    paths.home.as_utf8_path().as_std_path(),
+                    first,
+                    sealed,
+                );
+                connection.extend(git_env);
+            }
+            Err(_) => tracing::warn!(
+                "GIT_CONFIG_COUNT in the box environment is not a number; \
+                 the git credential helper is not set for the grant hosts"
+            ),
+        }
         let env_vars = layer_session_env(
             session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
             composition_vars,
-            attach_env.connection,
+            connection,
         );
         // Which shell this attach starts is decided from the composed
         // `SHELL` (see `crate::attach_shell`). Read before `env_vars`

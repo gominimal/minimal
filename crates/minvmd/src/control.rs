@@ -694,7 +694,14 @@ fn serve_connection(
         }
     };
     let root_peer = is_root_peer(uid);
-    if !root_peer && let Err(error) = check_peer_uid(uid) {
+    // The guest door also admits the VM user's uid (BEP-047): the VMM child
+    // dials it as `minimal-vmm`. The host door keeps its check, and the
+    // door, not the peer, decides which verbs a connection can ask for.
+    let checked = match door {
+        ControlDoor::GuestReports => check_guest_peer_uid(uid),
+        ControlDoor::Host => check_peer_uid(uid),
+    };
+    if !root_peer && let Err(error) = checked {
         tracing::debug!(%error, "control-socket peer check failed");
         return Ok(());
     }
@@ -1332,6 +1339,39 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
 #[cfg(test)]
 fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
     check_peer_uid(peer_uid(stream)?)
+}
+
+/// The uid of the VM user, `minimal-vmm`: `None` on a host without that
+/// user. A uid found is kept for the process lifetime. A miss is not kept,
+/// so a daemon that starts before `min finalize-install` creates the user
+/// admits it on the next connection.
+fn vmm_uid() -> Option<u32> {
+    static VMM_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = VMM_UID.get() {
+        return Some(*uid);
+    }
+    let uid = crate::sock::user_uid(crate::sock::VMM_USER)?;
+    Some(*VMM_UID.get_or_init(|| uid))
+}
+
+/// Whether a guest door admits `peer_uid`: the daemon's own uid, or the
+/// VM user's uid (`vmm_uid`) that the VMM child runs as.
+fn guest_peer_admitted(peer_uid: u32, my_uid: u32, vmm_uid: Option<u32>) -> bool {
+    peer_uid == my_uid || vmm_uid == Some(peer_uid)
+}
+
+/// The peer check of the guest doors (`guest-control.sock` and
+/// `guest-telemetry.sock`): [`check_peer_uid`], and also the
+/// `minimal-vmm` uid.
+pub(crate) fn check_guest_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let my_uid = unsafe { libc::geteuid() };
+    // The own-uid test comes first, so the common case does no user
+    // lookup. `vmm_uid` caches only a hit.
+    if peer_uid == my_uid || guest_peer_admitted(peer_uid, my_uid, vmm_uid()) {
+        return Ok(());
+    }
+    check_peer_uid(peer_uid)
 }
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
@@ -2811,6 +2851,25 @@ mod tests {
     use std::os::unix::net::UnixStream as TestStream;
     use std::sync::OnceLock;
     use std::time::Duration;
+
+    /// BEP-047: the guest door admits the `minimal-vmm` uid the VMM child
+    /// dials as, and the daemon's own; the host door admits only its own.
+    #[test]
+    fn guest_door_admits_the_vmm_uid_and_the_host_door_does_not() {
+        assert!(guest_peer_admitted(1000, 1000, Some(990)));
+        assert!(guest_peer_admitted(990, 1000, Some(990)));
+        assert!(!guest_peer_admitted(991, 1000, Some(990)));
+        assert!(!guest_peer_admitted(990, 1000, None));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        check_guest_peer_uid(me).unwrap();
+        check_peer_uid(me).unwrap();
+        let stranger = me.wrapping_add(4242);
+        assert!(check_peer_uid(stranger).is_err());
+        if vmm_uid() != Some(stranger) {
+            assert!(check_guest_peer_uid(stranger).is_err());
+        }
+    }
 
     use minimald_rpc::{
         BoxControlReply, BoxControlRequest, HoldBoxNameRequest, RegisterBoxRequest,

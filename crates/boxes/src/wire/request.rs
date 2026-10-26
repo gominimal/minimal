@@ -254,7 +254,11 @@ mod tests {
         );
         let v: ContributionVerdict =
             serde_json_lenient::from_str(&json).expect("legacy verdict must load");
-        assert!(v.lifecycle_hooks.is_empty());
+        assert!(
+            v.lifecycle_hooks.is_empty(),
+            "expected empty, got {:?}",
+            v.lifecycle_hooks
+        );
     }
 
     #[test]
@@ -360,7 +364,11 @@ mod tests {
         let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
         let c: WireContribution = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.orientation, WireOrientation::default());
-        assert!(c.orientation.loadouts_display.is_empty());
+        assert!(
+            c.orientation.loadouts_display.is_empty(),
+            "expected empty, got {:?}",
+            c.orientation.loadouts_display
+        );
 
         let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
         let c: WireComposition = serde_json_lenient::from_str(json).unwrap();

@@ -17,7 +17,9 @@
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
 //! registrations on the control socket ([`bep::control`]). It reads the
-//! per-boot token from standard input. Each request inside a box connection
+//! per-boot token from standard input. With `--exit-on-stdin-close` it
+//! stops when standard input closes, which is how a supervisor's death stops
+//! it ([`bep::supervisor`]). Each request inside a box connection
 //! goes to the redemption decision ([`bep::redeemer`]), which reads the
 //! boxes the control socket registers. The root certificate the start
 //! issued is the anchor of the CA that signs each leaf.
@@ -38,9 +40,9 @@ use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
-use bep::redeemer::BoxRedeemer;
+use bep::redeemer::{BoxRedeemer, Revocations};
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -92,6 +94,12 @@ struct ServeArgs {
     /// [default: ~/.minimal/bep/control.sock]
     #[arg(long, value_name = "PATH")]
     control: Option<PathBuf>,
+
+    /// Stop serving when standard input closes. A supervisor keeps its end
+    /// of the pipe open after the token, so the proxy stops when the
+    /// supervisor exits, even when it is killed.
+    #[arg(long)]
+    exit_on_stdin_close: bool,
 }
 
 fn main() -> ExitCode {
@@ -565,6 +573,7 @@ fn unix_now() -> Result<u64, String> {
 struct Wiring {
     clients: Registry,
     boxes: BoxRegistry,
+    revocations: Revocations,
     redeemer: Arc<dyn Redeemer>,
 }
 
@@ -581,18 +590,17 @@ where
     let node = sealing.public().kid();
     let clients = Registry::default();
     // `min` sends `register_box` when it creates a box with a GitHub grant
-    // (`crates/minimal/src/cmd/boxes/create.rs`). Interim: nothing sends
-    // `forget_box` at destroy until T20
-    // (https://github.com/gominimal/minimal/issues/2277), in
-    // `crates/minvmd/src/box_registry.rs`.
+    // (`crates/minimal/src/cmd/boxes/create.rs`). `minvmd` sends
+    // `revoke_box` and then `forget_box` when a live box is destroyed
+    // (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
-    // Interim: `BoxRedeemer::new` starts with no revocation in force, and
-    // nothing here gives it one. T20
-    // (https://github.com/gominimal/minimal/issues/2277) records revocations
-    // over the control socket. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores them from
+    // The revocations `revoke_box` records over the control socket, which
+    // the redeemer reads at each request (BEP-043, BEP-071). Interim: the
+    // set starts empty at each start. T33
+    // (https://github.com/gominimal/minimal/issues/2290) restores it from
     // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement. Those two are the flip.
+    // sub-requirement.
+    let revocations = Revocations::default();
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
@@ -606,12 +614,14 @@ where
             Arc::clone(&boxes),
             keychain,
         )
+        .with_revocations(Arc::clone(&revocations))
         // BEP-069: an expiring sign-in renews here, at the proxy.
         .with_token_endpoint(endpoint),
     );
     Wiring {
         clients,
         boxes,
+        revocations,
         redeemer,
     }
 }
@@ -626,9 +636,15 @@ impl Wiring {
         proxy.with_redeemer(Arc::clone(&self.redeemer))
     }
 
-    /// The control socket at `path`, which registers into this wiring.
-    fn control(&self, path: &Path) -> io::Result<Control> {
-        Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))
+    /// The control socket at `path`, which registers into this wiring and
+    /// appends its mint and revocation records to `audit`, the log the
+    /// proxy's decisions go to (BEP-067).
+    fn control(&self, path: &Path, audit: Arc<dyn AuditWriter>) -> io::Result<Control> {
+        Ok(
+            Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))?
+                .with_revocations(Arc::clone(&self.revocations))
+                .with_audit(audit),
+        )
     }
 }
 
@@ -640,6 +656,16 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
+    // Watched from here, so a supervisor that dies while the proxy starts
+    // stops it as soon as it serves (#2501).
+    let supervisor = if args.exit_on_stdin_close {
+        Some(
+            bep::supervisor::watch_until_closed(io::stdin())
+                .map_err(|err| format!("bep did not watch its standard input: {err}"))?,
+        )
+    } else {
+        None
+    };
     let control = args.control.clone().or_else(default_control).ok_or(
         "bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.",
     )?;
@@ -675,12 +701,15 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let endpoint = GitHubTokenEndpoint::new(roots.clone())?;
     let ca = Arc::new(Mutex::new(ca));
+    // One log, one writer: the proxy's decisions and the control socket's
+    // mint and revocation records share the chain (BEP-067).
+    let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
         ca.clone(),
         roots,
         Arc::new(SystemResolver),
-        Arc::new(Mutex::new(log)),
+        log.clone(),
     )
     .map_err(|err| err.to_string())?;
     let wiring = wire(sealing, HostKeychain, Arc::new(endpoint));
@@ -695,13 +724,12 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // The same socket takes `bep --rotate-signing`, which rotates the
         // signing CA the proxy signs leaves with (BEP-061).
         let control_socket = wiring
-            .control(&control)
+            .control(&control, log)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
         tracing::warn!(
             "A store-handle member is not admitted until #2280 lands. \
-             No revocation is in force until #2277 and #2290 land. \
-             Nothing forgets a destroyed box's declared egress until #2277 lands."
+             Revocations recorded before this start are not in force until #2290 lands."
         );
         tracing::info!(
             listener = %args.listener.display(),
@@ -715,9 +743,30 @@ fn serve<K: CaKey + Send + Sync + 'static>(
                 async move { proxy.serve(delivery, stream).await }
             }) => served,
             served = control_socket.run() => served,
+            closed = supervised(supervisor) => {
+                match closed {
+                    Ok(()) => tracing::info!("standard input closed, so the supervisor is gone; the proxy stops"),
+                    Err(err) => tracing::warn!(%err, "standard input failed, so the supervisor is taken for gone; the proxy stops"),
+                }
+                Ok(())
+            }
         };
         served.map_err(|err| format!("bep stopped serving: {err}"))
     })
+}
+
+/// Resolves when the supervisor's pipe closes, or never when `bep serve`
+/// runs without `--exit-on-stdin-close`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn supervised(
+    watch: Option<tokio::sync::oneshot::Receiver<bep::supervisor::Closed>>,
+) -> bep::supervisor::Closed {
+    match watch {
+        // A watch thread that ended without a word cannot see the pipe any
+        // more, so it counts as closed.
+        Some(watch) => watch.await.unwrap_or(Ok(())),
+        None => std::future::pending().await,
+    }
 }
 
 /// The client id of the Minimal-published GitHub App. `min auth login`
@@ -1408,7 +1457,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
         let _proxy = wiring.install(proxy, &path);
-        tokio::spawn(wiring.control(&path).unwrap().run());
+        tokio::spawn(
+            wiring
+                .control(&path, Arc::new(Mutex::new(Vec::<Decision>::new())))
+                .unwrap()
+                .run(),
+        );
 
         let client = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
         let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
@@ -1494,6 +1548,50 @@ mod tests {
             wiring.redeemer.redeem(BOX, &api, &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    /// #2501: a supervisor asks for the lifeline with a flag, so a person
+    /// who pipes the token in by hand keeps a proxy that outlives the pipe.
+    #[test]
+    fn serve_watches_standard_input_only_when_asked() {
+        let parsed = |extra: &[&str]| {
+            let args = Args::try_parse_from(
+                ["bep", "serve", "--listener", "/tmp/bep.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .expect("the arguments parse");
+            match args.command {
+                Some(Command::Serve(serve)) => serve.exit_on_stdin_close,
+                None => panic!("no serve command"),
+            }
+        };
+        assert!(!parsed(&[]), "a hand-run proxy outlives its input");
+        assert!(parsed(&["--exit-on-stdin-close"]));
+    }
+
+    /// #2501: the serve loop stops when the supervisor's pipe closes, and
+    /// never on that branch without the flag.
+    #[tokio::test]
+    async fn the_serve_loop_stops_when_the_supervisor_pipe_closes() {
+        let quiet = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(quiet, supervised(None)).await.is_err(),
+            "with no watch, the branch never fires"
+        );
+
+        let (reader, writer) = io::pipe().expect("pipe");
+        let watch = bep::supervisor::watch_until_closed(reader).expect("watch");
+        let mut stop = Box::pin(supervised(Some(watch)));
+        assert!(
+            tokio::time::timeout(quiet, &mut stop).await.is_err(),
+            "an open pipe keeps the proxy serving"
+        );
+        drop(writer);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+            .await
+            .expect("a closed pipe stops the proxy");
+        assert!(closed.is_ok(), "{closed:?}");
     }
 
     // BEP-069 (Gatehouse §6.10): a browser-flow sign-in renews under the

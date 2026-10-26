@@ -66,6 +66,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 
     let host_asks = host_asks_box(global, name.as_deref());
     box_via_ssh(
+        daemon_provider_kind(global),
         &sock,
         id,
         None,
@@ -102,7 +103,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    box_via_ssh(&sock, r.id, wire, None, None).await
+    box_via_ssh(daemon_provider_kind(global), &sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -134,6 +135,7 @@ pub async fn cmd_session_run(
     );
 
     box_via_ssh(
+        daemon_provider_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone

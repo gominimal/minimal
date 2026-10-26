@@ -392,6 +392,23 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// The supervisor's box registry: it feeds the proxy attachments, compiles
+/// under the operator's deny-all opt-out, persists to `registry_file`, and
+/// sends a live box's revocation to the Box Egress Proxy control socket under
+/// the home directory (BEP-043). Only this start path sets that socket.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn supervisor_registry(
+    proxy_attachments: crate::bep_attach::Attachments,
+    egress_deny_all_opt_out: bool,
+    registry_file: std::path::PathBuf,
+) -> crate::box_registry::BoxRegistry {
+    crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
+        .feeding_proxy_attachments(proxy_attachments)
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
+        .with_proxy_control(crate::box_registry::home_proxy_control())
+        .persisting_to(registry_file)
+}
+
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
 ///
@@ -565,10 +582,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // (NET-138): a supervisor restarted under a session's live box reloads
     // its row detached, for the box to attach again or its creator to
     // resume inside the grace — never from anything the guest reports.
-    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone())
-        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
-        .persisting_to(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
+    let boxes = supervisor_registry(
+        proxy_attachments.clone(),
+        egress_deny_all_opt_out,
+        state_dir.dir().join(crate::box_registry::REGISTRY_FILE),
+    );
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -1430,6 +1448,16 @@ fn cap_bep_log(log: &std::path::Path, cap: u64) -> std::io::Result<()> {
     }
 }
 
+/// The flag that tells `bep serve` to stop when its standard input closes.
+/// The supervisor holds the pipe's write end, and the kernel closes it when
+/// the supervisor exits, even by SIGKILL, so a supervisor that dies without
+/// unwinding still stops its proxy. It is the one mechanism on macOS, which
+/// has no parent-death signal. On Linux it backs up `PR_SET_PDEATHSIG`
+/// ([`tie_to_parent`]). #2501
+/// (https://github.com/gominimal/minimal/issues/2501).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const BEP_LIFELINE_FLAG: &str = "--exit-on-stdin-close";
+
 /// How often the proxy's watcher looks for an exit or a stop.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1478,8 +1506,11 @@ struct BepProxy {
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl BepProxy {
-    /// Starts `binary serve --listener <listener>`, with `token` as 64 hex
-    /// digits on its standard input and its output appended to `log`.
+    /// Starts `binary serve --listener <listener> --exit-on-stdin-close`,
+    /// with `token` as 64 hex digits on its standard input and its output
+    /// appended to `log`. The standard input stays open after the token for
+    /// as long as the child is owned here: it is the supervisor's lifeline
+    /// ([`BEP_LIFELINE_FLAG`]).
     fn spawn(
         binary: &std::path::Path,
         listener: &std::path::Path,
@@ -1506,6 +1537,7 @@ impl BepProxy {
             .arg("serve")
             .arg("--listener")
             .arg(listener)
+            .arg(BEP_LIFELINE_FLAG)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
@@ -1516,13 +1548,18 @@ impl BepProxy {
             line.push_str(&format!("{byte:02x}"));
         }
         line.push('\n');
-        // The proxy reads one line and closes its end. Dropping ours after
-        // the write is the end of input either way.
-        let written = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("the proxy's standard input was not piped"))
-            .and_then(|mut stdin| stdin.write_all(line.as_bytes()));
+        // The proxy reads one line, then waits for the end of its input.
+        // Our end goes back into the child, so it closes when the watcher
+        // drops the child or this process exits for any reason: a crash or
+        // SIGKILL closes it too, and the proxy stops (#2501).
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush()),
+            None => Err(std::io::Error::other(
+                "the proxy's standard input was not piped",
+            )),
+        };
         if let Err(error) = written {
             let _ = child.kill();
             let _ = child.wait();
@@ -1569,8 +1606,8 @@ impl BepProxy {
 /// `PR_SET_PDEATHSIG(SIGTERM)` in the child. The signal follows the thread
 /// that forks, and the supervisor's boot thread lives as long as the VM.
 /// The child exits at once when the supervisor is already gone at the
-/// `prctl`. macOS has no parent-death signal: #2501
-/// (https://github.com/gominimal/minimal/issues/2501) owns that half.
+/// `prctl`. macOS has no parent-death signal, so there the proxy's standard
+/// input is the tie: [`BEP_LIFELINE_FLAG`].
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn tie_to_parent(command: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
@@ -3220,6 +3257,23 @@ fn await_publish_report(
 
 #[cfg(test)]
 mod tests {
+    // BEP-043: the daemon's start path sends a live box's revocation to the
+    // proxy's control socket under the home directory.
+    #[test]
+    fn supervisor_registry_sends_revocations_to_the_home_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = super::supervisor_registry(
+            crate::bep_attach::Attachments::new(),
+            false,
+            dir.path().join("registry.json"),
+        );
+        assert_eq!(
+            registry.proxy_control(),
+            crate::box_registry::home_proxy_control().as_deref()
+        );
+        assert!(registry.proxy_control().is_some());
+    }
+
     #[cfg(not(minvmd_libkrun))]
     use super::*;
 
@@ -4548,7 +4602,11 @@ mod tests {
         let args = std::fs::read_to_string(seen.with_extension("args")).unwrap();
         assert_eq!(
             args.trim_end(),
-            format!("serve --listener {}", listener.display())
+            format!(
+                "serve --listener {} {}",
+                listener.display(),
+                super::BEP_LIFELINE_FLAG
+            )
         );
         assert!(!args.contains(&hex), "the token never rides in argv");
         assert!(
@@ -4630,6 +4688,56 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         drop(proxy);
+    }
+
+    /// #2501: the proxy's standard input stays open after the token for as
+    /// long as the supervisor owns the child, and closes when it lets go.
+    /// The kernel closes the same end when the supervisor dies without
+    /// unwinding (`bep::supervisor` proves that half with a SIGKILL'd
+    /// writer), so `bep serve --exit-on-stdin-close` stops on any host.
+    #[test]
+    fn proxy_is_started_with_the_per_boot_token_and_a_lifeline_on_its_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let eof = dir.path().join("eof");
+        let bin = dir.path().join("bep");
+        // A reader in the background holds the input past the token, as
+        // `bep serve` does, and records the end of input. An asynchronous
+        // list's input is /dev/null unless redirected, hence fd 3.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r token\n\
+                 exec 3<&0\n\
+                 ( cat <&3 >/dev/null; echo closed > '{eof}' ) &\n\
+                 exec sleep 30\n",
+                eof = eof.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let log = listener.with_file_name(super::BEP_LOG_FILE);
+        let token = [9u8; switch::bep_host::TOKEN_LEN];
+
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
+        assert!(
+            !eof.exists(),
+            "the input stays open after the token while the supervisor lives"
+        );
+
+        drop(proxy);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !eof.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the input never closed when the supervisor let go"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// The proxy's log, appended across boots, moves aside to `bep.log.old`

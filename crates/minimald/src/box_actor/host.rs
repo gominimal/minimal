@@ -65,6 +65,182 @@ pub(super) fn leave_quic443_cohort(
     crate::net::classifier::cohort_quic443_depart_over(cohort, box_id, moves);
 }
 
+/// Which launch of each box holds its `host_ip` cohort membership
+/// (BEP-018). A launch takes a new number before it joins, so the runtime
+/// loop of a host it replaced cannot take the new launch's membership away
+/// when that loop ends late.
+#[derive(Debug, Default)]
+pub(super) struct Quic443Launches {
+    /// The number the next launch takes.
+    next: u64,
+    /// The launch that holds each member's place, by box id.
+    current: std::collections::BTreeMap<String, u64>,
+}
+
+impl Quic443Launches {
+    /// An empty table, for the daemon's one static.
+    const fn new() -> Self {
+        Self {
+            next: 0,
+            current: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// The daemon's one table of cohort launches.
+static QUIC443_LAUNCHES: std::sync::Mutex<Quic443Launches> =
+    std::sync::Mutex::new(Quic443Launches::new());
+
+/// The daemon's one table of cohort launches, for the launch and stop paths.
+pub(super) fn quic443_launches() -> &'static std::sync::Mutex<Quic443Launches> {
+    &QUIC443_LAUNCHES
+}
+
+fn lock_launches(
+    launches: &std::sync::Mutex<Quic443Launches>,
+) -> std::sync::MutexGuard<'_, Quic443Launches> {
+    launches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether a launch of `record` joins the `host_ip` cohort: a host-address
+/// box that the launch placed. [`join_quic443_cohort`] joins exactly these.
+pub(super) fn joins_quic443_cohort(
+    record: &Record,
+    host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
+) -> bool {
+    host_ip_enforcement.is_some() && record.network == boxes::NetworkMode::HostNet
+}
+
+/// Gives the box `box_id` a new launch number, before that launch joins the
+/// cohort. Any earlier launch of the box stops holding its place.
+pub(super) fn begin_quic443_launch(
+    box_id: &str,
+    launches: &std::sync::Mutex<Quic443Launches>,
+) -> u64 {
+    let mut launches = lock_launches(launches);
+    launches.next += 1;
+    let launch = launches.next;
+    launches.current.insert(box_id.to_string(), launch);
+    launch
+}
+
+/// The stop's departure, with the launch table: the box `box_id` leaves the
+/// cohort whichever launch joined it, and no launch holds its place after.
+pub(super) fn stop_quic443_launch(
+    box_id: &str,
+    launches: &std::sync::Mutex<Quic443Launches>,
+    cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+    moves: &dyn crate::net::classifier::CgroupMoves,
+) {
+    let mut launches = lock_launches(launches);
+    launches.current.remove(box_id);
+    leave_quic443_cohort(box_id, cohort, moves);
+}
+
+/// The exit path's half of the cohort's QUIC stance (BEP-018): the host
+/// process of launch `launch` ended on its own, so the box `box_id` leaves
+/// the cohort as a stop makes it leave. When it was the last blocking
+/// member, the other members move back to their own leaves. A launch that
+/// no longer holds the box's place changes nothing. Returns whether the box
+/// left.
+pub(super) fn exit_quic443_launch(
+    box_id: &str,
+    launch: u64,
+    launches: &std::sync::Mutex<Quic443Launches>,
+    cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+    moves: &dyn crate::net::classifier::CgroupMoves,
+) -> bool {
+    let mut launches = lock_launches(launches);
+    if launches.current.get(box_id) != Some(&launch) {
+        return false;
+    }
+    launches.current.remove(box_id);
+    leave_quic443_cohort(box_id, cohort, moves);
+    let blocking: Vec<String> = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .blocking_members()
+        .map(str::to_string)
+        .collect();
+    drop(launches);
+    tracing::info!(
+        box_id,
+        blocking_members = ?blocking,
+        "a host-address box's shell exited on its own; the box left the cohort's \
+         UDP 443 stance"
+    );
+    true
+}
+
+/// Where a host's exit is observed for the cohort: the launch, the box and
+/// the cohort it leaves.
+pub(super) struct Quic443Exit {
+    pub(super) box_id: String,
+    pub(super) launch: u64,
+    pub(super) launches: &'static std::sync::Mutex<Quic443Launches>,
+    pub(super) cohort: &'static std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+    pub(super) moves: &'static (dyn crate::net::classifier::CgroupMoves + Sync),
+}
+
+/// Aborts the host's runtime loop when the task that watches it is
+/// aborted, so an abort of the watched handle reaches the loop as before.
+struct AbortLoopOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortLoopOnDrop {
+    /// The loop ended by itself: nothing is left to abort.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortLoopOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Watches a `host_ip` box's runtime loop `task`. When the loop ends, the
+/// host process exited, and the box leaves the cohort
+/// ([`exit_quic443_launch`]). The handle it returns stands in for `task`:
+/// it yields the loop's result, and an abort of it aborts the loop. An
+/// aborted loop leaves nothing here, because the stop that aborts it leaves
+/// the cohort itself.
+pub(super) fn watch_quic443_exit(
+    task: JoinHandle<Result<i32, std::io::Error>>,
+    exit: Quic443Exit,
+) -> JoinHandle<Result<i32, std::io::Error>> {
+    let mut abort_loop = AbortLoopOnDrop(Some(task.abort_handle()));
+    // The watcher lives as long as the loop it watches: its own root, as the
+    // loop has.
+    let root = tracing::info_span!(
+        parent: None,
+        "session.host.quic443_exit",
+        box_id = %exit.box_id,
+    );
+    crate::traced::spawn_detached(root, async move {
+        let result = task.await;
+        abort_loop.disarm();
+        // Leave before a panic unwinds: a loop that panicked still ends the
+        // launch, and a blocking member must not keep the block in place.
+        exit_quic443_launch(
+            &exit.box_id,
+            exit.launch,
+            exit.launches,
+            exit.cohort,
+            exit.moves,
+        );
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    })
+}
+
 /// Where in the session lifecycle a host launch is happening, which decides
 /// whether the launch has to wait for an `Active` record.
 ///
@@ -442,8 +618,9 @@ impl BoxActor {
         // the last blocking member, the other members move back to their
         // own leaves and send UDP 443 again. A box that never joined
         // changes nothing.
-        leave_quic443_cohort(
+        stop_quic443_launch(
             &self.record.id().to_string(),
+            quic443_launches(),
             crate::net::classifier::cohort_quic443(),
             &crate::net::classifier::KernelMoves,
         );
@@ -637,6 +814,11 @@ impl BoxActor {
         // the box's own leaf.
         // A launch whose box cannot be placed under the block fails here,
         // and its box is killed: a blocked stance never fails open.
+        // The launch number is taken before the join, so the loop of a host
+        // this launch replaced cannot take the new membership away.
+        let box_id = record.id.to_string();
+        let joins = joins_quic443_cohort(&record, host_ip_enforcement);
+        let launch = joins.then(|| begin_quic443_launch(&box_id, quic443_launches()));
         if let Err(error) = join_quic443_cohort(
             &record,
             host_ip_enforcement,
@@ -644,9 +826,30 @@ impl BoxActor {
             crate::net::classifier::cohort_quic443(),
             &crate::net::classifier::KernelMoves,
         ) {
+            stop_quic443_launch(
+                &box_id,
+                quic443_launches(),
+                crate::net::classifier::cohort_quic443(),
+                &crate::net::classifier::KernelMoves,
+            );
             let _ = host.kill(false).await;
             return Err(AttachError::SpawnFailed(quic443_placement_refused(&error)));
         }
+        // BEP-018: a shell that exits on its own ends the host's loop with no
+        // Stop. The box leaves the cohort then, as a stop makes it leave.
+        let task = match launch {
+            Some(launch) => watch_quic443_exit(
+                task,
+                Quic443Exit {
+                    box_id,
+                    launch,
+                    launches: quic443_launches(),
+                    cohort: crate::net::classifier::cohort_quic443(),
+                    moves: &crate::net::classifier::KernelMoves,
+                },
+            ),
+            None => task,
+        };
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -1247,5 +1450,117 @@ mod quic443_cohort_tests {
         assert_eq!(guard.blocking_members().count(), 0);
         drop(guard);
         assert_eq!(moves.where_is(100), plain_leaf, "the member stays home");
+    }
+
+    /// BEP-018 over the exit path: the only blocked member's shell exits on
+    /// its own, with no Stop and no destroy. Its host's loop ends, the box
+    /// leaves the cohort, and the other member's processes go home, where
+    /// UDP 443 leaves again. A loop of a launch that a later launch replaced
+    /// changes nothing when it ends, and an abort of the watched handle
+    /// still reaches the loop.
+    #[tokio::test]
+    async fn host_ip_cohort_shell_exit_leaves_and_lifts_the_block() {
+        use super::{
+            Quic443Exit, Quic443Launches, begin_quic443_launch, joins_quic443_cohort,
+            watch_quic443_exit,
+        };
+        use boxes::core::bep::Quic443;
+
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        for dir in [sandbox::config::DENY_DIR, sandbox::config::ALLOW_DIR] {
+            std::fs::create_dir_all(root.join(sandbox::classifier::BOXES_DIR).join(dir)).unwrap();
+        }
+        let blocked_leaf = quic443_blocked_leaf(root);
+        std::fs::create_dir(&blocked_leaf).unwrap();
+        let cohort: &'static std::sync::Mutex<CohortQuic443> =
+            Box::leak(Box::new(std::sync::Mutex::new(CohortQuic443::default())));
+        let launches: &'static std::sync::Mutex<Quic443Launches> =
+            Box::leak(Box::new(std::sync::Mutex::new(Quic443Launches::default())));
+        let moves: &'static StandinMoves = Box::leak(Box::new(StandinMoves::default()));
+
+        // A launch as `launch_host` makes it: a number, the join, and the
+        // loop handed back behind its watcher. The loop ends when its
+        // shell exits, which the sender stands in for.
+        let launch = |record: &Record, pid: i32| {
+            assert!(joins_quic443_cohort(record, record.host_ip_enforcement));
+            let box_id = record.id.to_string();
+            let leaf = sandbox::classifier::box_leaf(root, &box_id, Verdict::Allow);
+            if !leaf.is_dir() {
+                sandbox::classifier::create_box_leaf(root, &box_id, Verdict::Allow).unwrap();
+            }
+            moves.spawn_in(pid, &leaf);
+            let number = begin_quic443_launch(&box_id, launches);
+            join_quic443_cohort(record, record.host_ip_enforcement, root, cohort, moves)
+                .expect("the box is placed");
+            let (exit, exited) = tokio::sync::oneshot::channel::<i32>();
+            // A negative code stands in for a loop that panics.
+            let task = crate::traced::spawn(async move {
+                let code = exited.await.unwrap_or(137);
+                assert!(code >= 0, "the host loop panics");
+                Ok(code)
+            });
+            let watched = watch_quic443_exit(
+                task,
+                Quic443Exit {
+                    box_id,
+                    launch: number,
+                    launches,
+                    cohort,
+                    moves,
+                },
+            );
+            (leaf, exit, watched)
+        };
+
+        let plain = host_ip_record(None);
+        let (plain_leaf, _plain_exit, plain_task) = launch(&plain, 100);
+        let strict = host_ip_record(Some(Quic443::Block));
+        let (_, strict_exit, strict_task) = launch(&strict, 200);
+        assert!(cohort.lock().unwrap().blocked());
+        assert_eq!(moves.where_is(100), blocked_leaf);
+
+        // The blocked member's shell exits on its own: its loop ends with
+        // the shell's code, and the block lifts with no Stop.
+        moves.kill(200);
+        strict_exit.send(0).unwrap();
+        assert_eq!(strict_task.await.unwrap().unwrap(), 0);
+        assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
+        assert_eq!(cohort.lock().unwrap().blocking_members().count(), 0);
+        assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
+
+        // A relaunch of the blocked box replaces a loop that ends late: the
+        // late end leaves the relaunch's block in place.
+        let (_, stale_exit, stale_task) = launch(&strict, 300);
+        moves.kill(300);
+        let (_, mut relaunch_exit, relaunch_task) = launch(&strict, 400);
+        assert_eq!(moves.where_is(100), blocked_leaf);
+        stale_exit.send(0).unwrap();
+        stale_task.await.unwrap().unwrap();
+        assert!(
+            cohort.lock().unwrap().blocked(),
+            "the relaunch still blocks"
+        );
+        assert_eq!(moves.where_is(100), blocked_leaf);
+
+        // An abort of the watched handle reaches the loop, as a stop's
+        // abort did before the watcher, and leaves the cohort to the stop.
+        relaunch_task.abort();
+        assert!(relaunch_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), relaunch_exit.closed())
+            .await
+            .expect("the loop under the watcher is aborted too");
+        assert!(cohort.lock().unwrap().blocked(), "the stop's to lift");
+
+        // A loop that panics still ends the launch: the box leaves before
+        // the panic reaches the watched handle, and the block lifts.
+        let (_, panic_exit, panic_task) = launch(&strict, 500);
+        assert_eq!(moves.where_is(100), blocked_leaf);
+        moves.kill(500);
+        panic_exit.send(-1).unwrap();
+        assert!(panic_task.await.unwrap_err().is_panic());
+        assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
+        assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
+        plain_task.abort();
     }
 }
