@@ -1911,77 +1911,81 @@ pub(crate) async fn activate_box(
     // has to run before `ConfigureLoadout`. `--sync none` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
-    ActivationStep::UploadFiles.run(async {
-    match sync_mode {
-        SyncMode::None => {
-            // `--sync none` skips the upload, so the daemon composes against
-            // an empty workspace and the project's `minimal.toml` — packages,
-            // vars, patches, hooks — is silently dropped. Say so when there
-            // is a config to lose, so the default-config session is not a
-            // surprise.
-            if let Some(notice) = sync_none_notice(&utf8_path) {
-                eprintln!("{notice}");
-            }
-        }
-        SyncMode::Tarball => {
-            let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let decision = decide_workspace_upload(
-                &upload_root,
-                sync_explicit,
-                headless,
-                std::env::home_dir().as_deref(),
-            );
-            // The resolved-root notice is CLI presentation, and precedes the
-            // upload bar it explains.
-            if decision != UploadDecision::SkipEmptyOrHome
-                && let Some(notice) = resolved_upload_root_notice(&utf8_path, &upload_root)
-            {
-                eprintln!("{notice}");
-            }
-            let outcome = run_workspace_upload(
-                &mut client,
-                id,
-                &upload_root,
-                decision,
-                || {
-                    confirm(
-                        &format!(
-                            "{upload_root} is not a version control repository root. \
+    ActivationStep::UploadFiles
+        .run(async {
+            match sync_mode {
+                SyncMode::None => {
+                    // `--sync none` skips the upload, so the daemon composes against
+                    // an empty workspace and the project's `minimal.toml` — packages,
+                    // vars, patches, hooks — is silently dropped. Say so when there
+                    // is a config to lose, so the default-config session is not a
+                    // surprise.
+                    if let Some(notice) = sync_none_notice(&utf8_path) {
+                        eprintln!("{notice}");
+                    }
+                }
+                SyncMode::Tarball => {
+                    let upload_root =
+                        upload_root.expect("upload_root is set for SyncMode::Tarball above");
+                    let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+                    let decision = decide_workspace_upload(
+                        &upload_root,
+                        sync_explicit,
+                        headless,
+                        std::env::home_dir().as_deref(),
+                    );
+                    // The resolved-root notice is CLI presentation, and precedes the
+                    // upload bar it explains.
+                    if decision != UploadDecision::SkipEmptyOrHome
+                        && let Some(notice) = resolved_upload_root_notice(&utf8_path, &upload_root)
+                    {
+                        eprintln!("{notice}");
+                    }
+                    let outcome = run_workspace_upload(
+                        &mut client,
+                        id,
+                        &upload_root,
+                        decision,
+                        || {
+                            confirm(
+                                &format!(
+                                    "{upload_root} is not a version control repository root. \
                              Upload all files from this directory?"
-                        ),
-                        false,
+                                ),
+                                false,
+                            )
+                        },
+                        UploadProgress::Bar,
                     )
-                },
-                UploadProgress::Bar,
-            )
-            .await;
-            // A skip that would silently drop the project's lifecycle hooks
-            // refuses here (and any upload failure) — either abandons the
-            // activation, and the row its registration bought goes with it
-            // (T66). `--no-hooks` already disabled them, so that skip cannot
-            // drop anything by surprise and says nothing about them.
-            let dropped_hooks = if args.no_hooks {
-                DroppedHooksPolicy::Ignore
-            } else {
-                DroppedHooksPolicy::Refuse
+                    .await;
+                    // A skip that would silently drop the project's lifecycle hooks
+                    // refuses here (and any upload failure) — either abandons the
+                    // activation, and the row its registration bought goes with it
+                    // (T66). `--no-hooks` already disabled them, so that skip cannot
+                    // drop anything by surprise and says nothing about them.
+                    let dropped_hooks = if args.no_hooks {
+                        DroppedHooksPolicy::Ignore
+                    } else {
+                        DroppedHooksPolicy::Refuse
+                    };
+                    if let Err(error) = report_upload_outcome(outcome, &upload_root, dropped_hooks)
+                    {
+                        withdraw_box_row(
+                            control_sock.clone(),
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
+                            registered
+                                .as_ref()
+                                .and_then(|registration| registration.box_id),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
             };
-            if let Err(error) = report_upload_outcome(outcome, &upload_root, dropped_hooks) {
-                withdraw_box_row(
-                    control_sock.clone(),
-                    request.config.name.as_deref(),
-                    request.config.box_addresses,
-                    registered
-                        .as_ref()
-                        .and_then(|registration| registration.box_id),
-                )
-                .await;
-                return Err(error);
-            }
-        }
-    };
-    Ok::<_, anyhow::Error>(())
-    }).await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
 
     // Collect the client-side patches (from loadouts, already gated
     // in Phase 1) *before* the wire contribution moves into the
