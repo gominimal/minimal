@@ -12,16 +12,31 @@ use bep::audit::{LogCheck, verify_dir};
 
 use crate::task::TaskExit;
 
-/// The result line of the audit chain check, as `min doctor` prints it.
+/// The result lines of the audit chain check, as `min doctor` prints them.
 // The two outcome lines are fixed by the plan's diagnostics for BEP-049.
-fn audit_line(check: &LogCheck) -> String {
+// The lines after "chain verified." name each file where the check starts
+// again, because the files before it are missing (the BEP-049 residual).
+fn audit_lines(check: &LogCheck) -> Vec<String> {
     match &check.broken {
-        Some((segment, record)) => format!(
+        Some((segment, record)) => vec![format!(
             "Audit log: the hash chain breaks at record {record} of {}; a record was changed or removed.",
             segment.display()
-        ),
-        None if check.records == 0 => "Audit log: no records yet.".to_owned(),
-        None => "Audit log: chain verified.".to_owned(),
+        )],
+        None if check.records == 0 => vec!["Audit log: no records yet.".to_owned()],
+        None => {
+            let mut lines = vec!["Audit log: chain verified.".to_owned()];
+            for segment in &check.restarts {
+                lines.push(format!(
+                    "Audit log: the files before {} are missing, so the check starts again there.",
+                    segment.display()
+                ));
+                lines.push(
+                    "Audit log: min removes old audit files, so the check cannot tell if a person removed them."
+                        .to_owned(),
+                );
+            }
+            lines
+        }
     }
 }
 
@@ -38,17 +53,25 @@ pub(crate) fn run(dir: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
         dir = %dir.display(),
         segments = ?check.segments.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         records = check.records,
+        restarts = ?check.restarts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         outcome,
         "checked the audit log hash chain"
     );
-    writeln!(out, "{}", audit_line(&check))?;
+    for line in audit_lines(&check) {
+        writeln!(out, "{line}")?;
+    }
     Ok(check.broken.is_none())
 }
 
 /// `min doctor`. Exits 1, with no further message, when a check fails.
 pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
     // Interim (BEP-042): the client reads the proxy's log files on the host
-    // directly, as `min box audit` does.
+    // directly, as `min box audit` does. The architecture's audit paragraph
+    // and Gatehouse §6.10 put the un-enrolled read behind the proxy's local
+    // socket. Flip to that read when the proxy serves it, and drop this
+    // direct read.
+    // Tracked by https://github.com/gominimal/minimal/issues/2459, ended by
+    // https://github.com/gominimal/minimal/issues/2463.
     let dir = bep::audit::default_dir()
         .context("cannot find the home directory, so the audit log cannot be found")?;
     if run(&dir, &mut std::io::stdout().lock())? {
@@ -125,6 +148,22 @@ mod tests {
                 false,
                 format!(
                     "Audit log: the hash chain breaks at record 1 of {}; a record was changed or removed.\n",
+                    segments[1].display()
+                )
+            )
+        );
+
+        // With the oldest file gone, the rest verifies, and the check says
+        // where it starts again.
+        std::fs::remove_file(&segments[0]).unwrap();
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                true,
+                format!(
+                    "Audit log: chain verified.\n\
+                     Audit log: the files before {} are missing, so the check starts again there.\n\
+                     Audit log: min removes old audit files, so the check cannot tell if a person removed them.\n",
                     segments[1].display()
                 )
             )
