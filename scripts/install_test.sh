@@ -957,9 +957,11 @@ EOF
         grep -q "still installed on this host.*classifier units" "$OUT"
     want_ok "the classifier tree is advised" \
         grep -q "still installed on this host.*classifier tree" "$OUT"
+    want_ok "the QUIC block helper is advised as its own item" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule" "$OUT"
     want_ok "non-interactive uninstall never elevates (the tree survives)" \
         test -d "$fake_ns4/$cls_tree/classifier-table"
-    apply_remedies 2
+    apply_remedies 3
     for f in $cls_files "$cls_tree" usr/local/lib/minimal; do
         want_err "the printed remedies remove $f" test -e "$fake_ns4/$f"
     done
@@ -1017,8 +1019,10 @@ EOF
     run ns4d_run "$HNS4D" --uninstall
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with only the QUIC block helper exits 0"
-    want_ok "the uninstall names the QUIC block helper" \
-        grep -q "still installed on this host.*/usr/local/lib/minimal/quic443-leaf" "$OUT"
+    want_ok "the uninstall names the QUIC block helper and its sudoers rule" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule (/usr/local/lib/minimal/quic443-leaf)" "$OUT"
+    want_err "the QUIC block helper is not called a classifier unit" \
+        grep -q "classifier units" "$OUT"
     want_ok "non-interactive uninstall never elevates (the helper survives)" \
         test -f "$fake_ns4d/usr/local/lib/minimal/quic443-leaf"
     apply_remedies 1
@@ -1071,7 +1075,7 @@ EOF
     done
     want_ok "non-interactive uninstall leaves the system profile in place" \
         test -f "$fake_aa6/minimald"
-    apply_remedies 5
+    apply_remedies 6
     for f in $all_files "$cls_tree" usr/local/lib/minimal run/minimal; do
         want_err "the printed remedies remove $f" test -e "$fake_ns6/$f"
     done
