@@ -260,7 +260,11 @@ mod tests {
         let (wire, _) = UserComposer::new()
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
-        assert!(wire.orientation.loadouts_display.is_empty());
+        assert!(
+            wire.orientation.loadouts_display.is_empty(),
+            "expected empty, got {:?}",
+            wire.orientation.loadouts_display
+        );
     }
 
     /// The orientation field survives the daemon-side merge into the

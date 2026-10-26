@@ -522,6 +522,10 @@ fn create_session_request_round_trips() {
                 sealed: "sealed-value".into(),
             }],
             root_certificate: Some("-----BEGIN CERTIFICATE-----".into()),
+            // The non-defaults, so neither field can round-trip green
+            // while it is left off the wire.
+            creating_verb: CreatingVerb::Task,
+            project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
         },
         must_match_version: Some("0.6.0".into()),
     };
@@ -554,6 +558,8 @@ fn create_request_constructor_round_trips() {
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
+                creating_verb: CreatingVerb::Session,
+                project_root: None,
             },
             must_match_version: None,
         }

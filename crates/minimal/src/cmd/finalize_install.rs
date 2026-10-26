@@ -520,6 +520,9 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
             items.extend(linux::userns_item_on_this_host());
         }
         if global.use_minvmd() {
+            // BEP-047: the vm-users item is not offered until minvmd starts
+            // the VM and gvproxy through `sudo -n` (T66, #2566). Its drop-in
+            // names subcommands minvmd does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
             items.push(linux::classifier_item_on_this_host(global));
@@ -1345,6 +1348,530 @@ pub(crate) mod linux {
         let operator = crate::resolver::operator_name();
         let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
+    }
+
+    // ── The VM's own users (BEP-047) ──────────────────────────────────────
+    //
+    // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
+    // each started by the login through `sudo -n -u` under a drop-in this
+    // item installs. The users, the directories and the modes are the ones
+    // `docs/design/2026-10-25-split-user-vmm-provider-dir.md` lays out.
+
+    pub(crate) const VM_USERS_ID: &str = "vm-users";
+    const VM_USERS_LABEL: &str = "separate users for the VM and its network switch";
+    /// The user the VMM child runs as.
+    pub(crate) const VMM_USER: &str = "minimal-vmm";
+    /// The user gvproxy and the EGW process run as.
+    pub(crate) const GVPROXY_USER: &str = "minimal-gvproxy";
+    /// The sudoers drop-in. Its name has no `.`, so `sudo` reads it.
+    pub(crate) const SUDOERS_DROP_IN: &str = "/etc/sudoers.d/minimal-vm";
+    /// A world-readable copy of the drop-in: `/etc/sudoers.d` is not
+    /// readable by the login, so the probe compares this copy. The gap is
+    /// accepted: a drop-in that root deletes or edits while the copy stays
+    /// reads as done, and the `sudo -n` spawn then fails and says so.
+    pub(crate) const VM_USERS_RECORD: &str = "/var/lib/minimal/finalize-install-vm-users";
+    /// The root-owned base of the gvproxy, gvproxy config and gate dirs.
+    pub(crate) const VM_USERS_BASE: &str = "/var/lib/minimal";
+    /// The `minvmd` subcommand of the EGW process the drop-in admits.
+    pub(crate) const EGW_SUBCOMMAND: &str = "__egw";
+    /// The `minvmd` subcommand of the two stop rules the drop-in admits.
+    pub(crate) const STOP_SUBCOMMAND: &str = "__stop-group";
+    /// The `minvmd` subcommand of the VMM child.
+    pub(crate) const VMM_SUBCOMMAND: &str = "__krun-vmm";
+    /// The test that follows every `cd -P` in the script: `..` is the
+    /// directory the walk was in, by device and inode. The caller ends it
+    /// with the message, `" >&2; exit 1; }`.
+    const CD_PARENT_CHECK: &str = "[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \"";
+
+    /// One directory as `lstat` reads it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct DirFact {
+        pub uid: u32,
+        pub gid: u32,
+        /// The permission bits with setgid: `st_mode & 0o7777`.
+        pub mode: u32,
+        /// A directory, not a symlink or a file.
+        pub is_dir: bool,
+    }
+
+    /// The paths the item works on, for one login and one VM.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct VmUsersLayout {
+        pub provider_dir: std::path::PathBuf,
+        pub vm_dir: std::path::PathBuf,
+        pub gvproxy_dir: std::path::PathBuf,
+        pub gvproxy_config_dir: std::path::PathBuf,
+        pub gate_dir: std::path::PathBuf,
+    }
+
+    impl VmUsersLayout {
+        /// The layout for `operator`'s `vm` with its provider dir at
+        /// `provider_dir`, under [`VM_USERS_BASE`].
+        pub(crate) fn new(provider_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
+            let vm_dir = std::path::Path::new(VM_USERS_BASE).join(operator).join(vm);
+            VmUsersLayout {
+                provider_dir,
+                gvproxy_dir: vm_dir.join("gvproxy"),
+                gvproxy_config_dir: vm_dir.join("gvproxy-config"),
+                gate_dir: vm_dir.join("gate"),
+                vm_dir,
+            }
+        }
+
+        pub(crate) fn vmm_dir(&self) -> std::path::PathBuf {
+            self.provider_dir.join("vmm")
+        }
+    }
+
+    /// The facts the VM users item decides on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct VmUsersFacts {
+        pub operator: String,
+        pub operator_uid: u32,
+        /// `/etc/passwd`.
+        pub passwd: String,
+        /// `/etc/group`.
+        pub group: String,
+        /// The VM name the rules name.
+        pub vm: String,
+        pub layout: VmUsersLayout,
+        pub provider: Option<DirFact>,
+        pub vmm: Option<DirFact>,
+        pub gvproxy_dir: Option<DirFact>,
+        pub gvproxy_config_dir: Option<DirFact>,
+        pub gate_dir: Option<DirFact>,
+        /// [`VM_USERS_RECORD`], when readable.
+        pub record: Option<String>,
+        /// The `minvmd` the rules name, or why no rule can name it.
+        pub minvmd: Result<std::path::PathBuf, String>,
+        /// The gvproxy the rule names, or why no rule can name it.
+        pub gvproxy: Result<std::path::PathBuf, String>,
+    }
+
+    /// The uid and gid `/etc/passwd` gives `user`.
+    pub(crate) fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
+        passwd.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.len() >= 4 && fields[0] == user)
+                .then(|| Some((fields[2].parse().ok()?, fields[3].parse().ok()?)))
+                .flatten()
+        })
+    }
+
+    /// The gid and the member list `/etc/group` gives `group_name`.
+    pub(crate) fn group_entry(group: &str, group_name: &str) -> Option<(u32, Vec<String>)> {
+        group.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 4 || fields[0] != group_name {
+                return None;
+            }
+            let members = fields[3]
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some((fields[2].parse().ok()?, members))
+        })
+    }
+
+    /// `arg` escaped for a sudoers command line: `\`, `,`, `:` and `=`
+    /// take a backslash. `None` when it holds a character no rule can carry
+    /// as one literal argument: whitespace, a control character, a quote,
+    /// `#`, or one of the sudoers wildcard and negation characters `*`, `?`,
+    /// `[`, `]` and `!`, which make a rule match more than one command line.
+    pub(crate) fn sudoers_arg(arg: &str) -> Option<String> {
+        if arg.is_empty()
+            || arg.chars().any(|c| {
+                c.is_whitespace()
+                    || c.is_control()
+                    || matches!(c, '\'' | '"' | '#' | '*' | '?' | '[' | ']' | '!')
+            })
+        {
+            return None;
+        }
+        let mut out = String::with_capacity(arg.len());
+        for c in arg.chars() {
+            if matches!(c, '\\' | ',' | ':' | '=') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        Some(out)
+    }
+
+    /// The drop-in for `operator`: the gvproxy, VMM child and EGW spawns
+    /// and the two stop rules, each with a root-owned absolute binary and
+    /// literal arguments, `env_reset` with an empty `env_keep`, and
+    /// `umask=0077` with `umask_override` for gvproxy. `None` when a path
+    /// or a name cannot be a literal sudoers argument.
+    pub(crate) fn sudoers_drop_in(
+        operator: &str,
+        vm: &str,
+        layout: &VmUsersLayout,
+        minvmd: &std::path::Path,
+        gvproxy: &std::path::Path,
+    ) -> Option<String> {
+        let path = |p: &std::path::Path| sudoers_arg(p.to_str()?);
+        let minvmd = path(minvmd)?;
+        let gvproxy = path(gvproxy)?;
+        let vm = sudoers_arg(vm)?;
+        let config = path(&layout.gvproxy_config_dir.join("gvproxy.yaml"))?;
+        let listen = sudoers_arg(&format!(
+            "unix://{}",
+            layout.gvproxy_dir.join("gvproxy-switch.sock").to_str()?
+        ))?;
+        let operator = sudoers_arg(operator)?;
+        Some(format!(
+            "# Written by min finalize-install. It lets {operator} start the Minimal VM as\n\
+             # {VMM_USER} and its network switch as {GVPROXY_USER}, and nothing else.\n\
+             Cmnd_Alias MINIMAL_GVPROXY_SPAWN = {gvproxy} -config {config} -listen {listen} -ssh-port -1\n\
+             Cmnd_Alias MINIMAL_EGW_SPAWN = {minvmd} {EGW_SUBCOMMAND} {vm}\n\
+             Cmnd_Alias MINIMAL_VMM_SPAWN = {minvmd} {VMM_SUBCOMMAND} {vm}\n\
+             Cmnd_Alias MINIMAL_STOP = {minvmd} {STOP_SUBCOMMAND} {vm}\n\
+             Defaults!MINIMAL_GVPROXY_SPAWN env_reset, !env_keep, umask=0077, umask_override\n\
+             Defaults!MINIMAL_EGW_SPAWN env_reset, !env_keep, !use_pty\n\
+             Defaults!MINIMAL_VMM_SPAWN env_reset, !env_keep, !use_pty\n\
+             Defaults!MINIMAL_STOP env_reset, !env_keep, !use_pty\n\
+             {operator} ALL = ({GVPROXY_USER}) NOPASSWD: MINIMAL_GVPROXY_SPAWN, MINIMAL_EGW_SPAWN\n\
+             {operator} ALL = ({VMM_USER}) NOPASSWD: MINIMAL_VMM_SPAWN\n\
+             {operator} ALL = ({GVPROXY_USER}) NOPASSWD: MINIMAL_STOP\n\
+             {operator} ALL = ({VMM_USER}) NOPASSWD: MINIMAL_STOP\n"
+        ))
+    }
+
+    /// Whether `fact` is a directory with this owner, group and mode.
+    fn dir_is(fact: Option<DirFact>, uid: u32, gid: u32, mode: u32) -> bool {
+        fact.is_some_and(|f| f.is_dir && f.uid == uid && f.gid == gid && f.mode == mode)
+    }
+
+    /// The script block that creates the users, the directories and the
+    /// drop-in. The provider dir and `vmm/` sit in the login's state dir,
+    /// which the login can change while root works there. So root reaches
+    /// them by `cd -P`, checks that `pwd -P` is the path it means and
+    /// checks the owner of `.`, and changes only `.`.
+    fn vm_users_script(facts: &VmUsersFacts, drop_in: &str) -> String {
+        let op = &facts.operator;
+        let layout = &facts.layout;
+        let provider = layout.provider_dir.display().to_string();
+        let components: Vec<String> = layout
+            .provider_dir
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let last = components.len();
+        let mut walk = String::new();
+        let mut here = String::new();
+        for (i, name) in components.iter().enumerate() {
+            let want = if i + 1 == last {
+                "[ \"$owner\" = \"$op_uid\" ]"
+            } else {
+                "[ \"$owner\" = 0 ] || [ \"$owner\" = \"$op_uid\" ]"
+            };
+            here.push('/');
+            here.push_str(name);
+            // The login can swap the entry for a symlink between the `-L`
+            // test and the `cd`. So the device and inode of `.` are kept
+            // before the `cd`, and `..` must have them after it: the `cd`
+            // went one level down from where the walk was. The physical
+            // path is checked too.
+            walk.push_str(&format!(
+                "  [ ! -L '{name}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                 \x20 here=$(stat -c %d:%i .)\n\
+                 \x20 cd -P -- '{name}'\n\
+                 \x20 {CD_PARENT_CHECK}{provider}: a component moved\" >&2; exit 1; }}\n\
+                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                 \x20 owner=$(stat -c %u .)\n\
+                 \x20 {want} || {{ echo \"{provider}: a component has another owner\" >&2; exit 1; }}\n"
+            ));
+        }
+        let base = VM_USERS_BASE;
+        let login_dir = std::path::Path::new(base).join(op);
+        format!(
+            "# Separate users for the VM: the VMM child runs as {VMM_USER} and gvproxy as\n\
+             # {GVPROXY_USER}, each started through sudo under a drop-in that permits\n\
+             # only those spawns. {op} is the one login member of both groups.\n\
+             getent group {VMM_USER} >/dev/null || groupadd --system {VMM_USER}\n\
+             getent passwd {VMM_USER} >/dev/null || useradd --system --gid {VMM_USER} \
+             --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {VMM_USER}\n\
+             getent group {GVPROXY_USER} >/dev/null || groupadd --system {GVPROXY_USER}\n\
+             getent passwd {GVPROXY_USER} >/dev/null || useradd --system --gid {GVPROXY_USER} \
+             --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {GVPROXY_USER}\n\
+             # Each group has one login member. Another member stops the script\n\
+             # here, and nobody is removed from a group.\n\
+             for group in {VMM_USER} {GVPROXY_USER}; do\n\
+             \x20 members=$(getent group \"$group\" | cut -d: -f4)\n\
+             \x20 [ -z \"$members\" ] || [ \"$members\" = '{op}' ] || \
+             {{ echo \"group $group already has the members $members\" >&2; exit 1; }}\n\
+             \x20 gpasswd -a '{op}' \"$group\" >/dev/null\n\
+             done\n\
+             # The provider dir and its vmm/ subdirectory, reached from / one checked\n\
+             # component at a time and checked with pwd -P; only . is changed.\n\
+             (\n\
+             \x20 op_uid=$(id -u '{op}')\n\
+             \x20 cd /\n\
+             {walk}\
+             \x20 chgrp {VMM_USER} .\n\
+             \x20 chmod 0710 .\n\
+             \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
+             \x20 [ ! -L vmm ] || {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             \x20 here=$(stat -c %d:%i .)\n\
+             \x20 cd -P vmm\n\
+             \x20 {CD_PARENT_CHECK}{provider}/vmm moved\" >&2; exit 1; }}\n\
+             \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
+             {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             \x20 owner=$(stat -c %u .)\n\
+             \x20 [ \"$owner\" = 0 ] || [ \"$owner\" = \"$(id -u {VMM_USER})\" ] || \
+             {{ echo \"{provider}/vmm has another owner\" >&2; exit 1; }}\n\
+             \x20 chown root:root .\n\
+             \x20 chmod 0700 .\n\
+             \x20 chown {VMM_USER}:{VMM_USER} .\n\
+             \x20 chmod 0750 .\n\
+             )\n\
+             # The gvproxy, gvproxy config and gate dirs, under root-owned parents.\n\
+             install -d -o root -g root -m 0755 {base} '{login_dir}' '{vm_dir}'\n\
+             install -d -o {GVPROXY_USER} -g {GVPROXY_USER} -m 0750 '{gvproxy_dir}'\n\
+             install -d -o '{op}' -g {GVPROXY_USER} -m 0750 '{config_dir}'\n\
+             install -d -o {GVPROXY_USER} -g {VMM_USER} -m 0710 '{gate_dir}'\n\
+             chmod 2710 '{gate_dir}'\n\
+             # The drop-in, checked by visudo before it is put in place.\n\
+             drop_in=$(mktemp)\n\
+             cat > \"$drop_in\" <<\\MINIMAL_VM_USERS_EOF\n\
+             {drop_in}\
+             MINIMAL_VM_USERS_EOF\n\
+             visudo -cqf \"$drop_in\"\n\
+             install -o root -g root -m 0440 \"$drop_in\" {SUDOERS_DROP_IN}\n\
+             install -o root -g root -m 0644 \"$drop_in\" {VM_USERS_RECORD}\n\
+             rm -f \"$drop_in\"\n",
+            login_dir = login_dir.display(),
+            vm_dir = layout.vm_dir.display(),
+            gvproxy_dir = layout.gvproxy_dir.display(),
+            config_dir = layout.gvproxy_config_dir.display(),
+            gate_dir = layout.gate_dir.display(),
+        )
+    }
+
+    /// The VM users item over pre-read facts: done when both users exist
+    /// with the login as the one member of each group, every directory has
+    /// the owner, group and mode of the design, and the installed drop-in
+    /// is the one this host needs. Missing otherwise, with the step that
+    /// makes it so. Blocked when no rule can name the binaries.
+    pub(crate) fn vm_users_item_over(facts: &VmUsersFacts) -> Item {
+        let op = &facts.operator;
+        if op.is_empty() {
+            return Item::cannot(
+                VM_USERS_ID,
+                VM_USERS_LABEL,
+                "could not read this process's user name, so there is no account to start \
+                 the VM for"
+                    .to_string(),
+            );
+        }
+        if op.contains(['\'', '\n', ' ', '/']) || sudoers_arg(op).is_none() {
+            return Item::cannot(
+                VM_USERS_ID,
+                VM_USERS_LABEL,
+                format!(
+                    "this process's user name ({op:?}) holds a character the script cannot \
+                     quote"
+                ),
+            );
+        }
+        let minvmd = match &facts.minvmd {
+            Ok(path) => path,
+            Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
+        };
+        let gvproxy = match &facts.gvproxy {
+            Ok(path) => path,
+            Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
+        };
+        // The script prints the provider path inside double quotes, where
+        // `$`, a backtick and `\` keep a meaning to the shell. So those
+        // characters are refused too.
+        let paths_quotable = [&facts.layout.provider_dir, &facts.layout.vm_dir]
+            .iter()
+            .all(|p| {
+                p.to_str()
+                    .is_some_and(|s| sudoers_arg(s).is_some() && !s.contains(['$', '`', '\\']))
+            });
+        let Some(drop_in) = sudoers_drop_in(op, &facts.vm, &facts.layout, minvmd, gvproxy)
+            .filter(|_| paths_quotable)
+        else {
+            return Item::cannot(
+                VM_USERS_ID,
+                VM_USERS_LABEL,
+                "a path the sudo rules or the setup script must name holds a space, a quote, \
+                 a newline, a `$`, a backtick or a backslash"
+                    .to_string(),
+            );
+        };
+
+        // The script walks into the provider dir and does not create it.
+        if !facts.provider.is_some_and(|f| f.is_dir) {
+            return Item::cannot(
+                VM_USERS_ID,
+                VM_USERS_LABEL,
+                format!(
+                    "{} does not exist yet, so there is no VM directory to set up. minvmd \
+                     creates it the first time the VM starts",
+                    facts.layout.provider_dir.display()
+                ),
+            );
+        }
+
+        let vmm = passwd_ids(&facts.passwd, VMM_USER);
+        let gvp = passwd_ids(&facts.passwd, GVPROXY_USER);
+        let vmm_group = group_entry(&facts.group, VMM_USER);
+        let gvp_group = group_entry(&facts.group, GVPROXY_USER);
+        // The design gives each group one login member. Another member is
+        // never removed: the item refuses and names it.
+        for (name, entry) in [(VMM_USER, &vmm_group), (GVPROXY_USER, &gvp_group)] {
+            let others: Vec<&str> = entry
+                .iter()
+                .flat_map(|(_, members)| members.iter())
+                .map(String::as_str)
+                .filter(|m| m != op)
+                .collect();
+            if !others.is_empty() {
+                let member = match others.as_slice() {
+                    [one] => *one,
+                    _ => "<member>",
+                };
+                return Item::cannot(
+                    VM_USERS_ID,
+                    VM_USERS_LABEL,
+                    format!(
+                        "the {name} group already has other members: {}. The group can have \
+                         one login member only. Remove each one with `sudo gpasswd -d {member} \
+                         {name}`, then run `min finalize-install` again",
+                        others.join(", ")
+                    ),
+                );
+            }
+        }
+        let one_member = |entry: &Option<(u32, Vec<String>)>| {
+            entry
+                .as_ref()
+                .is_some_and(|(_, members)| members.len() == 1 && members[0] == *op)
+        };
+        let done = match (vmm, gvp, &vmm_group, &gvp_group) {
+            (Some((vmm_uid, _)), Some((gvp_uid, _)), Some((vmm_gid, _)), Some((gvp_gid, _))) => {
+                let (vmm_gid, gvp_gid) = (*vmm_gid, *gvp_gid);
+                one_member(&vmm_group)
+                    && one_member(&gvp_group)
+                    && facts.provider.is_some_and(|f| {
+                        f.is_dir
+                            && f.uid == facts.operator_uid
+                            && f.gid == vmm_gid
+                            && f.mode == 0o710
+                    })
+                    && dir_is(facts.vmm, vmm_uid, vmm_gid, 0o750)
+                    && dir_is(facts.gvproxy_dir, gvp_uid, gvp_gid, 0o750)
+                    && dir_is(facts.gvproxy_config_dir, facts.operator_uid, gvp_gid, 0o750)
+                    && dir_is(facts.gate_dir, gvp_uid, vmm_gid, 0o2710)
+                    && facts.record.as_deref() == Some(drop_in.as_str())
+            }
+            _ => false,
+        };
+        if done {
+            return Item::done(VM_USERS_ID, VM_USERS_LABEL);
+        }
+        Item::missing(
+            VM_USERS_ID,
+            VM_USERS_LABEL,
+            format!(
+                "the VM and its network switch cannot start as their own users, because \
+                 {VMM_USER}, {GVPROXY_USER} or the sudo rule that starts them is not set up"
+            ),
+            format!(
+                "creates the {VMM_USER} and {GVPROXY_USER} users, adds {op} to their groups \
+                 (it takes effect at your next login), and installs {SUDOERS_DROP_IN}"
+            ),
+            vm_users_script(facts, &drop_in),
+        )
+    }
+
+    /// `path` when every component, from `/` down, is owned by root and
+    /// writable by nobody else, so a sudo rule can name it. The reason
+    /// otherwise.
+    pub(crate) fn root_owned_binary(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let real = std::fs::canonicalize(path)
+            .map_err(|e| format!("{} cannot be read: {e}", path.display()))?;
+        for dir in real.ancestors() {
+            let meta = std::fs::symlink_metadata(dir)
+                .map_err(|e| format!("{} cannot be read: {e}", dir.display()))?;
+            if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{} is not a root-owned binary that only root can change, so no sudo rule \
+                     can start it as another user; install it under /usr/local/bin",
+                    real.display()
+                ));
+            }
+        }
+        Ok(real)
+    }
+
+    /// `minvmd` on `PATH`, the binary `min` starts.
+    fn minvmd_on_path() -> Result<std::path::PathBuf, String> {
+        std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("minvmd"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| "minvmd is not on PATH".to_string())
+    }
+
+    fn dir_fact(path: &std::path::Path) -> Option<DirFact> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(DirFact {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.mode() & 0o7777,
+            is_dir: meta.file_type().is_dir(),
+        })
+    }
+
+    /// [`vm_users_item_over`] this host's reads, for the default VM.
+    // BEP-047: not offered until T66 (#2566) spawns through `sudo -n`, so
+    // no caller exists at this head. T66 adds the caller back.
+    #[allow(dead_code)]
+    pub(crate) fn vm_users_item_on_this_host() -> Item {
+        let operator = crate::resolver::operator_name();
+        let provider_dir = paths::provider_instance_dir(
+            &paths::minimal_state_dir(),
+            paths::ProviderKind::Minvmd,
+            0,
+        )
+        .as_utf8_path()
+        .as_std_path()
+        .to_path_buf();
+        // The script refuses a symlink in the path, and `/home` is a
+        // symlink on some hosts. So the item works on the real path.
+        let provider_dir = std::fs::canonicalize(&provider_dir).unwrap_or(provider_dir);
+        let vm = paths::provider_instance_name(paths::ProviderKind::Minvmd, 0);
+        let layout = VmUsersLayout::new(provider_dir, &operator, &vm);
+        let facts = VmUsersFacts {
+            operator_uid: nix::unistd::getuid().as_raw(),
+            passwd: std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            group: std::fs::read_to_string("/etc/group").unwrap_or_default(),
+            vm,
+            provider: dir_fact(&layout.provider_dir),
+            vmm: dir_fact(&layout.vmm_dir()),
+            gvproxy_dir: dir_fact(&layout.gvproxy_dir),
+            gvproxy_config_dir: dir_fact(&layout.gvproxy_config_dir),
+            gate_dir: dir_fact(&layout.gate_dir),
+            record: std::fs::read_to_string(VM_USERS_RECORD).ok(),
+            minvmd: minvmd_on_path().and_then(|p| root_owned_binary(&p)),
+            gvproxy: root_owned_binary(&switch::installed_gvproxy_bin()),
+            layout,
+            operator,
+        };
+        vm_users_item_over(&facts)
     }
 }
 
@@ -2360,5 +2887,234 @@ mod tests {
         assert!(!in_kvm_group(group, "ali"));
         assert!(!in_kvm_group("kvm:x:108:\n", ""));
         assert!(!in_kvm_group("", "alice"));
+    }
+
+    /// BEP-047: the VM users item creates `minimal-vmm` and
+    /// `minimal-gvproxy`, the provider dir at 0710 group `minimal-vmm`,
+    /// `vmm/`, the gvproxy, gvproxy config and gate dirs, and the sudoers
+    /// drop-in, and reads as done once all of them hold.
+    #[test]
+    fn finalize_install_creates_the_split_users_dirs_and_drop_in() {
+        use linux::*;
+        use std::path::{Path, PathBuf};
+        let layout = VmUsersLayout::new(
+            PathBuf::from("/home/alice/.local/state/minimal/providers/local-minvmd0"),
+            "alice",
+            "local-minvmd0",
+        );
+        let fresh = VmUsersFacts {
+            operator: "alice".to_string(),
+            operator_uid: 1000,
+            passwd: "root:x:0:0::/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\n"
+                .to_string(),
+            group: "root:x:0:\nalice:x:1000:\n".to_string(),
+            vm: "local-minvmd0".to_string(),
+            layout: layout.clone(),
+            provider: Some(DirFact {
+                uid: 1000,
+                gid: 1000,
+                mode: 0o700,
+                is_dir: true,
+            }),
+            vmm: None,
+            gvproxy_dir: None,
+            gvproxy_config_dir: None,
+            gate_dir: None,
+            record: None,
+            minvmd: Ok(PathBuf::from("/usr/local/bin/minvmd")),
+            gvproxy: Ok(PathBuf::from("/usr/local/bin/gvproxy-min")),
+        };
+        let item = vm_users_item_over(&fresh);
+        assert_eq!(item.state, ItemState::Missing);
+        assert_eq!(item.id, "vm-users");
+        let script = item.script.clone().unwrap();
+        for line in [
+            "getent group minimal-vmm >/dev/null || groupadd --system minimal-vmm\n",
+            "getent group minimal-gvproxy >/dev/null || groupadd --system minimal-gvproxy\n",
+            "for group in minimal-vmm minimal-gvproxy; do\n",
+            "  [ -z \"$members\" ] || [ \"$members\" = 'alice' ] || ",
+            "  gpasswd -a 'alice' \"$group\" >/dev/null\n",
+            "  chgrp minimal-vmm .\n  chmod 0710 .\n",
+            "  chown minimal-vmm:minimal-vmm .\n  chmod 0750 .\n",
+            "install -d -o minimal-gvproxy -g minimal-gvproxy -m 0750 \
+             '/var/lib/minimal/alice/local-minvmd0/gvproxy'\n",
+            "install -d -o 'alice' -g minimal-gvproxy -m 0750 \
+             '/var/lib/minimal/alice/local-minvmd0/gvproxy-config'\n",
+            "chmod 2710 '/var/lib/minimal/alice/local-minvmd0/gate'\n",
+            "visudo -cqf \"$drop_in\"\n",
+            "install -o root -g root -m 0440 \"$drop_in\" /etc/sudoers.d/minimal-vm\n",
+        ] {
+            assert!(script.contains(line), "missing {line:?} in:\n{script}");
+        }
+        // Root never changes the state dir by path: each component is
+        // entered with `cd -P` after a symlink check, and only `.` changes.
+        assert!(script.contains("  [ ! -L 'home' ] ||"), "{script}");
+        assert!(script.contains("  cd -P -- 'local-minvmd0'\n"), "{script}");
+        // A component swapped for a symlink after the `-L` test fails the
+        // physical path check, before root changes anything.
+        assert!(
+            script.contains("  [ \"$(pwd -P)\" = '/home' ] ||"),
+            "{script}"
+        );
+        let vmm_check = "[ \"$(pwd -P)\" = \
+                         '/home/alice/.local/state/minimal/providers/local-minvmd0/vmm' ] ||";
+        assert!(
+            script.contains(vmm_check),
+            "missing {vmm_check:?} in:\n{script}"
+        );
+        assert!(!script.contains("chmod 0710 /home"), "{script}");
+        // No member list is replaced, so no other login is removed.
+        assert!(!script.contains("gpasswd -M"), "{script}");
+        // A swap between the `-L` test and the `cd -P` moves the walk out
+        // of the directory it was in. Every `cd -P` keeps the inode of `.`
+        // first and requires it at `..` after.
+        let lines: Vec<&str> = script.lines().collect();
+        let cds: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].trim_start().starts_with("cd -P"))
+            .collect();
+        assert_eq!(cds.len(), 8, "seven components and vmm:\n{script}");
+        for i in cds {
+            assert_eq!(lines[i - 1].trim(), "here=$(stat -c %d:%i .)", "{script}");
+            assert!(
+                lines[i + 1]
+                    .trim()
+                    .starts_with("[ \"$(stat -c %d:%i ..)\" = \"$here\" ] || { echo \""),
+                "no parent check after {:?} in:\n{script}",
+                lines[i]
+            );
+            assert!(lines[i + 1].ends_with("\" >&2; exit 1; }"), "{script}");
+        }
+
+        let drop_in = sudoers_drop_in(
+            "alice",
+            "local-minvmd0",
+            &layout,
+            Path::new("/usr/local/bin/minvmd"),
+            Path::new("/usr/local/bin/gvproxy-min"),
+        )
+        .unwrap();
+        for line in [
+            "Cmnd_Alias MINIMAL_GVPROXY_SPAWN = /usr/local/bin/gvproxy-min -config \
+             /var/lib/minimal/alice/local-minvmd0/gvproxy-config/gvproxy.yaml -listen \
+             unix\\:///var/lib/minimal/alice/local-minvmd0/gvproxy/gvproxy-switch.sock \
+             -ssh-port -1\n",
+            "Cmnd_Alias MINIMAL_EGW_SPAWN = /usr/local/bin/minvmd __egw local-minvmd0\n",
+            "Cmnd_Alias MINIMAL_VMM_SPAWN = /usr/local/bin/minvmd __krun-vmm local-minvmd0\n",
+            "Cmnd_Alias MINIMAL_STOP = /usr/local/bin/minvmd __stop-group local-minvmd0\n",
+            "Defaults!MINIMAL_GVPROXY_SPAWN env_reset, !env_keep, umask=0077, umask_override\n",
+            "Defaults!MINIMAL_VMM_SPAWN env_reset, !env_keep, !use_pty\n",
+            "alice ALL = (minimal-gvproxy) NOPASSWD: MINIMAL_GVPROXY_SPAWN, MINIMAL_EGW_SPAWN\n",
+            "alice ALL = (minimal-vmm) NOPASSWD: MINIMAL_VMM_SPAWN\n",
+            "alice ALL = (minimal-gvproxy) NOPASSWD: MINIMAL_STOP\n",
+            "alice ALL = (minimal-vmm) NOPASSWD: MINIMAL_STOP\n",
+        ] {
+            assert!(drop_in.contains(line), "missing {line:?} in:\n{drop_in}");
+        }
+        assert!(!drop_in.contains('*'), "no wildcard: {drop_in}");
+        assert!(
+            script.contains(&drop_in),
+            "the script installs this drop-in"
+        );
+
+        // Every user, group, directory and the drop-in in place: done.
+        let dir = |uid, gid, mode| {
+            Some(DirFact {
+                uid,
+                gid,
+                mode,
+                is_dir: true,
+            })
+        };
+        let finished = VmUsersFacts {
+            passwd: format!(
+                "{}minimal-vmm:x:990:990::/nonexistent:/usr/sbin/nologin\n\
+                             minimal-gvproxy:x:991:991::/nonexistent:/usr/sbin/nologin\n",
+                fresh.passwd
+            ),
+            group: format!(
+                "{}minimal-vmm:x:990:alice\nminimal-gvproxy:x:991:alice\n",
+                fresh.group
+            ),
+            provider: dir(1000, 990, 0o710),
+            vmm: dir(990, 990, 0o750),
+            gvproxy_dir: dir(991, 991, 0o750),
+            gvproxy_config_dir: dir(1000, 991, 0o750),
+            gate_dir: dir(991, 990, 0o2710),
+            record: Some(drop_in.clone()),
+            ..fresh.clone()
+        };
+        assert_eq!(vm_users_item_over(&finished).state, ItemState::Done);
+        // A gate dir without setgid, a provider dir at the wrong mode, or a
+        // stale drop-in each make the step run again.
+        for broken in [
+            VmUsersFacts {
+                gate_dir: dir(991, 990, 0o710),
+                ..finished.clone()
+            },
+            VmUsersFacts {
+                provider: dir(1000, 1000, 0o700),
+                ..finished.clone()
+            },
+            VmUsersFacts {
+                record: Some("old".to_string()),
+                ..finished.clone()
+            },
+        ] {
+            assert_eq!(vm_users_item_over(&broken).state, ItemState::Missing);
+        }
+        // A binary the login can change is no rule's binary.
+        let writable = VmUsersFacts {
+            minvmd: Err("/home/alice/.local/bin/minvmd is not a root-owned binary".to_string()),
+            ..fresh.clone()
+        };
+        let blocked = vm_users_item_over(&writable);
+        assert_eq!(blocked.state, ItemState::Cannot);
+        assert!(blocked.script.is_none());
+        assert!(root_owned_binary(Path::new("/nonexistent/minvmd")).is_err());
+        // Another login in a group is never removed: the item refuses and
+        // names it, and runs nothing.
+        let shared = VmUsersFacts {
+            group: finished
+                .group
+                .replace("minimal-vmm:x:990:alice", "minimal-vmm:x:990:alice,bob"),
+            ..finished.clone()
+        };
+        let refused = vm_users_item_over(&shared);
+        assert_eq!(refused.state, ItemState::Cannot);
+        assert!(refused.script.is_none());
+        let cause = refused.cause.unwrap();
+        assert!(
+            cause.contains("the minimal-vmm group already has other members: bob."),
+            "{cause}"
+        );
+        assert!(
+            cause.contains("`sudo gpasswd -d bob minimal-vmm`"),
+            "{cause}"
+        );
+        // No provider dir yet: the script has nothing to walk into, so the
+        // item refuses, and the rest of the plan still runs.
+        let no_provider = VmUsersFacts {
+            provider: None,
+            ..fresh.clone()
+        };
+        let not_yet = vm_users_item_over(&no_provider);
+        assert_eq!(not_yet.state, ItemState::Cannot);
+        assert!(not_yet.script.is_none());
+        // The script prints the provider path in double quotes, so a path
+        // the shell expands there is refused, and root runs nothing.
+        for active in ["/home/$(id)/p", "/home/`id`/p", "/home/a\\b/p"] {
+            let unsafe_path = VmUsersFacts {
+                layout: VmUsersLayout::new(PathBuf::from(active), "alice", "local-minvmd0"),
+                ..fresh.clone()
+            };
+            let refused = vm_users_item_over(&unsafe_path);
+            assert_eq!(refused.state, ItemState::Cannot, "{active}");
+            assert!(refused.script.is_none(), "{active}");
+        }
+        assert_eq!(sudoers_arg("a b"), None);
+        for wild in ["/opt/m*/minvmd", "/opt/m?", "/opt/[ab]", "!minvmd"] {
+            assert_eq!(sudoers_arg(wild), None, "{wild}");
+        }
+        assert_eq!(sudoers_arg("x=1,y:2").as_deref(), Some("x\\=1\\,y\\:2"));
     }
 }
