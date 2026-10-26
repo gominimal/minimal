@@ -10,6 +10,10 @@
 //! child of a box onto one stream. `--follow` replays and then tails.
 //! `self` is refused on a host that is not enrolled.
 //!
+//! The proxy rotates its log into numbered segments and prunes the oldest
+//! (BEP-068). The command reads every segment still in the log's
+//! directory, oldest first, so a box's trail is whole after a rotation.
+//!
 //! Interim: the client reads the operator-owned log files under file mode,
 //! on the host. The design reads over the proxy's local socket (ruled on
 //! gominimal/arch#137). The interim is
@@ -688,6 +692,64 @@ mod tests {
             out.contains("evil.example\u{202e}moc.buhtig.ipa:443"),
             "{out:?}"
         );
+    }
+
+    // BEP-068: after the proxy rotates its log, and after it prunes a
+    // segment, `min box audit` still reads the box's records in every
+    // segment left, in order.
+    #[test]
+    fn box_audit_reads_across_segments() {
+        use bep::audit::{Rotation, prune, segments};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A bound of one byte: each record after the first opens a segment.
+        let rotation = Rotation {
+            bound: 1,
+            retain: 100,
+            revocation_ceiling: std::time::Duration::ZERO,
+        };
+        let mut log = AuditLog::open_dir(dir.path(), rotation).unwrap();
+        for (box_id, authority) in [
+            (A, "one.example:443"),
+            (B, "b.example:443"),
+            (A, "two.example:443"),
+            (A, "three.example:443"),
+        ] {
+            log.append(&decision(box_id, authority)).unwrap();
+        }
+        assert_eq!(segments(dir.path()).unwrap().len(), 4);
+
+        let (result, out, err) =
+            run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        for (line, authority) in lines.iter().zip(["one", "two", "three"]) {
+            assert!(line.contains(&format!("{authority}.example:443")), "{out}");
+        }
+        assert!(!out.contains("b.example"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // The oldest segment is pruned. The rest of the trail still reads,
+        // and so does the record that lands after the next rotation.
+        let removed = prune(
+            dir.path(),
+            &Rotation {
+                retain: 3,
+                ..rotation
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(removed, vec![dir.path().join(segment_name(0))]);
+        log.append(&decision(A, "four.example:443")).unwrap();
+        let (result, out, _) = run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        for (line, authority) in lines.iter().zip(["two", "three", "four"]) {
+            assert!(line.contains(&format!("{authority}.example:443")), "{out}");
+        }
     }
 
     // BEP-042: a name reads the live box of that name, else the newest

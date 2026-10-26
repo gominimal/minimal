@@ -29,6 +29,14 @@
 //! never formed a record. [`AuditLog::open`] also takes an exclusive lock,
 //! so a second writer on the same path cannot fork the chain.
 //!
+//! [`AuditLog::open_dir`] writes the log as numbered segments in one
+//! directory (BEP-068). When the active segment reaches its size bound,
+//! the next record opens a new segment and carries the previous segment's
+//! final hash, so the chain runs on across segments. A rotation then
+//! removes whole segments past the retention bound, but keeps a segment
+//! that holds a revocation record while a value naming its box can be
+//! unexpired ([`prune`]). It never changes a segment it keeps.
+//!
 //! [`LogReader`] is the client's read-only view of the log, across every
 //! segment in the log's directory ([`segments`]). `min box audit` reads
 //! through it.
@@ -229,6 +237,76 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
 }
 
+/// Creates `dir` and its parents when absent. A directory this call creates
+/// gets mode 0700, so it is the proxy's alone.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut dirs = fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dirs.mode(0o700);
+    }
+    dirs.create(dir)
+}
+
+/// Opens the regular file at `path` for append, and creates it with mode
+/// 0600 when absent. Fails when `path` is a symlink or not a regular file.
+fn open_own_file(path: &Path) -> io::Result<File> {
+    // Refused before the open as well, so a symlink's target is never
+    // created and a FIFO never blocks the open. The check after the
+    // open still catches an entry swapped in between the two.
+    match fs::symlink_metadata(path) {
+        Ok(entry) if entry.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit log {} is a symlink", path.display()),
+            ));
+        }
+        Ok(entry) if !entry.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit log {} is not a regular file", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    // Checked after the open, against the open file, so a link swapped
+    // in between a check and the open cannot slip through.
+    ensure_own_file(path, &file)?;
+    Ok(file)
+}
+
+/// Creates `dir` when absent, and locks its [`DIR_LOCK`] file. The lock
+/// lasts as long as the returned file is open.
+fn lock_dir(dir: &Path) -> io::Result<File> {
+    create_private_dir(dir)?;
+    let file = open_own_file(&dir.join(DIR_LOCK))?;
+    // One writer per directory: a second one could append to a segment
+    // that the first one closed, and fork the chain there.
+    file.try_lock().map_err(|err| match err {
+        fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "audit directory {} is held by another `bep serve`",
+                dir.display()
+            ),
+        ),
+        fs::TryLockError::Error(err) => err,
+    })?;
+    Ok(file)
+}
+
 /// Fails unless `file` is a regular file and is the entry at `path` itself,
 /// not a file that a symlink at `path` leads to.
 fn ensure_own_file(path: &Path, file: &File) -> io::Result<()> {
@@ -331,6 +409,54 @@ pub struct AuditLog {
     len: u64,
     /// Set when a failed append left bytes the log was not able to cut.
     poisoned: bool,
+    /// The log's directory, the active segment's number and the bounds,
+    /// when the log rotates its segments (BEP-068).
+    rotation: Option<(PathBuf, u64, Rotation)>,
+    /// The locked [`DIR_LOCK`] file of the log's directory, held for the
+    /// life of the log when [`AuditLog::open_dir`] opened it.
+    dir_lock: Option<File>,
+}
+
+/// The lock file in an audit directory. The writer that holds its lock is
+/// the one writer of every segment in the directory.
+pub const DIR_LOCK: &str = ".lock";
+
+/// The size bound of an active segment: 8 MiB.
+pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The segments a rotating log keeps, the active one included, besides the
+/// segments that hold a revocation still in force.
+pub const RETAINED_SEGMENTS: usize = 16;
+
+/// How long a revocation record must stay in the log: the longest validity
+/// of a value that names a box. A value's expiry is the root CA's remaining
+/// validity at the mint (BEP-005, BEP-063), so no value outlives the root's
+/// full validity from its mint.
+pub const REVOCATION_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(crate::publish::ROOT_VALIDITY_SECS);
+
+/// The bounds of a rotating log (BEP-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rotation {
+    /// The active segment's size, in bytes, at which the next record opens
+    /// a new segment.
+    pub bound: u64,
+    /// The newest segments always kept, the active one included. At least
+    /// one is kept, whatever this is.
+    pub retain: usize,
+    /// How long after its last write a segment that holds a revocation
+    /// record is kept.
+    pub revocation_ceiling: std::time::Duration,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Self {
+            bound: SEGMENT_BYTES,
+            retain: RETAINED_SEGMENTS,
+            revocation_ceiling: REVOCATION_CEILING,
+        }
+    }
 }
 
 impl AuditLog {
@@ -346,47 +472,9 @@ impl AuditLog {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            // Directories this call creates are the proxy's alone.
-            let mut dirs = fs::DirBuilder::new();
-            dirs.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                dirs.mode(0o700);
-            }
-            dirs.create(parent)?;
+            create_private_dir(parent)?;
         }
-        // Refused before the open as well, so a symlink's target is never
-        // created and a FIFO never blocks the open. The check after the
-        // open still catches an entry swapped in between the two.
-        match fs::symlink_metadata(&path) {
-            Ok(entry) if entry.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("audit log {} is a symlink", path.display()),
-                ));
-            }
-            Ok(entry) if !entry.is_file() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("audit log {} is not a regular file", path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-        let mut options = OpenOptions::new();
-        options.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        // Checked after the open, against the open file, so a link swapped
-        // in between a check and the open cannot slip through.
-        ensure_own_file(&path, &file)?;
+        let file = open_own_file(&path)?;
         // One writer per log: a second one would chain to the same head.
         file.try_lock().map_err(|err| match err {
             fs::TryLockError::WouldBlock => io::Error::new(
@@ -422,7 +510,106 @@ impl AuditLog {
             head,
             len,
             poisoned: false,
+            rotation: None,
+            dir_lock: None,
         })
+    }
+
+    /// Opens the log in `dir` for append, as segments that rotate at
+    /// `rotation`'s bound (BEP-068). The active segment is the one with the
+    /// highest number, or `audit-0.jsonl` in an empty directory. When the
+    /// active segment holds no record yet, the next record chains to the
+    /// previous segment's last line, so the chain runs on across segments.
+    ///
+    /// Open first takes the lock on the directory's [`DIR_LOCK`] file, and
+    /// the log holds it until it drops. So one writer at a time has the
+    /// directory, and a rotation never frees a closed segment for a second
+    /// writer. While another log holds the directory, the call fails with
+    /// [`io::ErrorKind::WouldBlock`].
+    ///
+    /// Each segment has its own lock too, and open lists the directory
+    /// again after it takes that lock. A writer that takes no directory
+    /// lock and rotated in between releases the old segment, and a newer
+    /// one shows in the second listing. Then open drops the old segment and
+    /// tries the newest, which that writer holds.
+    pub fn open_dir(dir: impl AsRef<Path>, rotation: Rotation) -> io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let dir_lock = lock_dir(&dir)?;
+        let found = numbered_segments(&dir)?;
+        let mut log = Self::open_listed(dir, rotation, found)?;
+        log.dir_lock = Some(dir_lock);
+        Ok(log)
+    }
+
+    /// [`AuditLog::open_dir`] from a listing `found` taken before the call.
+    fn open_listed(
+        dir: PathBuf,
+        rotation: Rotation,
+        mut found: Vec<(u64, PathBuf)>,
+    ) -> io::Result<Self> {
+        // Each pass that retries saw a newer segment, so a writer that keeps
+        // rotating is the only way to run out of passes.
+        const PASSES: usize = 8;
+        for _ in 0..PASSES {
+            let (n, path) = found
+                .last()
+                .cloned()
+                .unwrap_or_else(|| (0, dir.join(segment_name(0))));
+            let mut log = Self::open(&path)?;
+            let now = numbered_segments(&dir)?;
+            if now.last().is_some_and(|(newest, _)| *newest > n) {
+                // Dropping `log` releases the stale segment unwritten.
+                found = now;
+                continue;
+            }
+            if log.len == 0
+                && let Some((_, previous)) = now.iter().rev().find(|(m, _)| *m < n)
+            {
+                log.head = final_hash(previous)?;
+            }
+            log.rotation = Some((dir, n, rotation));
+            return Ok(log);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("audit log {} is rotated by another writer", dir.display()),
+        ))
+    }
+
+    /// Closes the active segment and opens the next one, whose first record
+    /// carries the closed segment's final hash. Then prunes the segments
+    /// past the retention bound.
+    fn rotate(&mut self) -> io::Result<()> {
+        let Some((dir, n, rotation)) = self.rotation.clone() else {
+            return Ok(());
+        };
+        let next = dir.join(segment_name(n + 1));
+        let mut opened = Self::open(&next)?;
+        if opened.len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "audit segment {} holds records already, so the chain cannot continue in it",
+                    next.display()
+                ),
+            ));
+        }
+        tracing::info!(
+            closed = %self.path.display(),
+            final_hash = %self.head,
+            opened = %next.display(),
+            "rotated the audit log"
+        );
+        opened.head = std::mem::take(&mut self.head);
+        opened.rotation = Some((dir.clone(), n + 1, rotation));
+        // The directory stays locked across the swap, so no other writer
+        // can take the closed segment.
+        opened.dir_lock = self.dir_lock.take();
+        *self = opened;
+        if let Err(err) = prune(&dir, &rotation, std::time::SystemTime::now()) {
+            tracing::warn!(dir = %dir.display(), error = %err, "audit segments were not pruned");
+        }
+        Ok(())
     }
 
     /// The log's path.
@@ -444,6 +631,12 @@ impl AuditLog {
                 "audit log {} holds a torn line, reopen it",
                 self.path.display()
             )));
+        }
+        if let Some((_, _, rotation)) = &self.rotation
+            && self.len > 0
+            && self.len >= rotation.bound
+        {
+            self.rotate()?;
         }
         let record = Record::from_decision(decision, &self.head);
         let line = record.to_line();
@@ -513,7 +706,15 @@ pub fn default_dir() -> Option<PathBuf> {
 /// Every segment of the log in `dir`, oldest first. A missing directory is
 /// an empty log.
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
-    let entries = match fs::read_dir(dir.as_ref()) {
+    Ok(numbered_segments(dir.as_ref())?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect())
+}
+
+/// Every segment of the log in `dir` with its number, oldest first.
+fn numbered_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
@@ -526,7 +727,60 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
         }
     }
     found.sort();
-    Ok(found.into_iter().map(|(_, path)| path).collect())
+    Ok(found)
+}
+
+/// The hash of the last complete line of the segment at `path`, or
+/// [`ZERO_HASH`] when it holds none.
+fn final_hash(path: &Path) -> io::Result<String> {
+    let (_, tail) = read_tail(&File::open(path)?)?;
+    let complete = tail.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+    Ok(head_hash(&tail[..complete]))
+}
+
+/// Whether the segment at `path` holds a revocation record, or can hold
+/// one. A complete, non-empty line that does not parse as a record counts
+/// as one, so [`prune`] keeps a segment it cannot read whole. The bytes
+/// after the last newline are a partial write and count as none.
+fn holds_revocation(path: &Path) -> io::Result<bool> {
+    let bytes = fs::read(path)?;
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+    Ok(bytes[..complete].split(|&b| b == b'\n').any(|raw| {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        !raw.is_empty()
+            && serde_json::from_slice::<Record>(raw)
+                .map_or(true, |record| record.kind == Kind::Revocation)
+    }))
+}
+
+/// Removes the segments of the log in `dir` that are older than the newest
+/// `rotation.retain`, except a segment that holds a revocation record a
+/// value can still need (BEP-068). Records carry no time, so a segment's
+/// last write stands for its revocations' time. No value naming a box is
+/// minted after its destroy, so every value naming a revoked box expires
+/// before the segment's last write plus `rotation.revocation_ceiling`.
+/// Returns the segments it removed.
+pub fn prune(
+    dir: impl AsRef<Path>,
+    rotation: &Rotation,
+    now: std::time::SystemTime,
+) -> io::Result<Vec<PathBuf>> {
+    let found = segments(dir)?;
+    let old = found.len().saturating_sub(rotation.retain.max(1));
+    let mut removed = Vec::new();
+    for path in &found[..old] {
+        let written = fs::metadata(path)?.modified()?;
+        let in_force = written
+            .checked_add(rotation.revocation_ceiling)
+            .is_none_or(|until| until > now);
+        if in_force && holds_revocation(path)? {
+            continue;
+        }
+        fs::remove_file(path)?;
+        tracing::info!(segment = %path.display(), "removed an old audit segment");
+        removed.push(path.clone());
+    }
+    Ok(removed)
 }
 
 /// One record a [`LogReader`] read, with its line as it is on disk.
@@ -547,6 +801,8 @@ pub struct ReadBatch {
     pub segments: Vec<PathBuf>,
     /// The lines that did not parse as a record, and were skipped.
     pub skipped: usize,
+    /// The segments that hold a skipped line, oldest first and each once.
+    pub skipped_in: Vec<PathBuf>,
 }
 
 /// A read-only reader over the log in one directory, across every
@@ -650,7 +906,12 @@ impl LogReader {
                         record,
                         line: line.to_owned(),
                     }),
-                    None => out.skipped += 1,
+                    None => {
+                        out.skipped += 1;
+                        if out.skipped_in.last() != Some(&path) {
+                            out.skipped_in.push(path.clone());
+                        }
+                    }
                 }
             }
             self.offsets
@@ -1073,6 +1334,221 @@ mod tests {
             let err = AuditLog::open(&not_file).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    fn rotation(bound: u64, retain: usize, ceiling_secs: u64) -> Rotation {
+        Rotation {
+            bound,
+            retain,
+            revocation_ceiling: std::time::Duration::from_secs(ceiling_secs),
+        }
+    }
+
+    fn revocation(box_id: &str) -> Decision {
+        Decision {
+            kind: Kind::Revocation,
+            box_id: box_id.into(),
+            authority: String::new(),
+            identifier: None,
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Refuse,
+            marker: None,
+        }
+    }
+
+    // BEP-068: a full segment opens the next one, whose first record
+    // carries the previous segment's final hash, and so does a reopen into
+    // a segment that holds no record yet.
+    #[test]
+    fn segment_rotation_continues_chain() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        let found = segments(&audit).unwrap();
+        assert_eq!(
+            found,
+            (0..3)
+                .map(|n| audit.join(segment_name(n)))
+                .collect::<Vec<_>>()
+        );
+        let mut previous = ZERO_HASH.to_owned();
+        for path in &found {
+            let lines = lines(path);
+            assert_eq!(lines.len(), 1, "{}", path.display());
+            let record: Record = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(record.previous_hash, previous, "{}", path.display());
+            previous = line_hash(&lines[0]);
+        }
+        assert_eq!(log.head(), previous);
+        assert_eq!(log.path(), audit.join(segment_name(2)));
+
+        // A reopen resumes the chain in the active segment.
+        drop(log);
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        assert_eq!(log.head(), previous);
+        let record = log.append(&off_module()).unwrap();
+        assert_eq!(record.previous_hash, previous);
+        assert_eq!(log.path(), audit.join(segment_name(3)));
+
+        // An empty active segment, left by a stop between the open and the
+        // first append, chains to the segment before it.
+        let previous = log.head().to_owned();
+        drop(log);
+        File::create(audit.join(segment_name(4))).unwrap();
+        let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 100, 0)).unwrap();
+        assert_eq!(log.head(), previous);
+        let record = log.append(&admit()).unwrap();
+        assert_eq!(record.previous_hash, previous);
+        assert_eq!(log.path(), audit.join(segment_name(4)));
+
+        // Pruned past the retention bound, oldest first.
+        drop(log);
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 2, 0)).unwrap();
+        log.append(&admit()).unwrap();
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(4)), audit.join(segment_name(5))]
+        );
+    }
+
+    // BEP-068: a writer that listed the segments before another writer
+    // rotated does not lock the closed segment and fork the chain there.
+    #[test]
+    fn open_dir_relists_after_a_rotation() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut writer = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        writer.append(&admit()).unwrap();
+        let stale = numbered_segments(&audit).unwrap();
+        writer.append(&admit()).unwrap();
+        assert_eq!(writer.path(), audit.join(segment_name(1)));
+        let closed = fs::read(audit.join(segment_name(0))).unwrap();
+
+        // The closed segment is free to lock, but the newest is held.
+        let err =
+            AuditLog::open_listed(audit.clone(), rotation(1, 100, 0), stale.clone()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(audit.join(segment_name(0))).unwrap(), closed);
+
+        // With the writer gone, the stale listing still ends on the newest.
+        let head = writer.head().to_owned();
+        drop(writer);
+        let log = AuditLog::open_listed(audit.clone(), rotation(1, 100, 0), stale).unwrap();
+        assert_eq!(log.path(), audit.join(segment_name(1)));
+        assert_eq!(log.head(), head);
+    }
+
+    // BEP-068: one writer holds the audit directory for the life of its
+    // log, so a rotation does not free the closed segment for a second
+    // writer to append there and fork the chain.
+    #[test]
+    fn open_dir_refuses_a_second_writer_across_rotation() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut writer = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        writer.append(&admit()).unwrap();
+
+        let err = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "audit directory {} is held by another `bep serve`",
+                audit.display()
+            )
+        );
+
+        // The rotation releases segment 0, and the directory stays held.
+        writer.append(&admit()).unwrap();
+        assert_eq!(writer.path(), audit.join(segment_name(1)));
+        let closed = fs::read(audit.join(segment_name(0))).unwrap();
+        let err = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(audit.join(segment_name(0))).unwrap(), closed);
+        // The lock file is not a segment.
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(0)), audit.join(segment_name(1))]
+        );
+
+        // With the writer gone, the next one continues the newest segment.
+        let head = writer.head().to_owned();
+        drop(writer);
+        let log = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        assert_eq!(log.path(), audit.join(segment_name(1)));
+        assert_eq!(log.head(), head);
+    }
+
+    // BEP-068: a segment past the retention bound that holds a revocation
+    // record stays until every value naming the box can have expired.
+    #[test]
+    fn segment_with_live_revocation_is_retained() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let day = 24 * 60 * 60;
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 1, day)).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&revocation("0190aaaa")).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&admit()).unwrap();
+        // Only the active segment is within the bound. Segment 1 holds the
+        // revocation and is kept, segments 0 and 2 are not.
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(1)), audit.join(segment_name(3))]
+        );
+        assert!(holds_revocation(&audit.join(segment_name(1))).unwrap());
+
+        // Before the ceiling has passed the segment stays.
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(day / 2);
+        assert!(
+            prune(&audit, &rotation(1, 1, day), soon)
+                .unwrap()
+                .is_empty()
+        );
+        // Once every value naming the box has expired, it goes.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * day);
+        assert_eq!(
+            prune(&audit, &rotation(1, 1, day), later).unwrap(),
+            vec![audit.join(segment_name(1))]
+        );
+        assert_eq!(segments(&audit).unwrap(), vec![audit.join(segment_name(3))]);
+
+        // The default ceiling is the root's full validity.
+        assert_eq!(
+            Rotation::default().revocation_ceiling.as_secs(),
+            crate::publish::ROOT_VALIDITY_SECS
+        );
+    }
+
+    // BEP-068: a complete line that does not parse can be a revocation, so
+    // prune keeps its segment. A partial last line is a torn write, not a
+    // record, and does not keep one.
+    #[test]
+    fn segment_with_unparsable_line_survives_prune() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        fs::create_dir_all(&audit).unwrap();
+        fs::write(audit.join(segment_name(0)), b"{\"kind\":\"revoc\n").unwrap();
+        fs::write(audit.join(segment_name(1)), b"{\"kind\":\"revoc").unwrap();
+        fs::write(audit.join(segment_name(2)), b"").unwrap();
+        assert!(holds_revocation(&audit.join(segment_name(0))).unwrap());
+        assert!(!holds_revocation(&audit.join(segment_name(1))).unwrap());
+
+        let day = 24 * 60 * 60;
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(day / 2);
+        assert_eq!(
+            prune(&audit, &rotation(1, 1, day), soon).unwrap(),
+            vec![audit.join(segment_name(1))]
+        );
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(0)), audit.join(segment_name(2))]
+        );
     }
 
     // A request as the proxy sees it: the BEP-039 fields plus the secrets
