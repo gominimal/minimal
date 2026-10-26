@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-10-18
+updated: 2026-10-26
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -475,15 +475,31 @@ Store references
 - **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle of JWS `typ` `gatehouse-store-handle+jws`, signed under the client's local key, carrying the box id (`sub`), the host (`node_id`), the store, the identifier, the registered upstream authorities, the injection form, the issue time (`iat`), a unique handle id (`jti`) and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request and item deletion revokes it at once, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request, item deletion revokes it at once, and revoking the signing key by its `kid` ends every handle signed under it, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
   - WHEN the proxy restarts THE SYSTEM SHALL verify store handles under every client key registered before the restart.
     tier:   T0
     verify: cargo nextest run -p bep client_key_registrations_survive_restart
     <!-- event-driven; a registration held only by the running process would refuse every running box's store references after a restart, until the next mint registered the key again -->
   - IF the host keychain refuses the running client its handle-signing key THEN THE SYSTEM SHALL replace the key and register the replacement before minting.
     tier:   T0
-    verify: cargo nextest run -p bep a_client_key_this_program_is_refused_is_replaced
-    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step -->
+    verify: cargo nextest run -p minimal a_refused_client_key_is_replaced_and_registered_before_the_mint
+    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step; the verify line names the client-side test, because `a_client_key_this_program_is_refused_is_replaced` in `bep` proves only that a second registered key goes in beside the first -->
+  - WHEN the control socket's owner revokes a registered client key by its `kid` THE SYSTEM SHALL remove the key from the registry and from the kept registrations before the reply, so no store handle signed under it verifies again, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep a_revoked_client_key_no_longer_verifies_a_store_handle
+    <!-- event-driven; `revoke_client_key` on the control socket; the other registered keys stay; `a_key_removal_survives_a_restart` holds the removal across a restart -->
+  - WHEN the client replaces a client key that the host keychain refused THE SYSTEM SHALL register the replacement with `register_client_key`, then keep the replacement in the keychain, then revoke every other registered key with `replace_client_key`.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy
+    <!-- event-driven; the client cannot read the refused key, so it cannot name its `kid`, and `replace_client_key` revokes every key but the one it carries; the order keeps running boxes redeeming: a proxy that refuses step one leaves the refused key in the store for the next creation to try again, and a store that fails step two leaves every old key registered; a lock file beside the control socket serialises the replacement across `min` processes, so two creations that both meet a refusal revoke once (`a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations`), and a replacement the store does not keep revokes no key (`a_replacement_the_store_does_not_keep_revokes_no_key`) -->
+  - IF the revoke of the other client keys fails after the keychain keeps the replacement THEN THE SYSTEM SHALL keep the replacement registered, record the replacement's `kid` in a pending-revoke file beside the control socket, and revoke again at the next box creation.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke
+    <!-- unwanted; the file is written before step three and removed when the proxy records the revoke; a file that names a key the store does not hold is stale and is removed; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
+  - THE SYSTEM SHALL hold at most a bounded count of client keys in the registry, 16 by default, and drop the key registered least recently when a registration passes the bound, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep the_registry_never_holds_more_keys_than_its_bound
+    <!-- ubiquitous; the client keeps one key for each user and a replacement revokes the others, so the registry usually holds one key, and the bound limits what other registrations on the socket can add; the proxy binary has no setting for the bound and no idle period, and only an embedder sets another (`a_larger_key_bound_keeps_every_key_the_file_holds`); each dropped key is a warn log line -->
   - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
     tier:   T0
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
@@ -1074,4 +1090,5 @@ AT7 and AT25 (architecture threat model).
 - [NEEDS CLARIFICATION (MEDIUM): When does local repository narrowing land? The path is recorded, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7), and until it does the member is `full` breadth and the T28 residual is the signed-in account's manifest-capped reach for the reference's life.]
 - [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter ([gominimal/inbox#345](https://github.com/gominimal/inbox/issues/345)); unmeasured, a plan spike.]
 - [NEEDS CLARIFICATION (MEDIUM): How long is the root valid ([gominimal/arch#85](https://github.com/gominimal/arch/issues/85))? Its remaining validity at mint is the expiry of every sign-in reference and store handle (BEP-005, BEP-063), so it is the ceiling on a box's credentialed life and on the T28 window of a stolen reference, and the point at which a running box has to be re-created.]
+- [NEEDS CLARIFICATION (MEDIUM): Does one client for each control socket owner hold ([gominimal/arch#144](https://github.com/gominimal/arch/issues/144))? The client keeps its key in one keychain item with a fixed service and account, so one user has one client key, and a replacement revokes every other registered key (BEP-063). A second client of the same user that replaces its key revokes the key of the first, and the proxy does not tell the first, so the first client's running boxes lose their store references. The registry bound of 16 keys has no ruling either.]
 - [NEEDS CLARIFICATION (MEDIUM): On a Linux LocalVM host, which key store holds the signing CA key as non-exportable (TPM 2.0 via a PKCS#11 provider, or Secret Service without hardware backing)? BEP-014 is written over "the host keychain"; the plan carries a spike, and until it lands the Linux host is unverified for BEP-014.]
