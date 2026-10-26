@@ -446,13 +446,58 @@ fn client_config_path() -> Option<PathBuf> {
     Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
-/// What identifies one version of a file without a read of it: its
-/// modification time and its length, or `None` when it does not stat.
-type Stamp = Option<(Option<SystemTime>, u64)>;
+/// What identifies one version of a file without a read of it, or `None`
+/// when it does not stat.
+type Stamp = Option<FileStamp>;
+
+/// The stat of one file version: its modification time and its length,
+/// and on unix the inode change time, the inode and the device. An edit
+/// that keeps the length and the modification time (`cp -p`, `touch -r`,
+/// `rsync -t`, a package install) still sets the change time, and a file
+/// replaced by a rename gets a new inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    /// The inode change time, `None` off unix or when it does not convert.
+    changed: Option<SystemTime>,
+    /// The device and the inode, `None` off unix.
+    inode: Option<(u64, u64)>,
+}
+
+impl FileStamp {
+    /// The later of the modification time and the change time, or `None`
+    /// with no modification time.
+    fn latest(&self) -> Option<SystemTime> {
+        let modified = self.modified?;
+        Some(
+            self.changed
+                .map_or(modified, |changed| modified.max(changed)),
+        )
+    }
+}
 
 fn stamp(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok(), meta.len()))
+    #[cfg(unix)]
+    let (changed, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        let changed = u64::try_from(meta.ctime())
+            .ok()
+            .zip(u32::try_from(meta.ctime_nsec()).ok())
+            .and_then(|(secs, nanos)| {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+            });
+        (changed, Some((meta.dev(), meta.ino())))
+    };
+    #[cfg(not(unix))]
+    let (changed, inode) = (None, None);
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        changed,
+        inode,
+    })
 }
 
 /// How close to a read a file change can be and still hide from a stat.
@@ -462,14 +507,15 @@ const RACY: Duration = Duration::from_secs(2);
 
 /// Whether a file with `stamp` is older than the read at `read_at` by more
 /// than one tick, so a stamp that did not change means content that did
-/// not change. A file with no modification time is never settled.
+/// not change. The later of the modification time and the change time
+/// decides. A file with no modification time is never settled.
 fn settled(stamp: &Stamp, read_at: SystemTime) -> bool {
     match stamp {
         None => true,
-        Some((Some(modified), _)) => modified
-            .checked_add(RACY)
+        Some(file) => file
+            .latest()
+            .and_then(|latest| latest.checked_add(RACY))
             .is_some_and(|edge| edge < read_at),
-        Some((None, _)) => false,
     }
 }
 
@@ -2039,6 +2085,7 @@ mod tests {
             &mut stream,
             &Request::RegisterClientKey {
                 key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                box_id: None,
             },
         )
         .await;
@@ -2223,13 +2270,13 @@ mod tests {
         let source = ClientRules::new(Some((config.clone(), dir.path().join("organization.toml"))));
         assert_eq!(source.current().len(), 1);
 
-        // The same length and the same old time: the stat alone decides.
+        // The same length and the same old modification time: the change
+        // time is new, so the file is read again.
         let blank = " ".repeat(OPENAI_RULE.len());
         write(&blank, old);
-        assert_eq!(source.current().len(), 1);
+        assert_eq!(source.current(), Vec::<StoreRule>::new());
 
-        // A new time is a new stamp, so the file is read again.
-        write(&blank, old + Duration::from_secs(10));
+        // No write between two calls: the second call gives the same rules.
         assert_eq!(source.current(), Vec::<StoreRule>::new());
     }
 
