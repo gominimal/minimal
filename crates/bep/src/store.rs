@@ -10,11 +10,17 @@
 //! Other hosts have no native store yet: the Linux default waits on the store
 //! roster. [`HostStore`] there refuses every operation, and says so.
 //!
+//! The proxy reads a value through [`ValueReader`], once for each request
+//! that injects it, and keeps no copy (BEP-033). So a replaced value goes in
+//! the next request (BEP-054), and a deleted or disabled item refuses it
+//! (BEP-045).
+//!
 //! No function here writes a value to a file or to a log.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -36,26 +42,101 @@ pub const MAX_ID_LEN: usize = 128;
 /// item. The proxy reads no item under it, and a listing shows none.
 pub const STAGING_SERVICE: &str = "dev.minimal.secret.staging";
 
-/// The proxy binary that an item's access control names: the path in
-/// [`PROXY_BIN_ENV`] when it is set and not empty, else `bep` beside
-/// `minvmd`.
+/// The proxy binary: the path in [`PROXY_BIN_ENV`] when it is set and not
+/// empty, else `bep` beside `minvmd`. `None` when the variable is unset or
+/// empty and `minvmd` gives no path.
 ///
-/// `minvmd` is the path of the VM host daemon program that `min` starts:
-/// the first `minvmd` on `PATH`, as `Command::new("minvmd")` in the CLI's
-/// autospawn finds it. That daemon starts the proxy from the same variable,
-/// else from `bep` beside its own executable (`resolve_bep_binary` in
-/// `crates/minvmd/src/cmd/run.rs`). `current_exe()` there gives the path
-/// with symbolic links resolved, so pass `minvmd` with its links resolved
-/// too. So the access control names the program
-/// that the running daemon starts. The two functions are copies of one
-/// rule, and they must change together until one owner holds the rule:
-/// <https://github.com/gominimal/minimal/issues/2527>.
+/// This is the one definition of the rule. `minvmd` starts the proxy from
+/// it (`resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`), with
+/// `minvmd` as its own `current_exe()`. `min secret` names the same program
+/// in an item's access control, through [`proxy_binary_on_path`], with
+/// `minvmd` as the first `minvmd` on `PATH`, which is the program that the
+/// CLI's autospawn starts.
+///
+/// `minvmd` runs only when the variable does not give the path. Each
+/// resolution logs one debug line that names the path.
 #[must_use]
-pub fn proxy_binary_path(env: Option<&std::ffi::OsStr>, minvmd: &Path) -> PathBuf {
-    match env.filter(|v| !v.is_empty()) {
+pub fn proxy_binary_path(
+    env: Option<&std::ffi::OsStr>,
+    minvmd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let path = match env.filter(|v| !v.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => minvmd.with_file_name("bep"),
+        None => minvmd()?.with_file_name("bep"),
+    };
+    tracing::debug!(proxy = %path.display(), "resolved the proxy binary path");
+    Some(path)
+}
+
+/// Why [`proxy_binary_on_path`] gives no proxy path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyLookupError {
+    /// [`PROXY_BIN_ENV`] holds this relative path.
+    RelativeEnv(PathBuf),
+    /// The variable gives no path, and no executable `minvmd` is on `PATH`.
+    NoMinvmd,
+}
+
+/// The proxy that a `minvmd` started from `path` starts, by
+/// [`proxy_binary_path`]. `min secret` names this path in an item's access
+/// control. `minvmd` is the first executable `minvmd` in an absolute entry
+/// of `path`, which is the program that `Command::new("minvmd")` starts.
+///
+/// The access control trusts this path, so it is absolute. A relative
+/// variable is refused, and an empty or relative `PATH` entry is skipped,
+/// so a program in the current directory never becomes the trusted one.
+/// The `minvmd` that is found takes the path that its `current_exe()`
+/// gives: links resolved on Linux, as is on macOS. A proxy path that
+/// exists comes back canonical, and one that does not comes back as is.
+///
+/// # Errors
+///
+/// [`ProxyLookupError`] when the variable is relative, or when it gives no
+/// path and no `minvmd` is on `path`.
+pub fn proxy_binary_on_path(
+    env: Option<&std::ffi::OsStr>,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, ProxyLookupError> {
+    let env = env.filter(|v| !v.is_empty());
+    if let Some(env) = env.map(Path::new)
+        && !env.is_absolute()
+    {
+        return Err(ProxyLookupError::RelativeEnv(env.to_path_buf()));
     }
+    let proxy = proxy_binary_path(env, || find_on_path("minvmd", path).map(exe_path))
+        .ok_or(ProxyLookupError::NoMinvmd)?;
+    Ok(std::fs::canonicalize(&proxy).unwrap_or(proxy))
+}
+
+/// The path that `current_exe()` gives in a program started from `path`.
+/// On Linux that path has its symbolic links resolved. On macOS
+/// `current_exe()` is `_NSGetExecutablePath`, which gives the path that
+/// started the program and can be the link itself.
+fn exe_path(path: PathBuf) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        path
+    } else {
+        std::fs::canonicalize(&path).unwrap_or(path)
+    }
+}
+
+/// The first executable `name` in an absolute entry of `path`.
+fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Refuse a proxy binary that a user other than the current one or root
@@ -308,6 +389,7 @@ struct MemoryItem {
 #[derive(Debug, Default)]
 pub struct MemorySecretStore {
     items: Mutex<BTreeMap<String, MemoryItem>>,
+    reads: AtomicUsize,
 }
 
 impl MemorySecretStore {
@@ -336,6 +418,12 @@ impl MemorySecretStore {
         {
             item.trusted = trusted;
         }
+    }
+
+    /// How many times a [`MemoryReader`] read a value from this store.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
     fn lock(
@@ -379,6 +467,70 @@ impl SecretStore for MemorySecretStore {
 
     fn remove(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.lock("remove the secret")?.remove(id).is_some())
+    }
+}
+
+/// Why the proxy read no value for a store reference.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// No item is stored under the identifier: it was deleted.
+    #[error("no secret is stored under {0}")]
+    Deleted(String),
+    /// The item exists, and its access control does not let the proxy read
+    /// it without a prompt.
+    #[error("the secret {0} does not let the Box Egress Proxy read it")]
+    Disabled(String),
+    /// The store failed or refused the read.
+    #[error(transparent)]
+    Store(StoreError),
+}
+
+/// The values of one store, as the proxy reads them for a request.
+///
+/// Each call reads the store again. An implementation keeps no copy of a
+/// value, and writes none to a file or a log (BEP-033).
+pub trait ValueReader: Send + Sync {
+    /// The store's name, as a store reference writes it.
+    fn name(&self) -> &'static str;
+
+    /// The value stored under `id`, read now.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Deleted`] when no item is stored under `id`,
+    /// [`ReadError::Disabled`] when the item does not let the proxy read
+    /// it, and [`ReadError::Store`] when the store fails.
+    fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError>;
+}
+
+/// A [`MemorySecretStore`] as the program `app` reads it. An item that does
+/// not trust `app` is disabled for it. For tests.
+#[derive(Debug, Clone)]
+pub struct MemoryReader {
+    /// The store.
+    pub store: Arc<MemorySecretStore>,
+    /// The program that reads.
+    pub app: PathBuf,
+}
+
+impl ValueReader for MemoryReader {
+    fn name(&self) -> &'static str {
+        NATIVE_STORE
+    }
+
+    fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        let items = self
+            .store
+            .lock("read the secret")
+            .map_err(ReadError::Store)?;
+        self.store.reads.fetch_add(1, Ordering::SeqCst);
+        let item = items
+            .get(id)
+            .ok_or_else(|| ReadError::Deleted(id.to_owned()))?;
+        if !item.trusted.iter().any(|t| t == &self.app) {
+            return Err(ReadError::Disabled(id.to_owned()));
+        }
+        Ok(Zeroizing::new(item.value.to_vec()))
     }
 }
 
@@ -634,16 +786,31 @@ impl SecretStore for HostStore {
     }
 }
 
+impl ValueReader for HostStore {
+    fn name(&self) -> &'static str {
+        NATIVE_STORE
+    }
+
+    /// Reads the item in this process, so the keychain checks the item's
+    /// access control against the running program: the proxy.
+    fn read(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        if !valid_id(id) {
+            return Err(ReadError::Store(StoreError::InvalidId(id.to_owned())));
+        }
+        host::read(id)
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod host {
     use super::{
-        ItemInfo, Keychain, NATIVE_STORE, SERVICE, StoreError, add_line, parse_dump,
+        ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_line, parse_dump,
         parse_dump_service, set_item,
     };
     use std::io::Write as _;
     use std::path::Path;
     use std::process::{Command, Stdio};
-    use zeroize::Zeroize as _;
+    use zeroize::{Zeroize as _, Zeroizing};
 
     const SECURITY: &str = "/usr/bin/security";
     /// `security` exits 44 when no item matches.
@@ -743,6 +910,58 @@ mod host {
         delete(SERVICE, id)
     }
 
+    /// The codes that mean the item does not let this program read it:
+    /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
+    const DENIED: [i32; 3] = [-25293, -25243, -128];
+    /// `errSecInteractionNotAllowed`. With prompts off, a locked keychain
+    /// and an item that does not trust the proxy both return it, so the
+    /// read cannot say which cause it is.
+    const INTERACTION_NOT_ALLOWED: i32 = -25308;
+    /// `errSecItemNotFound`.
+    const ITEM_NOT_FOUND: i32 = -25300;
+
+    /// Serialises reads. The setting that turns off Keychain prompts is
+    /// process-wide, so one read must not turn prompts back on while
+    /// another read is in progress.
+    static NO_PROMPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn read(id: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        let _serial = NO_PROMPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // With prompts off, an item that does not let the proxy read it
+        // returns `errSecInteractionNotAllowed` and does not block the
+        // request on a dialog. The lock turns prompts back on when it drops.
+        let _no_prompt =
+            security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()
+                .map_err(|e| {
+                    ReadError::Store(StoreError::Refused {
+                        store: NATIVE_STORE,
+                        action: "read the secret",
+                        detail: e.to_string(),
+                    })
+                })?;
+        match security_framework::passwords::get_generic_password(SERVICE, id) {
+            Ok(value) => Ok(Zeroizing::new(value)),
+            Err(e) if e.code() == ITEM_NOT_FOUND => Err(ReadError::Deleted(id.to_owned())),
+            Err(e) if DENIED.contains(&e.code()) => Err(ReadError::Disabled(id.to_owned())),
+            Err(e) if e.code() == INTERACTION_NOT_ALLOWED => {
+                Err(ReadError::Store(StoreError::Refused {
+                    store: NATIVE_STORE,
+                    action: "read the secret",
+                    detail: format!(
+                        "the keychain is locked, or the secret {id} does not let the Box Egress Proxy read it without a prompt"
+                    ),
+                }))
+            }
+            Err(e) => Err(ReadError::Store(StoreError::Refused {
+                store: NATIVE_STORE,
+                action: "read the secret",
+                detail: e.to_string(),
+            })),
+        }
+    }
+
     fn delete(service: &str, id: &str) -> Result<bool, StoreError> {
         let out = run(
             "remove the secret",
@@ -761,8 +980,13 @@ mod host {
 
 #[cfg(not(target_os = "macos"))]
 mod host {
-    use super::{ItemInfo, StoreError};
+    use super::{ItemInfo, ReadError, StoreError};
     use std::path::Path;
+    use zeroize::Zeroizing;
+
+    pub(super) fn read(_: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        Err(ReadError::Store(StoreError::Unsupported))
+    }
 
     pub(super) fn set(_: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
         Err(StoreError::Unsupported)

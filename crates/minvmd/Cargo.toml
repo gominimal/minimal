@@ -82,6 +82,10 @@ paths.workspace = true
 # facts.
 uuid.workspace = true
 version.workspace = true
+# The proxy-binary rule (`bep::store::proxy_binary_path`) that the
+# supervisor starts the Box Egress Proxy from. `min secret` names the same
+# program in a keychain item's access control, so the rule has one owner.
+bep = { path = "../bep" }
 
 [dev-dependencies]
 camino.workspace = true

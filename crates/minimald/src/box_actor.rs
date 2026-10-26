@@ -55,6 +55,8 @@ mod kind;
 // The actor's concerns, one file each. The actor type, its loop and its
 // messages stay here.
 mod attach;
+// BEP-015: the git credential helper a GitHub grant box carries.
+pub(crate) mod bep_git_helper;
 mod handle;
 mod host;
 mod launcher;
@@ -698,6 +700,18 @@ impl BoxActor {
     pub(crate) async fn run(conf: BoxActorConfig) -> Result<BoxHandle, std::io::Error> {
         let obj = conf.record.object().await?;
         Self::create_dirs(&obj)?;
+        // BEP-015: a GitHub grant box carries a git credential helper that
+        // answers with its sealed value. Written on every start, so a box
+        // from before the helper gets it too. A failed write removes a
+        // helper from an earlier start. The box still starts: git then
+        // sends no credential for the grant hosts, and a clone fails.
+        let home = obj.home_path();
+        if let Err(error) = bep_git_helper::install(
+            std::path::Path::new(home.as_str()),
+            &obj.record().sealed_deliveries,
+        ) {
+            tracing::warn!(%error, home = %home, "writing the git credential helper");
+        }
 
         let inner = match obj.record().status {
             BoxState::Active => {

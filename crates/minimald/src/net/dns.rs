@@ -96,14 +96,43 @@ pub fn is_zone_name(name: &str) -> bool {
 /// A new state is *down*. A steered name fails closed until the listener
 /// is reported live, so no lookup answered before the first report can
 /// fall back to real DNS.
-// Interim until https://github.com/gominimal/minimal/issues/2523: no production code builds a state yet. Remove the allow when BoxGate::for_session passes one to the gate.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// A state built by [`Self::for_switch`] refreshes itself: it asks the VM
+/// host daemon over the switch's control channel
+/// ([`super::listeners::proxy_listening`]), and a read that finds the last
+/// answer older than [`PROXY_LISTENER_CACHE`] starts the next ask. The read
+/// never waits for the ask: it answers from the last answer. A host that
+/// cannot be asked, a native host among them, answers down.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProxyListenerState {
     live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where the state asks, or `None` for a state only [`Self::set_live`]
+    /// writes.
+    source: Option<std::sync::Arc<ListenerSource>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// How long one answer about the proxy's listener stands before a read
+/// asks again. Short, so a proxy that stops listening fails its steered
+/// names closed within seconds.
+pub(crate) const PROXY_LISTENER_CACHE: Duration = Duration::from_secs(2);
+
+/// Where a [`ProxyListenerState`] asks, and when it last asked.
+#[derive(Debug)]
+struct ListenerSource {
+    /// The switch's control channel, the path to the VM host daemon.
+    control: super::policy::ControlChannel,
+    /// When the last ask started, or `None` before the first.
+    asked: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Whether an ask is in flight: a door that does not answer holds one
+    /// ask for its whole deadline, and the next read starts no other.
+    asking: std::sync::atomic::AtomicBool,
+}
+
+/// The one listener state of each switch, by its control channel.
+static SWITCH_LISTENERS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, ProxyListenerState>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 impl ProxyListenerState {
     /// A state that reads down until [`Self::set_live`] reports otherwise.
     #[must_use]
@@ -111,10 +140,104 @@ impl ProxyListenerState {
         Self::default()
     }
 
-    /// Whether the listener is live now.
+    /// A new state that asks the VM host daemon over `control`. The first
+    /// ask starts at once when a runtime runs.
+    #[must_use]
+    pub(crate) fn asking(control: super::policy::ControlChannel) -> Self {
+        let state = Self {
+            live: std::sync::Arc::default(),
+            source: Some(std::sync::Arc::new(ListenerSource {
+                control,
+                asked: std::sync::Mutex::new(None),
+                asking: std::sync::atomic::AtomicBool::new(false),
+            })),
+        };
+        state.refresh_if_stale();
+        state
+    }
+
+    /// The state every gate on the switch at `control` shares: built and
+    /// asked at the first box's attach, and handed to every later one.
+    #[must_use]
+    pub(crate) fn for_switch(control: &super::policy::ControlChannel) -> Self {
+        let key = match control {
+            super::policy::ControlChannel::Unix(path) => format!("unix:{}", path.display()),
+            super::policy::ControlChannel::Vsock { cid, port } => format!("vsock:{cid}:{port}"),
+        };
+        SWITCH_LISTENERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_insert_with(|| Self::asking(control.clone()))
+            .clone()
+    }
+
+    /// Whether the listener is live now, by the last answer. A read that
+    /// finds the answer stale starts the next ask and does not wait for it.
     #[must_use]
     pub(crate) fn is_live(&self) -> bool {
+        self.refresh_if_stale();
         self.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Start an ask when the last one is older than [`PROXY_LISTENER_CACHE`]
+    /// and none is in flight. Without a runtime to run the ask on, the
+    /// state keeps its last answer.
+    fn refresh_if_stale(&self) {
+        let Some(source) = &self.source else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        {
+            let mut asked = source
+                .asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if asked.is_some_and(|at| now.duration_since(at) < PROXY_LISTENER_CACHE) {
+                return;
+            }
+            if source
+                .asking
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            *asked = Some(now);
+        }
+        let state = self.clone();
+        // The ask ends within the report door's deadline, so it carries the
+        // reader's span rather than a root span of its own.
+        crate::traced::spawn(async move {
+            state.refresh().await;
+        });
+    }
+
+    /// Ask the VM host daemon now and record its answer: `false` when it
+    /// cannot be asked or does not answer. Returns the recorded answer. A
+    /// state with nowhere to ask keeps its last answer.
+    pub(crate) async fn refresh(&self) -> bool {
+        let Some(source) = &self.source else {
+            return self.live.load(std::sync::atomic::Ordering::Acquire);
+        };
+        // The guard clears `asking` however the ask ends. A task dropped or
+        // panicking mid-ask would otherwise leave `asking` set, and no later
+        // read would ask again. An ask that ends without an answer also
+        // records down, so steered names fail closed.
+        let mut guard = AskGuard {
+            state: self,
+            source,
+            answered: false,
+        };
+        let live = super::listeners::proxy_listening(&source.control)
+            .await
+            .unwrap_or(false);
+        guard.state.set_live(live);
+        guard.answered = true;
+        drop(guard);
+        live
     }
 
     /// Records whether the listener is live. The change from down to live
@@ -129,6 +252,25 @@ impl ProxyListenerState {
             );
         }
         was != live
+    }
+}
+
+/// Ends one ask of a [`ProxyListenerState`]: clears its `asking` flag on
+/// drop, and records down when the ask ended without an answer.
+struct AskGuard<'a> {
+    state: &'a ProxyListenerState,
+    source: &'a ListenerSource,
+    answered: bool,
+}
+
+impl Drop for AskGuard<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.state.set_live(false);
+        }
+        self.source
+            .asking
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -5209,5 +5351,44 @@ mod tests {
             LoopbackGrant::Granted(boxes::core::loopback::POOL_FIRST),
             "an empty record reads as a fresh host"
         );
+    }
+
+    /// An ask that is dropped before the host answers clears its `asking`
+    /// flag and records down, so a later read asks again and a steered
+    /// name fails closed meanwhile.
+    #[tokio::test]
+    async fn a_dropped_listener_ask_clears_asking_and_reads_down() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let control_sock = dir.path().join("gvproxy.sock");
+        let door = dir.path().join("guest-control.sock");
+        // A door that takes the connection and never answers.
+        let _silent = tokio::net::UnixListener::bind(&door).expect("bind the silent door");
+        super::super::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+        let state = ProxyListenerState {
+            live: std::sync::Arc::default(),
+            source: Some(std::sync::Arc::new(ListenerSource {
+                control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
+                asked: std::sync::Mutex::new(None),
+                asking: std::sync::atomic::AtomicBool::new(true),
+            })),
+        };
+        state.set_live(true);
+        let ask = tokio::time::timeout(Duration::from_millis(50), state.refresh()).await;
+        assert!(
+            ask.is_err(),
+            "the silent door holds the ask past the timeout"
+        );
+
+        let source = state.source.as_ref().expect("the state has a source");
+        assert!(
+            !source.asking.load(std::sync::atomic::Ordering::Acquire),
+            "the dropped ask clears asking"
+        );
+        assert!(
+            !state.live.load(std::sync::atomic::Ordering::Acquire),
+            "the dropped ask records down"
+        );
+        super::super::listeners::clear_vm_report_door_for_tests(&control_sock);
     }
 }

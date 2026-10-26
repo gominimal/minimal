@@ -17,7 +17,9 @@
 //! `bep serve` starts the proxy the same way, then serves box connections on
 //! the listener socket ([`bep::listener`]), and client key and box
 //! registrations on the control socket ([`bep::control`]). It reads the
-//! per-boot token from standard input. Each request inside a box connection
+//! per-boot token from standard input. With `--exit-on-stdin-close` it
+//! stops when standard input closes, which is how a supervisor's death stops
+//! it ([`bep::supervisor`]). Each request inside a box connection
 //! goes to the redemption decision ([`bep::redeemer`]), which reads the
 //! boxes the control socket registers. The root certificate the start
 //! issued is the anchor of the CA that signs each leaf.
@@ -33,14 +35,15 @@ use std::time::{Duration, Instant, SystemTime};
 use bep::audit::{self, AuditLog};
 use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
-use bep::control::{Control, Registry, RotationReply, RotationRequest};
+use bep::control::{Control, KeyBound, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
-use bep::redeemer::BoxRedeemer;
+use bep::redeemer::{BoxRedeemer, Revocations};
+use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -92,6 +95,53 @@ struct ServeArgs {
     /// [default: ~/.minimal/bep/control.sock]
     #[arg(long, value_name = "PATH")]
     control: Option<PathBuf>,
+
+    /// Stop serving when standard input closes. A supervisor keeps its end
+    /// of the pipe open after the token, so the proxy stops when the
+    /// supervisor exits, even when it is killed.
+    #[arg(long)]
+    exit_on_stdin_close: bool,
+
+    /// The most client keys the control socket keeps. A new key past it
+    /// drops the key registered least recently. Give 1 or more.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = KeyBound::DEFAULT_MAX_KEYS,
+        value_parser = parse_max_client_keys
+    )]
+    max_client_keys: usize,
+
+    /// Move each audit log segment that holds a line bep cannot read into
+    /// the `quarantine` directory beside the log, then start. bep records
+    /// again the revocations it can read in a moved segment. A destroyed
+    /// box that only an unreadable line records is no longer refused.
+    #[arg(long)]
+    quarantine_unreadable: bool,
+}
+
+impl ServeArgs {
+    /// The client key bound of the control socket (BEP-063). The idle
+    /// period stays `None` until gominimal/arch#85 decides the root's
+    /// validity.
+    fn key_bound(&self) -> KeyBound {
+        KeyBound {
+            max_keys: self.max_client_keys,
+            idle: None,
+        }
+    }
+}
+
+/// Reads `--max-client-keys`: a whole number of 1 or more.
+fn parse_max_client_keys(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err(
+            "give 1 or more. The control socket always keeps the key that `min` registers."
+                .to_owned(),
+        ),
+        Ok(count) => Ok(count),
+        Err(_) => Err(format!("`{value}` is not a whole number. Give 1 or more.")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -565,15 +615,22 @@ fn unix_now() -> Result<u64, String> {
 struct Wiring {
     clients: Registry,
     boxes: BoxRegistry,
+    revocations: Revocations,
     redeemer: Arc<dyn Redeemer>,
 }
 
 /// The redeemer over the proxy key `sealing` and the sign-in item in
 /// `keychain`, and the registries it reads. The Box Host a sealed value and
 /// its handle name is this proxy's sealing key fingerprint, which the
-/// published identity carries.
+/// published identity carries. `restored` is the box ids that the
+/// revocations recorded before this start name.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn wire<K, C>(sealing: K, keychain: C, endpoint: Arc<dyn TokenEndpoint>) -> Wiring
+fn wire<K, C>(
+    sealing: K,
+    keychain: C,
+    endpoint: Arc<dyn TokenEndpoint>,
+    restored: Vec<String>,
+) -> Wiring
 where
     K: HeldKey + Send + Sync + 'static,
     C: Keychain + Send + Sync + 'static,
@@ -581,18 +638,15 @@ where
     let node = sealing.public().kid();
     let clients = Registry::default();
     // `min` sends `register_box` when it creates a box with a GitHub grant
-    // (`crates/minimal/src/cmd/boxes/create.rs`). Interim: nothing sends
-    // `forget_box` at destroy until T20
-    // (https://github.com/gominimal/minimal/issues/2277), in
-    // `crates/minvmd/src/box_registry.rs`.
+    // (`crates/minimal/src/cmd/boxes/create.rs`). `minvmd` sends
+    // `revoke_box` and then `forget_box` when a live box is destroyed
+    // (`crates/minvmd/src/box_registry.rs`).
     let boxes = BoxRegistry::default();
-    // Interim: `BoxRedeemer::new` starts with no revocation in force, and
-    // nothing here gives it one. T20
-    // (https://github.com/gominimal/minimal/issues/2277) records revocations
-    // over the control socket. T33
-    // (https://github.com/gominimal/minimal/issues/2290) restores them from
-    // every retained audit segment at start, the BEP-068 restore-on-start
-    // sub-requirement. Those two are the flip.
+    // The revocations `revoke_box` records over the control socket, which
+    // the redeemer reads at each request (BEP-043, BEP-071). The set starts
+    // with the revocations restored from every retained audit segment
+    // (BEP-068).
+    let revocations: Revocations = Arc::new(std::sync::RwLock::new(restored));
     //
     // Interim: the redeemer reads no store rules until T25
     // (https://github.com/gominimal/minimal/issues/2280) reads
@@ -606,12 +660,14 @@ where
             Arc::clone(&boxes),
             keychain,
         )
+        .with_revocations(Arc::clone(&revocations))
         // BEP-069: an expiring sign-in renews here, at the proxy.
         .with_token_endpoint(endpoint),
     );
     Wiring {
         clients,
         boxes,
+        revocations,
         redeemer,
     }
 }
@@ -626,10 +682,118 @@ impl Wiring {
         proxy.with_redeemer(Arc::clone(&self.redeemer))
     }
 
-    /// The control socket at `path`, which registers into this wiring.
-    fn control(&self, path: &Path) -> io::Result<Control> {
-        Control::bind(path, Arc::clone(&self.clients), Arc::clone(&self.boxes))
+    /// The control socket at `path`, which registers into this wiring and
+    /// appends its mint and revocation records to `audit`, the log the
+    /// proxy's decisions go to (BEP-067).
+    /// The registry keeps at most the keys that `bound` admits.
+    fn control(
+        &self,
+        path: &Path,
+        audit: Arc<dyn AuditWriter>,
+        bound: KeyBound,
+    ) -> io::Result<Control> {
+        Ok(Control::bind_with_key_bound(
+            path,
+            Arc::clone(&self.clients),
+            Arc::clone(&self.boxes),
+            bound,
+        )?
+        .with_revocations(Arc::clone(&self.revocations))
+        .with_audit(audit))
     }
+}
+
+/// Refuses the start when the audit log holds a complete line that does not
+/// parse. That line can be a revocation, and a start without it redeems a
+/// value for a destroyed box (BEP-068). The partial last line of a torn
+/// write is cut when the log opens, so it is not counted here. The refusal
+/// names `--quarantine-unreadable`, which moves those segments aside
+/// (BEP-068), in place of a hand edit of the log.
+fn refuse_unreadable(restored: &revoke::Restored, dir: &Path) -> Result<(), String> {
+    if restored.skipped == 0 {
+        return Ok(());
+    }
+    tracing::error!(
+        skipped = restored.skipped,
+        segments = ?restored.unreadable,
+        "refused the start: audit log lines did not parse, and one can be a revocation"
+    );
+    let segments: Vec<String> = restored
+        .unreadable
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect();
+    let lines = if restored.skipped == 1 {
+        "1 line".to_owned()
+    } else {
+        format!("{} lines", restored.skipped)
+    };
+    let these = if restored.unreadable.len() == 1 {
+        "that segment"
+    } else {
+        "those segments"
+    };
+    Err(format!(
+        "bep did not start. The audit log has {lines} that bep cannot read, in:\n{}\n\
+         A line that bep cannot read can record a destroyed box. \
+         Without it, bep cannot keep refusing that box.\n\
+         To move {these} into {} and start, run `bep serve` again with `--quarantine-unreadable`.\n\
+         bep then records again the revocations it can read there. \
+         A destroyed box that only an unreadable line records is no longer refused.",
+        segments.join("\n"),
+        dir.join(audit::QUARANTINE_DIR).display()
+    ))
+}
+
+/// Opens the audit log in `dir` and reads the revocations it records, for
+/// `bep serve`. With `quarantine`, the segments that hold an unreadable
+/// line move aside first, and the log is read again. Without it, such a
+/// line refuses the start.
+fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Restored), String> {
+    // Locked first, so no other writer rotates the segments under the read.
+    let mut log = open_audit_log(dir)?;
+    let read = |dir: &Path| {
+        revoke::restore(dir)
+            .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))
+    };
+    // BEP-068: the log rotates its segments, and the revocations in every
+    // retained segment are in force again from this start.
+    let mut restored = read(dir)?;
+    if quarantine && restored.skipped > 0 {
+        log.quarantine_unreadable().map_err(|err| {
+            format!(
+                "bep did not move the audit log segments it cannot read into {}: {err}",
+                dir.join(audit::QUARANTINE_DIR).display()
+            )
+        })?;
+        restored = read(dir)?;
+    }
+    tracing::info!(
+        count = restored.box_ids.len(),
+        box_ids = ?restored.box_ids,
+        audit = %dir.display(),
+        "restored the revocations recorded in the audit log"
+    );
+    refuse_unreadable(&restored, dir)?;
+    Ok((log, restored))
+}
+
+/// Opens the audit log in `dir` for `bep serve`. The log holds the
+/// directory, so a second `bep serve` on it is refused.
+fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                dir.display()
+            )
+        } else {
+            format!("bep did not open the audit log in {}: {err}", dir.display())
+        }
+    })
 }
 
 /// `bep serve`: the listener and the control socket, until one fails.
@@ -640,21 +804,24 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
+    // Watched from here, so a supervisor that dies while the proxy starts
+    // stops it as soon as it serves (#2501).
+    let supervisor = if args.exit_on_stdin_close {
+        Some(
+            bep::supervisor::watch_until_closed(io::stdin())
+                .map_err(|err| format!("bep did not watch its standard input: {err}"))?,
+        )
+    } else {
+        None
+    };
+    let key_bound = args.key_bound();
     let control = args.control.clone().or_else(default_control).ok_or(
         "bep did not find your home directory. Give the socket with `bep serve --control <PATH>`.",
     )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
-    let segment = audit::segments(&dir)
-        .map_err(|err| format!("bep did not read the audit log in {}: {err}", dir.display()))?
-        .pop()
-        .unwrap_or_else(|| dir.join(audit::segment_name(0)));
-    let log = AuditLog::open(&segment).map_err(|err| {
-        format!(
-            "bep did not open the audit log {}: {err}",
-            segment.display()
-        )
-    })?;
+    let (log, restored) = start_audit_log(&dir, args.quarantine_unreadable)?;
+    let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set when
@@ -675,15 +842,18 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let endpoint = GitHubTokenEndpoint::new(roots.clone())?;
     let ca = Arc::new(Mutex::new(ca));
+    // One log, one writer: the proxy's decisions and the control socket's
+    // mint and revocation records share the chain (BEP-067).
+    let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
     let proxy = Proxy::new(
         Admission::new(&[GITHUB], [("", 0); 0]),
         ca.clone(),
         roots,
         Arc::new(SystemResolver),
-        Arc::new(Mutex::new(log)),
+        log.clone(),
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint));
+    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored.box_ids);
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
@@ -695,19 +865,20 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         // The same socket takes `bep --rotate-signing`, which rotates the
         // signing CA the proxy signs leaves with (BEP-061).
         let control_socket = wiring
-            .control(&control)
+            .control(&control, log, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
-        tracing::warn!(
-            "A store-handle member is not admitted until #2280 lands. \
-             No revocation is in force until #2277 and #2290 land. \
-             Nothing forgets a destroyed box's declared egress until #2277 lands."
-        );
+        tracing::warn!("A store-handle member is not admitted until #2280 lands.");
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
             audit = %segment.display(),
             "the proxy is serving"
+        );
+        tracing::info!(
+            max_client_keys = key_bound.max_keys,
+            idle = ?key_bound.idle,
+            "the control socket keeps at most max_client_keys client keys"
         );
         let served = tokio::select! {
             served = listener.run(move |delivery, stream| {
@@ -715,9 +886,30 @@ fn serve<K: CaKey + Send + Sync + 'static>(
                 async move { proxy.serve(delivery, stream).await }
             }) => served,
             served = control_socket.run() => served,
+            closed = supervised(supervisor) => {
+                match closed {
+                    Ok(()) => tracing::info!("standard input closed, so the supervisor is gone; the proxy stops"),
+                    Err(err) => tracing::warn!(%err, "standard input failed, so the supervisor is taken for gone; the proxy stops"),
+                }
+                Ok(())
+            }
         };
         served.map_err(|err| format!("bep stopped serving: {err}"))
     })
+}
+
+/// Resolves when the supervisor's pipe closes, or never when `bep serve`
+/// runs without `--exit-on-stdin-close`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn supervised(
+    watch: Option<tokio::sync::oneshot::Receiver<bep::supervisor::Closed>>,
+) -> bep::supervisor::Closed {
+    match watch {
+        // A watch thread that ended without a word cannot see the pipe any
+        // more, so it counts as closed.
+        Some(watch) => watch.await.unwrap_or(Ok(())),
+        None => std::future::pending().await,
+    }
 }
 
 /// The client id of the Minimal-published GitHub App. `min auth login`
@@ -1072,6 +1264,146 @@ mod tests {
     use bep::ca::Leaf;
     use bep::proxy::LeafIssuer;
 
+    // BEP-068: a line that does not parse can be a revocation, so the start
+    // fails closed and names the segment that holds it.
+    #[test]
+    fn serve_refuses_start_on_unreadable_audit_line() {
+        let dir = Path::new("/audit");
+        assert_eq!(refuse_unreadable(&revoke::Restored::default(), dir), Ok(()));
+        let restored = revoke::Restored {
+            box_ids: Vec::new(),
+            skipped: 2,
+            unreadable: vec![PathBuf::from("/audit/audit-0.jsonl")],
+        };
+        let err = refuse_unreadable(&restored, dir).unwrap_err();
+        assert_eq!(
+            err,
+            "bep did not start. The audit log has 2 lines that bep cannot read, in:\n  \
+             /audit/audit-0.jsonl\n\
+             A line that bep cannot read can record a destroyed box. \
+             Without it, bep cannot keep refusing that box.\n\
+             To move that segment into /audit/quarantine and start, \
+             run `bep serve` again with `--quarantine-unreadable`.\n\
+             bep then records again the revocations it can read there. \
+             A destroyed box that only an unreadable line records is no longer refused."
+        );
+    }
+
+    // BEP-068: `bep serve --quarantine-unreadable` moves a segment with an
+    // unreadable line aside and starts. The quarantine record bridges the
+    // gap, so the chain verifies across it, and a revocation read in the
+    // moved segment stays in force at the next start.
+    #[test]
+    fn quarantine_keeps_the_chain_and_starts() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome, Record};
+        let decision = |kind: Kind, box_id: &str| Decision {
+            kind,
+            box_id: box_id.to_owned(),
+            authority: String::new(),
+            identifier: None,
+            // A mint or a revocation carries no handle. The test's
+            // decisions carry none either.
+            jti: String::new(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: if kind == Kind::Revocation {
+                Outcome::Refuse
+            } else {
+                Outcome::Admit
+            },
+            marker: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Three segments of one chain. The middle one holds a revocation,
+        // and its last line is then made unreadable.
+        let plan: [&[(Kind, &str)]; 3] = [
+            &[(Kind::Decision, "box-a"), (Kind::Mint, "box-a")],
+            &[(Kind::Revocation, "box-a"), (Kind::Decision, "box-b")],
+            &[(Kind::Decision, "box-b")],
+        ];
+        let mut head = audit::ZERO_HASH.to_owned();
+        let mut files = Vec::new();
+        for records in plan {
+            let mut lines = Vec::new();
+            for (kind, box_id) in records {
+                let line = Record::from_decision(&decision(*kind, box_id), &head).to_line();
+                head = audit::line_hash(&line);
+                lines.push(line);
+            }
+            files.push(lines);
+        }
+        // A record of a kind this bep does not know, chained in place, is
+        // no unreadable line.
+        let future = format!(
+            "{{\"schema\":\"{}\",\"kind\":\"future_kind\",\"previous_hash\":\"{head}\"}}",
+            audit::SCHEMA
+        );
+        files[2].push(future);
+        files[1][1] = "{\"schema\":\"min/v1/audit\",\"kind\":\"decis".to_owned();
+        for (n, lines) in files.iter().enumerate() {
+            std::fs::write(
+                dir.join(audit::segment_name(n as u64)),
+                lines
+                    .iter()
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        assert!(audit::verify_chain(&dir).unwrap().is_err());
+
+        let refused = start_audit_log(&dir, false).unwrap_err();
+        assert!(refused.contains("--quarantine-unreadable"), "{refused}");
+
+        let (mut log, restored) = start_audit_log(&dir, true).unwrap();
+        assert_eq!(restored.box_ids, vec!["box-a".to_owned()]);
+        assert_eq!(restored.skipped, 0);
+        assert!(!dir.join("audit-1.jsonl").exists());
+        assert!(dir.join("quarantine/audit-1.jsonl").exists());
+        // The revocation recorded again carries a marker, so it does not
+        // read as a second destroy of box-a.
+        let restated: Vec<_> = audit::LogReader::new(&dir)
+            .read_new()
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.record.kind == Kind::Revocation)
+            .collect();
+        assert_eq!(restated.len(), 1);
+        assert_eq!(restated[0].record.marker.as_deref(), Some(audit::RESTATED));
+        let verified = audit::verify_chain(&dir).unwrap();
+        assert!(verified.is_ok(), "{verified:?}");
+        log.append(&decision(Kind::Decision, "box-c")).unwrap();
+        assert!(audit::verify_chain(&dir).unwrap().is_ok());
+        drop(log);
+
+        // The next start needs no flag, and box-a is still revoked.
+        let (_, restored) = start_audit_log(&dir, false).unwrap();
+        assert_eq!(restored.box_ids, vec!["box-a".to_owned()]);
+    }
+
+    // BEP-068: a second `bep serve` on the same audit directory is refused,
+    // so two writers never fork the chain.
+    #[test]
+    fn serve_refuses_a_second_writer_of_the_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let first = open_audit_log(&audit).unwrap();
+        let err = open_audit_log(&audit).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                audit.display()
+            )
+        );
+        drop(first);
+        open_audit_log(&audit).unwrap();
+    }
+
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
     struct NoSigningKey;
 
@@ -1395,7 +1727,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint));
+        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint), Vec::new());
 
         let proxy = Proxy::new(
             Admission::new(&[GITHUB], [("", 0); 0]),
@@ -1408,7 +1740,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
         let _proxy = wiring.install(proxy, &path);
-        tokio::spawn(wiring.control(&path).unwrap().run());
+        tokio::spawn(
+            wiring
+                .control(
+                    &path,
+                    Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    KeyBound::default(),
+                )
+                .unwrap()
+                .run(),
+        );
 
         let client = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
         let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
@@ -1416,6 +1757,7 @@ mod tests {
             &mut stream,
             &Request::RegisterClientKey {
                 key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                box_id: None,
             },
         )
         .await;
@@ -1494,6 +1836,123 @@ mod tests {
             wiring.redeemer.redeem(BOX, &api, &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    /// #2501: a supervisor asks for the lifeline with a flag, so a person
+    /// who pipes the token in by hand keeps a proxy that outlives the pipe.
+    #[test]
+    fn serve_watches_standard_input_only_when_asked() {
+        let parsed = |extra: &[&str]| {
+            let args = Args::try_parse_from(
+                ["bep", "serve", "--listener", "/tmp/bep.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .expect("the arguments parse");
+            match args.command {
+                Some(Command::Serve(serve)) => serve.exit_on_stdin_close,
+                None => panic!("no serve command"),
+            }
+        };
+        assert!(!parsed(&[]), "a hand-run proxy outlives its input");
+        assert!(parsed(&["--exit-on-stdin-close"]));
+    }
+
+    // BEP-063: `bep serve --max-client-keys` bounds the control socket's
+    // client key registry, and a bound of zero or a word is refused before
+    // the proxy starts.
+    #[tokio::test]
+    async fn serve_passes_its_key_bound_to_the_control_socket() {
+        let serve_args = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["bep", "serve", "--listener", "/tmp/bep.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .map(|args| match args.command {
+                Some(Command::Serve(serve)) => serve,
+                None => panic!("no serve command"),
+            })
+        };
+        assert_eq!(serve_args(&[]).unwrap().key_bound(), KeyBound::default());
+        for bad in ["0", "-1", "many"] {
+            assert!(
+                serve_args(&["--max-client-keys", bad]).is_err(),
+                "{bad} is refused"
+            );
+        }
+        let serve = serve_args(&["--max-client-keys", "2"]).unwrap();
+        assert_eq!(
+            serve.key_bound(),
+            KeyBound {
+                max_keys: 2,
+                idle: None
+            }
+        );
+
+        let key = TestKey(SecretKey::from_slice(&[5u8; 32]).unwrap());
+        let wiring = wire(
+            key,
+            MemoryKeychain::default(),
+            Arc::new(signin::NoTokenEndpoint),
+            Vec::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        tokio::spawn(
+            wiring
+                .control(
+                    &path,
+                    Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    serve.key_bound(),
+                )
+                .unwrap()
+                .run(),
+        );
+
+        let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        let mut kids = Vec::new();
+        for byte in [11u8, 12, 13] {
+            let client = SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            let registered = ask(
+                &mut stream,
+                &Request::RegisterClientKey {
+                    key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                    box_id: None,
+                },
+            )
+            .await;
+            assert!(registered.ok, "{registered:?}");
+            kids.push(handle::kid(client.verifying_key()));
+        }
+        let clients = wiring.clients.read().unwrap();
+        assert!(!clients.contains(&kids[0]), "the oldest key is dropped");
+        assert!(clients.contains(&kids[1]));
+        assert!(clients.contains(&kids[2]));
+    }
+
+    /// #2501: the serve loop stops when the supervisor's pipe closes, and
+    /// never on that branch without the flag.
+    #[tokio::test]
+    async fn the_serve_loop_stops_when_the_supervisor_pipe_closes() {
+        let quiet = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(quiet, supervised(None)).await.is_err(),
+            "with no watch, the branch never fires"
+        );
+
+        let (reader, writer) = io::pipe().expect("pipe");
+        let watch = bep::supervisor::watch_until_closed(reader).expect("watch");
+        let mut stop = Box::pin(supervised(Some(watch)));
+        assert!(
+            tokio::time::timeout(quiet, &mut stop).await.is_err(),
+            "an open pipe keeps the proxy serving"
+        );
+        drop(writer);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+            .await
+            .expect("a closed pipe stops the proxy");
+        assert!(closed.is_ok(), "{closed:?}");
     }
 
     // BEP-069 (Gatehouse §6.10): a browser-flow sign-in renews under the

@@ -171,8 +171,16 @@ fn empty_response_produces_empty_verdict() {
     )
     .unwrap();
     assert_eq!(verdict.session_id, session_id());
-    assert!(verdict.vars.is_empty());
-    assert!(verdict.patches.is_empty());
+    assert!(
+        verdict.vars.is_empty(),
+        "expected empty, got {:?}",
+        verdict.vars
+    );
+    assert!(
+        verdict.patches.is_empty(),
+        "expected empty, got {:?}",
+        verdict.patches
+    );
 }
 
 /// A Specified pending var that matches the policy's `allow` rule
@@ -727,8 +735,16 @@ fn package_declared_hook_is_denied_without_prompting() {
         &pinned_env(&[]),
     )
     .unwrap();
-    assert!(verdict.vars.is_empty());
-    assert!(verdict.patches.is_empty());
+    assert!(
+        verdict.vars.is_empty(),
+        "expected empty, got {:?}",
+        verdict.vars
+    );
+    assert!(
+        verdict.patches.is_empty(),
+        "expected empty, got {:?}",
+        verdict.patches
+    );
     assert!(
         matches!(
             verdict.lifecycle_hooks.as_slice(),
