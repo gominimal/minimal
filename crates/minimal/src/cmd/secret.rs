@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use bep::store::{HostStore, NATIVE_STORE, ProxyLookupError, SecretStore, StoreError, valid_id};
-use boxes::core::bep::{StoreAction, StoreRuleConfig, StoreRules};
+use boxes::core::bep::{StoreAction, StoreRuleConfig, StoreRuleRefusal, StoreRules};
 use zeroize::Zeroizing;
 
 use crate::{GlobalArgs, SecretListArgs, SecretRmArgs, SecretSetArgs};
@@ -119,7 +119,10 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
     refuse_set_args(&args)?;
     let source = value_source(global.no_input, detect_source());
     let proxy = set_proxy(&HostStore, proxy_path)?;
-    run_set(
+    let path = crate::config::user_config_path(global);
+    let id = args.id.clone();
+    let mut confirm = |change: &str| confirm_rule_change(&id, change);
+    run_set_with_rule(
         &HostStore,
         &args,
         &proxy,
@@ -127,7 +130,22 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
         &mut || read_terminal(&args.id),
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
+        Some(RuleTarget {
+            path: &path,
+            confirm: &mut confirm,
+            notice: &mut std::io::stderr(),
+        }),
     )
+}
+
+/// Show `change` on stderr and ask on the terminal whether to replace the
+/// rule for `id`. The answer defaults to no.
+fn confirm_rule_change(id: &str, change: &str) -> anyhow::Result<bool> {
+    eprintln!("{change}");
+    inquire::Confirm::new(&format!("Replace the rule for {id}?"))
+        .with_default(false)
+        .prompt()
+        .context("min secret set did not read the answer from the terminal")
 }
 
 /// The proxy path for `set`, after the store check. Review finding
@@ -159,7 +177,253 @@ fn refuse_set_args(args: &SecretSetArgs) -> anyhow::Result<()> {
     }
     check_id(SET, &args.id)?;
     check_store(SET, args.store.as_deref())?;
+    requested_rule(args)?;
     Ok(())
+}
+
+/// A built-in rule for a service that takes a fixed token (BEP-079).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Preset {
+    /// The name `--preset` takes.
+    pub name: &'static str,
+    /// The one upstream authority.
+    pub upstream: &'static str,
+    /// The header the value goes in.
+    pub header: &'static str,
+    /// The text before the value, if any.
+    pub prefix: Option<&'static str>,
+}
+
+/// The presets, by name. The spec fixes each one (BEP-079).
+pub(crate) const PRESETS: [Preset; 5] = [
+    Preset {
+        name: "anthropic",
+        upstream: "api.anthropic.com",
+        header: "Authorization",
+        prefix: Some("Bearer "),
+    },
+    Preset {
+        name: "anthropic-api-key",
+        upstream: "api.anthropic.com",
+        header: "x-api-key",
+        prefix: None,
+    },
+    Preset {
+        name: "cloudflare",
+        upstream: "mcp.cloudflare.com",
+        header: "Authorization",
+        prefix: Some("Bearer "),
+    },
+    Preset {
+        name: "linear",
+        upstream: "mcp.linear.app",
+        header: "Authorization",
+        prefix: Some("Bearer "),
+    },
+    Preset {
+        name: "sentry",
+        upstream: "mcp.sentry.dev",
+        header: "Authorization",
+        prefix: Some("Sentry-Bearer "),
+    },
+];
+
+/// The rule the flags of `args` ask `set` to write, or `None` when no rule
+/// flag is given. No flag sets a consent `action` or a `store`, so the
+/// rule carries neither (BEP-079). `plan_rule` keeps those of a current rule.
+fn requested_rule(args: &SecretSetArgs) -> anyhow::Result<Option<StoreRuleConfig>> {
+    if let Some(name) = &args.preset {
+        let Some(preset) = PRESETS.iter().find(|p| p.name == name) else {
+            let known: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+            // The task fixes this wording.
+            bail!(
+                "There is no preset named {name}. Known presets: {}.",
+                known.join(", ")
+            );
+        };
+        return Ok(Some(StoreRuleConfig {
+            store: None,
+            upstream: vec![preset.upstream.to_owned()],
+            header: Some(preset.header.to_owned()),
+            prefix: preset.prefix.map(str::to_owned),
+            basic_auth: None,
+            action: None,
+        }));
+    }
+    if args.upstream.is_empty()
+        && args.header.is_none()
+        && args.prefix.is_none()
+        && args.basic_auth.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(StoreRuleConfig {
+        store: None,
+        upstream: args.upstream.clone(),
+        header: args.header.clone(),
+        prefix: args.prefix.clone(),
+        basic_auth: args.basic_auth.clone(),
+        action: None,
+    }))
+}
+
+/// Refuse `rule` for `id` when the configuration reader would refuse it
+/// (BEP-034), naming what it names. Nothing is read or written yet.
+fn check_new_rule(id: &str, rule: &StoreRuleConfig, path: &Path) -> anyhow::Result<()> {
+    let module_hosts = crate::config::store_module_hosts();
+    let deny = crate::config::store_deny_set(&module_hosts);
+    let file = path.display().to_string();
+    let (_, refused) =
+        boxes::core::bep::check_store_rules([(id.to_owned(), rule.clone())].into(), &file, deny);
+    let Some(refused) = refused.first() else {
+        return Ok(());
+    };
+    let why = match &refused.reason {
+        StoreRuleRefusal::MinimalInfrastructure { host, entry }
+            if !host.eq_ignore_ascii_case(entry) =>
+        {
+            format!(
+                "{host} is under {entry}, and a secret can never be sent to {entry} or a name \
+                 under it. Run the command again with another --upstream."
+            )
+        }
+        StoreRuleRefusal::ModuleHost { host }
+        | StoreRuleRefusal::MinimalInfrastructure { host, .. } => {
+            format!(
+                "a secret can never be sent to {host}. Run the command again with another --upstream."
+            )
+        }
+        StoreRuleRefusal::DeniedHeader { header } => format!(
+            "a secret can never be sent in the header {header}. Run the command again with another --header."
+        ),
+        StoreRuleRefusal::SignInItem => format!(
+            "the name {id} holds your GitHub sign-in, and only GitHub grants can use it. \
+             Run the command again with another name."
+        ),
+        StoreRuleRefusal::Malformed { field, value } => {
+            let (flag, shape) = match *field {
+                "upstream" => ("--upstream", "a host name or host:port"),
+                "header" => ("--header", "an HTTP header name"),
+                "basic_auth" => ("--basic-auth", "user or password"),
+                _ => ("--prefix", "text without control characters"),
+            };
+            format!(
+                "the {flag} value {value:?} is not {shape}. Run the command again with another {flag}."
+            )
+        }
+        StoreRuleRefusal::Incomplete => "a rule needs at least one --upstream, and either \
+             --header or --basic-auth. Run the command again with both."
+            .to_owned(),
+    };
+    bail!("min secret set refused the rule for {id}, and stored nothing: {why}")
+}
+
+/// Where `set` writes the rule, and how it asks before it replaces one.
+pub(crate) struct RuleTarget<'a> {
+    /// The user-level client configuration.
+    pub path: &'a Path,
+    /// Show the change and ask the person at the terminal. `true` replaces
+    /// the rule.
+    pub confirm: &'a mut dyn FnMut(&str) -> anyhow::Result<bool>,
+    /// Where `--yes` says which rule it replaces and what changes.
+    pub notice: &'a mut dyn Write,
+}
+
+/// The fields of `rule`, one per line, as the change prompt shows them.
+fn rule_lines(rule: &StoreRuleConfig) -> String {
+    let consent = match rule.action {
+        None => "none",
+        Some(StoreAction::Allow) => "allow",
+        Some(StoreAction::Ask) => "ask",
+        Some(StoreAction::Deny) => "deny",
+    };
+    format!(
+        "  upstream:  {}\n  injection: {}\n  consent:   {consent}",
+        rule.upstream.join(", "),
+        injection(rule)
+    )
+}
+
+/// The text that shows the current and the new rule for `id`.
+fn rule_change(id: &str, path: &Path, current: &StoreRuleConfig, new: &StoreRuleConfig) -> String {
+    format!(
+        "{path} has a different secret-store rule for {id}.\nCurrent rule:\n{}\nNew rule:\n{}",
+        rule_lines(current),
+        rule_lines(new),
+        path = path.display(),
+    )
+}
+
+/// The fields that differ from `current` to `new`, as the `--yes` line
+/// names them.
+fn rule_diff(current: &StoreRuleConfig, new: &StoreRuleConfig) -> String {
+    let mut changes = Vec::new();
+    if current.upstream != new.upstream {
+        changes.push(format!(
+            "upstream {} becomes {}",
+            current.upstream.join(", "),
+            new.upstream.join(", ")
+        ));
+    }
+    let (from, to) = (injection(current), injection(new));
+    if from != to {
+        changes.push(format!("injection {from} becomes {to}"));
+    }
+    changes.join(", and ")
+}
+
+/// Decide whether `set` writes a rule for `args.id` to `target`, before
+/// the value is read. `None` when the file already holds that rule.
+///
+/// Review findings 4371881769 and 4371881775: when a rule for the id
+/// exists, the new rule keeps its `action` and its `store`, because no
+/// flag sets them. A hand-set `deny` or `ask` is never dropped. With
+/// `--yes`, one line on `target.notice` names the rule and the change.
+fn plan_rule(
+    args: &SecretSetArgs,
+    mut rule: StoreRuleConfig,
+    source: ValueSource,
+    target: &mut RuleTarget<'_>,
+) -> anyhow::Result<Option<(StoreRuleConfig, Option<String>)>> {
+    let id = &args.id;
+    check_new_rule(id, &rule, target.path)?;
+    let (_, mut rules) = crate::config::read_config_parts(target.path).with_context(|| {
+        format!(
+            "min secret set stored nothing: it did not read the rules in {}",
+            target.path.display()
+        )
+    })?;
+    let Some(current) = rules.remove(id) else {
+        return Ok(Some((rule, None)));
+    };
+    rule.action = current.action;
+    rule.store.clone_from(&current.store);
+    if current == rule {
+        return Ok(None);
+    }
+    if args.yes {
+        let line = format!(
+            "min secret set replaces the rule for {id} in {}: {}.",
+            target.path.display(),
+            rule_diff(&current, &rule)
+        );
+        return Ok(Some((rule, Some(line))));
+    }
+    let change = rule_change(id, target.path, &current, &rule);
+    if source != ValueSource::Terminal {
+        bail!(
+            "min secret set stored nothing and changed no rule: \
+             it cannot ask you to confirm the new rule.\n{change}\n\
+             Run the command again with --yes to replace the rule."
+        );
+    }
+    if !(target.confirm)(&change)? {
+        bail!(
+            "min secret set stored nothing, and the rule for {id} is unchanged. \
+             To keep the rule and store the value, run `min secret set {id}` without rule flags."
+        );
+    }
+    Ok(Some((rule, None)))
 }
 
 /// The command names that the refusals print.
@@ -248,7 +512,9 @@ fn read_stdin_value(stdin: &mut dyn Read) -> anyhow::Result<Zeroizing<Vec<u8>>> 
     Ok(value)
 }
 
-/// `set` against `store`: the refusals, then the read, then the write.
+/// `set` against `store`, with no rule file: [`run_set_with_rule`] for a
+/// command with no rule flag.
+#[cfg(test)]
 pub(crate) fn run_set(
     store: &dyn SecretStore,
     args: &SecretSetArgs,
@@ -258,7 +524,40 @@ pub(crate) fn run_set(
     stdin: &mut dyn Read,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    run_set_with_rule(store, args, proxy, source, terminal, stdin, out, None)
+}
+
+/// `set` against `store`: the refusals, then the read, then the write of
+/// the rule to `target` and of the item.
+///
+/// Every check runs before the value is read: the arguments, the store,
+/// the proxy program, the rule against the deny set, and the change to a
+/// different rule. The rule is written first and the item second. When the
+/// store refuses the item, the configuration file is put back, so a failed
+/// command leaves both as they were (BEP-079).
+///
+/// The order is deliberate. `SecretStore` has no call that reads a value
+/// back, so an item that is replaced first cannot be put back when the rule
+/// write fails. The rule file can be put back, so it goes first.
+///
+/// Review finding 4374026712: this leaves one window. If the process is
+/// killed after the rule write and before `store.set` returns, no restore
+/// runs. The old item then stays under the new rule until the next `set`
+/// or `rm`. The window is the duration of one store call. The command
+/// prints no identifier in that case, and exits non-zero or not at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_set_with_rule(
+    store: &dyn SecretStore,
+    args: &SecretSetArgs,
+    proxy: &Path,
+    source: ValueSource,
+    terminal: &mut dyn FnMut() -> anyhow::Result<Zeroizing<String>>,
+    stdin: &mut dyn Read,
+    out: &mut dyn Write,
+    mut target: Option<RuleTarget<'_>>,
+) -> anyhow::Result<()> {
     refuse_set_args(args)?;
+    let rule = requested_rule(args)?;
     // Review finding 4369348711: the store and the proxy path are checked
     // before the value is read, so nobody types a secret that is refused.
     store
@@ -276,6 +575,16 @@ pub(crate) fn run_set(
     // Review finding 4369438785: the access control trusts this program, so
     // nobody but the current user or root can change it.
     bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
+    // BEP-079: the rule is checked, and any change confirmed, before the
+    // value is read.
+    let mut write = match (rule, target.as_mut()) {
+        (None, _) => None,
+        (Some(rule), Some(target)) => match plan_rule(args, rule, source, target)? {
+            None => None,
+            Some((rule, line)) => Some((target.path, rule, line, &mut *target.notice)),
+        },
+        (Some(_), None) => bail!("min secret set has no configuration file to write the rule to"),
+    };
     let value = match source {
         ValueSource::Absent => bail!(
             "min secret set has no value to store: there is no terminal, and standard input is empty. \
@@ -298,11 +607,59 @@ pub(crate) fn run_set(
             "min secret set stored nothing: the value is empty. Run the command again and give a value."
         );
     }
-    store.set(&args.id, &value, proxy).map_err(|e| match e {
-        // The new value is stored, so "did not store" is not true.
-        StoreError::StagingLeft { .. } => anyhow::Error::new(e),
-        e => anyhow::Error::new(e).context(format!("min secret set did not store {}", args.id)),
-    })?;
+    let snapshot = match &mut write {
+        None => None,
+        Some((path, rule, line, notice)) => {
+            if let Some(line) = line {
+                writeln!(notice, "{line}")?;
+            }
+            let snapshot =
+                crate::config::write_store_rule(path, &args.id, rule).with_context(|| {
+                    format!(
+                        "min secret set stored nothing: it did not write the rule for {} to {}",
+                        args.id,
+                        path.display()
+                    )
+                })?;
+            tracing::info!(
+                id = %args.id,
+                upstream = %rule.upstream.join(", "),
+                file = %path.display(),
+                "secret-store rule written"
+            );
+            Some((*path, snapshot))
+        }
+    };
+    if let Err(e) = store.set(&args.id, &value, proxy) {
+        // The new value is stored, so "did not store" is not true, and the
+        // rule stays with it.
+        if matches!(e, StoreError::StagingLeft { .. }) {
+            return Err(anyhow::Error::new(e));
+        }
+        let mut message = format!("min secret set did not store {}", args.id);
+        if let Some((path, snapshot)) = &snapshot {
+            match crate::config::restore_config(snapshot) {
+                Ok(()) => {
+                    tracing::info!(id = %args.id, file = %path.display(), "secret-store rule restored");
+                    message.push_str(&format!(
+                        ". The rule for {} in {} is back as it was",
+                        args.id,
+                        path.display()
+                    ));
+                }
+                Err(restore) => {
+                    tracing::warn!(id = %args.id, error = %restore, "secret-store rule not restored");
+                    message.push_str(&format!(
+                        ". The rule for {id} in {path} was not put back: {restore:#}. \
+                         Check [secret-store-rules.{id}] in {path}",
+                        id = args.id,
+                        path = path.display()
+                    ));
+                }
+            }
+        }
+        return Err(anyhow::Error::new(e).context(message));
+    }
     tracing::info!(store = store.name(), id = %args.id, "secret stored");
     writeln!(out, "{}", args.id)?;
     Ok(())
@@ -1149,5 +1506,741 @@ attributes:
         .expect_err("refused");
         assert!(format!("{err:#}").contains("did not read the value"));
         assert!(store.value("claude").is_none());
+    }
+
+    // ---- BEP-079: the store rule that `set` writes ----
+
+    /// Run `set` with a rule file at `path`. `confirm` answers the change
+    /// prompt and records the text it shows.
+    fn set_with_rule(
+        store: &dyn SecretStore,
+        argv: &[&str],
+        proxy: &Path,
+        source: ValueSource,
+        path: &Path,
+        confirm: &mut dyn FnMut(&str) -> anyhow::Result<bool>,
+    ) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let result = run_set_with_rule(
+            store,
+            &set_args(argv),
+            proxy,
+            source,
+            &mut || Ok(Zeroizing::new("typed".to_owned())),
+            &mut &b"piped\n"[..],
+            &mut out,
+            Some(RuleTarget {
+                path,
+                confirm,
+                notice: &mut std::io::sink(),
+            }),
+        );
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    fn no_confirm(_: &str) -> anyhow::Result<bool> {
+        panic!("the change prompt was shown")
+    }
+
+    /// The rules of the client configuration at `path`, as written.
+    fn written_rules(path: &Path) -> StoreRules {
+        crate::config::read_config_parts(path).expect("parses").1
+    }
+
+    fn header_rule(upstream: &str, header: &str, prefix: Option<&str>) -> StoreRuleConfig {
+        StoreRuleConfig {
+            store: None,
+            upstream: vec![upstream.to_owned()],
+            header: Some(header.to_owned()),
+            prefix: prefix.map(str::to_owned),
+            basic_auth: None,
+            action: None,
+        }
+    }
+
+    /// A config.toml with other settings, a hand-set rule for `claude` and a
+    /// rule for another item.
+    const EXISTING: &str = "# my settings\n\
+        [secrets]\nacknowledge_full_breadth_unenrolled = true\n\n\
+        [secret-store-rules.claude]\nupstream = [\"api.anthropic.com\"]\nheader = \"x-api-key\"\naction = \"ask\"\n\n\
+        [secret-store-rules.other]\nupstream = [\"api.example.com\"]\nbasic_auth = \"password\"\n";
+
+    #[test]
+    fn secret_set_writes_user_level_store_rule() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemorySecretStore::default();
+
+        // A new file, from --upstream and --header with --prefix.
+        let (result, out) = set_with_rule(
+            &store,
+            &[
+                "linear-key",
+                "--upstream",
+                "mcp.linear.app",
+                "--header",
+                "Authorization",
+                "--prefix",
+                "Bearer ",
+            ],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        result.unwrap();
+        assert_eq!(out, "linear-key\n");
+        assert_eq!(store.value("linear-key").as_deref(), Some(&b"piped"[..]));
+        let rules = written_rules(&path);
+        assert_eq!(
+            rules.get("linear-key"),
+            Some(&header_rule(
+                "mcp.linear.app",
+                "Authorization",
+                Some("Bearer ")
+            ))
+        );
+        // The rule reads back through the reader and passes the deny set.
+        let mut refusals = Vec::new();
+        let accepted = crate::config::refuse_store_rules(rules, &path, &mut refusals);
+        assert!(refusals.is_empty());
+        assert!(accepted.contains_key("linear-key"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("piped"));
+
+        // Basic auth, with two upstreams, into a file with other settings.
+        // The hand-set rule for `claude` and the rest of the file stay.
+        std::fs::write(&path, EXISTING).unwrap();
+        let (result, _) = set_with_rule(
+            &store,
+            &[
+                "basic",
+                "--upstream",
+                "a.example.com",
+                "--upstream",
+                "b.example.com:8443",
+                "--basic-auth",
+                "user",
+            ],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        result.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(EXISTING), "{text}");
+        let rules = written_rules(&path);
+        assert_eq!(
+            rules.get("basic"),
+            Some(&StoreRuleConfig {
+                store: None,
+                upstream: vec!["a.example.com".into(), "b.example.com:8443".into()],
+                header: None,
+                prefix: None,
+                basic_auth: Some("user".into()),
+                action: None,
+            })
+        );
+        assert_eq!(rules.len(), 3);
+        let (config, _) = crate::config::read_config_parts(&path).unwrap();
+        assert!(config.secrets.acknowledge_full_breadth_unenrolled);
+
+        // The command writes the user-level file in the config dir.
+        let global = GlobalArgs {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            crate::config::user_config_path(&global),
+            dir.path().join("minimal").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn secret_set_writes_no_project_or_org_config() {
+        let (_dir, proxy) = proxy();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("minimal.toml"), "[project]\nname = \"p\"\n").unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(root.path().join("config")),
+            ..GlobalArgs::default()
+        };
+        let path = crate::config::user_config_path(&global);
+        assert_ne!(path, Path::new(crate::config::ORGANIZATION_CONFIG_PATH));
+        assert!(!path.starts_with(&project));
+
+        /// Every file under `dir`, with its bytes.
+        fn files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut all = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    all.extend(files(&path));
+                } else {
+                    all.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+            all
+        }
+        let org = std::fs::read(crate::config::ORGANIZATION_CONFIG_PATH).ok();
+        let before = files(root.path());
+        let store = MemorySecretStore::default();
+        let (result, _) = set_with_rule(
+            &store,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        result.unwrap();
+        let mut after = files(root.path());
+        let written = after
+            .remove(&path)
+            .expect("the user config.toml is written");
+        assert!(
+            String::from_utf8(written)
+                .unwrap()
+                .contains("[secret-store-rules.claude]")
+        );
+        assert_eq!(after, before, "only the user config.toml changed");
+        assert_eq!(
+            std::fs::read(crate::config::ORGANIZATION_CONFIG_PATH).ok(),
+            org
+        );
+    }
+
+    #[test]
+    fn secret_set_presets_resolve_to_their_rules() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemorySecretStore::default();
+        let expected = [
+            (
+                "anthropic",
+                "api.anthropic.com",
+                "Authorization",
+                Some("Bearer "),
+            ),
+            ("anthropic-api-key", "api.anthropic.com", "x-api-key", None),
+            ("linear", "mcp.linear.app", "Authorization", Some("Bearer ")),
+            (
+                "sentry",
+                "mcp.sentry.dev",
+                "Authorization",
+                Some("Sentry-Bearer "),
+            ),
+            (
+                "cloudflare",
+                "mcp.cloudflare.com",
+                "Authorization",
+                Some("Bearer "),
+            ),
+        ];
+        assert_eq!(PRESETS.len(), expected.len());
+        for (name, upstream, header, prefix) in expected {
+            let id = format!("key-{name}");
+            let (result, _) = set_with_rule(
+                &store,
+                &[&id, "--preset", name],
+                &proxy,
+                ValueSource::Stdin,
+                &path,
+                &mut no_confirm,
+            );
+            result.unwrap();
+            assert_eq!(
+                written_rules(&path).get(&id),
+                Some(&header_rule(upstream, header, prefix)),
+                "{name}"
+            );
+        }
+        // `--preset` takes no other rule flag.
+        for flags in [
+            &["--header", "x"][..],
+            &["--prefix", "x"],
+            &["--basic-auth", "user"],
+            &["--upstream", "a.example.com"],
+        ] {
+            let mut argv = vec!["min", "secret", "set", "claude", "--preset", "anthropic"];
+            argv.extend_from_slice(flags);
+            assert!(crate::Cli::try_parse_from(argv).is_err(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn secret_set_unknown_preset_lists_known_ones() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemorySecretStore::default();
+        for source in [ValueSource::Terminal, ValueSource::Stdin] {
+            let mut out = Vec::new();
+            let err = run_set_with_rule(
+                &store,
+                &set_args(&["claude", "--preset", "openai"]),
+                &proxy,
+                source,
+                &mut no_terminal,
+                &mut PanicRead,
+                &mut out,
+                Some(RuleTarget {
+                    path: &path,
+                    confirm: &mut no_confirm,
+                    notice: &mut std::io::sink(),
+                }),
+            )
+            .expect_err("refused");
+            assert_eq!(
+                format!("{err:#}"),
+                "There is no preset named openai. Known presets: anthropic, anthropic-api-key, cloudflare, linear, sentry."
+            );
+            assert!(out.is_empty());
+        }
+        // The args check that `cmd_secret_set` runs first refuses it too.
+        assert!(refuse_set_args(&set_args(&["claude", "--preset", "openai"])).is_err());
+        assert!(store.value("claude").is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn secret_set_refuses_deny_set_rule_before_reading_value() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let store = MemorySecretStore::default();
+        for (argv, named) in [
+            (
+                &[
+                    "k",
+                    "--upstream",
+                    "api.github.com",
+                    "--header",
+                    "Authorization",
+                ][..],
+                "api.github.com",
+            ),
+            (
+                &["k", "--upstream", "host.min.internal", "--header", "X-Key"],
+                "host.min.internal",
+            ),
+            (
+                &["k", "--upstream", "api.example.com", "--header", "Cookie"],
+                "the header Cookie",
+            ),
+            (
+                &[
+                    "k",
+                    "--upstream",
+                    "api.example.com",
+                    "--header",
+                    "Proxy-Authorization",
+                ],
+                "the header Proxy-Authorization",
+            ),
+            (
+                &[
+                    "k",
+                    "--upstream",
+                    "https://api.example.com/",
+                    "--header",
+                    "X-Key",
+                ],
+                "--upstream value \"https://api.example.com/\"",
+            ),
+            (
+                &[
+                    "k",
+                    "--upstream",
+                    "api.example.com",
+                    "--basic-auth",
+                    "token",
+                ],
+                "--basic-auth value \"token\"",
+            ),
+        ] {
+            for source in [ValueSource::Terminal, ValueSource::Stdin] {
+                let mut out = Vec::new();
+                let err = run_set_with_rule(
+                    &store,
+                    &set_args(argv),
+                    &proxy,
+                    source,
+                    &mut no_terminal,
+                    &mut PanicRead,
+                    &mut out,
+                    Some(RuleTarget {
+                        path: &path,
+                        confirm: &mut no_confirm,
+                        notice: &mut std::io::sink(),
+                    }),
+                )
+                .expect_err("refused");
+                let text = format!("{err:#}");
+                assert!(
+                    text.starts_with("min secret set refused the rule for k, and stored nothing"),
+                    "{text}"
+                );
+                assert!(text.contains(named), "{named}: {text}");
+                assert!(out.is_empty());
+            }
+        }
+        assert!(store.value("k").is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+    }
+
+    #[test]
+    fn secret_set_shows_rule_change_and_asks() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemorySecretStore::default();
+
+        // Declined: neither the item nor the rule is written.
+        std::fs::write(&path, EXISTING).unwrap();
+        let mut shown = Vec::new();
+        let (result, out) = set_with_rule(
+            &store,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Terminal,
+            &path,
+            &mut |change: &str| {
+                shown.push(change.to_owned());
+                Ok(false)
+            },
+        );
+        let text = format!("{:#}", result.expect_err("declined"));
+        assert!(text.contains("the rule for claude is unchanged"), "{text}");
+        assert!(
+            text.contains("`min secret set claude` without rule flags"),
+            "{text}"
+        );
+        assert!(out.is_empty());
+        assert!(store.value("claude").is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+        assert_eq!(
+            shown,
+            [format!(
+                "{} has a different secret-store rule for claude.\n\
+                 Current rule:\n  upstream:  api.anthropic.com\n  injection: header x-api-key\n  consent:   ask\n\
+                 New rule:\n  upstream:  api.anthropic.com\n  injection: header Authorization, prefix \"Bearer \"\n  consent:   ask",
+                path.display()
+            )]
+        );
+
+        // Confirmed: the rule is replaced and the value from the terminal
+        // is stored.
+        let mut asked = 0;
+        let (result, out) = set_with_rule(
+            &store,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Terminal,
+            &path,
+            &mut |_: &str| {
+                asked += 1;
+                Ok(true)
+            },
+        );
+        result.unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(out, "claude\n");
+        assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
+        let rules = written_rules(&path);
+        // The hand-set `ask` stays (review finding 4371881769).
+        assert_eq!(
+            rules.get("claude"),
+            Some(&StoreRuleConfig {
+                action: Some(StoreAction::Ask),
+                ..header_rule("api.anthropic.com", "Authorization", Some("Bearer "))
+            })
+        );
+        assert!(rules.contains_key("other"));
+
+        // The same rule again is not a change, so nothing is asked.
+        let (result, _) = set_with_rule(
+            &store,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Terminal,
+            &path,
+            &mut no_confirm,
+        );
+        result.unwrap();
+    }
+
+    #[test]
+    fn secret_set_rule_change_without_tty_needs_yes() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let store = MemorySecretStore::default();
+        store
+            .set("claude", b"old", &proxy)
+            .expect("the old value is stored");
+        for source in [
+            ValueSource::Stdin,
+            ValueSource::Absent,
+            ValueSource::NoInput,
+        ] {
+            let mut out = Vec::new();
+            let err = run_set_with_rule(
+                &store,
+                &set_args(&["claude", "--preset", "anthropic"]),
+                &proxy,
+                source,
+                &mut no_terminal,
+                &mut PanicRead,
+                &mut out,
+                Some(RuleTarget {
+                    path: &path,
+                    confirm: &mut no_confirm,
+                    notice: &mut std::io::sink(),
+                }),
+            )
+            .expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with("min secret set stored nothing and changed no rule"),
+                "{text}"
+            );
+            assert!(text.contains("cannot ask you to confirm"), "{text}");
+            assert!(text.contains("Current rule:"), "{text}");
+            assert!(text.contains("New rule:"), "{text}");
+            assert!(
+                text.ends_with("Run the command again with --yes to replace the rule."),
+                "{text}"
+            );
+            assert!(out.is_empty());
+        }
+        assert_eq!(store.value("claude").as_deref(), Some(&b"old"[..]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+    }
+
+    #[test]
+    fn secret_set_yes_replaces_rule_without_asking() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemorySecretStore::default();
+        for (source, flag) in [(ValueSource::Stdin, "--yes"), (ValueSource::Terminal, "-y")] {
+            std::fs::write(&path, EXISTING).unwrap();
+            let (result, out) = set_with_rule(
+                &store,
+                &["claude", "--preset", "anthropic-api-key", flag],
+                &proxy,
+                source,
+                &path,
+                &mut no_confirm,
+            );
+            result.unwrap();
+            assert_eq!(out, "claude\n");
+            let rules = written_rules(&path);
+            // The hand-set `ask` stays (review finding 4371881769).
+            assert_eq!(
+                rules.get("claude"),
+                Some(&StoreRuleConfig {
+                    action: Some(StoreAction::Ask),
+                    ..header_rule("api.anthropic.com", "x-api-key", None)
+                })
+            );
+            assert!(rules.contains_key("other"));
+        }
+        assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
+    }
+
+    /// Review findings 4371881769 and 4371881775: `--yes` with new rule
+    /// flags keeps a hand-set `deny` and `store`, and one line names the
+    /// rule and what changes.
+    #[test]
+    fn secret_set_yes_replaces_rule_without_asking_keeps_consent_and_store() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[secret-store-rules.claude]\nstore = \"keychain\"\n\
+             upstream = [\"api.anthropic.com\"]\nheader = \"x-api-key\"\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let store = MemorySecretStore::default();
+        let mut out = Vec::new();
+        let mut notice = Vec::new();
+        run_set_with_rule(
+            &store,
+            &set_args(&[
+                "claude",
+                "--upstream",
+                "api.example.com",
+                "--header",
+                "Authorization",
+                "--prefix",
+                "Bearer ",
+                "--yes",
+            ]),
+            &proxy,
+            ValueSource::Stdin,
+            &mut no_terminal,
+            &mut &b"piped\n"[..],
+            &mut out,
+            Some(RuleTarget {
+                path: &path,
+                confirm: &mut no_confirm,
+                notice: &mut notice,
+            }),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "claude\n");
+        assert_eq!(store.value("claude").as_deref(), Some(&b"piped"[..]));
+        assert_eq!(
+            written_rules(&path).get("claude"),
+            Some(&StoreRuleConfig {
+                store: Some("keychain".to_owned()),
+                action: Some(StoreAction::Deny),
+                ..header_rule("api.example.com", "Authorization", Some("Bearer "))
+            })
+        );
+        assert_eq!(
+            String::from_utf8(notice).unwrap(),
+            format!(
+                "min secret set replaces the rule for claude in {}: \
+                 upstream api.anthropic.com becomes api.example.com, \
+                 and injection header x-api-key becomes header Authorization, prefix \"Bearer \".\n",
+                path.display()
+            )
+        );
+    }
+
+    /// A store whose `set` always fails.
+    struct RefusingStore;
+    impl SecretStore for RefusingStore {
+        fn name(&self) -> &'static str {
+            NATIVE_STORE
+        }
+        fn set(&self, _: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
+            Err(StoreError::Refused {
+                store: NATIVE_STORE,
+                action: "store the item",
+                detail: "the keychain is locked".into(),
+            })
+        }
+        fn list(&self, _: &Path) -> Result<Vec<bep::store::ItemInfo>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn remove(&self, _: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn secret_set_partial_failure_restores_both() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // The item fails after the rule is written: the file is put back,
+        // and the error names the item step.
+        std::fs::write(&path, EXISTING).unwrap();
+        let (result, out) = set_with_rule(
+            &RefusingStore,
+            &["claude", "--preset", "anthropic", "--yes"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        let text = format!("{:#}", result.expect_err("store failed"));
+        assert!(
+            text.starts_with("min secret set did not store claude"),
+            "{text}"
+        );
+        assert!(text.contains("is back as it was"), "{text}");
+        assert!(text.contains("the keychain is locked"), "{text}");
+        assert!(out.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+
+        // With no file before, no file after.
+        std::fs::remove_file(&path).unwrap();
+        let (result, _) = set_with_rule(
+            &RefusingStore,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        assert!(result.is_err());
+        assert!(!path.exists());
+
+        // The rule fails: the item keeps its old value, and the error names
+        // the rule step. An inline table parses but cannot take a section.
+        let inline = "secret-store-rules = {}\n";
+        std::fs::write(&path, inline).unwrap();
+        let store = MemorySecretStore::default();
+        store.set("claude", b"old", &proxy).unwrap();
+        let (result, out) = set_with_rule(
+            &store,
+            &["claude", "--preset", "anthropic"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        let text = format!("{:#}", result.expect_err("rule failed"));
+        assert!(
+            text.starts_with("min secret set stored nothing: it did not write the rule for claude"),
+            "{text}"
+        );
+        assert!(text.contains("inline table"), "{text}");
+        assert!(out.is_empty());
+        assert_eq!(store.value("claude").as_deref(), Some(&b"old"[..]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
+    }
+
+    #[test]
+    fn secret_set_without_rule_flags_leaves_rule_unchanged() {
+        let (_dir, proxy) = proxy();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+        let store = MemorySecretStore::default();
+        for source in [ValueSource::Stdin, ValueSource::Terminal] {
+            let (result, out) =
+                set_with_rule(&store, &["claude"], &proxy, source, &path, &mut no_confirm);
+            result.unwrap();
+            assert_eq!(out, "claude\n");
+        }
+        assert_eq!(store.value("claude").as_deref(), Some(&b"typed"[..]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+        // `--yes` alone is not a rule flag.
+        let (result, _) = set_with_rule(
+            &store,
+            &["claude", "--yes"],
+            &proxy,
+            ValueSource::Stdin,
+            &path,
+            &mut no_confirm,
+        );
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+        // No file is created either.
+        let missing = dir.path().join("none").join("config.toml");
+        let (result, _) = set_with_rule(
+            &store,
+            &["claude"],
+            &proxy,
+            ValueSource::Stdin,
+            &missing,
+            &mut no_confirm,
+        );
+        result.unwrap();
+        assert!(!missing.exists());
     }
 }
