@@ -6669,9 +6669,7 @@ mod tests {
         let logged = log.contents();
         assert_eq!(
             logged
-                .matches(
-                    "refused a box registration whose id a live row or attachment already holds"
-                )
+                .matches("refused a box registration whose id is already held")
                 .count(),
             1,
             "one warn line per refused registration, got: {logged}"
