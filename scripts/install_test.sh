@@ -2950,6 +2950,26 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
     want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
     NFT_FAIL=0
+
+    # --- Root runs the helper for the delegated account, so the install
+    # refuses a helper directory that another account can write: that
+    # account could replace the helper, or plant its staging name.
+    mkdir -p "$root/hcopen"
+    chmod 0777 "$root/hcopen"
+    HC_HELPER="$root/hcopen/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc open_helper_dir "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    check 1 "$rc" "an install whose helper directory others can write exits 1"
+    want_ok "the refusal names the directory and the fix" \
+        grep -q "$root/hcopen can be written by accounts other than its owner (mode 777)" "$OUT"
+    want_err "no helper is written into a directory others can write" \
+        test -e "$root/hcopen/quic443-leaf"
+    want_ok "no staging file is left behind either" \
+        [ -z "$(ls -A "$root/hcopen")" ]
+    rmdir "$root/hcopen"
+
     run_hc reloaded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "the next good re-install exits 0"

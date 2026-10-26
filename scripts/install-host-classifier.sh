@@ -687,6 +687,49 @@ exec "$NFT" "$verb" element inet "$TABLE" "$SET" "{ \"$ALLOW_REL/$name\" }"
 BODY
 }
 
+# stat_mode <path> — the permission bits in octal, GNU or BSD syntax.
+stat_mode() {
+    out="$(stat -c '%a' "$1" 2>/dev/null || true)"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+    stat -f '%Lp' "$1"
+}
+
+# assert_root_only_dir <dir> — succeeds when no account but root can change
+# what <dir> holds: the directory and every parent up to / are owned by
+# root and are not group or other writable. Otherwise it prints the first
+# directory that fails, and why, and returns 1. Root runs the helper for
+# the delegated account, so a directory that account can write would let
+# it replace the helper. A rehearsal checks only <dir> itself, and accepts
+# the running account as its owner, because its scratch tree sits under a
+# temporary directory that is not root-owned.
+assert_root_only_dir() {
+    local dir owner_ok mode uid
+    dir="$(cd -P "$1" 2>/dev/null && pwd -P)" || {
+        printf '%s is not a directory that can be read' "$1"
+        return 1
+    }
+    owner_ok=0
+    [ "$rehearsal" = 1 ] && owner_ok="$(id -u)"
+    while :; do
+        if ! uid="$(stat_uid_gid "$dir")" || ! mode="$(stat_mode "$dir")"; then
+            printf 'cannot read the owner and mode of %s' "$dir"
+            return 1
+        fi
+        uid=${uid%% *}
+        if [ "$uid" != 0 ] && [ "$uid" != "$owner_ok" ]; then
+            printf '%s is owned by uid %s, not root. Make root its owner, then run this installer again.' "$dir" "$uid"
+            return 1
+        fi
+        if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+            printf '%s can be written by accounts other than its owner (mode %s). Remove group and other write, e.g.: chmod go-w %s' "$dir" "$mode" "$dir"
+            return 1
+        fi
+        [ "$rehearsal" = 1 ] && return 0
+        [ "$dir" = / ] && return 0
+        dir="$(dirname "$dir")"
+    done
+}
+
 # install_quic443_helper — writes the helper root-owned, mode 0755, and the
 # sudoers drop-in that lets the delegated account run that one file as root
 # with no password, checked with visudo before it is put in place. A real
@@ -700,9 +743,17 @@ install_quic443_helper() {
     local why
     why="$(mkdir -p "$(dirname "$QUIC443_HELPER")" 2>&1)" ||
         die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
-    local staged="$QUIC443_HELPER.new"
-    why="$( { render_quic443_helper >"$staged" && chmod 0755 "$staged"; } 2>&1)" ||
+    why="$(assert_root_only_dir "$(dirname "$QUIC443_HELPER")")" ||
         die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    # mktemp creates a new file with O_EXCL, so a staging name planted in
+    # advance, a symlink included, is never written through.
+    local staged
+    staged="$(mktemp "$QUIC443_HELPER.XXXXXX" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $staged"
+    why="$( { render_quic443_helper >"$staged" && chmod 0755 "$staged"; } 2>&1)" || {
+        rm -f "$staged"
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    }
     if [ "$rehearsal" != 1 ]; then
         why="$(chown root:root "$staged" 2>&1)" ||
             die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
@@ -712,9 +763,13 @@ install_quic443_helper() {
 
     why="$(mkdir -p "$(dirname "$QUIC443_SUDOERS")" 2>&1)" ||
         die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    why="$(assert_root_only_dir "$(dirname "$QUIC443_SUDOERS")")" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
     # sudoers ignores a drop-in whose name carries a dot, so the staged
     # copy is never read before it is checked.
-    local staged_rule="$QUIC443_SUDOERS.new"
+    local staged_rule
+    staged_rule="$(mktemp "$QUIC443_SUDOERS.XXXXXX" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $staged_rule"
     why="$( {
         printf '# Written by install-host-classifier.sh: minimald runs this one helper as root.\n'
         printf '#%s ALL=(root) NOPASSWD: %s\n' "$owner_uid" "$QUIC443_HELPER"
