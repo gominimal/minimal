@@ -976,23 +976,21 @@ fn set_project_root(
 }
 
 /// The project root to record for an activation from `dir`. Tarball sync
-/// already resolved it as `upload_root`, so it is reused. `--sync none`
-/// skips the upload, and a broken `minimal.toml` must not fail it (#770):
-/// the root is only metadata there, so the lookup falls back to `dir`.
+/// already resolved it as `upload_root`, so it is reused. Otherwise the root
+/// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
+/// not load under every `--sync` mode, before `PlanUpload` runs, so an error
+/// here is not expected and propagates.
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
 fn activation_project_root(
     upload_root: Option<&camino::Utf8Path>,
     dir: &camino::Utf8Path,
-) -> camino::Utf8PathBuf {
+) -> Result<camino::Utf8PathBuf, anyhow::Error> {
     match upload_root {
-        Some(root) => root.to_path_buf(),
-        None => resolve_upload_root(dir).unwrap_or_else(|err| {
-            tracing::debug!(
-                %dir,
-                error = %err,
-                "project root lookup failed under --sync none; recording the directory"
-            );
-            dir.to_path_buf()
-        }),
+        Some(root) => Ok(root.to_path_buf()),
+        None => resolve_upload_root(dir),
     }
 }
 
@@ -1283,7 +1281,7 @@ pub(crate) async fn activate_box(
             // `--sync` mode, `none` included.
             set_project_root(
                 &mut request,
-                activation_project_root(upload_root.as_deref(), &utf8_path),
+                activation_project_root(upload_root.as_deref(), &utf8_path)?,
             )?;
 
             // Skip the upload without prompting when the resolved root is an
@@ -2406,21 +2404,34 @@ mod tests {
         assert_eq!(request.config.project_path.as_str(), sub.as_str());
     }
 
-    /// BOX-001, #770: under `--sync none` a broken `minimal.toml` does not
-    /// fail the activation. The directory is recorded as the project root.
+    /// BOX-001: with no tarball upload root, a subdirectory resolves to the
+    /// directory that holds `minimal.toml`, and a `minimal.toml` that does
+    /// not load is an error. A resolved upload root is reused as it is.
     #[test]
-    fn sync_none_records_the_directory_when_minimal_toml_is_broken() {
+    fn activation_project_root_resolves_the_root_and_refuses_a_broken_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
-        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
 
-        assert_eq!(activation_project_root(None, path), path.to_path_buf());
+        assert_eq!(
+            activation_project_root(None, &sub).unwrap(),
+            root.to_path_buf()
+        );
 
         let resolved = camino::Utf8Path::new("/resolved/root");
         assert_eq!(
-            activation_project_root(Some(resolved), path),
+            activation_project_root(Some(resolved), &sub).unwrap(),
             resolved.to_path_buf()
         );
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(activation_project_root(None, &sub).is_err());
     }
 
     #[test]
