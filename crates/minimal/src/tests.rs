@@ -4671,7 +4671,7 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     let mut ids: Vec<[u8; 16]> = Vec::with_capacity(CREATIONS);
     for creation in 0..CREATIONS {
         let before = now_ms();
-        let registered = register_box_for_activation(
+        let mut registered = register_box_for_activation(
             paths::ProviderKind::Minvmd,
             Some(dir.path()),
             boxes::NetworkMode::OwnIp,
@@ -4679,9 +4679,22 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
             &policy,
         )
         .await
-        .expect("the real control server answers the registration")
+        .unwrap_or_else(|error| {
+            panic!(
+                "creation {creation}: the real control server answers the registration, \
+                 after ids {ids:02x?}: {error:#}"
+            )
+        })
         .expect("an own-address box on a VM-backed host registers");
         let after = now_ms();
+        // Commit the lease, as an activation does once its session is
+        // active. A lease dropped uncommitted makes the host withdraw the
+        // row on its own thread, later. That late withdrawal can land
+        // while the next creation of "web" is being assigned its address,
+        // and the host then refuses that creation as withdrawn.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
         let id = registered
             .box_id
             .expect("the reply returns the id the host minted for this creation");
@@ -4724,8 +4737,8 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         let stamp = u64::from_be_bytes(stamp);
         assert!(
             (before..=after).contains(&stamp),
-            "creation {creation}: the id's timestamp {stamp} is the clock at the mint, \
-             between {before} and {after}"
+            "creation {creation}: the timestamp {stamp} of id {id} is the clock at the \
+             mint, between {before} and {after}"
         );
 
         ids.push(bytes);
@@ -4748,6 +4761,12 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         distinct.len(),
         CREATIONS,
         "each creation under one name gets an id of its own, got {ids:02x?}"
+    );
+    // The ids sort in creation order: each mint takes a later millisecond
+    // than the one before it.
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "the ids sort in creation order, got {ids:02x?}"
     );
     // The random fields are random fills, never a counter: all 74 bits
     // after the version and the variant. `rand_a` is the 12 bits after the
@@ -4774,19 +4793,19 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     assert_eq!(
         distinct_b.len(),
         CREATIONS,
-        "rand_b differs on every creation, got {rand_b:016x?}"
+        "rand_b differs on every creation, got {rand_b:016x?} from ids {ids:02x?}"
     );
     assert!(
         rand_b
             .windows(2)
             .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
-        "rand_b is not a counter, got {rand_b:016x?}"
+        "rand_b is not a counter, got {rand_b:016x?} from ids {ids:02x?}"
     );
     assert!(
         !rand_a
             .windows(2)
             .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff == 1),
-        "rand_a is not a counter, got {rand_a:03x?}"
+        "rand_a is not a counter, got {rand_a:03x?} from ids {ids:02x?}"
     );
 }
 
