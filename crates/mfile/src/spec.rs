@@ -4,9 +4,14 @@
 //!
 //! This is the first version, `v = 0`. It is built from the project's
 //! `[session]` table or a declared `[tasks.<name>]` entry, and from the
-//! command-line flags of the creating command. The full expansion over
-//! `[defaults]`, Box Types and loadouts replaces this builder later, and
-//! bumps `v`.
+//! command-line flags of the creating command. It serializes under the
+//! `box.toml` tables: `box.type`, `io.pty_enabled`, `install.packages`,
+//! `network.mode`, `network.egress.*` and `network.ingress`.
+//!
+//! [`BoxSpec::for_session`] and [`BoxSpec::for_task`] are an interim
+//! builder. #2410 (T16, BOX-064) replaces them with the expansion over the
+//! Box Type, `[defaults]`, `[upstream]` and loadouts. The interim ends when
+//! that expander lands, writes this file, and bumps [`BOX_SPEC_VERSION`].
 
 use crate::{Session, Task};
 
@@ -22,19 +27,19 @@ pub const DEFAULT_SESSION_ENTRY: &str = "default";
 /// Every list is in a fixed order and every map is ordered, so two builds
 /// over the same inputs serialize to the same bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(into = "SpecDoc", from = "SpecDoc")]
 pub struct BoxSpec {
     /// The spec shape's version, [`BOX_SPEC_VERSION`].
     pub v: u32,
-    /// The Box Type's name: `session` or `task`.
-    #[serde(rename = "type")]
+    /// The Box Type's name: `session` or `task`. Serialized as `box.type`.
     pub box_type: String,
     /// The entry the box comes from: a task's name, or
     /// [`DEFAULT_SESSION_ENTRY`] for a session.
     pub entry: String,
     /// The packages the entry asks for, in declaration order, each once.
+    /// Serialized as `install.packages`.
     pub packages: Vec<String>,
-    /// Whether the box runs with a terminal.
+    /// Whether the box runs with a terminal. Serialized as `io.pty_enabled`.
     pub pty_enabled: bool,
     /// Whether the box runs its lifecycle hooks.
     pub hooks_enabled: bool,
@@ -42,11 +47,13 @@ pub struct BoxSpec {
     pub network: SpecNetwork,
 }
 
-/// The network half of a [`BoxSpec`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The network half of a [`BoxSpec`]. It serializes as the `[network]`
+/// table: `mode`, then the policy's `egress` and `ingress` tables, and its
+/// `credentialed_upstream` and `quic443` when it sets them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecNetwork {
-    /// The network isolation mode.
+    /// The network isolation mode. Serialized as its spec word: `none`,
+    /// `host_ip` or `own_ip`.
     pub mode: boxes::NetworkMode,
     /// The egress and ingress policy the creating command resolved.
     pub policy: boxes::BoxPolicy,
@@ -81,16 +88,23 @@ impl BoxSpec {
     }
 
     /// The spec of a task box, from the `[tasks.<name>]` entry and the
-    /// flags. The box has a terminal only for an interactive task.
+    /// flags. A task's spec carries the request's box policy, which a task
+    /// leaves at the default.
+    ///
+    /// `None` for an interactive task. The `task` Box Type denies a
+    /// terminal, so no `task` spec has `pty_enabled = true`.
     #[must_use]
-    pub fn for_task(name: &str, task: &Task, flags: SpecFlags) -> Self {
-        Self::build(
+    pub fn for_task(name: &str, task: &Task, flags: SpecFlags) -> Option<Self> {
+        if task.interactive {
+            return None;
+        }
+        Some(Self::build(
             boxes::TASK_BOX_TYPE,
             name,
             &task.packages,
-            task.interactive,
+            false,
             flags,
-        )
+        ))
     }
 
     fn build(
@@ -116,6 +130,110 @@ impl BoxSpec {
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
+            },
+        }
+    }
+}
+
+/// The serialized shape of a [`BoxSpec`], under the `box.toml` tables.
+/// Plain values come before tables, so the shape also writes as TOML.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpecDoc {
+    v: u32,
+    entry: String,
+    hooks_enabled: bool,
+    #[serde(rename = "box")]
+    box_table: DocBox,
+    io: DocIo,
+    install: DocInstall,
+    network: DocNetwork,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocBox {
+    #[serde(rename = "type")]
+    box_type: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocIo {
+    pty_enabled: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocInstall {
+    packages: Vec<String>,
+}
+
+/// The `[network]` table. The policy's own keys are `egress`, `ingress`,
+/// and `credentialed_upstream` and `quic443` when it sets them, so it is
+/// flattened in beside `mode`. The policy refuses an unknown key.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DocNetwork {
+    mode: DocNetworkMode,
+    #[serde(flatten)]
+    policy: boxes::BoxPolicy,
+}
+
+/// The spec words of [`boxes::NetworkMode`], as [`boxes::NetworkMode::word`]
+/// documents them. They are not its serde form.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DocNetworkMode {
+    None,
+    HostIp,
+    OwnIp,
+}
+
+impl From<BoxSpec> for SpecDoc {
+    fn from(spec: BoxSpec) -> Self {
+        let mode = match spec.network.mode {
+            boxes::NetworkMode::NoNet => DocNetworkMode::None,
+            boxes::NetworkMode::OwnIp => DocNetworkMode::OwnIp,
+            _ => DocNetworkMode::HostIp,
+        };
+        Self {
+            v: spec.v,
+            entry: spec.entry,
+            hooks_enabled: spec.hooks_enabled,
+            box_table: DocBox {
+                box_type: spec.box_type,
+            },
+            io: DocIo {
+                pty_enabled: spec.pty_enabled,
+            },
+            install: DocInstall {
+                packages: spec.packages,
+            },
+            network: DocNetwork {
+                mode,
+                policy: spec.network.policy,
+            },
+        }
+    }
+}
+
+impl From<SpecDoc> for BoxSpec {
+    fn from(doc: SpecDoc) -> Self {
+        let mode = match doc.network.mode {
+            DocNetworkMode::None => boxes::NetworkMode::NoNet,
+            DocNetworkMode::HostIp => boxes::NetworkMode::HostNet,
+            DocNetworkMode::OwnIp => boxes::NetworkMode::OwnIp,
+        };
+        Self {
+            v: doc.v,
+            box_type: doc.box_table.box_type,
+            entry: doc.entry,
+            packages: doc.install.packages,
+            pty_enabled: doc.io.pty_enabled,
+            hooks_enabled: doc.hooks_enabled,
+            network: SpecNetwork {
+                mode,
+                policy: doc.network.policy,
             },
         }
     }
@@ -175,7 +293,8 @@ mod tests {
         assert!(empty.packages.is_empty());
         assert_eq!(empty.network.mode, boxes::NetworkMode::default());
 
-        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], flags.clone());
+        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], flags.clone())
+            .expect("a task that is not interactive has a spec");
         assert_eq!(lint.box_type, "task");
         assert_eq!(lint.entry, "lint");
         assert_eq!(lint.packages, vec!["rust".to_string()]);
@@ -185,13 +304,49 @@ mod tests {
         );
         assert_eq!(lint.network.policy, policy);
 
-        let tui = BoxSpec::for_task("tui", &file.tasks["tui"], flags);
-        assert!(tui.pty_enabled, "an interactive task has a terminal");
+        // The task type denies a terminal, so an interactive task has no spec.
+        assert_eq!(BoxSpec::for_task("tui", &file.tasks["tui"], flags), None);
 
-        // The spec round-trips, and its version and type keep their names.
+        // The spec writes the `box.toml` tables and the mode's spec word,
+        // and round-trips.
         let text = toml::to_string(&session).unwrap();
-        assert!(text.contains("v = 0"), "{text}");
-        assert!(text.contains("type = \"session\""), "{text}");
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["v"].as_integer(), Some(0), "{text}");
+        assert_eq!(value["box"]["type"].as_str(), Some("session"), "{text}");
+        assert_eq!(value["io"]["pty_enabled"].as_bool(), Some(true), "{text}");
+        assert_eq!(
+            value["install"]["packages"],
+            toml::Value::Array(vec!["git".into(), "ripgrep".into()]),
+            "{text}"
+        );
+        assert_eq!(value["network"]["mode"].as_str(), Some("own_ip"), "{text}");
+        assert_eq!(
+            value["network"]["egress"]["allow_subnets"],
+            toml::Value::Array(vec![]),
+            "{text}"
+        );
+        assert!(value.get("type").is_none(), "{text}");
+        assert!(value.get("packages").is_none(), "{text}");
+        assert!(value.get("pty_enabled").is_none(), "{text}");
+        assert!(value["network"].get("policy").is_none(), "{text}");
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), session);
+
+        for (mode, word) in [
+            (boxes::NetworkMode::NoNet, "none"),
+            (boxes::NetworkMode::HostNet, "host_ip"),
+            (boxes::NetworkMode::OwnIp, "own_ip"),
+        ] {
+            let spec = BoxSpec::for_session(
+                None,
+                SpecFlags {
+                    network: mode,
+                    ..SpecFlags::default()
+                },
+            );
+            let text = toml::to_string(&spec).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(value["network"]["mode"].as_str(), Some(word), "{text}");
+            assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
+        }
     }
 }
