@@ -1027,10 +1027,12 @@ impl BoxId {
 
     /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
     /// and all 74 of its random bits from the OS CSPRNG, with no counter.
-    /// No two ids minted in one process share a mint millisecond: a mint
-    /// in the millisecond of the one before it waits for the clock to
-    /// tick. So, while the clock moves forward, ids minted in one process
-    /// sort in mint order, which is creation order (NET-129).
+    /// No two ids minted in one process share a mint millisecond, and each
+    /// takes a later one than the id before it: a mint in the millisecond
+    /// of the one before it waits for the clock to tick. If the clock
+    /// steps back behind the last mint, the mint takes the millisecond
+    /// after the last one instead of the clock's. So ids minted in one
+    /// process sort in mint order, which is creation order (NET-129).
     #[must_use]
     pub fn mint() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1039,15 +1041,32 @@ impl BoxId {
         static LAST_MINT_MS: AtomicU64 = AtomicU64::new(0);
 
         loop {
-            let stamp = uuid::Timestamp::now(uuid::NoContext);
-            let (secs, nanos) = stamp.to_unix();
-            let ms = secs * 1000 + u64::from(nanos) / 1_000_000;
+            // Load the last mint before the clock is read. A clock reading
+            // then never predates the `last` it is compared to, and a CAS
+            // that another mint overtook fails and retries.
             let last = LAST_MINT_MS.load(Ordering::Acquire);
+            let now = uuid::Timestamp::now(uuid::NoContext);
+            let (secs, nanos) = now.to_unix();
+            let ms = secs * 1000 + u64::from(nanos) / 1_000_000;
             if ms == last {
                 // At most one millisecond: the clock ticks soon.
                 std::thread::yield_now();
                 continue;
             }
+            // The clock stepped back behind the last mint: take the next
+            // millisecond after it, so the order holds and nothing waits.
+            let (ms, stamp) = if ms < last {
+                let next = last + 1;
+                let stamp = uuid::Timestamp::from_unix(
+                    uuid::NoContext,
+                    next / 1000,
+                    // A remainder below 1000 always fits in a `u32`.
+                    u32::try_from(next % 1000).unwrap_or(0) * 1_000_000,
+                );
+                (next, stamp)
+            } else {
+                (ms, now)
+            };
             if LAST_MINT_MS
                 .compare_exchange(last, ms, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
