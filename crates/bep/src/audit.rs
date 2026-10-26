@@ -240,6 +240,11 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
 /// The `kind` of a [`QuarantineRecord`].
 pub const QUARANTINE: &str = "quarantine";
 
+/// The marker on a revocation that a quarantine records again from a moved
+/// segment. It tells the copy apart from the revocation a destroy wrote,
+/// so a reader of the log does not count one destroy twice.
+pub const RESTATED: &str = "quarantine_restated";
+
 /// The directory, inside the log's directory, that a quarantine moves
 /// segments into ([`AuditLog::quarantine_unreadable`]).
 pub const QUARANTINE_DIR: &str = "quarantine";
@@ -289,8 +294,9 @@ enum Line {
     Record(Record),
     /// A [`QuarantineRecord`].
     Quarantine(QuarantineRecord),
-    /// A record of the schema whose kind this bep does not know. It is
-    /// not one of the kinds this bep reads, so it is no lost revocation.
+    /// A record of the schema whose kind this bep does not know. Its chain
+    /// fields parse, so it is no corrupt line. It can still hold a
+    /// revocation from a newer bep, so [`prune`] keeps its segment.
     OtherKind {
         /// The record's `previous_hash`.
         previous_hash: String,
@@ -859,7 +865,7 @@ impl AuditLog {
                     identifier: None,
                     mapping: Mapping::ModuleUnmapped,
                     outcome: Outcome::Refuse,
-                    marker: None,
+                    marker: Some(RESTATED.to_owned()),
                 })?;
             }
             fs::rename(&quarantined.segment, &quarantined.moved_to)?;
@@ -868,7 +874,9 @@ impl AuditLog {
                 moved_to = %quarantined.moved_to.display(),
                 unreadable = quarantined.record.unreadable,
                 final_hash = %quarantined.record.final_hash,
-                "moved an audit segment with unreadable lines to quarantine"
+                "moved an audit segment with unreadable lines to quarantine; \
+                 a revocation on an unreadable line is no longer in force, so \
+                 check the destroyed boxes that segment can record"
             );
         }
         Ok(moved)
@@ -1039,14 +1047,17 @@ fn first_previous_hash(path: &Path) -> io::Result<Option<String>> {
 /// Whether the segment at `path` holds a revocation record, or can hold
 /// one. A complete, non-empty line that does not parse as a record counts
 /// as one, so [`prune`] keeps a segment it cannot read whole. A record of
-/// another kind does not count. The bytes after the last newline are a
+/// a kind this bep does not know counts too. A quarantine record does not
+/// count. The bytes after the last newline are a
 /// partial write and count as none.
 fn holds_revocation(path: &Path) -> io::Result<bool> {
     let bytes = fs::read(path)?;
     Ok(complete_lines(&bytes).any(|raw| match classify(raw) {
         Line::Record(record) => record.kind == Kind::Revocation,
-        Line::Corrupt => true,
-        Line::Quarantine(_) | Line::OtherKind { .. } => false,
+        // A kind this bep does not know can be a revocation that a newer
+        // bep wrote, so prune keeps its segment, as for a corrupt line.
+        Line::Corrupt | Line::OtherKind { .. } => true,
+        Line::Quarantine(_) => false,
     }))
 }
 
@@ -2011,6 +2022,14 @@ mod tests {
         fs::write(audit.join(segment_name(2)), b"").unwrap();
         assert!(holds_revocation(&audit.join(segment_name(0))).unwrap());
         assert!(!holds_revocation(&audit.join(segment_name(1))).unwrap());
+        // A kind this bep does not know can be a newer bep's revocation.
+        let future = dir.0.join("future.jsonl");
+        fs::write(
+            &future,
+            format!("{{\"schema\":\"{SCHEMA}\",\"kind\":\"future_kind\",\"previous_hash\":\"{ZERO_HASH}\"}}\n"),
+        )
+        .unwrap();
+        assert!(holds_revocation(&future).unwrap());
 
         let day = 24 * 60 * 60;
         let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(day / 2);

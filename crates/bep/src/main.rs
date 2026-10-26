@@ -1358,6 +1358,17 @@ mod tests {
         assert_eq!(restored.skipped, 0);
         assert!(!dir.join("audit-1.jsonl").exists());
         assert!(dir.join("quarantine/audit-1.jsonl").exists());
+        // The revocation recorded again carries a marker, so it does not
+        // read as a second destroy of box-a.
+        let restated: Vec<_> = audit::LogReader::new(&dir)
+            .read_new()
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.record.kind == Kind::Revocation)
+            .collect();
+        assert_eq!(restated.len(), 1);
+        assert_eq!(restated[0].record.marker.as_deref(), Some(audit::RESTATED));
         let verified = audit::verify_chain(&dir).unwrap();
         assert!(verified.is_ok(), "{verified:?}");
         log.append(&decision(Kind::Decision, "box-c")).unwrap();
