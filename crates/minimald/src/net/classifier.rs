@@ -584,18 +584,27 @@ pub(crate) trait CgroupMoves {
     /// refused UDP to port 443 (BEP-018). A socket keeps the cgroup it was
     /// created in, so this is what refuses a socket that a member opened in
     /// its own leaf before the cohort turned blocked. The default changes
-    /// no set: [`KernelMoves`] only moves processes, and the daemon's
-    /// launch and stop paths use a seam that runs the privileged helper.
-    /// An implementation logs its own refusal.
+    /// no set and fails with [`std::io::ErrorKind::Unsupported`], so a
+    /// seam that cannot change the set never counts a leaf as listed:
+    /// [`KernelMoves`] only moves processes, and the daemon's launch and
+    /// stop paths use a seam that runs the privileged helper. An
+    /// implementation logs its own refusal.
     fn add_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
-        let _ = leaf;
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{} cannot be added to the blocked set here", leaf.display()),
+        ))
     }
     /// Removes the box leaf `leaf` from that set. The default changes no
-    /// set, as [`Self::add_blocked_leaf`] says.
+    /// set and fails, as [`Self::add_blocked_leaf`] says.
     fn remove_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
-        let _ = leaf;
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{} cannot be removed from the blocked set here",
+                leaf.display()
+            ),
+        ))
     }
 }
 
@@ -661,6 +670,15 @@ pub(crate) enum CohortPlaceError {
         /// The box's own leaf.
         leaf: PathBuf,
     },
+    /// The cohort blocks, and a member's own leaf could not be added to
+    /// the table's blocked-leaves set. A socket opened in that leaf before
+    /// the block would keep sending UDP 443.
+    Unlisted {
+        /// The member's own leaf.
+        leaf: PathBuf,
+        /// The add's failure.
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for CohortPlaceError {
@@ -690,6 +708,11 @@ impl std::fmt::Display for CohortPlaceError {
                 "new processes kept starting in {} while they were moved",
                 leaf.display()
             ),
+            Self::Unlisted { leaf, error } => write!(
+                f,
+                "cannot add {} to the cgroups that are refused UDP to port 443: {error}",
+                leaf.display()
+            ),
         }
     }
 }
@@ -697,7 +720,9 @@ impl std::fmt::Display for CohortPlaceError {
 impl std::error::Error for CohortPlaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read { error, .. } | Self::Migrate { error, .. } => Some(error),
+            Self::Read { error, .. }
+            | Self::Migrate { error, .. }
+            | Self::Unlisted { error, .. } => Some(error),
             Self::NoBlockedLeaf | Self::StillStarting { .. } => None,
         }
     }
@@ -768,10 +793,17 @@ impl CohortQuic443 {
     /// Brings the table's blocked-leaves set in step with the cohort: the
     /// own leaf of every resident member whose processes move while the
     /// cohort blocks, and no leaf while it does not. Each change logs one
-    /// info line with the leaf and the blocking members. A refused add is
-    /// not recorded, so the next change tries it again. A refused remove
-    /// is dropped from the record: the box left, or its leaf did.
-    fn sync_leaf_set(&mut self, moves: &dyn CgroupMoves) {
+    /// info line with the leaf and the blocking members. A refused remove
+    /// stays recorded, and the next change tries it again. Only a leaf
+    /// that is gone is dropped from the record after a refused remove. A
+    /// refused add is not recorded, so the next change tries it again.
+    ///
+    /// # Errors
+    ///
+    /// [`CohortPlaceError::Unlisted`] for the first refused add, after
+    /// every other change was tried. Adds happen only while the cohort
+    /// blocks, so the error means a member's own leaf is not refused.
+    fn sync_leaf_set(&mut self, moves: &dyn CgroupMoves) -> Result<(), CohortPlaceError> {
         let want = if self.blocked() {
             self.homes.clone()
         } else {
@@ -796,15 +828,22 @@ impl CohortQuic443 {
             // Otherwise the leaf stays recorded, and the next change of the
             // cohort retries the remove.
         }
+        let mut refused = None;
         for (id, leaf) in want {
             if self.listed.contains_key(&id) {
                 continue;
             }
-            if moves.add_blocked_leaf(&leaf).is_ok() {
-                self.log_set_change(&id, &leaf, true);
-                self.listed.insert(id, leaf);
+            match moves.add_blocked_leaf(&leaf) {
+                Ok(()) => {
+                    self.log_set_change(&id, &leaf, true);
+                    self.listed.insert(id, leaf);
+                }
+                Err(error) => {
+                    refused.get_or_insert(CohortPlaceError::Unlisted { leaf, error });
+                }
             }
         }
+        refused.map_or(Ok(()), Err)
     }
 
     /// The one info line per change of the blocked-leaves set.
@@ -917,7 +956,8 @@ impl CohortQuic443 {
     /// # Errors
     ///
     /// A [`CohortPlaceError`] when the cohort blocks and a member's
-    /// processes cannot all be placed in the blocked leaf. The box stays a
+    /// processes cannot all be placed in the blocked leaf, or a member's
+    /// own leaf cannot be added to the blocked-leaves set. The box stays a
     /// member: the caller fails its launch and calls [`Self::depart`].
     pub(crate) fn admit(
         &mut self,
@@ -940,21 +980,22 @@ impl CohortQuic443 {
         if now != was {
             self.log_flip(box_id);
         }
-        self.sync_leaf_set(moves);
+        let listed = self.sync_leaf_set(moves);
         if !now {
             if was {
                 self.move_all_home(None, moves);
             }
-            return Ok(());
+            return listed;
         }
         if was {
-            return self.move_in(box_id, moves);
+            self.move_in(box_id, moves)?;
+            return listed;
         }
         let ids: Vec<String> = self.homes.keys().cloned().collect();
         for id in ids {
             self.move_in(&id, moves)?;
         }
-        Ok(())
+        listed
     }
 
     /// [`Self::leave`], and the move back: when the last blocking member
@@ -967,7 +1008,9 @@ impl CohortQuic443 {
         let was = self.blocked();
         self.leave(box_id);
         self.homes.remove(box_id);
-        self.sync_leaf_set(moves);
+        // A stop cannot fail. A refused add here is a leaf whose launch
+        // already failed on it, and the helper logged the refusal.
+        let _ = self.sync_leaf_set(moves);
         let now = self.blocked();
         if was && !now {
             self.log_flip(box_id);
@@ -7805,17 +7848,26 @@ mod tests {
         assert_eq!(moves.where_is(10), homes[0]);
         assert_eq!(moves.where_is(40), homes[3]);
 
-        // A refused add is not recorded, and the next change tries again.
+        // A refused add fails the admit that needs it, and is not
+        // recorded. The caller departs the box, and the block lifts.
         moves.unlistable.lock().unwrap().insert(homes[0].clone());
-        cohort
-            .admit("grant", Some(homes[2].clone()), true, &moves)
-            .expect("the cohort moves");
+        let refused = cohort.admit("grant", Some(homes[2].clone()), true, &moves);
+        assert!(
+            matches!(
+                &refused,
+                Err(CohortPlaceError::Unlisted { leaf, .. }) if *leaf == homes[0]
+            ),
+            "a refused add fails the admit, not open: {refused:?}"
+        );
         assert!(!listed(&moves).contains(&homes[0]));
         assert!(cohort.listed_leaves().all(|leaf| leaf != homes[0]));
+        cohort.depart("grant", &moves);
+        assert!(!cohort.blocked());
+        assert!(listed(&moves).is_empty(), "the failed flip lists nothing");
         moves.unlistable.lock().unwrap().clear();
         cohort
-            .admit("late", Some(homes[3].clone()), false, &moves)
-            .expect("the joiner stays");
+            .admit("grant", Some(homes[2].clone()), true, &moves)
+            .expect("the retry moves");
         assert!(listed(&moves).contains(&homes[0]), "the retry listed it");
 
         // A failed remove of a leaf that still exists stays recorded, and
@@ -7917,6 +7969,14 @@ mod tests {
 
         fn parent(&self, pid: i32) -> Option<i32> {
             self.inner.parent(pid)
+        }
+
+        fn add_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+            self.inner.add_blocked_leaf(leaf)
+        }
+
+        fn remove_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+            self.inner.remove_blocked_leaf(leaf)
         }
     }
 

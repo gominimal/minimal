@@ -18,8 +18,10 @@ pub(super) const QUIC443_LEAF_HELPER: &str = "/usr/local/lib/minimal/quic443-lea
 /// Runs `helper` through `sudo` with `-n`, so it never waits for a
 /// password, to `verb` (`add` or `remove`) the box leaf `leaf` in the
 /// blocked-leaves set. A refusal or a failure to run is logged with what
-/// the helper said, and returned: the cohort leaves the leaf unrecorded,
-/// and the box keeps running.
+/// the helper said, and returned. A refused add leaves the leaf
+/// unrecorded and fails the launch that needed it, so the block never
+/// fails open. A refused remove keeps the leaf recorded for a retry, and
+/// the box keeps running.
 pub(super) fn run_quic443_leaf_helper(
     sudo: &std::path::Path,
     helper: &std::path::Path,
@@ -56,8 +58,9 @@ pub(super) fn run_quic443_leaf_helper(
         helper = %helper.display(),
         %error,
         "the QUIC block helper refused a change to the set of leaves refused UDP 443; \
-         while the block holds, a socket opened in this leaf before it keeps \
-         sending UDP 443. scripts/install-host-classifier.sh installs the helper"
+         a refused add fails the launch that needed it, and a refused remove is \
+         tried again at the next change. scripts/install-host-classifier.sh \
+         installs the helper"
     );
     Err(error)
 }
