@@ -1368,6 +1368,8 @@ mod tests {
             box_id: box_id.into(),
             authority: String::new(),
             identifier: None,
+            // A mint or a revocation carries no handle.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: None,
