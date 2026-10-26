@@ -1031,26 +1031,26 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
                 continue;
             }
         };
-        match record.status {
-            boxes::BoxState::Pending | boxes::BoxState::Materializing => {
-                let id = *handle.id();
-                let status = record.status;
-                if let Err(e) = handle.delete().await {
-                    tracing::warn!(
-                        session_id = %id,
-                        error = %e,
-                        ?status,
-                        "reap: failed to delete unresumable record",
-                    );
-                } else {
-                    tracing::info!(
-                        session_id = %id,
-                        ?status,
-                        "reap: deleted unresumable record left over from a prior daemon lifetime",
-                    );
-                }
-            }
-            boxes::BoxState::Active => {}
+        // BOX-012: the restart reaps only pending and materializing
+        // records. Every other state, running included, is kept.
+        let state = record.state();
+        if !state.reaped_at_restart() {
+            continue;
+        }
+        let id = *handle.id();
+        if let Err(e) = handle.delete().await {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                state = state.name(),
+                "reap: failed to delete unresumable record",
+            );
+        } else {
+            tracing::info!(
+                session_id = %id,
+                state = state.name(),
+                "reap: deleted unresumable record left over from a prior daemon lifetime",
+            );
         }
     }
     Ok(())
