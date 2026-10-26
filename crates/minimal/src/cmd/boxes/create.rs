@@ -2479,10 +2479,22 @@ mod tests {
 
         stamp_session_spec(&mut request, root).unwrap();
 
-        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(
-            request.spec.clone().expect("the spec is on the request"),
-        )
-        .unwrap();
+        let wire = request.spec.clone().expect("the spec is on the request");
+        // The request carries the `box.toml` tables and the mode's spec word.
+        assert_eq!(wire["v"], mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(wire["box"]["type"], boxes::SESSION_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], true);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["git"])
+        );
+        assert_eq!(wire["network"]["mode"], "own_ip");
+        assert_eq!(
+            wire["network"]["egress"]["allow_subnets"],
+            serde_json_lenient::json!([])
+        );
+        assert!(wire.get("type").is_none() && wire.get("packages").is_none());
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
         assert_eq!(sent.v, mfile::spec::BOX_SPEC_VERSION);
         assert_eq!(sent.box_type, boxes::SESSION_BOX_TYPE);
         assert_eq!(sent.packages, vec!["git".to_string()]);
@@ -2493,12 +2505,18 @@ mod tests {
         // The task path: the declared task's spec, through the same helper.
         let file = mfile::File::from_dir_recursive(dir.path()).unwrap();
         let task =
-            mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&request));
+            mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&request))
+                .expect("a task that is not interactive has a spec");
         put_spec(&mut request, &task).unwrap();
-        let sent: mfile::spec::BoxSpec =
-            serde_json_lenient::from_value(request.spec.clone().unwrap()).unwrap();
+        let wire = request.spec.clone().unwrap();
+        assert_eq!(wire["box"]["type"], boxes::TASK_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], false);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["rust"])
+        );
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
         assert_eq!(sent, task);
-        assert_eq!(sent.box_type, boxes::TASK_BOX_TYPE);
 
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         assert!(stamp_session_spec(&mut request, root).is_err());
