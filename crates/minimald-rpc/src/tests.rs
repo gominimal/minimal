@@ -528,7 +528,7 @@ fn create_session_request_round_trips() {
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
         },
         must_match_version: Some("0.6.0".into()),
-        spec: Some(serde_json_lenient::json!({"v": 0, "type": "task"})),
+        spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
     };
     assert_eq!(round_trip(&req), req);
 }
@@ -578,12 +578,16 @@ fn create_request_constructor_round_trips() {
 fn create_sends_expanded_spec_and_stores_it() {
     let spec = serde_json_lenient::json!({
         "v": 0,
-        "type": "session",
         "entry": "default",
-        "packages": ["git", "ripgrep"],
-        "pty_enabled": true,
         "hooks_enabled": false,
-        "network": {"mode": "own_ip", "policy": {"egress": null, "ingress": null}},
+        "box": {"type": "session"},
+        "io": {"pty_enabled": true},
+        "install": {"packages": ["git", "ripgrep"]},
+        "network": {
+            "mode": "own_ip",
+            "egress": {"allow_dns_hosts": [], "allow_subnets": [], "allow_protocols": []},
+            "ingress": null,
+        },
     });
     let mut req = CreateSessionRequest::new(
         "spec-box",

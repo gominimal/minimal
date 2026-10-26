@@ -1356,7 +1356,7 @@ mod tests {
         let object = loader.get(&key).unwrap();
         assert_eq!(object.load_spec().unwrap(), None);
 
-        let spec = br#"{"type":"session","v":0}"#;
+        let spec = br#"{"box":{"type":"session"},"v":0}"#;
         object.store_spec(spec).unwrap();
 
         let record_dir = loader_dir(&tmp)

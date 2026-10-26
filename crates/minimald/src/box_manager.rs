@@ -2265,9 +2265,10 @@ mod create_stamp_tests {
         let (state, _cache, mngr) = manager().await;
         let spec = serde_json_lenient::json!({
             "v": 0,
-            "type": "session",
             "entry": "default",
-            "packages": ["git"],
+            "box": {"type": "session"},
+            "install": {"packages": ["git"]},
+            "network": {"mode": "host_ip"},
         });
         let id = mngr
             .create_box_with_spec(
@@ -2291,7 +2292,7 @@ mod create_stamp_tests {
         let err = mngr
             .create_box_with_spec(
                 config("bad-spec", "/home/dev/proj"),
-                Some(serde_json_lenient::json!({"type": "session"})),
+                Some(serde_json_lenient::json!({"box": {"type": "session"}})),
                 None,
                 None,
             )
