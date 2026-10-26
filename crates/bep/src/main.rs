@@ -685,6 +685,24 @@ fn refuse_unreadable(restored: &revoke::Restored) -> Result<(), String> {
     ))
 }
 
+/// Opens the audit log in `dir` for `bep serve`. The log holds the
+/// directory, so a second `bep serve` on it is refused.
+fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                dir.display()
+            )
+        } else {
+            format!("bep did not open the audit log in {}: {err}", dir.display())
+        }
+    })
+}
+
 /// `bep serve`: the listener and the control socket, until one fails.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn serve<K: CaKey + Send + Sync + 'static>(
@@ -708,6 +726,8 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     )?;
     let dir = audit::default_dir()
         .ok_or("bep did not find your home directory, which holds the audit log.")?;
+    // Locked first, so no other writer rotates the segments under the read.
+    let log = open_audit_log(&dir)?;
     // BEP-068: the log rotates its segments, and the revocations in every
     // retained segment are in force again from this start.
     let restored = revoke::restore(&dir)
@@ -719,8 +739,6 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         "restored the revocations recorded in the audit log"
     );
     refuse_unreadable(&restored)?;
-    let log = AuditLog::open_dir(&dir, audit::Rotation::default())
-        .map_err(|err| format!("bep did not open the audit log in {}: {err}", dir.display()))?;
     let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
@@ -1178,6 +1196,27 @@ mod tests {
              Without it, bep cannot keep refusing that box.\n\
              Repair or remove those lines, then run `bep serve` again."
         );
+    }
+
+    // BEP-068: a second `bep serve` on the same audit directory is refused,
+    // so two writers never fork the chain.
+    #[test]
+    fn serve_refuses_a_second_writer_of_the_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let first = open_audit_log(&audit).unwrap();
+        let err = open_audit_log(&audit).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "bep did not start. Another `bep serve` writes the audit log in {}.\n\
+                 Only one `bep serve` can write the audit log at a time.\n\
+                 Stop the other `bep serve`, then run `bep serve` again.",
+                audit.display()
+            )
+        );
+        drop(first);
+        open_audit_log(&audit).unwrap();
     }
 
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.

@@ -237,6 +237,76 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
 }
 
+/// Creates `dir` and its parents when absent. A directory this call creates
+/// gets mode 0700, so it is the proxy's alone.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut dirs = fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dirs.mode(0o700);
+    }
+    dirs.create(dir)
+}
+
+/// Opens the regular file at `path` for append, and creates it with mode
+/// 0600 when absent. Fails when `path` is a symlink or not a regular file.
+fn open_own_file(path: &Path) -> io::Result<File> {
+    // Refused before the open as well, so a symlink's target is never
+    // created and a FIFO never blocks the open. The check after the
+    // open still catches an entry swapped in between the two.
+    match fs::symlink_metadata(path) {
+        Ok(entry) if entry.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit log {} is a symlink", path.display()),
+            ));
+        }
+        Ok(entry) if !entry.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("audit log {} is not a regular file", path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    // Checked after the open, against the open file, so a link swapped
+    // in between a check and the open cannot slip through.
+    ensure_own_file(path, &file)?;
+    Ok(file)
+}
+
+/// Creates `dir` when absent, and locks its [`DIR_LOCK`] file. The lock
+/// lasts as long as the returned file is open.
+fn lock_dir(dir: &Path) -> io::Result<File> {
+    create_private_dir(dir)?;
+    let file = open_own_file(&dir.join(DIR_LOCK))?;
+    // One writer per directory: a second one could append to a segment
+    // that the first one closed, and fork the chain there.
+    file.try_lock().map_err(|err| match err {
+        fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "audit directory {} is held by another `bep serve`",
+                dir.display()
+            ),
+        ),
+        fs::TryLockError::Error(err) => err,
+    })?;
+    Ok(file)
+}
+
 /// Fails unless `file` is a regular file and is the entry at `path` itself,
 /// not a file that a symlink at `path` leads to.
 fn ensure_own_file(path: &Path, file: &File) -> io::Result<()> {
@@ -342,7 +412,14 @@ pub struct AuditLog {
     /// The log's directory, the active segment's number and the bounds,
     /// when the log rotates its segments (BEP-068).
     rotation: Option<(PathBuf, u64, Rotation)>,
+    /// The locked [`DIR_LOCK`] file of the log's directory, held for the
+    /// life of the log when [`AuditLog::open_dir`] opened it.
+    dir_lock: Option<File>,
 }
+
+/// The lock file in an audit directory. The writer that holds its lock is
+/// the one writer of every segment in the directory.
+pub const DIR_LOCK: &str = ".lock";
 
 /// The size bound of an active segment: 8 MiB.
 pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
@@ -395,47 +472,9 @@ impl AuditLog {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            // Directories this call creates are the proxy's alone.
-            let mut dirs = fs::DirBuilder::new();
-            dirs.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                dirs.mode(0o700);
-            }
-            dirs.create(parent)?;
+            create_private_dir(parent)?;
         }
-        // Refused before the open as well, so a symlink's target is never
-        // created and a FIFO never blocks the open. The check after the
-        // open still catches an entry swapped in between the two.
-        match fs::symlink_metadata(&path) {
-            Ok(entry) if entry.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("audit log {} is a symlink", path.display()),
-                ));
-            }
-            Ok(entry) if !entry.is_file() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("audit log {} is not a regular file", path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-        let mut options = OpenOptions::new();
-        options.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        // Checked after the open, against the open file, so a link swapped
-        // in between a check and the open cannot slip through.
-        ensure_own_file(&path, &file)?;
+        let file = open_own_file(&path)?;
         // One writer per log: a second one would chain to the same head.
         file.try_lock().map_err(|err| match err {
             fs::TryLockError::WouldBlock => io::Error::new(
@@ -472,6 +511,7 @@ impl AuditLog {
             len,
             poisoned: false,
             rotation: None,
+            dir_lock: None,
         })
     }
 
@@ -481,14 +521,24 @@ impl AuditLog {
     /// active segment holds no record yet, the next record chains to the
     /// previous segment's last line, so the chain runs on across segments.
     ///
-    /// The lock is per segment, so open lists the directory again after it
-    /// takes the lock. A writer that rotated in between releases the old
-    /// segment, and a newer one shows in the second listing. Then open
-    /// drops the old segment and tries the newest, which that writer holds.
+    /// Open first takes the lock on the directory's [`DIR_LOCK`] file, and
+    /// the log holds it until it drops. So one writer at a time has the
+    /// directory, and a rotation never frees a closed segment for a second
+    /// writer. While another log holds the directory, the call fails with
+    /// [`io::ErrorKind::WouldBlock`].
+    ///
+    /// Each segment has its own lock too, and open lists the directory
+    /// again after it takes that lock. A writer that takes no directory
+    /// lock and rotated in between releases the old segment, and a newer
+    /// one shows in the second listing. Then open drops the old segment and
+    /// tries the newest, which that writer holds.
     pub fn open_dir(dir: impl AsRef<Path>, rotation: Rotation) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        let dir_lock = lock_dir(&dir)?;
         let found = numbered_segments(&dir)?;
-        Self::open_listed(dir, rotation, found)
+        let mut log = Self::open_listed(dir, rotation, found)?;
+        log.dir_lock = Some(dir_lock);
+        Ok(log)
     }
 
     /// [`AuditLog::open_dir`] from a listing `found` taken before the call.
@@ -552,6 +602,9 @@ impl AuditLog {
         );
         opened.head = std::mem::take(&mut self.head);
         opened.rotation = Some((dir.clone(), n + 1, rotation));
+        // The directory stays locked across the swap, so no other writer
+        // can take the closed segment.
+        opened.dir_lock = self.dir_lock.take();
         *self = opened;
         if let Err(err) = prune(&dir, &rotation, std::time::SystemTime::now()) {
             tracing::warn!(dir = %dir.display(), error = %err, "audit segments were not pruned");
@@ -1385,6 +1438,47 @@ mod tests {
         let head = writer.head().to_owned();
         drop(writer);
         let log = AuditLog::open_listed(audit.clone(), rotation(1, 100, 0), stale).unwrap();
+        assert_eq!(log.path(), audit.join(segment_name(1)));
+        assert_eq!(log.head(), head);
+    }
+
+    // BEP-068: one writer holds the audit directory for the life of its
+    // log, so a rotation does not free the closed segment for a second
+    // writer to append there and fork the chain.
+    #[test]
+    fn open_dir_refuses_a_second_writer_across_rotation() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut writer = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        writer.append(&admit()).unwrap();
+
+        let err = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "audit directory {} is held by another `bep serve`",
+                audit.display()
+            )
+        );
+
+        // The rotation releases segment 0, and the directory stays held.
+        writer.append(&admit()).unwrap();
+        assert_eq!(writer.path(), audit.join(segment_name(1)));
+        let closed = fs::read(audit.join(segment_name(0))).unwrap();
+        let err = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(audit.join(segment_name(0))).unwrap(), closed);
+        // The lock file is not a segment.
+        assert_eq!(
+            segments(&audit).unwrap(),
+            vec![audit.join(segment_name(0)), audit.join(segment_name(1))]
+        );
+
+        // With the writer gone, the next one continues the newest segment.
+        let head = writer.head().to_owned();
+        drop(writer);
+        let log = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
         assert_eq!(log.path(), audit.join(segment_name(1)));
         assert_eq!(log.head(), head);
     }
