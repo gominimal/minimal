@@ -659,6 +659,16 @@ case_install() {
     want_ok "the card names the first command (R10.4)" \
         grep -qE "min +build the sandbox and step inside" "$OUT"
     want_card_last "the card closes a fresh install (R10.4)"
+    # The install's description for the update check (R6.1b): the target,
+    # the method and the pointer installed, recorded so uninstall removes it.
+    _im="$H1/xdg-state/minimal/install.toml"
+    want_ok "install.toml is written beside the record (R6.1b)" test -f "$_im"
+    want_ok "install.toml names the target channel (R6.1b)" grep -qx 'channel = "stable"' "$_im"
+    want_ok "install.toml names the installer as the method (R6.1b)" grep -qx 'method = "installer"' "$_im"
+    want_ok "install.toml carries the installed pointer (R6.1b)" grep -qx 'key = "v1"' "$_im"
+    want_ok "install.toml is recorded for uninstall (R6.1b)" \
+        record_has install-metadata "$_im" "$H1/xdg-state/minimal/installed"
+    want_ok "the card points at the update check's docs (R6.1b)" grep -q "reference/telemetry#update-check" "$OUT"
     # Nothing on a redirected stream may carry terminal escapes (R10.1): this
     # output is a file, so a stray SGR here would land in every CI log. `run` sets a
     # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
@@ -839,6 +849,7 @@ EOF
     run ns_run "$HNS" --uninstall
     FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_err "uninstall removes install.toml (R6.1b)" test -e "$HNS/xdg-state/minimal/install.toml"
     want_ok "uninstall advises the host DNS setup is still installed" \
         grep -q "still installed on this host.*host DNS setup" "$OUT"
     want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"

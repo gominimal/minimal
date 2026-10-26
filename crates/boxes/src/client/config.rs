@@ -43,6 +43,43 @@ pub struct Config {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub secret_store_rules: crate::core::bep::StoreRules,
+    /// `[telemetry]` section: the daily update check's switch
+    /// (gominimal/inbox#589) and the keys the opt-in export (spec 25) will
+    /// read. All of them are accepted now: the file is `deny_unknown_fields`,
+    /// so a key added later would fail to parse on an older binary.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+/// The `[telemetry]` section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The daily update check and the install count it carries. On by
+    /// default until 1.0; `false` makes no request and prints no notice.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Reserved for the opt-in export (spec 25): accepted, not yet read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Reserved for the opt-in export (spec 25): `[telemetry.export.<name>]`
+    /// tables of string settings, accepted, not yet read.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub export: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: None,
+            export: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// The `[secrets]` section.
@@ -268,6 +305,36 @@ mod tests {
         assert_eq!(cfg.loadouts.default_loadouts, vec!["helix", "fish"]);
         // `follow_symlinks` defaults to false when omitted.
         assert!(!cfg.loadouts.follow_symlinks);
+    }
+
+    /// `[telemetry]` is on by default, switches off with `enabled = false`,
+    /// and accepts the export keys spec 25 reserves.
+    #[test]
+    fn telemetry_section_defaults_on_and_accepts_the_reserved_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(dir.path(), "config.toml", "[loadouts]\n");
+        assert!(read_config_file(&path).unwrap().telemetry.enabled);
+        let path = write_file(
+            dir.path(),
+            "off.toml",
+            indoc::indoc! {r#"
+                [telemetry]
+                enabled = false
+                mode = "spool"
+
+                [telemetry.export.lab]
+                endpoint = "http://localhost:4318"
+            "#},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        assert!(!cfg.telemetry.enabled);
+        assert_eq!(cfg.telemetry.mode.as_deref(), Some("spool"));
+        assert!(cfg.telemetry.export.contains_key("lab"));
+        let path = write_file(dir.path(), "bad.toml", "[telemetry]\nenabld = false\n");
+        assert!(
+            read_config_file(&path).is_err(),
+            "a misspelt key is refused, as everywhere in this file"
+        );
     }
 
     /// `follow_symlinks` round-trips when explicitly set.
