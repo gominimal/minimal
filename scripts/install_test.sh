@@ -1350,6 +1350,8 @@ case_target_validation() {
     check 0 "$rc" "--version installs without a pointer (R2.5)"
     check "$h_minimald" "$(hash_file "$HV/bin/minimald")" "--version installs that version's bytes (R2.5)"
     want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
+    want_ok "--version records a pinned install, never notified (R6.1b)" \
+        grep -qx 'channel = "pinned"' "$HV/xdg-state/minimal/install.toml"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"

@@ -258,7 +258,7 @@ detached `min update-check --background` with a 2 second budget and no
 retry, and the command that spawned it does not wait. An endpoint that is
 down, slow, or answers 404 produces nothing.
 
-The request carries eight fields and nothing else:
+The request carries six fields and nothing else:
 
 | field | value |
 |---|---|
@@ -285,9 +285,12 @@ flag makes the request now and prints the answer.
 | `DO_NOT_TRACK=1` | environment, the cross-tool convention |
 | `CI` set | environment: a CI job that installs `min` is not an install to count |
 
-The first interactive run prints a one-line disclosure of the above and
-makes no request until a later command. Installs from a package manager see
-that line instead of the installer's closing card.
+An install's first `min` command never makes the request. The first command
+with a terminal prints a one-line disclosure of the above, even when earlier
+commands were a script's (the installer's own setup call, an agent), and the
+request waits for a later command. Installs from a package manager see that
+line instead of the installer's closing card. A `config.toml` that exists but
+does not parse turns the check off until it is fixed.
 
 At 1.0 the default flips to off.
 

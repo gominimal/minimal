@@ -241,13 +241,16 @@ fn state_dir(global: &GlobalArgs) -> Option<PathBuf> {
         .or_else(|| paths::try_minimal_state_dir().map(|p| AsRef::<Path>::as_ref(&p).to_path_buf()))
 }
 
-/// Whether the user config leaves the check on. A config that is missing
-/// or does not parse leaves it on: the check must not fail a command, and
-/// the config's own error prints where the config is used.
+/// Whether the user config leaves the check on. A missing config is the
+/// default, on. A config that exists but cannot be read or parsed turns the
+/// check off: it may well carry `enabled = false` next to the typo, and a
+/// check that is skipped until the file is fixed costs nothing. The check
+/// never fails the command either way; the config's own error prints where
+/// the config is used.
 fn config_enabled(global: &GlobalArgs) -> bool {
     crate::config::read_client_config(global)
         .map(|c| c.telemetry.enabled)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// The request the child makes.
@@ -303,6 +306,14 @@ pub fn notice(install: &Install, latest: &str) -> String {
     )
 }
 
+/// Whether the disclosure is owed: not yet shown, and a terminal to show it
+/// on. Independent of the install id, so an install whose first runs were a
+/// script's (the installer's own `finalize-install` call, an agent) still
+/// discloses on its first interactive run.
+pub fn disclosure_due(state: &State, tty: bool) -> bool {
+    tty && !state.disclosed
+}
+
 /// Whether a notice is owed: a channel install, an answer for that channel,
 /// a pointer that is not the installed key, not yet told.
 pub fn notice_due<'a>(state: &'a State, install: &Install) -> Option<&'a str> {
@@ -352,25 +363,34 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     let install = read_install(&dir, std::env::current_exe().ok().as_deref());
     let tty = std::io::stderr().is_terminal();
 
-    if state.install_id.is_none() {
+    let first_run = state.install_id.is_none();
+    if first_run {
         state.install_id = Some(new_install_id());
-        if tty && !state.disclosed {
-            // The first interactive run discloses and defers the first
-            // request to a later run. A non-interactive first run (an agent,
-            // a script) is counted from its next command without the text:
-            // the docs and the installer's closing card carry it.
-            state.disclosed = true;
-            let _ = writeln!(std::io::stderr(), "{}", disclosure());
-            let _ = write_state(&state_path, &state);
-            return;
-        }
-        if write_state(&state_path, &state).is_err() {
-            return;
-        }
+    }
+    let disclose = disclosure_due(&state, tty);
+    if disclose {
+        state.disclosed = true;
+        let _ = writeln!(std::io::stderr(), "{}", disclosure());
+    }
+    if (first_run || disclose) && write_state(&state_path, &state).is_err() {
+        return;
+    }
+    // An install's first run never makes the request, interactive or not:
+    // with a terminal the disclosure came first and the request waits for a
+    // later command; without one (an agent, a script, the installer's own
+    // `finalize-install` call) the install is counted from its next command,
+    // and its first interactive run still gets the disclosure above.
+    if first_run {
+        return;
     }
 
-    if due(&state, now_secs()) && acquire_lock(&dir.join(LOCK_FILE)) {
-        spawn_background(global);
+    if due(&state, now_secs()) {
+        let lock = dir.join(LOCK_FILE);
+        // The child releases the lock when it is done; a child that never
+        // started would otherwise hold it for LOCK_STALE.
+        if acquire_lock(&lock) && !spawn_background(global) {
+            release_lock(&lock);
+        }
     }
 
     if tty && let Some(latest) = notice_due(&state, &install) {
@@ -382,11 +402,11 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
 }
 
 /// The detached child: this binary, `update-check --background`, its own
-/// process group, null stdio, never waited on.
-fn spawn_background(global: &GlobalArgs) {
+/// process group, null stdio, never waited on. Whether it was spawned.
+fn spawn_background(global: &GlobalArgs) -> bool {
     use std::os::unix::process::CommandExt as _;
     let Ok(exe) = std::env::current_exe() else {
-        return;
+        return false;
     };
     let mut cmd = std::process::Command::new(exe);
     if let Some(d) = &global.minimal_dir {
@@ -411,7 +431,22 @@ fn spawn_background(global: &GlobalArgs) {
         .process_group(0);
     // Not waited on: a child that outlives a short command is reparented;
     // one that outlives a long one is reaped with it.
-    let _ = cmd.spawn();
+    cmd.spawn().is_ok()
+}
+
+/// Writes a check's outcome into the state file: `checked_at` now, and the
+/// answer when there was one. The file is re-read first and only those
+/// fields change: a command that ran during the request (up to
+/// [`REQUEST_BUDGET`]) may have printed the notice and written `notified`,
+/// and the state read before the request would put the stale value back.
+pub fn record_answer(state_path: &Path, answer: Option<(String, String)>) {
+    let mut state = read_state(state_path);
+    if let Some((channel, latest)) = answer {
+        state.latest = Some(latest);
+        state.latest_channel = Some(channel);
+    }
+    state.checked_at = Some(now_secs());
+    let _ = write_state(state_path, &state);
 }
 
 /// The endpoint's answer.
@@ -423,7 +458,11 @@ struct Answer {
 
 /// One GET within [`REQUEST_BUDGET`], no retry. Any failure is `None`.
 pub async fn fetch_latest(url: &str) -> Option<(String, String)> {
+    // One fixed-host GET: a redirect would carry the query (the install id,
+    // the OS) to whatever host the answer named, over whatever scheme, so
+    // none is followed.
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_BUDGET)
         .connect_timeout(REQUEST_BUDGET)
         .user_agent(format!("min/{}", version::VERSION))
@@ -457,7 +496,7 @@ pub async fn cmd_update_check(
         anyhow::bail!("no state directory (HOME is not set)");
     };
     let state_path = dir.join(STATE_FILE);
-    let mut state = read_state(&state_path);
+    let state = read_state(&state_path);
     let install = read_install(&dir, std::env::current_exe().ok().as_deref());
     let id = state
         .install_id
@@ -479,12 +518,8 @@ pub async fn cmd_update_check(
     }
     if args.background {
         if off.is_none() && state.install_id.is_some() {
-            if let Some((channel, latest)) = fetch_latest(&url).await {
-                state.latest = Some(latest);
-                state.latest_channel = Some(channel);
-            }
-            state.checked_at = Some(now_secs());
-            let _ = write_state(&state_path, &state);
+            let answer = fetch_latest(&url).await;
+            record_answer(&state_path, answer);
         }
         release_lock(&dir.join(LOCK_FILE));
         return Ok(());
@@ -504,10 +539,7 @@ pub async fn cmd_update_check(
                 install.key
             );
             if state.install_id.is_some() {
-                state.latest = Some(latest);
-                state.latest_channel = Some(channel);
-                state.checked_at = Some(now_secs());
-                let _ = write_state(&state_path, &state);
+                record_answer(&state_path, Some((channel, latest)));
             }
             Ok(())
         }
@@ -678,6 +710,73 @@ mod tests {
         assert!(acquire_lock(&lock), "a stale lock is taken over");
         release_lock(&lock);
         assert!(acquire_lock(&lock), "released");
+    }
+
+    #[test]
+    fn the_disclosure_is_owed_on_the_first_terminal_run_whatever_came_before() {
+        let fresh = State::default();
+        assert!(disclosure_due(&fresh, true));
+        assert!(!disclosure_due(&fresh, false), "no terminal, no text");
+        let scripted_first = State {
+            install_id: Some("id".into()),
+            ..State::default()
+        };
+        assert!(
+            disclosure_due(&scripted_first, true),
+            "an id minted by a script's run does not count as disclosed"
+        );
+        let shown = State {
+            disclosed: true,
+            ..scripted_first
+        };
+        assert!(!disclosure_due(&shown, true), "once");
+    }
+
+    #[test]
+    fn recording_an_answer_keeps_what_another_command_wrote_meanwhile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(STATE_FILE);
+        write_state(
+            &path,
+            &State {
+                install_id: Some("id".into()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        // Between the child's read and its write, a command told the user
+        // about 0.7.2 and wrote `notified`.
+        write_state(
+            &path,
+            &State {
+                install_id: Some("id".into()),
+                notified: Some("0.7.2".into()),
+                disclosed: true,
+                ..State::default()
+            },
+        )
+        .unwrap();
+        record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+        let after = read_state(&path);
+        assert_eq!(
+            after.notified.as_deref(),
+            Some("0.7.2"),
+            "the notice is not printed again"
+        );
+        assert!(after.disclosed);
+        assert_eq!(after.latest.as_deref(), Some("0.7.2"));
+        assert!(after.checked_at.is_some());
+        record_answer(&path, None);
+        let failed = read_state(&path);
+        assert_eq!(
+            failed.latest.as_deref(),
+            Some("0.7.2"),
+            "a failed check keeps the last answer"
+        );
+        assert!(
+            failed.checked_at.is_some(),
+            "and still counts as a check, so there is no retry storm"
+        );
     }
 
     #[test]
