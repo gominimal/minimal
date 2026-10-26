@@ -154,22 +154,19 @@ impl From<BoxState> for RecordState {
 
 /// What a daemon restart does to a store (BOX-012).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestartReap<C> {
+pub struct RestartReap<T> {
     /// The records the restart keeps, in store order.
-    pub kept: C,
+    pub kept: Vec<T>,
     /// The records the restart reaps, in store order.
-    pub reaped: C,
+    pub reaped: Vec<T>,
 }
 
 /// Split `records` into the ones a restart keeps and the ones it reaps,
 /// by the state `state_of` reads from each.
-///
-/// The output collection is generic so that the Kani harness can run
-/// this function into a fixed buffer with no heap. Callers use `Vec<T>`.
-pub fn restart_reap<T, C: Default + Extend<T>>(
+pub fn restart_reap<T>(
     records: impl IntoIterator<Item = T>,
     state_of: impl Fn(&T) -> RecordState,
-) -> RestartReap<C> {
+) -> RestartReap<T> {
     let (reaped, kept) = records
         .into_iter()
         .partition(|record| state_of(record).reaped_at_restart());
@@ -217,7 +214,7 @@ fn holds_one_state_with_its_ending(state: &RecordState) -> bool {
 fn reaps_exactly_the_unfinished(store: &[RecordState]) -> bool {
     let unfinished =
         |s: &RecordState| matches!(s, RecordState::Pending | RecordState::Materializing);
-    let outcome: RestartReap<Vec<RecordState>> = restart_reap(store.iter().copied(), |s| *s);
+    let outcome = restart_reap(store.iter().copied(), |s| *s);
     outcome.kept.len() + outcome.reaped.len() == store.len()
         && outcome.reaped.len() == store.iter().filter(|s| unfinished(s)).count()
         && outcome.reaped.iter().all(unfinished)
@@ -358,7 +355,7 @@ mod tests {
             ("d", RecordState::Stopped(StopEnding::AtDaemonStart)),
             ("e", RecordState::Exited(ExitEnding::Oom)),
         ];
-        let outcome: RestartReap<Vec<_>> = restart_reap(store, |(_, state)| *state);
+        let outcome = restart_reap(store, |(_, state)| *state);
         assert_eq!(names(&outcome.reaped), ["a", "c"]);
         assert_eq!(names(&outcome.kept), ["b", "d", "e"]);
 
@@ -419,53 +416,17 @@ mod kani_proofs {
         assert!(holds_one_state_with_its_ending(&state));
     }
 
-    /// A fixed buffer of at most 4 records. The harness runs
-    /// `restart_reap` into it, so CBMC sees no heap and no reallocation.
-    #[derive(Default)]
-    struct Four {
-        items: [Option<RecordState>; 4],
-        len: usize,
-    }
-
-    impl Extend<RecordState> for Four {
-        fn extend<I: IntoIterator<Item = RecordState>>(&mut self, iter: I) {
-            for state in iter {
-                assert!(self.len < 4);
-                self.items[self.len] = Some(state);
-                self.len += 1;
-            }
-        }
-    }
-
-    impl Four {
-        fn get(&self, i: usize) -> RecordState {
-            self.items[i].expect("held")
-        }
-    }
-
-    /// BOX-012: over every store of at most 4 records, restart reaps
-    /// exactly the `pending` and `materializing` ones, in store order,
-    /// and keeps every other one. A loop over 4 records needs a bound of
-    /// 5 to prove it ends.
+    /// BOX-012: a restart reaps a record exactly when it is `pending` or
+    /// `materializing`. The harness proves this per-record decision with
+    /// no collection, so CBMC sees no heap. `restart_reap` is a
+    /// `partition` on this predicate. The unit test of the same name
+    /// checks `restart_reap` over every store of at most 4 records.
     #[kani::proof]
-    #[kani::unwind(5)]
     fn restart_reaps_only_pending_or_materializing() {
-        let len: usize = kani::any();
-        kani::assume(len <= 4);
-        let all: [RecordState; 4] = kani::any();
-        let store = &all[..len];
-        let outcome: RestartReap<Four> = restart_reap(store.iter().copied(), |s| *s);
-        assert!(outcome.kept.len + outcome.reaped.len == len);
-        let (mut k, mut r) = (0, 0);
-        for state in store {
-            if matches!(state, RecordState::Pending | RecordState::Materializing) {
-                assert!(r < outcome.reaped.len && outcome.reaped.get(r) == *state);
-                r += 1;
-            } else {
-                assert!(k < outcome.kept.len && outcome.kept.get(k) == *state);
-                k += 1;
-            }
-        }
-        assert!(k == outcome.kept.len && r == outcome.reaped.len);
+        let state = kani::any::<RecordState>();
+        assert!(
+            state.reaped_at_restart()
+                == matches!(state, RecordState::Pending | RecordState::Materializing)
+        );
     }
 }

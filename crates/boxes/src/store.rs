@@ -514,10 +514,11 @@ impl DiskLoader {
     }
 
     /// Pass D (BOX-003): migrate each indexed record written before the
-    /// record carried `box_type` and `parent`. Such a record becomes a
-    /// `session` box with no parent, and it gets a fresh id only when its
-    /// stored id is nil. A migrated record carries both keys, so a later
-    /// start leaves it unchanged. A record that cannot be read or written
+    /// record carried `box_type` and `parent`. A record with no `box_type`
+    /// becomes a `session` box with no parent. A record with a `box_type`
+    /// keeps it, and an absent `parent` key is written as no parent. A
+    /// record gets a fresh id only when its stored id is nil. A migrated
+    /// record carries both keys, so a later start leaves it unchanged. A record that cannot be read or written
     /// is logged and left for the next start.
     fn heal_migrate_untyped_records(
         &mut self,
@@ -554,8 +555,13 @@ impl DiskLoader {
                 }
             };
             let stored_id = record.id;
-            record.box_type = Some(SESSION_BOX_TYPE.to_string());
-            record.parent = None;
+            // Keep a type the record already has. A record with an absent or
+            // null `box_type` becomes a `session` box with no parent. An
+            // absent `parent` key reads as `None` and is written as `null`.
+            if record.box_type.is_none() {
+                record.box_type = Some(SESSION_BOX_TYPE.to_string());
+                record.parent = None;
+            }
             if record.id.is_nil() {
                 record.id = SessionId::mint();
             }
@@ -579,9 +585,9 @@ impl DiskLoader {
                 short = %short,
                 box_id = %record.id,
                 stored_id = %stored_id,
-                box_type = SESSION_BOX_TYPE,
-                "migrated a box record without box_type or parent: \
-                 box_type = session, no parent",
+                box_type = record.box_type.as_deref().unwrap_or(SESSION_BOX_TYPE),
+                parent = ?record.parent,
+                "migrated a box record without box_type or parent",
             );
         }
     }
@@ -2072,6 +2078,40 @@ mod tests {
             "a later start leaves every migrated record unchanged"
         );
         assert_eq!(again.find_by_name("idless").unwrap(), Some(key));
+    }
+
+    // BOX-003: a record that has a `box_type` but no `parent` key keeps its
+    // type. The migration only adds `parent: null`.
+    #[test]
+    fn heal_migrate_keeps_box_type_of_record_without_parent_key() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut typed = sample_record();
+        typed.id = SessionId::from(uuid::Uuid::from_u128(0x7a5c_0001));
+        typed.name = Some("typed".to_string());
+        typed.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        let mut raw = serde_json_lenient::to_value(&typed).unwrap();
+        raw.as_object_mut().unwrap().remove("parent");
+        assert_eq!(raw["box_type"], "task");
+        write_raw_record(&root, "7a5c1", &raw);
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&typed.id)
+            .unwrap()
+            .expect("typed is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(migrated.box_type.as_deref(), Some(crate::TASK_BOX_TYPE));
+        assert_eq!(migrated.parent, None);
+
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "7a5c1").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "task");
+        assert!(written.as_object().unwrap().contains_key("parent"));
+        assert!(written["parent"].is_null());
     }
 
     #[test]
