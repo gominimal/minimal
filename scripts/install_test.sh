@@ -2606,10 +2606,18 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
+    [ -n "${NFT_LEAF_SET:-}" ] || exit 1
+    cat "$NFT_LEAF_SET"
+    exit 0
+fi
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
-    chmod +x "$hcbin/nft"
+    # The helper runs this nft as root, so the install checks that only its
+    # owner can write it and its directory. The modes are set here, not left
+    # to the umask.
+    chmod 0755 "$hcbin" "$hcbin/nft"
 
     # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
     run_hc() {
@@ -2617,12 +2625,13 @@ STUB
         OUT="$root/hc.$label"
         set +e
         env -i \
-            PATH="$hcbin:/usr/bin:/bin" \
+            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
+            NFT_LEAF_SET="${NFT_LEAF_SET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
             MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
@@ -3000,6 +3009,60 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         test -d "$tree/classifier-table"
     want_ok "the next good re-install restores the mask record beside it" \
         test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- The helper runs nft as root for the delegated account, so the
+    # install refuses an nft that another account can write, or one in a
+    # directory another account can write. It refuses before the load.
+    for _open in dir file; do
+        _nftdir="$root/hcnft-$_open"
+        mkdir -p "$_nftdir"
+        cp "$hcbin/nft" "$_nftdir/nft"
+        if [ "$_open" = dir ]; then
+            chmod 0777 "$_nftdir"; chmod 0755 "$_nftdir/nft"; _named="$_nftdir"
+        else
+            chmod 0755 "$_nftdir"; chmod 0777 "$_nftdir/nft"; _named="$_nftdir/nft"
+        fi
+        : >"$nft_input"
+        HC_PATH_PREFIX="$_nftdir"
+        HC_HELPER="$root/hcnftlib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        run_hc "open_nft_$_open" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        unset HC_PATH_PREFIX HC_HELPER HC_SUDOERS
+        check 1 "$rc" "an install whose nft $_open others can write exits 1"
+        want_ok "the refusal names the writable nft $_open and the fix" \
+            grep -q "cannot install the QUIC block helper at $root/hcnftlib/quic443-leaf: $_named can be written by accounts other than its owner (mode 777)" "$OUT"
+        want_err "no helper runs an nft $_open others can write" \
+            test -e "$root/hcnftlib/quic443-leaf"
+        want_ok "a refused nft $_open loads no table" [ ! -s "$nft_input" ]
+        rm -rf "$_nftdir"
+    done
+
+    # --- A re-install while the daemon runs keeps the leaves in the
+    # blocked-leaves set: the set is declared with them in the same
+    # transaction that replaces the table. A leaf whose directory is gone,
+    # and a path outside the allow subtree, are not carried over.
+    mkdir -p "$tree/boxes/allow/grant"
+    nft_leaf_set="$root/nft-leaf-set.json"
+    printf '%s' '{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "name": "quic443_blocked_leaves", "table": "minimal_class", "type": "cgroupsv2", "handle": 4, "elem": ["minimald.slice/boxes/allow/grant", "minimald.slice/boxes/allow/gone", "minimald.slice/boxes/deny"]}}]}' \
+        >"$nft_leaf_set"
+    : >"$nft_input"
+    NFT_LEAF_SET="$nft_leaf_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc reload_kept "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset NFT_LEAF_SET HC_HELPER HC_SUDOERS
+    check 0 "$rc" "a re-install with a leaf in the blocked-leaves set exits 0"
+    want_ok "the re-install declares the set with the leaf still in it" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 2 && $0 == "        elements = { \"minimald.slice/boxes/allow/grant\" }" {ok = 1}
+             END {exit !ok}' "$nft_input"
+    want_ok "the leaf is kept in the same transaction that deletes the table" \
+        [ "$(grep -c '^delete table inet minimal_class$' "$nft_input")" -eq 1 ]
+    want_ok "the re-install names the leaf it kept" \
+        grep -q "kept the box leaves that are refused UDP to port 443: minimald.slice/boxes/allow/grant$" "$OUT"
+    rmdir "$tree/boxes/allow/grant"
 
     # --- The ct-mark bits are a shared namespace: a component already
     # classing with one of them would be silently overwritten by the

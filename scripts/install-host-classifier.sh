@@ -641,11 +641,11 @@ box_leaf_level() {
 # It refuses every other path, so the account that may run it as root can
 # put no other cgroup in the set and run nothing else. The tree's paths and
 # the nft binary are written in at install: under sudo nothing in the
-# caller's environment reaches them.
+# caller's environment reaches them. The nft path is $quic443_nft, which
+# resolve_quic443_nft resolved and checked before the install began.
 render_quic443_helper() {
     local allow_root="$tree_root/$BOXES_DIR/$ALLOW_DIR"
-    local nft_bin
-    nft_bin="$(command -v nft)"
+    local nft_bin="$quic443_nft"
     cat <<'HEAD'
 #!/bin/bash
 # Written by install-host-classifier.sh. Adds a box's own leaf to the set of
@@ -703,31 +703,56 @@ stat_mode() {
 # the running account as its owner, because its scratch tree sits under a
 # temporary directory that is not root-owned.
 assert_root_only_dir() {
-    local dir owner_ok mode uid
+    local dir
     dir="$(cd -P "$1" 2>/dev/null && pwd -P)" || {
         printf '%s is not a directory that can be read' "$1"
         return 1
     }
-    owner_ok=0
-    [ "$rehearsal" = 1 ] && owner_ok="$(id -u)"
     while :; do
-        if ! uid="$(stat_uid_gid "$dir")" || ! mode="$(stat_mode "$dir")"; then
-            printf 'cannot read the owner and mode of %s' "$dir"
-            return 1
-        fi
-        uid=${uid%% *}
-        if [ "$uid" != 0 ] && [ "$uid" != "$owner_ok" ]; then
-            printf '%s is owned by uid %s, not root. Make root its owner, then run this installer again.' "$dir" "$uid"
-            return 1
-        fi
-        if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
-            printf '%s can be written by accounts other than its owner (mode %s). Remove group and other write, e.g.: chmod go-w %s' "$dir" "$mode" "$dir"
-            return 1
-        fi
+        assert_root_only_entry "$dir" || return 1
         [ "$rehearsal" = 1 ] && return 0
         [ "$dir" = / ] && return 0
         dir="$(dirname "$dir")"
     done
+}
+
+# assert_root_only_entry <path> — succeeds when <path> itself is owned by
+# root and is not group or other writable. Otherwise it prints why and
+# returns 1. A rehearsal also accepts the running account as the owner.
+assert_root_only_entry() {
+    local owner_ok mode uid
+    owner_ok=0
+    [ "$rehearsal" = 1 ] && owner_ok="$(id -u)"
+    if ! uid="$(stat_uid_gid "$1")" || ! mode="$(stat_mode "$1")"; then
+        printf 'cannot read the owner and mode of %s' "$1"
+        return 1
+    fi
+    uid=${uid%% *}
+    if [ "$uid" != 0 ] && [ "$uid" != "$owner_ok" ]; then
+        printf '%s is owned by uid %s, not root. Make root its owner, then run this installer again.' "$1" "$uid"
+        return 1
+    fi
+    if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+        printf '%s can be written by accounts other than its owner (mode %s). Remove group and other write, e.g.: chmod go-w %s' "$1" "$mode" "$1"
+        return 1
+    fi
+}
+
+# resolve_quic443_nft — sets quic443_nft to the nft binary the helper runs
+# as root, with every symlink resolved. It refuses the binary unless the
+# file and each directory above it are root-only, because an account that
+# can replace that file gets root through the helper.
+resolve_quic443_nft() {
+    local found
+    found="$(command -v nft)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: nft is not on PATH"
+    quic443_nft="$(readlink -f "$found" 2>/dev/null)" && [ -f "$quic443_nft" ] ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: cannot resolve $found to a file"
+    local why
+    why="$(assert_root_only_entry "$quic443_nft")" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    why="$(assert_root_only_dir "$(dirname "$quic443_nft")")" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
 }
 
 # install_quic443_helper — writes the helper root-owned, mode 0755, and the
@@ -840,8 +865,12 @@ install_quic443_helper() {
 # same reject for a socket created in a box leaf that is in the
 # $QUIC443_LEAF_SET set: a socket keeps the cgroup it was created in, so a
 # socket a member opened before the cohort turned blocked is matched on
-# its own leaf. The set starts empty, and only the root-owned helper the
-# install adds changes it, one leaf under the allow subtree at a time.
+# its own leaf. Only the root-owned helper the install adds changes the
+# set, one leaf under the allow subtree at a time. A first install declares
+# it empty. A re-install declares it with the leaves in
+# $quic443_kept_leaves, which kept_quic443_leaves read from the loaded
+# table, so the delete and the re-declare in one transaction never take a
+# blocked leaf out of the set, even for an instant.
 #
 # The classify chain is where a flow is classed, at the mangle priority —
 # ahead of the dstnat and filter chains, and the last place the kernel
@@ -865,6 +894,13 @@ install_quic443_helper() {
 # nothing is translated, and the chain stands so an association can add
 # the reserved addresses to the same two marks without a reinstall.
 render_ruleset() {
+    leaf_elements=
+    if [ -n "${quic443_kept_leaves:-}" ]; then
+        leaf_elements="$(printf '%s\n' "$quic443_kept_leaves" |
+            awk 'NF { printf "%s\"%s\"", (n++ ? ", " : ""), $0 }')"
+        leaf_elements="
+        elements = { $leaf_elements }"
+    fi
     carve_out_rule=
     dstnat_chain=
     snat_rules=
@@ -886,7 +922,7 @@ delete table inet $TABLE_NAME
 
 table inet $TABLE_NAME {
     set $QUIC443_LEAF_SET {
-        typeof socket cgroupv2 level $(box_leaf_level)
+        typeof socket cgroupv2 level $(box_leaf_level)$leaf_elements
     }
     chain output {
         type filter hook output priority filter; policy accept;
@@ -909,6 +945,32 @@ table inet $TABLE_NAME {
     }
 }
 RULES
+}
+
+# kept_quic443_leaves — the box leaves in the loaded table's
+# $QUIC443_LEAF_SET set, one per line, read with `nft -j list set`. It keeps
+# only a leaf the helper can add: one directory directly under the allow
+# subtree, with a plain name. A leaf whose directory is gone is dropped,
+# because nft refuses a cgroup path that does not exist. No table, or no
+# set, prints nothing.
+kept_quic443_leaves() {
+    local listing elems elem name
+    listing="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" </dev/null 2>/dev/null)" ||
+        return 0
+    elems="$(printf '%s' "$listing" | tr -d '\n' | grep -o '"elem": *\[[^]]*\]' || true)"
+    elems=${elems#*\[}
+    printf '%s' "$elems" | { grep -o '"[^"]*"' || true; } | while IFS= read -r elem; do
+        elem=${elem#\"}
+        elem=${elem%\"}
+        name=${elem#"$allow_path/"}
+        [ "$name" != "$elem" ] || continue
+        case "$name" in
+            ''|.|..|-*|*/*|*[!A-Za-z0-9._-]*) continue ;;
+        esac
+        [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ] &&
+            [ ! -L "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ] || continue
+        printf '%s\n' "$elem"
+    done
 }
 
 # require_identities — the cohort's and the node plane's source identities
@@ -1149,6 +1211,12 @@ require_identities
 require_mask
 command -v nft >/dev/null 2>&1 ||
     die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
+# The helper runs nft as root, so the nft it will run is checked here,
+# before anything is laid out or loaded: a refused binary changes nothing.
+quic443_nft=
+if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+    resolve_quic443_nft
+fi
 # The bits this install classifies with are nobody else's: whatever ruleset
 # the host carries is scanned for a ct-mark user of them, ours excepted,
 # and a conflict is refused, named, with the override — never installed
@@ -1232,10 +1300,17 @@ done
 # wrote: `read -d ''` with an empty delimiter reads without a terminator, so
 # every trailing newline survives (a command substitution would strip them and
 # the digest below would then cover different bytes than nft received).
+# The leaves a running daemon put in the blocked-leaves set are read just
+# before the render, and the render declares the set with them, so a
+# re-install does not let a blocked box send UDP to port 443 again.
+quic443_kept_leaves="$(kept_quic443_leaves)"
 IFS= read -r -d '' ruleset < <(render_ruleset) || true
 ruleset_sha256="$(sha256_of "$ruleset")"
 printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
 note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
+if [ -n "$quic443_kept_leaves" ]; then
+    note "kept the box leaves that are refused UDP to port 443: $(printf '%s' "$quic443_kept_leaves" | tr '\n' ' ')"
+fi
 # The helper and its sudoers rule go in only after the load succeeded, so a
 # load that fails writes neither and leaves a pair from an earlier install as
 # it was. They still go in before the marker, so a host whose helper cannot
