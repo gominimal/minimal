@@ -72,6 +72,9 @@ rand_core = { workspace = true, optional = true }
 
 args.workspace = true
 async-dialog.workspace = true
+# The GitHub module: the git credential helper reads `bep::module::GITHUB`,
+# and its host set is the names a `dns` or `both` box's DNS gate steers to
+# the Box Egress Proxy (BEP-062).
 bep = { path = "../bep" }
 check.workspace = true
 common.workspace = true

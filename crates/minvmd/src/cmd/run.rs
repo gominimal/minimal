@@ -690,6 +690,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // from the host side — the same host-side argument the answerer's read
     // already makes.
     let proxy_publish = crate::control::ProxyPublishStatus::new();
+    // Whether the Box Egress Proxy listens (BEP-062): the cell the guest
+    // report door answers the in-VM daemon's proxy-listening read from.
+    // Empty until the proxy below starts, so a boot without one answers
+    // `false` and the guest's DNS gate fails steered names closed.
+    let bep_listening = crate::control::BepListening::new();
 
     // The host-side door to the box table (T66): the control socket the
     // activating client registers an own-address box on, reads its
@@ -709,6 +714,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         &boxes,
         &answerer_status,
         &proxy_publish,
+        &bep_listening,
     )?;
 
     // The guest telemetry door (TEL-034): bound only with telemetry on,
@@ -894,26 +900,28 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // value (spec NET-132), named here so the two cannot drift.
             let wire = switch::bep_host::BepWire::new(proxy_sock, token)
                 .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+            // The stand-in binds before it returns, so it listens for the
+            // boot's life. The proxy listens only once its watcher sees its
+            // socket, and stops with its exit.
+            let proxy_listening = if _bep_stub.is_some() {
+                Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    true,
+                )))
+            } else {
+                _bep_proxy.as_ref().map(BepProxy::listening)
+            };
+            // The guest door answers the in-VM daemon's proxy-listening
+            // read from the same flag the delivery wiring reads (BEP-062).
+            if let Some(listening) = &proxy_listening {
+                bep_listening.attach(std::sync::Arc::clone(listening));
+            }
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
                 wire,
-                bep_box_source(
-                    // The stand-in binds before it returns, so it listens
-                    // for the boot's life. The proxy listens only once its
-                    // watcher sees its socket, and stops with its exit.
-                    if _bep_stub.is_some() {
-                        Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                            true,
-                        )))
-                    } else {
-                        _bep_proxy.as_ref().map(BepProxy::listening)
-                    },
-                    boxes.table(),
-                    proxy_attachments.clone(),
-                ),
+                bep_box_source(proxy_listening, boxes.table(), proxy_attachments.clone()),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -2808,6 +2816,7 @@ fn bind_box_doors(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
+    bep_listening: &crate::control::BepListening,
 ) -> Result<(
     std::thread::JoinHandle<()>,
     (&'static str, std::path::PathBuf),
@@ -2826,17 +2835,21 @@ fn bind_box_doors(
             control_sock_path.display()
         )
     })?;
-    let guest_report_door =
-        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish).with_context(
-            || {
-                format!(
-                    "binding the guest report door at {}",
-                    control_sock_path
-                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
-                        .display()
-                )
-            },
-        )?;
+    let guest_report_door = guest_report_door_env(
+        control_sock_path,
+        boxes,
+        answerer,
+        proxy_publish,
+        bep_listening,
+    )
+    .with_context(|| {
+        format!(
+            "binding the guest report door at {}",
+            control_sock_path
+                .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                .display()
+        )
+    })?;
     Ok((control, guest_report_door))
 }
 
@@ -2860,12 +2873,14 @@ fn guest_report_door_env(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
+    bep_listening: &crate::control::BepListening,
 ) -> std::io::Result<(&'static str, std::path::PathBuf)> {
-    let door = crate::control::spawn_guest_reports_door(
+    let door = crate::control::spawn_guest_reports_door_with_proxy(
         control_sock_path,
         boxes.clone(),
         answerer.clone(),
         proxy_publish.clone(),
+        bep_listening.clone(),
     )?;
     Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
 }
@@ -4415,9 +4430,14 @@ mod tests {
         let proxy_publish = crate::control::ProxyPublishStatus::new();
 
         // The bound half: the pair names the door's path under its env.
-        let (name, door) =
-            super::guest_report_door_env(&control_sock, &boxes, &answerer, &proxy_publish)
-                .expect("the guest report door binds beside the control socket");
+        let (name, door) = super::guest_report_door_env(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect("the guest report door binds beside the control socket");
         assert_eq!(
             name,
             crate::control::GUEST_REPORT_SOCK_ENV,
@@ -4446,7 +4466,14 @@ mod tests {
         )
         .expect("seeding the blocking file");
         assert!(
-            super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish).is_err(),
+            super::guest_report_door_env(
+                &blocked_sock,
+                &boxes,
+                &answerer,
+                &proxy_publish,
+                &Default::default()
+            )
+            .is_err(),
             "a guest-door path held by a non-socket file refuses the bind, and \
              the env the child would register it from"
         );
@@ -4466,8 +4493,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
         std::fs::write(&control_sock, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-            .expect_err("a control socket path held by a non-socket file fails the startup");
+        let error = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect_err("a control socket path held by a non-socket file fails the startup");
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!(
@@ -4481,8 +4514,14 @@ mod tests {
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
         let door = control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE);
         std::fs::write(&door, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-            .expect_err("a guest door path held by a non-socket file fails the startup");
+        let error = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect_err("a guest door path held by a non-socket file fails the startup");
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!(
@@ -4494,9 +4533,14 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        let (_control, (name, door)) =
-            super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-                .expect("both doors bind on a clear path");
+        let (_control, (name, door)) = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect("both doors bind on a clear path");
         assert_eq!(name, crate::control::GUEST_REPORT_SOCK_ENV);
         assert!(
             std::os::unix::net::UnixStream::connect(&control_sock).is_ok()
