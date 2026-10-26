@@ -398,6 +398,118 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
     }
 }
 
+/// `libdetbuild.so` (gominimal/pkgs#884) is the `LD_PRELOAD` shim that makes
+/// a build's entropy a fixed-seed stream and pins `uname`. Anything that
+/// captures the preload into what it ships (a libtool wrapper, `config.status`,
+/// a `.pc` or cmake file, a script that re-execs with the build's environment)
+/// carries it to users, whose processes would then draw guessable keys. So no
+/// output may mention it, by the byte string `libdetbuild`. The `detbuild`
+/// package, which ships the library itself, is the one exemption (#2489).
+pub(crate) struct OutputsFreeOfDetbuild;
+
+/// The name this check reports under, and the one `skip_checkers` takes.
+const NO_DETBUILD_CHECK: &str = "no libdetbuild in outputs";
+/// What no output may contain.
+const DETBUILD_NEEDLE: &[u8] = b"libdetbuild";
+/// The package that legitimately ships the library.
+const DETBUILD_PACKAGE: &str = "detbuild";
+
+impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
+    async fn check(
+        self,
+        ctx: &CheckCtx,
+        pkg: String,
+        _package_dir: &Path,
+        graph: RwLockReadGuard<'_, Graph>,
+        _ot: Option<OpTracker>,
+    ) -> Result<CheckResult, Error> {
+        let check_cache = ctx.check_cache.clone();
+        let cache = ctx.cache.clone();
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: NO_DETBUILD_CHECK.into(),
+            err: vec![],
+        };
+        if ctx.skip_checkers.contains(&NO_DETBUILD_CHECK.to_string()) {
+            return Ok(result);
+        }
+        let bsr = match graph.by_name(&pkg) {
+            Some(b) => *b,
+            None => return Ok(result), // skip: nothing to check against
+        };
+        let graph = std::ops::Deref::deref(&graph).clone();
+        let cancel = ctx.cancel.clone();
+        let span = tracing::Span::current();
+
+        // The closure's error is a `String`: `Error` is not `Send`, and a
+        // blocking task's result must be, as `MissingRuntimeDeps` does it.
+        tokio::task::spawn_blocking(move || {
+            let _enter = span.enter();
+            (move || -> Result<CheckResult, Error> {
+            crate::bail_if_cancelled(&cancel)?;
+            let build = graph.get(&bsr).unwrap();
+            let Ok(cached_build) = cache.read_dir(&graph.spec_hash(&bsr)) else {
+                return Ok(result); // skip: we need the cached build
+            };
+            result.verdict = CheckVerdict::Pass;
+            if build.name == DETBUILD_PACKAGE {
+                return Ok(result);
+            }
+            for output in build.outputs.values() {
+                for path in check_cache
+                    .match_files_for_glob(cached_build.path(), output.glob())?
+                    .iter()
+                {
+                    crate::bail_if_cancelled(&cancel)?;
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let found = file_contains(path, DETBUILD_NEEDLE)
+                        .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
+                    if found {
+                        result.verdict = CheckVerdict::Fail;
+                        result.err.push(format!(
+                            "{}: contains `libdetbuild`: the build's LD_PRELOAD shim leaked into what ships; \
+                             nothing in an output may name it (gominimal/minimal#2489)",
+                            path.strip_prefix(cached_build.path())
+                                .unwrap_or(path)
+                                .display()
+                        ));
+                    }
+                }
+            }
+            Ok(result)
+            })().map_err(|e| format!("{e}"))
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow!(e)))?
+        .map_err(|e| Error::Other(anyhow!(e)))
+    }
+}
+
+/// Whether `path` contains `needle`, read in 64 KiB chunks with an overlap of
+/// `needle.len() - 1` bytes carried between them, so a match that straddles a
+/// chunk boundary is seen; outputs can be large and are not read whole.
+fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let keep = needle.len().saturating_sub(1);
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut window: Vec<u8> = Vec::with_capacity(keep + chunk.len());
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        window.extend_from_slice(&chunk[..n]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        let start = window.len().saturating_sub(keep);
+        window.drain(..start);
+    }
+}
+
 fn find_lib_in_deps(
     check_cache: &CheckCache,
     lib: &str,
@@ -557,6 +669,192 @@ mod tests {
     /// wrapped for the checker. The package declares no runtime deps, so its
     /// transitive runtime-dep set is empty.
     ///
+    /// Stage one finalized build with one file in its `bin/` output.
+    async fn staged_build_with_file(
+        ctx: &CheckCtx,
+        graph: &Arc<RwLock<Graph>>,
+        pkg: &str,
+        file: &str,
+        contents: &[u8],
+    ) {
+        let spec_hash = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name(pkg).expect("pkg in graph"))
+        };
+        let pending = ctx.cache.write_dir(&spec_hash).expect("write cache dir");
+        std::fs::create_dir_all(pending.path().join("bin")).expect("bin dir");
+        std::fs::write(pending.path().join(file), contents).expect("write output file");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec(pkg.to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+    }
+
+    fn pkg_with_bin_output(name: &str) -> Arc<RwLock<Graph>> {
+        graph_with_pkg(&format!(
+            r#"
+            let {{BuildSpec, OutputData, ..}} = import "minimal.ncl" in
+            {{
+                name = "{name}",
+                build_deps = [],
+                cmd = "",
+                outputs = {{ bin = {{glob = "bin/*"}} | OutputData }},
+            }} | BuildSpec
+            "#
+        ))
+    }
+
+    /// #2489: an output that names `libdetbuild` (here a libtool-style wrapper
+    /// that recorded the build's `LD_PRELOAD`) fails the check, and the error
+    /// names the file.
+    #[tokio::test]
+    async fn no_detbuild_fails_when_an_output_names_it() {
+        let tmpdir = make_tmp_dir("detbuild_leak");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("wrapped");
+        staged_build_with_file(
+            &ctx,
+            &graph,
+            "wrapped",
+            "bin/wrapped",
+            b"#!/bin/sh
+LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
+",
+        )
+        .await;
+
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "wrapped".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Fail),
+            "a leaked preload must fail, got {:?}",
+            result.verdict
+        );
+        assert_eq!(result.err.len(), 1, "one file, one error: {:?}", result.err);
+        assert!(
+            result.err[0].starts_with("bin/wrapped:"),
+            "{:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// An output with no mention of the shim passes with no errors, including
+    /// a file larger than one read chunk whose only near-miss straddles the
+    /// chunk boundary.
+    #[tokio::test]
+    async fn no_detbuild_passes_a_clean_output() {
+        let tmpdir = make_tmp_dir("detbuild_clean");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("clean");
+        let mut big = vec![b'x'; (1 << 16) - 5];
+        big.extend_from_slice(b"libdet-build"); // not the needle, across the boundary
+        big.extend(std::iter::repeat_n(b'y', 1000));
+        staged_build_with_file(&ctx, &graph, "clean", "bin/clean", &big).await;
+
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "clean".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "got {:?} {:?}",
+            result.verdict,
+            result.err
+        );
+        assert!(result.err.is_empty());
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// The needle straddling a chunk boundary is still found.
+    #[tokio::test]
+    async fn no_detbuild_sees_a_match_across_a_chunk_boundary() {
+        let tmpdir = make_tmp_dir("detbuild_boundary");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("split");
+        let mut big = vec![b'x'; (1 << 16) - 4];
+        big.extend_from_slice(b"libdetbuild.so");
+        staged_build_with_file(&ctx, &graph, "split", "bin/split", &big).await;
+
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "split".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Fail),
+            "got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// The `detbuild` package ships the library itself and is exempt.
+    #[tokio::test]
+    async fn no_detbuild_exempts_the_detbuild_package() {
+        let tmpdir = make_tmp_dir("detbuild_self");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("detbuild");
+        staged_build_with_file(
+            &ctx,
+            &graph,
+            "detbuild",
+            "bin/libdetbuild.so",
+            b"libdetbuild",
+        )
+        .await;
+
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "detbuild".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// Named in `skip_checkers`, or with no cached build, the check skips.
+    #[tokio::test]
+    async fn no_detbuild_skips_when_asked_or_uncached() {
+        let tmpdir = make_tmp_dir("detbuild_skip");
+        let ctx = make_ctx(&tmpdir, vec![NO_DETBUILD_CHECK.to_string()]);
+        let graph = pkg_with_bin_output("anything");
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "anything".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(matches!(result.verdict, CheckVerdict::Skip));
+
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "anything".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "uncached: {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
     /// `Layer::new_for_test` resolves `import "minimal.ncl"` relative to
     /// `CARGO_MANIFEST_DIR/minimal-ncl`, a directory the `check` crate does not
     /// ship. We point the variable at the `stdlib` crate (which owns the
