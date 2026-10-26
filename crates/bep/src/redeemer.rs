@@ -104,13 +104,12 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// `boxes`, and resolves sign-in references from `keychain`. The clock
     /// is the system clock.
     ///
-    /// Interim: the redeemer starts with no revocation in force, and in
-    /// `bep serve` nothing writes one. T20
-    /// (<https://github.com/gominimal/minimal/issues/2277>) records
-    /// revocations over the control socket. T33
+    /// A `revoke_box` request on the control socket puts a revocation in
+    /// force ([`crate::revoke::record`]). Interim: the redeemer starts with
+    /// no revocation in force. T33
     /// (<https://github.com/gominimal/minimal/issues/2290>) restores them
     /// from every retained audit segment at start, the BEP-068
-    /// restore-on-start sub-requirement. Those two are the flip.
+    /// restore-on-start sub-requirement. That is the one interim left.
     #[must_use]
     pub fn new(
         key: K,
@@ -220,8 +219,10 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
 
     /// Gathers the facts [`redeem::decide`] reads for one request.
     ///
-    /// The revoked set is what [`Self::with_revocations`] gave, which is
-    /// empty in `bep serve` until T20 (#2277) and T33 (#2290) land. The
+    /// The revoked set is the revocations in force that cover the box id
+    /// the value names ([`crate::revoke::in_force_for`]). A `revoke_box` request on the
+    /// control socket puts one in force. The set is empty at start until
+    /// T33 (#2290) restores it from the audit log. The
     /// store rules are empty until T25
     /// (<https://github.com/gominimal/minimal/issues/2280>) reads
     /// `[secret-store-rules]`, so this redeemer never admits a
@@ -298,11 +299,22 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 None,
             ),
         };
-        let revoked = self
-            .revocations
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let revoked = {
+            let set = self
+                .revocations
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            // The value's own box id, which differs from the source's for a
+            // cohort member. A value that did not open names no box, and
+            // `decide` refuses it before it reads this set.
+            match &unsealed {
+                Unsealed::Opened { box_id: named, .. } => crate::revoke::in_force_for(&set, named)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                _ => Vec::new(),
+            }
+        };
         Facts {
             redemption: Redemption {
                 unsealed,

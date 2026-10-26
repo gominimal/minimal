@@ -290,7 +290,8 @@ fn accept_loop(listener: UnixListener, vm: &str, forward: &SyncSender<(Signal, V
         match stream {
             Ok(stream) => {
                 if crate::control::peer_uid(&stream)
-                    .and_then(crate::control::check_peer_uid)
+                    // The VMM child dials as `minimal-vmm` (BEP-047).
+                    .and_then(crate::control::check_guest_peer_uid)
                     .is_err()
                 {
                     continue;

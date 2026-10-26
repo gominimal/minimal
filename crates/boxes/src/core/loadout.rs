@@ -700,10 +700,18 @@ mod tests {
     #[test]
     fn default_loadout_is_empty() {
         let l = Loadout::new(LoadoutName::try_new("Test").unwrap());
-        assert!(l.packages().is_empty());
+        assert!(
+            l.packages().is_empty(),
+            "expected empty, got {:?}",
+            l.packages()
+        );
         assert_eq!(l.all_vars().count(), 0);
         assert!(l.patches().is_empty());
-        assert!(l.lifecycle_hooks().is_empty());
+        assert!(
+            l.lifecycle_hooks().is_empty(),
+            "expected empty, got {:?}",
+            l.lifecycle_hooks()
+        );
     }
 
     #[test]
