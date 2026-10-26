@@ -12665,10 +12665,9 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
 #   3. a UDP datagram to port 443 must be rejected at once: the switch
 #      answers ICMP port unreachable, so socat reads "Connection refused"
 #      well inside its 5 s wait (BEP-018).
-# Legs 2 and 3 are hard assertions. Leg 1 is a KNOWN GAP while
-# https://github.com/gominimal/minimal/issues/2523 is open: no production
-# code wires the steering into the relay's DNS gate yet, so the lookup is
-# forwarded. When that issue lands, change its known_gap to a fail.
+# All three legs are hard assertions. The relay's DNS gate asks minvmd over
+# the guest report door whether the proxy listens, so leg 1 holds on every
+# host (Networking §5.3).
 # Admission refuses `dns` steering for a box with a broker secret on every
 # host today (no box-zone resolver, BEP-017), so the lane comes from
 # --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
@@ -12793,12 +12792,12 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   # Leg 1: the steered A lookup fails closed.
   ds_ans="$(ds_dns api.github.com 1)"
   echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
-  ds_a_gap=""
   if [ "${ds_ans%% *}" = 2 ]; then
     echo "steered A lookup: SERVFAIL while the proxy is down"
   else
-    ds_a_gap=1
-    known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
+    echo "::error::the A lookup of the steered name api.github.com was not answered SERVFAIL while the Box Egress Proxy is down: got '${ds_ans:-no reply}'"
+    cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+    ds_fail
   fi
 
   # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
@@ -12843,13 +12842,7 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   rm -f "${WORK:?}/${ds_case:?}".*
 
   ds_cleanup
-  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
-  # the known gap, the steered A lookup did not fail closed.
-  if [ -n "$ds_a_gap" ]; then
-    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
-  else
-    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
-  fi
+  echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
   echo "::endgroup::"
 }
 

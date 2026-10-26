@@ -1309,6 +1309,14 @@ pub enum BoxControlRequest {
     /// ([`RowStandingRequest`]): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::RowStanding`].
     RowStanding(RowStandingRequest),
+    /// The in-VM daemon's read of whether the Box Egress Proxy's listener is
+    /// live on the host (BEP-062): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::ProxyListening`]. A read,
+    /// never a report: the proxy runs on the host, outside the VM, so the
+    /// guest can only ask. The DNS gate of a `dns` or `both` box answers a
+    /// steered name with the proxy's address only while the answer is
+    /// `true`, and SERVFAIL otherwise.
+    ProxyListening,
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1676,6 +1684,14 @@ pub enum BoxControlReply {
         switch_address: std::net::Ipv4Addr,
         /// Whether a row stands at it.
         row_standing: bool,
+    },
+    /// The proxy-listening read's answer: whether the Box Egress Proxy's
+    /// listener is live on the host. `false` when the host runs no proxy.
+    /// `listening` is required — the marker that keeps this document from
+    /// decoding as any other reply.
+    ProxyListening {
+        /// Whether the proxy's listener is live.
+        listening: bool,
     },
 }
 
