@@ -185,15 +185,17 @@ fn holds_one_state_with_its_ending(state: &RecordState) -> bool {
         + u8::from(matches!(state, RecordState::Stopped(_)))
         + u8::from(matches!(state, RecordState::Exited(_)));
     let exactly_one = held == 1;
-    let ending = match state.name() {
-        "pending" | "materializing" | "running" => {
+    // Matched on the variant, not on `name()`: a string compare is a byte
+    // loop, and Kani then needs a longer unwind bound.
+    let ending = match state {
+        RecordState::Pending | RecordState::Materializing | RecordState::Running => {
             state.reason().is_none() && state.exit_code().is_none() && state.signal().is_none()
         }
-        "stopped" => {
+        RecordState::Stopped(_) => {
             state.reason() == Some(EndReason::Stopped)
                 && !(state.exit_code().is_some() && state.signal().is_some())
         }
-        "exited" => {
+        RecordState::Exited(_) => {
             state.signal().is_none()
                 && match state.reason() {
                     Some(EndReason::Exit) => state.exit_code().is_some(),
@@ -202,7 +204,6 @@ fn holds_one_state_with_its_ending(state: &RecordState) -> bool {
                     _ => false,
                 }
         }
-        _ => false,
     };
     exactly_one && ending
 }
