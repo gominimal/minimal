@@ -7152,3 +7152,107 @@ fn trust_env_keeps_a_spec_value() {
     assert_eq!(env["REQUESTS_CA_BUNDLE"], BOX_CA_BUNDLE);
     assert_eq!(env["NODE_EXTRA_CA_CERTS"], BOX_ROOT_CERTIFICATE);
 }
+
+/// BEP-018: a blocking member's admit that runs after `injection_leaf`
+/// handed a shim the box's own leaf, but before the shim joined it, finds
+/// no shim to move. The check after the join moves the shim, and the
+/// program it forked, into the blocked leaf, records both, and logs each
+/// move. A process that cannot be moved refuses the injection.
+#[test]
+fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
+    use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
+    use sandbox::config::ClassifierLeaf;
+
+    let tree = tempfile::tempdir().unwrap();
+    let blocked = quic443_blocked_leaf(tree.path());
+    std::fs::create_dir_all(&blocked).unwrap();
+    let own = ClassifierLeaf::new(tree.path().join("plain"));
+    let moves = StandinMoves::default();
+    let cohort = std::sync::Mutex::new(CohortQuic443::default());
+    {
+        let mut guard = cohort.lock().unwrap();
+        guard.learn_blocked_leaf(blocked.clone());
+        guard
+            .admit("plain", Some(own.dir().to_path_buf()), false, &moves)
+            .unwrap();
+    }
+
+    // The command is built while the cohort does not block.
+    let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+    assert_eq!(leaf.as_ref().map(ClassifierLeaf::dir), Some(own.dir()));
+    assert!(!adopt);
+
+    // A blocking member's admit runs before the shim joins: the box's own
+    // leaf is empty, so it moves nothing.
+    cohort
+        .lock()
+        .unwrap()
+        .admit("grant", None, true, &moves)
+        .unwrap();
+
+    // The shim joins the own leaf it was given, and forks its program.
+    let (shim, program) = (4100, 4101);
+    moves.spawn_in(shim, own.dir());
+    moves.fork(shim, program);
+    assert!(wait_for_injection_join(
+        shim,
+        &[own.dir(), blocked.as_path()],
+        &moves,
+        || true,
+        Duration::from_secs(5),
+    ));
+
+    let capture = crate::test_harness::CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let moved = tracing::subscriber::with_default(subscriber, || {
+        settle_injection("plain", shim, adopt, own.dir(), &cohort, &moves)
+    })
+    .expect("the shim and its program move into the blocked leaf");
+    assert_eq!(moved, 2);
+    assert_eq!(moves.where_is(shim), blocked);
+    assert_eq!(moves.where_is(program), blocked);
+    let log = capture.contents();
+    for pid in [shim, program] {
+        assert!(
+            log.lines().any(|l| l.contains("DEBUG")
+                && l.contains("UDP 443 blocked leaf")
+                && l.contains(&format!("pid={pid} "))),
+            "one debug line names {pid}: {log}"
+        );
+    }
+
+    // Both are recorded: they go home when the block lifts.
+    cohort.lock().unwrap().depart("grant", &moves);
+    assert_eq!(moves.where_is(shim), own.dir());
+    assert_eq!(moves.where_is(program), own.dir());
+
+    // An admit in the window again, and a process that cannot move: the
+    // check refuses the injection.
+    cohort
+        .lock()
+        .unwrap()
+        .admit("grant", None, true, &moves)
+        .unwrap();
+    let late = 4200;
+    moves.spawn_in(late, own.dir());
+    moves.refused.lock().unwrap().insert(late);
+    let refused = settle_injection("plain", late, false, own.dir(), &cohort, &moves)
+        .expect_err("a process that cannot move refuses the injection");
+    assert_eq!(refused.pid, late);
+    assert_eq!(moves.where_is(late), own.dir());
+
+    // A shim given the own leaf while the cohort still does not block
+    // stays where it is.
+    cohort.lock().unwrap().depart("grant", &moves);
+    let calm = 4300;
+    moves.spawn_in(calm, own.dir());
+    assert_eq!(
+        settle_injection("plain", calm, false, own.dir(), &cohort, &moves).unwrap(),
+        0
+    );
+    assert_eq!(moves.where_is(calm), own.dir());
+}

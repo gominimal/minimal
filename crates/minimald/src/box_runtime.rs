@@ -290,6 +290,123 @@ pub(crate) fn injection_leaf(
     }
 }
 
+/// How long the daemon waits for an injected shim to join its classifier
+/// leaf before it checks the `host_ip` cohort again anyway (BEP-018).
+#[cfg_attr(test, allow(dead_code))]
+const INJECTION_JOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the daemon looks for an injected shim in its leaf.
+const INJECTION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Waits until the injected shim `pid` is in one of `leaves`, until `alive`
+/// says it is gone, or until `wait` passes. The shim joins its leaf itself,
+/// after it execs, so the daemon learns of the join only from the leaf.
+/// Returns whether the shim is in one of `leaves`.
+pub(crate) fn wait_for_injection_join(
+    pid: i32,
+    leaves: &[&std::path::Path],
+    moves: &dyn crate::net::classifier::CgroupMoves,
+    alive: impl Fn() -> bool,
+    wait: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if leaves
+            .iter()
+            .any(|leaf| moves.procs(leaf).is_ok_and(|pids| pids.contains(&pid)))
+        {
+            return true;
+        }
+        if !alive() || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(INJECTION_JOIN_POLL);
+    }
+}
+
+/// Why the check after an injected shim's join refused the injection
+/// (BEP-018): a process of it could not be moved into the blocked leaf.
+#[derive(Debug)]
+pub(crate) struct InjectionRefused {
+    /// The process that could not be moved.
+    pub(crate) pid: i32,
+    /// The failure.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) error: std::io::Error,
+}
+
+/// The check after the injected shim `pid` joined its leaf (BEP-018). It
+/// runs under the cohort's lock, so no admit runs between it and its moves.
+/// A shim given the blocked leaf (`given_blocked`) is recorded under the
+/// box. A shim given `own`, the box's own leaf, while the cohort did not
+/// block, can find that a blocking member's admit ran before its join. The
+/// admit then found no shim in `own` to move. So while the cohort now
+/// blocks for the box, the shim and everything in `own` move into the
+/// blocked leaf and are recorded. Returns how many processes moved.
+///
+/// # Errors
+///
+/// [`InjectionRefused`] when `own` cannot be read, or a live process cannot
+/// be moved. The caller must stop the shim, so the block never fails open.
+pub(crate) fn settle_injection(
+    box_id: &str,
+    pid: i32,
+    given_blocked: bool,
+    own: &std::path::Path,
+    cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
+    moves: &dyn crate::net::classifier::CgroupMoves,
+) -> Result<usize, InjectionRefused> {
+    let mut cohort = cohort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if given_blocked {
+        cohort.adopt_injected(box_id, pid, moves);
+        return Ok(0);
+    }
+    let Some(blocked) = cohort
+        .injection_leaf(box_id)
+        .map(std::path::Path::to_path_buf)
+    else {
+        return Ok(0);
+    };
+    let mut moved = 0;
+    let mut first = true;
+    // A process that forks while the move runs leaves its child in `own`,
+    // so `own` is read again until it is empty, as an admit's move does.
+    for _ in 0..8 {
+        let mut pids = moves
+            .procs(own)
+            .map_err(|error| InjectionRefused { pid, error })?;
+        if first && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+        first = false;
+        if pids.is_empty() {
+            break;
+        }
+        for each in pids {
+            match moves.migrate(each, &blocked) {
+                Ok(()) => {
+                    tracing::debug!(
+                        box_id,
+                        pid = each,
+                        shim_pid = pid,
+                        leaf = %blocked.display(),
+                        "moved a process injected into a host-address box into the UDP 443 \
+                         blocked leaf; a blocking box joined the cohort before the injection \
+                         joined its leaf"
+                    );
+                    cohort.adopt_injected(box_id, each, moves);
+                    moved += 1;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(InjectionRefused { pid: each, error }),
+            }
+        }
+    }
+    Ok(moved)
+}
+
 /// Arranges for `cmd`'s child to send its pid to `on_pid` once it is
 /// spawned. The child sends it from a `pre_exec` hook, before it execs,
 /// and a thread of its own reads it. A command dropped unspawned, or a
@@ -664,21 +781,55 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             injection
         };
         let mut command = injection.command()?;
-        // BEP-018: the shim in the blocked leaf is recorded under this box,
-        // so it and the program it forks go home when the block lifts.
-        if adopt
+        // BEP-018: once the shim is in its leaf, the cohort is checked again
+        // under its lock. A shim in the blocked leaf is recorded under this
+        // box, so it and the program it forks go home when the block lifts.
+        // A shim in the box's own leaf moves into the blocked leaf when a
+        // blocking member's admit ran between `injection_leaf` and the join.
+        if let Some(own) = self.leaf.as_ref().map(|leaf| leaf.dir().to_path_buf())
             && let Err(error) = report_spawned_pid(&mut command, move |pid| {
-                crate::net::classifier::cohort_quic443()
+                let moves = crate::net::classifier::KernelMoves;
+                let cohort = crate::net::classifier::cohort_quic443();
+                let blocked = cohort
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .adopt_injected(&box_id, pid, &crate::net::classifier::KernelMoves);
+                    .blocked_leaf()
+                    .map(std::path::Path::to_path_buf);
+                let mut leaves = vec![own.as_path()];
+                leaves.extend(blocked.as_deref());
+                let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+                wait_for_injection_join(
+                    pid,
+                    &leaves,
+                    &moves,
+                    || proc_dir.exists(),
+                    INJECTION_JOIN_WAIT,
+                );
+                if let Err(refused) = settle_injection(&box_id, pid, adopt, &own, cohort, &moves) {
+                    tracing::warn!(
+                        box_id,
+                        shim_pid = pid,
+                        pid = refused.pid,
+                        error = %refused.error,
+                        "cannot move a process injected into a host-address box into the \
+                         UDP 443 blocked leaf; the injection is stopped"
+                    );
+                    // SAFETY: kill(2) takes no pointer. The failed move
+                    // found the process alive, and the shim is this daemon's
+                    // child, so neither pid is free for reuse yet.
+                    unsafe {
+                        libc::kill(refused.pid, libc::SIGKILL);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
             })
         {
             tracing::warn!(
                 session_id = %self.session_id,
                 %error,
-                "cannot record a process injected under the host-address cohort's UDP 443 \
-                 block; it stays blocked when the block lifts"
+                "cannot check a process injected under the host-address cohort's UDP 443 \
+                 block after it joins its leaf; it can escape the block or stay blocked \
+                 when the block lifts"
             );
         }
         Ok(command)
