@@ -495,7 +495,7 @@ Store references
   - IF the revoke of the other client keys fails after the keychain keeps the replacement THEN THE SYSTEM SHALL keep the replacement registered and revoke again at the next box creation, from the pending-revoke file beside the control socket that names the replacement's `kid`.
     tier:   T0
     verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke
-    <!-- unwanted; the client writes the file after step one and before step two, so the file exists even when step two fails, and the proxy's record of the revoke removes it; after a failed step two the store still refuses, so the next creation makes a new key and overwrites the file with that key's `kid`; a file that names a key other than the one the store holds is stale, and the next creation removes it; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
+    <!-- unwanted; the client writes the file after step one and before step two, so the file exists even when step two fails, and the client removes it when the revoke succeeds; after a failed step two the store still refuses, so the next creation makes a new key and overwrites the file with that key's `kid`; a file that names a key other than the one the store holds is stale, and the next creation removes it; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
   - THE SYSTEM SHALL hold at most a bounded count of client keys in the registry, 16 by default, and drop the key registered least recently when a registration passes the bound, after a restart included.
     tier:   T0
     verify: cargo nextest run -p bep the_registry_never_holds_more_keys_than_its_bound
