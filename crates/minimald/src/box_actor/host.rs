@@ -7,6 +7,101 @@ pub(super) type LaunchedHost = (
     JoinHandle<Result<i32, std::io::Error>>,
 );
 
+/// The root-owned helper the privileged step installs (BEP-018). It adds
+/// one box leaf under the allow subtree to the table's set of leaves that
+/// are refused UDP to port 443, or removes it, and it refuses every other
+/// path. Spelled the same as `QUIC443_HELPER` in
+/// `scripts/install-host-classifier.sh`, whose sudoers drop-in lets the
+/// daemon's account run it with `sudo -n`.
+pub(super) const QUIC443_LEAF_HELPER: &str = "/usr/local/lib/minimal/quic443-leaf";
+
+/// Runs `helper` through `sudo` with `-n`, so it never waits for a
+/// password, to `verb` (`add` or `remove`) the box leaf `leaf` in the
+/// blocked-leaves set. A refusal or a failure to run is logged with what
+/// the helper said, and returned. A refused add leaves the leaf
+/// unrecorded and fails the launch that needed it, so the block never
+/// fails open. A refused remove keeps the leaf recorded for a retry, and
+/// the box keeps running.
+pub(super) fn run_quic443_leaf_helper(
+    sudo: &std::path::Path,
+    helper: &std::path::Path,
+    verb: &str,
+    leaf: &std::path::Path,
+) -> std::io::Result<()> {
+    let ran = std::process::Command::new(sudo)
+        .arg("-n")
+        .arg(helper)
+        .arg(verb)
+        .arg(leaf)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let error = match ran {
+        Ok(ran) if ran.status.success() => return Ok(()),
+        Ok(ran) => std::io::Error::other(format!(
+            "{} exited with {}: {}",
+            helper.display(),
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr).trim()
+        )),
+        Err(error) => std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot run {} -n {}: {error}",
+                sudo.display(),
+                helper.display()
+            ),
+        ),
+    };
+    tracing::warn!(
+        leaf = %leaf.display(),
+        verb,
+        helper = %helper.display(),
+        %error,
+        "the QUIC block helper refused a change to the set of leaves refused UDP 443; \
+         a refused add fails the launch that needed it, and a refused remove is \
+         tried again at the next change. scripts/install-host-classifier.sh \
+         installs the helper"
+    );
+    Err(error)
+}
+
+/// The cgroup operations of the daemon's launch and stop paths (BEP-018):
+/// the process moves of [`crate::net::classifier::KernelMoves`], and the
+/// blocked-leaves set changed through [`QUIC443_LEAF_HELPER`].
+pub(super) struct HostMoves;
+
+impl crate::net::classifier::CgroupMoves for HostMoves {
+    fn procs(&self, leaf: &std::path::Path) -> std::io::Result<Vec<i32>> {
+        crate::net::classifier::KernelMoves.procs(leaf)
+    }
+
+    fn migrate(&self, pid: i32, to: &std::path::Path) -> std::io::Result<()> {
+        crate::net::classifier::KernelMoves.migrate(pid, to)
+    }
+
+    fn parent(&self, pid: i32) -> Option<i32> {
+        crate::net::classifier::KernelMoves.parent(pid)
+    }
+
+    fn add_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        run_quic443_leaf_helper(
+            std::path::Path::new("sudo"),
+            std::path::Path::new(QUIC443_LEAF_HELPER),
+            "add",
+            leaf,
+        )
+    }
+
+    fn remove_blocked_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        run_quic443_leaf_helper(
+            std::path::Path::new("sudo"),
+            std::path::Path::new(QUIC443_LEAF_HELPER),
+            "remove",
+            leaf,
+        )
+    }
+}
+
 /// The `host_ip` launch's half of the cohort's QUIC stance (BEP-018): the
 /// launched box joins the daemon's cohort with its resolved `quic443`
 /// stance, and its processes move into the cohort's blocked leaf while any
@@ -622,7 +717,7 @@ impl BoxActor {
             &self.record.id().to_string(),
             quic443_launches(),
             crate::net::classifier::cohort_quic443(),
-            &crate::net::classifier::KernelMoves,
+            &HostMoves,
         );
     }
 
@@ -824,13 +919,13 @@ impl BoxActor {
             host_ip_enforcement,
             std::path::Path::new(sandbox::classifier::TREE_ROOT),
             crate::net::classifier::cohort_quic443(),
-            &crate::net::classifier::KernelMoves,
+            &HostMoves,
         ) {
             stop_quic443_launch(
                 &box_id,
                 quic443_launches(),
                 crate::net::classifier::cohort_quic443(),
-                &crate::net::classifier::KernelMoves,
+                &HostMoves,
             );
             let _ = host.kill(false).await;
             return Err(AttachError::SpawnFailed(quic443_placement_refused(&error)));
@@ -845,7 +940,7 @@ impl BoxActor {
                     launch,
                     launches: quic443_launches(),
                     cohort: crate::net::classifier::cohort_quic443(),
-                    moves: &crate::net::classifier::KernelMoves,
+                    moves: &HostMoves,
                 },
             ),
             None => task,
@@ -1323,6 +1418,95 @@ mod quic443_cohort_tests {
             project_root: None,
             attrs: Default::default(),
         }
+    }
+
+    /// BEP-018 over the launch and stop paths: a blocking launch puts the
+    /// own leaf of every host-address member in the blocked-leaves set,
+    /// and its stop takes them all out again.
+    #[test]
+    fn cohort_flip_puts_member_leaves_in_the_blocked_set_over_launch_and_stop() {
+        use boxes::core::bep::Quic443;
+
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        std::fs::create_dir_all(
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::ALLOW_DIR),
+        )
+        .unwrap();
+        std::fs::create_dir(quic443_blocked_leaf(root)).unwrap();
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        let moves = StandinMoves::default();
+        let launch = |record: &Record, pid: i32| {
+            let leaf =
+                sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
+                    .unwrap();
+            moves.spawn_in(pid, &leaf);
+            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
+                .expect("the box is placed");
+            leaf
+        };
+        let plain = host_ip_record(None);
+        let plain_leaf = launch(&plain, 100);
+        assert!(moves.listed.lock().unwrap().is_empty());
+
+        let strict = host_ip_record(Some(Quic443::Block));
+        let strict_leaf = launch(&strict, 200);
+        assert_eq!(
+            *moves.listed.lock().unwrap(),
+            [plain_leaf.clone(), strict_leaf].into_iter().collect(),
+            "the flip lists both members' own leaves"
+        );
+
+        leave_quic443_cohort(&strict.id.to_string(), &cohort, &moves);
+        assert!(
+            moves.listed.lock().unwrap().is_empty(),
+            "the stop of the last blocker lists nothing"
+        );
+        assert_eq!(moves.where_is(100), plain_leaf);
+    }
+
+    /// The set changes run the helper through `sudo -n`, and a refusal
+    /// comes back as an error with what the helper said, so the cohort
+    /// leaves the leaf unrecorded and the box keeps running.
+    #[test]
+    fn cohort_flip_puts_member_leaves_in_the_blocked_set_through_sudo_n() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let record = scratch.path().join("argv");
+        let stub = |name: &str, body: &str| {
+            let path = scratch.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let sudo = stub(
+            "sudo",
+            &format!("printf '%s\\n' \"$@\" >'{}'\nexit 0", record.display()),
+        );
+        let helper = std::path::Path::new(super::QUIC443_LEAF_HELPER);
+        let leaf = std::path::Path::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b1");
+        super::run_quic443_leaf_helper(&sudo, helper, "add", leaf).expect("the helper ran");
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!("-n\n{}\nadd\n{}\n", helper.display(), leaf.display()),
+            "sudo never prompts, and runs the one helper"
+        );
+
+        let refusing = stub(
+            "sudo-refusing",
+            "echo 'error: refused: not a box leaf' >&2\nexit 2",
+        );
+        let error = super::run_quic443_leaf_helper(&refusing, helper, "remove", leaf)
+            .expect_err("a refusal is an error");
+        assert!(
+            error.to_string().contains("refused: not a box leaf"),
+            "{error}"
+        );
+
+        let missing = scratch.path().join("no-sudo");
+        assert!(super::run_quic443_leaf_helper(&missing, helper, "add", leaf).is_err());
     }
 
     /// BEP-018 over the launch and stop paths: a cohort with one blocked
