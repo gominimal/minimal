@@ -1227,8 +1227,8 @@ pub(crate) mod linux {
         pub(crate) helper_root_owned: bool,
         /// [`QUIC443_SUDOERS_PATH`] is a root-owned file. Where this account
         /// cannot look inside its directory (some distributions make
-        /// `/etc/sudoers.d` root-only), sudo says this account may run the
-        /// helper with no password.
+        /// `/etc/sudoers.d` root-only), `sudo -n -l` lists a NOPASSWD rule
+        /// that names the helper.
         pub(crate) sudoers_root_owned: bool,
     }
 
@@ -1304,7 +1304,8 @@ pub(crate) mod linux {
                 // Some distributions make `/etc/sudoers.d` root-only, so this
                 // account cannot stat the drop-in. Ask sudo instead whether
                 // this account may run the helper with no password: the
-                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt.
+                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt,
+                // and only a rule that names the helper counts.
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     helper_root_owned && sudo_lets_this_account_run(QUIC443_HELPER_PATH)
                 }
@@ -1317,16 +1318,32 @@ pub(crate) mod linux {
         ]
     }
 
-    /// Whether `sudo -n -l <path>` exits zero: this account may run `path`
-    /// through sudo with no password. False when sudo is absent or asks.
+    /// Whether this account's sudo rules, listed by `sudo -n -l`, let it run
+    /// `path` with no password. A broad rule such as `NOPASSWD: ALL` does
+    /// not count: it says nothing of the drop-in. False when sudo is absent
+    /// or asks.
     fn sudo_lets_this_account_run(path: &str) -> bool {
         std::process::Command::new("sudo")
-            .args(["-n", "-l", path])
+            .args(["-n", "-l"])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && sudo_listing_names_nopasswd(&String::from_utf8_lossy(&out.stdout), path)
+            })
+    }
+
+    /// Whether a `sudo -l` listing has a NOPASSWD rule whose commands name
+    /// `path` itself, as the drop-in's rule does.
+    pub(crate) fn sudo_listing_names_nopasswd(listing: &str, path: &str) -> bool {
+        listing.lines().any(|line| {
+            line.split_once("NOPASSWD:").is_some_and(|(_, commands)| {
+                commands
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .any(|token| token == path)
+            })
+        })
     }
 
     /// [`classifier_item_over`]'s inputs from this host's reads: the table's
@@ -2649,6 +2666,7 @@ mod tests {
         use linux::{
             Cgroup2Mount, ClassifierFacts, QUIC443_HELPER_PATH, QUIC443_SUDOERS_PATH,
             Quic443HelperFacts, classifier_item_over, quic443_helper_item_over,
+            sudo_listing_names_nopasswd,
         };
         // The paths are the ones the classifier step installs to.
         let script = crate::resolver::CLASSIFIER_SCRIPT;
@@ -2710,6 +2728,27 @@ mod tests {
             assert!(
                 summary.contains(&format!("      today: {wanted}\n")),
                 "{summary}"
+            );
+        }
+
+        // Where `/etc/sudoers.d` is root-only, only a NOPASSWD rule that
+        // names the helper stands in for the drop-in, not a broad one.
+        let drop_in = format!(
+            "User alice may run the following commands on host:\n    (root) NOPASSWD: \
+             {QUIC443_HELPER_PATH}\n"
+        );
+        assert!(sudo_listing_names_nopasswd(&drop_in, QUIC443_HELPER_PATH));
+        let among = format!("    (root) NOPASSWD: SETENV: /usr/bin/true, {QUIC443_HELPER_PATH}\n");
+        assert!(sudo_listing_names_nopasswd(&among, QUIC443_HELPER_PATH));
+        for broad in [
+            "User alice may run the following commands on host:\n    (ALL) NOPASSWD: ALL\n",
+            "    (ALL : ALL) NOPASSWD: ALL\n",
+            &format!("    (root) {QUIC443_HELPER_PATH}\n"),
+            &format!("    (root) NOPASSWD: {QUIC443_HELPER_PATH}.bak\n"),
+        ] {
+            assert!(
+                !sudo_listing_names_nopasswd(broad, QUIC443_HELPER_PATH),
+                "{broad}"
             );
         }
 
