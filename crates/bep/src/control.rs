@@ -111,9 +111,10 @@
 //! keys, and drops the key registered least recently that no running box
 //! uses to stay inside it. When running boxes use every key, it refuses a
 //! new key with [`KEYS_IN_USE`]. With an idle period set, it also drops a
-//! key that no running box uses and nobody registered for that long. The proxy binary has no setting for the bound. It uses
-//! [`KeyBound::default`]: a fixed count and no idle period. Only an embedder
-//! that calls [`Control::bind_with_key_bound`] sets another bound.
+//! key that no running box uses and nobody registered for that long.
+//! `bep serve --max-client-keys <N>` sets the count, 16 by default
+//! ([`KeyBound::DEFAULT_MAX_KEYS`]), and leaves the idle period unset. An
+//! embedder sets another bound with [`Control::bind_with_key_bound`].
 
 use std::collections::BTreeSet;
 use std::io::{self, Read as _, Write as _};
@@ -868,7 +869,9 @@ impl KeyFile {
         retire_unused(&mut entries);
         // The end of the box takes effect in memory first, as a revocation
         // does in `replace`, so a failed write leaves no retired key
-        // verifying in this process. The next write records it.
+        // verifying in this process. A failed write leaves the ended box in
+        // the file. Only a later successful write records the end, and a
+        // restart before it restores the retired key as in use (#2617).
         if entries.len() != before {
             install(&entries, registry);
         }
