@@ -7350,3 +7350,23 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
     );
     assert_eq!(moves.where_is(calm), own.dir());
 }
+
+/// BEP-018: the join check takes an unpinned shim as gone only when its
+/// `/proc/<pid>/stat` is missing or names a zombie. A read error such as
+/// `EMFILE`, which also fails the pin, leaves a live shim alive.
+#[test]
+fn a_shim_stat_read_says_gone_only_for_a_zombie_or_a_missing_file() {
+    let stat = |state: &str| Ok(format!("42 (sh (x) y) {state} 1 42 42 0 -1"));
+    assert!(!stat_alive(stat("Z")), "a zombie is gone");
+    assert!(!stat_alive(stat("X")), "a dead process is gone");
+    assert!(stat_alive(stat("R")), "a running process is alive");
+    assert!(stat_alive(stat("S")), "a sleeping process is alive");
+    assert!(
+        !stat_alive(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+        "a missing stat file says the process is gone"
+    );
+    assert!(
+        stat_alive(Err(std::io::Error::from_raw_os_error(libc::EMFILE))),
+        "a read error says nothing about the process"
+    );
+}

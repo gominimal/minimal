@@ -468,17 +468,30 @@ fn pin_pid(pid: i32) -> io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-/// Whether the process `pid` runs, from `/proc/<pid>/stat`: it exists and
-/// is not a zombie. The liveness check for a process that could not be
-/// pinned for a reason other than `ESRCH`.
+/// Whether the process `pid` can still run, from `/proc/<pid>/stat`. The
+/// liveness check for a process that could not be pinned for a reason other
+/// than `ESRCH`. See [`stat_alive`].
 #[cfg_attr(test, allow(dead_code))]
 fn proc_alive(pid: i32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        // The state follows the last `)`, which closes the command name.
-        stat.rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().next())
-            .is_some_and(|state| state != "Z" && state != "X")
-    })
+    stat_alive(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Whether a read of `/proc/<pid>/stat` says the process can still run.
+/// Only a missing file or a `Z` or `X` state says it is gone. Any other read
+/// error (`EMFILE` among them, which also fails the pin) says nothing about
+/// it, so the process counts as alive and the join check does not take a
+/// live shim as joined (BEP-018).
+fn stat_alive(read: io::Result<String>) -> bool {
+    match read {
+        Ok(stat) => {
+            // The state follows the last `)`, which closes the command name.
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next());
+            !matches!(state, Some("Z" | "X"))
+        }
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 /// Sends SIGKILL to `pid` by its number. Only for a process that could not
@@ -932,7 +945,15 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // box, so it and the program it forks go home when the block lifts.
         // A shim in the box's own leaf moves into the blocked leaf when a
         // blocking member's admit ran between `injection_leaf` and the join.
-        if let Some(own) = self.leaf.as_ref().map(|leaf| leaf.dir().to_path_buf())
+        // A box without host-address enforcement never joins the cohort
+        // (`join_quic443_cohort`), so the check can change nothing for it
+        // and its injection does not wait for the join.
+        let own = self
+            .leaf
+            .as_ref()
+            .filter(|_| self.attrs.host_ip_enforcement.is_some())
+            .map(|leaf| leaf.dir().to_path_buf());
+        if let Some(own) = own
             && let Err(error) = report_spawned_pid(&mut command, move |pid| {
                 // Pinned first: the shim can exit and its pid be reused
                 // while the check waits.
