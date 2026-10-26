@@ -130,6 +130,9 @@ pub struct Decision {
     /// The member or store identifier, or `None` when the request names
     /// none (an off-module or unsealed request).
     pub identifier: Option<String>,
+    /// The handle's `jti`, the audit correlation id. Empty when the request
+    /// carries no handle, or when the handle does not parse.
+    pub jti: String,
     /// The mapped resource and permission.
     pub mapping: Mapping,
     /// Admit or refuse.
@@ -155,6 +158,10 @@ pub struct Record {
     pub upstream: String,
     /// The member or store identifier, or [`NONE`].
     pub identifier: String,
+    /// The handle's `jti`, or empty. A record written before the field
+    /// existed reads as empty.
+    #[serde(default)]
+    pub jti: String,
     /// The mapped resource, or [`MODULE_UNMAPPED`].
     pub resource: String,
     /// The mapped permission, or [`MODULE_UNMAPPED`].
@@ -188,6 +195,7 @@ impl Record {
                 .identifier
                 .as_deref()
                 .map_or_else(|| NONE.to_owned(), bounded),
+            jti: bounded(&decision.jti),
             resource,
             permission,
             decision: decision.outcome,
@@ -707,6 +715,7 @@ mod tests {
             box_id: "box-7f3a".into(),
             authority: "api.github.com:443".into(),
             identifier: Some("github:user-token".into()),
+            jti: "jti-7f3a".into(),
             mapping: Mapping::Mapped {
                 resource: "repo:gominimal/minimal".into(),
                 permission: "contents:read".into(),
@@ -722,6 +731,7 @@ mod tests {
             box_id: "box-7f3a".into(),
             authority: "example.com:443".into(),
             identifier: None,
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some("off_module".into()),
@@ -1099,16 +1109,18 @@ mod tests {
             field(),
             field(),
             proptest::option::of(field()),
+            field(),
             proptest::option::of((field(), field())),
             any::<bool>(),
             proptest::option::of(field()),
         )
             .prop_map(
-                |(kind, box_id, authority, identifier, mapping, admit, marker)| Decision {
+                |(kind, box_id, authority, identifier, jti, mapping, admit, marker)| Decision {
                     kind,
                     box_id,
                     authority,
                     identifier,
+                    jti,
                     mapping: mapping.map_or(Mapping::ModuleUnmapped, |(resource, permission)| {
                         Mapping::Mapped {
                             resource,

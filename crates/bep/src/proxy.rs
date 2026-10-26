@@ -463,6 +463,8 @@ impl Proxy {
             box_id: box_id.to_owned(),
             authority: authority.to_owned(),
             identifier: None,
+            // Refused before any sealed value is read.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some(marker.to_owned()),
