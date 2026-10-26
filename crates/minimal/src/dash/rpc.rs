@@ -520,6 +520,10 @@ pub async fn activate(
     // has no `--no-hooks` of its own, and a session created here is
     // attachable later like any other.
     request.config.name = name;
+    // The directory that holds the project's `minimal.toml`, as `min session
+    // activate` sends it. The daemon records it as the box's project root
+    // (BOX-001), and falls back to the form's path only for older clients.
+    crate::stamp_project_root(&mut request, project_path.as_utf8_path())?;
     // A daemon of another build refuses this before it allocates anything;
     // `None` under the skew override, which is how an operator still gets
     // through.
@@ -1376,6 +1380,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("sub")).unwrap();
         assert_eq!(resolve_upload_root(&path).unwrap(), path);
+    }
+
+    /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
+    /// `<root>`, the directory that holds `minimal.toml`, as the project
+    /// root, the same stamp `activate` puts on its request.
+    #[test]
+    fn dashboard_create_from_a_subdirectory_sends_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let project_path = paths::HostAbsPath::try_new(sub.clone()).unwrap();
+        let mut request = CreateSessionRequest::new(
+            String::new(),
+            project_path.clone(),
+            NetworkMode::HostNet,
+            BoxPolicy::default(),
+        );
+
+        crate::stamp_project_root(&mut request, project_path.as_utf8_path()).unwrap();
+
+        assert_eq!(
+            request.config.project_root,
+            Some(paths::HostAbsPath::try_new(root).unwrap())
+        );
+        assert_eq!(request.config.project_path.as_str(), sub.as_str());
     }
 
     /// `resolve_upload_root` walks up to the nearest mfile and returns its
