@@ -1225,9 +1225,10 @@ pub(crate) mod linux {
     pub(crate) struct Quic443HelperFacts {
         /// [`QUIC443_HELPER_PATH`] is a root-owned file.
         pub(crate) helper_root_owned: bool,
-        /// [`QUIC443_SUDOERS_PATH`] is a root-owned file, or this account
+        /// [`QUIC443_SUDOERS_PATH`] is a root-owned file. Where this account
         /// cannot look inside its directory (some distributions make
-        /// `/etc/sudoers.d` root-only), so nothing here says it is not.
+        /// `/etc/sudoers.d` root-only), sudo says this account may run the
+        /// helper with no password.
         pub(crate) sudoers_root_owned: bool,
     }
 
@@ -1283,19 +1284,49 @@ pub(crate) mod linux {
     pub(crate) fn classifier_items_on_this_host(global: &GlobalArgs) -> [Item; 2] {
         use std::os::unix::fs::MetadataExt as _;
         let (facts, operator, socket) = classifier_facts_on_this_host(global);
-        let root_owned_file =
-            |path: &str| std::fs::metadata(path).map(|meta| meta.is_file() && meta.uid() == 0);
+        // Root-owned and writable by root alone: not a symlink, no group or
+        // other write bit, and the same of the directory that holds it.
+        let root_only = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+        let root_owned_file = |path: &str| -> std::io::Result<bool> {
+            let path = std::path::Path::new(path);
+            let meta = std::fs::symlink_metadata(path)?;
+            let parent_root_only = path
+                .parent()
+                .and_then(|dir| std::fs::symlink_metadata(dir).ok())
+                .is_some_and(|dir| dir.is_dir() && root_only(&dir));
+            Ok(meta.file_type().is_file() && root_only(&meta) && parent_root_only)
+        };
+        let helper_root_owned = root_owned_file(QUIC443_HELPER_PATH).unwrap_or(false);
         let helper = Quic443HelperFacts {
-            helper_root_owned: root_owned_file(QUIC443_HELPER_PATH).unwrap_or(false),
+            helper_root_owned,
             sudoers_root_owned: match root_owned_file(QUIC443_SUDOERS_PATH) {
                 Ok(owned) => owned,
-                Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
+                // Some distributions make `/etc/sudoers.d` root-only, so this
+                // account cannot stat the drop-in. Ask sudo instead whether
+                // this account may run the helper with no password: the
+                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    helper_root_owned && sudo_lets_this_account_run(QUIC443_HELPER_PATH)
+                }
+                Err(_) => false,
             },
         };
         [
             classifier_item_over(&facts, &operator, &socket),
             quic443_helper_item_over(helper, &facts, &operator, &socket),
         ]
+    }
+
+    /// Whether `sudo -n -l <path>` exits zero: this account may run `path`
+    /// through sudo with no password. False when sudo is absent or asks.
+    fn sudo_lets_this_account_run(path: &str) -> bool {
+        std::process::Command::new("sudo")
+            .args(["-n", "-l", path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// [`classifier_item_over`]'s inputs from this host's reads: the table's
@@ -2609,13 +2640,6 @@ mod tests {
         assert!(!table_present(root), "a record without the marker");
     }
 
-    /// The classifier item's table: done on the marker with a current copy
-    /// of the step and enabled units (or no systemctl to owe them to);
-    /// blocked by another account's tree, by root, by the mount, or by an
-    /// account or socket path outside the block's allowlists; otherwise
-    /// missing, with its step — a marker over a stale copy, or over units
-    /// that did not install, included, so a re-run refreshes what the units
-    /// run and retries what a failed run left out.
     /// BEP-018 (#2607): the QUIC block helper item is done when the helper
     /// and its sudoers drop-in are root-owned. Otherwise it names the
     /// helper's path and the step that installs it, which is the classifier
@@ -2735,6 +2759,13 @@ mod tests {
         );
     }
 
+    /// The classifier item's table: done on the marker with a current copy
+    /// of the step and enabled units (or no systemctl to owe them to);
+    /// blocked by another account's tree, by root, by the mount, or by an
+    /// account or socket path outside the block's allowlists; otherwise
+    /// missing, with its step — a marker over a stale copy, or over units
+    /// that did not install, included, so a re-run refreshes what the units
+    /// run and retries what a failed run left out.
     #[test]
     fn classifier_item_table() {
         use linux::{Cgroup2Mount, ClassifierFacts, cgroup2_mount_from, classifier_item_over};
