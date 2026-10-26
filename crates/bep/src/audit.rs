@@ -480,20 +480,50 @@ impl AuditLog {
     /// highest number, or `audit-0.jsonl` in an empty directory. When the
     /// active segment holds no record yet, the next record chains to the
     /// previous segment's last line, so the chain runs on across segments.
+    ///
+    /// The lock is per segment, so open lists the directory again after it
+    /// takes the lock. A writer that rotated in between releases the old
+    /// segment, and a newer one shows in the second listing. Then open
+    /// drops the old segment and tries the newest, which that writer holds.
     pub fn open_dir(dir: impl AsRef<Path>, rotation: Rotation) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let mut found = numbered_segments(&dir)?;
-        let (n, path) = found
-            .pop()
-            .unwrap_or_else(|| (0, dir.join(segment_name(0))));
-        let mut log = Self::open(&path)?;
-        if log.len == 0
-            && let Some((_, previous)) = found.last()
-        {
-            log.head = final_hash(previous)?;
+        let found = numbered_segments(&dir)?;
+        Self::open_listed(dir, rotation, found)
+    }
+
+    /// [`AuditLog::open_dir`] from a listing `found` taken before the call.
+    fn open_listed(
+        dir: PathBuf,
+        rotation: Rotation,
+        mut found: Vec<(u64, PathBuf)>,
+    ) -> io::Result<Self> {
+        // Each pass that retries saw a newer segment, so a writer that keeps
+        // rotating is the only way to run out of passes.
+        const PASSES: usize = 8;
+        for _ in 0..PASSES {
+            let (n, path) = found
+                .last()
+                .cloned()
+                .unwrap_or_else(|| (0, dir.join(segment_name(0))));
+            let mut log = Self::open(&path)?;
+            let now = numbered_segments(&dir)?;
+            if now.last().is_some_and(|(newest, _)| *newest > n) {
+                // Dropping `log` releases the stale segment unwritten.
+                found = now;
+                continue;
+            }
+            if log.len == 0
+                && let Some((_, previous)) = now.iter().rev().find(|(m, _)| *m < n)
+            {
+                log.head = final_hash(previous)?;
+            }
+            log.rotation = Some((dir, n, rotation));
+            return Ok(log);
         }
-        log.rotation = Some((dir, n, rotation));
-        Ok(log)
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("audit log {} is rotated by another writer", dir.display()),
+        ))
     }
 
     /// Closes the active segment and opens the next one, whose first record
@@ -1330,6 +1360,33 @@ mod tests {
             segments(&audit).unwrap(),
             vec![audit.join(segment_name(4)), audit.join(segment_name(5))]
         );
+    }
+
+    // BEP-068: a writer that listed the segments before another writer
+    // rotated does not lock the closed segment and fork the chain there.
+    #[test]
+    fn open_dir_relists_after_a_rotation() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut writer = AuditLog::open_dir(&audit, rotation(1, 100, 0)).unwrap();
+        writer.append(&admit()).unwrap();
+        let stale = numbered_segments(&audit).unwrap();
+        writer.append(&admit()).unwrap();
+        assert_eq!(writer.path(), audit.join(segment_name(1)));
+        let closed = fs::read(audit.join(segment_name(0))).unwrap();
+
+        // The closed segment is free to lock, but the newest is held.
+        let err =
+            AuditLog::open_listed(audit.clone(), rotation(1, 100, 0), stale.clone()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(audit.join(segment_name(0))).unwrap(), closed);
+
+        // With the writer gone, the stale listing still ends on the newest.
+        let head = writer.head().to_owned();
+        drop(writer);
+        let log = AuditLog::open_listed(audit.clone(), rotation(1, 100, 0), stale).unwrap();
+        assert_eq!(log.path(), audit.join(segment_name(1)));
+        assert_eq!(log.head(), head);
     }
 
     // BEP-068: a segment past the retention bound that holds a revocation
