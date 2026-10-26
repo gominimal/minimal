@@ -66,6 +66,7 @@ use crate::http::{self, CloseReason, Parse};
 use crate::listener::Delivery;
 use crate::module::Module;
 use crate::redeem;
+use crate::store::HostStore;
 
 /// The one ALPN protocol both TLS legs offer.
 pub const ALPN_HTTP11: &[u8] = b"http/1.1";
@@ -647,7 +648,10 @@ impl Proxy {
             Arc::clone(&self.audit),
             Arc::clone(&self.redeemer),
             upstream.proof(),
-        );
+        )
+        // An admitted store reference reads its value from this host's
+        // store, per request (BEP-032, BEP-033).
+        .with_store(Arc::new(HostStore));
         relay(flow, boxed, upstream, IDLE_TIMEOUT).await;
         Ended::Relayed
     }

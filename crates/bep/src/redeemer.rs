@@ -14,7 +14,9 @@
 //! 5. and on an admit only, resolves the sign-in reference to the member's
 //!    credential from the sign-in item in the host keychain. A token that
 //!    has expired, or expires within 5 minutes, is renewed first, one
-//!    renewal in flight per item (BEP-069).
+//!    renewal in flight per item (BEP-069). An admitted store member is
+//!    given to the forwarder as [`Redeemed::Store`], and the forwarder reads
+//!    its value from the host store (BEP-032).
 //!
 //! A revoked value is refused at step 4, so no reference is resolved for it
 //! (BEP-071). The redeemer never logs or returns the credential except in
@@ -29,14 +31,16 @@ use zeroize::Zeroizing;
 use crate::audit::Mapping;
 use crate::boxes::BoxRegistry;
 use crate::control::Registry;
-use crate::forward::{Ran, Redeemer, SingleFlight, Verdict};
-use crate::handle::{self, Handle, StoreRule};
+use crate::forward::{
+    Ran, Redeemed, Redeemer, SEALED_HEADER_MISPLACED, SingleFlight, StoreAdmit, Verdict,
+};
+use crate::handle::{self, Handle, Rules, StoreRule};
 use crate::keys::HeldKey;
 use crate::module::Module;
 use crate::redeem::{
     self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
 };
-use crate::seal::{self, Binding, OpenError, Opened};
+use crate::seal::{self, Binding, MemberKind, OpenError, Opened};
 use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint};
 
 /// The audit marker of an admitted redemption whose sign-in reference
@@ -46,6 +50,9 @@ pub const SIGN_IN_REQUIRED: &str = "github_sign_in_required";
 
 /// The box ids that the revocations in force name.
 pub type Revocations = Arc<RwLock<Vec<String>>>;
+
+/// The source of the current `[secret-store-rules]`, asked at each request.
+pub type StoreRules = Arc<dyn Rules + Send + Sync>;
 
 /// The clock, in seconds since the Unix epoch.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -70,6 +77,7 @@ pub struct BoxRedeemer<K, C> {
     boxes: BoxRegistry,
     keychain: C,
     revocations: Revocations,
+    rules: StoreRules,
     clock: Clock,
     endpoint: Arc<dyn TokenEndpoint>,
     renewals: SingleFlight<Result<Resolved, RenewError>>,
@@ -96,6 +104,8 @@ impl<K, C> std::fmt::Debug for BoxRedeemer<K, C> {
 struct Facts {
     redemption: Redemption<String, String>,
     identifier: Option<String>,
+    /// The opened member's kind, or `None` when the value did not open.
+    kind: Option<MemberKind>,
     /// The handle's `jti` for the audit record, or empty when the value did
     /// not open or the handle does not parse.
     jti: String,
@@ -128,6 +138,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             boxes,
             keychain,
             revocations: Revocations::default(),
+            rules: Arc::new(Vec::<StoreRule>::new()),
             clock: system_clock(),
             endpoint: Arc::new(NoTokenEndpoint),
             renewals: SingleFlight::default(),
@@ -148,6 +159,14 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     #[must_use]
     pub fn with_revocations(mut self, revocations: Revocations) -> Self {
         self.revocations = revocations;
+        self
+    }
+
+    /// This redeemer, with `rules` as the current `[secret-store-rules]`.
+    /// With none, no store member is admitted.
+    #[must_use]
+    pub fn with_rules(mut self, rules: StoreRules) -> Self {
+        self.rules = rules;
         self
     }
 
@@ -224,11 +243,14 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// the value names ([`crate::revoke::in_force_for`]). A `revoke_box` request on the
     /// control socket puts one in force. `bep serve` passes the
     /// revocations restored from every retained audit segment through
-    /// [`with_revocations`](Self::with_revocations) (BEP-068). The
-    /// store rules are empty until T25
-    /// (<https://github.com/gominimal/minimal/issues/2280>) reads
-    /// `[secret-store-rules]`, so this redeemer never admits a
-    /// store-handle member yet.
+    /// [`with_revocations`](Self::with_revocations) (BEP-068).
+    ///
+    /// For a store member, the bound set is the handle's `upstream` and the
+    /// current set is the current rule's authorities, so the checks that
+    /// read a module's host sets read those (BEP-032, BEP-064). The rules
+    /// are the ones [`Self::with_rules`] gives. `bep serve` gives none until
+    /// <https://github.com/gominimal/minimal/issues/2599> gives it the
+    /// `[secret-store-rules]`.
     fn facts(
         &self,
         box_id: &str,
@@ -269,22 +291,34 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 port: a.port,
             })
             .collect();
-        let (bound_set, handle, identifier, jti) = match &opened {
+        let kind = opened.as_ref().map(|opened| opened.member.kind);
+        let (bound_set, current_set, handle, identifier, jti) = match &opened {
             Some(opened) => {
-                // Only the module's current host-set version is known, so a
-                // value sealed under another version has an empty bound set.
-                let bound_set = if opened.context.host_set_version == self.module.host_set_version {
-                    current_set.clone()
-                } else {
-                    Vec::new()
-                };
-                // Interim: no store rules until T25 (#2280) reads
-                // `[secret-store-rules]`, so a store-handle member is not
-                // admitted here.
-                let rules: &[StoreRule] = &[];
                 let read = {
                     let clients = self.clients.read().unwrap_or_else(PoisonError::into_inner);
-                    handle::read_opened(opened, &clients, rules, &self.module, now)
+                    handle::read_opened(opened, &clients, &*self.rules, &self.module, now)
+                };
+                let (bound_set, current_set) = match opened.member.kind {
+                    MemberKind::Store => (
+                        read.handle.upstream.clone(),
+                        read.handle
+                            .rule
+                            .as_ref()
+                            .map(|rule| rule.upstream.clone())
+                            .unwrap_or_default(),
+                    ),
+                    // Only the module's current host-set version is known,
+                    // so a value sealed under another version has an empty
+                    // bound set.
+                    MemberKind::SignIn => {
+                        let bound_set =
+                            if opened.context.host_set_version == self.module.host_set_version {
+                                current_set.clone()
+                            } else {
+                                Vec::new()
+                            };
+                        (bound_set, current_set)
+                    }
                 };
                 // Gatehouse §6.10: the audit record carries the handle's
                 // `jti` as its correlation id. The `jti` is the claim even
@@ -293,6 +327,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 // verified handle, so an admitted record's `jti` is verified.
                 (
                     bound_set,
+                    current_set,
                     read.handle,
                     read.identifier,
                     read.jti.unwrap_or_default(),
@@ -300,6 +335,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             }
             None => (
                 Vec::new(),
+                current_set,
                 Handle {
                     verified: false,
                     bound: false,
@@ -343,8 +379,78 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 handle,
             },
             identifier,
+            kind,
             jti,
         }
+    }
+
+    /// The verdict on a sign-in member, from its `facts` at clock reading
+    /// `now`.
+    fn sign_in_verdict(&self, box_id: &str, facts: Facts, now: u64) -> Verdict {
+        let verdict = match redeem::decide(&facts.redemption) {
+            Decision::Refuse(check) => Verdict::Refuse(check.marker()),
+            decision @ Decision::Admit { .. } => {
+                let identifier = facts.identifier.unwrap_or_default();
+                match self.credential(&identifier, now) {
+                    // The admission's marker reaches the audit record, so a
+                    // cohort admission is recorded `cohort_attributed`
+                    // (BEP-028).
+                    Some((credential, renewed)) => Verdict::Admit {
+                        credential,
+                        identifier,
+                        mapping: Mapping::ModuleUnmapped,
+                        renewed,
+                        marker: decision.marker(),
+                        cohort_attributed: decision.cohort_attributed(),
+                    },
+                    None => Verdict::Refuse(SIGN_IN_REQUIRED),
+                }
+            }
+        };
+        tracing::debug!(box_id, ?verdict, jti = ?facts.jti, "sealed value decided");
+        verdict
+    }
+
+    /// The decision on a store member, from its `facts` (BEP-032). An
+    /// admitted member names the store, the identifier and the injection
+    /// form for the forwarder, which reads the value. Nothing is read here.
+    fn store_decision(box_id: &str, facts: Facts) -> Redeemed {
+        let decided = match redeem::decide(&facts.redemption) {
+            Decision::Refuse(check) => Redeemed::Verdict(Verdict::Refuse(check.marker())),
+            decision @ Decision::Admit { .. } => {
+                let reference = facts
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| identifier.split_once(':'));
+                match (reference, facts.redemption.handle.inject) {
+                    (Some((store, id)), Some(inject)) => Redeemed::Store(StoreAdmit {
+                        store: store.to_owned(),
+                        id: id.to_owned(),
+                        inject,
+                        mapping: Mapping::ModuleUnmapped,
+                        marker: decision.marker(),
+                        cohort_attributed: decision.cohort_attributed(),
+                    }),
+                    // A checked store handle names both, so this is not
+                    // reached. It refuses rather than inject nothing.
+                    _ => Redeemed::Verdict(Verdict::Refuse(
+                        redeem::Check::StoreHandleInvalid.marker(),
+                    )),
+                }
+            }
+        };
+        match &decided {
+            Redeemed::Store(admit) => tracing::debug!(
+                box_id,
+                store = %admit.store,
+                id = %admit.id,
+                "store reference admitted"
+            ),
+            Redeemed::Verdict(verdict) => {
+                tracing::debug!(box_id, ?verdict, "store reference decided")
+            }
+        }
+        decided
     }
 
     /// The credential the sign-in reference `identifier` names, when the
@@ -467,28 +573,42 @@ where
     ) -> (Verdict, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
-        let verdict = match redeem::decide(&facts.redemption) {
-            Decision::Refuse(check) => Verdict::Refuse(check.marker()),
-            decision @ Decision::Admit { .. } => {
-                let identifier = facts.identifier.unwrap_or_default();
-                match self.credential(&identifier, now) {
-                    // The admission's marker reaches the audit record, so a
-                    // cohort admission is recorded `cohort_attributed`
-                    // (BEP-028).
-                    Some((credential, renewed)) => Verdict::Admit {
-                        credential,
-                        identifier,
-                        mapping: Mapping::ModuleUnmapped,
-                        renewed,
-                        marker: decision.marker(),
-                        cohort_attributed: decision.cohort_attributed(),
-                    },
-                    None => Verdict::Refuse(SIGN_IN_REQUIRED),
-                }
-            }
-        };
-        tracing::debug!(box_id, ?verdict, jti = ?facts.jti, "sealed value decided");
-        (verdict, facts.jti)
+        let jti = facts.jti.clone();
+        (self.sign_in_verdict(box_id, facts, now), jti)
+    }
+
+    /// Decides one request that carries `sealed` in the header named
+    /// `header`. An admitted store member is [`Redeemed::Store`], and the
+    /// forwarder checks that `header` is where the rule's injection form
+    /// puts the value (BEP-032).
+    ///
+    /// Any other value in a header other than `Authorization` is refused as
+    /// [`SEALED_HEADER_MISPLACED`] before it is decided, so no sign-in is
+    /// read or renewed for it.
+    fn redeem_reference(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String) {
+        let now = (self.clock)();
+        let facts = self.facts(box_id, authority, request, sealed, now);
+        let jti = facts.jti.clone();
+        if facts.kind == Some(MemberKind::Store) {
+            return (Self::store_decision(box_id, facts), jti);
+        }
+        if !header.eq_ignore_ascii_case("authorization") {
+            return (
+                Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
+                String::new(),
+            );
+        }
+        (
+            Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
+            jti,
+        )
     }
 }
 
@@ -1631,5 +1751,220 @@ mod tests {
         assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
         assert!(upstream.is_empty());
         assert_eq!(endpoint.calls(), 2);
+    }
+
+    const STORE_ID: &str = "openai";
+    const STORED_KEY: &str = "sk-stored-key";
+
+    fn openai() -> Authority<String> {
+        Authority {
+            host: "api.openai.com".into(),
+            port: 443,
+        }
+    }
+
+    fn bearer() -> Inject {
+        Inject::Header {
+            name: "Authorization".into(),
+            prefix: Some("Bearer ".into()),
+        }
+    }
+
+    /// The `[secret-store-rules]` rule for [`STORE_ID`] in the keychain:
+    /// `api.openai.com`, as a bearer token.
+    fn openai_rule() -> StoreRule {
+        StoreRule {
+            store: crate::store::NATIVE_STORE.into(),
+            id: STORE_ID.into(),
+            upstream: vec!["api.openai.com".into()],
+            inject: bearer(),
+        }
+    }
+
+    /// A value sealed for `box_id` on this node, with a store member for
+    /// [`STORE_ID`] in the keychain, to `api.openai.com` as a bearer token.
+    fn store_sealed_for<K, C>(world: &World<K, C>, box_id: &str) -> String {
+        let jws = handle::sign(
+            &world.client,
+            &Claims {
+                sub: box_id.into(),
+                node_id: NODE.into(),
+                store: crate::store::NATIVE_STORE.into(),
+                id: STORE_ID.into(),
+                upstream: vec!["api.openai.com".into()],
+                inject: Some(bearer()),
+                iat: NOW - 10,
+                exp: NOW + 3600,
+                jti: "jti-store".into(),
+            },
+        );
+        seal::seal(
+            &world.sealing,
+            &Context {
+                box_id: box_id.into(),
+                host: NODE.into(),
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: NOW - 10,
+                expiry: NOW + 600,
+                kid: world.sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::Store,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Sends one request from `box_id` to `api.openai.com` with
+    /// `sealed_header` on a flow that reads store values from `store`, as
+    /// `bep serve` builds it. Gives what reached the upstream, how the half
+    /// ended, and the audit records.
+    fn send_to_store(
+        world: &World,
+        box_id: &str,
+        store: Arc<dyn crate::store::ValueReader>,
+        sealed_header: &str,
+    ) -> (String, HalfEnd, Vec<Record>) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::<Record>::new()));
+        let audit: Arc<dyn AuditWriter> = records.clone();
+        let redeemer: Arc<dyn Redeemer> = world.redeemer.clone();
+        let flow = Flow::new(
+            box_id,
+            openai(),
+            audit,
+            redeemer,
+            Validated::unchecked(()).proof(),
+        )
+        .with_store(store);
+        let request =
+            format!("GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\n{sealed_header}\r\n\r\n");
+        let mut client = Cursor::new(request.into_bytes());
+        let mut upstream = Vec::new();
+        let end = forward_requests(&flow, &mut client, &mut upstream);
+        let records = records.lock().unwrap().clone();
+        (String::from_utf8(upstream).unwrap(), end, records)
+    }
+
+    // BEP-032: a store member that passes every check reaches the rule's
+    // registered upstream with the stored key in the registered form. The
+    // box holds only the sealed value, and the audit names the store and
+    // the identifier, never the key.
+    #[test]
+    fn serve_injects_a_stored_key_for_an_admitted_store_member() {
+        use crate::store::{MemoryReader, MemorySecretStore, SecretStore as _};
+
+        let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 3600, NOW + 7200);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_rules(Arc::new(vec![openai_rule()]))
+        });
+        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let program = std::path::PathBuf::from("/opt/minimal/bin/bep");
+        let store = Arc::new(MemorySecretStore::default());
+        store
+            .set(STORE_ID, STORED_KEY.as_bytes(), &program)
+            .unwrap();
+        let reader: Arc<dyn crate::store::ValueReader> = Arc::new(MemoryReader {
+            store: Arc::clone(&store),
+            app: program,
+        });
+        let sealed = store_sealed_for(&world, "b1");
+        assert!(!sealed.contains(STORED_KEY), "the box never holds the key");
+
+        let bearer_header = format!("Authorization: Bearer {sealed}");
+        let (upstream, end, records) =
+            send_to_store(&world, "b1", Arc::clone(&reader), &bearer_header);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(
+            upstream.contains(&format!("\r\nauthorization: Bearer {STORED_KEY}\r\n")),
+            "{upstream}"
+        );
+        assert!(!upstream.contains(&sealed), "the sealed value is replaced");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].identifier.as_deref(), Some("keychain:openai"));
+        assert!(!format!("{records:?}").contains(STORED_KEY));
+
+        // The same value from another box is refused, and nothing goes
+        // upstream (BEP-020).
+        world.boxes.register("b2", vec![openai()], Stance::OwnIp);
+        let (upstream, end, _) = send_to_store(&world, "b2", Arc::clone(&reader), &bearer_header);
+        assert_eq!(refused(&end), Some(Check::CrossBox.marker()));
+        assert!(upstream.is_empty());
+
+        // In a header that the rule does not name, it is refused before the
+        // store is read.
+        let (upstream, end, _) = send_to_store(
+            &world,
+            "b1",
+            Arc::clone(&reader),
+            &format!("x-api-key: {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(SEALED_HEADER_MISPLACED));
+        assert!(upstream.is_empty());
+
+        // A sign-in member outside `Authorization` is still refused before
+        // it is decided.
+        let sign_in = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, _) = send_to_store(
+            &world,
+            "b1",
+            Arc::clone(&reader),
+            &format!("x-api-key: {sign_in}"),
+        );
+        assert_eq!(refused(&end), Some(SEALED_HEADER_MISPLACED));
+        assert!(upstream.is_empty());
+
+        // With no rule for the item, the handle is invalid (BEP-064).
+        let keychain = MemoryKeychain::default();
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let bare = world_over(key, keychain, |redeemer| redeemer);
+        bare.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let sealed = store_sealed_for(&bare, "b1");
+        let (upstream, end, _) = send_to_store(
+            &bare,
+            "b1",
+            Arc::clone(&reader),
+            &format!("Authorization: Bearer {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(Check::StoreHandleInvalid.marker()));
+        assert!(upstream.is_empty());
+    }
+
+    // The store `bep serve` opens off macOS reads nothing, so an admitted
+    // store member is refused `store_item_unreadable`, never forwarded
+    // without the key.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn serve_refuses_an_unreadable_store_member() {
+        let keychain = MemoryKeychain::default();
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_rules(Arc::new(vec![openai_rule()]))
+        });
+        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let sealed = store_sealed_for(&world, "b1");
+        let (upstream, end, records) = send_to_store(
+            &world,
+            "b1",
+            Arc::new(crate::store::HostStore),
+            &format!("Authorization: Bearer {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(crate::forward::STORE_ITEM_UNREADABLE));
+        assert!(upstream.is_empty());
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(
+            records[0].marker.as_deref(),
+            Some(crate::forward::STORE_ITEM_UNREADABLE)
+        );
     }
 }
