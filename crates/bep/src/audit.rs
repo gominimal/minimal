@@ -820,6 +820,7 @@ mod tests {
             "txn",
             "upstream",
             "identifier",
+            "jti",
             "resource",
             "permission",
             "decision",
