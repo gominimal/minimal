@@ -2995,7 +2995,7 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     unset HC_HELPER HC_SUDOERS
     check 1 "$rc" "an install whose helper directory others can write exits 1"
     want_ok "the refusal names the directory and the fix" \
-        grep -q "$root/hcopen can be written by accounts other than its owner (mode 777)" "$OUT"
+        grep -q "$(cd -P "$root/hcopen" && pwd -P) can be written by accounts other than its owner (mode 777)" "$OUT"
     want_err "no helper is written into a directory others can write" \
         test -e "$root/hcopen/quic443-leaf"
     want_ok "no staging file is left behind either" \
@@ -3022,6 +3022,9 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         else
             chmod 0755 "$_nftdir"; chmod 0777 "$_nftdir/nft"; _named="$_nftdir/nft"
         fi
+        # The install names the nft by its physical path: on macOS the
+        # scratch root sits under /var, a symlink to /private/var.
+        _named="$(cd -P "$_nftdir" && pwd -P)${_named#"$_nftdir"}"
         : >"$nft_input"
         HC_PATH_PREFIX="$_nftdir"
         HC_HELPER="$root/hcnftlib/quic443-leaf"
@@ -3054,6 +3057,7 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     unset NFT_LEAF_SET HC_HELPER HC_SUDOERS
     check 0 "$rc" "a re-install with a leaf in the blocked-leaves set exits 0"
+    # shellcheck disable=SC2016 # $0 is awk's line, not a shell expansion
     want_ok "the re-install declares the set with the leaf still in it" \
         awk '/set quic443_blocked_leaves \{/ {s = NR}
              s && NR == s + 2 && $0 == "        elements = { \"minimald.slice/boxes/allow/grant\" }" {ok = 1}
@@ -3063,6 +3067,28 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "the re-install names the leaf it kept" \
         grep -q "kept the box leaves that are refused UDP to port 443: minimald.slice/boxes/allow/grant$" "$OUT"
     rmdir "$tree/boxes/allow/grant"
+
+    # --- A set listing that fails while the loaded table declares the set
+    # stops the install before the load: rendering the set empty would let
+    # a blocked box send UDP to port 443 again. The stub's `-j list set`
+    # fails when NFT_LEAF_SET is unset.
+    nft_ruleset_with_set="$root/nft-ruleset-with-set"
+    printf '%s\n' 'table inet minimal_class {' '	set quic443_blocked_leaves {' \
+        '		typeof socket cgroupv2 level 4' '	}' '}' >"$nft_ruleset_with_set"
+    : >"$nft_input"
+    NFT_RULESET="$nft_ruleset_with_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc leaf_set_unreadable "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    NFT_RULESET=
+    check 1 "$rc" "an install that cannot list the declared blocked-leaves set exits 1"
+    want_ok "the refusal says it cannot read the blocked box leaves" \
+        grep -q "cannot read the box leaves that are refused UDP to port 443 from inet minimal_class: nft -j list set inet minimal_class quic443_blocked_leaves failed" "$OUT"
+    want_ok "the refusal says the loaded table is unchanged" \
+        grep -q "The loaded table is unchanged.$" "$OUT"
+    want_ok "an unreadable blocked-leaves set loads no table" [ ! -s "$nft_input" ]
 
     # --- The ct-mark bits are a shared namespace: a component already
     # classing with one of them would be silently overwritten by the

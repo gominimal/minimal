@@ -952,11 +952,18 @@ RULES
 # only a leaf the helper can add: one directory directly under the allow
 # subtree, with a plain name. A leaf whose directory is gone is dropped,
 # because nft refuses a cgroup path that does not exist. No table, or no
-# set, prints nothing.
+# set, prints nothing. When the listing fails while the loaded table
+# declares the set, it prints why and returns 1: rendering the set empty
+# would let a blocked box send UDP to port 443 again. The loaded table is
+# read from $host_ruleset, the listing scan_ct_mark_conflicts took.
 kept_quic443_leaves() {
-    local listing elems elem name
-    listing="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" </dev/null 2>/dev/null)" ||
-        return 0
+    local listing elems elem name why
+    if ! listing="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" </dev/null 2>/dev/null)"; then
+        printf '%s\n' "$host_ruleset" | quic443_set_declared || return 0
+        why="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" 2>&1 >/dev/null </dev/null || true)"
+        printf 'nft -j list set inet %s %s failed: %s' "$TABLE_NAME" "$QUIC443_LEAF_SET" "${why:-no error text}"
+        return 1
+    fi
     elems="$(printf '%s' "$listing" | tr -d '\n' | grep -o '"elem": *\[[^]]*\]' || true)"
     elems=${elems#*\[}
     printf '%s' "$elems" | { grep -o '"[^"]*"' || true; } | while IFS= read -r elem; do
@@ -971,6 +978,16 @@ kept_quic443_leaves() {
             [ ! -L "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ] || continue
         printf '%s\n' "$elem"
     done
+}
+
+# quic443_set_declared — succeeds when the `nft list ruleset` text on
+# stdin declares the set $QUIC443_LEAF_SET in the table inet $TABLE_NAME.
+quic443_set_declared() {
+    awk -v table="table inet $TABLE_NAME {" -v set="set $QUIC443_LEAF_SET {" '
+        $0 == table { in_table = 1; next }
+        in_table && $0 == "}" { in_table = 0 }
+        in_table { line = $0; sub(/^[ \t]+/, "", line); if (line == set) found = 1 }
+        END { exit !found }'
 }
 
 # require_identities — the cohort's and the node plane's source identities
@@ -1110,6 +1127,8 @@ scan_ct_mark_conflicts() {
     if ! listing="$(nft list ruleset 2>/dev/null)"; then
         die "cannot read this host's ruleset with \`nft list ruleset\` to check the ct-mark bits $mask_hex: refusing to load a classification over a ruleset this step cannot see"
     fi
+    # kept_quic443_leaves reads the same listing, so nft lists it once.
+    host_ruleset="$listing"
     conflicting="$(printf '%s\n' "$listing" | ct_mark_conflicts_in)"
     if command -v iptables-save >/dev/null 2>&1 &&
         legacy="$(iptables-save 2>/dev/null)" && [ -n "$legacy" ]
@@ -1270,6 +1289,13 @@ done
 # them (see compute_cgroup_paths).
 compute_cgroup_paths
 
+# The leaves a running daemon put in the blocked-leaves set are read before
+# the marker is removed, and the render declares the set with them, so a
+# re-install does not let a blocked box send UDP to port 443 again. A read
+# that fails stops the install while the marker still vouches for the table.
+quic443_kept_leaves="$(kept_quic443_leaves)" ||
+    die "cannot read the box leaves that are refused UDP to port 443 from inet $TABLE_NAME: $quic443_kept_leaves. The loaded table is unchanged."
+
 # The one nftables transaction. `nft -f` applies a batch whole or not at
 # all, so the ruleset above carries its own prelude — declare this table,
 # delete it, then the definition — and the load replaces whatever a previous
@@ -1300,10 +1326,6 @@ done
 # wrote: `read -d ''` with an empty delimiter reads without a terminator, so
 # every trailing newline survives (a command substitution would strip them and
 # the digest below would then cover different bytes than nft received).
-# The leaves a running daemon put in the blocked-leaves set are read just
-# before the render, and the render declares the set with them, so a
-# re-install does not let a blocked box send UDP to port 443 again.
-quic443_kept_leaves="$(kept_quic443_leaves)"
 IFS= read -r -d '' ruleset < <(render_ruleset) || true
 ruleset_sha256="$(sha256_of "$ruleset")"
 printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
