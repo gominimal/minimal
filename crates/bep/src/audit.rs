@@ -1108,19 +1108,62 @@ pub struct ChainBreak {
 /// and returns the count of records it verified. Each record must carry
 /// the hash of the line before it (BEP-048). The first retained record can
 /// carry any hash, since the segments before it can be pruned. A gap is
-/// verified when [`QuarantineRecord`]s in the log lead from the hash
-/// before the gap to the hash after it.
+/// verified only between two segments, and only when [`QuarantineRecord`]s
+/// lead across it from the hash before it to the hash after it. Each of
+/// those records must name a segment under [`QUARANTINE_DIR`] that agrees
+/// with it, numbered between the two segments, and come after the gap.
 pub fn verify_chain(dir: impl AsRef<Path>) -> io::Result<Result<usize, ChainBreak>> {
+    let dir = dir.as_ref();
     let mut read = Vec::new();
     for path in segments(dir)? {
         let bytes = fs::read(&path)?;
         read.push((path, bytes));
     }
-    Ok(verify_segments(&read))
+    let mut moved = Vec::new();
+    for (_, path) in numbered_segments(&dir.join(QUARANTINE_DIR))? {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        moved.push((name, fs::read(&path)?));
+    }
+    Ok(verify_segments(&read, &moved))
 }
 
-/// [`verify_chain`] over segments already read, oldest first. Pure.
-pub fn verify_segments(segments: &[(PathBuf, Vec<u8>)]) -> Result<usize, ChainBreak> {
+/// Whether `bytes`, a segment under [`QUARANTINE_DIR`], is the segment
+/// that `record` says it moved: it holds `record.unreadable` lines that do
+/// not parse, and its first and last lines, where they parse, carry the
+/// hashes the record bridges.
+fn moved_segment_matches(record: &QuarantineRecord, bytes: &[u8]) -> bool {
+    let lines: Vec<Line> = complete_lines(bytes).map(classify).collect();
+    let unreadable = lines
+        .iter()
+        .filter(|line| matches!(line, Line::Corrupt))
+        .count();
+    if unreadable == 0 || unreadable != record.unreadable {
+        return false;
+    }
+    let first = lines
+        .first()
+        .and_then(Line::previous_hash)
+        .is_none_or(|hash| hash == record.from_hash);
+    let last = complete_lines(bytes).last().is_none_or(|raw| {
+        matches!(classify(raw), Line::Corrupt) || line_hash(raw) == record.final_hash
+    });
+    first && last
+}
+
+/// [`verify_chain`] over segments already read, oldest first, and the
+/// segments under [`QUARANTINE_DIR`] by file name. Pure.
+pub fn verify_segments(
+    segments: &[(PathBuf, Vec<u8>)],
+    quarantined: &[(String, Vec<u8>)],
+) -> Result<usize, ChainBreak> {
+    let number_of = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(segment_number)
+    };
     let lines: Vec<(&Path, usize, &[u8], Line)> = segments
         .iter()
         .flat_map(|(path, bytes)| {
@@ -1129,28 +1172,51 @@ pub fn verify_segments(segments: &[(PathBuf, Vec<u8>)]) -> Result<usize, ChainBr
                 .map(move |(i, raw)| (path.as_path(), i + 1, raw, classify(raw)))
         })
         .collect();
-    let gaps: Vec<(&str, &str)> = lines
+    // Each bridge: where it sits in the log, the moved segment's number,
+    // and the record. A bridge whose moved segment is absent, or does not
+    // agree with it, bridges nothing.
+    let bridges: Vec<(usize, u64, &QuarantineRecord)> = lines
         .iter()
-        .filter_map(|(_, _, _, line)| match line {
-            Line::Quarantine(record) => {
-                Some((record.from_hash.as_str(), record.final_hash.as_str()))
-            }
+        .enumerate()
+        .filter_map(|(at, (_, _, _, line))| match line {
+            Line::Quarantine(record) => Some((at, record)),
             _ => None,
         })
+        .filter_map(|(at, record)| {
+            let number = segment_number(&record.segment)?;
+            let (_, bytes) = quarantined
+                .iter()
+                .find(|(name, _)| *name == record.segment)?;
+            moved_segment_matches(record, bytes).then_some((at, number, record))
+        })
         .collect();
-    let mut head: Option<String> = None;
-    for (path, number, raw, line) in &lines {
+    // The hash of the line before, and the number of its segment.
+    let mut head: Option<(String, Option<u64>)> = None;
+    for (index, (path, number, raw, line)) in lines.iter().enumerate() {
         let found = line.previous_hash();
-        if let Some(expected) = &head {
+        if let Some((expected, before)) = &head {
             let bridged = found.is_some_and(|found| {
+                if expected == found {
+                    return true;
+                }
+                // A quarantine moves whole segments, so a gap opens only
+                // before the first line of a segment.
+                let (Some(mut after), Some(here)) = (*before, number_of(path)) else {
+                    return false;
+                };
+                if *number != 1 {
+                    return false;
+                }
                 let mut at = expected.as_str();
-                for _ in 0..=gaps.len() {
+                // Each step moves to a higher segment number, so the walk
+                // ends.
+                while let Some((_, moved, record)) = bridges.iter().find(|(pos, moved, record)| {
+                    *pos >= index && *moved > after && *moved < here && record.from_hash == at
+                }) {
+                    at = &record.final_hash;
+                    after = *moved;
                     if at == found {
                         return true;
-                    }
-                    match gaps.iter().find(|(from, _)| *from == at) {
-                        Some((_, to)) => at = to,
-                        None => return false,
                     }
                 }
                 false
@@ -1171,7 +1237,7 @@ pub fn verify_segments(segments: &[(PathBuf, Vec<u8>)]) -> Result<usize, ChainBr
                 found: None,
             });
         }
-        head = Some(line_hash(raw));
+        head = Some((line_hash(raw), number_of(path)));
     }
     Ok(lines.len())
 }
@@ -1823,6 +1889,84 @@ mod tests {
                 .iter()
                 .any(|entry| entry.record.kind == Kind::Revocation)
         );
+    }
+
+    // BEP-049, BEP-068: a quarantine record bridges a gap only between two
+    // segments, and only with the moved segment under `quarantine/`.
+    #[test]
+    fn forged_quarantine_record_bridges_no_gap() {
+        let forge = |from_hash: &str, final_hash: &str, previous_hash: &str| {
+            QuarantineRecord {
+                schema: SCHEMA.to_owned(),
+                kind: QUARANTINE.to_owned(),
+                segment: segment_name(1),
+                from_hash: from_hash.to_owned(),
+                final_hash: final_hash.to_owned(),
+                unreadable: 1,
+                previous_hash: previous_hash.to_owned(),
+            }
+            .to_line()
+        };
+        let append_line = |path: &Path, line: &str| {
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        };
+
+        // A whole segment removed, and a record that names it appended.
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        log.append(&revocation("box-gone")).unwrap();
+        let third = log.append(&admit()).unwrap();
+        let head = log.head().to_owned();
+        drop(log);
+        let removed = audit.join(segment_name(1));
+        let removed_bytes = fs::read(&removed).unwrap();
+        fs::remove_file(&removed).unwrap();
+        let first_hash = line_hash(first.to_line());
+        append_line(
+            &audit.join(segment_name(2)),
+            &forge(&first_hash, &third.previous_hash, &head),
+        );
+        assert!(verify_chain(&audit).unwrap().is_err());
+        // A file of that name that holds no unreadable line does not agree.
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(1)),
+            &removed_bytes,
+        )
+        .unwrap();
+        assert!(verify_chain(&audit).unwrap().is_err());
+
+        // A run of records removed inside one segment.
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        let second = log.append(&revocation("box-gone")).unwrap();
+        let third = log.append(&admit()).unwrap();
+        drop(log);
+        let active = audit.join(segment_name(0));
+        let kept = format!("{}\n{}\n", first.to_line(), third.to_line());
+        fs::write(&active, &kept).unwrap();
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(1)),
+            format!("{}\nnot a record\n", second.to_line()),
+        )
+        .unwrap();
+        let first_hash = line_hash(first.to_line());
+        append_line(
+            &active,
+            &forge(
+                &first_hash,
+                &third.previous_hash,
+                &line_hash(third.to_line()),
+            ),
+        );
+        assert!(verify_chain(&audit).unwrap().is_err());
     }
 
     // BEP-068: a quarantine that fails part way moves no segment it did
