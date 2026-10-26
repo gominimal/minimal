@@ -689,8 +689,10 @@ BODY
 
 # install_quic443_helper — writes the helper root-owned, mode 0755, and the
 # sudoers drop-in that lets the delegated account run that one file as root
-# with no password, checked with visudo before it is put in place. A
-# rehearsal writes them only where its MINIMAL_OVERRIDE_* knobs say.
+# with no password, checked with visudo before it is put in place. A real
+# install refuses when visudo is missing. A rehearsal writes them only where
+# its MINIMAL_OVERRIDE_* knobs say, and skips the check when visudo is
+# missing, because its drop-in is not in a directory sudo reads.
 install_quic443_helper() {
     if [ "$rehearsal" = 1 ] && [ "$quic443_helper_overridden" != 1 ]; then
         return 0
@@ -723,6 +725,11 @@ install_quic443_helper() {
             rm -f "$staged_rule"
             die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: visudo refused it: $why"
         }
+    elif [ "$rehearsal" != 1 ]; then
+        # An unchecked drop-in that sudo cannot parse breaks sudo for the
+        # whole host, so a real install never puts one in place.
+        rm -f "$staged_rule"
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: visudo is not installed, so the rule cannot be checked. Install the sudo package, then run this installer again."
     fi
     if [ "$rehearsal" != 1 ]; then
         why="$(chown root:root "$staged_rule" 2>&1)" ||

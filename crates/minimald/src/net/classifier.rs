@@ -784,10 +784,17 @@ impl CohortQuic443 {
             .map(|(id, leaf)| (id.clone(), leaf.clone()))
             .collect();
         for (id, leaf) in stale {
-            self.listed.remove(&id);
             if moves.remove_blocked_leaf(&leaf).is_ok() {
+                self.listed.remove(&id);
                 self.log_set_change(&id, &leaf, false);
+            } else if !leaf.exists() {
+                // The leaf's cgroup is gone. The kernel never gives its id
+                // to another cgroup, so its element matches no socket and
+                // nothing is left to remove.
+                self.listed.remove(&id);
             }
+            // Otherwise the leaf stays recorded, and the next change of the
+            // cohort retries the remove.
         }
         for (id, leaf) in want {
             if self.listed.contains_key(&id) {
@@ -1174,6 +1181,9 @@ pub(crate) struct StandinMoves {
     /// The leaves the stand-in helper refuses to add, as a host whose
     /// helper is missing would.
     pub(crate) unlistable: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// The leaves the stand-in helper refuses to remove, as a transient
+    /// failure of `sudo` or `nft` would.
+    pub(crate) unremovable: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -1240,6 +1250,9 @@ impl CgroupMoves for StandinMoves {
     }
 
     fn remove_blocked_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        if self.unremovable.lock().unwrap().contains(leaf) {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
         self.listed.lock().unwrap().remove(leaf);
         Ok(())
     }
@@ -7804,6 +7817,38 @@ mod tests {
             .admit("late", Some(homes[3].clone()), false, &moves)
             .expect("the joiner stays");
         assert!(listed(&moves).contains(&homes[0]), "the retry listed it");
+
+        // A failed remove of a leaf that still exists stays recorded, and
+        // the next change retries it.
+        std::fs::create_dir_all(&homes[0]).expect("the home leaf");
+        moves.unremovable.lock().unwrap().insert(homes[0].clone());
+        cohort.depart("grant", &moves);
+        assert!(!cohort.blocked());
+        assert!(listed(&moves).contains(&homes[0]), "the remove failed");
+        assert!(
+            cohort.listed_leaves().any(|leaf| leaf == homes[0]),
+            "the cohort still records the leaf it did not remove"
+        );
+        moves.unremovable.lock().unwrap().clear();
+        cohort.depart("late", &moves);
+        assert!(!listed(&moves).contains(&homes[0]), "the retry removed it");
+        assert!(cohort.listed_leaves().all(|leaf| leaf != homes[0]));
+
+        // A failed remove of a leaf that is gone is dropped: its cgroup id
+        // is never reused, so the element matches no socket.
+        moves.unremovable.lock().unwrap().insert(homes[3].clone());
+        cohort
+            .admit("grant", Some(homes[2].clone()), true, &moves)
+            .expect("the cohort moves");
+        cohort
+            .admit("late", Some(homes[3].clone()), false, &moves)
+            .expect("the joiner moves");
+        assert!(cohort.listed_leaves().any(|leaf| leaf == homes[3]));
+        cohort.depart("late", &moves);
+        assert!(
+            cohort.listed_leaves().all(|leaf| leaf != homes[3]),
+            "a gone leaf is not retried"
+        );
     }
 
     /// A cohort over a stand-in tree: its blocked leaf, learned, and a home
