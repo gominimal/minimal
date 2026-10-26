@@ -331,8 +331,16 @@ fn check_new_rule(id: &str, rule: &StoreRuleConfig, path: &Path) -> anyhow::Resu
         return Ok(());
     };
     let why = match &refused.reason {
+        StoreRuleRefusal::MinimalInfrastructure { host, entry }
+            if !host.eq_ignore_ascii_case(entry) =>
+        {
+            format!(
+                "{host} is under {entry}, and a secret can never be sent to {entry} or a name \
+                 under it. Run the command again with another --upstream."
+            )
+        }
         StoreRuleRefusal::ModuleHost { host }
-        | StoreRuleRefusal::MinimalInfrastructure { host } => {
+        | StoreRuleRefusal::MinimalInfrastructure { host, .. } => {
             format!(
                 "a secret can never be sent to {host}. Run the command again with another --upstream."
             )
