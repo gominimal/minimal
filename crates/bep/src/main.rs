@@ -414,9 +414,10 @@ fn admission(rules: &[StoreRule]) -> Admission {
 /// redemption (BEP-032). Two limits hold. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
-/// read: <https://github.com/gominimal/minimal/issues/2620>. The root's names and the admitted CONNECT set take the rules at
-/// start only, so a rule that adds an upstream reaches them when the proxy
-/// restarts: <https://github.com/gominimal/minimal/issues/2618>. The start
+/// read: <https://github.com/gominimal/minimal/issues/2620>. The root's
+/// names and the admitted CONNECT set take the rules at start only, so a
+/// rule that adds an upstream reaches them when the proxy restarts:
+/// <https://github.com/gominimal/minimal/issues/2618>. The start
 /// log line names the file, so both show there.
 fn client_store_rules() -> ClientRules {
     let paths = client_config_path().map(|user| {
@@ -445,31 +446,58 @@ fn client_config_path() -> Option<PathBuf> {
     Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
-/// What identifies one version of a file: its content, or `None` when it
-/// does not read. The content, not the modification time and the length,
-/// so an edit that keeps the length inside one timestamp tick is seen.
-type Stamp = Option<Vec<u8>>;
+/// What identifies one version of a file without a read of it: its
+/// modification time and its length, or `None` when it does not stat.
+type Stamp = Option<(Option<SystemTime>, u64)>;
 
 fn stamp(path: &Path) -> Stamp {
-    std::fs::read(path).ok()
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+/// How close to a read a file change can be and still hide from a stat.
+/// An edit that keeps the length inside one timestamp tick keeps the stamp,
+/// and the coarsest common tick (FAT) is two seconds.
+const RACY: Duration = Duration::from_secs(2);
+
+/// Whether a file with `stamp` is older than the read at `read_at` by more
+/// than one tick, so a stamp that did not change means content that did
+/// not change. A file with no modification time is never settled.
+fn settled(stamp: &Stamp, read_at: SystemTime) -> bool {
+    match stamp {
+        None => true,
+        Some((Some(modified), _)) => modified
+            .checked_add(RACY)
+            .is_some_and(|edge| edge < read_at),
+        Some((None, _)) => false,
+    }
+}
+
+/// The rules of the last read, with the stamps of the two files before it
+/// and the time it started.
+struct Read {
+    stamps: [Stamp; 2],
+    read_at: SystemTime,
+    rules: Vec<StoreRule>,
 }
 
 /// The source of the client's store rules that `bep serve` owns. It holds
-/// the rules of the user and the organization file, and parses them again
-/// when the content of either file changes.
+/// the rules of the user and the organization file. Each request stats the
+/// two files, and reads them again only when a stamp changed, or when a
+/// file changed so near the last read that a same-tick edit can hide.
 struct ClientRules {
     /// The user file and the organization file, or `None` with no home
     /// directory.
     paths: Option<(PathBuf, PathBuf)>,
-    /// The stamps of the two files at the last read, and the rules read.
-    cache: Mutex<(Option<[Stamp; 2]>, Vec<StoreRule>)>,
+    /// The last read, or `None` before the first.
+    cache: Mutex<Option<Read>>,
 }
 
 impl ClientRules {
     fn new(paths: Option<(PathBuf, PathBuf)>) -> Self {
         Self {
             paths,
-            cache: Mutex::new((None, Vec::new())),
+            cache: Mutex::new(None),
         }
     }
 
@@ -478,21 +506,38 @@ impl ClientRules {
         let Some((user, organization)) = &self.paths else {
             return Vec::new();
         };
-        // The files are read before the lock, so one slow read does not
-        // hold up the other redemptions.
-        let now = [stamp(user), stamp(organization)];
-        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.0.as_ref() != Some(&now) {
-            let rules = store_rules_in(user, organization);
-            if cache.0.is_some() {
-                tracing::info!(
-                    store_rules = rules.len(),
-                    "read the secret-store rules again after the client configuration changed"
-                );
+        let stamps = [stamp(user), stamp(organization)];
+        let changed = {
+            let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            match &*cache {
+                Some(last)
+                    if last.stamps == stamps && stamps.iter().all(|s| settled(s, last.read_at)) =>
+                {
+                    return last.rules.clone();
+                }
+                Some(last) => last.stamps != stamps,
+                None => false,
             }
-            *cache = (Some(now), rules);
+        };
+        // The files are read outside the lock, so one slow read does not
+        // hold up the other redemptions.
+        let read_at = SystemTime::now();
+        let rules = store_rules_in(user, organization);
+        if changed {
+            tracing::info!(
+                store_rules = rules.len(),
+                "read the secret-store rules again after the client configuration changed"
+            );
         }
-        cache.1.clone()
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.as_ref().is_none_or(|last| last.read_at <= read_at) {
+            *cache = Some(Read {
+                stamps,
+                read_at,
+                rules: rules.clone(),
+            });
+        }
+        rules
     }
 }
 
@@ -2155,6 +2200,36 @@ mod tests {
             ),
             "{redeemed:?}"
         );
+    }
+
+    // BEP-032: a redemption stats the files and reads them only when a
+    // stamp changed or a file changed inside the racy window.
+    #[test]
+    fn settled_store_rules_are_read_again_only_on_a_new_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let old = SystemTime::now() - Duration::from_secs(60);
+        let write = |text: &str, modified: SystemTime| {
+            std::fs::write(&config, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&config)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        };
+        write(OPENAI_RULE, old);
+        let source = ClientRules::new(Some((config.clone(), dir.path().join("organization.toml"))));
+        assert_eq!(source.current().len(), 1);
+
+        // The same length and the same old time: the stat alone decides.
+        let blank = " ".repeat(OPENAI_RULE.len());
+        write(&blank, old);
+        assert_eq!(source.current().len(), 1);
+
+        // A new time is a new stamp, so the file is read again.
+        write(&blank, old + Duration::from_secs(10));
+        assert_eq!(source.current(), Vec::<StoreRule>::new());
     }
 
     // C2: an organization `deny` holds against a user `allow`, and an
