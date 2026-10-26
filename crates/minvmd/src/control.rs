@@ -460,6 +460,46 @@ impl ProxyPublishStatus {
     }
 }
 
+/// Whether the Box Egress Proxy's listener is live (BEP-062): the fact the
+/// guest report door answers [`BoxControlRequest::ProxyListening`] from.
+///
+/// The doors are bound before the proxy starts, so the cell starts empty
+/// and the supervisor attaches the proxy's own `listening` flag once it
+/// starts one ([`Self::attach`]). An empty cell answers `false`: a boot
+/// that runs no proxy has no listener, and the in-VM daemon's DNS gate then
+/// answers a steered name SERVFAIL rather than an address that reaches
+/// nothing.
+#[derive(Clone, Default)]
+pub struct BepListening(Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>);
+
+impl BepListening {
+    /// The empty cell the doors are bound with: no proxy, so not listening.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hand the cell the proxy's own `listening` flag: from now on the door
+    /// answers what the flag says.
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    pub(crate) fn attach(&self, listening: Arc<std::sync::atomic::AtomicBool>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listening);
+    }
+
+    /// Whether the proxy's listener is live now: `false` when no proxy was
+    /// attached.
+    pub(crate) fn is_listening(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
 /// Resolve the control socket's path: `<provider dir>/control.sock`, the
 /// dir the CLI resolves the ssh socket under, so the client finds both by
 /// the same rule.
@@ -512,6 +552,7 @@ pub fn spawn(
                 boxes,
                 answerer,
                 proxy_publish,
+                &BepListening::new(),
                 ControlDoor::Host,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
@@ -548,6 +589,26 @@ pub fn spawn_guest_reports_door(
     answerer: AnswererStatus,
     proxy_publish: ProxyPublishStatus,
 ) -> std::io::Result<PathBuf> {
+    spawn_guest_reports_door_with_proxy(
+        control_sock_path,
+        boxes,
+        answerer,
+        proxy_publish,
+        BepListening::new(),
+    )
+}
+
+/// [`spawn_guest_reports_door`], with the Box Egress Proxy's listener cell
+/// the door answers [`BoxControlRequest::ProxyListening`] from (BEP-062).
+/// The supervisor binds the door through this, and attaches the proxy's
+/// flag to `bep_listening` once the proxy starts.
+pub fn spawn_guest_reports_door_with_proxy(
+    control_sock_path: &Path,
+    boxes: BoxRegistry,
+    answerer: AnswererStatus,
+    proxy_publish: ProxyPublishStatus,
+    bep_listening: BepListening,
+) -> std::io::Result<PathBuf> {
     let sock_path = control_sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
     crate::sock::check_uds_path_len(&sock_path)?;
     crate::sock::prepare_socket_dir(&sock_path)?;
@@ -573,6 +634,7 @@ pub fn spawn_guest_reports_door(
                 boxes,
                 answerer,
                 proxy_publish,
+                &bep_listening,
                 ControlDoor::GuestReports,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
@@ -601,11 +663,16 @@ pub fn spawn_guest_reports_door(
 /// apply one at a time, in the order their requests were read and
 /// validated ([`ApplyOrder`]): the read, the ask hand-off and the guest
 /// door's drain stay concurrent, and only the registry write takes turns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the door's shared state, handed to each connection's thread"
+)]
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
     proxy_publish: ProxyPublishStatus,
+    bep_listening: &BepListening,
     door: ControlDoor,
     audit_path: &Path,
     cap: usize,
@@ -635,6 +702,7 @@ fn accept_loop(
                 let boxes = boxes.clone();
                 let answerer = answerer.clone();
                 let proxy_publish = proxy_publish.clone();
+                let bep_listening = bep_listening.clone();
                 let audit_path = audit_path.to_path_buf();
                 let order = Arc::clone(&order);
                 if let Err(error) = std::thread::Builder::new()
@@ -646,6 +714,7 @@ fn accept_loop(
                             &boxes,
                             &answerer,
                             &proxy_publish,
+                            &bep_listening,
                             door,
                             &audit_path,
                             &order,
@@ -663,11 +732,16 @@ fn accept_loop(
 }
 
 /// Serve one request: read the line, dispatch the verb, answer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the door's shared state, passed through as accept_loop holds it"
+)]
 fn serve_connection(
     stream: UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     proxy_publish: &ProxyPublishStatus,
+    bep_listening: &BepListening,
     door: ControlDoor,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
@@ -821,6 +895,7 @@ fn serve_connection(
             boxes,
             answerer,
             proxy_publish,
+            bep_listening,
             door,
             audit_path,
             order,
@@ -910,6 +985,7 @@ fn serve_request(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     proxy_publish: &ProxyPublishStatus,
+    bep_listening: &BepListening,
     door: ControlDoor,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
@@ -951,6 +1027,16 @@ fn serve_request(
                             !record.is_task_row() && asked.to_bytes() == record.box_id()
                         })
                     }),
+            };
+            write_reply(stream, &reply)
+        }
+        // A read of the host's own proxy, like the row read: no ticket.
+        // The proxy runs on the host, so the in-VM daemon asks here before
+        // its DNS gate answers a steered name with the proxy's address
+        // (BEP-062). A boot that runs no proxy answers `false`.
+        (BoxControlRequest::ProxyListening, ControlDoor::GuestReports) => {
+            let reply = BoxControlReply::ProxyListening {
+                listening: bep_listening.is_listening(),
             };
             write_reply(stream, &reply)
         }
@@ -1325,6 +1411,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::SubscribeAsks(_) => "subscribe_asks",
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
+        BoxControlRequest::ProxyListening => "proxy_listening",
     }
 }
 
@@ -3036,6 +3123,9 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
+            other @ BoxControlReply::ProxyListening { .. } => {
+                panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -3512,6 +3602,9 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
+            other @ BoxControlReply::ProxyListening { .. } => {
+                panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -3629,6 +3722,11 @@ mod tests {
                 other @ BoxControlReply::RowStanding { .. } => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
+                other @ BoxControlReply::ProxyListening { .. } => {
+                    panic!(
+                        "a box verb is never answered with a proxy-listening read, got {other:?}"
+                    )
+                }
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
@@ -3696,6 +3794,9 @@ mod tests {
             }
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
+            }
+            other @ BoxControlReply::ProxyListening { .. } => {
+                panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
@@ -4524,6 +4625,66 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the audit copy is owner-only, got {mode:o}");
+    }
+
+    /// BEP-062: the guest door answers the proxy-listening read from the
+    /// proxy's own `listening` flag, and `false` while no proxy runs. The
+    /// host's socket does not serve the read: the question is the in-VM
+    /// daemon's.
+    #[test]
+    fn guest_door_answers_proxy_listening() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let _host = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )
+        .expect("the host socket binds");
+        let bep_listening = BepListening::new();
+        let door = spawn_guest_reports_door_with_proxy(
+            &sock_path,
+            boxes,
+            answerer,
+            proxy_publish,
+            bep_listening.clone(),
+        )
+        .expect("the guest door binds");
+        for _ in 0..500 {
+            if TestStream::connect(&door).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let listening = || match control(&door, &BoxControlRequest::ProxyListening)
+            .expect("the read is answered")
+        {
+            BoxControlReply::ProxyListening { listening } => listening,
+            other => panic!("the read is answered with its own reply, got {other:?}"),
+        };
+
+        assert!(!listening(), "no proxy runs, so nothing listens");
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        bep_listening.attach(Arc::clone(&flag));
+        assert!(!listening(), "a started proxy that has not bound yet");
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        assert!(listening(), "the proxy's listener is live");
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        assert!(!listening(), "the proxy stopped listening");
+
+        match control(&sock_path, &BoxControlRequest::ProxyListening)
+            .expect("the host socket answers")
+        {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("proxy_listening"),
+                "the refusal names the verb: {error}"
+            ),
+            other => panic!("the host socket refuses the read, got {other:?}"),
+        }
     }
 
     /// NET-138: the guest door's row-standing read answers from the asking
@@ -5737,6 +5898,7 @@ mod tests {
                 boxes,
                 answerer,
                 proxy_publish,
+                &BepListening::new(),
                 ControlDoor::Host,
                 &audit_path,
                 1,

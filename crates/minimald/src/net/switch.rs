@@ -1456,6 +1456,16 @@ pub struct BoxGate {
     quic443_log: Quic443RejectLog,
 }
 
+/// The names a credentialed box's lookups are steered for: the GitHub
+/// module's host set, the one credential module (BEP-062).
+fn credential_module_hosts() -> Vec<&'static str> {
+    bep::module::GITHUB
+        .hosts
+        .iter()
+        .map(|authority| authority.host)
+        .collect()
+}
+
 impl BoxGate {
     /// Builds a gate from a session's whole policy: the declared internal ports
     /// per transport (TCP and UDP separately) drive the inbound half, the
@@ -1475,6 +1485,32 @@ impl BoxGate {
         policy: &boxes::BoxPolicy,
         subnet: SwitchSubnet,
         hostname_proxy_port: Option<u16>,
+    ) -> Self {
+        // A gate built with no switch's listener state steers with a state
+        // that stays down, so a steered name fails closed (BEP-062).
+        Self::for_session_steered(
+            label,
+            lease,
+            policy,
+            subnet,
+            hostname_proxy_port,
+            super::dns::ProxyListenerState::down(),
+        )
+    }
+
+    /// [`Self::for_session`], with the switch's shared state of the Box
+    /// Egress Proxy's listener. When the box's steering resolves to `dns`
+    /// or `both`, its DNS gate answers the credential module's names itself
+    /// (BEP-062, BEP-078): the proxy's address on this switch while
+    /// `listener` reads live, and SERVFAIL while it reads down.
+    #[must_use]
+    pub(crate) fn for_session_steered(
+        label: String,
+        lease: Ipv4Addr,
+        policy: &boxes::BoxPolicy,
+        subnet: SwitchSubnet,
+        hostname_proxy_port: Option<u16>,
+        listener: super::dns::ProxyListenerState,
     ) -> Self {
         // The one egress compilation this box's frames are decided by, shared
         // with the DNS gate below — so a name's admission and a frame's
@@ -1497,6 +1533,12 @@ impl BoxGate {
             infrastructure,
             subnet.host_alias().octets(),
             Arc::clone(&limiter),
+        )
+        .with_steering(
+            policy,
+            &credential_module_hosts(),
+            subnet.box_egress_proxy_address(),
+            listener,
         );
         // The reset channel the legs synthesize refusals through: created with
         // the gate, its receiving half leaves it when the relay's spawn takes
@@ -7582,5 +7624,248 @@ pub(crate) mod tests {
         let mut harness = spawn_test_relay(&policy);
         assert!(!harness.gate.as_ref().unwrap().quic443_blocked());
         assert_eq!(first_forwarded(&mut harness, &quic).await, quic);
+    }
+
+    /// The relay's steered-lookup proofs (BEP-062): a box gate built the
+    /// way the attach builds it, over a switch whose report door is a
+    /// stand-in that answers the proxy-listening read from a flag.
+    mod steered_lookups {
+        use super::*;
+        use crate::net::dns::ProxyListenerState;
+        use crate::net::policy::ControlChannel;
+        use hickory_proto::op::{Message, ResponseCode};
+        use hickory_proto::rr::{RData, RecordType};
+        use std::net::SocketAddrV4;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A `dns`-steered box (no steering declared resolves to `dns`) that
+        /// allows the GitHub module's names.
+        fn steered_policy() -> boxes::BoxPolicy {
+            boxes::BoxPolicy {
+                egress: Some(boxes::EgressPolicy {
+                    allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                    allow_subnets: Some(Vec::new()),
+                    allow_dns_hosts: Some(
+                        credential_module_hosts()
+                            .iter()
+                            .map(|host| (*host).to_string())
+                            .collect(),
+                    ),
+                    deny_subnets: None,
+                }),
+                ingress: None,
+                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                quic443: None,
+            }
+        }
+
+        /// The box's gate, steered with `listener`, at the default subnet.
+        fn steered_box_gate(listener: ProxyListenerState) -> BoxGate {
+            BoxGate::for_session_steered(
+                "100.64.0.20".to_string(),
+                Ipv4Addr::new(100, 64, 0, 20),
+                &steered_policy(),
+                SwitchSubnet::default(),
+                None,
+                listener,
+            )
+        }
+
+        /// The gate's answer to the box's A lookup of `name`, parsed: the
+        /// relay answers a steered name itself and never forwards it.
+        fn lookup(gate: &BoxGate, name: &str) -> Message {
+            let query = crate::net::dns_gate::tests::dns_query(name, RecordType::A);
+            let resolver = SocketAddrV4::new(SwitchSubnet::default().dns_server(), 53);
+            let reply = gate
+                .dns
+                .intercept_query(&resolver, &query)
+                .unwrap_or_else(|| panic!("{name} is answered at the relay, never forwarded"));
+            Message::from_vec(&reply).expect("the relay's reply parses")
+        }
+
+        /// The A addresses in `reply`.
+        fn addresses(reply: &Message) -> Vec<Ipv4Addr> {
+            reply
+                .answers
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::A(address) => Some(address.0),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A stand-in for the VM host daemon's report door at `door`: it
+        /// answers the proxy-listening read from `listening`.
+        fn proxy_door(
+            door: &std::path::Path,
+            listening: Arc<AtomicBool>,
+        ) -> tokio::task::JoinHandle<()> {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+            let listener =
+                tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
+            crate::traced::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    if tokio::io::BufReader::new(read)
+                        .read_line(&mut line)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let request = serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(
+                        line.trim(),
+                    )
+                    .expect("the report door's request line parses");
+                    assert_eq!(request, minimald_rpc::BoxControlRequest::ProxyListening);
+                    let mut reply = serde_json_lenient::to_string(
+                        &minimald_rpc::BoxControlReply::ProxyListening {
+                            listening: listening.load(Ordering::Acquire),
+                        },
+                    )
+                    .expect("the reply serialises");
+                    reply.push('\n');
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the client may already have given up on the reply"
+                    )]
+                    let _ = write.write_all(reply.as_bytes()).await;
+                }
+            })
+        }
+
+        /// Looks `name` up until the relay answers it with `rcode`, past the
+        /// listener state's cache, and answers that reply.
+        async fn lookup_until(gate: &BoxGate, name: &str, rcode: ResponseCode) -> Message {
+            let deadline = tokio::time::Instant::now() + crate::net::dns::PROXY_LISTENER_CACHE * 5;
+            loop {
+                let reply = lookup(gate, name);
+                if reply.metadata.response_code == rcode {
+                    return reply;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{name} never answered {rcode:?}: last {:?}",
+                    reply.metadata.response_code
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// BEP-062: with the proxy stopped, a `dns`-steered box's lookup of
+        /// github.com is SERVFAIL and never a real address, and the daemon
+        /// log names the box and the name.
+        #[tokio::test]
+        async fn a_dns_steered_box_gets_servfail_while_the_proxy_is_down() {
+            let capture = crate::test_harness::captured_log();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let listening = Arc::new(AtomicBool::new(false));
+            let door_task = proxy_door(&door, Arc::clone(&listening));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+            let listener =
+                ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone()));
+            assert!(!listener.refresh().await, "the host says the proxy is down");
+            let gate = steered_box_gate(listener);
+            for name in ["github.com.", "api.github.com."] {
+                let reply = lookup(&gate, name);
+                assert_eq!(
+                    reply.metadata.response_code,
+                    ResponseCode::ServFail,
+                    "{name}"
+                );
+                assert!(
+                    addresses(&reply).is_empty(),
+                    "{name}: SERVFAIL carries no address"
+                );
+            }
+            let logged = capture.contents();
+            for expected in [
+                "answered SERVFAIL for a steered name",
+                "name=github.com",
+                "session_id=100.64.0.20",
+            ] {
+                assert!(
+                    logged.contains(expected),
+                    "the log carries {expected:?}: {logged}"
+                );
+            }
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
+        /// BEP-062: once the host reports the proxy's listener live, the
+        /// same lookup resolves to the proxy's address on the switch, with
+        /// one info line; when it stops again, the lookup fails closed.
+        #[tokio::test]
+        async fn a_steered_name_resolves_to_the_proxy_once_its_listener_is_live() {
+            let capture = crate::test_harness::captured_log();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let listening = Arc::new(AtomicBool::new(false));
+            let door_task = proxy_door(&door, Arc::clone(&listening));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+            let gate = steered_box_gate(ProxyListenerState::for_switch(&ControlChannel::Unix(
+                control_sock.clone(),
+            )));
+            lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+
+            // The lookups themselves ask the host again once the last answer
+            // is stale: nothing but the proxy's own flag changes here.
+            listening.store(true, Ordering::Release);
+            let reply = lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
+            assert_eq!(
+                addresses(&reply),
+                vec![SwitchSubnet::default().box_egress_proxy_address()],
+                "the steered name resolves to the proxy, never a real address"
+            );
+            assert!(
+                capture
+                    .contents()
+                    .contains("the Box Egress Proxy's listener is live"),
+                "the listener's return writes one info line"
+            );
+
+            listening.store(false, Ordering::Release);
+            lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
+        /// BEP-062: a native host runs no proxy and has no VM host daemon to
+        /// ask, so a steered name always gets SERVFAIL.
+        #[tokio::test]
+        async fn a_native_host_steered_name_gets_servfail() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control = ControlChannel::Unix(dir.path().join("gvproxy.sock"));
+            let listener = ProxyListenerState::for_switch(&control);
+            assert!(!listener.refresh().await, "a native host has no one to ask");
+            for gate in [
+                steered_box_gate(listener),
+                // A gate built without the switch's state steers too.
+                BoxGate::for_session(
+                    "100.64.0.21".to_string(),
+                    Ipv4Addr::new(100, 64, 0, 21),
+                    &steered_policy(),
+                    SwitchSubnet::default(),
+                    None,
+                ),
+            ] {
+                for _ in 0..3 {
+                    let reply = lookup(&gate, "github.com.");
+                    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+                    assert!(addresses(&reply).is_empty());
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 }

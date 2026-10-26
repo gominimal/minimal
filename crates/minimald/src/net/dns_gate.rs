@@ -498,10 +498,6 @@ impl DnsGate {
     /// never forwarded: an A lookup gets `proxy` while the listener is live
     /// and SERVFAIL while it is down, and every other record type gets
     /// NODATA.
-    // Interim until https://github.com/gominimal/minimal/issues/2523: no
-    // production code calls this yet. Remove the allow when
-    // BoxGate::for_session calls it with a shared ProxyListenerState.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn with_steering(
         mut self,
