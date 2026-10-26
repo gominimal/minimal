@@ -481,7 +481,7 @@ mod keychain {
             let public = key
                 .public_key()
                 .and_then(|public| public.external_representation())
-                .and_then(|bytes| ProxyPublicKey::from_sec1_bytes(&bytes.to_vec()))
+                .and_then(|bytes| ProxyPublicKey::from_sec1_bytes(&bytes))
                 .ok_or_else(|| refused(role, "the key has no P-256 public half"))?;
             Ok(Self { role, key, public })
         }

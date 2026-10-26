@@ -515,8 +515,15 @@ async fn task_producer(
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
-                let mut child = cmd
-                    .spawn()
+                // On the fork thread, never this one: hakoniwa arms
+                // `PR_SET_PDEATHSIG(SIGKILL)` in the container, so it dies
+                // with the thread that forked it, and a runtime worker is
+                // retired ~10 s after any `block_in_place` displaces it (see
+                // `sandbox::forker`). #1748 moved the session launch and
+                // `Sandbox::run_with_cancel` there; this spawn, a task run's,
+                // stayed on the worker, and idle task sessions died with it
+                // (inbox#710).
+                let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;

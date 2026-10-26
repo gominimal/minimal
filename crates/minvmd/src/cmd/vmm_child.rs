@@ -115,7 +115,10 @@ fn run_vmm() -> Result<()> {
         .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
     // Capture is diagnostics, not a boot dependency: any failure — creating
     // the file or wiring the console — warns and boots on, never propagates.
-    if let Err(e) = std::fs::File::create(&boot_log) {
+    // The log is 0640 (BEP-047): the VM user writes it, and the login reads
+    // it through the `minimal-vmm` group for `min diag`. The mode is set on
+    // the descriptor too, because a log from an earlier boot keeps its own.
+    if let Err(e) = create_boot_log(&boot_log) {
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
     } else if let Err(e) = ctx.set_console_output(&boot_log) {
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot wire console to boot log; console discarded");
@@ -272,4 +275,42 @@ fn start_timekeep(ctx: &mut crate::krun::Context) -> Result<()> {
         "registered host→guest timekeep bridge",
     );
     Ok(())
+}
+
+/// Create or truncate the boot log at `path` with mode 0640, never with
+/// the mode the umask gives (design fact 4).
+#[cfg(any(minvmd_libkrun, test))]
+fn create_boot_log(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o640))
+}
+
+#[cfg(test)]
+mod tests {
+    /// BEP-047: the boot log is 0640, also when a log from an earlier boot
+    /// had another mode.
+    #[test]
+    fn boot_log_is_created_0640() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("boot.log");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        super::create_boot_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o640);
+        std::fs::write(&log, b"old boot").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o666)).unwrap();
+        super::create_boot_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o640);
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            0,
+            "truncated each boot"
+        );
+    }
 }

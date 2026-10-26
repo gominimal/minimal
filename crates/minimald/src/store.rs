@@ -67,12 +67,25 @@ pub struct Store {
     receiver: mpsc::Receiver<StoreMessage>,
     weak_self: WeakStoreHandle,
     store: DiskLoader,
+    /// Mints the id of each record this store creates. Production's is
+    /// [`SessionId::mint`]; a test hands one that repeats an id, to drive
+    /// the collision refusal.
+    mint: fn() -> SessionId,
 }
 
 impl Store {
     /// Launches the session store actor, managing session records in
     /// the given minimal state dir.
     pub async fn init(minimal_state_dir: DaemonAbsPath) -> Result<StoreHandle, std::io::Error> {
+        Self::init_with_mint(minimal_state_dir, SessionId::mint).await
+    }
+
+    /// [`Store::init`] with the id minter `mint` in place of
+    /// [`SessionId::mint`].
+    pub(crate) async fn init_with_mint(
+        minimal_state_dir: DaemonAbsPath,
+        mint: fn() -> SessionId,
+    ) -> Result<StoreHandle, std::io::Error> {
         let l = DiskLoader::new(minimal_state_dir.clone())?;
 
         let (sender, receiver) = mpsc::channel(8);
@@ -82,6 +95,7 @@ impl Store {
             receiver,
             weak_self,
             store: l,
+            mint,
         };
 
         // Lives for the daemon: a root of its own (see `traced::spawn_detached`).
@@ -105,6 +119,26 @@ impl Store {
         }
     }
 
+    /// Files `record` under a freshly minted id (BOX-001). The id the
+    /// record carries is overwritten: a client never names a box's id. A
+    /// minted id that a retained record already names refuses the
+    /// creation and leaves the store unchanged (BEP-070).
+    fn create(&mut self, mut record: Record) -> Result<DiskBoxKey, std::io::Error> {
+        let id = (self.mint)();
+        if self.store.find_by_id(&id)?.is_some() {
+            tracing::warn!(
+                box_id = %id,
+                "refused a create: the minted box id is already held by a retained record"
+            );
+            return Err(std::io::Error::other(format!(
+                "the new session's id {id} is already in use by another session. \
+                 No session was created. Run the command again."
+            )));
+        }
+        record.id = id;
+        self.store.create_with_id(record)
+    }
+
     /// Wraps a key in a record handle. The caller awaiting this message holds a
     /// strong [`StoreHandle`], so the upgrade always succeeds.
     fn handle_for(&self, k: DiskBoxKey) -> BoxRecordHandle {
@@ -124,7 +158,7 @@ impl Store {
                 let _ = r.send(Ok(self.store.keys().map(|k| self.handle_for(k)).collect()));
             }
             StoreMessage::Create(record, r) => {
-                let created = self.store.create(*record);
+                let created = self.create(*record);
                 let _ = r.send(created.map(|k| self.handle_for(k)));
             }
             StoreMessage::Find(pred, r) => {
@@ -185,7 +219,8 @@ impl StoreHandle {
     }
 
     /// Creates a record, returning a handle to it. The record's `id` is
-    /// ignored — the store allocates the real one.
+    /// ignored — the store mints the real one, and refuses the creation
+    /// when a retained record already names it.
     pub async fn create(&self, record: Record) -> Result<BoxRecordHandle, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -398,6 +433,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         }
     }
@@ -415,6 +453,59 @@ mod tests {
             ids.push(*handle.create(r).await.unwrap().id());
         }
         (handle, ids)
+    }
+
+    /// BOX-001, BEP-070: a minted id that a retained record already names
+    /// refuses the creation, and the store is unchanged after it.
+    #[tokio::test]
+    async fn colliding_box_id_refuses_creation() {
+        static HELD: std::sync::OnceLock<SessionId> = std::sync::OnceLock::new();
+        fn mint_the_held_id() -> SessionId {
+            *HELD
+                .get()
+                .expect("the held id is set before the store mints")
+        }
+
+        let dir = TempDir::new().unwrap();
+        let held = {
+            let (store, ids) = store_seeded_with(&dir, [record_named("held")]).await;
+            let held = open(&store, RecordPredicate::Id(ids[0]))
+                .await
+                .record()
+                .await
+                .unwrap();
+            assert_eq!(held.id, ids[0]);
+            held
+        };
+        HELD.set(held.id).unwrap();
+
+        let store = Store::init_with_mint(daemon_dir(&dir), mint_the_held_id)
+            .await
+            .unwrap();
+        let err = store
+            .create(record_named("other"))
+            .await
+            .expect_err("a minted id a retained record names is refused");
+        assert!(
+            err.to_string().contains("already in use"),
+            "the refusal says what happened: {err}"
+        );
+
+        assert_eq!(stored_ids(&store).await, BTreeSet::from([held.id]));
+        assert!(
+            store
+                .find(RecordPredicate::Name("other".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused record is not filed"
+        );
+        let after = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
+            .await
+            .unwrap();
+        assert_eq!(after, held, "the retained record is unchanged");
     }
 
     /// Resolve a handle to a record expected to exist.

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Kill leftover microVM host processes a failed or killed session can strand:
-# minvmd, its detached __krun-vmm grandchild, and the gvproxy switch. Any of
-# them wedges the next VM's host->guest vsock bridge (the leftover-wedge
-# class). Best-effort, and sudo because a relay leftover can be root-owned.
-# `sudo -n` keeps it non-interactive: without passwordless sudo it fails fast
+# minvmd, its detached __krun-vmm grandchild, the gvproxy switch, and the
+# `bep serve` box egress proxy beside it. Any of the first three wedges the
+# next VM's host->guest vsock bridge (the leftover-wedge class); a leftover
+# proxy holds its listener socket and a dead boot's token (#2501).
+# Best-effort, and sudo because a relay leftover can be root-owned. `sudo -n`
+# keeps it non-interactive: without passwordless sudo it fails fast
 # instead of blocking on a password prompt in CI. The proper fix is
 # harness-side process-group reaping, tracked separately.
 #
 # Matching is scoped to THIS checkout's binaries: the persistent leftovers all
 # carry the absolute repo path in their cmdline (minvmd's supervisor and
 # __krun-vmm re-exec via current_exe(); gvproxy is spawned from the full
-# MINVMD_GVPROXY_BIN path), so a bare-name pkill would only add collateral —
+# MINVMD_GVPROXY_BIN path; `bep` runs from beside minvmd, or from
+# MINVMD_BEP_BIN), so a bare-name pkill would only add collateral —
 # an unrelated checkout's live VM, or podman's gvproxy.
 #
 # Usage: scripts/reap-vms.sh [--vm <NAME>] [--root <DIR>]
@@ -24,7 +27,8 @@
 # processes are matched: every minvmd re-exec of a named VM carries
 # `--vm <NAME>` on its cmdline (the detached supervisor and its __krun-vmm
 # child), and the VM's gvproxy switch carries the per-name socket directory in
-# its argv (`.../local-minvmd0/<NAME>/gvproxy-switch.sock`). Other VMs of this
+# its argv (`.../local-minvmd0/<NAME>/gvproxy-switch.sock`), as the VM's
+# proxy does (`.../local-minvmd0/<NAME>/gvproxy-bep.sock`). Other VMs of this
 # checkout — and every other checkout's VMs — keep running.
 #
 # `--vm default` is the bare invocation, not a name search: the default VM's
@@ -112,11 +116,27 @@ gvproxy_pat() {
   fi
 }
 
+# The `pkill -f` pattern for this checkout's `bep serve` proxies. A VM's
+# proxy listens on `gvproxy-bep.sock` in that VM's socket directory, the
+# default VM's directly under `local-minvmd<N>/`, a named VM's under
+# `local-minvmd<N>/<NAME>/`. SIGKILL, so a leftover proxy gets no chance to
+# run on with a dead boot's token.
+bep_pat() {
+  if [ -n "$VM" ]; then
+    printf '%s/.*/bep serve .*local-minvmd[0-9]+/%s/gvproxy-bep\\.sock' \
+      "$ROOT_RE" "$(ere_quote "$VM")"
+  else
+    printf '%s/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock' "$ROOT_RE"
+  fi
+}
+
 # SIGKILL, because a VM in `krun_start_enter` ignores SIGTERM: a plain pkill
 # leaves exactly the leftover this script exists to remove.
 # User-owned leftovers first — this must not depend on sudo succeeding.
 pkill -9 -f "$(minvmd_pat)" 2>/dev/null || true
 pkill -9 -f "$(gvproxy_pat)" 2>/dev/null || true
+pkill -9 -f "$(bep_pat)" 2>/dev/null || true
 # Root-owned relay leftovers need sudo; -n fails fast without passwordless sudo.
 sudo -n pkill -9 -f "$(minvmd_pat)" 2>/dev/null || true
 sudo -n pkill -9 -f "$(gvproxy_pat)" 2>/dev/null || true
+sudo -n pkill -9 -f "$(bep_pat)" 2>/dev/null || true
