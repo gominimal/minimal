@@ -962,9 +962,38 @@ pub(crate) fn stamp_project_root(
     dir: &camino::Utf8Path,
 ) -> Result<(), anyhow::Error> {
     let root = resolve_upload_root(dir)?;
+    set_project_root(request, root)
+}
+
+/// Puts `root` on the create request as the box's project root (BOX-001).
+fn set_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    root: camino::Utf8PathBuf,
+) -> Result<(), anyhow::Error> {
     request.config.project_root =
         Some(paths::HostAbsPath::try_new(root).context("Invalid project root")?);
     Ok(())
+}
+
+/// The project root to record for an activation from `dir`. Tarball sync
+/// already resolved it as `upload_root`, so it is reused. `--sync none`
+/// skips the upload, and a broken `minimal.toml` must not fail it (#770):
+/// the root is only metadata there, so the lookup falls back to `dir`.
+fn activation_project_root(
+    upload_root: Option<&camino::Utf8Path>,
+    dir: &camino::Utf8Path,
+) -> camino::Utf8PathBuf {
+    match upload_root {
+        Some(root) => root.to_path_buf(),
+        None => resolve_upload_root(dir).unwrap_or_else(|err| {
+            tracing::debug!(
+                %dir,
+                error = %err,
+                "project root lookup failed under --sync none; recording the directory"
+            );
+            dir.to_path_buf()
+        }),
+    }
 }
 
 pub(crate) async fn activate_box(
@@ -1250,9 +1279,12 @@ pub(crate) async fn activate_box(
                 SyncMode::None => None,
                 SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
             };
-            // The record's project root (BOX-001) is resolved under every
+            // The record's project root (BOX-001) is set under every
             // `--sync` mode, `none` included.
-            stamp_project_root(&mut request, &utf8_path)?;
+            set_project_root(
+                &mut request,
+                activation_project_root(upload_root.as_deref(), &utf8_path),
+            )?;
 
             // Skip the upload without prompting when the resolved root is an
             // empty directory or `$HOME` — unless the user asked for it with an
@@ -2372,6 +2404,23 @@ mod tests {
             Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
         );
         assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// BOX-001, #770: under `--sync none` a broken `minimal.toml` does not
+    /// fail the activation. The directory is recorded as the project root.
+    #[test]
+    fn sync_none_records_the_directory_when_minimal_toml_is_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+
+        assert_eq!(activation_project_root(None, path), path.to_path_buf());
+
+        let resolved = camino::Utf8Path::new("/resolved/root");
+        assert_eq!(
+            activation_project_root(Some(resolved), path),
+            resolved.to_path_buf()
+        );
     }
 
     #[test]
