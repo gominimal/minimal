@@ -12,7 +12,7 @@ use std::io::{IsTerminal as _, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use bep::store::{HostStore, NATIVE_STORE, SecretStore, StoreError, proxy_binary_path, valid_id};
+use bep::store::{HostStore, NATIVE_STORE, ProxyLookupError, SecretStore, StoreError, valid_id};
 use boxes::core::bep::{StoreAction, StoreRuleConfig, StoreRules};
 use zeroize::Zeroizing;
 
@@ -79,89 +79,37 @@ fn proxy_path() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// The proxy that the running `minvmd` starts: the variable's path when it
-/// is set and not empty, else `bep` beside the first `minvmd` on `path`.
+/// The proxy that the running `minvmd` starts, by the shared rule
+/// [`bep::store::proxy_binary_on_path`]: the variable's path when it is set
+/// and not empty, else `bep` beside the first `minvmd` on `path`.
 /// `autospawn` starts `minvmd` with `Command::new("minvmd")`, which finds
 /// it on `PATH` in the same way. The `minvmd` that autospawn starts gets
 /// this process's environment, so it reads the same variable.
 ///
-/// The item's access control trusts this path, so it is absolute. A
-/// relative variable is refused, and an empty or relative `PATH` entry is
-/// skipped, so a program in the current directory never becomes the
-/// trusted one. A path that exists comes back canonical. A path that does
-/// not exist comes back as is, and `run_set` refuses it.
+/// A relative variable is refused, and `PATH` gives only absolute paths.
+/// A path that exists comes back canonical. A path that does not exist
+/// comes back as is, and `run_set` refuses it.
 ///
 /// The error text names no command. `set` and `list` each add their own.
-///
-/// This rule and `resolve_bep_binary` in `crates/minvmd/src/cmd/run.rs`
-/// predict the same program. One owner for the rule:
-/// <https://github.com/gominimal/minimal/issues/2527>.
 pub(crate) fn resolve_proxy(
     env: Option<&std::ffi::OsStr>,
     path: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<PathBuf> {
-    let proxy = match env.filter(|v| !v.is_empty()) {
-        Some(env) => {
-            let env = Path::new(env);
-            if !env.is_absolute() {
-                bail!(
-                    "{var} is the relative path {}. \
-                     Set {var} to the absolute path of the `bep` program, and run the command again.",
-                    env.display(),
-                    var = bep::store::PROXY_BIN_ENV
-                );
-            }
-            env.to_path_buf()
-        }
-        None => {
-            let Some(minvmd) = find_on_path("minvmd", path) else {
-                bail!(
-                    "no `minvmd` program is on PATH, \
-                     and `min secret` looks for the `bep` program beside it. \
-                     Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
-                    bep::store::PROXY_BIN_ENV
-                );
-            };
-            proxy_binary_path(None, &exe_path(minvmd))
-        }
-    };
-    Ok(std::fs::canonicalize(&proxy).unwrap_or(proxy))
-}
-
-/// The path that `current_exe()` gives in a program started from `path`.
-///
-/// Review finding 4369647106: the daemon takes `bep` beside its
-/// `current_exe()`. On Linux that path has its symbolic links resolved, so
-/// a `minvmd` on PATH that is a link resolves here too. On macOS
-/// `current_exe()` is `_NSGetExecutablePath`, which gives the path that
-/// started the program and can be the link itself, so the path stays as is.
-fn exe_path(path: PathBuf) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        path
-    } else {
-        std::fs::canonicalize(&path).unwrap_or(path)
+    match bep::store::proxy_binary_on_path(env, path) {
+        Ok(proxy) => Ok(proxy),
+        Err(ProxyLookupError::RelativeEnv(env)) => bail!(
+            "{var} is the relative path {}. \
+             Set {var} to the absolute path of the `bep` program, and run the command again.",
+            env.display(),
+            var = bep::store::PROXY_BIN_ENV
+        ),
+        Err(ProxyLookupError::NoMinvmd) => bail!(
+            "no `minvmd` program is on PATH, \
+             and `min secret` looks for the `bep` program beside it. \
+             Put `minvmd` on PATH, or set {} to the path of the `bep` program, and run the command again.",
+            bep::store::PROXY_BIN_ENV
+        ),
     }
-}
-
-/// The first executable file `name` in the absolute directories of `path`,
-/// in the order that `execvp` tries them. An empty or relative entry names
-/// a directory under the current one, so it is skipped.
-fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    std::env::split_paths(path?)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 /// `min secret set`.
@@ -1054,18 +1002,18 @@ attributes:
         assert!(store.value("claude").is_none());
 
         // The path is `bep` beside `minvmd`, or the variable's path.
-        let minvmd = Path::new("/opt/minimal/bin/minvmd");
+        let minvmd = || Some(PathBuf::from("/opt/minimal/bin/minvmd"));
         assert_eq!(
-            proxy_binary_path(None, minvmd),
-            PathBuf::from("/opt/minimal/bin/bep")
+            bep::store::proxy_binary_path(None, minvmd),
+            Some(PathBuf::from("/opt/minimal/bin/bep"))
         );
         assert_eq!(
-            proxy_binary_path(Some(std::ffi::OsStr::new("")), minvmd),
-            PathBuf::from("/opt/minimal/bin/bep")
+            bep::store::proxy_binary_path(Some(std::ffi::OsStr::new("")), minvmd),
+            Some(PathBuf::from("/opt/minimal/bin/bep"))
         );
         assert_eq!(
-            proxy_binary_path(Some(std::ffi::OsStr::new("/x/bep")), minvmd),
-            PathBuf::from("/x/bep")
+            bep::store::proxy_binary_path(Some(std::ffi::OsStr::new("/x/bep")), minvmd),
+            Some(PathBuf::from("/x/bep"))
         );
 
         // The anchor is the first executable `minvmd` on PATH, the one that

@@ -563,7 +563,7 @@ Review, audit and revocation
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
   property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
-- **BEP-041** THE SYSTEM SHALL open the audit log for append only and modify or remove no existing record.
+- **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record only by removing a whole segment that BEP-068 retention no longer retains.
   tier:     T0
   verify:   cargo nextest run -p bep audit_log_is_opened_append_only
 
