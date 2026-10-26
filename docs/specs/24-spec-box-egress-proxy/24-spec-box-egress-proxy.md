@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-10-18
+updated: 2026-10-26
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -475,15 +475,31 @@ Store references
 - **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle of JWS `typ` `gatehouse-store-handle+jws`, signed under the client's local key, carrying the box id (`sub`), the host (`node_id`), the store, the identifier, the registered upstream authorities, the injection form, the issue time (`iat`), a unique handle id (`jti`) and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request and item deletion revokes it at once, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request, item deletion revokes it at once, and revoking the signing key by its `kid` ends every handle signed under it, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
   - WHEN the proxy restarts THE SYSTEM SHALL verify store handles under every client key registered before the restart.
     tier:   T0
     verify: cargo nextest run -p bep client_key_registrations_survive_restart
     <!-- event-driven; a registration held only by the running process would refuse every running box's store references after a restart, until the next mint registered the key again -->
   - IF the host keychain refuses the running client its handle-signing key THEN THE SYSTEM SHALL replace the key and register the replacement before minting.
     tier:   T0
-    verify: cargo nextest run -p bep a_client_key_this_program_is_refused_is_replaced
-    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step -->
+    verify: cargo nextest run -p minimal a_refused_client_key_is_replaced_and_registered_before_the_mint
+    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step; the verify line names the client-side test, because `a_client_key_this_program_is_refused_is_replaced` in `bep` proves only that a second registered key goes in beside the first -->
+  - WHEN the control socket's owner revokes a registered client key by its `kid` THE SYSTEM SHALL remove the key from the registry and from the kept registrations before the reply, so no store handle signed under it verifies again, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep a_revoked_client_key_no_longer_verifies_a_store_handle
+    <!-- event-driven; `revoke_client_key` on the control socket; the other registered keys stay; `a_key_removal_survives_a_restart` holds the removal across a restart -->
+  - WHEN the client replaces a client key that the host keychain refused THE SYSTEM SHALL register the replacement with `register_client_key`, then keep the replacement in the keychain, then revoke with `replace_client_key` every other registered key that no running box uses, and keep each key that a running box uses verifying until the last such box ends.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_keeps_verifying_until_its_boxes_end
+    <!-- event-driven; the client cannot read the refused key, so it cannot name its `kid`, and `replace_client_key` revokes every key but the one it carries and those that running boxes use; the [gominimal/arch#144 ruling](https://github.com/gominimal/arch/issues/144#issuecomment-6409882482) keeps the old key verifying until the boxes minted under it end (Gatehouse §6.10), so a replacement is not a cause to re-create a box; each mint names its box in `register_client_key`, the proxy keeps each key's running boxes in the registrations file, so the keep holds across a restart, and `forget_box` at the box's destroy ends the box's use; known gap: a box that ends with no `forget_box`, such as a creation stopped by Ctrl-C before `minvmd` records the box or a box whose `minvmd` stopped, stays in the key's running boxes across restarts, so a retired key keeps verifying with no time limit, also when the client replaced it as suspect, and 16 such boxes make the bound refuse every new key; the proxy holds no list of live boxes to reconcile against, and a maximum age for a retired key would break the keep for a box that runs longer than that age; a failed write of the registrations file when a box ends leaves the ended box in the file, so a restart before a later successful write restores the retired key as in use ([#2617](https://github.com/gominimal/minimal/issues/2617)); a replaced key that a running box uses is retired, and the forget of the last such box revokes it, with an info log line that names its `kid`; on the failure paths the order keeps running boxes redeeming: a proxy that refuses step one leaves the refused key in the store for the next creation to try again, and a store that fails step two leaves every old key registered; a lock file beside the control socket serialises the replacement across `min` processes, so two creations that both meet a refusal revoke once (`a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations`), and a replacement the store does not keep revokes no key (`a_replacement_the_store_does_not_keep_revokes_no_key`) -->
+  - IF the revoke of the other client keys fails after the keychain keeps the replacement THEN THE SYSTEM SHALL keep the replacement registered and revoke again at the next box creation, from the pending-revoke file beside the control socket that names the replacement's `kid`.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke
+    <!-- unwanted; the client writes the file after step one and before step two, so the file exists even when step two fails; the proxy never removes the file, and the client removes it when `replace_client_key` succeeds, at the replacement or at the retry; after a failed step two the store still refuses, so the next creation makes a new key and overwrites the file with that key's `kid`; a file that names a key other than the one the store holds is stale, and the next creation removes it; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
+  - THE SYSTEM SHALL hold at most a bounded count of client keys in the registry, 16 by default, and drop the key registered least recently that no running box uses when a registration passes the bound, or refuse the registration when running boxes use every key, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep the_registry_bound_never_drops_a_key_a_running_box_uses
+    <!-- ubiquitous; the client keeps one key for each user and a replacement revokes the others that no running box uses, so the registry usually holds one key, and the bound limits what other registrations on the socket can add; the bound never drops a key that a running box uses, so no running box loses its store handles or sign-in references to it; when running boxes use every key, the proxy refuses the new key, and the creation fails with "min did not create the box: the Box Egress Proxy already holds 16 client keys, and running boxes use each one. A key is freed when the last box created under it ends." on stderr (`a_replacement_past_a_bound_of_keys_in_use_fails_the_creation`); `the_registry_never_holds_more_keys_than_its_bound` holds the count and the idle period for keys no box uses; `bep serve --max-client-keys <N>` sets the bound, 16 by default (`KeyBound::DEFAULT_MAX_KEYS`), and refuses a value below 1 when the arguments parse (`serve_passes_its_key_bound_to_the_control_socket`); the idle period stays unset until gominimal/arch#85 decides the root validity, and it never drops a key that a running box uses; an embedder that sets a bound above the count of keys in the file keeps every key the file holds (`a_larger_key_bound_keeps_every_key_the_file_holds`); each dropped key is a warn log line -->
   - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
     tier:   T0
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
@@ -633,6 +649,8 @@ Review, audit and revocation
   - IF a minted box id is named by any retained record THEN THE SYSTEM SHALL refuse the creation.
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
+    verify: cargo nextest run -p minvmd colliding_box_id_refused
+    <!-- Limit: both tests prove a collision with a live row, a kept creation or an attachment. The host's collision check does not read the retained revocation records, so a collision with a revocation record alone is not yet refused. [#2585](https://github.com/gominimal/minimal/issues/2585) tracks this gap. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems
