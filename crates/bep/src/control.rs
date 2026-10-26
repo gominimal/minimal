@@ -554,13 +554,15 @@ fn enforce(entries: &mut Vec<Entry>, bound: KeyBound, now: u64, keep: Option<&st
     dropped
 }
 
-/// Whether `bound` admits every key of `entries` at `now`, so that
-/// [`enforce`] drops none of them.
-fn within(entries: &[Entry], bound: KeyBound, now: u64) -> bool {
-    entries.len() <= bound.max_keys.max(1)
+/// Whether [`enforce`] drops none of `entries` at `now`. As there, the key
+/// `keep` and every key that a running box uses are never dropped.
+fn within(entries: &[Entry], bound: KeyBound, now: u64, keep: Option<&str>) -> bool {
+    let droppable = |entry: &&Entry| Some(entry.kid.as_str()) != keep && !entry.in_use();
+    (entries.len() <= bound.max_keys.max(1) || !entries.iter().any(|e| droppable(&e)))
         && bound.idle.is_none_or(|idle| {
             entries
                 .iter()
+                .filter(droppable)
                 .all(|entry| now.saturating_sub(entry.seen) < idle.as_secs())
         })
 }
@@ -737,7 +739,7 @@ impl KeyFile {
             .filter(|&last| last != NEVER_WRITTEN)
             .and_then(|last| now.checked_sub(last))
             .is_some_and(|since| since < self.seen_refresh().as_secs());
-        if unchanged && !replace && recent && within(&entries, self.bound, now) {
+        if unchanged && !replace && recent && within(&entries, self.bound, now, Some(&entry.kid)) {
             if let Some(kept) = entries.iter_mut().find(|e| e.kid == entry.kid) {
                 kept.seen = now;
             }
@@ -870,13 +872,17 @@ impl KeyFile {
         // The end of the box takes effect in memory first, as a revocation
         // does in `replace`, so a failed write leaves no retired key
         // verifying in this process. A failed write leaves the ended box in
-        // the file. Only a later successful write records the end, and a
-        // restart before it restores the retired key as in use (#2617).
+        // the file. The next registration then writes the file again, and a
+        // restart before a successful write restores the retired key as in
+        // use (#2617).
         if entries.len() != before {
             install(&entries, registry);
         }
         if let Err(err) = self.write(&entries) {
             tracing::error!(path = %self.path.display(), %err, "did not record the end of a box that uses a client key");
+            // `register_for` skips the write of a known key only after a
+            // recent successful write.
+            self.written.store(NEVER_WRITTEN, Ordering::Relaxed);
         }
     }
 
@@ -1947,6 +1953,36 @@ mod tests {
         restarted.release(BOX_X, &restored);
         restarted.register(d.clone(), &restored, 60, false).unwrap();
         assert_eq!(held(&restored), [false, false, true, true]);
+    }
+
+    // BEP-063: a key that a running box uses is never dropped, so it does
+    // not take the bound out of the fast path of a known key.
+    #[test]
+    fn the_bound_check_skips_keys_in_use() {
+        const BOX_X: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+        let entry = |byte: u8, seen: u64| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                seen,
+            )
+            .unwrap()
+        };
+        let bound = KeyBound {
+            max_keys: 1,
+            idle: Some(Duration::from_secs(100)),
+        };
+        let (mut a, b) = (entry(1, 0), entry(2, 500));
+        a.boxes.insert(BOX_X.to_owned());
+        // `a` is idle and above the count, but box X uses it.
+        let entries = vec![a.clone(), b.clone()];
+        assert!(within(&entries, bound, 550, Some(&b.kid)));
+        // Without the use, `enforce` drops `a`.
+        a.boxes.clear();
+        let mut entries = vec![a, b.clone()];
+        assert!(!within(&entries, bound, 550, Some(&b.kid)));
+        enforce(&mut entries, bound, 550, Some(&b.kid));
+        assert!(within(&entries, bound, 550, Some(&b.kid)));
     }
 
     // BEP-063: a replacement retires a key that a running box uses, and the
