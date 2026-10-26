@@ -527,9 +527,10 @@ maybe_remove_finalize_install() {
         # The classifier's units, the boot unit first: it re-runs the step at
         # every boot, so left enabled it lays the tree and the table out again.
         # They are disabled before their files go, and before the tree's line.
+        # The QUIC block helper and its sudoers rule go with them (BEP-018).
         _cls_rm=
         _cls_found=
-        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
+        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
             _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
             if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
                 _cls_found="$_cls_p"
