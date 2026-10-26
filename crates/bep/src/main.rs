@@ -216,11 +216,13 @@ where
         };
     }
     let rules = Arc::new(client_store_rules());
-    let started =
-        start(store, &path, &rules.current()).and_then(|(keys, root)| match &args.command {
-            Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules),
-            None => Ok(()),
-        });
+    // One read feeds the root's names and the admitted set, so the proxy
+    // never admits an authority that the published root does not permit.
+    let held = rules.current();
+    let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
+        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held),
+        None => Ok(()),
+    });
     match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -437,18 +439,18 @@ fn client_config_path() -> Option<PathBuf> {
     Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
-/// What identifies one version of a file: its modification time and its
-/// length, or `None` when it is not there.
-type Stamp = Option<(SystemTime, u64)>;
+/// What identifies one version of a file: its content, or `None` when it
+/// does not read. The content, not the modification time and the length,
+/// so an edit that keeps the length inside one timestamp tick is seen.
+type Stamp = Option<Vec<u8>>;
 
 fn stamp(path: &Path) -> Stamp {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    std::fs::read(path).ok()
 }
 
 /// The source of the client's store rules that `bep serve` owns. It holds
-/// the rules of the user and the organization file, and reads them again
-/// when the modification time or the length of either file changes.
+/// the rules of the user and the organization file, and parses them again
+/// when the content of either file changes.
 struct ClientRules {
     /// The user file and the organization file, or `None` with no home
     /// directory.
@@ -470,9 +472,11 @@ impl ClientRules {
         let Some((user, organization)) = &self.paths else {
             return Vec::new();
         };
+        // The files are read before the lock, so one slow read does not
+        // hold up the other redemptions.
         let now = [stamp(user), stamp(organization)];
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.0 != Some(now) {
+        if cache.0.as_ref() != Some(&now) {
             let rules = store_rules_in(user, organization);
             if cache.0.is_some() {
                 tracing::info!(
@@ -936,6 +940,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     keys: ProxyKeys<K>,
     root: RootCertificate,
     rules: Arc<ClientRules>,
+    held: Vec<StoreRule>,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
     // Watched from here, so a supervisor that dies while the proxy starts
@@ -972,8 +977,8 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
     // The store rules' authorities join the admitted set, so a CONNECT to
     // an authority that no module and no rule admits is refused and audited
-    // `off_module`. The set takes the rules at start only (#2618).
-    let held = rules.current();
+    // `off_module`. The set takes the rules that `start` issued the root
+    // under, at start only (#2618).
     let admitted = admission(&held);
     // The file names where the rules came from: the default config dir
     // (see `client_store_rules`).
