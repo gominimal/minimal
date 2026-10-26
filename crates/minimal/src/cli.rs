@@ -97,6 +97,11 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host for problems: today, that no record of the audit log
+    /// was changed or removed
+    // BEP-049: whole-log verification of the audit chain is a `min doctor`
+    // check, never a `min box audit` flag.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
