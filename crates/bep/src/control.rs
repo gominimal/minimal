@@ -117,6 +117,14 @@
 //! < {"ok":true,"kid":"<kid>"}
 //! ```
 //!
+//! At each start, a box in the file that the box registry does not hold
+//! no longer uses its key. Such a box ended with no `forget_box`: its
+//! creation stopped before `minvmd` recorded it, its `minvmd` stopped, or
+//! the file write at its forget failed. `bep serve` lives only as long as
+//! the `minvmd` that started it, so its registry is empty at start, and
+//! every key is free then. A retired key is revoked at that point, with an
+//! info log line that names its `kid`.
+//!
 //! The registry is bounded ([`KeyBound`]): it holds at most a set count of
 //! keys, and drops the key registered least recently that no running box
 //! uses to stay inside it. When running boxes use every key, it refuses a
@@ -683,7 +691,17 @@ impl KeyFile {
     /// Registers every key in the file into `registry`, inside the bound at
     /// `now`, and returns how many keys it registered. A missing file holds
     /// no keys. A line that is not a key is skipped with a warning.
-    fn restore(&self, registry: &RwLock<ClientKeys>, now: u64) -> io::Result<usize> {
+    ///
+    /// A box in a key's `boxes=` that `running` does not hold ended with no
+    /// `forget_box`, so it no longer uses the key (#2617). `bep serve` lives
+    /// only as long as the `minvmd` that started it, and so do its boxes, so
+    /// at its start `running` is empty and every key is free.
+    fn restore(
+        &self,
+        registry: &RwLock<ClientKeys>,
+        running: &Boxes,
+        now: u64,
+    ) -> io::Result<usize> {
         let mut entries = self.lock();
         entries.clear();
         if let Some(mut file) = self.open()? {
@@ -720,11 +738,30 @@ impl KeyFile {
                 }
             }
         }
+        // A box that ended with no `forget_box` (a creation stopped before
+        // `minvmd` recorded the box, a stopped `minvmd`, a failed write at
+        // `release`) frees each key it held in use.
+        let mut freed = false;
+        for entry in entries.iter_mut() {
+            let held = entry.boxes.len();
+            entry.boxes.retain(|id| running.get(id).is_some());
+            if entry.boxes.len() == held {
+                continue;
+            }
+            freed = true;
+            if !entry.in_use() {
+                tracing::info!(
+                    kid = %entry.kid,
+                    ended = held,
+                    "freed a client key at start: no box that used it is still registered"
+                );
+            }
+        }
         // A retired key whose boxes all ended is revoked.
         let before = entries.len();
         retire_unused(&mut entries);
         let retired = entries.len() != before;
-        if !enforce(&mut entries, self.bound, now, None).is_empty() || retired {
+        if !enforce(&mut entries, self.bound, now, None).is_empty() || retired || freed {
             self.write(&entries)?;
         }
         install(&entries, registry);
@@ -918,9 +955,9 @@ impl KeyFile {
         // The end of the box takes effect in memory first, as a revocation
         // does in `replace`, so a failed write leaves no retired key
         // verifying in this process. A failed write leaves the ended box in
-        // the file. The next registration then writes the file again, and a
-        // restart before a successful write restores the retired key as in
-        // use (#2617).
+        // the file. The next registration then writes the file again, and
+        // the next start frees the key of a box that is not registered then
+        // (#2617).
         if entries.len() != before {
             install(&entries, registry);
         }
@@ -1298,7 +1335,7 @@ impl Control {
             bound,
             ..KeyFile::new(client_keys_path(path))
         };
-        let restored = keys.restore(&registry, unix_now())?;
+        let restored = keys.restore(&registry, &boxes, unix_now())?;
         tracing::info!(
             restored,
             path = %keys.path.display(),
@@ -1934,9 +1971,12 @@ mod tests {
             ..KeyFile::new(keys.path.clone())
         };
         let restored = RwLock::new(ClientKeys::new());
-        assert_eq!(restarted.restore(&restored, 135).unwrap(), 1);
+        assert_eq!(restarted.restore(&restored, &Boxes::new(), 135).unwrap(), 1);
         assert_eq!(held(&restored), [false, false, true]);
-        assert_eq!(restarted.restore(&restored, 1_000).unwrap(), 0);
+        assert_eq!(
+            restarted.restore(&restored, &Boxes::new(), 1_000).unwrap(),
+            0
+        );
         assert_eq!(held(&restored), [false, false, false]);
     }
 
@@ -1985,13 +2025,16 @@ mod tests {
         assert_eq!(keys_in_use_bound(&error), Some(2), "{error}");
         assert_eq!(held(&registry), [true, false, true, false]);
 
-        // The use survives a restart.
+        // The use survives a restart while both boxes are still registered.
         let restarted = KeyFile {
             bound: keys.bound,
             ..KeyFile::new(keys.path.clone())
         };
+        let running = Boxes::new();
+        running.register(BOX_X, Vec::new(), Stance::OwnIp);
+        running.register(BOX_Y, Vec::new(), Stance::OwnIp);
         let restored = RwLock::new(ClientKeys::new());
-        assert_eq!(restarted.restore(&restored, 50).unwrap(), 2);
+        assert_eq!(restarted.restore(&restored, &running, 50).unwrap(), 2);
         let error = restarted
             .register(d.clone(), &restored, 50, false)
             .unwrap_err();
@@ -2071,8 +2114,87 @@ mod tests {
 
         let restored = RwLock::new(ClientKeys::new());
         KeyFile::new(keys.path.clone())
-            .restore(&restored, 40)
+            .restore(&restored, &Boxes::new(), 40)
             .unwrap();
         assert_eq!(held(&restored), [false, false, true]);
+    }
+
+    // BEP-063 (#2617): a box that ended with no `forget_box` stays in the
+    // registrations file, and the next start frees its key. A box that is
+    // still registered keeps its key in use, and a retired key whose boxes
+    // all ended is revoked. The bound then counts only the keys that running
+    // boxes use.
+    #[test]
+    fn a_stranded_box_frees_its_key_at_start() {
+        const STRANDED: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+        const RUNNING: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        const RETIRED_BOX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f7";
+        let dir = tempfile::tempdir().unwrap();
+        let bound = KeyBound {
+            max_keys: 3,
+            idle: None,
+        };
+        let keys = KeyFile {
+            bound,
+            ..KeyFile::new(dir.path().join("control.sock.client-keys"))
+        };
+        let registry = RwLock::new(ClientKeys::new());
+        let entry = |byte: u8| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                0,
+            )
+            .unwrap()
+        };
+        let (retired, stranded, running, new) = (entry(1), entry(2), entry(3), entry(4));
+        keys.register_for(retired.clone(), &registry, 10, false, Some(RETIRED_BOX))
+            .unwrap();
+        // The replacement retires `retired`: box RETIRED_BOX still uses it.
+        keys.register_for(stranded.clone(), &registry, 20, true, Some(STRANDED))
+            .unwrap();
+        keys.register_for(running.clone(), &registry, 30, false, Some(RUNNING))
+            .unwrap();
+        // Running boxes use every key, so the bound refuses a new one.
+        let error = keys
+            .register(new.clone(), &registry, 40, false)
+            .unwrap_err();
+        assert_eq!(keys_in_use_bound(&error), Some(3), "{error}");
+        let held = |registry: &RwLock<ClientKeys>| {
+            let registry = registry.read().unwrap();
+            [&retired, &stranded, &running, &new].map(|e| registry.contains(&e.kid))
+        };
+        assert_eq!(held(&registry), [true, true, true, false]);
+
+        // The proxy restarts. Only box RUNNING is registered again: the
+        // others ended with no `forget_box`.
+        let restarted = KeyFile {
+            bound,
+            ..KeyFile::new(keys.path.clone())
+        };
+        let boxes = Boxes::new();
+        boxes.register(RUNNING, Vec::new(), Stance::OwnIp);
+        let restored = RwLock::new(ClientKeys::new());
+        assert_eq!(restarted.restore(&restored, &boxes, 50).unwrap(), 2);
+        // The retired key is revoked, and the stranded box frees its key.
+        assert_eq!(held(&restored), [false, true, true, false]);
+        let file = std::fs::read_to_string(&keys.path).unwrap();
+        assert!(!file.contains(STRANDED), "{file}");
+        assert!(!file.contains(RETIRED_BOX), "{file}");
+        assert!(file.contains(&format!("boxes={RUNNING}")), "{file}");
+
+        // The bound counts only the key that box RUNNING uses, so a new key
+        // passes it.
+        restarted
+            .register(new.clone(), &restored, 60, false)
+            .unwrap();
+        assert_eq!(held(&restored), [false, true, true, true]);
+        // At the bound, the freed key is dropped and the used key stays.
+        let fourth = entry(5);
+        restarted
+            .register(fourth.clone(), &restored, 70, false)
+            .unwrap();
+        assert_eq!(held(&restored), [false, false, true, true]);
+        assert!(restored.read().unwrap().contains(&fourth.kid));
     }
 }
