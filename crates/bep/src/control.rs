@@ -62,6 +62,16 @@
 //! < {"ok":true,"old_fingerprint":"<hex>","new_fingerprint":"<hex>"}
 //! ```
 //!
+//! The box's creator asks for the box ids the revocations in force name
+//! before it gives a new box its id, so a minted id that a revocation holds
+//! is refused (BEP-070). The list holds the revocations the proxy restored
+//! from its audit log at start and each one recorded since:
+//!
+//! ```text
+//! > {"op":"revoked_box_ids"}
+//! < {"ok":true,"box_ids":["<id>"]}
+//! ```
+//!
 //! A request the proxy cannot do gets `{"ok":false,"error":"<why>"}`, and the
 //! connection stays open for the next line. The registered key goes into the
 //! [`ClientKeys`] registry that the proxy verifies store handles under.
@@ -287,6 +297,42 @@ impl RotationReply {
             new_fingerprint: None,
             error: Some(error.into()),
         }
+    }
+}
+
+/// The creator's request for the box ids the revocations in force name. It
+/// is a type of its own, beside [`Request`], so a client that matches every
+/// [`Request`] keeps its match, and [`Reply`] keeps its fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RevocationsRequest {
+    /// List the box ids the revocations in force name.
+    RevokedBoxIds,
+}
+
+/// The reply line to a [`RevocationsRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedBoxIdsReply {
+    /// Whether the proxy listed the revocations.
+    pub ok: bool,
+    /// The box ids the revocations in force name, each 32 lowercase hex
+    /// digits: the ones restored from the audit log at start and the ones
+    /// recorded since.
+    #[serde(default)]
+    pub box_ids: Vec<String>,
+}
+
+impl Records {
+    /// The box ids the revocations in force name, as the reply to
+    /// [`RevocationsRequest::RevokedBoxIds`].
+    #[must_use]
+    pub fn revoked_box_ids(&self) -> RevokedBoxIdsReply {
+        let box_ids = self
+            .revocations
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        RevokedBoxIdsReply { ok: true, box_ids }
     }
 }
 
@@ -1180,6 +1226,8 @@ async fn serve(
         }
         let written = if let Ok(RotationRequest::RotateSigning) = serde_json::from_str(&line) {
             write_reply(&mut write, &rotate(rotation.clone()).await).await
+        } else if let Ok(RevocationsRequest::RevokedBoxIds) = serde_json::from_str(&line) {
+            write_reply(&mut write, &records.revoked_box_ids()).await
         } else {
             write_reply(&mut write, &records.handle_keeping(&line, Some(&keys))).await
         };
