@@ -12131,6 +12131,10 @@ proof_bep_first_slice_end_to_end() {
 #      `min box spec` shows the reference with its registered upstream.
 #   3. The box sends its sealed value in the rule's header to an HTTPS echo
 #      service, E2E_BEP_STORE_ECHO_URL (default https://httpbin.org/headers).
+#      The default is a public third-party service that this repository does
+#      not control: it sees the request, and the case depends on it. The
+#      value it receives is a fresh random throwaway, never a real secret.
+#      Set E2E_BEP_STORE_ECHO_URL to an echo service you run to avoid it.
 #      The service answers with the headers it received. The box hashes the
 #      echoed header in a pipe and prints only the hash, so the echo is
 #      written to no file and no variable the box exports. The host compares
@@ -12173,7 +12177,7 @@ proof_bep_store_reference_end_to_end() {
   echo "::group::Box Egress Proxy: a Keychain secret by reference reaches its upstream and never enters the box"
   local sr_case=bep_store_reference_end_to_end
   local sr_url="${E2E_BEP_STORE_ECHO_URL:-https://httpbin.org/headers}"
-  local sr_host sr_id sr_value sr_out sr_spec sr_got sr_want sr_hits sr_audit
+  local sr_host sr_id sr_value sr_out sr_spec sr_got sr_want sr_hits sr_scan sr_audit
   local sr_name=e2e-bep-store-ref sr_header=X-Minimal-E2E-Probe sr_header_lc=x-minimal-e2e-probe
   sr_host="${sr_url#https://}"
   sr_host="${sr_host%%/*}"
@@ -12333,17 +12337,23 @@ proof_bep_store_reference_end_to_end() {
     echo "::error::the E2E_STORE_KEY value of the store-reference box is not a sealed value (${#sr_out} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
     sr_fail
   fi
-  if ! sr_hits="$(mnl session exec "$SR_SID" sh -c \
-    'timeout 600 grep -rlIE "mne2e[0-9a-f]{32}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev 2>/dev/null; [ $? -le 1 ]' \
-    </dev/null 2>"$WORK/$sr_case.scan.err")"; then
-    echo "::error::the file search in the store-reference box did not finish"
-    cat "$WORK/$sr_case.scan.err" 2>/dev/null || true
-    sr_fail
-  fi
+  # grep exits 2 when it cannot read a file, even after it lists matches.
+  # So the host keeps the match list whatever the exit status, and fails on
+  # a match first. grep's own errors name paths only, never file content.
+  sr_hits="$(mnl session exec "$SR_SID" sh -c \
+    'timeout 600 grep -rlIE "mne2e[0-9a-f]{32}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev; s=$?; [ "$s" -le 1 ] || exit "$s"' \
+    </dev/null 2>"$WORK/$sr_case.scan.err")"
+  sr_scan=$?
   sr_hits="$(printf '%s\n' "$sr_hits" | tr -d '\r' | sed '/^$/d')"
   if [ -n "$sr_hits" ]; then
     echo "::error::files in the store-reference box hold a value of the stored value's shape:"
     printf '%s\n' "$sr_hits"
+    sr_fail
+  fi
+  if [ "$sr_scan" -ne 0 ]; then
+    echo "::error::the file search in the store-reference box did not finish (exit $sr_scan)"
+    echo "--- search errors (tail) ---"
+    tail -n 20 "$WORK/$sr_case.scan.err" 2>/dev/null || true
     sr_fail
   fi
   echo "store-reference box: E2E_STORE_KEY holds a sealed value (${#sr_out} characters), and no file or variable holds the stored value"
