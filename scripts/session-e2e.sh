@@ -12911,6 +12911,12 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     [ -n "$cq_src" ] || cq_why="no default-route source address for the install"
   fi
   if [ -n "$cq_why" ]; then
+    # A native CI lane carries every gate above, so a missing one there is a
+    # lane fault, as in proof_host_ip_deny_all, never a NOT RUN.
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $cq_why"
+      fail
+    fi
     not_run "$cq_case" "$cq_why"
     echo "::endgroup::"
     return 0
@@ -24764,6 +24770,11 @@ case "${1:-}" in
     # already carries a classifier install, and a residue here would read as
     # one there.
     proof_host_ip_deny_all
+    # After proof_host_ip_deny_all and before the daemon-fetch proof, for the
+    # same reasons: it installs its own host classifier tree and table
+    # (removed before it returns) and respawns the daemon under its own
+    # record filter, and a residue would trip the daemon-fetch proof's gates.
+    proof_bep_host_ip_cohort_blocks_udp_443
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
