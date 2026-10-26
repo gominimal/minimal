@@ -344,14 +344,21 @@ pub(crate) struct InjectionRefused {
 /// blocks for the box, the shim and everything in `own` move into the
 /// blocked leaf and are recorded. Returns how many processes moved.
 ///
+/// `joined` says whether the shim was seen in its leaf. A shim given `own`
+/// that did not join yet can still join `own` after a move, and so leave the
+/// blocked leaf. While the cohort blocks for the box, that injection is
+/// refused.
+///
 /// # Errors
 ///
-/// [`InjectionRefused`] when `own` cannot be read, or a live process cannot
-/// be moved. The caller must stop the shim, so the block never fails open.
+/// [`InjectionRefused`] when `own` cannot be read, a live process cannot be
+/// moved, or the shim did not join `own` while the cohort blocks. The caller
+/// must stop the shim, so the block never fails open.
 pub(crate) fn settle_injection(
     box_id: &str,
     pid: i32,
     given_blocked: bool,
+    joined: bool,
     own: &std::path::Path,
     cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
     moves: &dyn crate::net::classifier::CgroupMoves,
@@ -369,6 +376,16 @@ pub(crate) fn settle_injection(
     else {
         return Ok(0);
     };
+    if !joined {
+        // A move now is undone when the shim joins `own` later.
+        return Err(InjectionRefused {
+            pid,
+            error: io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the injected process did not join its classifier leaf in time",
+            ),
+        });
+    }
     let mut moved = 0;
     let mut first = true;
     // A process that forks while the move runs leaves its child in `own`,
@@ -798,14 +815,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 let mut leaves = vec![own.as_path()];
                 leaves.extend(blocked.as_deref());
                 let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
-                wait_for_injection_join(
+                let joined = wait_for_injection_join(
                     pid,
                     &leaves,
                     &moves,
                     || proc_dir.exists(),
                     INJECTION_JOIN_WAIT,
                 );
-                if let Err(refused) = settle_injection(&box_id, pid, adopt, &own, cohort, &moves) {
+                if let Err(refused) =
+                    settle_injection(&box_id, pid, adopt, joined, &own, cohort, &moves)
+                {
                     tracing::warn!(
                         box_id,
                         shim_pid = pid,

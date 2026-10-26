@@ -7209,7 +7209,7 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
         .with_max_level(tracing::Level::DEBUG)
         .finish();
     let moved = tracing::subscriber::with_default(subscriber, || {
-        settle_injection("plain", shim, adopt, own.dir(), &cohort, &moves)
+        settle_injection("plain", shim, adopt, true, own.dir(), &cohort, &moves)
     })
     .expect("the shim and its program move into the blocked leaf");
     assert_eq!(moved, 2);
@@ -7240,10 +7240,18 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
     let late = 4200;
     moves.spawn_in(late, own.dir());
     moves.refused.lock().unwrap().insert(late);
-    let refused = settle_injection("plain", late, false, own.dir(), &cohort, &moves)
+    let refused = settle_injection("plain", late, false, true, own.dir(), &cohort, &moves)
         .expect_err("a process that cannot move refuses the injection");
     assert_eq!(refused.pid, late);
     assert_eq!(moves.where_is(late), own.dir());
+
+    // A shim that did not join its own leaf in time while the cohort
+    // blocks is refused: a move now is undone by its later join.
+    let slow = 4250;
+    let refused = settle_injection("plain", slow, false, false, own.dir(), &cohort, &moves)
+        .expect_err("a shim that did not join in time refuses the injection");
+    assert_eq!(refused.pid, slow);
+    assert_eq!(refused.error.kind(), std::io::ErrorKind::TimedOut);
 
     // A shim given the own leaf while the cohort still does not block
     // stays where it is.
@@ -7251,7 +7259,7 @@ fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
     let calm = 4300;
     moves.spawn_in(calm, own.dir());
     assert_eq!(
-        settle_injection("plain", calm, false, own.dir(), &cohort, &moves).unwrap(),
+        settle_injection("plain", calm, false, true, own.dir(), &cohort, &moves).unwrap(),
         0
     );
     assert_eq!(moves.where_is(calm), own.dir());
