@@ -106,6 +106,9 @@ struct Facts {
     identifier: Option<String>,
     /// The opened member's kind, or `None` when the value did not open.
     kind: Option<MemberKind>,
+    /// The handle's `jti` for the audit record, or empty when the value did
+    /// not open or the handle does not parse.
+    jti: String,
 }
 
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
@@ -289,7 +292,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             })
             .collect();
         let kind = opened.as_ref().map(|opened| opened.member.kind);
-        let (bound_set, current_set, handle, identifier) = match &opened {
+        let (bound_set, current_set, handle, identifier, jti) = match &opened {
             Some(opened) => {
                 let read = {
                     let clients = self.clients.read().unwrap_or_else(PoisonError::into_inner);
@@ -317,7 +320,18 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                         (bound_set, current_set)
                     }
                 };
-                (bound_set, current_set, read.handle, read.identifier)
+                // Gatehouse §6.10: the audit record carries the handle's
+                // `jti` as its correlation id. The `jti` is the claim even
+                // when the signature does not verify, so a refusal of a
+                // forged handle still correlates. `decide` admits only a
+                // verified handle, so an admitted record's `jti` is verified.
+                (
+                    bound_set,
+                    current_set,
+                    read.handle,
+                    read.identifier,
+                    read.jti.unwrap_or_default(),
+                )
             }
             None => (
                 Vec::new(),
@@ -331,6 +345,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                     rule: None,
                 },
                 None,
+                String::new(),
             ),
         };
         let revoked = {
@@ -365,6 +380,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             },
             identifier,
             kind,
+            jti,
         }
     }
 
@@ -391,7 +407,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 }
             }
         };
-        tracing::debug!(box_id, ?verdict, "sealed value decided");
+        tracing::debug!(box_id, ?verdict, jti = ?facts.jti, "sealed value decided");
         verdict
     }
 
@@ -545,9 +561,20 @@ where
         request: &RequestAuthority<String>,
         sealed: &str,
     ) -> Verdict {
+        self.redeem_with_jti(box_id, authority, request, sealed).0
+    }
+
+    fn redeem_with_jti(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+    ) -> (Verdict, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
-        self.sign_in_verdict(box_id, facts, now)
+        let jti = facts.jti.clone();
+        (self.sign_in_verdict(box_id, facts, now), jti)
     }
 
     /// Decides one request that carries `sealed` in the header named
@@ -565,16 +592,23 @@ where
         request: &RequestAuthority<String>,
         sealed: &str,
         header: &str,
-    ) -> Redeemed {
+    ) -> (Redeemed, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
+        let jti = facts.jti.clone();
         if facts.kind == Some(MemberKind::Store) {
-            return Self::store_decision(box_id, facts);
+            return (Self::store_decision(box_id, facts), jti);
         }
         if !header.eq_ignore_ascii_case("authorization") {
-            return Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED));
+            return (
+                Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
+                String::new(),
+            );
         }
-        Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now))
+        (
+            Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
+            jti,
+        )
     }
 }
 
@@ -876,6 +910,87 @@ mod tests {
             world.redeemer.redeem("b1", &api(), &request, &sealed),
             Verdict::Refuse("no_live_box")
         ));
+    }
+
+    /// A value sealed for `box_id` on this node, with one store-handle
+    /// member whose `jti` is `jti`.
+    fn sealed_store_for<K, C>(world: &World<K, C>, box_id: &str, jti: &str) -> String {
+        let jws = handle::sign(
+            &world.client,
+            &Claims {
+                sub: box_id.into(),
+                node_id: NODE.into(),
+                store: "keychain".into(),
+                id: "anthropic".into(),
+                upstream: vec!["api.github.com".into()],
+                inject: Some(Inject::Header {
+                    name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                }),
+                iat: NOW - 10,
+                exp: NOW + 3600,
+                jti: jti.into(),
+            },
+        );
+        seal::seal(
+            &world.sealing,
+            &Context {
+                box_id: box_id.into(),
+                host: NODE.into(),
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: NOW - 10,
+                expiry: NOW + 600,
+                kid: world.sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::Store,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    // BEP-067 (Gatehouse §6.10): a redeemed member and a refused store
+    // member both write an audit record that carries the handle's `jti`.
+    // A value that does not open has no handle, so its `jti` is empty.
+    #[test]
+    fn a_store_handle_audit_record_carries_its_jti() {
+        let world = new_world();
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].jti, "jti-1");
+        let line = crate::audit::Record::from_decision(&records[0], crate::audit::ZERO_HASH);
+        assert_eq!(line.jti, "jti-1");
+
+        let sealed = sealed_store_for(&world, "b1", "jti-store-7");
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(Check::StoreHandleInvalid.marker()));
+        assert!(upstream.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some("store_handle_invalid"));
+        assert_eq!(records[0].jti, "jti-store-7");
+        let line = crate::audit::Record::from_decision(&records[0], crate::audit::ZERO_HASH);
+        assert_eq!(line.jti, "jti-store-7");
+
+        // A value sealed to another host's key does not open here.
+        let other = new_world();
+        other.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let (_, end, records) = send(&other, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(Check::Undecryptable.marker()));
+        assert_eq!(records[0].jti, "");
     }
 
     /// A sealing key that counts its key agreements.

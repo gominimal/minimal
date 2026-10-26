@@ -837,6 +837,8 @@ fn append(
         box_id: box_id.to_owned(),
         authority: String::new(),
         identifier,
+        // A mint or a revocation carries no handle.
+        jti: String::new(),
         mapping: Mapping::ModuleUnmapped,
         outcome,
         marker: None,

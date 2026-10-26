@@ -633,6 +633,8 @@ Review, audit and revocation
   - IF a minted box id is named by any retained record THEN THE SYSTEM SHALL refuse the creation.
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
+    verify: cargo nextest run -p minvmd colliding_box_id_refused
+    <!-- Limit: both tests prove a collision with a live row, a kept creation or an attachment. The host's collision check does not read the retained revocation records, so a collision with a revocation record alone is not yet refused. [#2585](https://github.com/gominimal/minimal/issues/2585) tracks this gap. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems

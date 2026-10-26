@@ -4622,3 +4622,269 @@ mod mint_tests {
         );
     }
 }
+
+/// BEP-070: on a host that is not enrolled, each box creation gets a box id
+/// that the host-side creator mints outside the VM: a UUIDv7 whose timestamp
+/// comes from the clock and whose random fields come from the OS CSPRNG.
+/// The test drives the CLI's own registration against the real VM host
+/// tables and control server, and creates the box again and again under one
+/// name. Each creation gets a new id. The CLI presents no id, so the id the
+/// reply returns is the one the host's row holds. A friendly name is an
+/// alias, so a re-created box never inherits the id of its predecessor.
+#[tokio::test]
+async fn box_id_is_a_csprng_uuidv7_per_creation() {
+    use minimal_client::box_registration::{register_box_for_activation, withdraw_box_row};
+
+    const CREATIONS: usize = 8;
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_millis(),
+        )
+        .expect("the time in milliseconds fits in 64 bits")
+    }
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let sock_path = provider_dir.join("control.sock");
+    let attachments = minvmd::bep_attach::Attachments::new();
+    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+        .feeding_proxy_attachments(attachments.clone());
+    let _server = minvmd::control::spawn(
+        sock_path.clone(),
+        registry.clone(),
+        minvmd::net::answerer::AnswererStatus::allocating_for_tests("box-id-test-node"),
+        minvmd::control::ProxyPublishStatus::default(),
+    )
+    .expect("the control server binds its socket");
+
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(CREATIONS);
+    for creation in 0..CREATIONS {
+        let before = now_ms();
+        let mut registered = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "creation {creation}: the real control server answers the registration, \
+                 after ids {ids:02x?}: {error:#}"
+            )
+        })
+        .expect("an own-address box on a VM-backed host registers");
+        let after = now_ms();
+        // Commit the lease, as an activation does once its session is
+        // active. A lease dropped uncommitted makes the host withdraw the
+        // row on its own thread, later. That late withdrawal can land
+        // while the next creation of "web" is being assigned its address,
+        // and the host then refuses that creation as withdrawn.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
+        let id = registered
+            .box_id
+            .expect("the reply returns the id the host minted for this creation");
+        let bytes = id.to_bytes();
+
+        // The host minted it: the row and the attachment that the
+        // registration published hold the id that the reply returned.
+        let row = registry
+            .table()
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration published the box's row");
+        assert_eq!(
+            row.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's row holds"
+        );
+        let attachment = attachments
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            attachment.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's attachment holds"
+        );
+
+        // A UUIDv7: version 7 and the RFC 9562 variant.
+        assert_eq!(
+            bytes[6] >> 4,
+            7,
+            "creation {creation}: the id is a UUIDv7, got {id}"
+        );
+        assert_eq!(
+            bytes[8] >> 6,
+            0b10,
+            "creation {creation}: the id carries the RFC 9562 variant, got {id}"
+        );
+        // Its 48-bit timestamp is the clock at the mint, not a counter.
+        // The mint can take the millisecond after the process's last mint
+        // when that is ahead of the clock, so the upper bound allows one
+        // second of lead over the clock after the registration.
+        let mut stamp = [0u8; 8];
+        stamp[2..].copy_from_slice(&bytes[..6]);
+        let stamp = u64::from_be_bytes(stamp);
+        let latest = after + 1_000;
+        assert!(
+            (before..=latest).contains(&stamp),
+            "creation {creation}: the timestamp {stamp} of id {id} is the clock at the \
+             mint, between {before} and {latest}"
+        );
+
+        ids.push(bytes);
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(registered.addresses),
+            Some(id),
+        )
+        .await;
+        assert!(
+            !attachments.holds_id(bytes),
+            "creation {creation}: the destroyed box's id is held by no attachment"
+        );
+    }
+
+    // One id per creation: no id returns under the name it was minted for.
+    let distinct: std::collections::BTreeSet<[u8; 16]> = ids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        CREATIONS,
+        "each creation under one name gets an id of its own, got {ids:02x?}"
+    );
+    // The ids sort in creation order: each mint takes a later millisecond
+    // than the one before it.
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "the ids sort in creation order, got {ids:02x?}"
+    );
+    // The random fields are random fills, never a counter: all 74 bits
+    // after the version and the variant. `rand_a` is the 12 bits after the
+    // version, and `rand_b` is the 62 bits after the variant. Eight draws of
+    // 62 random bits are all distinct, and no two consecutive draws differ
+    // by one: either chance is below 2^-55. `rand_a` holds 12 bits only, so
+    // two of eight draws match about once in 150 runs. The test asserts
+    // only that `rand_a` does not step by one on every creation, the shape
+    // a counter gives it: a chance of 2^-84 for random fills.
+    let rand_a: Vec<u16> = ids
+        .iter()
+        .map(|bytes| u16::from_be_bytes([bytes[6] & 0x0f, bytes[7]]))
+        .collect();
+    let rand_b: Vec<u64> = ids
+        .iter()
+        .map(|bytes| {
+            let mut field = [0u8; 8];
+            field.copy_from_slice(&bytes[8..16]);
+            field[0] &= 0x3f;
+            u64::from_be_bytes(field)
+        })
+        .collect();
+    let distinct_b: std::collections::BTreeSet<u64> = rand_b.iter().copied().collect();
+    assert_eq!(
+        distinct_b.len(),
+        CREATIONS,
+        "rand_b differs on every creation, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        rand_b
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
+        "rand_b is not a counter, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        !rand_a
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff == 1),
+        "rand_a is not a counter, got {rand_a:03x?} from ids {ids:02x?}"
+    );
+}
+
+/// BEP-070: a minted box id that a retained record already names refuses
+/// the creation. This test proves the CLI half only: when the host refuses
+/// a registration for a colliding id, the CLI refuses the creation. It does
+/// not prove that the host detects a collision. The host half — the
+/// registry refuses the colliding mint before it spends an address — is
+/// `minvmd`'s `colliding_box_id_refused`, which the spec names as a second
+/// verify line. A real mint does not collide, and no public door fixes the
+/// id the host mints. So this test stands in for the host on the control
+/// socket and answers the CLI's registration with the exact refusal the
+/// host sends for a collision. The activation fails with the refusal, which
+/// names the colliding id, and no box id comes back.
+#[tokio::test]
+async fn colliding_box_id_refuses_creation() {
+    use minimal_client::box_registration::register_box_for_activation;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+
+    // The id a retained record already holds, and the refusal the host's
+    // control server replies with when a mint lands on it.
+    let held = minvmd::bep_attach::mint_box_id();
+    let refusal = minvmd::box_registry::AllocationError::CollidingBoxId { id: held }.to_string();
+    let held_text = minimald_rpc::BoxId::from_bytes(held).to_string();
+    assert!(
+        refusal.contains(&held_text),
+        "the host's refusal names the colliding id {held_text}, got {refusal:?}"
+    );
+
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the CLI connects");
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the CLI sends a control request");
+        assert!(
+            matches!(request, minimald_rpc::BoxControlRequest::Register(_)),
+            "the CLI asks the host to register the box, got {request:?}"
+        );
+        let mut reply =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error { error: refusal })
+                .unwrap();
+        reply.push('\n');
+        stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+    });
+
+    let err = register_box_for_activation(
+        paths::ProviderKind::Minvmd,
+        Some(dir.path()),
+        boxes::NetworkMode::OwnIp,
+        "web",
+        &policy,
+    )
+    .await
+    .expect_err("a colliding box id refuses the creation; the box gets no id");
+    host.await.expect("the stand-in host answered");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains(&held_text),
+        "the refusal names the colliding id {held_text}, got {chain:?}"
+    );
+    assert!(
+        chain.contains("does not start"),
+        "the activation ends on the refusal, so no box is created, got {chain:?}"
+    );
+}
