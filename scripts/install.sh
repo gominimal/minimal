@@ -543,8 +543,8 @@ maybe_remove_finalize_install() {
 }      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
         fi
         # The QUIC block helper and its sudoers rule, an item of their own.
-        # `min finalize-install --undo` does not remove them, so on a yes
-        # either one left afterwards prints the manual remedy.
+        # `min finalize-install --undo` does not remove them, so a yes
+        # removes them here, and either one left prints the manual remedy.
         _qb_rm=
         for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
             _qb_rm="$_qb_rm $(shq "$_fi_root$_qb_p")"
@@ -595,10 +595,16 @@ maybe_remove_finalize_install() {
                 if [ -n "$_fi_owned" ]; then
                     { [ -x "$_fi_min" ] && "$_fi_min" finalize-install --undo; } || _fi_ok=
                 fi
+                # `min finalize-install --undo` does not remove the QUIC
+                # block helper or its sudoers rule, so remove them here.
                 if [ -n "$_qb_found" ]; then
                     for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
+                        if [ -e "$_fi_root$_qb_p" ]; then
+                            sudo rm -f "$_fi_root$_qb_p" || _fi_ok=
+                        fi
                         [ ! -e "$_fi_root$_qb_p" ] || _fi_ok=
                     done
+                    sudo rmdir "$_lib_dir" 2>/dev/null || true
                 fi
                 if [ -n "$_aa_unowned" ]; then
                     { [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
