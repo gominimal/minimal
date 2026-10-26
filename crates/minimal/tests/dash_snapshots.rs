@@ -1,6 +1,10 @@
 //! Snapshot tests for the `view` half: render a fixed model into a
 //! `TestBackend` buffer and compare against the checked-in snapshots.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use boxes::{NetworkMode, SessionId};
 use chrono::DateTime;
 use minimal::dash::app::{self, Detail, Model, Msg, SessionKey};
