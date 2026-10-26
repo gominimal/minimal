@@ -12791,6 +12791,266 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
   echo "::endgroup::"
 }
 
+# Revoke and sign out, end to end (BEP T23). One box name carries the whole
+# story, and each step shows its refusal or its admit in 'min box audit':
+#   1. A grant box starts under the name, 'gh api user' answers, and the case
+#      copies its sealed GH_TOKEN value.
+#   2. 'min session destroy' removes it. 'min box audit <old id>' shows one
+#      revocation record within 60 s.
+#   3. A new grant box starts under the same name. It gets a new box id, its
+#      own value redeems (an admit record), and the copied value is refused
+#      in it (a cross_box refusal).
+#   4. 'min auth logout' runs. The next 'gh api user' in the box is refused
+#      (a github_sign_in_required refusal), and the box keeps running.
+#   5. 'min auth login --device' signs this machine in again. The person who
+#      runs the case enters the code that the command prints.
+#   6. The box's own value stays refused (one more github_sign_in_required
+#      refusal), and the destroyed box's value stays refused (one more
+#      cross_box refusal). A box started after the sign-in redeems.
+# The case signs this machine out of GitHub and needs a person at the device
+# flow, so it runs only with E2E_BEP_LOGOUT=1, and bep_live_gate records it
+# NOT RUN where no proxy can run. The values are never printed: the
+# transcript names only their lengths.
+
+# Counts the refuse records marked $2 in the jsonl file $1.
+bep_e2e_refusals() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if r.get("kind") == "decision" and r.get("decision") == "refuse" and r.get("marker") == sys.argv[2]:
+            n += 1
+print(n)
+PY
+}
+
+# Counts the admit records for api.github.com:443 that name a member, in the
+# jsonl file $1.
+bep_e2e_admits() {
+  python3 - "$1" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            n += 1
+print(n)
+PY
+}
+
+proof_bep_revoke_and_sign_out_end_to_end() {
+  echo "::group::destroy, re-create, log out and sign in again: each refusal and admit"
+  local ee_case=bep_revoke_and_sign_out_end_to_end
+  local ee_name=e2e-bep-end-to-end ee_after=e2e-bep-end-to-end-after
+  local ee_old_value ee_new_value ee_old_id ee_new_id ee_try ee_count=0 ee_n
+  local ee_out ee_status ee_cross ee_signin
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$ee_case" "the case signs this machine out of GitHub and asks for a sign-in code: set E2E_BEP_LOGOUT=1 to run it"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$ee_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: ee_cleanup reads them.
+  EE_SID="" EE_SID2=""
+  ee_cleanup() {
+    [ -n "$EE_SID" ] && mnl session destroy --force "$EE_SID" >/dev/null 2>&1
+    [ -n "$EE_SID2" ] && mnl session destroy --force "$EE_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  ee_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection\|revocation\|logout' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    ee_cleanup
+    fail
+  }
+  # Writes 'min box audit $1' to $WORK/$ee_case.audit, or fails the case.
+  ee_audit() {
+    if ! mnl box audit "$1" -o jsonl </dev/null >"$WORK/$ee_case.audit" 2>"$WORK/$ee_case.audit.err"; then
+      echo "::error::'min box audit $1' failed"
+      cat "$WORK/$ee_case.audit.err" 2>/dev/null || true
+      ee_fail
+    fi
+  }
+
+  # 1. The first box under the name, and the value copied from it.
+  bep_revoke_seed "$ee_case"
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_old_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || ee_fail
+  ee_old_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  echo "first $ee_name (box $ee_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#ee_old_value} characters)"
+
+  # 2. The destroy, and its revocation record within 60 s.
+  if ! mnl session destroy --force "$EE_SID" </dev/null >/dev/null 2>"$WORK/$ee_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $ee_name failed"
+    cat "$WORK/$ee_case.destroy.err" 2>/dev/null || true
+    ee_fail
+  fi
+  EE_SID=""
+  for ee_try in $(seq 1 12); do
+    [ "$ee_try" -gt 1 ] && sleep 5
+    mnl box audit "$ee_old_id" -o jsonl </dev/null >"$WORK/$ee_case.old.audit" 2>"$WORK/$ee_case.old.audit.err" \
+      || continue
+    ee_count="$(bep_revoke_count "$WORK/$ee_case.old.audit" revocation)"
+    [ "$ee_count" -ge 1 ] && break
+  done
+  if [ "$ee_count" != 1 ]; then
+    echo "::error::'min box audit $ee_old_id' shows $ee_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$ee_case.old.audit" "$WORK/$ee_case.old.audit.err" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "min box audit $ee_old_id: 1 revocation record within 60 s of the destroy"
+
+  # 3. The box re-created under the name: a new id, its own value admitted,
+  # and the destroyed box's value refused.
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_new_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || {
+    echo "::error::the box re-created under $ee_name did not redeem its own value"
+    ee_fail
+  }
+  ee_new_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  if [ "$ee_new_id" = "$ee_old_id" ]; then
+    echo "::error::'min box audit $ee_name' names box $ee_new_id for both boxes: the re-created box reused the destroyed box's id"
+    ee_fail
+  fi
+  if [ "$ee_new_value" = "$ee_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    ee_fail
+  fi
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.$ee_name.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_name' shows no admit record for api.github.com:443 that names a member: the re-created box's value was not redeemed"
+    cat "$WORK/$ee_case.$ee_name.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "second $ee_name (box $ee_new_id): 'gh api user' answered with its own value (${#ee_new_value} characters), and min box audit shows $ee_n admit record(s) for api.github.com:443"
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_cross="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_cross" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no cross_box refusal of the destroyed box's value"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $ee_cross cross_box refusal(s)"
+
+  # 4. The logout: the box's next request is refused, and the box runs on.
+  if ! ee_out="$(mnl auth logout </dev/null 2>"$WORK/$ee_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$ee_out"
+    echo "--- stderr ---"; cat "$WORK/$ee_case.logout.err" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$ee_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$ee_status"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-logout" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after 'min auth logout'"
+    ee_fail
+  fi
+  if ! mnl session exec "$EE_SID" true >/dev/null 2>"$WORK/$ee_case.alive"; then
+    echo "::error::the box $ee_name does not run a command after the logout: the logout must keep the box's processes running"
+    cat "$WORK/$ee_case.alive" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_count" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no github_sign_in_required refusal after the logout"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the logout: 'gh api user' in $ee_name failed, the box still runs, and min box audit shows $ee_count github_sign_in_required refusal(s)"
+
+  # 5. The sign-in again. The device flow prints a code on stderr, and the
+  # person who runs the case enters it. The command waits until the code
+  # expires.
+  echo "Sign in to GitHub again: open the address below and enter the code."
+  if ! mnl auth login --device </dev/null 2>&1 | tee "$WORK/$ee_case.login"; then
+    echo "::error::'min auth login --device' did not sign this machine in again"
+    ee_fail
+  fi
+  ee_signin="$(mnl auth status </dev/null 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$ee_signin" != "Signed in to GitHub"* ]]; then
+    echo "::error::'min auth status' after 'min auth login' does not report a sign-in"
+    printf '%s\n' "$ee_signin"
+    ee_fail
+  fi
+  echo "min auth status: ${ee_signin%%$'\n'*}"
+
+  # 6. The sign-in revives nothing: the box's own value and the destroyed
+  # box's value stay refused, each with one more refusal in the audit.
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-login" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after the sign-in: the sign-in revived a value made before the logout"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded with the destroyed box's value after the sign-in"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_n="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_n" -le "$ee_count" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new github_sign_in_required refusal after the sign-in ($ee_n, $ee_count before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_count" -le "$ee_cross" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new cross_box refusal after the sign-in ($ee_count, $ee_cross before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the sign-in: both values in $ee_name are still refused, and min box audit shows $ee_n github_sign_in_required and $ee_count cross_box refusal(s)"
+
+  # A box started after the sign-in redeems, so the refusals above are not a
+  # broken sign-in.
+  EE_SID2="$(bep_revoke_activate "$ee_case" "$ee_after")" || ee_fail
+  if ! mnl session exec "$EE_SID2" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.fresh" 2>&1; then
+    echo "::error::'gh api user' failed in the box $ee_after, started after the sign-in"
+    cat "$WORK/$ee_case.fresh" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_after"
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_after' shows no admit record for api.github.com:443 that names a member"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "$ee_after, started after the sign-in: 'gh api user' answered, and min box audit shows $ee_n admit record(s)"
+
+  ee_cleanup
+  rm -f "${WORK:?}/${ee_case:?}".*
+  echo "Revoke and sign out OK (the destroyed box's value refused within 60 s, the re-created box redeemed, the logout refused its next request, and the sign-in revived neither value)"
+  echo "::endgroup::"
+}
+
 # DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
 # the gvproxy switch. A box on a credentialed lane with the default `dns`
 # steering and `quic443 = "block"` starts. Then the case stops the Box Egress
@@ -24550,6 +24810,7 @@ case "${1:-}" in
     proof_bep_box_recreated_under_its_name_redeems
     proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
@@ -24621,6 +24882,7 @@ case "${1:-}" in
     | bep_box_recreated_under_its_name_redeems \
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
+    | bep_revoke_and_sign_out_end_to_end \
     | bep_dns_steering_fails_closed_end_to_end)
     "proof_$1"
     ;;
@@ -24666,7 +24928,7 @@ case "${1:-}" in
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
-    echo "         bep_box_recreated_under_its_name_redeems"
+    echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
     echo "         bep_dns_steering_fails_closed_end_to_end"
     exit 2
     ;;
