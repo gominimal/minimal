@@ -2080,7 +2080,10 @@ mod tests {
             }],
             "the rule on a GitHub host is refused, and a deny rule is not held"
         );
-        assert!(store_rules_in(&dir.path().join("missing.toml"), &organization).is_empty());
+        assert_eq!(
+            store_rules_in(&dir.path().join("missing.toml"), &organization),
+            Vec::<StoreRule>::new()
+        );
 
         assert!(registered_union(&rules).contains("api.openai.com"));
         assert!(!registered_union(&[]).contains("api.openai.com"));
@@ -2159,9 +2162,15 @@ mod tests {
              upstream = [\"api.openai.com\"]\nheader = \"Authorization\"\n",
         )
         .unwrap();
-        assert!(store_rules_in(&config, &organization).is_empty());
+        assert_eq!(
+            store_rules_in(&config, &organization),
+            Vec::<StoreRule>::new()
+        );
         std::fs::write(&organization, "not toml [").unwrap();
-        assert!(store_rules_in(&config, &organization).is_empty());
+        assert_eq!(
+            store_rules_in(&config, &organization),
+            Vec::<StoreRule>::new()
+        );
     }
 
     /// #2501: a supervisor asks for the lifeline with a flag, so a person

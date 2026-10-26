@@ -781,7 +781,7 @@ mod tests {
         refused.upstream = vec!["api.github.com".to_owned()];
         let org_read: StoreRules = [("item".to_owned(), refused)].into();
         let org = accepted(org_read.clone());
-        assert!(org.is_empty());
+        assert_eq!(org, StoreRules::new());
         let user: StoreRules = [("item".to_owned(), rule(Some(StoreAction::Allow)))].into();
         let merged = keep_read_actions(&org_read, merge_store_rules(org, user));
         assert_eq!(merged["item"].action, Some(StoreAction::Deny));
@@ -815,7 +815,7 @@ mod tests {
         let merged = deny_refused_items(&[&org_read, &user_read], merged);
         for item in ["org-refused", "user-refused"] {
             assert_eq!(merged[item].action, Some(StoreAction::Deny), "{item}");
-            assert!(merged[item].upstream.is_empty(), "{item}");
+            assert_eq!(merged[item].upstream, Vec::<String>::new(), "{item}");
             assert_eq!(merged[item].header, None, "{item}");
         }
         assert_eq!(merged["shared"].action, Some(StoreAction::Deny));
@@ -852,7 +852,7 @@ mod tests {
         assert!(read.organization_error.is_none());
         assert_eq!(read.rules["item"].action, Some(StoreAction::Deny));
         assert_eq!(read.rules["leak"].action, Some(StoreAction::Deny));
-        assert!(read.rules["leak"].upstream.is_empty());
+        assert_eq!(read.rules["leak"].upstream, Vec::<String>::new());
         assert_eq!(read.refused.len(), 1);
         assert_eq!(read.refused[0].file, user.display().to_string());
 
