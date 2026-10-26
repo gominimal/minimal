@@ -11,6 +11,8 @@
 //! through [`RecordState::from`]. Until the store holds an ending, the
 //! `state_is_exactly_one` harness runs over [`RecordState`], not over
 //! the stored [`crate::Record`] that the BOX-011 harness line names.
+//! Issue #2634 owns the stored ending and the move of the harness to
+//! [`crate::Record`].
 
 use serde::{Deserialize, Serialize};
 

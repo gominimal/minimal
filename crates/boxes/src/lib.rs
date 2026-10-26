@@ -1495,6 +1495,7 @@ impl Record {
     /// The one state the record is in (BOX-011). A stored record is
     /// `pending`, `materializing` or `running`: the store does not yet
     /// hold an ending, so no stored record reads as `stopped` or `exited`.
+    /// Issue #2634 owns storing `reason`, `exit_code` and `signal`.
     #[must_use]
     pub fn state(&self) -> crate::core::record::RecordState {
         crate::core::record::RecordState::from(self.status)
