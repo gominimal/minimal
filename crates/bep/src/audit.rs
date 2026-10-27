@@ -252,6 +252,132 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
 }
 
+/// The `kind` of a [`QuarantineRecord`].
+pub const QUARANTINE: &str = "quarantine";
+
+/// The marker on a revocation that a quarantine records again from a moved
+/// segment. It tells the copy apart from the revocation a destroy wrote,
+/// so a reader of the log does not count one destroy twice.
+pub const RESTATED: &str = "quarantine_restated";
+
+/// The directory, inside the log's directory, that a quarantine moves
+/// segments into ([`AuditLog::quarantine_unreadable`]).
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// The record a quarantine appends for each segment it moves out of the
+/// log. The chain runs from `from_hash` into the moved segment and on from
+/// `final_hash` past it, so a verifier can bridge the gap the move leaves
+/// ([`verify_chain`]). The field order is the line's byte order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineRecord {
+    /// Always [`SCHEMA`].
+    pub schema: String,
+    /// Always [`QUARANTINE`].
+    pub kind: String,
+    /// The moved segment's file name, now under [`QUARANTINE_DIR`].
+    pub segment: String,
+    /// The hash the moved segment's first record chains to.
+    pub from_hash: String,
+    /// The moved segment's final hash: the hash the record after it
+    /// chains to.
+    pub final_hash: String,
+    /// The complete lines in the moved segment that did not parse.
+    pub unreadable: usize,
+    /// The hash of the previous record's line (BEP-048).
+    pub previous_hash: String,
+}
+
+impl QuarantineRecord {
+    /// The record's line: compact JSON, without the trailing newline.
+    pub fn to_line(&self) -> String {
+        serde_json::to_string(self).expect("a quarantine record serializes")
+    }
+}
+
+/// The fields every record of the schema has, whatever its kind.
+#[derive(Deserialize)]
+struct Envelope {
+    schema: String,
+    kind: String,
+    previous_hash: String,
+}
+
+/// What one complete, non-empty line of a segment holds.
+#[derive(Debug)]
+enum Line {
+    /// A decision, mint or revocation record.
+    Record(Record),
+    /// A [`QuarantineRecord`].
+    Quarantine(QuarantineRecord),
+    /// A record of the schema whose kind this bep does not know. Its chain
+    /// fields parse, so it is no corrupt line. It can still hold a
+    /// revocation from a newer bep, so [`prune`] keeps its segment.
+    OtherKind {
+        /// The record's `previous_hash`.
+        previous_hash: String,
+    },
+    /// A line that is no record: not JSON, not the schema, or a known
+    /// kind with a field missing or malformed.
+    Corrupt,
+}
+
+/// The kinds of [`Kind`], as they serialize.
+const KNOWN_KINDS: [&str; 3] = ["decision", "mint", "revocation"];
+
+fn is_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Tells what the line `raw` holds, its newline stripped.
+fn classify(raw: &[u8]) -> Line {
+    if let Ok(record) = serde_json::from_slice::<Record>(raw) {
+        return Line::Record(record);
+    }
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(raw) else {
+        return Line::Corrupt;
+    };
+    if envelope.schema != SCHEMA || !is_hash(&envelope.previous_hash) {
+        return Line::Corrupt;
+    }
+    if envelope.kind == QUARANTINE {
+        return serde_json::from_slice::<QuarantineRecord>(raw)
+            .ok()
+            .filter(|record| is_hash(&record.from_hash) && is_hash(&record.final_hash))
+            .map_or(Line::Corrupt, Line::Quarantine);
+    }
+    if KNOWN_KINDS.contains(&envelope.kind.as_str()) {
+        return Line::Corrupt;
+    }
+    Line::OtherKind {
+        previous_hash: envelope.previous_hash,
+    }
+}
+
+impl Line {
+    /// The `previous_hash` the line carries, or `None` for a corrupt line.
+    fn previous_hash(&self) -> Option<&str> {
+        match self {
+            Self::Record(record) => Some(&record.previous_hash),
+            Self::Quarantine(record) => Some(&record.previous_hash),
+            Self::OtherKind { previous_hash } => Some(previous_hash),
+            Self::Corrupt => None,
+        }
+    }
+}
+
+/// The complete, non-empty lines of `bytes`, each without its newline.
+/// The bytes after the last newline are a partial write and are left out.
+fn complete_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
+    bytes[..complete]
+        .split(|&b| b == b'\n')
+        .map(|raw| raw.strip_suffix(b"\r").unwrap_or(raw))
+        .filter(|raw| !raw.is_empty())
+}
+
 /// Creates `dir` and its parents when absent. A directory this call creates
 /// gets mode 0700, so it is the proxy's alone.
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -595,6 +721,19 @@ impl AuditLog {
     /// carries the closed segment's final hash. Then prunes the segments
     /// past the retention bound.
     fn rotate(&mut self) -> io::Result<()> {
+        let Some((dir, _, rotation)) = self.rotation.clone() else {
+            return Ok(());
+        };
+        self.open_next()?;
+        if let Err(err) = prune(&dir, &rotation, std::time::SystemTime::now()) {
+            tracing::warn!(dir = %dir.display(), error = %err, "audit segments were not pruned");
+        }
+        Ok(())
+    }
+
+    /// Opens the segment after the active one as the active segment. Its
+    /// first record carries the head of the segment it replaces.
+    fn open_next(&mut self) -> io::Result<()> {
         let Some((dir, n, rotation)) = self.rotation.clone() else {
             return Ok(());
         };
@@ -616,15 +755,158 @@ impl AuditLog {
             "rotated the audit log"
         );
         opened.head = std::mem::take(&mut self.head);
-        opened.rotation = Some((dir.clone(), n + 1, rotation));
+        opened.rotation = Some((dir, n + 1, rotation));
         // The directory stays locked across the swap, so no other writer
         // can take the closed segment.
         opened.dir_lock = self.dir_lock.take();
         *self = opened;
-        if let Err(err) = prune(&dir, &rotation, std::time::SystemTime::now()) {
-            tracing::warn!(dir = %dir.display(), error = %err, "audit segments were not pruned");
-        }
         Ok(())
+    }
+
+    /// Moves each segment of the log that holds a complete line that does
+    /// not parse into [`QUARANTINE_DIR`] in the log's directory, and starts
+    /// the log past them. For each moved segment it appends one
+    /// [`QuarantineRecord`], which carries the hashes the chain runs on
+    /// across the gap, and then each revocation it read in that segment
+    /// again, so those stay in force at later starts. A line that does
+    /// not parse is lost to the log, whatever it recorded.
+    ///
+    /// Only a log that [`AuditLog::open_dir`] opened can quarantine, since
+    /// it holds the directory. Returns the segments it moved, oldest first.
+    pub fn quarantine_unreadable(&mut self) -> io::Result<Vec<Quarantined>> {
+        let Some((dir, active, _)) = self.rotation.clone() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only an audit log opened as a directory of segments can quarantine",
+            ));
+        };
+        let found = numbered_segments(&dir)?;
+        let quarantine_dir = dir.join(QUARANTINE_DIR);
+        // The plan reads every segment and changes nothing, so an error in
+        // it leaves the log as it was.
+        let mut moved = Vec::new();
+        let mut active_moved = false;
+        // The hash the chain carries out of the segment before this one.
+        let mut previous_final: Option<String> = None;
+        for (i, (n, path)) in found.iter().enumerate() {
+            let bytes = fs::read(path)?;
+            let lines: Vec<Line> = complete_lines(&bytes).map(classify).collect();
+            let unreadable = lines
+                .iter()
+                .filter(|line| matches!(line, Line::Corrupt))
+                .count();
+            let file_final =
+                head_hash(&bytes[..bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1)]);
+            if unreadable == 0 {
+                previous_final = Some(file_final);
+                continue;
+            }
+            let from_hash = previous_final
+                .take()
+                .or_else(|| {
+                    lines
+                        .first()
+                        .and_then(Line::previous_hash)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| ZERO_HASH.to_owned());
+            // The record after the segment chains to the hash its last
+            // line had when it was written, and an unreadable last line
+            // can differ from it now.
+            let final_hash = match found.get(i + 1) {
+                Some((_, next)) => first_previous_hash(next)?.unwrap_or(file_final),
+                None => file_final,
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let moved_to = quarantine_dir.join(&name);
+            if fs::symlink_metadata(&moved_to).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists already", moved_to.display()),
+                ));
+            }
+            active_moved |= *n == active;
+            let mut revoked: Vec<String> = Vec::new();
+            for line in &lines {
+                if let Line::Record(record) = line
+                    && record.kind == Kind::Revocation
+                    && !revoked.contains(&record.subject)
+                {
+                    revoked.push(record.subject.clone());
+                }
+            }
+            // A record of a kind this bep does not know can be a newer
+            // bep's revocation. The move cannot record it again, so it
+            // counts it for the warn line.
+            let other_kinds = lines
+                .iter()
+                .filter(|line| matches!(line, Line::OtherKind { .. }))
+                .count();
+            previous_final = Some(final_hash.clone());
+            moved.push(Quarantined {
+                segment: path.clone(),
+                moved_to,
+                record: QuarantineRecord {
+                    schema: SCHEMA.to_owned(),
+                    kind: QUARANTINE.to_owned(),
+                    segment: name,
+                    from_hash,
+                    final_hash,
+                    unreadable,
+                    previous_hash: String::new(),
+                },
+                revoked,
+                other_kinds,
+            });
+        }
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+        create_private_dir(&quarantine_dir)?;
+        if active_moved {
+            // The log writes the records below to a segment that stays, so
+            // it goes on in a new segment, chained to its head, before it
+            // moves the active one.
+            self.open_next()?;
+        }
+        // Each segment's record and revocations go to the log before the
+        // segment moves. A failure or a crash between the two leaves the
+        // segment in place, and the next quarantine moves it. It never
+        // leaves a moved segment without its record or its revocations.
+        for quarantined in &mut moved {
+            self.prepare()?;
+            quarantined.record.previous_hash = self.head.clone();
+            self.write_line(&quarantined.record.to_line())?;
+            for box_id in &quarantined.revoked {
+                self.append(&Decision {
+                    kind: Kind::Revocation,
+                    box_id: box_id.clone(),
+                    authority: String::new(),
+                    identifier: None,
+                    // A mint or a revocation carries no handle.
+                    jti: String::new(),
+                    mapping: Mapping::ModuleUnmapped,
+                    outcome: Outcome::Refuse,
+                    marker: Some(RESTATED.to_owned()),
+                })?;
+            }
+            fs::rename(&quarantined.segment, &quarantined.moved_to)?;
+            tracing::warn!(
+                segment = %quarantined.segment.display(),
+                moved_to = %quarantined.moved_to.display(),
+                unreadable = quarantined.record.unreadable,
+                other_kinds = quarantined.other_kinds,
+                final_hash = %quarantined.record.final_hash,
+                "moved an audit segment with unreadable lines to quarantine; \
+                 a revocation on an unreadable line, or on a line of a kind \
+                 this bep does not know (other_kinds), is no longer in force, \
+                 so check the destroyed boxes that segment can record"
+            );
+        }
+        Ok(moved)
     }
 
     /// The log's path.
@@ -641,6 +923,15 @@ impl AuditLog {
     /// head does not move, the partial bytes are cut off, and one warn line
     /// names the path. When the cut fails too, every later append fails.
     pub fn append(&mut self, decision: &Decision) -> io::Result<Record> {
+        self.prepare()?;
+        let record = Record::from_decision(decision, &self.head);
+        self.write_line(&record.to_line())?;
+        Ok(record)
+    }
+
+    /// Fails when an earlier append poisoned the log, and rotates the
+    /// active segment when it is full, before the next line is built.
+    fn prepare(&mut self) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(format!(
                 "audit log {} holds a torn line, reopen it",
@@ -653,8 +944,11 @@ impl AuditLog {
         {
             self.rotate()?;
         }
-        let record = Record::from_decision(decision, &self.head);
-        let line = record.to_line();
+        Ok(())
+    }
+
+    /// Appends `line`, which chains to the head, and moves the head to it.
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
@@ -682,9 +976,26 @@ impl AuditLog {
             return Err(err);
         }
         self.len += bytes.len() as u64;
-        self.head = line_hash(&line);
-        Ok(record)
+        self.head = line_hash(line);
+        Ok(())
     }
+}
+
+/// One segment that [`AuditLog::quarantine_unreadable`] moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quarantined {
+    /// Where the segment was.
+    pub segment: PathBuf,
+    /// Where it is now, under [`QUARANTINE_DIR`].
+    pub moved_to: PathBuf,
+    /// The record the move appended to the log.
+    pub record: QuarantineRecord,
+    /// The box ids of the revocations read in the segment, which the move
+    /// appended to the log again.
+    pub revoked: Vec<String>,
+    /// The lines in the segment of a kind this bep does not know. One can
+    /// be a newer bep's revocation, which the move does not record again.
+    pub other_kinds: usize,
 }
 
 /// The file name of segment `n` of a log: `audit-<n>.jsonl`. A log is the
@@ -753,19 +1064,182 @@ fn final_hash(path: &Path) -> io::Result<String> {
     Ok(head_hash(&tail[..complete]))
 }
 
+/// The `previous_hash` of the first line of the segment at `path`, or
+/// `None` when it holds no line or its first line does not parse.
+fn first_previous_hash(path: &Path) -> io::Result<Option<String>> {
+    let bytes = fs::read(path)?;
+    Ok(complete_lines(&bytes)
+        .next()
+        .map(classify)
+        .and_then(|line| line.previous_hash().map(str::to_owned)))
+}
+
 /// Whether the segment at `path` holds a revocation record, or can hold
 /// one. A complete, non-empty line that does not parse as a record counts
-/// as one, so [`prune`] keeps a segment it cannot read whole. The bytes
-/// after the last newline are a partial write and count as none.
+/// as one, so [`prune`] keeps a segment it cannot read whole. A record of
+/// a kind this bep does not know counts too. A quarantine record does not
+/// count. The bytes after the last newline are a
+/// partial write and count as none.
 fn holds_revocation(path: &Path) -> io::Result<bool> {
     let bytes = fs::read(path)?;
-    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |n| n + 1);
-    Ok(bytes[..complete].split(|&b| b == b'\n').any(|raw| {
-        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-        !raw.is_empty()
-            && serde_json::from_slice::<Record>(raw)
-                .map_or(true, |record| record.kind == Kind::Revocation)
+    Ok(complete_lines(&bytes).any(|raw| match classify(raw) {
+        Line::Record(record) => record.kind == Kind::Revocation,
+        // A kind this bep does not know can be a revocation that a newer
+        // bep wrote, so prune keeps its segment, as for a corrupt line.
+        Line::Corrupt | Line::OtherKind { .. } => true,
+        Line::Quarantine(_) => false,
     }))
+}
+
+/// Where the chain of a log stops verifying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainBreak {
+    /// The segment that holds the line.
+    pub segment: PathBuf,
+    /// The line's number in its segment, from 1.
+    pub line: usize,
+    /// The hash the line must carry as `previous_hash`.
+    pub expected: String,
+    /// The hash it carries, or `None` when the line does not parse.
+    pub found: Option<String>,
+}
+
+/// Verifies the chain of the log in `dir` across every retained segment,
+/// and returns the count of records it verified. Each record must carry
+/// the hash of the line before it (BEP-048). The first retained record can
+/// carry any hash, since the segments before it can be pruned. A gap is
+/// verified only between two segments, and only when [`QuarantineRecord`]s
+/// lead across it from the hash before it to the hash after it. Each of
+/// those records must name a segment under [`QUARANTINE_DIR`] that agrees
+/// with it, numbered between the two segments, and come after the gap.
+pub fn verify_chain(dir: impl AsRef<Path>) -> io::Result<Result<usize, ChainBreak>> {
+    let dir = dir.as_ref();
+    let mut read = Vec::new();
+    for path in segments(dir)? {
+        let bytes = fs::read(&path)?;
+        read.push((path, bytes));
+    }
+    let mut moved = Vec::new();
+    for (_, path) in numbered_segments(&dir.join(QUARANTINE_DIR))? {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        moved.push((name, fs::read(&path)?));
+    }
+    Ok(verify_segments(&read, &moved))
+}
+
+/// Whether `bytes`, a segment under [`QUARANTINE_DIR`], is the segment
+/// that `record` says it moved: it holds `record.unreadable` lines that do
+/// not parse, and its first and last lines, where they parse, carry the
+/// hashes the record bridges.
+fn moved_segment_matches(record: &QuarantineRecord, bytes: &[u8]) -> bool {
+    let lines: Vec<Line> = complete_lines(bytes).map(classify).collect();
+    let unreadable = lines
+        .iter()
+        .filter(|line| matches!(line, Line::Corrupt))
+        .count();
+    if unreadable == 0 || unreadable != record.unreadable {
+        return false;
+    }
+    let first = lines
+        .first()
+        .and_then(Line::previous_hash)
+        .is_none_or(|hash| hash == record.from_hash);
+    let last = complete_lines(bytes).last().is_none_or(|raw| {
+        matches!(classify(raw), Line::Corrupt) || line_hash(raw) == record.final_hash
+    });
+    first && last
+}
+
+/// [`verify_chain`] over segments already read, oldest first, and the
+/// segments under [`QUARANTINE_DIR`] by file name. Pure.
+pub fn verify_segments(
+    segments: &[(PathBuf, Vec<u8>)],
+    quarantined: &[(String, Vec<u8>)],
+) -> Result<usize, ChainBreak> {
+    let number_of = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(segment_number)
+    };
+    let lines: Vec<(&Path, usize, &[u8], Line)> = segments
+        .iter()
+        .flat_map(|(path, bytes)| {
+            complete_lines(bytes)
+                .enumerate()
+                .map(move |(i, raw)| (path.as_path(), i + 1, raw, classify(raw)))
+        })
+        .collect();
+    // Each bridge: where it sits in the log, the moved segment's number,
+    // and the record. A bridge whose moved segment is absent, or does not
+    // agree with it, bridges nothing.
+    let bridges: Vec<(usize, u64, &QuarantineRecord)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (_, _, _, line))| match line {
+            Line::Quarantine(record) => Some((at, record)),
+            _ => None,
+        })
+        .filter_map(|(at, record)| {
+            let number = segment_number(&record.segment)?;
+            let (_, bytes) = quarantined
+                .iter()
+                .find(|(name, _)| *name == record.segment)?;
+            moved_segment_matches(record, bytes).then_some((at, number, record))
+        })
+        .collect();
+    // The hash of the line before, and the number of its segment.
+    let mut head: Option<(String, Option<u64>)> = None;
+    for (index, (path, number, raw, line)) in lines.iter().enumerate() {
+        let found = line.previous_hash();
+        if let Some((expected, before)) = &head {
+            let bridged = found.is_some_and(|found| {
+                if expected == found {
+                    return true;
+                }
+                // A quarantine moves whole segments, so a gap opens only
+                // before the first line of a segment.
+                let (Some(mut after), Some(here)) = (*before, number_of(path)) else {
+                    return false;
+                };
+                if *number != 1 {
+                    return false;
+                }
+                let mut at = expected.as_str();
+                // Each step moves to a higher segment number, so the walk
+                // ends.
+                while let Some((_, moved, record)) = bridges.iter().find(|(pos, moved, record)| {
+                    *pos >= index && *moved > after && *moved < here && record.from_hash == at
+                }) {
+                    at = &record.final_hash;
+                    after = *moved;
+                    if at == found {
+                        return true;
+                    }
+                }
+                false
+            });
+            if !bridged {
+                return Err(ChainBreak {
+                    segment: path.to_path_buf(),
+                    line: *number,
+                    expected: expected.clone(),
+                    found: found.map(str::to_owned),
+                });
+            }
+        } else if found.is_none() {
+            return Err(ChainBreak {
+                segment: path.to_path_buf(),
+                line: *number,
+                expected: String::new(),
+                found: None,
+            });
+        }
+        head = Some((line_hash(raw), number_of(path)));
+    }
+    Ok(lines.len())
 }
 
 /// Removes the segments of the log in `dir` that are older than the newest
@@ -818,6 +1292,10 @@ pub struct ReadBatch {
     pub skipped: usize,
     /// The segments that hold a skipped line, oldest first and each once.
     pub skipped_in: Vec<PathBuf>,
+    /// The records of a kind other than a decision, a mint or a revocation:
+    /// a quarantine record, or a kind this bep does not know. They are not
+    /// counted in `skipped`.
+    pub other_kinds: usize,
 }
 
 /// A read-only reader over the log in one directory, across every
@@ -908,20 +1386,15 @@ impl LogReader {
             if complete == 0 {
                 continue;
             }
-            for raw in bytes[..complete].split(|&b| b == b'\n') {
-                let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-                if raw.is_empty() {
-                    continue;
-                }
-                let parsed = std::str::from_utf8(raw)
-                    .ok()
-                    .and_then(|line| Some((line, serde_json::from_str::<Record>(line).ok()?)));
-                match parsed {
-                    Some((line, record)) => out.entries.push(Entry {
+            for raw in complete_lines(&bytes[..complete]) {
+                match classify(raw) {
+                    Line::Record(record) => out.entries.push(Entry {
                         record,
-                        line: line.to_owned(),
+                        // A record parsed from these bytes, so they are UTF-8.
+                        line: String::from_utf8_lossy(raw).into_owned(),
                     }),
-                    None => {
+                    Line::Quarantine(_) | Line::OtherKind { .. } => out.other_kinds += 1,
+                    Line::Corrupt => {
                         out.skipped += 1;
                         if out.skipped_in.last() != Some(&path) {
                             out.skipped_in.push(path.clone());
@@ -1376,6 +1849,180 @@ mod tests {
         }
     }
 
+    // BEP-068: a quarantine of the active segment goes on in the next
+    // segment, chained across the gap, and a revocation read in the moved
+    // segment is recorded again.
+    #[test]
+    fn quarantine_of_the_active_segment_opens_the_next() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 16, 60)).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&revocation("box-gone")).unwrap();
+        let head = log.head().to_owned();
+        drop(log);
+        let active = audit.join(segment_name(0));
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        let other = format!(r#"{{"schema":"{SCHEMA}","kind":"future","previous_hash":"{head}"}}"#);
+        file.write_all(format!("{other}\n").as_bytes()).unwrap();
+        file.write_all(b"not a record\n").unwrap();
+        drop(file);
+        assert_eq!(LogReader::new(&audit).read_new().unwrap().skipped, 1);
+
+        let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 16, 60)).unwrap();
+        let moved = log.quarantine_unreadable().unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].revoked, vec!["box-gone".to_owned()]);
+        assert_eq!(moved[0].other_kinds, 1);
+        assert_eq!(log.path(), audit.join(segment_name(1)));
+        assert_eq!(moved[0].record.previous_hash, moved[0].record.final_hash);
+        log.append(&off_module()).unwrap();
+        drop(log);
+        assert!(audit.join(QUARANTINE_DIR).join(segment_name(0)).exists());
+        // The quarantine, the revocation again and the new record.
+        assert_eq!(verify_chain(&audit).unwrap(), Ok(3));
+        let batch = LogReader::new(&audit).read_new().unwrap();
+        assert_eq!((batch.skipped, batch.other_kinds), (0, 1));
+        assert!(
+            batch
+                .entries
+                .iter()
+                .any(|entry| entry.record.kind == Kind::Revocation)
+        );
+    }
+
+    // BEP-049, BEP-068: a quarantine record bridges a gap only between two
+    // segments, and only with the moved segment under `quarantine/`.
+    #[test]
+    fn forged_quarantine_record_bridges_no_gap() {
+        let forge = |from_hash: &str, final_hash: &str, previous_hash: &str| {
+            QuarantineRecord {
+                schema: SCHEMA.to_owned(),
+                kind: QUARANTINE.to_owned(),
+                segment: segment_name(1),
+                from_hash: from_hash.to_owned(),
+                final_hash: final_hash.to_owned(),
+                unreadable: 1,
+                previous_hash: previous_hash.to_owned(),
+            }
+            .to_line()
+        };
+        let append_line = |path: &Path, line: &str| {
+            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        };
+
+        // A whole segment removed, and a record that names it appended.
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        log.append(&revocation("box-gone")).unwrap();
+        let third = log.append(&admit()).unwrap();
+        let head = log.head().to_owned();
+        drop(log);
+        let removed = audit.join(segment_name(1));
+        let removed_bytes = fs::read(&removed).unwrap();
+        fs::remove_file(&removed).unwrap();
+        let first_hash = line_hash(first.to_line());
+        append_line(
+            &audit.join(segment_name(2)),
+            &forge(&first_hash, &third.previous_hash, &head),
+        );
+        assert!(verify_chain(&audit).unwrap().is_err());
+        // A file of that name that holds no unreadable line does not agree.
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(1)),
+            &removed_bytes,
+        )
+        .unwrap();
+        assert!(verify_chain(&audit).unwrap().is_err());
+
+        // A run of records removed inside one segment.
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut log = AuditLog::open_dir(&audit, rotation(1 << 20, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        let second = log.append(&revocation("box-gone")).unwrap();
+        let third = log.append(&admit()).unwrap();
+        drop(log);
+        let active = audit.join(segment_name(0));
+        let kept = format!("{}\n{}\n", first.to_line(), third.to_line());
+        fs::write(&active, &kept).unwrap();
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(1)),
+            format!("{}\nnot a record\n", second.to_line()),
+        )
+        .unwrap();
+        let first_hash = line_hash(first.to_line());
+        append_line(
+            &active,
+            &forge(
+                &first_hash,
+                &third.previous_hash,
+                &line_hash(third.to_line()),
+            ),
+        );
+        assert!(verify_chain(&audit).unwrap().is_err());
+    }
+
+    // BEP-068: a quarantine that fails part way moves no segment it did
+    // not record, so a revocation in a bad segment stays in the log.
+    #[test]
+    fn quarantine_that_fails_leaves_no_moved_segment_unrecorded() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        log.append(&revocation("box-gone")).unwrap();
+        log.append(&admit()).unwrap();
+        log.append(&admit()).unwrap();
+        drop(log);
+        for n in [0, 1] {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(audit.join(segment_name(n)))
+                .unwrap();
+            file.write_all(b"not a record\n").unwrap();
+        }
+        // A file in the way of the second move.
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        let blocker = audit.join(QUARANTINE_DIR).join(segment_name(1));
+        fs::write(&blocker, b"").unwrap();
+        let before: Vec<Vec<u8>> = (0..3)
+            .map(|n| fs::read(audit.join(segment_name(n))).unwrap())
+            .collect();
+
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let err = log.quarantine_unreadable().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        drop(log);
+        assert!(!audit.join(QUARANTINE_DIR).join(segment_name(0)).exists());
+        let after: Vec<Vec<u8>> = (0..3)
+            .map(|n| fs::read(audit.join(segment_name(n))).unwrap())
+            .collect();
+        assert_eq!(after, before);
+
+        fs::remove_file(&blocker).unwrap();
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let moved = log.quarantine_unreadable().unwrap();
+        assert_eq!(moved.len(), 2);
+        assert_eq!(moved[0].revoked, vec!["box-gone".to_owned()]);
+        drop(log);
+        assert!(verify_chain(&audit).unwrap().is_ok());
+        let batch = LogReader::new(&audit).read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
+        assert!(
+            batch
+                .entries
+                .iter()
+                .any(|entry| entry.record.kind == Kind::Revocation)
+        );
+    }
+
     // BEP-068: a full segment opens the next one, whose first record
     // carries the previous segment's final hash, and so does a reopen into
     // a segment that holds no record yet.
@@ -1558,6 +2205,14 @@ mod tests {
         fs::write(audit.join(segment_name(2)), b"").unwrap();
         assert!(holds_revocation(&audit.join(segment_name(0))).unwrap());
         assert!(!holds_revocation(&audit.join(segment_name(1))).unwrap());
+        // A kind this bep does not know can be a newer bep's revocation.
+        let future = dir.0.join("future.jsonl");
+        fs::write(
+            &future,
+            format!("{{\"schema\":\"{SCHEMA}\",\"kind\":\"future_kind\",\"previous_hash\":\"{ZERO_HASH}\"}}\n"),
+        )
+        .unwrap();
+        assert!(holds_revocation(&future).unwrap());
 
         let day = 24 * 60 * 60;
         let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(day / 2);

@@ -13,7 +13,8 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;
@@ -943,8 +944,10 @@ pub enum BoxState {
     Materializing,
     /// Composition complete and every side-channel upload is on
     /// disk; the record is ready to apply and the session is
-    /// attachable.
+    /// attachable. This is the stored spelling of the `running` state
+    /// (BOX-011), and a record that spells it `running` loads as it.
     #[default]
+    #[serde(alias = "running")]
     Active,
 }
 
@@ -1490,6 +1493,15 @@ pub const SESSION_BOX_TYPE: &str = "session";
 pub const TASK_BOX_TYPE: &str = "task";
 
 impl Record {
+    /// The one state the record is in (BOX-011). A stored record is
+    /// `pending`, `materializing` or `running`: the store does not yet
+    /// hold an ending, so no stored record reads as `stopped` or `exited`.
+    /// Issue #2634 owns storing `reason`, `exit_code` and `signal`.
+    #[must_use]
+    pub fn state(&self) -> crate::core::record::RecordState {
+        crate::core::record::RecordState::from(self.status)
+    }
+
     /// [`Record::validate_policy`] plus the checks a record must pass only
     /// when it is created: added after records were already stored, they
     /// would strand an existing session if they ran on every launch.

@@ -248,9 +248,10 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// For a store member, the bound set is the handle's `upstream` and the
     /// current set is the current rule's authorities, so the checks that
     /// read a module's host sets read those (BEP-032, BEP-064). The rules
-    /// are the ones [`Self::with_rules`] gives. `bep serve` gives none until
-    /// <https://github.com/gominimal/minimal/issues/2599> gives it the
-    /// `[secret-store-rules]`.
+    /// are the ones [`Self::with_rules`] gives. `bep serve` gives the
+    /// `[secret-store-rules]` of the user-level client `config.toml` merged
+    /// over the organization's, less each rule the deny set refuses
+    /// (BEP-034), read again when either file changes.
     fn facts(
         &self,
         box_id: &str,

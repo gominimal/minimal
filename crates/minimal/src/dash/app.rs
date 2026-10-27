@@ -71,6 +71,10 @@ pub enum Action {
     Rename { key: SessionKey, input: String },
     /// `n`: the create form.
     Create(CreateForm),
+    /// A dashboard create paused on the undeclared non-VCS upload confirm
+    /// (the CLI's #770 prompt): "y" uploads the root, "n" skips it and
+    /// creates the box empty, Esc calls the create off.
+    ConfirmCreateUpload { token: u64, root: String },
 }
 
 /// The create form's fields. `field` is which one has input focus.
@@ -132,11 +136,44 @@ pub enum Msg {
     Created {
         provider: String,
         id: SessionId,
+        /// What the tree upload did, for the status line.
+        upload: crate::WorkspaceUpload,
         /// The daemon's package check stepped aside at finalize.
         package_check_skipped: bool,
         /// The deny-all egress default binds the new box (NET-074).
         egress_deny_all_default: bool,
     },
+    /// A create paused for the undeclared non-VCS upload confirm: the
+    /// background task holds the create and awaits the user's answer on
+    /// `reply`. The driver stashes `reply` keyed by `token` (a `oneshot::Sender`
+    /// cannot live in [`Action`], which derives `Clone`/`Eq`) and opens the
+    /// confirm modal.
+    CreateUploadConfirm {
+        token: u64,
+        root: String,
+        reply: tokio::sync::oneshot::Sender<UploadAnswer>,
+    },
+}
+
+/// The user's answer to a create's upload confirm. "n" and Esc are different
+/// answers: the first creates the box without the tree, the second calls the
+/// create off, as Esc does everywhere else in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadAnswer {
+    /// Upload the root and create the box from it.
+    Upload,
+    /// Skip the upload and create the box empty.
+    Decline,
+    /// Create nothing at all.
+    Cancel,
+}
+
+/// What a finished create task got.
+enum CreateOutcome {
+    /// The box was created and activated.
+    Created(rpc::Activated),
+    /// The user called the create off at the upload confirm.
+    Cancelled,
 }
 
 /// Side effects [`update`] asks the driver to run.
@@ -157,6 +194,13 @@ pub enum Effect {
     /// Suspend the TUI, attach to the session over ssh, and resume when the
     /// user detaches.
     Attach(SessionKey),
+    /// Answer a paused create's upload confirm. Handled inline by the run
+    /// loop (it owns the stashed `oneshot::Sender`, which cannot live in this
+    /// `Effect`).
+    AnswerCreateUpload {
+        token: u64,
+        answer: UploadAnswer,
+    },
     /// Persist the last-focused session to `dash-state.json`.
     SaveState,
 }
@@ -525,10 +569,12 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Created {
             provider,
             id,
+            upload,
             package_check_skipped,
             egress_deny_all_default,
         } => {
             model.status = Some(created_status(
+                upload,
                 package_check_skipped,
                 egress_deny_all_default,
             ));
@@ -536,16 +582,49 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
+        // Intercepted by the run loop before `update` (it carries the create
+        // task's reply sender); reaching here would drop that reply and hang
+        // the create.
+        Msg::CreateUploadConfirm { .. } => {
+            unreachable!("CreateUploadConfirm is handled by the run loop")
+        }
     }
 }
 
-/// The status line a create ends with: the package check's warning when it
-/// stepped aside, and the note `min session activate` prints when the
-/// deny-all egress default binds the new box (NET-074) — the dashboard has
-/// no egress fields, so a bare own-address box it creates reaches nothing
-/// outside itself until it is re-created with declared reach.
-fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) -> String {
+/// The status line a create ends with: what the upload did with the tree,
+/// the package check's warning when it stepped aside, and the note `min
+/// session activate` prints when the deny-all egress default binds the new
+/// box (NET-074) — the dashboard has no egress fields, so a bare own-address
+/// box it creates reaches nothing outside itself until it is re-created with
+/// declared reach.
+fn created_status(
+    upload: crate::WorkspaceUpload,
+    package_check_skipped: bool,
+    egress_deny_all_default: bool,
+) -> String {
     let mut status = "session created".to_string();
+    match upload {
+        crate::WorkspaceUpload::Uploaded => {}
+        crate::WorkspaceUpload::SkippedEmptyOrHome { .. } => {
+            status.push_str("; starting with an empty box (nothing here to sync)");
+        }
+        // Defensive: the dashboard's create task always passes
+        // `headless: false` and resolves its own confirm, so it can only
+        // produce `Uploaded`, `SkippedEmptyOrHome` or `Declined`. The arm is
+        // kept so the match stays exhaustive over the shared `WorkspaceUpload`.
+        crate::WorkspaceUpload::SkippedUndeclared => {
+            status.push_str(
+                "; the file upload was skipped: not a repository root and no minimal.toml, \
+                 so the box starts with an empty workspace",
+            );
+        }
+        crate::WorkspaceUpload::Declined => {
+            status.push_str(
+                "; the file upload was skipped as you asked: the box starts with an empty \
+                 workspace",
+            );
+        }
+    }
     if package_check_skipped {
         status.push_str(
             "; warning: package names were not checked, so an unknown package name \
@@ -688,9 +767,49 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.action = None;
                 vec![Effect::Destroy(target)]
             }
+            // The global quit keys are not swallowed by an open confirm.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
+            }
             (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                 model.action = None;
                 Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        Action::ConfirmCreateUpload { token, .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Upload,
+                }]
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Decline,
+                }]
+            }
+            // Esc backs out the way it does on every other dashboard prompt:
+            // no session is created, rather than an empty one.
+            (KeyCode::Esc, _) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Cancel,
+                }]
+            }
+            // The global quit keys are not swallowed by an open confirm. The
+            // create task's reply drops with the loop, which it reads as a
+            // cancel.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
             }
             _ => Vec::new(),
         },
@@ -880,7 +999,7 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
 }
 
 /// Options for [`run`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DashOptions {
     /// `--minimal-dir` override; `None` uses the platform default state dir.
     pub minimal_dir: Option<PathBuf>,
@@ -888,11 +1007,60 @@ pub struct DashOptions {
     /// Resolved into session keys at attach so a dash-attach honors the
     /// `[session-keys]` config just like `min session attach`.
     pub config_dir: Option<PathBuf>,
-    /// The loadout contribution the CLI composed at startup (default
-    /// loadouts + user policy), re-sent with every create so `n` in dash
-    /// matches `min session activate`. Composition needs the CLI crate's
-    /// config plumbing, which lives above this crate.
-    pub contribution: boxes::wire::request::WireContribution,
+    /// The loadout selection every dashboard create resolves its activation
+    /// inputs from — `LoadoutSelection::Defaults`, matching `min session
+    /// activate` with no flags, so `default_loadouts` and the user policy
+    /// apply to dashboard-created sessions.
+    pub(crate) loadouts: crate::loadouts::LoadoutSelection,
+}
+
+/// One create waiting on an upload confirm: the token keys it, `root` is
+/// shown in the footer, and `reply` is answered when the user answers.
+struct PendingConfirm {
+    token: u64,
+    root: String,
+    reply: tokio::sync::oneshot::Sender<UploadAnswer>,
+}
+
+/// The next upload-confirm token. A create task picks one before it sends
+/// [`Msg::CreateUploadConfirm`]; the driver keys the stashed reply by it, so
+/// two creates in flight never answer each other's prompt.
+fn next_confirm_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Discards keys already in flight when a prompt opens. They were typed
+/// before it appeared, so answering with one would make an `n` meant for the
+/// list create the box on an empty workspace; the prompt must wait for a
+/// deliberate answer.
+async fn discard_buffered_input(events: &mut crossterm::event::EventStream) {
+    use futures::StreamExt as _;
+    // Only a real event is discarded. A stream that ended (`None`) or failed
+    // (`Some(Err(_))`) stops the drain instead of spinning, and the main loop
+    // sees the stream end on its next read.
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(std::time::Duration::ZERO, events.next()).await
+    {
+    }
+}
+
+/// Show the oldest pending upload confirm if no other modal is open, and
+/// report whether one opened. A queued confirm shown behind an open modal
+/// must leave that modal's keystrokes alone; the caller drains in-flight
+/// input only when the confirm actually appears.
+fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) -> bool {
+    if model.action.is_some() {
+        return false;
+    }
+    let Some(p) = pending.front() else {
+        return false;
+    };
+    model.action = Some(Action::ConfirmCreateUpload {
+        token: p.token,
+        root: p.root.clone(),
+    });
+    true
 }
 
 /// Entry point for `min dash`: discover providers, then drive the
@@ -911,7 +1079,24 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     // dashboard the same way it refuses `min ls` — plain message, terminal
     // untouched.
     let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await?;
-    let contribution = opts.contribution.clone();
+    // The create task resolves each session's activation inputs through the
+    // CLI's helper; it needs a `GlobalArgs` carrying the same directory
+    // overrides the dashboard was launched with (the other fields do not
+    // affect activation-inputs resolution).
+    let global = crate::GlobalArgs {
+        minimal_dir: opts.minimal_dir.clone(),
+        config_dir: opts.config_dir.clone(),
+        ..Default::default()
+    };
+    // Read once here, before the TUI owns the screen: the read prints the
+    // organization-file errors and refused store rules on stderr, and a
+    // config or policy that does not parse must fail at startup rather than
+    // at each create. A default loadout that cannot be resolved fails here
+    // for the same reason; the create task resolves and stages them again
+    // against the create's own project root.
+    let client_config = crate::config::read_client_config(&global)?;
+    let user_policy = crate::config::read_user_policy(&global)?;
+    crate::loadouts::resolve_active_loadouts(opts.loadouts.clone(), &client_config, &global)?;
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());
     let mut model = Model::new(Utc::now());
@@ -931,6 +1116,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     // Background tasks (the create flow runs its upload off the UI loop)
     // report back over this channel.
     let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<Msg>(8);
+
+    // Creates paused on an upload confirm, oldest first. Each carries the
+    // `oneshot::Sender` its task awaits; the modal answers the front one.
+    let mut pending_confirms: VecDeque<PendingConfirm> = VecDeque::new();
 
     // Prime the list immediately rather than waiting out the first tick.
     let mut inbox: VecDeque<Msg> = VecDeque::from([Msg::Tick]);
@@ -959,11 +1148,40 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
             }
         };
 
+        // A create pausing for the upload confirm is not a pure state
+        // transition (it carries the task's reply sender), so the driver
+        // intercepts it, stashes the sender, and opens the modal itself.
+        let msg = match msg {
+            Msg::CreateUploadConfirm { token, root, reply } => {
+                pending_confirms.push_back(PendingConfirm { token, root, reply });
+                if show_pending_confirm(&mut model, &mut pending_confirms) {
+                    discard_buffered_input(&mut events).await;
+                }
+                continue;
+            }
+            other => other,
+        };
+
         for effect in update(&mut model, msg) {
             match effect {
                 // State persistence is local disk, not a daemon call, so it
                 // runs inline rather than going through `exec_effect`.
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
+                // The upload confirm the user just answered: deliver the
+                // stashed reply and, if another create is waiting, show its
+                // modal now that `update` closed this one.
+                Effect::AnswerCreateUpload { token, answer } => {
+                    if let Some(i) = pending_confirms.iter().position(|p| p.token == token) {
+                        // `remove` needs the index; the element is known to
+                        // exist from the `position` above.
+                        if let Some(p) = pending_confirms.remove(i) {
+                            let _ = p.reply.send(answer);
+                        }
+                    }
+                    if show_pending_confirm(&mut model, &mut pending_confirms) {
+                        discard_buffered_input(&mut events).await;
+                    }
+                }
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
                 Effect::Attach(key) => match providers.iter_mut().find(|p| p.label == key.provider)
@@ -1000,10 +1218,17 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         );
                         // The attach may have ended in the shell-exit
                         // prompt's Delete: withdraw the box's row, or
-                        // release a `host_ip` box's hold.
+                        // release a `host_ip` box's hold, through the CLI's
+                        // helper (it carries the lookup timeout the dashboard's
+                        // old copy lacked).
                         if let Some(name) = box_name.as_deref() {
-                            rpc::release_held_name_after_attach(p, key.id, name, box_addresses)
-                                .await;
+                            crate::release_held_name_after_attach(
+                                &sock,
+                                key.id,
+                                name,
+                                box_addresses,
+                            )
+                            .await;
                         }
                         inbox.push_back(Msg::Tick);
                     }
@@ -1024,7 +1249,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let tx = bg_tx.clone();
-                        let contribution = contribution.clone();
+                        let global = global.clone();
+                        let client_config = client_config.clone();
+                        let user_policy = user_policy.clone();
+                        let loadouts = opts.loadouts.clone();
                         model.status = Some(format!(
                             "creating {}…",
                             name.as_deref().unwrap_or("session")
@@ -1040,20 +1268,114 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 )?;
                                 let abs = paths::HostAbsPath::try_new(utf8)
                                     .context("invalid project path")?;
-                                rpc::activate(&sock, name, abs, network, contribution).await
+                                // Resolve the loadout contribution, stage its
+                                // hook scripts, size the hook budget against
+                                // this project path, resolve the upload root,
+                                // and take the upload gate's stats — all
+                                // through the same CLI helpers `min session
+                                // activate` uses, so an external loadout hook
+                                // works from the dashboard too. Every one of
+                                // them is blocking filesystem work (config and
+                                // policy reads, loadout resolution, hook
+                                // staging, the resolve walk), so run the batch
+                                // off the async worker: a stalled mount must
+                                // not stall the runtime.
+                                let (upload_root, _) =
+                                    rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
+                                let (inputs, decision) = {
+                                    let global_blocking = global.clone();
+                                    let root = upload_root.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let inputs =
+                                            crate::loadouts::prepare_activation_inputs_with_config(
+                                                &client_config,
+                                                &global_blocking,
+                                                &root,
+                                                loadouts,
+                                                crate::loadouts::HookPrep::Enforce,
+                                                Some(user_policy),
+                                            )?;
+                                        let decision = crate::decide_workspace_upload(
+                                            &root,
+                                            false,
+                                            false,
+                                            std::env::home_dir().as_deref(),
+                                        );
+                                        Ok::<_, anyhow::Error>((inputs, decision))
+                                    })
+                                    .await
+                                    .context("preparing the session create")??
+                                };
+                                // The undeclared non-VCS root gets the CLI's
+                                // confirm here, through the TUI, before the
+                                // session is created: a form pre-filled with
+                                // the home directory must not stream it on
+                                // three Enters (#770).
+                                let decision = if decision == crate::UploadDecision::Confirm {
+                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                    let _ = tx
+                                        .send(Msg::CreateUploadConfirm {
+                                            token: next_confirm_token(),
+                                            root: upload_root.to_string(),
+                                            reply: reply_tx,
+                                        })
+                                        .await;
+                                    match reply_rx.await.unwrap_or(UploadAnswer::Cancel) {
+                                        UploadAnswer::Upload => crate::UploadDecision::Upload,
+                                        // The user declined: the session
+                                        // starts on an empty box, the way the
+                                        // CLI's own "no" does. Declined, not
+                                        // the headless skip — that one is what
+                                        // the CLI refuses over dropped hooks.
+                                        UploadAnswer::Decline => crate::UploadDecision::Declined,
+                                        // Esc called the create off: nothing
+                                        // reaches the daemon, so there is no
+                                        // empty box to clean up.
+                                        UploadAnswer::Cancel => {
+                                            return Ok(CreateOutcome::Cancelled);
+                                        }
+                                    }
+                                } else {
+                                    decision
+                                };
+                                // A `$HOME` skip that would drop the project's
+                                // lifecycle hooks refuses here, before the
+                                // create and its row registration, rather than
+                                // tearing a created box back down.
+                                crate::refuse_dropped_hooks_before_create(
+                                    decision,
+                                    &upload_root,
+                                    crate::DASH_DROPPED_HOOKS_REMEDY,
+                                )?;
+                                rpc::activate(
+                                    &sock,
+                                    name,
+                                    abs,
+                                    upload_root,
+                                    network,
+                                    decision,
+                                    inputs,
+                                )
+                                .await
+                                .map(CreateOutcome::Created)
                             }
                             .await;
                             let msg = match result {
-                                Ok(rpc::Activated {
+                                Ok(CreateOutcome::Created(rpc::Activated {
                                     id,
+                                    upload,
                                     package_check_skipped,
                                     egress_deny_all_default,
-                                }) => Msg::Created {
+                                })) => Msg::Created {
                                     provider,
                                     id,
+                                    upload,
                                     package_check_skipped,
                                     egress_deny_all_default,
                                 },
+                                Ok(CreateOutcome::Cancelled) => {
+                                    Msg::ActionDone(Ok("create cancelled".to_string()))
+                                }
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
                             let _ = tx.send(msg).await;
@@ -1076,6 +1398,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     }
                 }
             }
+        }
+        // A modal may have just closed (a destroy/rename/create answered): if
+        // a create confirm was queued behind it, show it now, dropping keys
+        // typed before it appeared.
+        if show_pending_confirm(&mut model, &mut pending_confirms) {
+            discard_buffered_input(&mut events).await;
         }
         if model.quit {
             break;
@@ -1192,8 +1520,12 @@ async fn exec_effect(
             Some(Msg::ActionDone(result))
         }
         // Handled inline by the run loop: SaveState is local disk, Attach
-        // needs the terminal guard, Create spawns a background task.
-        Effect::SaveState | Effect::Attach(_) | Effect::Create { .. } => None,
+        // needs the terminal guard, Create spawns a background task, and
+        // AnswerCreateUpload delivers a stashed reply the loop owns.
+        Effect::SaveState
+        | Effect::Attach(_)
+        | Effect::Create { .. }
+        | Effect::AnswerCreateUpload { .. } => None,
     }
 }
 
@@ -1396,6 +1728,7 @@ mod tests {
             Msg::Created {
                 provider: "host".to_string(),
                 id: id(1),
+                upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: true,
             },
@@ -1415,11 +1748,52 @@ mod tests {
             Msg::Created {
                 provider: "host".to_string(),
                 id: id(2),
+                upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
                 egress_deny_all_default: false,
             },
         );
         assert_eq!(model.status.as_deref(), Some("session created"));
+    }
+
+    /// A create that skipped the tree says so on the status line, the way the
+    /// CLI prints its own line for the same skip: the box looks created either
+    /// way, and only the status tells them apart.
+    #[test]
+    fn created_status_reports_each_upload_outcome() {
+        let status_of = |upload| {
+            let mut model = model_with(Vec::new());
+            update(
+                &mut model,
+                Msg::Created {
+                    provider: "host".to_string(),
+                    id: id(3),
+                    upload,
+                    package_check_skipped: false,
+                    egress_deny_all_default: false,
+                },
+            );
+            model.status.clone().unwrap_or_default()
+        };
+        assert_eq!(
+            status_of(crate::WorkspaceUpload::Uploaded),
+            "session created"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 })
+                .contains("nothing here to sync"),
+            "an empty or home root says the box starts empty"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::Declined).contains("as you asked"),
+            "a declined upload is the user's own answer"
+        );
+        // The defensive arm: the dashboard cannot reach this today (its
+        // create never runs headless), but the renderer still maps it.
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedUndeclared).contains("was skipped"),
+            "an undeclared root says the upload was skipped"
+        );
     }
 
     fn two_providers() -> Model {
@@ -1676,6 +2050,90 @@ mod tests {
             }
         )));
         assert!(model.action.is_none());
+    }
+
+    /// "n" and Esc are different answers: "n" creates the box without the
+    /// tree, Esc calls the create off. Everywhere else in the dashboard Esc
+    /// backs out, and a user who mistyped the path must be able to too.
+    #[test]
+    fn create_upload_confirm_answers_y_n_and_esc() {
+        let answer = |code: KeyCode| {
+            let mut model = two_providers();
+            model.action = Some(Action::ConfirmCreateUpload {
+                token: 7,
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, key(code));
+            assert!(model.action.is_none(), "the modal closes on {code:?}");
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::AnswerCreateUpload { token: 7, answer } => Some(answer),
+                    _ => None,
+                })
+                .expect("the answer reaches the waiting create")
+        };
+        assert_eq!(answer(KeyCode::Char('y')), UploadAnswer::Upload);
+        assert_eq!(answer(KeyCode::Char('n')), UploadAnswer::Decline);
+        assert_eq!(answer(KeyCode::Esc), UploadAnswer::Cancel);
+    }
+
+    /// The global quit keys are not swallowed by an open confirm: the modal
+    /// captures every other key, but `q` and Ctrl-C still end the dashboard.
+    #[test]
+    fn upload_confirm_does_not_swallow_quit() {
+        for keys in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut model = two_providers();
+            model.action = Some(Action::ConfirmCreateUpload {
+                token: 7,
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, Msg::Key(keys));
+            assert!(model.quit, "{keys:?} quits");
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::SaveState)),
+                "{keys:?} saves state"
+            );
+        }
+    }
+
+    /// Two creates can pause on the upload confirm at once: the second waits
+    /// behind whichever modal is open and is shown only once the first is
+    /// answered, so neither task's reply is dropped.
+    #[test]
+    fn pending_upload_confirms_queue_behind_an_open_modal() {
+        let mut model = two_providers();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let mut pending = VecDeque::from([
+            PendingConfirm {
+                token: 1,
+                root: "a".into(),
+                reply: tx1,
+            },
+            PendingConfirm {
+                token: 2,
+                root: "b".into(),
+                reply: tx2,
+            },
+        ]);
+
+        // Another modal owns the footer: the confirm waits, and says so, so
+        // the caller leaves that modal's keystrokes alone.
+        model.action = Some(Action::ConfirmDestroy(skey("host", 1), "x".into()));
+        assert!(!show_pending_confirm(&mut model, &mut pending));
+        assert!(matches!(model.action, Some(Action::ConfirmDestroy(..))));
+
+        // With the footer free, the oldest confirm shows, keyed by its token.
+        model.action = None;
+        assert!(show_pending_confirm(&mut model, &mut pending));
+        assert!(matches!(
+            model.action,
+            Some(Action::ConfirmCreateUpload { token: 1, .. })
+        ));
     }
 
     #[test]

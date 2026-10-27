@@ -92,11 +92,44 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// days, so a reissue after one day keeps every served leaf well inside it.
 const LEAF_REUSE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The source of the store authorities that [`Admission`] asks at each
+/// CONNECT, so a changed rule decides the next tunnel without a restart.
+pub trait StoreAuthorities: Send + Sync {
+    /// The `host:port` authorities that the store rules register now.
+    fn authorities(&self) -> Vec<(String, u16)>;
+}
+
+/// The store authorities of an [`Admission`]: a fixed list, or a source.
+#[derive(Clone)]
+enum Store {
+    Fixed(Vec<(String, u16)>),
+    Source(Arc<dyn StoreAuthorities>),
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::Fixed(Vec::new())
+    }
+}
+
 /// The authorities the proxy carries requests to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct Admission {
     modules: Vec<Module>,
-    store: Vec<(String, u16)>,
+    store: Store,
+}
+
+impl fmt::Debug for Admission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let store = match &self.store {
+            Store::Fixed(store) => format!("{store:?}"),
+            Store::Source(_) => "source".to_owned(),
+        };
+        f.debug_struct("Admission")
+            .field("modules", &self.modules)
+            .field("store", &store)
+            .finish()
+    }
 }
 
 impl Admission {
@@ -110,9 +143,33 @@ impl Admission {
     {
         Self {
             modules: modules.to_vec(),
-            store: store
+            store: Store::Fixed(
+                store
+                    .into_iter()
+                    .map(|(host, port)| (normal_host(host.as_ref()), port))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The host sets of `modules`, and the store authorities that `source`
+    /// gives at each CONNECT (BEP-032).
+    #[must_use]
+    pub fn with_source(modules: &[Module], source: Arc<dyn StoreAuthorities>) -> Self {
+        Self {
+            modules: modules.to_vec(),
+            store: Store::Source(source),
+        }
+    }
+
+    /// The store authorities now, with normal hosts.
+    fn store(&self) -> Vec<(String, u16)> {
+        match &self.store {
+            Store::Fixed(store) => store.clone(),
+            Store::Source(source) => source
+                .authorities()
                 .into_iter()
-                .map(|(host, port)| (normal_host(host.as_ref()), port))
+                .map(|(host, port)| (normal_host(&host), port))
                 .collect(),
         }
     }
@@ -125,7 +182,7 @@ impl Admission {
             .iter()
             .flat_map(|module| module.hosts)
             .any(|a| a.host == host && a.port == port)
-            || self.store.iter().any(|(h, p)| *h == host && *p == port)
+            || self.store().iter().any(|(h, p)| *h == host && *p == port)
     }
 
     /// Whether `host` is a credentialed host, on any port.
@@ -136,7 +193,7 @@ impl Admission {
             .iter()
             .flat_map(|module| module.hosts)
             .any(|a| a.host == host)
-            || self.store.iter().any(|(h, _)| *h == host)
+            || self.store().iter().any(|(h, _)| *h == host)
     }
 }
 

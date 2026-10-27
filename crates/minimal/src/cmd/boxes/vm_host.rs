@@ -287,15 +287,7 @@ pub(crate) async fn release_held_name_after_attach(
     match attached_box_record(sock, id).await {
         Ok(None) => match box_addresses {
             // The record carries no box id, so the pair is the proof.
-            Some(addresses) => {
-                let (ssh_sock, box_name) = (sock.to_path_buf(), name.to_string());
-                let _ = tokio::task::spawn_blocking(move || {
-                    minimal_client::attach::withdraw_box_row_beside(
-                        &ssh_sock, &box_name, addresses, None,
-                    )
-                })
-                .await;
-            }
+            Some(addresses) => withdraw_box_row_with_vm_host(sock, name, addresses).await,
             None => {
                 hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
             }
@@ -400,6 +392,35 @@ fn rehold_undo(
             && other.box_addresses.is_none()
     });
     Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
+}
+
+/// Whether this box holds its name at the VM host instead of registering
+/// an address there. A `host_ip` box uses the host's own address, so the
+/// host only reserves the name for it (a lookup returns no address), and
+/// the record carries no `box_addresses`.
+pub(crate) fn holds_name(record: &boxes::Record) -> bool {
+    record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
+/// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
+/// off the async worker: the control exchange is a blocking socket call.
+/// The pair comes off the session record, which carries no box id, so the
+/// pair is the withdrawal's proof. `min session attach`'s post-attach
+/// release and the dashboard's destroy both go through this, so a change to
+/// the call (a timeout, a box id) reaches both.
+pub(crate) async fn withdraw_box_row_with_vm_host(
+    sock: &std::path::Path,
+    name: &str,
+    addresses: boxes::BoxAddresses,
+) {
+    let (sock, name) = (sock.to_path_buf(), name.to_string());
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
+    })
+    .await
+    {
+        tracing::warn!(%error, "the box row withdrawal's thread failed");
+    }
 }
 
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
