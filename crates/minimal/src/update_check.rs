@@ -23,8 +23,13 @@
 //! - Off switches, any one wins: `[telemetry] enabled = false` in the user
 //!   config, `MINIMAL_TELEMETRY` falsy, `DO_NOT_TRACK` set, or `CI` set
 //!   (CI installs `min` per job and would mint an install id each time).
-//! - On by default until 1.0; the first interactive run says so on stderr
-//!   and makes no request until a later run.
+//! - On by default until 1.0. The first run with a terminal says so on
+//!   stderr and makes no request; the request waits for a later command.
+//!   An install whose commands are a script's or an agent's (no terminal)
+//!   is counted from its second command without that text: the docs page
+//!   and the installer's closing card carry it, and the decision to count
+//!   those installs is inbox#589's. Its first command with a terminal still
+//!   gets the disclosure, and makes no request that time either.
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -393,12 +398,13 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     if (first_run || disclose) && write_state(&state_path, &state).is_err() {
         return;
     }
-    // An install's first run never makes the request, interactive or not:
-    // with a terminal the disclosure came first and the request waits for a
-    // later command; without one (an agent, a script, the installer's own
-    // `finalize-install` call) the install is counted from its next command,
-    // and its first interactive run still gets the disclosure above.
-    if first_run {
+    // No request in the command that minted the id, nor in the one that
+    // printed the disclosure: the request waits for a later command either
+    // way. Without a terminal (an agent, a script, the installer's own
+    // `finalize-install` call) the install is counted from its second
+    // command, and its first command with a terminal still discloses, and
+    // still sends nothing that time.
+    if first_run || disclose {
         return;
     }
 
@@ -522,7 +528,10 @@ pub async fn cmd_update_check(
     // without one (its parent minted it).
     if state.install_id.is_none() && !args.dry_run && !args.background {
         state.install_id = Some(new_install_id());
-        let _ = write_state(&state_path, &state);
+        // Sent only once it is on disk: an id that was not written would
+        // be minted again next time, and the count would see two installs.
+        write_state(&state_path, &state)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", state_path.display()))?;
     }
     let id = state
         .install_id
@@ -706,10 +715,24 @@ mod tests {
 
     #[test]
     fn install_fields_are_the_installer_charset_bounded() {
-        for ok in ["stable", "0.7.1", "5a93a07a", "installer", "0.8.0-dev.198.ge8f53f6e"] {
+        for ok in [
+            "stable",
+            "0.7.1",
+            "5a93a07a",
+            "installer",
+            "0.8.0-dev.198.ge8f53f6e",
+        ] {
             assert!(valid_field(ok), "{ok}");
         }
-        for bad in ["", "../x", "a?b=c", "a&b", "a b", "\u{1b}[31m", &"x".repeat(65)] {
+        for bad in [
+            "",
+            "../x",
+            "a?b=c",
+            "a&b",
+            "a b",
+            "\u{1b}[31m",
+            &"x".repeat(65),
+        ] {
             assert!(!valid_field(bad), "{bad:?}");
         }
     }
