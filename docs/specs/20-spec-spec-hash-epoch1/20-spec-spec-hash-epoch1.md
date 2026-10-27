@@ -143,8 +143,8 @@ build-infra operator. Release manager.
   the epoch that the index of its registry pin declares.
   tier:     T1
   verify:   cargo nextest run -p rcache epoch_follows_pinned_index
-  property: for all pins p, specs s: lookup_key(p, s) == hash(epoch(index(p)),
-    encode_epoch(index(p))(s))
+  property: for all pins p whose index holds a record, specs s:
+    lookup_key(p, s) == hash(epoch(index(p)), encode_epoch(index(p))(s))
   - IF a lookup reads several indexes as one (an upstream with sideloads,
     or a per-commit snapshot with the root index as its fallback) AND two
     of them declare different epochs THEN THE SYSTEM SHALL refuse the
@@ -366,11 +366,17 @@ reuses them.
   covered by: EPOCH-001, EPOCH-004, EPOCH-011, EPOCH-013
 - **Invariant:** THE SYSTEM SHALL never silently absorb unknown structure
   into a hash preimage.
-  enforced by: strict decoding, unknown tag = hard error
-  covered by: EPOCH-007
+  enforced by: the encoder, which emits only the tags of its epoch for the
+    fields of the canonical form and nothing else; strict decoding (an
+    unknown tag is a hard error) guards the tooling that reads encodings
+    back, since nothing on the key path decodes
+  covered by: EPOCH-001, EPOCH-007
 - **Invariant:** THE SYSTEM SHALL trust epoch-0 keys for pinned history
   only, and SHALL never re-bless old artifacts under new keys.
-  enforced by: the signed epoch in the pinned index and no migration path
+  enforced by: the epoch each index record declares (EPOCH-009), read by
+    every consumer for its lookup keys (EPOCH-012), and no migration path;
+    today's client checks no Sigstore bundle, so the signature over that
+    declaration is future work (minimal#1109), not an enforcement
   covered by: EPOCH-005, EPOCH-009, EPOCH-012
 
 ## Rollout
