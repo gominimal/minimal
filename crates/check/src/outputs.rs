@@ -437,7 +437,15 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
             Some(b) => *b,
             None => return Ok(result), // skip: nothing to check against
         };
-        let graph = std::ops::Deref::deref(&graph).clone();
+        // Only what the scan needs leaves the guard: the hash that names
+        // the cached build, the package's name and its output globs. The
+        // graph itself stays where it is (cloning it per package would
+        // scale with packages times graph size).
+        let spec_hash = graph.spec_hash(&bsr);
+        let build = graph.get(&bsr).unwrap();
+        let name = build.name.clone();
+        let globs: Vec<String> = build.outputs.values().map(|o| o.glob().clone()).collect();
+        drop(graph);
         let cancel = ctx.cancel.clone();
         let span = tracing::Span::current();
 
@@ -447,17 +455,25 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
             let _enter = span.enter();
             (move || -> Result<CheckResult, Error> {
             crate::bail_if_cancelled(&cancel)?;
-            let build = graph.get(&bsr).unwrap();
-            let Ok(cached_build) = cache.read_dir(&graph.spec_hash(&bsr)) else {
-                return Ok(result); // skip: we need the cached build
+            // No cached build is a skip; a cache that cannot be read is an
+            // error, never a silent pass over an output that exists.
+            let cached_build = match cache.read_dir(&spec_hash) {
+                Ok(c) => c,
+                Err(lcache::CacheErr::NotFound) => return Ok(result),
+                Err(e) => {
+                    return Err(Error::Other(
+                        anyhow::Error::from(e)
+                            .context(format!("reading the cached build of {name}")),
+                    ));
+                }
             };
             result.verdict = CheckVerdict::Pass;
-            if build.name == DETBUILD_PACKAGE {
+            if name == DETBUILD_PACKAGE {
                 return Ok(result);
             }
-            for output in build.outputs.values() {
+            for glob in &globs {
                 for path in check_cache
-                    .match_files_for_glob(cached_build.path(), output.glob())?
+                    .match_files_for_glob(cached_build.path(), glob)?
                     .iter()
                 {
                     crate::bail_if_cancelled(&cancel)?;
@@ -665,10 +681,6 @@ mod tests {
     /// concurrent ingesting tests never race on the process environment.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Ingests a single inline-Nickel package into a fresh graph and returns it
-    /// wrapped for the checker. The package declares no runtime deps, so its
-    /// transitive runtime-dep set is empty.
-    ///
     /// Stage one finalized build with one file in its `bin/` output.
     async fn staged_build_with_file(
         ctx: &CheckCtx,
@@ -692,6 +704,10 @@ mod tests {
             .expect("finalize cache entry");
     }
 
+    /// Ingests a single inline-Nickel package into a fresh graph and returns it
+    /// wrapped for the checker. The package declares no runtime deps, so its
+    /// transitive runtime-dep set is empty.
+    ///
     fn pkg_with_bin_output(name: &str) -> Arc<RwLock<Graph>> {
         graph_with_pkg(&format!(
             r#"
