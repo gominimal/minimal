@@ -1462,6 +1462,12 @@ fn bep_reads_store_rule(
 
 /// The form `bep serve` holds a checked rule in, as its `store_rule` makes
 /// it: none for a `deny` rule or a rule with no single injection form.
+///
+/// This copies `store_rule` in `crates/bep/src/main.rs`, which is a binary
+/// that `min` cannot call. Change both copies together. If they disagree on
+/// `inject`, this check and the redemption check of BEP-032 disagree, and a
+/// handle that `min` mints is refused at redemption. The fix moves the
+/// conversion into the `bep` library: no issue tracks it yet.
 fn proxy_rule(id: &str, rule: &boxes::core::bep::StoreRuleConfig) -> Option<StoreRule> {
     if rule.action == Some(boxes::core::bep::StoreAction::Deny) {
         return None;

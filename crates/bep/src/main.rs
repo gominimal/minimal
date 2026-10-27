@@ -648,6 +648,9 @@ fn store_rules_in(user: &Path, organization: &Path) -> Vec<StoreRule> {
 
 /// The proxy's form of one checked rule. A `deny` rule is never redeemed,
 /// so the proxy holds no rule for it, and a handle for its item is refused.
+///
+/// `proxy_rule` in `crates/minimal/src/mint.rs` copies this conversion to
+/// check a rule at mint. Change both copies together.
 fn store_rule(id: String, rule: StoreRuleConfig) -> Option<StoreRule> {
     if rule.action == Some(StoreAction::Deny) {
         return None;
