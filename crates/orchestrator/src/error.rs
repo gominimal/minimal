@@ -1,6 +1,6 @@
 //! Error types for the orchestrator crate.
 
-use graph::{Graph, PlanErr};
+use graph::{BuildSpecRef, Graph, PlanErr};
 use lcache::CacheErr;
 
 /// Error type for the orchestrator crate.
@@ -22,6 +22,12 @@ pub enum Error {
     /// A generic error occurred during the setup or execution of a sandbox.
     #[error("sandbox error: {0}")]
     Sandbox(#[from] sandbox::Error),
+    /// The remote index lists the spec but the store no longer has its
+    /// artifact (a dangling hit): the plan trusted the index and scheduled a
+    /// cache fill with no build behind it. The caller re-plans with the spec
+    /// masked out of every cache, which turns the fill into a build.
+    #[error("the remote cache lists {0:?} but no longer has its artifact")]
+    DanglingCacheHit(BuildSpecRef),
     /// Other errors.
     #[error("other: {0}")]
     Other(anyhow::Error),
