@@ -66,6 +66,10 @@ pub const SOURCE_CHANNEL: &str = "source";
 pub enum Off {
     /// `[telemetry] enabled = false` in the user config.
     Config,
+    /// The user config exists but could not be read or parsed: the check
+    /// fails closed until it is fixed, and says so rather than claiming a
+    /// setting the file may not hold.
+    ConfigUnreadable,
     /// An environment variable, named.
     Env(&'static str),
 }
@@ -74,6 +78,9 @@ impl std::fmt::Display for Off {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Off::Config => f.write_str("[telemetry] enabled = false in config.toml"),
+            Off::ConfigUnreadable => {
+                f.write_str("a config.toml that could not be read or parsed (the check stays off until it is fixed)")
+            }
             Off::Env(name) => write!(f, "{name} in the environment"),
         }
     }
@@ -83,7 +90,7 @@ impl std::fmt::Display for Off {
 /// cross-tool convention) and `CI` win on presence; `MINIMAL_TELEMETRY`
 /// turns it off when falsy (`0`, `false`, `no`, `off`; a truthy value is the
 /// OpenTelemetry opt-in and says nothing here); then the config.
-pub fn off_switch(config_enabled: bool, var: impl Fn(&str) -> Option<OsString>) -> Option<Off> {
+pub fn off_switch(config: ConfigState, var: impl Fn(&str) -> Option<OsString>) -> Option<Off> {
     let set = |name: &str| var(name).is_some_and(|v| !v.is_empty());
     if set("DO_NOT_TRACK") {
         return Some(Off::Env("DO_NOT_TRACK"));
@@ -101,10 +108,22 @@ pub fn off_switch(config_enabled: bool, var: impl Fn(&str) -> Option<OsString>) 
     if falsy {
         return Some(Off::Env("MINIMAL_TELEMETRY"));
     }
-    if !config_enabled {
-        return Some(Off::Config);
+    match config {
+        ConfigState::Enabled => None,
+        ConfigState::Disabled => Some(Off::Config),
+        ConfigState::Unreadable => Some(Off::ConfigUnreadable),
     }
-    None
+}
+
+/// What the user config says about the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigState {
+    /// Missing, or present with the check on (the default).
+    Enabled,
+    /// `[telemetry] enabled = false`.
+    Disabled,
+    /// Present but not readable or not parsable.
+    Unreadable,
 }
 
 /// How this binary was installed: the channel it came from, the method
@@ -264,16 +283,17 @@ fn state_dir(global: &GlobalArgs) -> Option<PathBuf> {
         .or_else(|| paths::try_minimal_state_dir().map(|p| AsRef::<Path>::as_ref(&p).to_path_buf()))
 }
 
-/// Whether the user config leaves the check on. A missing config is the
-/// default, on. A config that exists but cannot be read or parsed turns the
-/// check off: it may well carry `enabled = false` next to the typo, and a
-/// check that is skipped until the file is fixed costs nothing. The check
-/// never fails the command either way; the config's own error prints where
-/// the config is used.
-fn config_enabled(global: &GlobalArgs) -> bool {
-    crate::config::read_client_config(global)
-        .map(|c| c.telemetry.enabled)
-        .unwrap_or(false)
+/// What the user config says. A missing config is the default, on. A config
+/// that exists but cannot be read or parsed turns the check off: it may well
+/// carry `enabled = false` next to the typo, and a check that is skipped
+/// until the file is fixed costs nothing. The check never fails the command
+/// either way; the config's own error prints where the config is used.
+fn config_state(global: &GlobalArgs) -> ConfigState {
+    match crate::config::read_client_config(global) {
+        Ok(c) if c.telemetry.enabled => ConfigState::Enabled,
+        Ok(_) => ConfigState::Disabled,
+        Err(_) => ConfigState::Unreadable,
+    }
 }
 
 /// The request the child makes.
@@ -375,7 +395,7 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     if skip_for(command) {
         return;
     }
-    if off_switch(config_enabled(global), |n| std::env::var_os(n)).is_some() {
+    if off_switch(config_state(global), |n| std::env::var_os(n)).is_some() {
         return;
     }
     let Some(dir) = state_dir(global) else {
@@ -515,7 +535,7 @@ pub async fn cmd_update_check(
     global: &GlobalArgs,
     args: UpdateCheckArgs,
 ) -> Result<(), anyhow::Error> {
-    let off = off_switch(config_enabled(global), |n| std::env::var_os(n));
+    let off = off_switch(config_state(global), |n| std::env::var_os(n));
     let Some(dir) = state_dir(global) else {
         anyhow::bail!("no state directory (HOME is not set)");
     };
@@ -526,7 +546,8 @@ pub async fn cmd_update_check(
     // A foreground check the user asked for on a fresh install mints the id
     // first, as a first command would; the background child never runs
     // without one (its parent minted it).
-    if state.install_id.is_none() && !args.dry_run && !args.background {
+    // A disabled install keeps no id: the switches are read first.
+    if state.install_id.is_none() && off.is_none() && !args.dry_run && !args.background {
         state.install_id = Some(new_install_id());
         // Sent only once it is on disk: an id that was not written would
         // be minted again next time, and the count would see two installs.
@@ -597,35 +618,48 @@ mod tests {
 
     #[test]
     fn the_switches_each_turn_it_off_in_order() {
-        assert_eq!(off_switch(true, env(&[])), None);
+        assert_eq!(off_switch(ConfigState::Enabled, env(&[])), None);
         assert_eq!(
-            off_switch(true, env(&[("DO_NOT_TRACK", "1")])),
+            off_switch(ConfigState::Enabled, env(&[("DO_NOT_TRACK", "1")])),
             Some(Off::Env("DO_NOT_TRACK"))
         );
         assert_eq!(
-            off_switch(true, env(&[("CI", "true")])),
+            off_switch(ConfigState::Enabled, env(&[("CI", "true")])),
             Some(Off::Env("CI"))
         );
         assert_eq!(
-            off_switch(true, env(&[("CI", "")])),
+            off_switch(ConfigState::Enabled, env(&[("CI", "")])),
             None,
             "an empty CI is unset"
         );
         for v in ["0", "false", "NO", " off "] {
             assert_eq!(
-                off_switch(true, env(&[("MINIMAL_TELEMETRY", v)])),
+                off_switch(ConfigState::Enabled, env(&[("MINIMAL_TELEMETRY", v)])),
                 Some(Off::Env("MINIMAL_TELEMETRY")),
                 "{v:?} is falsy"
             );
         }
         assert_eq!(
-            off_switch(true, env(&[("MINIMAL_TELEMETRY", "1")])),
+            off_switch(ConfigState::Enabled, env(&[("MINIMAL_TELEMETRY", "1")])),
             None,
             "the OTel opt-in is not a switch here"
         );
-        assert_eq!(off_switch(false, env(&[])), Some(Off::Config));
         assert_eq!(
-            off_switch(false, env(&[("DO_NOT_TRACK", "1")])),
+            off_switch(ConfigState::Disabled, env(&[])),
+            Some(Off::Config)
+        );
+        assert_eq!(
+            off_switch(ConfigState::Unreadable, env(&[])),
+            Some(Off::ConfigUnreadable),
+            "an unreadable config fails closed, and says that, not a setting it may not hold"
+        );
+        assert!(
+            Off::ConfigUnreadable
+                .to_string()
+                .contains("could not be read")
+        );
+        assert_eq!(
+            off_switch(ConfigState::Disabled, env(&[("DO_NOT_TRACK", "1")])),
             Some(Off::Env("DO_NOT_TRACK")),
             "the environment is named ahead of the config"
         );
