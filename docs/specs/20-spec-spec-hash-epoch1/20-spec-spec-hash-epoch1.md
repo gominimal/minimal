@@ -112,13 +112,6 @@ build-infra operator. Release manager.
     canon(canon(x)) == canon(x)
   harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
     (3 elements per list, 8 bytes per string, depth 2)
-  - THE SYSTEM SHALL decode every epoch-1 container encoding back to the
-    canonical form of the container it encodes.
-    tier:   T2
-    verify: cargo nextest run -p graph epoch1_container_roundtrip_bounded
-    property: for all bounded containers c: decode(encode(c)) == canon(c)
-    harness: kani_epoch1_container_roundtrip_bounded, exhaustive over
-      bounded containers
 
 - **EPOCH-004** THE SYSTEM SHALL encode every epoch-0 collision-witness
   pair from the epoch-0 defect catalog to distinct outputs.
@@ -245,6 +238,14 @@ build-infra operator. Release manager.
     tier:   T0
     verify: cargo nextest run -p rcache container_with_a_member_of_another_epoch_is_refused
 
+- **EPOCH-016** THE SYSTEM SHALL decode every epoch-1 container encoding
+  back to the canonical form of the container it encodes.
+  tier:     T2
+  verify:   cargo nextest run -p graph epoch1_container_roundtrip_bounded
+  property: for all bounded containers c: decode(encode(c)) == canon(c)
+  harness:  kani_epoch1_container_roundtrip_bounded, exhaustive over
+    bounded containers
+
 - **EPOCH-015** WHEN the system computes a container key THE SYSTEM SHALL
   derive it under the epoch-1 context from the container's canonical
   encoding, 32 bytes wide, as EPOCH-005 derives a spec key.
@@ -339,9 +340,8 @@ class 9 is its collision family. A subset computed under another epoch
 cannot find the index of its spec.
 
 The container key (EPOCH-013, EPOCH-014, EPOCH-015) is the same codec with
-container tags; EPOCH-003's and EPOCH-007's container sub-bullets cover the
-container round-trip and the unknown-tag rejection in container position,
-with their own harnesses. `ContainerHasher` chooses its encoder at its own call site,
+container tags; EPOCH-016 and EPOCH-007's container harness cover the container
+round-trip and the unknown-tag rejection in container position. `ContainerHasher` chooses its encoder at its own call site,
 so the flip must move that site together with `SpecHasher` and
 `SubsetHasher`, or containers stay on epoch 0 with the witness minimal#1331
 pinned. A container is a declaration over packages. Its members enter by
@@ -381,8 +381,12 @@ reuses them.
   producing side is build infrastructure, remote execution and the hosts
   that seal new indices. Consumers never flip. They follow the epoch their
   pinned index declares. The container call site flips with the producing
-  side (EPOCH-014). The catalog rebuilds cold under epoch-1 keys on
-  the first pkgs CI cycle at that release. That is a full world rebuild,
+  side (EPOCH-014). The root index is resealed under epoch 1 in the same
+  cycle that seals the first epoch-1 snapshot, and until it is, the
+  snapshot's root-index fallback is withheld, so no lookup unions the two
+  epochs (EPOCH-012) and the flip shows consumers misses, never refusals.
+  The catalog rebuilds cold under epoch-1 keys on the first pkgs CI cycle
+  at that release. That is a full world rebuild,
   and build-infra schedules it on purpose (build-servers#271 and #272 hold
   the operational lessons). A staged catalog rebuild on the staging cache
   comes before the release.
@@ -392,8 +396,9 @@ reuses them.
   declares epoch 0 sees no change. A per-commit snapshot sealed after the
   rollback beside a root index still on epoch 1 is a mixed union, which
   EPOCH-012 refuses, so the root index rolls back with the producers (or
-  the fallback is withheld for the window). Rollback takes minutes, and
-  nothing rebuilds.
+  the fallback is withheld for the window). Rollback takes minutes and
+  schedules no catalog rebuild; an entry that exists only under an epoch-1
+  key misses on an epoch-0 pin and rebuilds on its own, as any miss does.
 - **Blast radius:** catalog consumers during the one cold rebuild window
   see cache misses, and never wrong data. Record layouts do not change.
 
