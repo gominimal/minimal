@@ -2354,10 +2354,12 @@ async fn events_written_outside_box_filesystem_with_box_parent_ts_type() {
     }
 }
 
-/// BOX-041: a process in the box, root or not, reaches only the
-/// directories mounted into the box. An events file it writes there,
-/// whatever it claims, is not the box's events: the read returns only
-/// what the daemon wrote, from an owner-only file the box cannot reach.
+/// BOX-041, placement only: the box's events file is outside every
+/// directory the box can see. An events file written into those
+/// directories, whatever it claims, is not the box's events. The read
+/// returns only what the daemon wrote. No process runs inside a box here.
+/// The proof that uid 0 inside a real sandbox cannot append is the
+/// `_root_integration` test that #2661 owns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_box_root_cannot_append_events() {
     let (_state, _cache, mngr) = manager().await;

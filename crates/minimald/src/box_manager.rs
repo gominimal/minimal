@@ -2307,7 +2307,11 @@ impl BoxEventsReader {
                 return Ok(Some(events));
             }
             if !self.object.is_retained() {
-                return Ok(None);
+                // An event written after the read above and before the reap
+                // is still returned. The stream ends on the first empty
+                // read after the box is gone.
+                let last = self.read_new()?;
+                return Ok((!last.is_empty()).then_some(last));
             }
             tokio::select! {
                 _ = self.written.changed() => {}
