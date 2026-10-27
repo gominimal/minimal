@@ -475,6 +475,10 @@ SETUP_CLASSIFIER_INSTALLED=""
 HIDA_SEED_DIR="" # the decided half's project seed; removed on teardown
 HIDA_UNENFORCED_SEED_DIR="" # the unenforced half's project seed; removed on teardown
 HIDA_CLASSIFIER_INSTALLED=""
+# The classifier tree+table the cohort leg of the round-two walk installs on a
+# CI native lane: its own, removed before the leg returns. The teardown covers
+# a death between install and return.
+CO_CLASSIFIER_INSTALLED=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -917,6 +921,12 @@ teardown() {
   if [ -n "$HIDA_CLASSIFIER_INSTALLED" ]; then
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
     HIDA_CLASSIFIER_INSTALLED=""
+  fi
+  # The cohort leg of the round-two walk installs the classifier on a CI
+  # native lane. This is the same net, under the same ordering reason.
+  if [ -n "$CO_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    CO_CLASSIFIER_INSTALLED=""
   fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
@@ -13285,8 +13295,8 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             box opened before the cohort turned blocked end refused,
 #             and so do the processes 'min session exec' injects into it
 #             while the cohort turns and after.
-#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1, and
-#             always on under CI: an unreadable line in this machine's
+#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1:
+#             an unreadable line in this machine's
 #             audit log refuses a box creation with no proxy, refuses a plain `bep serve`, and
 #             `bep serve --quarantine-unreadable` moves its segment aside,
 #             records the quarantine in the chain, and serves.
@@ -13523,9 +13533,9 @@ rt_leg_key() {
 rt_leg_cohort() {
   local co_leg="$RT_CASE/cohort" co_helper=/usr/local/lib/minimal/quic443-leaf
   local co_sock co_out co_t0 co_tb co_i co_rc co_end co_line co_probe co_why co_try
-  local co_took
+  local co_took co_src
   if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
-    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux: the native Linux CI lane (ci-linux-native) runs this leg"
+    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux"
     return 0
   fi
   co_why=""
@@ -13534,12 +13544,53 @@ rt_leg_cohort() {
   elif ! sudo -n true 2>/dev/null; then
     co_why="no passwordless sudo, which places the daemon in the classifier tree"
   fi
-  if [ -n "$co_why" ]; then
-    if [ -n "${CI:-}" ]; then
+  if [ -n "$co_why" ] && [ -n "${CI:-}" ]; then
+    # A CI native lane installs the QUIC block here, with the gates and the
+    # install of proof_host_ip_deny_all. Only a missing gate or a failed
+    # install fails the leg.
+    co_why=""
+    co_src=""
+    if ! command -v nft >/dev/null 2>&1; then
+      co_why="no nft on PATH: the classifier table is loaded with it"
+    elif ! command -v ip >/dev/null 2>&1; then
+      co_why="no ip on PATH: the leg cannot derive the default-route source address the install renders both identities from"
+    elif ! sudo -n true >/dev/null 2>&1; then
+      co_why="no passwordless sudo: the install that loads the tree and the table needs root"
+    elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+        --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+        >/dev/null 2>"$WORK/$RT_CASE.mount.err"; then
+      co_why="the installer's own mount check refuses this host: $(head -n1 "$WORK/$RT_CASE.mount.err" 2>/dev/null || true)"
+    else
+      co_src="$(ip route get 1.1.1.1 2>/dev/null \
+        | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+      [ -n "$co_src" ] \
+        || co_why="no default-route source address to render the install's two identities from"
+    fi
+    if [ -n "$co_why" ]; then
       echo "::error::a CI native lane must be able to load the classifier table: $co_why"
       fail
     fi
-    not_run "$co_leg" "$co_why. The native Linux CI lane (ci-linux-native) runs this leg"
+    # The daemon starts again under the install. The flag is set before the
+    # install, so a death inside it still leaves the teardown a table to remove.
+    mnl stop --force >/dev/null 2>&1 || true
+    BEP_LIVE_DAEMON=""
+    CO_CLASSIFIER_INSTALLED=1
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+        --cohort-address "$co_src" --node-plane-address "$co_src" \
+        >"$WORK/$RT_CASE.install.out" 2>&1; then
+      echo "::error::the classifier install failed, so the QUIC block is not loaded for $co_leg"
+      cat "$WORK/$RT_CASE.install.out" 2>/dev/null || true
+      fail
+    fi
+    if [ ! -x "$co_helper" ] || [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+      echo "::error::the classifier install exited 0 but left no QUIC block helper at $co_helper or no table marker"
+      cat "$WORK/$RT_CASE.install.out" 2>/dev/null || true
+      fail
+    fi
+  fi
+  if [ -n "$co_why" ]; then
+    not_run "$co_leg" "$co_why"
     return 0
   fi
   co_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
@@ -13595,6 +13646,20 @@ rt_leg_cohort() {
   co_refused() {
     [[ "$1" == *"Connection refused"* ]] || [[ "$1" == *"Operation not permitted"* ]]
   }
+  # A drop in the OUTPUT hook also fails sendmsg with EPERM. So when the
+  # output $1 carries only 'Operation not permitted', the table must hold
+  # the active reject for the blocked leaves, never a silent drop.
+  co_eperm_is_reject() {
+    local cr_table
+    [[ "$1" == *"Connection refused"* ]] && return 0
+    [[ "$1" == *"Operation not permitted"* ]] || return 0
+    cr_table="$(sudo -n nft list table inet minimal_class 2>&1 </dev/null || true)"
+    if [[ "$cr_table" != *"@quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable"* ]]; then
+      echo "::error::$2 got 'Operation not permitted', but the table inet minimal_class holds no reject for quic443_blocked_leaves, so the refusal can be a silent drop"
+      printf '%s\n' "$cr_table"
+      co_fail
+    fi
+  }
   # Whether box A's own leaf is in the table's set of blocked leaves.
   co_a_blocked() {
     sudo -n nft -j list set inet minimal_class quic443_blocked_leaves 2>/dev/null </dev/null \
@@ -13646,6 +13711,7 @@ rt_leg_cohort() {
       printf '%s\n' "$co_out"
       co_fail
     fi
+    co_eperm_is_reject "$co_out" "the UDP 443 flow $co_i from box A"
     echo "$co_i: refused, ended at $co_end (box B's activation began at $co_t0, the block was seen at $co_tb)"
   done
 
@@ -13659,6 +13725,7 @@ rt_leg_cohort() {
     printf '%s\n' "$co_out"
     co_fail
   fi
+  co_eperm_is_reject "$co_out" "UDP 443 from a process injected into box A"
   echo "injection while blocked: refused"
   # The block is the cohort's: with box B gone, box A sends again.
   mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1 || true
@@ -13672,6 +13739,19 @@ rt_leg_cohort() {
   echo "after box B ended: box A's UDP 443 is not refused"
 
   co_cleanup
+  if [ -n "$CO_CLASSIFIER_INSTALLED" ]; then
+    # The install is this leg's own, and a later proof refuses a host that
+    # carries one. The uninstall refuses while the daemon holds the tree.
+    mnl stop --force >/dev/null 2>&1 || true
+    BEP_LIVE_DAEMON=""
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >"$WORK/$RT_CASE.uninstall.out" 2>&1; then
+      echo "::error::the classifier uninstall after $co_leg failed"
+      cat "$WORK/$RT_CASE.uninstall.out" 2>/dev/null || true
+      fail
+    fi
+    CO_CLASSIFIER_INSTALLED=""
+  fi
   rm -f "${WORK:?}/${RT_CASE:?}".*
   RT_RAN="$RT_RAN cohort"
   echo "$co_leg: PASS (earlier flows and injections during and after the turn all refused, and released with the last blocking box)"
@@ -13680,9 +13760,7 @@ rt_leg_cohort() {
 rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
   local qu_sockets qu_listener qu_control
-  # A CI runner's audit log is disposable, so CI runs the leg as if
-  # E2E_BEP_QUARANTINE=1 were set. The teardown trap restores the segment.
-  if [ -z "${CI:-}" ] && [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
+  if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
     not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 to run it. A CI lane with a live proxy runs it (#2500)"
     return 0
   fi
