@@ -13280,13 +13280,14 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             UUIDv7 id. `bep serve --help` names the client key bound.
 #             A refusal of a colliding id is not drivable from the CLI: the
 #             unit test colliding_box_id_refuses_creation proves it.
-#   cohort    (BEP-018) native Linux with the QUIC block installed: UDP 443
-#             flows that a host_ip box opened before the cohort turned
-#             blocked end refused, and so do the processes 'min session
-#             exec' injects into it while the cohort turns and after.
-#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1: an
-#             unreadable line in this machine's audit log refuses a box
-#             creation with no proxy, refuses a plain `bep serve`, and
+#   cohort    (BEP-018) native Linux with the QUIC block installed, which
+#             a CI native lane must have: UDP 443 flows that a host_ip
+#             box opened before the cohort turned blocked end refused,
+#             and so do the processes 'min session exec' injects into it
+#             while the cohort turns and after.
+#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1, and
+#             always on under CI: an unreadable line in this machine's
+#             audit log refuses a box creation with no proxy, refuses a plain `bep serve`, and
 #             `bep serve --quarantine-unreadable` moves its segment aside,
 #             records the quarantine in the chain, and serves.
 # The values are never printed: the transcript names only their lengths.
@@ -13369,6 +13370,7 @@ rt_leg_store() {
     fail
   fi
   echo "$st_leg: the proxy read the client's secret-store rules at its start: ${st_line##*INFO }"
+  echo "$st_leg/rules: PASS (bep serve holds the client's secret-store rules)"
   RT_RAN="$RT_RAN store"
   not_run "$st_leg/injection" "no box carries a store handle yet, so no request can redeem one (#2525)"
 }
@@ -13520,17 +13522,24 @@ rt_leg_key() {
 
 rt_leg_cohort() {
   local co_leg="$RT_CASE/cohort" co_helper=/usr/local/lib/minimal/quic443-leaf
-  local co_sock co_out co_t0 co_i co_rc co_end co_line co_probe
+  local co_sock co_out co_t0 co_tb co_i co_rc co_end co_line co_probe co_why co_try
+  local co_took
   if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
-    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux"
+    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux: the native Linux CI lane (ci-linux-native) runs this leg"
     return 0
   fi
+  co_why=""
   if [ ! -x "$co_helper" ] || [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
-    not_run "$co_leg" "the QUIC block is not installed: run 'sudo scripts/install-host-classifier.sh --cohort-address <ip> --node-plane-address <ip>' first"
-    return 0
+    co_why="the QUIC block is not installed: run 'sudo scripts/install-host-classifier.sh --cohort-address <ip> --node-plane-address <ip>' first"
+  elif ! sudo -n true 2>/dev/null; then
+    co_why="no passwordless sudo, which places the daemon in the classifier tree"
   fi
-  if ! sudo -n true 2>/dev/null; then
-    not_run "$co_leg" "no passwordless sudo, which places the daemon in the classifier tree"
+  if [ -n "$co_why" ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $co_why"
+      fail
+    fi
+    not_run "$co_leg" "$co_why. The native Linux CI lane (ci-linux-native) runs this leg"
     return 0
   fi
   co_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
@@ -13571,14 +13580,25 @@ rt_leg_cohort() {
     printf '%s\n' "$ca_out" | tail -n1 | tr -d '\r'
   }
   # A UDP flow to TEST-NET-1 port 443 from box A, written to probe file $1:
-  # one datagram each half second for 30 s, then the end time and exit code.
-  # Before the block nothing answers, so socat waits. A reject ends it with
-  # 'Connection refused'.
+  # one datagram each half second for 120 s, then the end time and exit
+  # code. Before the block nothing answers, so socat waits. A reject ends
+  # it with 'Connection refused', or with 'Operation not permitted' when
+  # the local OUTPUT hook fails sendmsg. The flow outlasts a slow
+  # activation of box B, so only the block can end it early.
   co_flow() {
     # shellcheck disable=SC2016
     mnl session exec "$CO_SID_A" sh -c \
-      'n=0; while [ $n -lt 60 ]; do echo q; sleep 0.5; n=$((n+1)); done | socat -t 1 - UDP:192.0.2.1:443 2>&1; echo "rc=$? end=$(date +%s)"' \
+      'n=0; while [ $n -lt 240 ]; do echo q; sleep 0.5; n=$((n+1)); done | socat -t 1 - UDP:192.0.2.1:443 2>&1; echo "rc=$? end=$(date +%s)"' \
       >"$1" 2>&1
+  }
+  # Whether the output $1 carries one of the two refusals.
+  co_refused() {
+    [[ "$1" == *"Connection refused"* ]] || [[ "$1" == *"Operation not permitted"* ]]
+  }
+  # Whether box A's own leaf is in the table's set of blocked leaves.
+  co_a_blocked() {
+    sudo -n nft -j list set inet minimal_class quic443_blocked_leaves 2>/dev/null </dev/null \
+      | grep -qF "/$CO_SID_A\""
   }
 
   CO_SEED_A="$(hook_mktemp /tmp/mnlquica.XXXXXX)"
@@ -13598,6 +13618,21 @@ rt_leg_cohort() {
   ( sleep 0.2; co_flow "$WORK/$RT_CASE.race1" ) & CO_PIDS="$CO_PIDS $!"
   ( sleep 0.6; co_flow "$WORK/$RT_CASE.race2" ) & CO_PIDS="$CO_PIDS $!"
   CO_SID_B="$(co_activate "$CO_SEED_B" e2e-quic-cohort-b)" || co_fail
+  # Box B's first exec, then the block itself: box A's own leaf in the
+  # table's set of blocked leaves, polled, never a fixed window.
+  mnl session exec "$CO_SID_B" true >/dev/null 2>&1 \
+    || { echo "::error::the first 'min session exec' in box B failed"; co_fail; }
+  for co_try in $(seq 1 60); do
+    [ "$co_try" -gt 1 ] && sleep 0.5
+    co_a_blocked && break
+  done
+  if ! co_a_blocked; then
+    echo "::error::box A's own leaf did not appear in the table's quic443_blocked_leaves set within 30 s of box B's first exec"
+    sudo -n nft -j list set inet minimal_class quic443_blocked_leaves 2>&1 </dev/null || true
+    co_fail
+  fi
+  co_tb="$(date +%s)"
+  echo "the cohort blocks UDP 443: box A's own leaf is in quic443_blocked_leaves at $co_tb"
   # shellcheck disable=SC2086
   wait $CO_PIDS 2>/dev/null || true
   CO_PIDS=""
@@ -13605,21 +13640,22 @@ rt_leg_cohort() {
     co_out="$(tr -d '\r' <"$WORK/$RT_CASE.$co_i" 2>/dev/null || true)"
     co_line="$(printf '%s\n' "$co_out" | sed -n 's/^rc=\([0-9]*\) end=\([0-9]*\)$/\1 \2/p' | tail -n1)"
     co_rc="${co_line%% *}" co_end="${co_line##* }"
-    if [ -z "$co_line" ] || [ "$co_rc" = 0 ] || [[ "$co_out" != *"Connection refused"* ]] \
-       || [ "$co_end" -lt "$co_t0" ] || [ "$co_end" -ge "$(( co_t0 + 25 ))" ]; then
-      echo "::error::the UDP 443 flow $co_i from box A did not end refused after the cohort turned blocked at $co_t0 (expected 'Connection refused' and an end before $(( co_t0 + 25 )))"
+    if [ -z "$co_line" ] || [ "$co_rc" = 0 ] || ! co_refused "$co_out" \
+       || [ "$co_end" -lt "$co_t0" ] || [ "$co_end" -gt "$(( co_tb + 2 ))" ]; then
+      echo "::error::the UDP 443 flow $co_i from box A did not end refused when the cohort turned blocked at $co_tb (expected 'Connection refused' or 'Operation not permitted', and an end between $co_t0 and $(( co_tb + 2 )))"
       printf '%s\n' "$co_out"
       co_fail
     fi
-    echo "$co_i: refused, ended at $co_end (block began at $co_t0)"
+    echo "$co_i: refused, ended at $co_end (box B's activation began at $co_t0, the block was seen at $co_tb)"
   done
 
-  # An injection while the cohort blocks.
+  # An injection while the cohort blocks: refused within 2 s.
   # shellcheck disable=SC2016
-  co_probe='printf q | socat -t 2 - UDP:192.0.2.1:443 2>&1; echo "rc=$?"'
+  co_probe='s=$(date +%s); printf q | socat -t 2 - UDP:192.0.2.1:443 2>&1; echo "rc=$? took=$(( $(date +%s) - s ))"'
   co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
-  if [[ "$co_out" != *"Connection refused"* ]]; then
-    echo "::error::UDP 443 from a process injected into box A while the cohort blocks was not refused"
+  co_took="$(printf '%s\n' "$co_out" | sed -n 's/^rc=[0-9]* took=\([0-9]*\)$/\1/p' | tail -n1)"
+  if ! co_refused "$co_out" || [ -z "$co_took" ] || [ "$co_took" -gt 2 ]; then
+    echo "::error::UDP 443 from a process injected into box A while the cohort blocks was not refused within 2 s"
     printf '%s\n' "$co_out"
     co_fail
   fi
@@ -13628,7 +13664,7 @@ rt_leg_cohort() {
   mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1 || true
   CO_SID_B=""
   co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
-  if [[ "$co_out" == *"Connection refused"* ]] || [[ "$co_out" != *"rc=0"* ]]; then
+  if co_refused "$co_out" || [[ "$co_out" != *"rc=0 "* ]]; then
     echo "::error::UDP 443 from box A was still refused after the last blocking box of the cohort ended"
     printf '%s\n' "$co_out"
     co_fail
@@ -13644,8 +13680,10 @@ rt_leg_cohort() {
 rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
   local qu_sockets qu_listener qu_control
-  if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
-    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 to run it"
+  # A CI runner's audit log is disposable, so CI runs the leg as if
+  # E2E_BEP_QUARANTINE=1 were set. The teardown trap restores the segment.
+  if [ -z "${CI:-}" ] && [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
+    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 to run it. A CI lane with a live proxy runs it (#2500)"
     return 0
   fi
   bep_live_gate "$qu_leg" || return 0
