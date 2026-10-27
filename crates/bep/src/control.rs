@@ -227,6 +227,14 @@ pub enum Request {
         /// The box id.
         box_id: String,
     },
+}
+
+/// The request that names every box the box's creator still holds. It is a
+/// type of its own, beside [`Request`], so a client that matches every
+/// [`Request`] keeps its match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum LiveBoxesRequest {
     /// Name every box that the box's creator still holds. Each box that the
     /// registrations file held at this start and that the list leaves out
     /// ended with no `forget_box`, so it no longer uses its key.
@@ -234,6 +242,22 @@ pub enum Request {
         /// The box ids.
         box_ids: Vec<String>,
     },
+}
+
+/// Frees the keys of the boxes that ended with no `forget_box`: each box
+/// that `keys` held at its restore and that `box_ids` leaves out.
+fn live_boxes(box_ids: &[String], registry: &RwLock<ClientKeys>, keys: &KeyFile) -> Reply {
+    let Some(live) = box_ids
+        .iter()
+        .map(|id| normalise_box_id(id))
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return Reply::refused("a box id is not 32 hex digits");
+    };
+    match keys.reconcile(&live, registry) {
+        Ok(_) => Reply::done(),
+        Err(error) => Reply::refused(error),
+    }
 }
 
 /// What the control socket writes into: the client keys, the boxes, the
@@ -1284,22 +1308,6 @@ fn handle_request(
             }
             Reply::done()
         }
-        Request::LiveBoxes { box_ids } => {
-            let Some(live) = box_ids
-                .iter()
-                .map(|id| normalise_box_id(id))
-                .collect::<Option<BTreeSet<_>>>()
-            else {
-                return Reply::refused("a box id is not 32 hex digits");
-            };
-            let Some(keys) = keys else {
-                return Reply::done();
-            };
-            match keys.reconcile(&live, registry) {
-                Ok(_) => Reply::done(),
-                Err(error) => Reply::refused(error),
-            }
-        }
         Request::RecordMint { box_id, identifier } => {
             let Some(box_id) = normalise_box_id(&box_id) else {
                 return Reply::refused("the box id is not 32 hex digits");
@@ -1521,6 +1529,8 @@ async fn serve(
             write_reply(&mut write, &rotate(rotation.clone()).await).await
         } else if let Ok(RevocationsRequest::RevokedBoxIds) = serde_json::from_str(&line) {
             write_reply(&mut write, &records.revoked_box_ids()).await
+        } else if let Ok(LiveBoxesRequest::LiveBoxes { box_ids }) = serde_json::from_str(&line) {
+            write_reply(&mut write, &live_boxes(&box_ids, &records.registry, &keys)).await
         } else {
             write_reply(&mut write, &records.handle_keeping(&line, Some(&keys))).await
         };
@@ -2239,18 +2249,12 @@ mod tests {
         assert_eq!(keys_in_use_bound(&error), Some(3), "{error}");
 
         // The box's creator names box RUNNING alone.
-        let line = serde_json::to_string(&Request::LiveBoxes {
-            box_ids: vec![RUNNING.to_uppercase()],
-        })
-        .unwrap();
-        let reply = handle_request(
-            &line,
-            &restored,
-            &Boxes::new(),
-            &Revocations::default(),
-            None,
-            Some(&restarted),
+        let line = format!(
+            r#"{{"op":"live_boxes","box_ids":["{}"]}}"#,
+            RUNNING.to_uppercase()
         );
+        let LiveBoxesRequest::LiveBoxes { box_ids } = serde_json::from_str(&line).unwrap();
+        let reply = live_boxes(&box_ids, &restored, &restarted);
         assert!(reply.ok, "{reply:?}");
         // The retired key is revoked, and the stranded box frees its key.
         assert_eq!(held(&restored), [false, true, true, false]);
@@ -2277,28 +2281,14 @@ mod tests {
         restarted
             .register_for(entry(6), &restored, 80, false, Some(STRANDED))
             .unwrap();
-        let reply = handle_request(
-            &line,
-            &restored,
-            &Boxes::new(),
-            &Revocations::default(),
-            None,
-            Some(&restarted),
-        );
+        let reply = live_boxes(&box_ids, &restored, &restarted);
         assert!(reply.ok, "{reply:?}");
         let file = std::fs::read_to_string(&keys.path).unwrap();
         assert!(file.contains(&format!("boxes={STRANDED}")), "{file}");
         assert!(file.contains(&format!("boxes={RUNNING}")), "{file}");
 
         // A list with an id that is not a box id is refused.
-        let reply = handle_request(
-            r#"{"op":"live_boxes","box_ids":["not-a-box"]}"#,
-            &restored,
-            &Boxes::new(),
-            &Revocations::default(),
-            None,
-            Some(&restarted),
-        );
+        let reply = live_boxes(&["not-a-box".to_owned()], &restored, &restarted);
         assert!(!reply.ok, "{reply:?}");
     }
 }
