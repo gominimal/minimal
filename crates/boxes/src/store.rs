@@ -304,8 +304,11 @@ impl DiskBox {
     }
 
     /// Appends `event` to the box's events file as one line (BOX-040). The
-    /// line goes out in one `O_APPEND` write, so lines from two writers
-    /// never interleave, and the file order is the write order (BOX-162).
+    /// append holds an exclusive lock on the file from the read of its
+    /// length through the cut, the write and the sync. That lock is why two
+    /// writers never interleave and one never cuts the other's line, and
+    /// the file order is the write order (BOX-162). `O_APPEND` alone is not
+    /// enough, because a cut and a write are two steps.
     /// The file is created owner-only.
     ///
     /// A last line torn by a crash has no newline. Its write was never
@@ -333,6 +336,9 @@ impl DiskBox {
             options.mode(0o600);
         }
         let mut file = options.open(self.events_path().as_utf8_path())?;
+        // Held until `file` drops after `sync_data`: the length, the cut and
+        // the write below are one step for every other appender.
+        file.lock()?;
         let len = file.metadata()?.len();
         let complete = complete_len(&mut file, len)?;
         if complete < len {
@@ -1713,6 +1719,48 @@ mod tests {
         let all = object.read_events_from(0).unwrap();
         assert_eq!(all.events, [after]);
         assert_eq!(all.refused.len(), 0);
+    }
+
+    /// BOX-162: two threads append to a file with a torn tail at once. The
+    /// file lock makes each cut and write one step, so the second cut never
+    /// removes the first append's event. Every event reads back, and no line
+    /// is refused.
+    #[test]
+    fn concurrent_appends_after_a_torn_line_keep_every_event() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        const PER_THREAD: usize = 50;
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let path = object.events_path();
+        std::fs::write(path.as_utf8_path(), b"{\"box\":\"torn").unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for kind in [BoxEventType::Started, BoxEventType::Detached] {
+                let object = loader.get(&key).unwrap();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let event = BoxEvent::for_record(object.record(), kind);
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        object.append_event(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        assert_eq!(all.events.len(), 2 * PER_THREAD);
+        for kind in [BoxEventType::Started, BoxEventType::Detached] {
+            let count = all.events.iter().filter(|e| e.kind == kind).count();
+            assert_eq!(count, PER_THREAD, "events of {kind:?} lost");
+        }
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
     }
 
     /// An event for a box whose directory is gone fails with `NotFound`
