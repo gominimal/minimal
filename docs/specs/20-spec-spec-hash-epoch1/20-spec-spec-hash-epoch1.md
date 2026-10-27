@@ -33,7 +33,8 @@ and cites D3.1 by its stable identifier.
 
 This document uses these terms. A spec's **canonical form** is the set of
 fields the epoch-0 encoder covers (`spec_hasher.rs`). In that form the
-dependency edges form a set and every number takes its normal form
+dependency edges form a set (order and repetition carry nothing) and every
+number takes its normal form
 (EPOCH-002, EPOCH-006). A spec's `tests` are outside its canonical form
 (EPOCH-010). A **container's canonical form** is the set of fields
 `ContainerHasher` covers (`spec_hasher.rs`, minimal#1331): its name, the
@@ -98,11 +99,13 @@ build-infra operator. Release manager.
     raise the bound after measuring, and must not lower it
   proof:    proofs/SpecHash/Epoch1.lean#encode_injective
 
-- **EPOCH-002** WHEN a permutation reorders a spec's dependency edges THE
-  SYSTEM SHALL produce an identical encoding.
+- **EPOCH-002** WHEN a permutation reorders a spec's dependency edges, or
+  an edge is listed more than once, THE SYSTEM SHALL produce an identical
+  encoding: the edges enter as a set.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_dep_order_irrelevant
-  property: for all s, permutations p: encode(s) == encode(p(s))
+  property: for all s, permutations p, edges e of s: encode(s) == encode(p(s))
+    == encode(s with e listed again)
 
 - **EPOCH-003** THE SYSTEM SHALL decode every epoch-1 encoding back to the
   canonical form of the spec it encodes.
@@ -145,6 +148,12 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p rcache epoch_follows_pinned_index
   property: for all pins p whose index holds a record, specs s:
     lookup_key(p, s) == hash(epoch(index(p)), encode_epoch(index(p))(s))
+  - An index that declares a lower epoch than the one a pin's commit was
+    sealed with is not a downgrade the keyspace permits but an index
+    substitution: a pin names a commit, the commit names its index object,
+    and replacing that object is the threat the index's Sigstore bundle
+    answers (minimal#1109, inbox#721), outside this spec. Epoch 0 stays
+    accepted for the pins that produced it (D3.1), so no floor is set here.
   - IF a lookup reads several indexes as one (an upstream with sideloads,
     or a per-commit snapshot with the root index as its fallback) AND two
     of them declare different epochs THEN THE SYSTEM SHALL refuse the
@@ -345,8 +354,9 @@ round-trip and the unknown-tag rejection in container position. `ContainerHasher
 so the flip must move that site together with `SpecHasher` and
 `SubsetHasher`, or containers stay on epoch 0 with the witness minimal#1331
 pinned. A container is a declaration over packages. Its members enter by
-key, and a key carries its epoch through the context, so a container key is
-well-defined only when every member key is of the container's epoch, which
+key, and a key's epoch is the one its index record declares, nothing in
+the key's bytes says it, so a container key is well-defined only when
+every member key is of the container's epoch, which
 EPOCH-014's refusal makes a requirement rather than an inference from
 EPOCH-009: a member may well sit in another index of another epoch. Today no index holds a container record
 (build-servers#371), so the container keyspace has nothing to rotate.
