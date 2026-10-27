@@ -41,7 +41,7 @@ use bep::handle::{self as store_handle, Inject, Rules, StoreRule};
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, StoreAuthorities, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
@@ -227,7 +227,7 @@ where
     // never admits an authority that the published root does not permit.
     let held = rules.current();
     let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
-        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held),
+        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held, &path),
         None => Ok(()),
     });
     match started {
@@ -398,16 +398,123 @@ fn registered_union(rules: &[StoreRule]) -> Union {
 /// host sets and the `host:port` authorities the client's store `rules`
 /// register (BEP-032). A store authority whose host the root does not
 /// permit is left out, so the deny set is never admitted.
+#[cfg(test)]
 fn admission(rules: &[StoreRule]) -> Admission {
-    let union = registered_union(rules);
-    let store: Vec<(String, u16)> = rules
+    Admission::new(
+        &[GITHUB],
+        store_authorities(rules, &registered_union(rules)),
+    )
+}
+
+/// The `host:port` authorities that the store `rules` register, less each
+/// one whose host `union` does not permit.
+fn store_authorities(rules: &[StoreRule], union: &Union) -> Vec<(String, u16)> {
+    rules
         .iter()
         .flat_map(|rule| rule.upstream.iter())
         .filter_map(|written| store_handle::parse_authority(written))
         .filter(|authority| union.contains(&authority.host))
         .map(|authority| (authority.host, authority.port))
-        .collect();
-    Admission::new(&[GITHUB], store)
+        .collect()
+}
+
+/// The rules that the admitted store authorities came from, and those
+/// authorities.
+struct Admitted {
+    rules: Vec<StoreRule>,
+    authorities: Vec<(String, u16)>,
+}
+
+/// The store authorities that `bep serve` admits at each CONNECT. When the
+/// client's rules change, the root is issued again under the same key and
+/// subject with the new names, the published identity gets that root, and
+/// the admitted set follows. A rule that adds an upstream is admitted
+/// without a restart (#2618, BEP-032).
+struct StoreAdmission<K: 'static> {
+    rules: Arc<ClientRules>,
+    ca: Arc<Mutex<Ca<'static, K>>>,
+    /// The published identity file, which gets each new root.
+    identity: PathBuf,
+    admitted: Mutex<Admitted>,
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
+    /// The source over `rules`, which starts with the `held` rules that the
+    /// root of `ca` was issued under.
+    fn new(
+        rules: Arc<ClientRules>,
+        ca: Arc<Mutex<Ca<'static, K>>>,
+        identity: PathBuf,
+        held: Vec<StoreRule>,
+    ) -> Self {
+        let union = ca
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .union()
+            .clone();
+        let authorities = store_authorities(&held, &union);
+        Self {
+            rules,
+            ca,
+            identity,
+            admitted: Mutex::new(Admitted {
+                rules: held,
+                authorities,
+            }),
+        }
+    }
+
+    /// Issues the root again for `rules` when their names changed, and
+    /// publishes it. Gives the names the root in use permits. On an error the
+    /// old root stays in use, so the new names are not admitted.
+    fn reissue(&self, rules: &[StoreRule]) -> Union {
+        let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
+        match ca.reissue_root(registered_union(rules), SystemTime::now()) {
+            Ok(true) => {
+                let published = Identity::read(&self.identity)
+                    .map(|identity| identity.with_root_certificate(ca.root()))
+                    .and_then(|identity| identity.publish(&self.identity));
+                if let Err(err) = published {
+                    tracing::error!(
+                        path = %self.identity.display(),
+                        error = %err,
+                        "did not publish the re-issued root; boxes created now get the old root"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
+            ),
+        }
+        ca.union().clone()
+    }
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
+    fn authorities(&self) -> Vec<(String, u16)> {
+        let rules = self.rules.current();
+        let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if admitted.rules == rules {
+            return admitted.authorities.clone();
+        }
+        let union = self.reissue(&rules);
+        let authorities = store_authorities(&rules, &union);
+        if authorities != admitted.authorities {
+            tracing::info!(
+                before = ?admitted.authorities,
+                after = ?authorities,
+                identity = %self.identity.display(),
+                "admits the changed secret-store upstreams with no restart"
+            );
+        }
+        *admitted = Admitted {
+            rules,
+            authorities: authorities.clone(),
+        };
+        authorities
+    }
 }
 
 /// The client's `[secret-store-rules]` that `bep` holds: the rules of the
@@ -418,14 +525,12 @@ fn admission(rules: &[StoreRule]) -> Admission {
 ///
 /// The redeemer asks the source at each request, and the source re-reads
 /// the files when one changes, so an edited rule decides the next
-/// redemption (BEP-032). Two limits hold. `bep` reads the default config
+/// redemption (BEP-032). One limit holds. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
 /// read: <https://github.com/gominimal/minimal/issues/2620>. The root's
-/// names and the admitted CONNECT set take the rules at start only, so a
-/// rule that adds an upstream reaches them when the proxy restarts:
-/// <https://github.com/gominimal/minimal/issues/2618>. The start
-/// log line names the file, so both show there.
+/// names and the admitted CONNECT set follow the rules at each
+/// CONNECT ([`StoreAdmission`]). The start log line names the file.
 fn client_store_rules() -> ClientRules {
     let paths = client_config_path().map(|user| {
         (
@@ -1088,6 +1193,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
     rules: Arc<ClientRules>,
     held: Vec<StoreRule>,
+    identity: &Path,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
     // Watched from here, so a supervisor that dies while the proxy starts
@@ -1110,11 +1216,6 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
-    // The store rules' authorities join the admitted set, so a CONNECT to
-    // an authority that no module and no rule admits is refused and audited
-    // `off_module`. The set takes the rules that `start` issued the root
-    // under, at start only (#2618).
-    let admitted = admission(&held);
     // The file names where the rules came from: the default config dir
     // (see `client_store_rules`).
     let config = client_config_path().map(|path| path.display().to_string());
@@ -1136,6 +1237,20 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let endpoint = GitHubTokenEndpoint::new(roots.clone())?;
     let ca = Arc::new(Mutex::new(ca));
+    // The store rules' authorities join the admitted set, so a CONNECT to
+    // an authority that no module and no rule admits is refused and audited
+    // `off_module`. The set starts with the rules that `start` issued the
+    // root under, and each CONNECT asks for the current rules, so a widened
+    // rule re-issues the root and is admitted with no restart (#2618).
+    let admitted = Admission::with_source(
+        &[GITHUB],
+        Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            identity.to_path_buf(),
+            held,
+        )),
+    );
     // One log, one writer: the proxy's decisions and the control socket's
     // mint and revocation records share the chain (BEP-067).
     let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
@@ -2384,6 +2499,73 @@ mod tests {
             ),
             "{redeemed:?}"
         );
+    }
+
+    // BEP-032, #2618: a rule that adds an upstream while `bep serve` runs
+    // re-issues the root under the same key with the new name, publishes it,
+    // and the next CONNECT to the new upstream is admitted with no restart.
+    #[test]
+    fn a_widened_store_rule_is_admitted_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&config, "").unwrap();
+        let rules = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let keys: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let held = rules.current();
+        let at = SystemTime::now();
+        let (identity, root) = Identity::of(keys)
+            .issuing_root(&keys.root, registered_union(&held), at)
+            .unwrap();
+        identity.publish(&path).unwrap();
+        let before = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
+        ));
+        let admitted = Admission::with_source(
+            &[GITHUB],
+            Arc::new(StoreAdmission::new(
+                Arc::clone(&rules),
+                Arc::clone(&ca),
+                path.clone(),
+                held,
+            )),
+        );
+        assert!(!admitted.admits("api.openai.com", 443), "off_module");
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_err());
+
+        // The rule widens the client's upstreams, with no restart.
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert!(!admitted.admits("api.openai.com", 8443));
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(ca.lock().unwrap().union().contains("api.openai.com"));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_ok());
+
+        // The published root is the re-issued one, under the same key.
+        let published = Identity::read(&path).unwrap();
+        let after = published.root_certificate_der().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after, ca.lock().unwrap().root().to_vec());
+        assert_eq!(
+            published.key(Role::Root).unwrap().kid(),
+            keys.root.public().kid()
+        );
+
+        // A narrowed rule takes the upstream out again.
+        std::fs::write(&config, "").unwrap();
+        assert!(!admitted.admits("api.openai.com", 443));
     }
 
     // BEP-032: a redemption stats the files and reads them only when a
