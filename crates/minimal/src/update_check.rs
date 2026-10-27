@@ -135,10 +135,28 @@ pub fn build_key(version: &str) -> String {
     hash.unwrap_or(version).to_string()
 }
 
+/// A field of the install file, as it may go into a request path, a query
+/// or a terminal: the installer's own charset for a target or a version,
+/// bounded.
+pub fn valid_field(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+impl Install {
+    fn valid(&self) -> bool {
+        valid_field(&self.channel) && valid_field(&self.method) && valid_field(&self.key)
+    }
+}
+
 /// The install description: the per-user file the installer wrote, else
 /// the read-only one a package ships beside the binary
 /// (`<prefix>/share/minimal/install.toml`, two levels up from `bin/min`),
-/// else [`Install::source`]. A file that does not parse counts as absent.
+/// else [`Install::source`]. A file that does not parse, or whose fields
+/// are outside the charset a request path, query or terminal may carry,
+/// counts as absent: a package's file is not this program's to trust.
 pub fn read_install(state_dir: &Path, exe: Option<&Path>) -> Install {
     let per_user = state_dir.join(INSTALL_FILE);
     let packaged = exe
@@ -150,7 +168,7 @@ pub fn read_install(state_dir: &Path, exe: Option<&Path>) -> Install {
         .flatten()
         .find_map(|p| {
             let text = std::fs::read_to_string(p).ok()?;
-            toml::from_str::<Install>(&text).ok()
+            toml::from_str::<Install>(&text).ok().filter(Install::valid)
         })
         .unwrap_or_else(Install::source)
 }
@@ -496,8 +514,16 @@ pub async fn cmd_update_check(
         anyhow::bail!("no state directory (HOME is not set)");
     };
     let state_path = dir.join(STATE_FILE);
-    let state = read_state(&state_path);
+    let mut state = read_state(&state_path);
     let install = read_install(&dir, std::env::current_exe().ok().as_deref());
+    // The placeholder is for the eye only: a request is never made with it.
+    // A foreground check the user asked for on a fresh install mints the id
+    // first, as a first command would; the background child never runs
+    // without one (its parent minted it).
+    if state.install_id.is_none() && !args.dry_run && !args.background {
+        state.install_id = Some(new_install_id());
+        let _ = write_state(&state_path, &state);
+    }
     let id = state
         .install_id
         .clone()
@@ -656,6 +682,36 @@ mod tests {
             "brew",
             "an unparsable user file is absent"
         );
+        std::fs::write(
+            state.join(INSTALL_FILE),
+            "channel = \"../x?a=b\"\nmethod = \"installer\"\nkey = \"0.7.1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_install(&state, Some(&exe)).method,
+            "brew",
+            "a field outside the charset makes the file absent"
+        );
+        std::fs::write(
+            state.join(INSTALL_FILE),
+            "channel = \"stable\"\nmethod = \"installer\"\nkey = \"0.7.1\\u001b[31m\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_install(&state, Some(&exe)).method,
+            "brew",
+            "a control character makes the file absent"
+        );
+    }
+
+    #[test]
+    fn install_fields_are_the_installer_charset_bounded() {
+        for ok in ["stable", "0.7.1", "5a93a07a", "installer", "0.8.0-dev.198.ge8f53f6e"] {
+            assert!(valid_field(ok), "{ok}");
+        }
+        for bad in ["", "../x", "a?b=c", "a&b", "a b", "\u{1b}[31m", &"x".repeat(65)] {
+            assert!(!valid_field(bad), "{bad:?}");
+        }
     }
 
     #[test]
