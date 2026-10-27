@@ -13244,6 +13244,468 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   echo "::endgroup::"
 }
 
+# Round-two conditions closed, end to end (BEP T76, #2591). One walk over
+# the residuals that the second review round filed. Each leg prints PASS, or
+# records NOT RUN with the gate it misses. On a lane that runs no leg, the
+# whole walk is NOT RUN.
+#   store     (BEP-032) `bep serve` holds the client's [secret-store-rules]
+#             at its start. The injection of a store value into a box's
+#             request is NOT RUN until a box can carry a store handle
+#             (#2525): today no box creation mints one.
+#   key       (BEP-063, BEP-067, BEP-070) a grant box A answers 'gh api
+#             user'. The case puts a value that is no key in the keychain
+#             item of the client's signing key, so the next creation (box
+#             B) replaces the key. The proxy keeps the replaced key, which
+#             it names by its kid, and A still answers. The admit records of
+#             A and B each carry the jti of their own handle. The destroy of
+#             A records a revocation of A's id, the proxy revokes the
+#             replaced key, and a box re-created under A's name gets a new
+#             UUIDv7 id. `bep serve --help` names the client key bound.
+#             A refusal of a colliding id is not drivable from the CLI: the
+#             unit test colliding_box_id_refuses_creation proves it.
+#   cohort    (BEP-018) native Linux with the QUIC block installed: UDP 443
+#             flows that a host_ip box opened before the cohort turned
+#             blocked end refused, and so do the processes 'min session
+#             exec' injects into it while the cohort turns and after.
+#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1: an
+#             unreadable line in this machine's audit log refuses a box
+#             creation with no proxy, refuses a plain `bep serve`, and
+#             `bep serve --quarantine-unreadable` moves its segment aside,
+#             records the quarantine in the chain, and serves.
+# The values are never printed: the transcript names only their lengths.
+RT_CASE=bep_round_two_conditions_closed
+RT_RAN=""
+
+# Prints the bep binary that the VM host daemon starts: MINVMD_BEP_BIN,
+# else the bep beside minvmd, or fails the case.
+rt_bep_bin() {
+  local rb_bin="${MINVMD_BEP_BIN:-}"
+  if [ -z "$rb_bin" ]; then
+    rb_bin="$(command -v minvmd 2>/dev/null || true)"
+    rb_bin="${rb_bin%/*}/bep"
+  fi
+  if [ ! -x "$rb_bin" ]; then
+    echo "::error::no bep binary at '$rb_bin': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs" >&2
+    return 1
+  fi
+  printf '%s\n' "$rb_bin"
+}
+
+# The proxy's log lines after line $1, that contain $2.
+rt_bep_log_since() {
+  tail -n +"$(( $1 + 1 ))" "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+    | grep -F -- "$2" || true
+}
+rt_bep_log_lines() {
+  wc -l <"$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tr -d ' ' || echo 0
+}
+
+# Prints the jti of each admit record for api.github.com:443 that names a
+# member, in the jsonl file $1, one a line.
+rt_admit_jtis() {
+  python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            print(r.get("jti", ""))
+PY
+}
+
+rt_leg_store() {
+  local st_leg="$RT_CASE/store" st_line
+  bep_live_gate "$st_leg" || return 0
+  st_line="$(grep -h 'holds the secret-store rules of the client configuration' \
+    "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tail -n1)"
+  if [ -z "$st_line" ]; then
+    echo "::error::the Box Egress Proxy log has no line that says it holds the client's secret-store rules: 'bep serve' did not read them at its start"
+    tail -40 "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null || true
+    fail
+  fi
+  echo "$st_leg: the proxy read the client's secret-store rules at its start: ${st_line##*INFO }"
+  RT_RAN="$RT_RAN store"
+  not_run "$st_leg/injection" "no box carries a store handle yet, so no request can redeem one (#2525)"
+}
+
+rt_leg_key() {
+  local ck_leg="$RT_CASE/key" ck_bep ck_help ck_mark ck_kept ck_gone ck_try
+  local ck_a=e2e-bep-round-two-a ck_b=e2e-bep-round-two-b
+  local ck_id_a ck_id_b ck_id_a2 ck_jti_a ck_jti_b ck_n
+  local ck_v7='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  bep_live_gate "$ck_leg" || return 0
+  ck_bep="$(rt_bep_bin)" || fail
+
+  # The key bound: the proxy takes it as a flag, with its default.
+  ck_help="$("$ck_bep" serve --help 2>&1 || true)"
+  if [[ "$ck_help" != *"--max-client-keys"* ]]; then
+    echo "::error::'bep serve --help' does not name --max-client-keys: the proxy has no client key bound"
+    printf '%s\n' "$ck_help"
+    fail
+  fi
+  echo "key bound: $(printf '%s\n' "$ck_help" | grep -F -A1 -- '--max-client-keys' | tr -s ' ' | tr '\n' ' ')"
+
+  # Not local: ck_cleanup reads them.
+  CK_SID_A="" CK_SID_B="" CK_SID_A2=""
+  ck_cleanup() {
+    [ -n "$CK_SID_A" ] && mnl session destroy --force "$CK_SID_A" >/dev/null 2>&1
+    [ -n "$CK_SID_B" ] && mnl session destroy --force "$CK_SID_B" >/dev/null 2>&1
+    [ -n "$CK_SID_A2" ] && mnl session destroy --force "$CK_SID_A2" >/dev/null 2>&1
+    CK_SID_A="" CK_SID_B="" CK_SID_A2=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  ck_fail() {
+    echo "--- bep.log (client keys and box connections, tail) ---"
+    grep -h 'client key\|box_connection\|revocation' \
+      "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tail -20 || true
+    ck_cleanup
+    fail
+  }
+  # 'gh api user' in the box $1, or the case fails naming $2.
+  ck_gh() {
+    if ! mnl session exec "$1" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$RT_CASE.gh" 2>&1; then
+      echo "::error::'gh api user' failed in $2"
+      cat "$WORK/$RT_CASE.gh" 2>/dev/null || true
+      ck_fail
+    fi
+  }
+
+  bep_revoke_seed "$RT_CASE"
+  CK_SID_A="$(bep_revoke_activate "$RT_CASE" "$ck_a")" || ck_fail
+  ck_gh "$CK_SID_A" "box A ($ck_a) before the key replacement"
+  ck_id_a="$(bep_recreate_audited_id "$RT_CASE" "$ck_a")" || ck_fail
+  echo "box A: $ck_a, box id $ck_id_a, 'gh api user' answered"
+
+  # The keychain item now holds no valid key, so the next creation reads a
+  # refused key and replaces it.
+  security delete-generic-password -s dev.minimal.client-key -a minimal >/dev/null 2>&1 || true
+  if ! security add-generic-password -s dev.minimal.client-key -a minimal \
+      -l "Minimal client signing key" -w not-a-key >/dev/null 2>"$WORK/$RT_CASE.security.err"; then
+    echo "::error::'security add-generic-password' did not write the client key item"
+    cat "$WORK/$RT_CASE.security.err" 2>/dev/null || true
+    ck_fail
+  fi
+  ck_mark="$(rt_bep_log_lines)"
+  CK_SID_B="$(bep_revoke_activate "$RT_CASE" "$ck_b")" || ck_fail
+  ck_gh "$CK_SID_B" "box B ($ck_b), created under the replacement key"
+  ck_id_b="$(bep_recreate_audited_id "$RT_CASE" "$ck_b")" || ck_fail
+  ck_kept="$(rt_bep_log_since "$ck_mark" 'kept a replaced client key until the running boxes that use it end')"
+  if [[ "$ck_kept" != *"kid="*"replacement="* ]]; then
+    echo "::error::the proxy did not keep the replaced client key for box A, by its kid, when box B's creation replaced it"
+    rt_bep_log_since "$ck_mark" 'client key'
+    ck_fail
+  fi
+  echo "replacement: ${ck_kept##*INFO }"
+  ck_gh "$CK_SID_A" "box A ($ck_a) after the key replacement: a replaced key must keep verifying until its boxes end"
+  echo "box A answered 'gh api user' after the replacement"
+
+  # The audit jti: each box's admits carry its own handle's jti.
+  ck_jti_a="$(rt_admit_jtis "$WORK/$RT_CASE.$ck_a.audit" | sort -u)"
+  mnl box audit "$ck_b" -o jsonl </dev/null >"$WORK/$RT_CASE.$ck_b.audit" 2>/dev/null || true
+  ck_jti_b="$(rt_admit_jtis "$WORK/$RT_CASE.$ck_b.audit" | sort -u)"
+  if [ -z "$ck_jti_a" ] || [ -z "$ck_jti_b" ] \
+     || printf '%s\n' "$ck_jti_a" "$ck_jti_b" | grep -qx ''; then
+    echo "::error::an admit record for api.github.com:443 carries no jti (box A: '${ck_jti_a//$'\n'/ }', box B: '${ck_jti_b//$'\n'/ }')"
+    ck_fail
+  fi
+  if [ "$(printf '%s\n' "$ck_jti_a" | wc -l)" -ne 1 ] || [ "$ck_jti_a" = "$ck_jti_b" ]; then
+    echo "::error::the admit records do not carry one jti per box: box A '${ck_jti_a//$'\n'/ }', box B '${ck_jti_b//$'\n'/ }'"
+    ck_fail
+  fi
+  echo "audit jti: box A's admits carry $ck_jti_a, box B's carry $ck_jti_b"
+
+  # The destroy of A ends the last box under the replaced key.
+  ck_mark="$(rt_bep_log_lines)"
+  if ! mnl session destroy --force "$CK_SID_A" >/dev/null 2>"$WORK/$RT_CASE.destroy.err"; then
+    echo "::error::'min session destroy' of box A failed"
+    cat "$WORK/$RT_CASE.destroy.err" 2>/dev/null || true
+    ck_fail
+  fi
+  CK_SID_A=""
+  ck_gone="" ck_n=0
+  for ck_try in $(seq 1 60); do
+    [ "$ck_try" -gt 1 ] && sleep 1
+    [ -z "$ck_gone" ] && ck_gone="$(rt_bep_log_since "$ck_mark" 'revoked a replaced client key: the last box created under it ended')"
+    if mnl box audit "$ck_id_a" -o jsonl </dev/null >"$WORK/$RT_CASE.old.audit" 2>/dev/null; then
+      ck_n="$(bep_revoke_count "$WORK/$RT_CASE.old.audit" revocation)"
+    fi
+    [ -n "$ck_gone" ] && [ "$ck_n" -ge 1 ] && break
+  done
+  if [[ "$ck_gone" != *"kid="* ]]; then
+    echo "::error::the proxy did not revoke the replaced client key, by its kid, within 60 s of the destroy of box A"
+    rt_bep_log_since "$ck_mark" 'client key'
+    ck_fail
+  fi
+  echo "end of box A: ${ck_gone##*INFO }"
+  if [ "$ck_n" -lt 1 ]; then
+    echo "::error::'min box audit $ck_id_a' shows no revocation record within 60 s of the destroy"
+    ck_fail
+  fi
+
+  # The revoked id never returns: the name gets a new UUIDv7 id.
+  CK_SID_A2="$(bep_revoke_activate "$RT_CASE" "$ck_a")" || ck_fail
+  ck_id_a2="$(bep_recreate_audited_id "$RT_CASE" "$ck_a")" || ck_fail
+  for ck_n in "$ck_id_a" "$ck_id_b" "$ck_id_a2"; do
+    if ! [[ "$(printf '%s' "$ck_n" | tr 'A-F' 'a-f')" =~ $ck_v7 ]]; then
+      echo "::error::box id $ck_n is not a UUIDv7"
+      ck_fail
+    fi
+  done
+  if [ "$ck_id_a2" = "$ck_id_a" ]; then
+    echo "::error::the box re-created under $ck_a got the revoked id $ck_id_a again"
+    ck_fail
+  fi
+  echo "revoked id: $ck_id_a has a revocation record, and $ck_a re-created as $ck_id_a2 (UUIDv7)"
+
+  ck_cleanup
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN key"
+  echo "$ck_leg: PASS (key bound, replaced key kept by kid until box A ended, one jti per box in the audit, revoked id not reused)"
+}
+
+rt_leg_cohort() {
+  local co_leg="$RT_CASE/cohort" co_helper=/usr/local/lib/minimal/quic443-leaf
+  local co_sock co_out co_t0 co_i co_rc co_end co_line co_probe
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux"
+    return 0
+  fi
+  if [ ! -x "$co_helper" ] || [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+    not_run "$co_leg" "the QUIC block is not installed: run 'sudo scripts/install-host-classifier.sh --cohort-address <ip> --node-plane-address <ip>' first"
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    not_run "$co_leg" "no passwordless sudo, which places the daemon in the classifier tree"
+    return 0
+  fi
+  co_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+  mnl ls >/dev/null 2>&1 || { echo "::error::the daemon did not start for $co_leg"; fail; }
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+      --place-listener "$co_sock" >"$WORK/$RT_CASE.place.out" 2>&1; then
+    echo "::error::the installer's --place-listener step did not place the daemon in the classifier tree"
+    cat "$WORK/$RT_CASE.place.out" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: co_cleanup reads them.
+  CO_SID_A="" CO_SID_B="" CO_SEED_A="" CO_SEED_B="" CO_PIDS=""
+  co_cleanup() {
+    [ -n "$CO_SID_A" ] && mnl session destroy --force "$CO_SID_A" >/dev/null 2>&1
+    [ -n "$CO_SID_B" ] && mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1
+    CO_SID_A="" CO_SID_B=""
+    [ -n "$CO_SEED_A" ] && rm -rf "${CO_SEED_A:?}"
+    [ -n "$CO_SEED_B" ] && rm -rf "${CO_SEED_B:?}"
+    CO_SEED_A="" CO_SEED_B=""
+    # shellcheck disable=SC2086
+    [ -n "$CO_PIDS" ] && { wait $CO_PIDS 2>/dev/null || true; }
+    CO_PIDS=""
+    return 0
+  }
+  co_fail() { co_cleanup; fail; }
+  # Activates the project $1 as host_ip box $2, and prints its id.
+  co_activate() {
+    local ca_out
+    ca_out="$(cd "$1" && mnl session activate . --no-prompt --name "$2" --network host_ip \
+      </dev/null 2>"$WORK/$RT_CASE.$2.err")" || {
+      echo "::error::'min session activate --network host_ip' of $2 failed" >&2
+      printf '%s\n' "$ca_out" >&2
+      cat "$WORK/$RT_CASE.$2.err" >&2 2>/dev/null || true
+      return 1
+    }
+    printf '%s\n' "$ca_out" | tail -n1 | tr -d '\r'
+  }
+  # A UDP flow to TEST-NET-1 port 443 from box A, written to probe file $1:
+  # one datagram each half second for 30 s, then the end time and exit code.
+  # Before the block nothing answers, so socat waits. A reject ends it with
+  # 'Connection refused'.
+  co_flow() {
+    # shellcheck disable=SC2016
+    mnl session exec "$CO_SID_A" sh -c \
+      'n=0; while [ $n -lt 60 ]; do echo q; sleep 0.5; n=$((n+1)); done | socat -t 1 - UDP:192.0.2.1:443 2>&1; echo "rc=$? end=$(date +%s)"' \
+      >"$1" 2>&1
+  }
+
+  CO_SEED_A="$(hook_mktemp /tmp/mnlquica.XXXXXX)"
+  hook_seed_preamble >"$CO_SEED_A/minimal.toml"
+  mkdir "$CO_SEED_A/.git"
+  CO_SEED_B="$(hook_mktemp /tmp/mnlquicb.XXXXXX)"
+  { hook_seed_preamble; printf '\n[session.network]\nquic443 = "block"\n'; } >"$CO_SEED_B/minimal.toml"
+  mkdir "$CO_SEED_B/.git"
+
+  CO_SID_A="$(co_activate "$CO_SEED_A" e2e-quic-cohort-a)" || co_fail
+  # The earlier flows: open before the cohort turns blocked.
+  co_flow "$WORK/$RT_CASE.flow1" & CO_PIDS="$CO_PIDS $!"
+  co_flow "$WORK/$RT_CASE.flow2" & CO_PIDS="$CO_PIDS $!"
+  sleep 3
+  co_t0="$(date +%s)"
+  # The race: injections that start while the cohort turns blocked.
+  ( sleep 0.2; co_flow "$WORK/$RT_CASE.race1" ) & CO_PIDS="$CO_PIDS $!"
+  ( sleep 0.6; co_flow "$WORK/$RT_CASE.race2" ) & CO_PIDS="$CO_PIDS $!"
+  CO_SID_B="$(co_activate "$CO_SEED_B" e2e-quic-cohort-b)" || co_fail
+  # shellcheck disable=SC2086
+  wait $CO_PIDS 2>/dev/null || true
+  CO_PIDS=""
+  for co_i in flow1 flow2 race1 race2; do
+    co_out="$(tr -d '\r' <"$WORK/$RT_CASE.$co_i" 2>/dev/null || true)"
+    co_line="$(printf '%s\n' "$co_out" | sed -n 's/^rc=\([0-9]*\) end=\([0-9]*\)$/\1 \2/p' | tail -n1)"
+    co_rc="${co_line%% *}" co_end="${co_line##* }"
+    if [ -z "$co_line" ] || [ "$co_rc" = 0 ] || [[ "$co_out" != *"Connection refused"* ]] \
+       || [ "$co_end" -lt "$co_t0" ] || [ "$co_end" -ge "$(( co_t0 + 25 ))" ]; then
+      echo "::error::the UDP 443 flow $co_i from box A did not end refused after the cohort turned blocked at $co_t0 (expected 'Connection refused' and an end before $(( co_t0 + 25 )))"
+      printf '%s\n' "$co_out"
+      co_fail
+    fi
+    echo "$co_i: refused, ended at $co_end (block began at $co_t0)"
+  done
+
+  # An injection while the cohort blocks.
+  # shellcheck disable=SC2016
+  co_probe='printf q | socat -t 2 - UDP:192.0.2.1:443 2>&1; echo "rc=$?"'
+  co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
+  if [[ "$co_out" != *"Connection refused"* ]]; then
+    echo "::error::UDP 443 from a process injected into box A while the cohort blocks was not refused"
+    printf '%s\n' "$co_out"
+    co_fail
+  fi
+  echo "injection while blocked: refused"
+  # The block is the cohort's: with box B gone, box A sends again.
+  mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1 || true
+  CO_SID_B=""
+  co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
+  if [[ "$co_out" == *"Connection refused"* ]] || [[ "$co_out" != *"rc=0"* ]]; then
+    echo "::error::UDP 443 from box A was still refused after the last blocking box of the cohort ended"
+    printf '%s\n' "$co_out"
+    co_fail
+  fi
+  echo "after box B ended: box A's UDP 443 is not refused"
+
+  co_cleanup
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN cohort"
+  echo "$co_leg: PASS (earlier flows and injections during and after the turn all refused, and released with the last blocking box)"
+}
+
+rt_leg_quarantine() {
+  local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
+  local qu_sockets qu_listener qu_control
+  if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
+    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 to run it"
+    return 0
+  fi
+  bep_live_gate "$qu_leg" || return 0
+  qu_bep="$(rt_bep_bin)" || fail
+  # A short directory: a socket path has a length limit.
+  qu_sockets="$(mktemp -d /tmp/mnlrtq.XXXXXX)"
+  qu_listener="$qu_sockets/l.sock" qu_control="$qu_sockets/c.sock"
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  qu_dir="$HOME/.minimal/bep/audit"
+
+  # No proxy runs from here, so the next live leg restarts the pair.
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  BEP_LIVE_DAEMON=""
+  qu_seg="$(find "$qu_dir" -maxdepth 1 -name 'audit-*.jsonl' 2>/dev/null \
+    | sed 's/.*audit-\([0-9]*\)\.jsonl$/\1 &/' | sort -n | tail -n1 | cut -d' ' -f2-)"
+  if [ -z "$qu_seg" ]; then
+    echo "::error::the audit log in $qu_dir has no segment, though the proxy served"
+    fail
+  fi
+  qu_name="${qu_seg##*/}"
+  printf '%s\n' '{"schema":"min/v1/audit","kind":"decis' >>"$qu_seg"
+  echo "wrote one unreadable line into $qu_seg"
+
+  # A creation with no proxy that can read the log is refused.
+  bep_revoke_seed "$RT_CASE"
+  if qu_out="$(bep_revoke_activate "$RT_CASE" e2e-bep-round-two-quarantine 2>&1)"; then
+    mnl session destroy --force "$(printf '%s\n' "$qu_out" | tail -n1)" >/dev/null 2>&1 || true
+    rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+    echo "::error::a box was created while the audit log held a line that nothing can read"
+    fail
+  fi
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  if [[ "$qu_out" != *"--quarantine-unreadable"* ]] \
+     && ! grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable'"
+    printf '%s\n' "$qu_out"
+    fail
+  fi
+  echo "creation with the unreadable line: refused, and the way out is named"
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+
+  # A plain start is refused, and names the flag. Standard input closes
+  # after the token, so a start that is not refused stops at once.
+  qu_out="$(printf '%064d\n' 0 | "$qu_bep" serve --listener "$qu_listener" \
+    --control "$qu_control" --exit-on-stdin-close 2>&1)" && {
+    echo "::error::'bep serve' started on an audit log with an unreadable line"
+    fail
+  }
+  if [[ "$qu_out" != *"--quarantine-unreadable"* ]]; then
+    echo "::error::the refused 'bep serve' does not name --quarantine-unreadable"
+    printf '%s\n' "$qu_out"
+    fail
+  fi
+  echo "plain 'bep serve': refused, naming --quarantine-unreadable"
+
+  # The way out: the segment moves aside, the chain records it, bep serves.
+  ( sleep 600 | { printf '%064d\n' 0; cat; } | "$qu_bep" serve --listener "$qu_listener" \
+      --control "$qu_control" --quarantine-unreadable --exit-on-stdin-close \
+      >"$WORK/$RT_CASE.serve.out" 2>&1 ) &
+  QU_PID=$!
+  for qu_try in $(seq 1 60); do
+    [ "$qu_try" -gt 1 ] && sleep 1
+    bep_control_live "$qu_control" && break
+  done
+  if ! bep_control_live "$qu_control"; then
+    echo "::error::'bep serve --quarantine-unreadable' did not serve within 60 s"
+    cat "$WORK/$RT_CASE.serve.out" 2>/dev/null || true
+    pkill -P "$QU_PID" 2>/dev/null || true
+    fail
+  fi
+  if [ ! -f "$qu_dir/quarantine/$qu_name" ] || [ -e "$qu_seg" ]; then
+    echo "::error::'bep serve --quarantine-unreadable' did not move $qu_name into $qu_dir/quarantine"
+    pkill -P "$QU_PID" 2>/dev/null || true
+    fail
+  fi
+  qu_out="$(grep -hF '"kind":"quarantine"' "$qu_dir"/audit-*.jsonl 2>/dev/null | grep -F "$qu_name" | tail -n1)"
+  pkill -P "$QU_PID" 2>/dev/null || true
+  wait "$QU_PID" 2>/dev/null || true
+  if [[ "$qu_out" != *'"previous_hash":"'* ]]; then
+    echo "::error::the audit log has no chained quarantine record that names $qu_name"
+    fail
+  fi
+  rm -rf "${qu_sockets:?}"
+  echo "quarantine: $qu_name moved into $qu_dir/quarantine, and a chained quarantine record names it"
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN quarantine"
+  echo "$qu_leg: PASS (unreadable line refused the creation and the plain start, and the quarantine start served)"
+}
+
+proof_bep_round_two_conditions_closed() {
+  echo "::group::round-two conditions closed: store rules, client key, audit jti, key bound, cohort, revoked id, quarantine"
+  RT_RAN=""
+  rt_leg_store
+  rt_leg_key
+  rt_leg_cohort
+  rt_leg_quarantine
+  if [ -z "$RT_RAN" ]; then
+    not_run "$RT_CASE" "no leg of the walk can run on this lane"
+  else
+    echo "Round-two conditions closed OK (legs that ran:$RT_RAN)"
+  fi
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -24812,6 +25274,7 @@ case "${1:-}" in
     proof_bep_logout_refuses_every_reference_at_next_request
     proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
+    proof_bep_round_two_conditions_closed
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -24883,7 +25346,8 @@ case "${1:-}" in
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
     | bep_revoke_and_sign_out_end_to_end \
-    | bep_dns_steering_fails_closed_end_to_end)
+    | bep_dns_steering_fails_closed_end_to_end \
+    | bep_round_two_conditions_closed)
     "proof_$1"
     ;;
   *)
@@ -24929,7 +25393,7 @@ case "${1:-}" in
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
     echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
-    echo "         bep_dns_steering_fails_closed_end_to_end"
+    echo "         bep_dns_steering_fails_closed_end_to_end bep_round_two_conditions_closed"
     exit 2
     ;;
 esac
