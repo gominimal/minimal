@@ -95,7 +95,8 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p graph epoch1_injectivity_bounded
   property: for all canonical a, b: a != b implies encode(a) != encode(b)
   harness:  kani_epoch1_injectivity_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2). The codec PR can
+    (3 elements per list, 8 bytes per string, depth 2), unwind 9 (the
+    8-byte string loop; a 3-element list loop needs 4). The codec PR can
     raise the bound after measuring, and must not lower it
   proof:    proofs/SpecHash/Epoch1.lean#encode_injective
 
@@ -114,7 +115,7 @@ build-infra operator. Release manager.
   property: for all bounded specs x: decode(encode(x)) == canon(x), and
     canon(canon(x)) == canon(x)
   harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2)
+    (3 elements per list, 8 bytes per string, depth 2), unwind 9
 
 - **EPOCH-004** THE SYSTEM SHALL encode every epoch-0 collision-witness
   pair from the epoch-0 defect catalog to distinct outputs.
@@ -122,7 +123,8 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p graph epoch1_witness_refutations
   property: for all catalog pairs (a, b): encode(a) != encode(b)
   harness:  kani_epoch1_witness_refutations, one harness per witness class
-    in the epoch-0 defect catalog (nine)
+    in the epoch-0 defect catalog (nine), each over its concrete witness
+    pair, unwind 9 (the witnesses' strings are at most 8 bytes)
 
 - **EPOCH-005** THE SYSTEM SHALL derive epoch-1 hashes under the epoch-1
   context, at 32 bytes, with every downstream record layout unchanged.
@@ -186,7 +188,7 @@ build-infra operator. Release manager.
     with an unassigned tag: decode(s) errors
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
     all 256 tag bytes with a bounded 8-byte payload, in spec and in
-    container position
+    container position, unwind 9 (the payload loop)
   - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1. A later
     optional field takes one with absent-means-epoch-1 semantics: a closure
     that does not set the field encodes, and keys, byte-identically to
@@ -224,7 +226,8 @@ build-infra operator. Release manager.
     encode(a) != encode(b)
   harness:  kani_epoch1_container_injectivity_bounded, exhaustive over
     bounded containers (3 elements per list, set or map, 8 bytes per
-    string)
+    string, up to 3 member keys), unwind 33 (the 32-byte member-key
+    loop; lists and strings need less)
   - THE SYSTEM SHALL encode the epoch-0 container witness (minimal#1331:
     `env_vars` `{Av: B}` against `{A: vB}`) to distinct outputs.
     tier:   T1
@@ -253,7 +256,7 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p graph epoch1_container_roundtrip_bounded
   property: for all bounded containers c: decode(encode(c)) == canon(c)
   harness:  kani_epoch1_container_roundtrip_bounded, exhaustive over
-    bounded containers
+    bounded containers, unwind 33
 
 - **EPOCH-015** WHEN the system computes a container key THE SYSTEM SHALL
   derive it under the epoch-1 context from the container's canonical
