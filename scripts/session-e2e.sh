@@ -13309,9 +13309,12 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             box opened before the cohort turned blocked end refused,
 #             and so do the processes 'min session exec' injects into it
 #             while the cohort turns and after.
-#   quarantine (BEP-068, BEP-070) opt-in with E2E_BEP_QUARANTINE=1:
-#             an unreadable line in this machine's
-#             audit log refuses a box creation with no proxy, refuses a plain `bep serve`, and
+#   quarantine (BEP-068, BEP-070) the leg writes an unreadable line into
+#             this machine's Box Egress Proxy audit log and moves its
+#             segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host
+#             whose audit log may be moved aside to run it. The manual
+#             macOS lane runs it (#2500). The unreadable line refuses a box
+#             creation with no proxy, refuses a plain `bep serve`, and
 #             `bep serve --quarantine-unreadable` moves its segment aside,
 #             records the quarantine in the chain, and serves.
 # The values are never printed: the transcript names only their lengths.
@@ -13785,7 +13788,7 @@ rt_leg_quarantine() {
   local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
   local qu_sockets qu_listener qu_control
   if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
-    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 to run it. A CI lane with a live proxy runs it (#2500)"
+    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host whose audit log may be moved aside to run it. The manual macOS lane runs it (#2500)"
     return 0
   fi
   bep_live_gate "$qu_leg" || return 0
