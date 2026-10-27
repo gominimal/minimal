@@ -421,7 +421,8 @@ fn admission(rules: &[StoreRule]) -> Admission {
 /// redemption (BEP-032). Two limits hold. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
-/// read: <https://github.com/gominimal/minimal/issues/2620>. The root's
+/// read. `min` refuses to mint a store handle under such a rule unless this
+/// dir holds the same rule, and the refusal names both dirs. The root's
 /// names and the admitted CONNECT set take the rules at start only, so a
 /// rule that adds an upstream reaches them when the proxy restarts:
 /// <https://github.com/gominimal/minimal/issues/2618>. The start
