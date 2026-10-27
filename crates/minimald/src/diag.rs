@@ -698,20 +698,22 @@ async fn sessions<W: BundleSink>(
         }
         // The box's lifecycle events (BOX-040) travel beside its record:
         // the record says where the box is, the events say how it got
-        // there. Each line is a box id, a parent, a timestamp and a type,
-        // with no user data, so it travels verbatim, tail-capped like a
-        // log. An absent file is a box created before events were written.
+        // there. An event's `data` can carry user data, such as a box name
+        // or an exit reason, so each line is redacted like the record,
+        // tail-capped like a log. An absent file is a box created before
+        // events were written.
         let events = format!("sessions/{short}/{}", boxes::events::EVENTS_FILE);
-        match w
-            .add_file_tail(
-                &events,
-                &entry.path().join(boxes::events::EVENTS_FILE),
-                MAX_SESSION_FILE_BYTES,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {}
+        match read_events_tail(&entry.path().join(boxes::events::EVENTS_FILE)).await {
+            Ok(Some((bytes, capped))) => {
+                let redaction = if capped {
+                    Redaction::TailCapped
+                } else {
+                    Redaction::Keys
+                };
+                w.add_bytes(&events, &redact_event_lines(&bytes), redaction)
+                    .await?;
+            }
+            Ok(None) => {}
             Err(e) => w.skip(events, format!("unreadable: {e:#}")),
         }
         // An absent file is always explainable (the manifest contract): a
@@ -826,6 +828,70 @@ async fn read_session_file(path: &Path) -> Result<Option<Vec<u8>>, anyhow::Error
         "over the {MAX_SESSION_FILE_BYTES}-byte session-file cap"
     );
     Ok(Some(bytes))
+}
+
+/// The line a bundle carries in place of an events line that does not
+/// decode as JSON. Such a line cannot be redacted, so it does not travel.
+const WITHHELD_EVENT_LINE: &str = "\"<withheld: event line is not JSON>\"";
+
+/// Reads the last [`MAX_SESSION_FILE_BYTES`] of a box's events file without
+/// following a symlink. The bool is true when the file was over the cap. A
+/// capped read starts mid-line, so the bytes up to the first newline go.
+/// `Ok(None)` means the file is absent.
+async fn read_events_tail(path: &Path) -> Result<Option<(Vec<u8>, bool)>, anyhow::Error> {
+    use tokio::io::AsyncSeekExt as _;
+
+    let (mut file, meta) = match diagnostics::open_regular_nofollow(path).await {
+        Ok(open) => open,
+        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let capped = meta.len() > MAX_SESSION_FILE_BYTES;
+    if capped {
+        file.seek(std::io::SeekFrom::End(-(MAX_SESSION_FILE_BYTES as i64)))
+            .await
+            .with_context(|| format!("seeking {}", path.display()))?;
+    }
+    // Bound the read at the reader: the daemon can append between the stat
+    // and the read.
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_SESSION_FILE_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    if capped {
+        let start = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |at| at + 1);
+        bytes.drain(..start);
+    }
+    Ok(Some((bytes, capped)))
+}
+
+/// Redacts each line of a box's events file as [`redact_json`] redacts a
+/// record, and writes each back as one line. A line that does not decode is
+/// replaced by [`WITHHELD_EVENT_LINE`]. Blank lines go.
+fn redact_event_lines(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json_lenient::from_slice::<serde_json_lenient::Value>(line) {
+            Ok(mut value) => {
+                redact_json(&mut value);
+                match serde_json_lenient::to_vec(&value) {
+                    Ok(json) => out.extend_from_slice(&json),
+                    Err(_) => out.extend_from_slice(WITHHELD_EVENT_LINE.as_bytes()),
+                }
+            }
+            Err(_) => out.extend_from_slice(WITHHELD_EVENT_LINE.as_bytes()),
+        }
+        out.push(b'\n');
+    }
+    out
 }
 
 /// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
@@ -1533,6 +1599,69 @@ mod tests {
         let first = events.split(|b| *b == b'\n').next().unwrap();
         let event: boxes::events::BoxEvent = serde_json_lenient::from_slice(first).unwrap();
         assert_eq!(event.kind, boxes::events::BoxEventType::Created);
+    }
+
+    /// BOX-040: an event's `data` can carry user data, so the bundle redacts
+    /// each events line as it redacts the record. A secret-keyed value in
+    /// `data` does not travel, and a line that does not decode travels as a
+    /// fixed placeholder.
+    #[tokio::test]
+    async fn diag_bundle_redacts_box_events_data() {
+        use std::io::Write as _;
+
+        let server = TestServer::new().await;
+        {
+            let mut client = server.connect().await;
+            crate::test_harness::create_configured_session(&mut client, "diag-redact", "/tmp")
+                .await;
+        }
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let events_path = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join(boxes::events::EVENTS_FILE))
+            .find(|path| path.exists())
+            .expect("the box should have an events file");
+        let created = std::fs::read(&events_path).unwrap();
+        let mut event: boxes::events::BoxEvent =
+            serde_json_lenient::from_slice(created.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        event.kind = boxes::events::BoxEventType::Renamed;
+        event.data.insert(
+            "auth_token".to_owned(),
+            serde_json_lenient::Value::String("hunter2-in-event-data".to_owned()),
+        );
+        event.data.insert(
+            "new_name".to_owned(),
+            serde_json_lenient::Value::from("kept-name"),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap();
+        file.write_all(&event.to_line().unwrap()).unwrap();
+        file.write_all(b"not json hunter2-in-a-bad-line\n").unwrap();
+        drop(file);
+
+        let files = fetch_bundle(&server).await;
+        let bundled = files
+            .iter()
+            .find(|(path, _)| path.ends_with(boxes::events::EVENTS_FILE))
+            .map(|(_, contents)| String::from_utf8(contents.clone()).unwrap())
+            .expect("the box's events file should be bundled");
+        assert!(
+            !bundled.contains("hunter2"),
+            "a redacted value travels: {bundled}"
+        );
+        let lines: Vec<&str> = bundled.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "one bundled line per events line: {bundled}"
+        );
+        let renamed: serde_json_lenient::Value = serde_json_lenient::from_str(lines[1]).unwrap();
+        assert_eq!(renamed["type"], "renamed");
+        assert_eq!(renamed["data"]["new_name"], "kept-name");
+        assert_eq!(lines[2], WITHHELD_EVENT_LINE);
     }
 
     /// An unreadable `sessions/` is a fact about the bundle, not an empty
