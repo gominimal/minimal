@@ -47,8 +47,8 @@ use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use bep::store::NATIVE_STORE;
-use boxes::core::bep::{StoreAction, StoreDenySet, StoreRuleConfig};
 use clap::{Parser, Subcommand};
+use client_config::store_rules::{StoreAction, StoreDenySet, StoreRuleConfig};
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// Runs the box egress proxy on this host.
@@ -430,7 +430,7 @@ fn client_store_rules() -> ClientRules {
     let paths = client_config_path().map(|user| {
         (
             user,
-            PathBuf::from(boxes::client::config::ORGANIZATION_CONFIG_PATH),
+            PathBuf::from(client_config::config::ORGANIZATION_CONFIG_PATH),
         )
     });
     if paths.is_none() {
@@ -617,7 +617,7 @@ fn store_rules_in(user: &Path, organization: &Path) -> Vec<StoreRule> {
         infrastructure: bep::ca::DENY_SET,
         sign_in_items: &[signin::SERVICE, signin::META_SERVICE],
     };
-    let read = match boxes::client::config::read_client_store_rules(user, organization, deny) {
+    let read = match client_config::config::read_client_store_rules(user, organization, deny) {
         Ok(read) => read,
         Err(err) => {
             tracing::error!(

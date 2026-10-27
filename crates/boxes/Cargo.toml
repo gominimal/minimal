@@ -8,6 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+client-config.workspace = true
 common.workspace = true
 globset.workspace = true
 hex.workspace = true

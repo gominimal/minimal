@@ -10,10 +10,11 @@ license.workspace = true
 [dependencies]
 aes-gcm.workspace = true
 base64.workspace = true
-# `bep serve` reads the client's `[secret-store-rules]` and checks them
-# with the same reader and deny set as `min` (BEP-032, BEP-034).
-boxes.workspace = true
 clap.workspace = true
+# `bep serve` reads the client's `[secret-store-rules]` and checks them
+# with the same reader and deny set as `min` (BEP-032, BEP-034). The reader
+# lives in `client-config`, not `boxes`, so this crate does not link `common`.
+client-config.workspace = true
 getrandom.workspace = true
 p256.workspace = true
 paths.workspace = true
