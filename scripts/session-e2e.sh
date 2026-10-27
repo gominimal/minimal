@@ -13663,12 +13663,22 @@ rt_leg_cohort() {
   # A drop in the OUTPUT hook also fails sendmsg with EPERM. So when the
   # output $1 carries only 'Operation not permitted', the table must hold
   # the active reject for the blocked leaves, never a silent drop.
+  # port-unreachable is the default reject of an inet table, so 'nft list'
+  # prints it as a bare 'reject'. A 'with' clause must name port-unreachable.
   co_eperm_is_reject() {
-    local cr_table
+    local cr_table cr_line cr_rest cr_ok=""
     [[ "$1" == *"Connection refused"* ]] && return 0
     [[ "$1" == *"Operation not permitted"* ]] || return 0
     cr_table="$(sudo -n nft list table inet minimal_class 2>&1 </dev/null || true)"
-    if [[ "$cr_table" != *"@quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable"* ]]; then
+    while IFS= read -r cr_line; do
+      [[ "$cr_line" == *drop* ]] && continue
+      cr_rest="${cr_line#*@quic443_blocked_leaves udp dport 443 reject}"
+      if [[ "$cr_rest" == *with* ]] && [[ "$cr_rest" != *port-unreachable* ]]; then
+        continue
+      fi
+      cr_ok=1
+    done < <(printf '%s\n' "$cr_table" | grep -F '@quic443_blocked_leaves udp dport 443 reject' || true)
+    if [ -z "$cr_ok" ]; then
       echo "::error::$2 got 'Operation not permitted', but the table inet minimal_class holds no reject for quic443_blocked_leaves, so the refusal can be a silent drop"
       printf '%s\n' "$cr_table"
       co_fail
