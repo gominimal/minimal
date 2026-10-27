@@ -2920,7 +2920,10 @@ mod read_events_tests {
                     box_id: id,
                     parent: Some(SessionId::mint()),
                     ts: 1_700_000_000_000,
-                    kind: BoxEventType::Created,
+                    kind: BoxEventType::Exited,
+                    data: [("reason".to_string(), "stopped".into())]
+                        .into_iter()
+                        .collect(),
                 },
             },
             ReadEventsUpdate::Done,

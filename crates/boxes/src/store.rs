@@ -308,24 +308,41 @@ impl DiskBox {
     /// never interleave, and the file order is the write order (BOX-162).
     /// The file is created owner-only.
     ///
+    /// A last line torn by a crash has no newline. The write then starts
+    /// with a newline, so the torn line stays one refused line and does not
+    /// join this event.
+    ///
+    /// The box's directory is never created here. An event for a box whose
+    /// directory is gone, because the box was reaped, fails with
+    /// `NotFound` and leaves nothing on disk.
+    ///
     /// # Errors
     ///
-    /// An I/O error if the box's directory or the file cannot be written.
+    /// `NotFound` if the box's directory does not exist, and an I/O error
+    /// if the file cannot be read or written.
     pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
-        use std::io::Write as _;
+        use std::io::{Read as _, Seek as _, Write as _};
 
-        let dir = self.root_path();
-        std::fs::create_dir_all(dir.as_utf8_path())?;
-        let line = event.to_line()?;
         let mut options = std::fs::OpenOptions::new();
-        options.append(true).create(true);
+        options.read(true).append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
         let mut file = options.open(self.events_path().as_utf8_path())?;
-        file.write_all(&line)?;
+        let mut out = Vec::new();
+        let len = file.metadata()?.len();
+        if len > 0 {
+            let mut last = [0u8; 1];
+            file.seek(std::io::SeekFrom::Start(len - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                out.push(b'\n');
+            }
+        }
+        out.extend_from_slice(&event.to_line()?);
+        file.write_all(&out)?;
         file.sync_data()
     }
 
@@ -1629,6 +1646,55 @@ mod tests {
             object.read_events_from(0).unwrap().events,
             [] as [crate::events::BoxEvent; 0]
         );
+    }
+
+    /// BOX-162: an append after a torn last line, one a crash left without
+    /// its newline, starts on a new line. Both events written around the
+    /// torn line read back, and the torn line is one refused line.
+    #[test]
+    fn append_after_a_torn_line_keeps_both_events() {
+        use crate::events::{BoxEvent, BoxEventType};
+        use std::io::Write as _;
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let before = BoxEvent::for_record(object.record(), BoxEventType::Created);
+        object.append_event(&before).unwrap();
+        let torn_at = std::fs::metadata(object.events_path().as_utf8_path())
+            .unwrap()
+            .len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(object.events_path().as_utf8_path())
+            .unwrap()
+            .write_all(b"{\"box\":\"torn")
+            .unwrap();
+        let after = BoxEvent::for_record(object.record(), BoxEventType::Started);
+        object.append_event(&after).unwrap();
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [before, after]);
+        assert_eq!(all.refused.len(), 1);
+        assert_eq!(all.refused[0].0, torn_at);
+    }
+
+    /// An event for a box whose directory is gone fails with `NotFound`
+    /// and does not create the directory again.
+    #[test]
+    fn append_after_delete_leaves_no_directory() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        loader.delete(&key).unwrap();
+        let event = BoxEvent::for_record(object.record(), BoxEventType::Exited);
+        let err = object.append_event(&event).unwrap_err();
+        assert_eq!(err.kind(), NotFound);
+        assert!(!object.root_path().as_utf8_path().exists());
     }
 
     #[test]

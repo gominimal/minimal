@@ -72,10 +72,20 @@ pub struct BoxEvent {
     /// What happened.
     #[serde(rename = "type")]
     pub kind: BoxEventType,
+    /// What the event type records beyond the box, its parent and the
+    /// time: for example, the reason and the exit code or signal of an
+    /// `exited` event, or the old and new names of a `renamed` event.
+    /// Empty for `created`. A line written without it reads as empty.
+    #[serde(default)]
+    pub data: EventData,
 }
 
+/// The `data` object of a [`BoxEvent`].
+pub type EventData = serde_json_lenient::Map<String, serde_json_lenient::Value>;
+
 impl BoxEvent {
-    /// An event of `kind` about the box `record` describes, stamped now.
+    /// An event of `kind` about the box `record` describes, stamped now,
+    /// with an empty `data` object.
     #[must_use]
     pub fn for_record(record: &Record, kind: BoxEventType) -> Self {
         Self {
@@ -83,6 +93,7 @@ impl BoxEvent {
             parent: record.parent,
             ts: now_ms(),
             kind,
+            data: EventData::new(),
         }
     }
 
@@ -148,6 +159,7 @@ mod tests {
             parent: None,
             ts: 1,
             kind: BoxEventType::ExecStarted,
+            data: EventData::new(),
         };
         let value: serde_json_lenient::Value =
             serde_json_lenient::from_slice(&event.to_line().unwrap()).unwrap();
@@ -155,6 +167,7 @@ mod tests {
         assert_eq!(value["parent"], serde_json_lenient::Value::Null);
         assert_eq!(value["ts"], 1);
         assert_eq!(value["box"], event.box_id.to_string());
+        assert!(value["data"].is_object());
     }
 
     #[test]
@@ -164,6 +177,7 @@ mod tests {
             parent: None,
             ts: 2,
             kind: BoxEventType::Created,
+            data: EventData::new(),
         };
         let mut buf = event.to_line().unwrap();
         let bad_at = buf.len() as u64;
@@ -173,5 +187,17 @@ mod tests {
         assert_eq!(decoded.refused.len(), 1);
         assert_eq!(decoded.refused[0].0, 10 + bad_at);
         assert_eq!(decoded.consumed, bad_at + 9);
+    }
+
+    /// A line written before events carried `data` reads with an empty
+    /// `data` object.
+    #[test]
+    fn a_line_without_data_reads_as_empty_data() {
+        let id = BoxId::mint();
+        let line = format!("{{\"box\":\"{id}\",\"parent\":null,\"ts\":3,\"type\":\"created\"}}\n");
+        let decoded = decode_lines(line.as_bytes(), 0);
+        assert_eq!(decoded.refused, [] as [(u64, String); 0]);
+        assert_eq!(decoded.events.len(), 1);
+        assert!(decoded.events[0].data.is_empty());
     }
 }
