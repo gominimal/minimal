@@ -215,9 +215,17 @@ impl Plan {
             labels.join(", ")
         );
         let mut script = crate::resolver::script_header(&what, crate::resolver::FINALIZE_SHOWN_BY);
+        // Two items can share one step (the classifier step installs the
+        // QUIC block helper too), and the script runs that step once.
+        let mut blocks: Vec<&str> = Vec::new();
         for item in missing {
+            let block = item.script.as_deref().unwrap_or_default();
+            if blocks.contains(&block) {
+                continue;
+            }
+            blocks.push(block);
             script.push('\n');
-            script.push_str(item.script.as_deref().unwrap_or_default());
+            script.push_str(block);
         }
         Some(script)
     }
@@ -495,12 +503,14 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
 
 /// Every item this host has, probed in the order the summary lists them.
 async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
-    // The names item sits before the last of the other items (the `kvm`
-    // group or the classifier tree), after the user-namespace profile.
+    // The names item sits after the user-namespace profile, ahead of the
+    // `kvm` group or the classifier tree and its QUIC block helper.
     let mut items = other_items_for_this_host(global);
-    let last = items.pop();
-    items.push(names_item_on_this_host(global).await);
-    items.extend(last);
+    let at = items
+        .iter()
+        .take_while(|item| item.id == "userns-profile")
+        .count();
+    items.insert(at, names_item_on_this_host(global).await);
     Plan { items }
 }
 
@@ -525,7 +535,7 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
             // names subcommands minvmd does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
-            items.push(linux::classifier_item_on_this_host(global));
+            items.extend(linux::classifier_items_on_this_host(global));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -718,6 +728,16 @@ pub(crate) mod linux {
     const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
      machine's address (--network host_ip with --deny-all-egress)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
+    pub(crate) const QUIC443_HELPER_ID: &str = "quic443-helper";
+    const QUIC443_HELPER_LABEL: &str = "QUIC block helper";
+    /// The root-owned helper minimald runs through `sudo -n` to block UDP
+    /// 443 for a box (BEP-018). Spelled as `QUIC443_HELPER` in
+    /// `scripts/install-host-classifier.sh` and `QUIC443_LEAF_HELPER` in
+    /// minimald.
+    pub(crate) const QUIC443_HELPER_PATH: &str = "/usr/local/lib/minimal/quic443-leaf";
+    /// The sudoers drop-in that lets the daemon's account run the helper,
+    /// spelled as `QUIC443_SUDOERS` in the classifier step.
+    pub(crate) const QUIC443_SUDOERS_PATH: &str = "/etc/sudoers.d/minimal-quic443-leaf";
 
     /// The profile the step installs, the very file the checkout ships.
     const APPARMOR_PROFILE: &str = include_str!("../../../../packaging/apparmor/minimald");
@@ -1199,12 +1219,140 @@ pub(crate) mod linux {
         mask.is_some()
     }
 
-    /// [`classifier_item_over`] this host's reads: the table's presence, the
-    /// root-owned copy's bytes against this binary's, the units and their
-    /// `multi-user.target` links where the host has systemctl, the tree's
-    /// owner, this process's uid and account, the cgroup2 mount, and the
-    /// native daemon's socket path for this `--minimal-dir`.
-    pub(crate) fn classifier_item_on_this_host(global: &GlobalArgs) -> Item {
+    /// The QUIC block helper's facts: whether the helper and its sudoers
+    /// drop-in are each a file owned by root.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Quic443HelperFacts {
+        /// [`QUIC443_HELPER_PATH`] is a root-owned file.
+        pub(crate) helper_root_owned: bool,
+        /// [`QUIC443_SUDOERS_PATH`] is a root-owned file. Where this account
+        /// cannot look inside its directory (some distributions make
+        /// `/etc/sudoers.d` root-only), `sudo -n -l` lists a NOPASSWD rule
+        /// that names the helper.
+        pub(crate) sudoers_root_owned: bool,
+    }
+
+    /// The QUIC block helper item (BEP-018): done when the helper and its
+    /// sudoers drop-in are installed root-owned. Otherwise it names the
+    /// helper's path and carries the classifier step, which installs both,
+    /// or it is blocked by what blocks that step.
+    pub(crate) fn quic443_helper_item_over(
+        helper: Quic443HelperFacts,
+        classifier: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+    ) -> Item {
+        if helper.helper_root_owned && helper.sudoers_root_owned {
+            return Item::done(QUIC443_HELPER_ID, QUIC443_HELPER_LABEL);
+        }
+        // The classifier item as if its table were absent: its step is the
+        // one that installs the helper, so its script or its cause is ours.
+        let step = classifier_item_over(
+            &ClassifierFacts {
+                table_present: false,
+                ..*classifier
+            },
+            operator,
+            socket,
+        );
+        match step.script {
+            // The wording is the task's diagnostics line (#2607).
+            Some(script) => Item::missing(
+                QUIC443_HELPER_ID,
+                QUIC443_HELPER_LABEL,
+                format!(
+                    "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to \
+                     install it."
+                ),
+                format!(
+                    "installs the helper at {QUIC443_HELPER_PATH} that blocks UDP port 443 \
+                     (QUIC) for boxes, and the sudoers rule at {QUIC443_SUDOERS_PATH} that \
+                     lets {operator}'s daemon run it"
+                ),
+                script,
+            ),
+            None => Item::cannot(
+                QUIC443_HELPER_ID,
+                QUIC443_HELPER_LABEL,
+                step.cause.unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The classifier item and the QUIC block helper item over this host's
+    /// reads, in that order.
+    pub(crate) fn classifier_items_on_this_host(global: &GlobalArgs) -> [Item; 2] {
+        use std::os::unix::fs::MetadataExt as _;
+        let (facts, operator, socket) = classifier_facts_on_this_host(global);
+        // Root-owned and writable by root alone: not a symlink, no group or
+        // other write bit, and the same of the directory that holds it.
+        let root_only = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+        let root_owned_file = |path: &str| -> std::io::Result<bool> {
+            let path = std::path::Path::new(path);
+            let meta = std::fs::symlink_metadata(path)?;
+            let parent_root_only = path
+                .parent()
+                .and_then(|dir| std::fs::symlink_metadata(dir).ok())
+                .is_some_and(|dir| dir.is_dir() && root_only(&dir));
+            Ok(meta.file_type().is_file() && root_only(&meta) && parent_root_only)
+        };
+        let helper_root_owned = root_owned_file(QUIC443_HELPER_PATH).unwrap_or(false);
+        let helper = Quic443HelperFacts {
+            helper_root_owned,
+            sudoers_root_owned: match root_owned_file(QUIC443_SUDOERS_PATH) {
+                Ok(owned) => owned,
+                // Some distributions make `/etc/sudoers.d` root-only, so this
+                // account cannot stat the drop-in. Ask sudo instead whether
+                // this account may run the helper with no password: the
+                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt,
+                // and only a rule that names the helper counts.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    helper_root_owned && sudo_lets_this_account_run(QUIC443_HELPER_PATH)
+                }
+                Err(_) => false,
+            },
+        };
+        [
+            classifier_item_over(&facts, &operator, &socket),
+            quic443_helper_item_over(helper, &facts, &operator, &socket),
+        ]
+    }
+
+    /// Whether this account's sudo rules, listed by `sudo -n -l`, let it run
+    /// `path` with no password. A broad rule such as `NOPASSWD: ALL` does
+    /// not count: it says nothing of the drop-in. False when sudo is absent
+    /// or asks.
+    fn sudo_lets_this_account_run(path: &str) -> bool {
+        std::process::Command::new("sudo")
+            .args(["-n", "-l"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && sudo_listing_names_nopasswd(&String::from_utf8_lossy(&out.stdout), path)
+            })
+    }
+
+    /// Whether a `sudo -l` listing has a NOPASSWD rule whose commands name
+    /// `path` itself, as the drop-in's rule does.
+    pub(crate) fn sudo_listing_names_nopasswd(listing: &str, path: &str) -> bool {
+        listing.lines().any(|line| {
+            line.split_once("NOPASSWD:").is_some_and(|(_, commands)| {
+                commands
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .any(|token| token == path)
+            })
+        })
+    }
+
+    /// [`classifier_item_over`]'s inputs from this host's reads: the table's
+    /// presence, the root-owned copy's bytes against this binary's, the
+    /// units and their `multi-user.target` links where the host has
+    /// systemctl, the tree's owner, this process's uid and account, the
+    /// cgroup2 mount, and the native daemon's socket path for this
+    /// `--minimal-dir`.
+    fn classifier_facts_on_this_host(global: &GlobalArgs) -> (ClassifierFacts, String, String) {
         use std::os::unix::fs::MetadataExt as _;
         let root = std::path::Path::new(CLASSIFIER_TREE_ROOT);
         let copy_current = std::fs::read(CLASSIFIER_PROGRAM_PATH)
@@ -1235,8 +1383,8 @@ pub(crate) mod linux {
         let socket = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        classifier_item_over(
-            &ClassifierFacts {
+        (
+            ClassifierFacts {
                 table_present: table_present(root),
                 copy_current,
                 units_enabled,
@@ -1244,8 +1392,8 @@ pub(crate) mod linux {
                 root: me == 0,
                 mount: cgroup2_mount_from(&mountinfo),
             },
-            &crate::resolver::operator_name(),
-            &socket,
+            crate::resolver::operator_name(),
+            socket,
         )
     }
     /// The KVM item over the result of opening `/dev/kvm` for reading:
@@ -2507,6 +2655,147 @@ mod tests {
         std::fs::remove_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
         std::fs::remove_dir(root.join("classifier-table")).unwrap();
         assert!(!table_present(root), "a record without the marker");
+    }
+
+    /// BEP-018 (#2607): the QUIC block helper item is done when the helper
+    /// and its sudoers drop-in are root-owned. Otherwise it names the
+    /// helper's path and the step that installs it, which is the classifier
+    /// step, and a run carries that step once.
+    #[test]
+    fn finalize_install_names_the_quic_block_helper() {
+        use linux::{
+            Cgroup2Mount, ClassifierFacts, QUIC443_HELPER_PATH, QUIC443_SUDOERS_PATH,
+            Quic443HelperFacts, classifier_item_over, quic443_helper_item_over,
+            sudo_listing_names_nopasswd,
+        };
+        // The paths are the ones the classifier step installs to.
+        let script = crate::resolver::CLASSIFIER_SCRIPT;
+        assert!(script.contains(&format!(
+            "QUIC443_HELPER=${{MINIMAL_OVERRIDE_QUIC443_HELPER:-{QUIC443_HELPER_PATH}}}"
+        )));
+        assert!(script.contains(&format!(
+            "QUIC443_SUDOERS=${{MINIMAL_OVERRIDE_QUIC443_SUDOERS:-{QUIC443_SUDOERS_PATH}}}"
+        )));
+
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let classifier = ClassifierFacts {
+            table_present: true,
+            copy_current: true,
+            units_enabled: Some(true),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+        };
+        let installed = Quic443HelperFacts {
+            helper_root_owned: true,
+            sudoers_root_owned: true,
+        };
+        let item = quic443_helper_item_over(installed, &classifier, "alice", sock);
+        assert_eq!(item.id, "quic443-helper");
+        assert_eq!(item.label, "QUIC block helper");
+        assert_eq!(item.state, ItemState::Done);
+
+        let wanted = format!(
+            "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to install it."
+        );
+        for helper in [
+            Quic443HelperFacts {
+                helper_root_owned: false,
+                ..installed
+            },
+            Quic443HelperFacts {
+                sudoers_root_owned: false,
+                ..installed
+            },
+        ] {
+            let item = quic443_helper_item_over(helper, &classifier, "alice", sock);
+            assert_eq!(item.state, ItemState::Missing, "{helper:?}");
+            assert_eq!(item.today.as_deref(), Some(wanted.as_str()));
+            let step = item.step.as_deref().unwrap_or_default();
+            assert!(step.contains(QUIC443_HELPER_PATH), "{step}");
+            assert!(step.contains(QUIC443_SUDOERS_PATH), "{step}");
+            assert!(
+                item.script
+                    .as_deref()
+                    .is_some_and(|block| block.contains(crate::resolver::CLASSIFIER_PROGRAM_PATH)),
+                "the step is the classifier step"
+            );
+            let summary = Plan {
+                items: vec![item.clone()],
+            }
+            .summary();
+            assert!(summary.contains("  ✗ QUIC block helper\n"), "{summary}");
+            assert!(
+                summary.contains(&format!("      today: {wanted}\n")),
+                "{summary}"
+            );
+        }
+
+        // Where `/etc/sudoers.d` is root-only, only a NOPASSWD rule that
+        // names the helper stands in for the drop-in, not a broad one.
+        let drop_in = format!(
+            "User alice may run the following commands on host:\n    (root) NOPASSWD: \
+             {QUIC443_HELPER_PATH}\n"
+        );
+        assert!(sudo_listing_names_nopasswd(&drop_in, QUIC443_HELPER_PATH));
+        let among = format!("    (root) NOPASSWD: SETENV: /usr/bin/true, {QUIC443_HELPER_PATH}\n");
+        assert!(sudo_listing_names_nopasswd(&among, QUIC443_HELPER_PATH));
+        for broad in [
+            "User alice may run the following commands on host:\n    (ALL) NOPASSWD: ALL\n",
+            "    (ALL : ALL) NOPASSWD: ALL\n",
+            &format!("    (root) {QUIC443_HELPER_PATH}\n"),
+            &format!("    (root) NOPASSWD: {QUIC443_HELPER_PATH}.bak\n"),
+        ] {
+            assert!(
+                !sudo_listing_names_nopasswd(broad, QUIC443_HELPER_PATH),
+                "{broad}"
+            );
+        }
+
+        // What blocks the classifier step blocks the helper too.
+        let unmounted = ClassifierFacts {
+            mount: Cgroup2Mount::Absent,
+            ..classifier
+        };
+        let missing_helper = Quic443HelperFacts {
+            helper_root_owned: false,
+            sudoers_root_owned: false,
+        };
+        let blocked = quic443_helper_item_over(missing_helper, &unmounted, "alice", sock);
+        assert_eq!(blocked.state, ItemState::Cannot);
+        assert!(
+            blocked
+                .cause
+                .as_deref()
+                .is_some_and(|c| c.contains("cgroup2")),
+            "{blocked:?}"
+        );
+
+        // With the classifier missing as well, a run carries its step once.
+        let bare = ClassifierFacts {
+            table_present: false,
+            ..classifier
+        };
+        let plan = Plan {
+            items: vec![
+                classifier_item_over(&bare, "alice", sock),
+                quic443_helper_item_over(missing_helper, &bare, "alice", sock),
+            ],
+        };
+        let run = plan.script().expect("a script while items are missing");
+        let program = format!(
+            "{} --user 'alice'\n",
+            crate::resolver::CLASSIFIER_PROGRAM_PATH
+        );
+        assert!(
+            run.contains("QUIC block helper"),
+            "the header names the item"
+        );
+        assert_eq!(
+            run.matches(&format!("\n{program}")).count(),
+            1,
+            "one classifier step: {run}"
+        );
     }
 
     /// The classifier item's table: done on the marker with a current copy

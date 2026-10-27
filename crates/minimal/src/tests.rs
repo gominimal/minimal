@@ -301,9 +301,12 @@ fn every_daemon_connection_is_classified() {
             // Test-only: the BEP-063 mint tests register keys with a proxy
             // control socket they serve themselves, so no daemon is involved.
             "mint.rs::a_refused_client_key_is_replaced_and_registered_before_the_mint = ungated",
-            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy = ungated",
             "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke = ungated",
             "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replacement_past_a_bound_of_keys_in_use_fails_the_creation = ungated",
             "mint.rs::a_replacement_the_store_does_not_keep_revokes_no_key = ungated",
             "mint.rs::create = ungated",
             // The proxy's control socket, not the daemon: a replaced client
@@ -349,8 +352,14 @@ fn every_create_session_asserts_the_daemon_build() {
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
             "cmd/boxes/create.rs::activate_box = asserts",
+            // A unit test's request, never sent: it checks the box spec.
+            "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
+            // A unit test's request, never sent: it checks the project root.
+            "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // A unit test's request, never sent: it checks the project root.
+            "dash/rpc.rs::dashboard_create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",

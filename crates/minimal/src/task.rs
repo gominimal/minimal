@@ -665,6 +665,15 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();
+    // The record's type is the task verb's (BOX-001).
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    // BOX-068: the declared task's spec, with this command's settings. An
+    // interactive task sends none: the task type denies a terminal.
+    if let Some(spec) =
+        mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
+    {
+        crate::put_spec(&mut request, &spec)?;
+    }
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
@@ -695,6 +704,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
+    crate::stamp_project_root(&mut request, &utf8_path)?;
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {

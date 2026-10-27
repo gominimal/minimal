@@ -526,6 +526,29 @@ pub struct BoxConfig {
     /// reads nothing from it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_certificate: Option<String>,
+    /// The client verb that asked for the box. The daemon stamps the
+    /// record's Box Type from it. A client that predates the field sends
+    /// none, and the box is a session.
+    #[serde(default)]
+    pub creating_verb: CreatingVerb,
+    /// The root of the project the box comes from: the directory that
+    /// holds the project's `minimal.toml`, which can be a parent of
+    /// [`Self::project_path`]. `None` from a client that predates the
+    /// field. The daemon then records `project_path` as the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
+/// A closed set: a value outside it does not deserialize.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreatingVerb {
+    /// `min session activate`, or the dashboard's create.
+    #[default]
+    Session,
+    /// `min task run`.
+    Task,
 }
 
 /// Serde default for [`BoxConfig::hooks_enabled`]. See
@@ -1719,6 +1742,15 @@ pub struct CreateSessionRequest {
     /// [`CreateSessionResponse::daemon_version`] it fails to echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_match_version: Option<String>,
+    /// The box's spec, as the client built it from the project's entry and
+    /// the command's flags (BOX-068): a JSON object whose `v` names the
+    /// spec's shape. The daemon stores it beside the box's record before the
+    /// box starts, and refuses a create whose spec is not such an object.
+    /// `None` comes from three senders: a client that predates the field,
+    /// the dashboard create (#2635), and `min task run` of an interactive
+    /// task (#2411). The daemon then files a record with no stored spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json_lenient::Value>,
 }
 
 impl CreateSessionRequest {
@@ -1726,7 +1758,8 @@ impl CreateSessionRequest {
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, no attrs, no sealed deliveries, no root
-    /// certificate, and no version assertion.
+    /// certificate, the session verb, no project root, no version
+    /// assertion, and no spec.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1746,8 +1779,11 @@ impl CreateSessionRequest {
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
+                creating_verb: CreatingVerb::default(),
+                project_root: None,
             },
             must_match_version: None,
+            spec: None,
         }
     }
 }

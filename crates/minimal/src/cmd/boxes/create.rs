@@ -949,6 +949,101 @@ impl ActivationStep {
     }
 }
 
+/// Puts the root of the project at `dir` on the create request: the
+/// directory that holds the project's `minimal.toml`, found the way the
+/// upload finds it. The daemon records it as the box's project root
+/// (BOX-001).
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
+pub(crate) fn stamp_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let root = resolve_upload_root(dir)?;
+    set_project_root(request, root)
+}
+
+/// Puts `root` on the create request as the box's project root (BOX-001).
+fn set_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    root: camino::Utf8PathBuf,
+) -> Result<(), anyhow::Error> {
+    request.config.project_root =
+        Some(paths::HostAbsPath::try_new(root).context("Invalid project root")?);
+    Ok(())
+}
+
+/// The spec flags of the create request: the network mode, the policy and
+/// the hooks choice that the command's flags and the project resolved.
+pub(crate) fn spec_flags(request: &minimald_rpc::CreateSessionRequest) -> mfile::spec::SpecFlags {
+    mfile::spec::SpecFlags {
+        network: request.config.network,
+        policy: request.config.policy.clone(),
+        hooks_enabled: request.config.hooks_enabled,
+    }
+}
+
+/// Puts `spec` on the create request, for the daemon to store with the
+/// box's record (BOX-068).
+///
+/// # Errors
+///
+/// Fails if the spec cannot be encoded as JSON.
+pub(crate) fn put_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+) -> Result<(), anyhow::Error> {
+    request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    Ok(())
+}
+
+/// Puts the spec of a session box from `dir` on the create request
+/// (BOX-068): the project's `[session]` table, with the request's network
+/// mode, policy and hooks choice as the flags. A project with no
+/// `minimal.toml` has no `[session]` table.
+///
+/// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
+/// builds its own `CreateSessionRequest` and does not call this yet, so a
+/// session box created from `min dash` has no stored spec. That file is
+/// outside this change. A follow-up must call this function there.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
+        Ok(file) => file.session,
+        Err(mfile::Error::NotFound) => None,
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    put_spec(request, &spec)
+}
+
+/// The project root to record for an activation from `dir`. Tarball sync
+/// already resolved it as `upload_root`, so it is reused. Otherwise the root
+/// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
+/// not load under every `--sync` mode, before `PlanUpload` runs, so an error
+/// here is not expected and propagates.
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
+fn activation_project_root(
+    upload_root: Option<&camino::Utf8Path>,
+    dir: &camino::Utf8Path,
+) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    match upload_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => resolve_upload_root(dir),
+    }
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1121,6 +1216,7 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
     request.config.hooks_enabled = !args.no_hooks;
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
     // outright, before it allocates anything to tear down. `None` under the
     // skew override, which is what lets an operator proceed.
@@ -1231,6 +1327,15 @@ pub(crate) async fn activate_box(
                 SyncMode::None => None,
                 SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
             };
+            // The record's project root (BOX-001) is set under every
+            // `--sync` mode, `none` included.
+            set_project_root(
+                &mut request,
+                activation_project_root(upload_root.as_deref(), &utf8_path)?,
+            )?;
+            // BOX-068: the box's spec, after every flag and the project's
+            // policy are on the request.
+            stamp_session_spec(&mut request, &utf8_path)?;
 
             // Skip the upload without prompting when the resolved root is an
             // empty directory or `$HOME` — unless the user asked for it with an
@@ -2322,6 +2427,135 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use boxes::DynamicIngress;
+
+    /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
+    /// that holds `minimal.toml`, as the project root.
+    #[test]
+    fn create_from_a_subdirectory_sends_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "rooted",
+            paths::HostAbsPath::try_new(sub.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+
+        stamp_project_root(&mut request, &sub).unwrap();
+
+        assert_eq!(
+            request.config.project_root,
+            Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
+        );
+        assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// BOX-068: the create request carries the box's spec: the project's
+    /// `[session]` table with the request's flags for an activation, and
+    /// the declared task for `min task run`.
+    #[test]
+    fn activation_puts_the_spec_on_the_create_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nexec = [\"true\"]\npackages = [\"rust\"]\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
+            ..Default::default()
+        };
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "specced",
+            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            policy.clone(),
+        );
+        request.config.hooks_enabled = false;
+        assert_eq!(request.spec, None);
+
+        stamp_session_spec(&mut request, root).unwrap();
+
+        let wire = request.spec.clone().expect("the spec is on the request");
+        // The request carries the `box.toml` tables and the mode's spec word.
+        assert_eq!(wire["v"], mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(wire["box"]["type"], boxes::SESSION_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], true);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["git"])
+        );
+        assert_eq!(wire["network"]["mode"], "own_ip");
+        assert_eq!(
+            wire["network"]["egress"]["allow_subnets"],
+            serde_json_lenient::json!([])
+        );
+        assert!(wire.get("type").is_none() && wire.get("packages").is_none());
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent.v, mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(sent.box_type, boxes::SESSION_BOX_TYPE);
+        assert_eq!(sent.packages, vec!["git".to_string()]);
+        assert!(!sent.hooks_enabled, "--no-hooks reaches the spec");
+        assert_eq!(sent.network.mode, boxes::NetworkMode::OwnIp);
+        assert_eq!(sent.network.policy, policy);
+
+        // The task path: the declared task's spec, through the same helper.
+        let file = mfile::File::from_dir_recursive(dir.path()).unwrap();
+        let task =
+            mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&request))
+                .expect("a task that is not interactive has a spec");
+        put_spec(&mut request, &task).unwrap();
+        let wire = request.spec.clone().unwrap();
+        assert_eq!(wire["box"]["type"], boxes::TASK_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], false);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["rust"])
+        );
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent, task);
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(stamp_session_spec(&mut request, root).is_err());
+    }
+
+    /// BOX-001: with no tarball upload root, a subdirectory resolves to the
+    /// directory that holds `minimal.toml`, and a `minimal.toml` that does
+    /// not load is an error. A resolved upload root is reused as it is.
+    #[test]
+    fn activation_project_root_resolves_the_root_and_refuses_a_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        assert_eq!(
+            activation_project_root(None, &sub).unwrap(),
+            root.to_path_buf()
+        );
+
+        let resolved = camino::Utf8Path::new("/resolved/root");
+        assert_eq!(
+            activation_project_root(Some(resolved), &sub).unwrap(),
+            resolved.to_path_buf()
+        );
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(activation_project_root(None, &sub).is_err());
+    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
