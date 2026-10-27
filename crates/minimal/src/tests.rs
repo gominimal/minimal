@@ -1962,6 +1962,7 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
             Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
             root,
             DroppedHooksPolicy::Refuse,
+            &mut Vec::new(),
         )
         .is_err(),
         "a skipped home that declares hooks is refused"
@@ -1972,7 +1973,8 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
         WorkspaceUpload::Declined,
     ] {
         assert!(
-            report_upload_outcome(Ok(kept), root, DroppedHooksPolicy::Refuse).is_ok(),
+            report_upload_outcome(Ok(kept), root, DroppedHooksPolicy::Refuse, &mut Vec::new())
+                .is_ok(),
             "{kept:?}"
         );
     }
@@ -1984,18 +1986,19 @@ fn report_upload_outcome_refuses_dropped_hooks_only() {
 #[test]
 fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
     let root = camino::Utf8Path::new("/srv/data/run42");
-    let (stderr, result) = capture_stderr(|| {
-        report_upload_outcome(
-            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
-            root,
-            DroppedHooksPolicy::Warn,
-        )
-    });
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Warn,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
     assert!(result.is_ok(), "{result:?}");
-    assert!(stderr.contains("Starting with an empty box"), "{stderr:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
     assert!(
-        stderr.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
-        "{stderr:?}"
+        err.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
+        "{err:?}"
     );
 }
 
@@ -2004,16 +2007,17 @@ fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
 #[test]
 fn report_upload_outcome_ignores_hooks_the_caller_disabled() {
     let root = camino::Utf8Path::new("/srv/data/run42");
-    let (stderr, result) = capture_stderr(|| {
-        report_upload_outcome(
-            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
-            root,
-            DroppedHooksPolicy::Ignore,
-        )
-    });
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Ignore,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
     assert!(result.is_ok(), "{result:?}");
-    assert!(stderr.contains("Starting with an empty box"), "{stderr:?}");
-    assert!(!stderr.contains("lifecycle hook"), "{stderr:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
+    assert!(!err.contains("lifecycle hook"), "{err:?}");
 }
 
 /// The rule `min dash` applies in place of the stderr wording refuses exactly

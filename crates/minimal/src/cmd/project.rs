@@ -378,16 +378,22 @@ pub(crate) enum DroppedHooksPolicy {
     Ignore,
 }
 
-/// Renders a [`WorkspaceUpload`] outcome on the CLI's stderr — the shared
-/// presentation for `min session activate` and `min task run`. `policy`
-/// selects the caller's treatment of the `$HOME` skip that would drop
-/// lifecycle hooks: activate refuses unless `--no-hooks` disabled them; task
-/// run, which has no upload flag to offer, warns with the count. `Ok(())`
-/// when the session may proceed.
+/// Renders a [`WorkspaceUpload`] outcome on `err`, the sink its caller owns:
+/// the CLI's stderr, or a buffer in a test. `policy` selects the caller's
+/// treatment of the `$HOME` skip that would drop lifecycle hooks: activate
+/// refuses unless `--no-hooks` disabled them; task run, which has no upload
+/// flag to offer, warns with the count. `Ok(())` when the session may
+/// proceed.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "a closed stderr has no reader left to tell; the outcome's own \
+              result is the command's answer either way"
+)]
 pub(crate) fn report_upload_outcome(
     outcome: Result<WorkspaceUpload, anyhow::Error>,
     root: &camino::Utf8Path,
     policy: DroppedHooksPolicy,
+    err: &mut impl std::io::Write,
 ) -> Result<(), anyhow::Error> {
     let outcome = outcome?;
     if policy == DroppedHooksPolicy::Refuse {
@@ -396,12 +402,13 @@ pub(crate) fn report_upload_outcome(
     match outcome {
         WorkspaceUpload::Uploaded => Ok(()),
         WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks } => {
-            eprintln!("Starting with an empty box (nothing here to sync)");
+            let _ = writeln!(err, "Starting with an empty box (nothing here to sync)");
             if dropped_hooks > 0 && policy == DroppedHooksPolicy::Warn {
                 // Name the hooks so the warning does not read as a healthy
                 // start. `Refuse` returned above, and `Ignore` belongs to a
                 // caller that already disabled them.
-                eprintln!(
+                let _ = writeln!(
+                    err,
                     "{dropped_hooks} lifecycle hook(s) declared in {} will not run: \
                      the file upload is skipped.",
                     root.join(mfile::MFILE_NAME)
@@ -410,14 +417,18 @@ pub(crate) fn report_upload_outcome(
             Ok(())
         }
         WorkspaceUpload::SkippedUndeclared => {
-            eprintln!(
+            let _ = writeln!(
+                err,
                 "{}",
                 file_upload::skipped_upload_warning(root.as_std_path())
             );
             Ok(())
         }
         WorkspaceUpload::Declined => {
-            eprintln!("Skipping file upload; the session will start with an empty workspace.");
+            let _ = writeln!(
+                err,
+                "Skipping file upload; the session will start with an empty workspace."
+            );
             Ok(())
         }
     }
@@ -460,7 +471,7 @@ pub(crate) async fn cli_workspace_upload(
         UploadProgress::Bar,
     )
     .await;
-    report_upload_outcome(outcome, root, policy)
+    report_upload_outcome(outcome, root, policy, &mut std::io::stderr())
 }
 
 /// Build an `mctx::Config` from the shared global args.
