@@ -667,6 +667,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     request.must_match_version = minimal_client::version_assertion();
     // The record's type is the task verb's (BOX-001).
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    // BOX-068: the declared task's spec, with this command's settings. An
+    // interactive task sends none: the task type denies a terminal.
+    if let Some(spec) =
+        mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
+    {
+        crate::put_spec(&mut request, &spec)?;
+    }
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
