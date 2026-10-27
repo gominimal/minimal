@@ -554,6 +554,19 @@ impl ActivationInputs {
     }
 }
 
+/// Whether [`prepare_activation_inputs`] validates the project's own hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectHookCheck {
+    /// Run the checks a staging pass would make: `min session activate` and
+    /// the dashboard create, which upload the project tree and so carry the
+    /// hooks to the daemon.
+    Enforce,
+    /// Skip them. `min task run` shares this prep for its loadout staging and
+    /// finalize budget, but it never checked the project's hooks before the
+    /// helper was shared, and it has no `--no-hooks` to get past a refusal.
+    Skip,
+}
+
 /// Read the client config and user policy, resolve `selection` into the
 /// active loadouts, and stage/validate/compose everything an activation
 /// needs — the one sequence `min session activate`, `min task run`, and the
@@ -571,19 +584,47 @@ impl ActivationInputs {
 /// failed.
 pub(crate) fn prepare_activation_inputs(
     global: &GlobalArgs,
-    project: &paths::HostAbsPath,
+    project: &camino::Utf8Path,
     selection: LoadoutSelection,
     hooks_enabled: bool,
+    project_hooks: ProjectHookCheck,
     user_policy_override: Option<boxes::core::policy::UserPolicy>,
 ) -> Result<ActivationInputs, anyhow::Error> {
     let cfg = read_client_config(global)?;
+    prepare_activation_inputs_with_config(
+        &cfg,
+        global,
+        project,
+        selection,
+        hooks_enabled,
+        project_hooks,
+        user_policy_override,
+    )
+}
+
+/// [`prepare_activation_inputs`] with the client config already read, for a
+/// caller that must read it before it takes over the screen (the `min dash`
+/// TUI): the read can print store-rule refusals and organization-file
+/// errors, and those belong on the terminal the user still owns.
+pub(crate) fn prepare_activation_inputs_with_config(
+    cfg: &boxes::client::config::Config,
+    global: &GlobalArgs,
+    project: &camino::Utf8Path,
+    selection: LoadoutSelection,
+    hooks_enabled: bool,
+    project_hooks: ProjectHookCheck,
+    user_policy_override: Option<boxes::core::policy::UserPolicy>,
+) -> Result<ActivationInputs, anyhow::Error> {
+    let project =
+        paths::HostAbsPath::try_new(project.to_path_buf()).context("Invalid project root")?;
+    let project = &project;
     let user_policy = match user_policy_override {
         Some(policy) => policy,
         None => read_user_policy(global)?,
     };
     let initial_policy = user_policy.clone();
-    let compose_options = compose_options_from_config(&cfg);
-    let active = resolve_active_loadouts(selection, &cfg, global)?;
+    let compose_options = compose_options_from_config(cfg);
+    let active = resolve_active_loadouts(selection, cfg, global)?;
     let loadout_names = active
         .loadouts
         .iter()
@@ -592,8 +633,9 @@ pub(crate) fn prepare_activation_inputs(
     let hook_scripts = stage_loadout_hook_scripts(&active, project, hooks_enabled)?;
     // The project's hooks reach the daemon inside the uploaded mfile, so they
     // never pass through the staging above; the checks a staging pass would
-    // have made are still worth making here.
-    if hooks_enabled {
+    // have made are still worth making here. Callers whose pre-shared path did
+    // not make them opt out through `project_hooks`.
+    if hooks_enabled && project_hooks == ProjectHookCheck::Enforce {
         check_project_hooks(project)?;
     }
     let hook_budget = activate_hook_budget(&active, project.as_utf8_path(), hooks_enabled);
@@ -802,6 +844,42 @@ impl LoadoutRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ProjectHookCheck::Skip` leaves alone a project whose hooks the
+    /// staging check would reject: `min task run` never refused one before the
+    /// prep was shared, and it has no `--no-hooks` to get past a refusal.
+    #[test]
+    fn project_hook_check_skip_keeps_task_runs_pre_shared_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[[session.lifecycle_hooks]]\n\
+             on_activate = { type = \"inline\", value = \"\" }\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let global = GlobalArgs::default();
+        let cfg = boxes::client::config::Config::default();
+        let prepare = |project_hooks| {
+            prepare_activation_inputs_with_config(
+                &cfg,
+                &global,
+                root,
+                LoadoutSelection::None,
+                true,
+                project_hooks,
+                Some(boxes::core::policy::UserPolicy::default()),
+            )
+        };
+        assert!(
+            prepare(ProjectHookCheck::Enforce).is_err(),
+            "an empty inline hook is refused where the check runs"
+        );
+        assert!(
+            prepare(ProjectHookCheck::Skip).is_ok(),
+            "task run keeps its pre-shared behaviour"
+        );
+    }
 
     /// The directory these tests pretend their hand-built loadouts were
     /// read from. Nothing here declares a `$LOADOUT_ROOT` patch source

@@ -679,17 +679,29 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         crate::put_spec(&mut request, &spec)?;
     }
 
+    // Upload per the normal activate rules: tarball sync (the default), the
+    // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
+    let upload_root = crate::resolve_upload_root(&utf8_path)?;
+    crate::stamp_project_root(&mut request, &upload_root)?;
+
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
     // the daemon connection so a broken loadout fails loudly client-side, and
     // through the same shared helper an activate uses so the staged hook
-    // scripts and the finalize budget match.
+    // scripts and the finalize budget match. The helper gets the resolved
+    // project root, not the directory `min task run` was invoked from, so a
+    // task started in a subdirectory still finds the project's config.
+    //
+    // `ProjectHookCheck::Skip` keeps this path's own behaviour: a task's hooks
+    // reach the daemon inside the uploaded mfile, and this command never
+    // refused a project whose hook script the staging check rejects.
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
     let inputs = crate::loadouts::prepare_activation_inputs(
         global,
-        &abs_path,
+        &upload_root,
         selection,
         true,
+        crate::loadouts::ProjectHookCheck::Skip,
         Some(amended_policy),
     )?;
     inputs.announce_loadouts();
@@ -700,11 +712,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let finalize_hook_budget = inputs.hook_budget;
     let contribution = inputs.contribution;
     let user_policy = inputs.user_policy;
-
-    // Upload per the normal activate rules: tarball sync (the default), the
-    // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
-    let upload_root = crate::resolve_upload_root(&utf8_path)?;
-    crate::stamp_project_root(&mut request, &utf8_path)?;
     // Sent only for a task that declares `inherit_cwd`; any other task
     // starts at the root of the uploaded tree.
     let task_cwd = if declared.inherit_cwd {
@@ -761,32 +768,18 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         headless,
         std::env::home_dir().as_deref(),
     );
-    if decision != crate::UploadDecision::SkipEmptyOrHome
-        && let Some(notice) = crate::resolved_upload_root_notice(&utf8_path, &upload_root)
-    {
-        eprintln!("{notice}");
-    }
-    let outcome = crate::run_workspace_upload(
-        &mut client,
-        id,
-        &upload_root,
-        decision,
-        || {
-            crate::confirm(
-                &format!(
-                    "{upload_root} is not a version control repository root. \
-                     Upload all files from this directory?"
-                ),
-                false,
-            )
-        },
-        crate::UploadProgress::Bar,
-    )
-    .await;
     // `min task run` has no `--sync` flags, so it warns rather than refuses:
     // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
     // hooks it drops. The box still starts, as it did before the shared gate.
-    crate::report_upload_outcome(outcome, &upload_root, crate::DroppedHooksPolicy::Warn)?;
+    crate::cli_workspace_upload(
+        &mut client,
+        id,
+        &utf8_path,
+        &upload_root,
+        decision,
+        crate::DroppedHooksPolicy::Warn,
+    )
+    .await?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches

@@ -767,6 +767,12 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.action = None;
                 vec![Effect::Destroy(target)]
             }
+            // The global quit keys are not swallowed by an open confirm.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
+            }
             (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                 model.action = None;
                 Vec::new()
@@ -796,6 +802,14 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     token,
                     answer: UploadAnswer::Cancel,
                 }]
+            }
+            // The global quit keys are not swallowed by an open confirm. The
+            // create task's reply drops with the loop, which it reads as a
+            // cancel.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
             }
             _ => Vec::new(),
         },
@@ -1055,6 +1069,15 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         config_dir: opts.config_dir.clone(),
         ..Default::default()
     };
+    // Read once here, before the TUI owns the screen: the read prints the
+    // organization-file errors and refused store rules on stderr, and a
+    // config or policy that does not parse must fail at startup rather than
+    // at each create. A default loadout that cannot be resolved fails here
+    // for the same reason; the create task resolves and stages them again
+    // against the create's own project root.
+    let client_config = crate::config::read_client_config(&global)?;
+    let user_policy = crate::config::read_user_policy(&global)?;
+    crate::loadouts::resolve_active_loadouts(opts.loadouts.clone(), &client_config, &global)?;
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());
     let mut model = Model::new(Utc::now());
@@ -1112,6 +1135,17 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         let msg = match msg {
             Msg::CreateUploadConfirm { token, root, reply } => {
                 pending_confirms.push_back(PendingConfirm { token, root, reply });
+                // Keys already in flight were typed before this prompt
+                // appeared; answering with one would make a `n` meant for the
+                // list create the box on an empty workspace. Discard them so
+                // the prompt waits for a deliberate answer.
+                {
+                    use futures::StreamExt as _;
+                    while tokio::time::timeout(std::time::Duration::ZERO, events.next())
+                        .await
+                        .is_ok()
+                    {}
+                }
                 show_pending_confirm(&mut model, &mut pending_confirms);
                 continue;
             }
@@ -1204,6 +1238,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         let sock = p.sock.clone();
                         let tx = bg_tx.clone();
                         let global = global.clone();
+                        let client_config = client_config.clone();
+                        let user_policy = user_policy.clone();
                         let loadouts = opts.loadouts.clone();
                         model.status = Some(format!(
                             "creating {}…",
@@ -1235,17 +1271,19 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 let (upload_root, _) =
                                     rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
                                 let (inputs, decision) = {
-                                    let abs_blocking = abs.clone();
                                     let global_blocking = global.clone();
                                     let root = upload_root.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let inputs = crate::loadouts::prepare_activation_inputs(
-                                            &global_blocking,
-                                            &abs_blocking,
-                                            loadouts,
-                                            true,
-                                            None,
-                                        )?;
+                                        let inputs =
+                                            crate::loadouts::prepare_activation_inputs_with_config(
+                                                &client_config,
+                                                &global_blocking,
+                                                &root,
+                                                loadouts,
+                                                true,
+                                                crate::loadouts::ProjectHookCheck::Enforce,
+                                                Some(user_policy),
+                                            )?;
                                         let decision = crate::decide_workspace_upload(
                                             &root,
                                             false,
@@ -1289,6 +1327,15 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 } else {
                                     decision
                                 };
+                                // A `$HOME` skip that would drop the project's
+                                // lifecycle hooks refuses here, before the
+                                // create and its row registration, rather than
+                                // tearing a created box back down.
+                                crate::refuse_dropped_hooks_before_create(
+                                    decision,
+                                    &upload_root,
+                                    crate::DASH_DROPPED_HOOKS_REMEDY,
+                                )?;
                                 rpc::activate(
                                     &sock,
                                     name,
@@ -2015,6 +2062,28 @@ mod tests {
         assert_eq!(answer(KeyCode::Char('y')), UploadAnswer::Upload);
         assert_eq!(answer(KeyCode::Char('n')), UploadAnswer::Decline);
         assert_eq!(answer(KeyCode::Esc), UploadAnswer::Cancel);
+    }
+
+    /// The global quit keys are not swallowed by an open confirm: the modal
+    /// captures every other key, but `q` and Ctrl-C still end the dashboard.
+    #[test]
+    fn upload_confirm_does_not_swallow_quit() {
+        for keys in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut model = two_providers();
+            model.action = Some(Action::ConfirmCreateUpload {
+                token: 7,
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, Msg::Key(keys));
+            assert!(model.quit, "{keys:?} quits");
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::SaveState)),
+                "{keys:?} saves state"
+            );
+        }
     }
 
     /// Two creates can pause on the upload confirm at once: the second waits

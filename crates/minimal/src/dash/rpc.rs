@@ -297,21 +297,6 @@ async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
     crate::hold_box_name_with_vm_host(crate::control_sock_beside(sock), name, Some(id), hold).await;
 }
 
-/// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
-/// off the async workers: the control exchange is a blocking socket call.
-/// The pair comes off the session record, which carries no box id, so the
-/// pair is the withdrawal's proof.
-async fn withdraw_box_row(sock: &Path, name: &str, addresses: boxes::BoxAddresses) {
-    let (sock, name) = (sock.to_path_buf(), name.to_string());
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
-    })
-    .await
-    {
-        tracing::warn!(%error, "the box row withdrawal's thread failed");
-    }
-}
-
 /// The session's record, best-effort: `None` when it cannot be read.
 pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<boxes::Record> {
     timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
@@ -364,7 +349,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
         return;
     };
     if let Some(addresses) = record.box_addresses {
-        withdraw_box_row(sock, name, addresses).await;
+        crate::withdraw_box_row_with_vm_host(sock, name, addresses).await;
     } else if crate::holds_name(record) {
         hold_box_name(sock, name, id, false).await;
     }
@@ -531,12 +516,11 @@ pub async fn activate(
     let lease = row.take_lease();
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
         // The caller resolved the root and the decision (the Confirm answered
-        // through the TUI); the upload is the shared CLI path, quiet because
-        // the TUI owns the screen. The notices stay unrendered — an empty
-        // session is the caller's own answer — but the refusal is not
-        // optional: `min session activate` will not create a session missing
-        // the lifecycle hooks a skipped upload would have carried, and a box
-        // created here must not either.
+        // through the TUI, and a `$HOME` skip that would drop the project's
+        // lifecycle hooks refused there, before this create). The upload is
+        // the shared CLI path, quiet because the TUI owns the screen; the
+        // notices stay unrendered — an empty session is the caller's own
+        // answer.
         let outcome = crate::run_workspace_upload(
             &mut client,
             id,
@@ -546,7 +530,6 @@ pub async fn activate(
             crate::UploadProgress::Quiet,
         )
         .await?;
-        crate::refuse_dropped_hooks(&outcome, &upload_root, crate::DASH_DROPPED_HOOKS_REMEDY)?;
         // Upload the loadouts' external hook scripts before the configure:
         // the daemon gates `FinalizeSession` on the upload's ready-marker, and
         // a composition naming a script that never arrived cannot finalize.

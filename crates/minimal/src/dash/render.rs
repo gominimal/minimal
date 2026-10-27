@@ -749,12 +749,20 @@ fn wire_color(s: &str) -> Color {
     Color::Reset
 }
 
+/// The upload confirm's question, rendered between the root and the key
+/// hints. [`upload_confirm_path`] budgets the root against the same two
+/// spans, so rewording the prompt cannot clip the hints on a narrow terminal.
+const UPLOAD_CONFIRM_QUESTION: &str = " is not a repository root; upload it? ";
+/// The upload confirm's key hints, after [`UPLOAD_CONFIRM_QUESTION`].
+const UPLOAD_CONFIRM_HINTS: &str = " y / n / esc ";
+
 /// The upload root shown in the create confirm, shortened so the fixed
 /// question and key hints fit beside it. The leading space is part of the
 /// rendered line, so it counts against the path's budget too.
 fn upload_confirm_path(root: &str, width: u16) -> String {
-    const FIXED: &str = " is not a repository root; upload it?  y / n ";
-    let reserved = 1 + UnicodeWidthStr::width(FIXED);
+    let reserved = 1
+        + UnicodeWidthStr::width(UPLOAD_CONFIRM_QUESTION)
+        + UnicodeWidthStr::width(UPLOAD_CONFIRM_HINTS);
     truncate(root, (width as usize).saturating_sub(reserved))
 }
 
@@ -775,12 +783,12 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
             let root = upload_confirm_path(root, area.width);
             let line = Line::from(vec![
                 Span::styled(
-                    format!(" {root} is not a repository root; upload it? "),
+                    format!(" {root}{UPLOAD_CONFIRM_QUESTION}"),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" y / n ", Style::default().fg(Color::Gray)),
+                Span::styled(UPLOAD_CONFIRM_HINTS, Style::default().fg(Color::Gray)),
             ]);
             frame.render_widget(Paragraph::new(line), area);
         }
@@ -921,12 +929,12 @@ mod tests {
         let width = 60;
         let long = "/home/someone/Projects/a-very-long-project-name/with/more/depth";
         let shown = upload_confirm_path(long, width);
-        let line = format!(" {shown} is not a repository root; upload it?  y / n ");
+        let line = format!(" {shown}{UPLOAD_CONFIRM_QUESTION}{UPLOAD_CONFIRM_HINTS}");
         assert!(
             UnicodeWidthStr::width(line.as_str()) <= width as usize,
             "{line:?}"
         );
-        assert!(line.ends_with("upload it?  y / n "), "{line:?}");
+        assert!(line.ends_with(UPLOAD_CONFIRM_HINTS), "{line:?}");
         assert!(shown.ends_with('…'), "{shown:?}");
         assert_eq!(upload_confirm_path("/tmp/x", width), "/tmp/x");
     }

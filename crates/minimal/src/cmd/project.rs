@@ -293,12 +293,13 @@ pub(crate) fn resolved_upload_root_notice(
         .then(|| format!("Uploading from project root {root} (resolved from {invoked_from})"))
 }
 
-/// The rule of [`report_upload_outcome`]'s refusal, for a caller that owns
-/// its own screen and so cannot take that function's stderr lines: `min dash`
-/// applies it to the outcome it was handed before it creates the box. Every
-/// other outcome passes — a [`WorkspaceUpload::Declined`] is the user's own
-/// answer, never an accident to refuse. `remedy` is the one part of the
-/// refusal each caller words for itself; see [`CLI_DROPPED_HOOKS_REMEDY`].
+/// The rule of [`report_upload_outcome`]'s refusal, split out for a caller
+/// that words the refusal itself. Every other outcome passes — a
+/// [`WorkspaceUpload::Declined`] is the user's own answer, never an accident
+/// to refuse. `remedy` is the one part of the refusal each caller words for
+/// itself; see [`CLI_DROPPED_HOOKS_REMEDY`]. A caller that has resolved its
+/// decision but not yet created anything refuses through
+/// [`refuse_dropped_hooks_before_create`] instead.
 pub(crate) fn refuse_dropped_hooks(
     outcome: &WorkspaceUpload,
     root: &camino::Utf8Path,
@@ -315,6 +316,27 @@ pub(crate) fn refuse_dropped_hooks(
         | WorkspaceUpload::SkippedUndeclared
         | WorkspaceUpload::Declined => Ok(()),
     }
+}
+
+/// The refusal [`refuse_dropped_hooks`] applies, decided from the upload
+/// decision alone and so available before the daemon holds anything. A caller
+/// that resolves its decision in its plan step refuses the create there
+/// instead of creating a session and tearing it down.
+pub(crate) fn refuse_dropped_hooks_before_create(
+    decision: UploadDecision,
+    root: &camino::Utf8Path,
+    remedy: &str,
+) -> Result<(), anyhow::Error> {
+    if decision != UploadDecision::SkipEmptyOrHome {
+        return Ok(());
+    }
+    refuse_dropped_hooks(
+        &WorkspaceUpload::SkippedEmptyOrHome {
+            dropped_hooks: project_lifecycle_hook_count(root),
+        },
+        root,
+        remedy,
+    )
 }
 
 /// What a refusing CLI caller tells the user of a `$HOME` create: which of
@@ -401,6 +423,46 @@ pub(crate) fn report_upload_outcome(
             Ok(())
         }
     }
+}
+
+/// The confirm `min session activate` and `min task run` ask before uploading
+/// an undeclared non-VCS root, with the root named in it.
+pub(crate) fn upload_confirm_prompt(root: &camino::Utf8Path) -> String {
+    format!(
+        "{root} is not a version control repository root. Upload all files from this directory?"
+    )
+}
+
+/// The CLI's whole workspace-upload step: the resolved-root notice, the
+/// interactive confirm, the spinner-bar transport, and the outcome's stderr
+/// lines. `decision` comes from the caller's plan step and `policy` is its
+/// treatment of an empty-or-`$HOME` skip that would drop the project's
+/// hooks. The failure is returned for the caller to tear the session down.
+pub(crate) async fn cli_workspace_upload(
+    client: &mut client::Client,
+    id: boxes::SessionId,
+    invoked_from: &camino::Utf8Path,
+    root: &camino::Utf8Path,
+    decision: UploadDecision,
+    policy: DroppedHooksPolicy,
+) -> Result<(), anyhow::Error> {
+    // The resolved-root notice is CLI presentation, and precedes the upload
+    // bar it explains.
+    if decision != UploadDecision::SkipEmptyOrHome
+        && let Some(notice) = resolved_upload_root_notice(invoked_from, root)
+    {
+        eprintln!("{notice}");
+    }
+    let outcome = run_workspace_upload(
+        client,
+        id,
+        root,
+        decision,
+        || confirm(&upload_confirm_prompt(root), false),
+        UploadProgress::Bar,
+    )
+    .await;
+    report_upload_outcome(outcome, root, policy)
 }
 
 /// Build an `mctx::Config` from the shared global args.

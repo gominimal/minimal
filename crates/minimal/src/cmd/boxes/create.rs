@@ -1222,6 +1222,28 @@ pub(crate) async fn activate_box(
     // skew override, which is what lets an operator proceed.
     request.must_match_version = version_assertion();
 
+    // `--sync` defaults to tarball; `sync_explicit` records whether the
+    // user actually typed the flag, which distinguishes a deliberate
+    // `--sync tarball` (the escape hatch that force-uploads an empty dir
+    // or `$HOME`) from the implicit default.
+    let sync_explicit = args.sync.is_some();
+    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
+
+    // Resolve the upload root before opening the daemon connection: a
+    // malformed mfile in an ancestor should fail loudly before we create a
+    // session on the daemon, so we don't leak a draft session. Resolved
+    // before the loadout prep, which checks the project's own hooks and sizes
+    // the finalize budget against the project root — not the directory the
+    // command was invoked from. Only needed for tarball sync: `--sync none`
+    // skips the upload entirely (#770).
+    let upload_root = match sync_mode {
+        SyncMode::None => None,
+        SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
+    };
+    // The record's project root (BOX-001), set on the request below under
+    // every `--sync` mode, `none` included.
+    let project_root = activation_project_root(upload_root.as_deref(), &utf8_path)?;
+
     let (
         policy_path,
         initial_policy,
@@ -1240,11 +1262,15 @@ pub(crate) async fn activate_box(
             // `min task run`, and the dashboard share it.
             let policy_path = config::user_policy_path(global);
             let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
+            // The project root the upload will carry, so the project's own
+            // hooks are checked and its `[session]` timeouts size the finalize
+            // budget; a subdirectory invocation must not look empty.
             let inputs = loadouts::prepare_activation_inputs(
                 global,
-                &abs_path,
+                &project_root,
                 selection,
                 !args.no_hooks,
+                loadouts::ProjectHookCheck::Enforce,
                 None,
             )?;
 
@@ -1284,34 +1310,35 @@ pub(crate) async fn activate_box(
         })
         .await?;
 
-    // `--sync` defaults to tarball; `sync_explicit` records whether the
-    // user actually typed the flag, which distinguishes a deliberate
-    // `--sync tarball` (the escape hatch that force-uploads an empty dir
-    // or `$HOME`) from the implicit default.
-    let sync_explicit = args.sync.is_some();
-    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
-
-    // Resolve the upload root before opening the daemon connection:
-    // a malformed mfile in an ancestor should fail loudly before
-    // we create a session on the daemon, so we don't leak a draft
-    // session. Only needed for tarball sync — `--sync none` skips
-    // the upload entirely (#770).
-    let upload_root = ActivationStep::PlanUpload
+    // The upload decision needs no TTY — the interactive `Confirm` is answered
+    // at the upload step, once the session exists — so it is resolved here,
+    // still before the create. A `$HOME` whose lifecycle hooks a skip would
+    // drop refuses here rather than after a session and its row exist.
+    let upload_decision = ActivationStep::PlanUpload
         .run(async {
-            let upload_root = match sync_mode {
-                SyncMode::None => None,
-                SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
-            };
-            // The record's project root (BOX-001) is set under every
-            // `--sync` mode, `none` included.
-            set_project_root(
-                &mut request,
-                activation_project_root(upload_root.as_deref(), &utf8_path)?,
-            )?;
+            set_project_root(&mut request, project_root.clone())?;
             // BOX-068: the box's spec, after every flag and the project's
             // policy are on the request.
             stamp_session_spec(&mut request, &utf8_path)?;
-            Ok::<_, anyhow::Error>(upload_root)
+
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            let upload_decision = upload_root.as_deref().map(|root| {
+                decide_workspace_upload(
+                    root,
+                    sync_explicit,
+                    headless,
+                    std::env::home_dir().as_deref(),
+                )
+            });
+            // `--no-hooks` already disabled the project's hooks, so a skip
+            // cannot drop anything by surprise.
+            if let Some(decision) = upload_decision
+                && !args.no_hooks
+                && let Some(root) = upload_root.as_deref()
+            {
+                refuse_dropped_hooks_before_create(decision, root, CLI_DROPPED_HOOKS_REMEDY)?;
+            }
+            Ok::<_, anyhow::Error>(upload_decision)
         })
         .await?;
 
@@ -1927,49 +1954,28 @@ pub(crate) async fn activate_box(
                 SyncMode::Tarball => {
                     let upload_root =
                         upload_root.expect("upload_root is set for SyncMode::Tarball above");
-                    let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-                    let decision = decide_workspace_upload(
-                        &upload_root,
-                        sync_explicit,
-                        headless,
-                        std::env::home_dir().as_deref(),
-                    );
-                    // The resolved-root notice is CLI presentation, and precedes the
-                    // upload bar it explains.
-                    if decision != UploadDecision::SkipEmptyOrHome
-                        && let Some(notice) = resolved_upload_root_notice(&utf8_path, &upload_root)
-                    {
-                        eprintln!("{notice}");
-                    }
-                    let outcome = run_workspace_upload(
-                        &mut client,
-                        id,
-                        &upload_root,
-                        decision,
-                        || {
-                            confirm(
-                                &format!(
-                                    "{upload_root} is not a version control repository root. \
-                             Upload all files from this directory?"
-                                ),
-                                false,
-                            )
-                        },
-                        UploadProgress::Bar,
-                    )
-                    .await;
-                    // A skip that would silently drop the project's lifecycle hooks
-                    // refuses here (and any upload failure) — either abandons the
-                    // activation, and the row its registration bought goes with it
-                    // (T66). `--no-hooks` already disabled them, so that skip cannot
-                    // drop anything by surprise and says nothing about them.
+                    let decision =
+                        upload_decision.expect("decision is set for SyncMode::Tarball above");
+                    // `--no-hooks` already disabled the project's hooks, so a
+                    // skip cannot drop anything by surprise and says nothing
+                    // about them.
                     let dropped_hooks = if args.no_hooks {
                         DroppedHooksPolicy::Ignore
                     } else {
                         DroppedHooksPolicy::Refuse
                     };
-                    if let Err(error) = report_upload_outcome(outcome, &upload_root, dropped_hooks)
+                    if let Err(error) = cli_workspace_upload(
+                        &mut client,
+                        id,
+                        &utf8_path,
+                        &upload_root,
+                        decision,
+                        dropped_hooks,
+                    )
+                    .await
                     {
+                        // The upload failed: the activation is abandoned, and
+                        // the row its registration bought goes with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
                             request.config.name.as_deref(),

@@ -2042,6 +2042,40 @@ fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
     assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
 }
 
+/// A create that plans its upload refuses the hook-dropping `$HOME` skip
+/// from the decision alone, before the daemon holds a session or a row: only
+/// the empty/`$HOME` skip can cost hooks, and only when the root declares
+/// some.
+#[test]
+fn refuse_dropped_hooks_before_create_refuses_the_home_skip() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    for allowed in [
+        UploadDecision::Upload,
+        UploadDecision::SkipUndeclared,
+        UploadDecision::Confirm,
+        UploadDecision::Declined,
+    ] {
+        assert!(
+            refuse_dropped_hooks_before_create(allowed, home, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
+    }
+    let err = refuse_dropped_hooks_before_create(
+        UploadDecision::SkipEmptyOrHome,
+        home,
+        CLI_DROPPED_HOOKS_REMEDY,
+    )
+    .expect_err("the home skip that drops hooks is refused before the create");
+    assert!(err.to_string().contains("1 lifecycle hook(s)"), "{err}");
+}
+
 /// A refused composition is reported in the user's terms — the
 /// directory the activation ran from — with the daemon's own text kept
 /// as subordinate detail rather than as the headline (#581).
