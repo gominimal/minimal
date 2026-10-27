@@ -2932,7 +2932,10 @@ mod read_events_tests {
         for update in updates {
             let bytes = serde_json_lenient::to_vec(&update).unwrap();
             let back: ReadEventsUpdate = serde_json_lenient::from_slice(&bytes).unwrap();
-            assert_eq!(back.is_terminal(), !matches!(update, ReadEventsUpdate::Event { .. }));
+            assert_eq!(
+                back.is_terminal(),
+                !matches!(update, ReadEventsUpdate::Event { .. })
+            );
             assert_eq!(back, update);
         }
     }

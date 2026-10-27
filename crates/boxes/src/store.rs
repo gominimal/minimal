@@ -11,8 +11,8 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
-    events::{BoxEvent, DecodedEvents, decode_lines},
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+    events::{BoxEvent, DecodedEvents, decode_lines},
 };
 
 /// Describes the session object yielded by [`Loader`].
@@ -353,6 +353,7 @@ impl DiskBox {
     /// Whether the box's record is still retained: its `record.json` is on
     /// disk and no delete of its directory has begun. A follower of the
     /// box's events stops once this is false (BOX-162).
+    #[must_use]
     pub fn is_retained(&self) -> bool {
         let root = self.root_path();
         let root = root.as_utf8_path();

@@ -6,6 +6,7 @@ use crate::{
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
 use boxes::SessionId;
+use boxes::events::{BoxEvent, BoxEventType};
 use paths::DaemonAbsPath;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
@@ -266,6 +267,10 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
+    /// The retained box an events read follows (BOX-162): its on-disk
+    /// object, so the read runs off the mainloop. `None` for an id no
+    /// retained record names.
+    EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -320,6 +325,7 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::GetRecord(..) => "GetRecord",
+            Self::EventsSource(..) => "EventsSource",
             Self::GetSession(..) => "GetSession",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
@@ -1568,14 +1574,32 @@ impl BoxManager {
             "filed the box record"
         );
 
+        // BOX-040: the `created` event is the first line of the box's
+        // events, written as its record is filed. An event that cannot be
+        // written takes the record with it, as a spec that cannot be stored
+        // does below: the caller never received the id.
+        let object = match handle.object().await {
+            Ok(object) => object,
+            Err(e) => {
+                discard_new_record(handle, "the box record could not be read back").await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = write_box_event(&object, BoxEventType::Created) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "could not write the box's created event; deleting the record"
+            );
+            discard_new_record(handle, "the created event was not written").await;
+            return Err(e);
+        }
+
         // BOX-068: the spec is written beside the record before the actor
         // starts. A spec that cannot be written takes the record with it:
         // the caller never received the id, so nothing else could reach it.
         if let Some(bytes) = &spec {
-            let stored = match handle.object().await {
-                Ok(object) => object.store_spec(bytes).map(|()| object.spec_path()),
-                Err(e) => Err(e),
-            };
+            let stored = object.store_spec(bytes).map(|()| object.spec_path());
             match stored {
                 Ok(path) => tracing::info!(
                     session_id = %session_id,
@@ -1695,6 +1719,17 @@ impl BoxManager {
                         Some(handle) => Some(handle.record().await?),
                         None => None,
                     })
+                })
+                .await;
+            }
+            ManagerMessage::EventsSource(id, r) => {
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            Some(handle) => Some(handle.object().await?),
+                            None => None,
+                        },
+                    )
                 })
                 .await;
             }
@@ -2153,6 +2188,164 @@ impl BoxManager {
 /// A teardown task that ended by a panic or a cancel took its responder
 /// with it, so its caller saw a closed channel and nothing said why: the
 /// join error is the only record of it, so it goes to the log.
+/// Deletes a record whose create failed before its id reached the caller.
+/// Best-effort: the create's own error is what the caller sees.
+async fn discard_new_record(handle: crate::store::BoxRecordHandle, why: &str) {
+    let session_id = *handle.id();
+    if let Err(e) = handle.delete().await
+        && e.kind() != NotFound
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            why,
+            "failed to delete the session record after a create failure; \
+             it will linger until it is deleted explicitly",
+        );
+    }
+}
+
+/// Counts the box events this daemon wrote. A follower of a box's events
+/// (BOX-162) waits on it, so a new event wakes the follower at once.
+static EVENTS_WRITTEN: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::Sender::new(0));
+
+/// How often a follower that saw no new event checks whether its box was
+/// reaped. A reap deletes the box's directory on any of several paths, and
+/// none of them wakes the follower.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Writes one lifecycle event of the box `object` is (BOX-040), stamped
+/// now with the box's id and parent, and wakes every follower. Only the
+/// daemon calls this, and the file it appends to is outside every path
+/// mounted into the box (BOX-041). Logs one line per event written.
+///
+/// # Errors
+///
+/// An I/O error if the event cannot be appended.
+pub(crate) fn write_box_event(
+    object: &boxes::store::DiskBox,
+    kind: BoxEventType,
+) -> Result<BoxEvent, std::io::Error> {
+    use boxes::store::BoxObject as _;
+
+    let event = BoxEvent::for_record(object.record(), kind);
+    object.append_event(&event)?;
+    EVENTS_WRITTEN.send_modify(|n| *n = n.wrapping_add(1));
+    tracing::info!(
+        box_id = %event.box_id,
+        parent = %event.parent.map_or_else(|| "none".to_string(), |p| p.to_string()),
+        event_type = kind.name(),
+        ts = event.ts,
+        events_path = %object.events_path().as_str(),
+        "wrote a box event"
+    );
+    Ok(event)
+}
+
+/// A read of one box's events (BOX-162): every retained event in the order
+/// it was written, then, for a follower, each new one as it is written.
+#[derive(Debug)]
+pub struct BoxEventsReader {
+    object: boxes::store::DiskBox,
+    /// The byte offset after the last complete line read.
+    offset: u64,
+    /// Subscribed before the first read, so no write after it is missed.
+    written: tokio::sync::watch::Receiver<u64>,
+}
+
+impl BoxEventsReader {
+    /// The id of the box whose events this reads.
+    pub fn box_id(&self) -> SessionId {
+        use boxes::store::BoxObject as _;
+        self.object.record().id
+    }
+
+    /// Every event written since the last read, in the order it was
+    /// written. The first call returns every retained event.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the events file exists but cannot be read.
+    pub fn read_new(&mut self) -> Result<Vec<BoxEvent>, std::io::Error> {
+        self.written.borrow_and_update();
+        let decoded = self.object.read_events_from(self.offset)?;
+        for (offset, error) in &decoded.refused {
+            tracing::warn!(
+                box_id = %self.box_id(),
+                offset,
+                error = %error,
+                events_path = %self.object.events_path().as_str(),
+                "refused a line of a box's events file: it does not parse as an event"
+            );
+        }
+        self.offset += decoded.consumed;
+        Ok(decoded.events)
+    }
+
+    /// Waits for the next events written. `None` once the box is reaped,
+    /// with no event left to read.
+    ///
+    /// Cancel-safe: an event read is returned in the same poll, so a
+    /// dropped call loses none.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the events file exists but cannot be read.
+    pub async fn next_events(&mut self) -> Result<Option<Vec<BoxEvent>>, std::io::Error> {
+        loop {
+            let events = self.read_new()?;
+            if !events.is_empty() {
+                return Ok(Some(events));
+            }
+            if !self.object.is_retained() {
+                return Ok(None);
+            }
+            tokio::select! {
+                _ = self.written.changed() => {}
+                () = tokio::time::sleep(REAP_POLL) => {}
+            }
+        }
+    }
+}
+
+impl BoxManagerHandle {
+    /// Opens a read of the events of the box `id` (BOX-162).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if no retained record names `id`.
+    pub async fn box_events(&self, id: SessionId) -> Result<BoxEventsReader, BoxManagerError> {
+        // Subscribe first: an event written between the lookup and the
+        // first read then wakes the follower.
+        let written = EVENTS_WRITTEN.subscribe();
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EventsSource(id, send))
+            .await;
+        match recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        {
+            Some(object) => Ok(BoxEventsReader {
+                object,
+                offset: 0,
+                written,
+            }),
+            None => Err(std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            )),
+        }
+    }
+}
+
 fn log_teardown_join(joined: Result<(), tokio::task::JoinError>) {
     if let Err(e) = joined {
         tracing::error!(error = %e, "a session teardown task did not finish on its own");

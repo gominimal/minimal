@@ -696,6 +696,24 @@ async fn sessions<W: BundleSink>(
                 continue;
             }
         }
+        // The box's lifecycle events (BOX-040) travel beside its record:
+        // the record says where the box is, the events say how it got
+        // there. Each line is a box id, a parent, a timestamp and a type,
+        // with no user data, so it travels verbatim, tail-capped like a
+        // log. An absent file is a box created before events were written.
+        let events = format!("sessions/{short}/{}", boxes::events::EVENTS_FILE);
+        match w
+            .add_file_tail(
+                &events,
+                &entry.path().join(boxes::events::EVENTS_FILE),
+                MAX_SESSION_FILE_BYTES,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {}
+            Err(e) => w.skip(events, format!("unreadable: {e:#}")),
+        }
         // An absent file is always explainable (the manifest contract): a
         // genuinely-missing record is silent, but a read failure or an
         // unparseable-and-withheld record leaves a note in its place rather
@@ -1494,6 +1512,27 @@ mod tests {
             .expect("a redacted session record should be bundled");
         let value: serde_json_lenient::Value = serde_json_lenient::from_slice(record).unwrap();
         assert_eq!(value["name"], "diag-test", "non-secret fields survive");
+    }
+
+    /// BOX-040: a box's events travel beside its record, line for line.
+    #[tokio::test]
+    async fn diag_bundle_copies_box_events() {
+        let server = TestServer::new().await;
+        {
+            let mut client = server.connect().await;
+            crate::test_harness::create_configured_session(&mut client, "diag-events", "/tmp")
+                .await;
+        }
+        let files = fetch_bundle(&server).await;
+
+        let events = files
+            .iter()
+            .find(|(path, _)| path.ends_with(boxes::events::EVENTS_FILE))
+            .map(|(_, contents)| contents)
+            .expect("the box's events file should be bundled");
+        let first = events.split(|b| *b == b'\n').next().unwrap();
+        let event: boxes::events::BoxEvent = serde_json_lenient::from_slice(first).unwrap();
+        assert_eq!(event.kind, boxes::events::BoxEventType::Created);
     }
 
     /// An unreadable `sessions/` is a fact about the bundle, not an empty
