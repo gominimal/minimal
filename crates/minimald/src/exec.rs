@@ -1852,15 +1852,26 @@ async fn pump_channel_input<M>(
                         Ok(()) => {
                             // A chunk that fits ends the wait only once a
                             // quantum has drained since it began; a byte
-                            // read per chunk keeps the window where it is.
-                            if wait.as_ref().is_some_and(|w| w.window.drained(&held)) {
-                                wait = None;
+                            // read per chunk keeps the window where it is,
+                            // paused: the window counts time at the bound,
+                            // not the gap until the client's next chunk.
+                            match wait.as_mut() {
+                                Some(w) if w.window.drained(&held) => wait = None,
+                                Some(w) => w.paused = Some(tokio::time::Instant::now()),
+                                None => {}
                             }
                             break;
                         }
                         Err(bound) => bound,
                     };
                     let w = wait.get_or_insert_with(|| BoundWait::begin(&held));
+                    if let Some(paused) = w.paused.take() {
+                        // Back at the bound: the time away does not count
+                        // against the window, and a starved wait's holders
+                        // are looked at afresh.
+                        w.since += paused.elapsed();
+                        w.holders = None;
+                    }
                     let since = w.since;
                     let unstarted_from = w.since;
                     if !held.started() {
@@ -1996,6 +2007,9 @@ struct BoundWait {
     window: DrainWindow,
     holders: Option<Vec<HolderAtWindow>>,
     starved_warned: bool,
+    /// Set while the last chunk fit and no quantum has drained: the window
+    /// is paused, and the time until the next refusal is not counted.
+    paused: Option<tokio::time::Instant>,
 }
 
 impl BoundWait {
@@ -2005,6 +2019,7 @@ impl BoundWait {
             window: DrainWindow::begin(held),
             holders: None,
             starved_warned: false,
+            paused: None,
         }
     }
 }
