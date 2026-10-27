@@ -377,6 +377,16 @@ jobs:
       # registry at deploy time. Bump by moving `locked_commit` (`mip update`),
       # deliberately. run-task does its own plumbing (user namespaces, the mip
       # fetch); nothing here needs the caches a build job restores.
+      # The gate above proves ci.yml passed on this commit; the Worker's own
+      # tests run in a different workflow (ci-update-check.yml), which that
+      # gate does not see. Run them here, right before the upload, so a red
+      # test blocks the deploy whatever workflow it ran in. Seconds, no
+      # network: node from the catalog over src/logic.js.
+      - name: Test the Worker before uploading it
+        uses: gominimal/run-task@a5ed123f612b9774e3d6eaa7af45370e33aa1116 # v1, the pin ci.yml and ci-update-check.yml use
+        with:
+          task: test-update-check
+          channel: unstable
       - name: Deploy update-check Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKER_DEPLOY_TOKEN }}
