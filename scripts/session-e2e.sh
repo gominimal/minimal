@@ -1089,6 +1089,22 @@ teardown() {
     sleep 0.5 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
   fi
+  # The round-two walk's key leg: a failure between its write of a refused
+  # value and the creation that replaces it leaves that value in the login
+  # keychain. Delete the item, so the next creation writes a new key.
+  if [ -n "${RT_KEY_STUB:-}" ]; then
+    security delete-generic-password -s dev.minimal.client-key -a minimal >/dev/null 2>&1 || true
+  fi
+  # Its quarantine leg: stop the 'bep serve' it started, and take its
+  # unreadable line back out of the audit segment if it is still there.
+  if [ -n "${RT_QU_PID:-}" ]; then
+    pkill -P "$RT_QU_PID" 2>/dev/null || true
+    kill "$RT_QU_PID" 2>/dev/null || true
+  fi
+  if [ -n "${RT_QU_SEG:-}" ]; then
+    rt_quarantine_unwrite
+  fi
+  [ -n "${RT_QU_SOCKETS:-}" ] && rm -rf "$RT_QU_SOCKETS"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -13252,7 +13268,8 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             at its start. The injection of a store value into a box's
 #             request is NOT RUN until a box can carry a store handle
 #             (#2525): today no box creation mints one.
-#   key       (BEP-063, BEP-067, BEP-070) a grant box A answers 'gh api
+#   key       (BEP-063, BEP-067, BEP-070) under CI, or opt-in with
+#             E2E_BEP_KEY_REPLACE=1: a grant box A answers 'gh api
 #             user'. The case puts a value that is no key in the keychain
 #             item of the client's signing key, so the next creation (box
 #             B) replaces the key. The proxy keeps the replaced key, which
@@ -13275,6 +13292,29 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 # The values are never printed: the transcript names only their lengths.
 RT_CASE=bep_round_two_conditions_closed
 RT_RAN=""
+# Set while the key leg's refused value is in the keychain, and while the
+# quarantine leg's unreadable line, proxy and sockets exist: teardown reads
+# them, so every path out of a leg puts the machine back.
+RT_KEY_STUB="" RT_QU_PID="" RT_QU_SEG="" RT_QU_SIZE="" RT_QU_SOCKETS=""
+RT_QU_LINE='{"schema":"min/v1/audit","kind":"decis'
+
+# Takes the quarantine leg's unreadable line back out of RT_QU_SEG: the
+# segment is cut to its size before the write, only when it still ends in
+# that line, so no record the proxy wrote after it is lost.
+rt_quarantine_unwrite() {
+  python3 - "$RT_QU_SEG" "$RT_QU_SIZE" "$RT_QU_LINE" <<'PY' || true
+import os, sys
+path, size, line = sys.argv[1], int(sys.argv[2]), sys.argv[3] + "\n"
+try:
+    with open(path, "rb") as f:
+        data = f.read()
+except FileNotFoundError:
+    sys.exit(0)
+if len(data) == size + len(line) and data[size:] == line.encode():
+    os.truncate(path, size)
+PY
+  RT_QU_SEG="" RT_QU_SIZE=""
+}
 
 # Prints the bep binary that the VM host daemon starts: MINVMD_BEP_BIN,
 # else the bep beside minvmd, or fails the case.
@@ -13338,6 +13378,10 @@ rt_leg_key() {
   local ck_a=e2e-bep-round-two-a ck_b=e2e-bep-round-two-b
   local ck_id_a ck_id_b ck_id_a2 ck_jti_a ck_jti_b ck_n
   local ck_v7='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  if [ -z "${CI:-}" ] && [ "${E2E_BEP_KEY_REPLACE:-}" != 1 ]; then
+    not_run "$ck_leg" "the leg replaces the client signing key in this machine's login keychain: set E2E_BEP_KEY_REPLACE=1 to run it"
+    return 0
+  fi
   bep_live_gate "$ck_leg" || return 0
   ck_bep="$(rt_bep_bin)" || fail
 
@@ -13385,7 +13429,9 @@ rt_leg_key() {
   echo "box A: $ck_a, box id $ck_id_a, 'gh api user' answered"
 
   # The keychain item now holds no valid key, so the next creation reads a
-  # refused key and replaces it.
+  # refused key and replaces it. The original key is not restored: the
+  # proxy revokes it when box A ends, so a restored copy can not verify.
+  RT_KEY_STUB=1
   security delete-generic-password -s dev.minimal.client-key -a minimal >/dev/null 2>&1 || true
   if ! security add-generic-password -s dev.minimal.client-key -a minimal \
       -l "Minimal client signing key" -w not-a-key >/dev/null 2>"$WORK/$RT_CASE.security.err"; then
@@ -13395,6 +13441,7 @@ rt_leg_key() {
   fi
   ck_mark="$(rt_bep_log_lines)"
   CK_SID_B="$(bep_revoke_activate "$RT_CASE" "$ck_b")" || ck_fail
+  RT_KEY_STUB=""
   ck_gh "$CK_SID_B" "box B ($ck_b), created under the replacement key"
   ck_id_b="$(bep_recreate_audited_id "$RT_CASE" "$ck_b")" || ck_fail
   ck_kept="$(rt_bep_log_since "$ck_mark" 'kept a replaced client key until the running boxes that use it end')"
@@ -13605,6 +13652,7 @@ rt_leg_quarantine() {
   qu_bep="$(rt_bep_bin)" || fail
   # A short directory: a socket path has a length limit.
   qu_sockets="$(mktemp -d /tmp/mnlrtq.XXXXXX)"
+  RT_QU_SOCKETS="$qu_sockets"
   qu_listener="$qu_sockets/l.sock" qu_control="$qu_sockets/c.sock"
   # This reads the real home, as bep_live_gate does.
   # shellcheck disable=SC2031
@@ -13621,7 +13669,9 @@ rt_leg_quarantine() {
     fail
   fi
   qu_name="${qu_seg##*/}"
-  printf '%s\n' '{"schema":"min/v1/audit","kind":"decis' >>"$qu_seg"
+  RT_QU_SIZE="$(wc -c <"$qu_seg" | tr -d ' ')"
+  RT_QU_SEG="$qu_seg"
+  printf '%s\n' "$RT_QU_LINE" >>"$qu_seg"
   echo "wrote one unreadable line into $qu_seg"
 
   # A creation with no proxy that can read the log is refused.
@@ -13662,6 +13712,7 @@ rt_leg_quarantine() {
       --control "$qu_control" --quarantine-unreadable --exit-on-stdin-close \
       >"$WORK/$RT_CASE.serve.out" 2>&1 ) &
   QU_PID=$!
+  RT_QU_PID=$QU_PID
   for qu_try in $(seq 1 60); do
     [ "$qu_try" -gt 1 ] && sleep 1
     bep_control_live "$qu_control" && break
@@ -13680,11 +13731,15 @@ rt_leg_quarantine() {
   qu_out="$(grep -hF '"kind":"quarantine"' "$qu_dir"/audit-*.jsonl 2>/dev/null | grep -F "$qu_name" | tail -n1)"
   pkill -P "$QU_PID" 2>/dev/null || true
   wait "$QU_PID" 2>/dev/null || true
+  RT_QU_PID=""
+  # The segment moved into quarantine, so no line is left to take out.
+  RT_QU_SEG="" RT_QU_SIZE=""
   if [[ "$qu_out" != *'"previous_hash":"'* ]]; then
     echo "::error::the audit log has no chained quarantine record that names $qu_name"
     fail
   fi
   rm -rf "${qu_sockets:?}"
+  RT_QU_SOCKETS=""
   echo "quarantine: $qu_name moved into $qu_dir/quarantine, and a chained quarantine record names it"
   rm -f "${WORK:?}/${RT_CASE:?}".*
   RT_RAN="$RT_RAN quarantine"
