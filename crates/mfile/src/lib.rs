@@ -14,6 +14,7 @@ mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
 pub use project_composable::ProjectComposable;
+pub mod spec;
 mod tasks;
 use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};

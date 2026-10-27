@@ -2257,3 +2257,32 @@ async fn record_carries_the_root_certificate_to_the_launch() {
     let wire = serde_json_lenient::to_string(&record).unwrap();
     assert!(!wire.contains("root_certificate"), "{wire}");
 }
+
+/// BOX-012: a restart reaps the pending record and keeps the running one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_keeps_running_records_and_reaps_pending_ones() {
+    let (state, cache, mngr, pending, _response) = create_pending_session().await;
+    let mut config = sample_config();
+    config.name = Some("still-running".to_string());
+    let running = create_active_session_with(&mngr, config).await;
+    assert_eq!(status_of(&mngr, pending).await, boxes::BoxState::Pending);
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+
+    assert_eq!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap(),
+        None,
+        "the restart reaps a pending record"
+    );
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(running))
+            .await
+            .unwrap()
+            .is_some(),
+        "the restart keeps a running record"
+    );
+}

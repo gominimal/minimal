@@ -352,6 +352,8 @@ fn every_create_session_asserts_the_daemon_build() {
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
             "cmd/boxes/create.rs::activate_box = asserts",
+            // A unit test's request, never sent: it checks the box spec.
+            "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.

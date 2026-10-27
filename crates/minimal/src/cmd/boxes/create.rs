@@ -975,6 +975,56 @@ fn set_project_root(
     Ok(())
 }
 
+/// The spec flags of the create request: the network mode, the policy and
+/// the hooks choice that the command's flags and the project resolved.
+pub(crate) fn spec_flags(request: &minimald_rpc::CreateSessionRequest) -> mfile::spec::SpecFlags {
+    mfile::spec::SpecFlags {
+        network: request.config.network,
+        policy: request.config.policy.clone(),
+        hooks_enabled: request.config.hooks_enabled,
+    }
+}
+
+/// Puts `spec` on the create request, for the daemon to store with the
+/// box's record (BOX-068).
+///
+/// # Errors
+///
+/// Fails if the spec cannot be encoded as JSON.
+pub(crate) fn put_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+) -> Result<(), anyhow::Error> {
+    request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    Ok(())
+}
+
+/// Puts the spec of a session box from `dir` on the create request
+/// (BOX-068): the project's `[session]` table, with the request's network
+/// mode, policy and hooks choice as the flags. A project with no
+/// `minimal.toml` has no `[session]` table.
+///
+/// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
+/// builds its own `CreateSessionRequest` and does not call this yet, so a
+/// session box created from `min dash` has no stored spec. That file is
+/// outside this change. A follow-up must call this function there.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
+        Ok(file) => file.session,
+        Err(mfile::Error::NotFound) => None,
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    put_spec(request, &spec)
+}
+
 /// The project root to record for an activation from `dir`. Tarball sync
 /// already resolved it as `upload_root`, so it is reused. Otherwise the root
 /// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
@@ -1283,6 +1333,9 @@ pub(crate) async fn activate_box(
                 &mut request,
                 activation_project_root(upload_root.as_deref(), &utf8_path)?,
             )?;
+            // BOX-068: the box's spec, after every flag and the project's
+            // policy are on the request.
+            stamp_session_spec(&mut request, &utf8_path)?;
 
             // Skip the upload without prompting when the resolved root is an
             // empty directory or `$HOME` — unless the user asked for it with an
@@ -2402,6 +2455,76 @@ mod tests {
             Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
         );
         assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// BOX-068: the create request carries the box's spec: the project's
+    /// `[session]` table with the request's flags for an activation, and
+    /// the declared task for `min task run`.
+    #[test]
+    fn activation_puts_the_spec_on_the_create_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nexec = [\"true\"]\npackages = [\"rust\"]\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
+            ..Default::default()
+        };
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "specced",
+            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            policy.clone(),
+        );
+        request.config.hooks_enabled = false;
+        assert_eq!(request.spec, None);
+
+        stamp_session_spec(&mut request, root).unwrap();
+
+        let wire = request.spec.clone().expect("the spec is on the request");
+        // The request carries the `box.toml` tables and the mode's spec word.
+        assert_eq!(wire["v"], mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(wire["box"]["type"], boxes::SESSION_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], true);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["git"])
+        );
+        assert_eq!(wire["network"]["mode"], "own_ip");
+        assert_eq!(
+            wire["network"]["egress"]["allow_subnets"],
+            serde_json_lenient::json!([])
+        );
+        assert!(wire.get("type").is_none() && wire.get("packages").is_none());
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent.v, mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(sent.box_type, boxes::SESSION_BOX_TYPE);
+        assert_eq!(sent.packages, vec!["git".to_string()]);
+        assert!(!sent.hooks_enabled, "--no-hooks reaches the spec");
+        assert_eq!(sent.network.mode, boxes::NetworkMode::OwnIp);
+        assert_eq!(sent.network.policy, policy);
+
+        // The task path: the declared task's spec, through the same helper.
+        let file = mfile::File::from_dir_recursive(dir.path()).unwrap();
+        let task =
+            mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&request))
+                .expect("a task that is not interactive has a spec");
+        put_spec(&mut request, &task).unwrap();
+        let wire = request.spec.clone().unwrap();
+        assert_eq!(wire["box"]["type"], boxes::TASK_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], false);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["rust"])
+        );
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent, task);
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(stamp_session_spec(&mut request, root).is_err());
     }
 
     /// BOX-001: with no tarball upload root, a subdirectory resolves to the
