@@ -41,7 +41,7 @@ use bep::handle::{self as store_handle, Inject, Rules, StoreRule};
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, StoreAuthorities, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
@@ -227,7 +227,7 @@ where
     // never admits an authority that the published root does not permit.
     let held = rules.current();
     let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
-        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held),
+        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held, &path),
         None => Ok(()),
     });
     match started {
@@ -398,16 +398,181 @@ fn registered_union(rules: &[StoreRule]) -> Union {
 /// host sets and the `host:port` authorities the client's store `rules`
 /// register (BEP-032). A store authority whose host the root does not
 /// permit is left out, so the deny set is never admitted.
+#[cfg(test)]
 fn admission(rules: &[StoreRule]) -> Admission {
-    let union = registered_union(rules);
-    let store: Vec<(String, u16)> = rules
+    Admission::new(
+        &[GITHUB],
+        store_authorities(rules, &registered_union(rules)),
+    )
+}
+
+/// The `host:port` authorities that the store `rules` register, less each
+/// one whose host `union` does not permit.
+fn store_authorities(rules: &[StoreRule], union: &Union) -> Vec<(String, u16)> {
+    rules
         .iter()
         .flat_map(|rule| rule.upstream.iter())
         .filter_map(|written| store_handle::parse_authority(written))
         .filter(|authority| union.contains(&authority.host))
         .map(|authority| (authority.host, authority.port))
-        .collect();
-    Admission::new(&[GITHUB], store)
+        .collect()
+}
+
+/// The rules that the published root was issued under, and the admitted
+/// store authorities.
+struct Admitted {
+    /// The rules of the last re-issue and publish that succeeded. A failed
+    /// one leaves them, so the next CONNECT tries again.
+    rules: Vec<StoreRule>,
+    authorities: Vec<(String, u16)>,
+    /// The CA holds a root that the identity file does not have yet.
+    unpublished: bool,
+    /// The rules of the last re-issue or publish that failed, and when the
+    /// next try for those same rules is due. Until then a CONNECT gives
+    /// the admitted set and does not read the file or log again.
+    failed: Option<(Vec<StoreRule>, Instant)>,
+}
+
+/// How long `bep serve` waits to re-issue or publish the root again after
+/// a try failed, while the rules stay the same.
+const REISSUE_RETRY: Duration = Duration::from_secs(60);
+
+/// The store authorities that `bep serve` admits at each CONNECT. When the
+/// client's rules change, the root is issued again under the same key and
+/// subject with the new names, the published identity gets that root, and
+/// the admitted set follows. A rule that adds an upstream is admitted
+/// without a restart (#2618, BEP-032).
+struct StoreAdmission<K: 'static> {
+    rules: Arc<ClientRules>,
+    ca: Arc<Mutex<Ca<'static, K>>>,
+    /// The `kid` of the root key that the CA holds. A root is published
+    /// only to an identity file that names this key.
+    root_kid: String,
+    /// The published identity file, which gets each new root.
+    identity: PathBuf,
+    admitted: Mutex<Admitted>,
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
+    /// The source over `rules`, which starts with the `held` rules that the
+    /// root of `ca` was issued under. `root_kid` names the root key of `ca`.
+    fn new(
+        rules: Arc<ClientRules>,
+        ca: Arc<Mutex<Ca<'static, K>>>,
+        root_kid: String,
+        identity: PathBuf,
+        held: Vec<StoreRule>,
+    ) -> Self {
+        let union = ca
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .union()
+            .clone();
+        let authorities = store_authorities(&held, &union);
+        Self {
+            rules,
+            ca,
+            root_kid,
+            identity,
+            admitted: Mutex::new(Admitted {
+                rules: held,
+                authorities,
+                unpublished: false,
+                failed: None,
+            }),
+        }
+    }
+
+    /// Issues the root again for `rules` when their names changed, and
+    /// publishes it, or publishes a root that an earlier call did not.
+    /// Gives the names the root in use permits, and whether the re-issue
+    /// and the publish succeeded. On an error the root in use stays, and
+    /// the caller tries again at the next CONNECT.
+    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, bool) {
+        let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
+        let issued = match ca.reissue_root(registered_union(rules), SystemTime::now()) {
+            Ok(issued) => issued,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
+                );
+                return (ca.union().clone(), false);
+            }
+        };
+        if issued || *unpublished {
+            *unpublished = true;
+            if let Err(err) = self.publish(ca.root()) {
+                tracing::error!(
+                    path = %self.identity.display(),
+                    error = %err,
+                    "did not publish the re-issued root; boxes created now get the old root"
+                );
+                return (ca.union().clone(), false);
+            }
+            *unpublished = false;
+        }
+        (ca.union().clone(), true)
+    }
+
+    /// Writes `root` to the identity file when the file names the root key
+    /// that the CA holds. A file whose root key was replaced while
+    /// `bep serve` runs is left as it is.
+    fn publish(&self, root: &[u8]) -> Result<(), String> {
+        let identity = Identity::read(&self.identity).map_err(|err| err.to_string())?;
+        let kid = identity
+            .key(Role::Root)
+            .map_err(|err| err.to_string())?
+            .kid();
+        if kid != self.root_kid {
+            return Err(format!(
+                "the file names root key {kid}, and bep serve holds root key {}",
+                self.root_kid
+            ));
+        }
+        identity
+            .with_root_certificate(root)
+            .publish(&self.identity)
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
+    fn authorities(&self) -> Vec<(String, u16)> {
+        let rules = self.rules.current();
+        let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if admitted.rules == rules && !admitted.unpublished {
+            return admitted.authorities.clone();
+        }
+        if let Some((failed, due)) = &admitted.failed
+            && *failed == rules
+            && Instant::now() < *due
+        {
+            return admitted.authorities.clone();
+        }
+        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
+        let authorities = store_authorities(&rules, &union);
+        if authorities != admitted.authorities {
+            tracing::info!(
+                before = ?admitted.authorities,
+                after = ?authorities,
+                identity = %self.identity.display(),
+                "admits the changed secret-store upstreams with no restart"
+            );
+        }
+        admitted.authorities.clone_from(&authorities);
+        if done {
+            admitted.rules = rules;
+            admitted.failed = None;
+        } else {
+            tracing::info!(
+                retry_secs = REISSUE_RETRY.as_secs(),
+                "re-issues or publishes the root again after the retry delay, or when the rules change"
+            );
+            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
+        }
+        authorities
+    }
 }
 
 /// The client's `[secret-store-rules]` that `bep` holds: the rules of the
@@ -418,14 +583,12 @@ fn admission(rules: &[StoreRule]) -> Admission {
 ///
 /// The redeemer asks the source at each request, and the source re-reads
 /// the files when one changes, so an edited rule decides the next
-/// redemption (BEP-032). Two limits hold. `bep` reads the default config
+/// redemption (BEP-032). One limit holds. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
 /// read: <https://github.com/gominimal/minimal/issues/2620>. The root's
-/// names and the admitted CONNECT set take the rules at start only, so a
-/// rule that adds an upstream reaches them when the proxy restarts:
-/// <https://github.com/gominimal/minimal/issues/2618>. The start
-/// log line names the file, so both show there.
+/// names and the admitted CONNECT set follow the rules at each
+/// CONNECT ([`StoreAdmission`]). The start log line names the file.
 fn client_store_rules() -> ClientRules {
     let paths = client_config_path().map(|user| {
         (
@@ -1088,6 +1251,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     root: RootCertificate,
     rules: Arc<ClientRules>,
     held: Vec<StoreRule>,
+    identity: &Path,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
     // Watched from here, so a supervisor that dies while the proxy starts
@@ -1110,11 +1274,6 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
-    // The store rules' authorities join the admitted set, so a CONNECT to
-    // an authority that no module and no rule admits is refused and audited
-    // `off_module`. The set takes the rules that `start` issued the root
-    // under, at start only (#2618).
-    let admitted = admission(&held);
     // The file names where the rules came from: the default config dir
     // (see `client_store_rules`).
     let config = client_config_path().map(|path| path.display().to_string());
@@ -1136,6 +1295,21 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let endpoint = GitHubTokenEndpoint::new(roots.clone())?;
     let ca = Arc::new(Mutex::new(ca));
+    // The store rules' authorities join the admitted set, so a CONNECT to
+    // an authority that no module and no rule admits is refused and audited
+    // `off_module`. The set starts with the rules that `start` issued the
+    // root under, and each CONNECT asks for the current rules, so a widened
+    // rule re-issues the root and is admitted with no restart (#2618).
+    let admitted = Admission::with_source(
+        &[GITHUB],
+        Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            root_key.public().kid(),
+            identity.to_path_buf(),
+            held,
+        )),
+    );
     // One log, one writer: the proxy's decisions and the control socket's
     // mint and revocation records share the chain (BEP-067).
     let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
@@ -2383,6 +2557,119 @@ mod tests {
                 bep::forward::Redeemed::Verdict(Verdict::Refuse(_))
             ),
             "{redeemed:?}"
+        );
+    }
+
+    // BEP-032, #2618: a rule that adds an upstream while `bep serve` runs
+    // re-issues the root under the same key with the new name, publishes it,
+    // and the next CONNECT to the new upstream is admitted with no restart.
+    #[test]
+    fn a_widened_store_rule_is_admitted_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&config, "").unwrap();
+        let rules = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let keys: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let held = rules.current();
+        let at = SystemTime::now();
+        let (identity, root) = Identity::of(keys)
+            .issuing_root(&keys.root, registered_union(&held), at)
+            .unwrap();
+        identity.publish(&path).unwrap();
+        let before = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
+        ));
+        let source = Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            keys.root.public().kid(),
+            path.clone(),
+            held,
+        ));
+        let admitted = Admission::with_source(&[GITHUB], Arc::clone(&source) as _);
+        assert!(!admitted.admits("api.openai.com", 443), "off_module");
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_err());
+
+        // The rule widens the client's upstreams, with no restart.
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert!(!admitted.admits("api.openai.com", 8443));
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(ca.lock().unwrap().union().contains("api.openai.com"));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_ok());
+
+        // The published root is the re-issued one, under the same key.
+        let published = Identity::read(&path).unwrap();
+        let after = published.root_certificate_der().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after, ca.lock().unwrap().root().to_vec());
+        assert_eq!(
+            published.key(Role::Root).unwrap().kid(),
+            keys.root.public().kid()
+        );
+
+        // A narrowed rule takes the upstream out again.
+        std::fs::write(&config, "").unwrap();
+        assert!(!admitted.admits("api.openai.com", 443));
+        let narrowed = Identity::read(&path).unwrap();
+
+        // A root key replaced in the file while `bep serve` runs: the
+        // re-issued root is not published to the file.
+        let other: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let (replaced, _) = Identity::of(other)
+            .issuing_root(&other.root, registered_union(&[]), at)
+            .unwrap();
+        replaced.publish(&path).unwrap();
+        let foreign = Identity::read(&path).unwrap();
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            foreign.root_certificate_der().unwrap()
+        );
+
+        // With no change of the rules, a CONNECT before the retry delay
+        // ends does not try the failed publish again.
+        narrowed.publish(&path).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            narrowed.root_certificate_der().unwrap()
+        );
+
+        // The failed publish is tried again at the first CONNECT after the
+        // retry delay, once the file names the held root key.
+        source.admitted.lock().unwrap().failed.as_mut().unwrap().1 = Instant::now();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            ca.lock().unwrap().root().to_vec()
         );
     }
 
