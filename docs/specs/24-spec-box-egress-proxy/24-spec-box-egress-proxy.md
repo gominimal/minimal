@@ -650,7 +650,8 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
     verify: cargo nextest run -p minvmd colliding_box_id_refused
-    <!-- Limit: both tests prove a collision with a live row, a kept creation or an attachment. The host's collision check does not read the retained revocation records, so a collision with a revocation record alone is not yet refused. [#2585](https://github.com/gominimal/minimal/issues/2585) tracks this gap. -->
+    verify: cargo nextest run -p minvmd a_minted_id_a_revocation_holds_is_refused_with_no_proxy
+    <!-- The host's collision check reads live rows, kept creations and attachments, then the revocation records. When the proxy answers its control socket, the check reads the records the proxy holds in force. When no proxy answers, the check reads the revocation records in the audit log beside the socket, `~/.minimal/bep/audit`. These are the records that the next `bep serve` start restores. When that log is not read whole, the check refuses the creation, because a line that does not parse can be a revocation. The refusal names `bep serve --quarantine-unreadable`, which moves those segments aside and starts the proxy. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems
