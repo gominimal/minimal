@@ -427,7 +427,15 @@ struct Admitted {
     authorities: Vec<(String, u16)>,
     /// The CA holds a root that the identity file does not have yet.
     unpublished: bool,
+    /// The rules of the last re-issue or publish that failed, and when the
+    /// next try for those same rules is due. Until then a CONNECT gives
+    /// the admitted set and does not read the file or log again.
+    failed: Option<(Vec<StoreRule>, Instant)>,
 }
+
+/// How long `bep serve` waits to re-issue or publish the root again after
+/// a try failed, while the rules stay the same.
+const REISSUE_RETRY: Duration = Duration::from_secs(60);
 
 /// The store authorities that `bep serve` admits at each CONNECT. When the
 /// client's rules change, the root is issued again under the same key and
@@ -470,6 +478,7 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
                 rules: held,
                 authorities,
                 unpublished: false,
+                failed: None,
             }),
         }
     }
@@ -535,6 +544,12 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
         if admitted.rules == rules && !admitted.unpublished {
             return admitted.authorities.clone();
         }
+        if let Some((failed, due)) = &admitted.failed
+            && *failed == rules
+            && Instant::now() < *due
+        {
+            return admitted.authorities.clone();
+        }
         let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
         let authorities = store_authorities(&rules, &union);
         if authorities != admitted.authorities {
@@ -548,6 +563,13 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
         admitted.authorities.clone_from(&authorities);
         if done {
             admitted.rules = rules;
+            admitted.failed = None;
+        } else {
+            tracing::info!(
+                retry_secs = REISSUE_RETRY.as_secs(),
+                "re-issues or publishes the root again after the retry delay, or when the rules change"
+            );
+            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
         }
         authorities
     }
@@ -2569,16 +2591,14 @@ mod tests {
         let ca = Arc::new(Mutex::new(
             Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
         ));
-        let admitted = Admission::with_source(
-            &[GITHUB],
-            Arc::new(StoreAdmission::new(
-                Arc::clone(&rules),
-                Arc::clone(&ca),
-                keys.root.public().kid(),
-                path.clone(),
-                held,
-            )),
-        );
+        let source = Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            keys.root.public().kid(),
+            path.clone(),
+            held,
+        ));
+        let admitted = Admission::with_source(&[GITHUB], Arc::clone(&source) as _);
         assert!(!admitted.admits("api.openai.com", 443), "off_module");
         assert!(admitted.admits("api.github.com", 443));
         assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_err());
@@ -2628,9 +2648,21 @@ mod tests {
             foreign.root_certificate_der().unwrap()
         );
 
-        // The failed publish is tried again at the next CONNECT, with no
-        // change of the rules, once the file names the held root key.
+        // With no change of the rules, a CONNECT before the retry delay
+        // ends does not try the failed publish again.
         narrowed.publish(&path).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            narrowed.root_certificate_der().unwrap()
+        );
+
+        // The failed publish is tried again at the first CONNECT after the
+        // retry delay, once the file names the held root key.
+        source.admitted.lock().unwrap().failed.as_mut().unwrap().1 = Instant::now();
         assert!(admitted.admits("api.openai.com", 443));
         assert_eq!(
             Identity::read(&path)
