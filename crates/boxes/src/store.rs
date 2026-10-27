@@ -11,6 +11,7 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
+    events::{BoxEvent, DecodedEvents, decode_lines},
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
 };
 
@@ -291,6 +292,74 @@ impl DiskBox {
             Err(e) if e.kind() == NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// The path of the box's events file, [`EVENTS_FILE`](crate::events::EVENTS_FILE), beside its
+    /// record (BOX-040). No path mounted into the box reaches it: the box
+    /// sees only the `tree`, `home`, `cache`, `patches` and `hooks`
+    /// directories beside it (BOX-041). A test pins the literal to
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "events.jsonl")
+    }
+
+    /// Appends `event` to the box's events file as one line (BOX-040). The
+    /// line goes out in one `O_APPEND` write, so lines from two writers
+    /// never interleave, and the file order is the write order (BOX-162).
+    /// The file is created owner-only.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the box's directory or the file cannot be written.
+    pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        let dir = self.root_path();
+        std::fs::create_dir_all(dir.as_utf8_path())?;
+        let line = event.to_line()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(self.events_path().as_utf8_path())?;
+        file.write_all(&line)?;
+        file.sync_data()
+    }
+
+    /// Reads the box's events file from byte `offset` (BOX-162): every
+    /// complete line from there, in file order, and the offset after the
+    /// last of them. A box with no events file reads as no events.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file exists but cannot be read.
+    pub fn read_events_from(&self, offset: u64) -> Result<DecodedEvents, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match std::fs::File::open(self.events_path().as_utf8_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(DecodedEvents::default()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(decode_lines(&buf, offset))
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun. A follower of the
+    /// box's events stops once this is false (BOX-162).
+    pub fn is_retained(&self) -> bool {
+        let root = self.root_path();
+        let root = root.as_utf8_path();
+        let tombstone = root
+            .parent()
+            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
     }
 }
 
@@ -1473,6 +1542,86 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-040, BOX-162: events append beside the record, outside every
+    /// directory the box sees, and read back in the order they were
+    /// written, from the start or from an offset. Deleting the box removes
+    /// the file and ends its retention.
+    #[test]
+    fn events_file_appends_in_write_order() {
+        use crate::events::{BoxEvent, BoxEventType, EVENTS_FILE};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert!(object.read_events_from(0).unwrap().events.is_empty());
+        assert!(object.is_retained());
+
+        let kinds = [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Detached,
+            BoxEventType::Resumed,
+            BoxEventType::Exited,
+        ];
+        let written: Vec<BoxEvent> = kinds
+            .iter()
+            .map(|kind| BoxEvent::for_record(object.record(), *kind))
+            .collect();
+        object.append_event(&written[0]).unwrap();
+        let first = object.read_events_from(0).unwrap();
+        assert_eq!(first.events, written[..1]);
+        for event in &written[1..] {
+            object.append_event(event).unwrap();
+        }
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, written);
+        assert!(all.refused.is_empty());
+        let rest = object.read_events_from(first.consumed).unwrap();
+        assert_eq!(rest.events, written[1..]);
+        assert_eq!(rest.consumed + first.consumed, all.consumed);
+        assert!(written.iter().all(|e| e.box_id == key.session_id));
+        assert!(written.iter().all(|e| e.parent == object.record().parent));
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.events_path().as_utf8_path(),
+            record_dir.join(EVENTS_FILE)
+        );
+        for seen in [
+            object.workspace_path(),
+            object.home_path(),
+            object.cache_path(),
+            object.patches_path(),
+            object.hooks_path(),
+        ] {
+            assert!(
+                !object
+                    .events_path()
+                    .as_utf8_path()
+                    .starts_with(seen.as_utf8_path())
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(record_dir.join(EVENTS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(EVENTS_FILE).exists());
+        assert!(!object.is_retained());
+        assert!(object.read_events_from(0).unwrap().events.is_empty());
     }
 
     #[test]
