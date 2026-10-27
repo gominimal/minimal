@@ -34,7 +34,12 @@ pub enum Error<BE: std::fmt::Debug> {
     Cache(lcache::CacheErr),
     /// The remote cache has no artifact for `object`: a spec the index does
     /// not list, or an index hit whose artifact the store no longer has.
-    NotFound { object: String },
+    NotFound {
+        /// Which identifier `object` is: the spec hash an index was asked
+        /// for, or the artifact file a store was asked for.
+        what: &'static str,
+        object: String,
+    },
     /// An error occurred unpacking an archive.
     ArchiveError(archive::ArchiveError),
     /// The sha256 hash that was requested differed from what was written/downloaded.
@@ -57,8 +62,8 @@ pub enum Error<BE: std::fmt::Debug> {
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::NotFound { object } => {
-                write!(f, "the remote cache has no artifact for {object}")
+            Error::NotFound { what, object } => {
+                write!(f, "the remote cache has no artifact for {what} {object}")
             }
             Error::Unavailable { object, status } => match status {
                 Some(status) => write!(
@@ -795,7 +800,10 @@ impl<B: FetchBackend> RemoteCache<B> {
                 object = %object,
                 "the remote cache lists an artifact the store no longer has; it is a miss"
             );
-            return Err(Error::NotFound { object });
+            return Err(Error::NotFound {
+                what: "artifact file",
+                object,
+            });
         }
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
@@ -861,6 +869,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             .index
             .sha256(spec_hash)
             .ok_or_else(|| Error::NotFound {
+                what: "spec hash",
                 object: spec_hash.0.to_hex().to_string(),
             })?;
 
