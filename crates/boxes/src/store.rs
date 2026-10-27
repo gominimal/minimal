@@ -308,9 +308,11 @@ impl DiskBox {
     /// never interleave, and the file order is the write order (BOX-162).
     /// The file is created owner-only.
     ///
-    /// A last line torn by a crash has no newline. The write then starts
-    /// with a newline, so the torn line stays one refused line and does not
-    /// join this event.
+    /// A last line torn by a crash has no newline. Its write was never
+    /// acknowledged, so no event is lost when it goes: the file is cut back
+    /// to the end of its last complete line before this event is written.
+    /// The event then never joins the torn bytes, and no line that does not
+    /// parse stays in the file. A warning names the box and the bytes cut.
     ///
     /// The box's directory is never created here. An event for a box whose
     /// directory is gone, because the box was reaped, fails with
@@ -321,7 +323,7 @@ impl DiskBox {
     /// `NotFound` if the box's directory does not exist, and an I/O error
     /// if the file cannot be read or written.
     pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
-        use std::io::{Read as _, Seek as _, Write as _};
+        use std::io::Write as _;
 
         let mut options = std::fs::OpenOptions::new();
         options.read(true).append(true).create(true);
@@ -331,18 +333,18 @@ impl DiskBox {
             options.mode(0o600);
         }
         let mut file = options.open(self.events_path().as_utf8_path())?;
-        let mut out = Vec::new();
         let len = file.metadata()?.len();
-        if len > 0 {
-            let mut last = [0u8; 1];
-            file.seek(std::io::SeekFrom::Start(len - 1))?;
-            file.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                out.push(b'\n');
-            }
+        let complete = complete_len(&mut file, len)?;
+        if complete < len {
+            file.set_len(complete)?;
+            tracing::warn!(
+                box_id = %self.key.id(),
+                dropped_bytes = len - complete,
+                events_path = %self.events_path().as_str(),
+                "cut a torn last line from a box's events file before an append"
+            );
         }
-        out.extend_from_slice(&event.to_line()?);
-        file.write_all(&out)?;
+        file.write_all(&event.to_line()?)?;
         file.sync_data()
     }
 
@@ -379,6 +381,32 @@ impl DiskBox {
             .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
         root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
     }
+}
+
+/// The length of `file` up to and including its last `\n`, or 0 if it has
+/// none. `len` is the file's length. Reads back from the end in chunks, so
+/// a file whose last byte is `\n` costs one byte read.
+fn complete_len(file: &mut std::fs::File, len: u64) -> Result<u64, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = if end == len {
+            end - 1
+        } else {
+            end.saturating_sub(CHUNK)
+        };
+        buf.resize(usize::try_from(end - start).unwrap_or(0), 0);
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 impl BoxObject for DiskBox {
@@ -1649,10 +1677,10 @@ mod tests {
     }
 
     /// BOX-162: an append after a torn last line, one a crash left without
-    /// its newline, starts on a new line. Both events written around the
-    /// torn line read back, and the torn line is one refused line.
+    /// its newline, cuts the torn bytes first. The event before them and the
+    /// new event read back, the torn bytes are gone, and no line is refused.
     #[test]
-    fn append_after_a_torn_line_keeps_both_events() {
+    fn append_after_a_torn_line_drops_the_fragment() {
         use crate::events::{BoxEvent, BoxEventType};
         use std::io::Write as _;
 
@@ -1662,12 +1690,10 @@ mod tests {
         let object = loader.get(&key).unwrap();
         let before = BoxEvent::for_record(object.record(), BoxEventType::Created);
         object.append_event(&before).unwrap();
-        let torn_at = std::fs::metadata(object.events_path().as_utf8_path())
-            .unwrap()
-            .len();
+        let path = object.events_path();
         std::fs::OpenOptions::new()
             .append(true)
-            .open(object.events_path().as_utf8_path())
+            .open(path.as_utf8_path())
             .unwrap()
             .write_all(b"{\"box\":\"torn")
             .unwrap();
@@ -1675,9 +1701,18 @@ mod tests {
         object.append_event(&after).unwrap();
 
         let all = object.read_events_from(0).unwrap();
-        assert_eq!(all.events, [before, after]);
-        assert_eq!(all.refused.len(), 1);
-        assert_eq!(all.refused[0].0, torn_at);
+        assert_eq!(all.events, [before.clone(), after.clone()]);
+        assert_eq!(all.refused.len(), 0);
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+        assert_eq!(all.consumed, text.len() as u64);
+
+        // A file that holds only a torn line is cut to nothing.
+        std::fs::write(path.as_utf8_path(), b"{\"box\"").unwrap();
+        object.append_event(&after).unwrap();
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [after]);
+        assert_eq!(all.refused.len(), 0);
     }
 
     /// An event for a box whose directory is gone fails with `NotFound`
