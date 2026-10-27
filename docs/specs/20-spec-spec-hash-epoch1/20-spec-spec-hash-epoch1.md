@@ -81,10 +81,10 @@ build-infra operator. Release manager.
 - AS A security engineer I WANT the Container Spec Hash to carry the same
   guarantee as the package key SO THAT an OCI Archive fetched by key is as
   safe from substitution as a package tarball (D3.1, AT2)
-- AS A release manager I WANT every epoch-1 reader to read every epoch-1
-  encoding, and every later tag to be a later epoch SO THAT a keyspace
-  change is always a scheduled epoch flip and never a reader that fails on
-  data it should know
+- AS A release manager I WANT additive evolution (reserved tags,
+  absent-means-epoch-1) after this change SO THAT no existing key ever
+  changes again and the only keyspace change I schedule is a new epoch
+  (D3.1)
 
 ## Requirements
 
@@ -185,9 +185,10 @@ build-infra operator. Release manager.
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
     all 256 tag bytes with a bounded 8-byte payload, in spec and in
     container position
-  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1, and
-    SHALL emit no tag in epoch 1 that an epoch-1 decoder does not know: a
-    new tag is a new epoch.
+  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1. A later
+    optional field takes one with absent-means-epoch-1 semantics: a closure
+    that does not set the field encodes, and keys, byte-identically to
+    epoch 1 without it.
     tier:   T0
     verify: cargo nextest run -p graph epoch1_reserved_tags_unassigned
 
@@ -288,18 +289,21 @@ D3.1 has four commitments, and each maps to requirements:
 - injective over the closure's meaning: EPOCH-001, EPOCH-002, EPOCH-004
   and EPOCH-013
 - epochs by domain-separated context at a fixed 32 bytes, declared by the
-  index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012 and
-  EPOCH-014
+  index and followed by consumers: EPOCH-005, EPOCH-009, EPOCH-012,
+  EPOCH-014 and EPOCH-015
 - keyspace rotation as a migration class: the Rollout section and the
   migration non-goal
 - additive evolution, with an unknown tag as a hard error: EPOCH-007
 
-Under EPOCH-007 evolution within epoch 1 is one-directional: a new reader
-reads every epoch-1 encoding, because no epoch-1 writer ever emits a tag an
-epoch-1 reader does not know. A field that needs a new tag is a new epoch,
-whatever its default; the reserved range only keeps a later epoch's tags
-from colliding with epoch 1's. "Additive" names what a reader may gain,
-never what a writer may emit.
+Under EPOCH-007 additive evolution (D3.1) is a promise about keys, not
+about readers. A new optional field takes a reserved tag and is absent
+from every closure that does not set it, so every existing key is
+unchanged and no catalog rebuilds. A decoder older than the field
+hard-errors on an encoding that carries it; that reaches `decode()` alone,
+which nothing on the key path calls (the decoder exists for EPOCH-003's
+round-trip), so a reader older than the data it meets is a tooling-version
+error, never a keyspace change. A change that cannot be expressed as an
+absent-means-epoch-1 field is a new epoch.
 
 The index records its epoch in the flags field of each record (EPOCH-009).
 The index format reserved that field for format changes, and the reader
