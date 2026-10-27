@@ -99,6 +99,9 @@ pub enum Command {
     Dirs,
     /// Check this host for problems: today, that no record of the audit log
     /// was changed or removed
+    ///
+    /// Exits 0 when the audit log verifies, 1 when a record was changed or
+    /// removed, and 2 when audit files are missing.
     // BEP-049: whole-log verification of the audit chain is a `min doctor`
     // check, never a `min box audit` flag.
     Doctor,
