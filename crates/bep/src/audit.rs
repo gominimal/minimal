@@ -2904,8 +2904,9 @@ mod kani_proofs {
         let carried = |l: &Line| Some(l.1);
         assert!(verify_lines_with(Some(0), &originals[..n], carried, hash).is_ok());
 
+        // `i < n - 1`, not `i + 1 < n`: a free `i` overflows `i + 1`.
         let i: usize = kani::any();
-        kani::assume(i + 1 < n);
+        kani::assume(i < n - 1);
         let mut lines = originals;
         let len = if kani::any() {
             // Remove line i: shift its successors down by one.
