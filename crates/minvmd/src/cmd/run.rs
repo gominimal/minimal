@@ -3864,6 +3864,10 @@ mod tests {
         assert_eq!(drawn, 1, "one candidate drawn, no TCP probe applied to it");
     }
 
+    /// How many times a step that releases a port asks for it again when
+    /// another test in the process took it first (#2653).
+    const NODE_PORT_RACE_ATTEMPTS: usize = 16;
+
     #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
         // Its own reservation dir: no test takes a flock in the real one.
@@ -3886,16 +3890,24 @@ mod tests {
         // probe assigns it as asked — the case the session e2e's hardcoded
         // default proxy port depends on. Released on the wildcard the probe
         // addresses, like the hold above.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
-        assert_eq!(
-            super::assign_node_port(ports.path(), free, false)
-                .unwrap()
-                .port,
-            free,
-            "a free port is assigned as asked"
-        );
+        // Another test in the process can take the released port before the
+        // probe runs (#2653): that is a lost race, not a wrong answer, so a
+        // skipped preferred port releases a fresh one and asks again. A probe
+        // that refuses every free port still fails after the last attempt.
+        let mut handed_as_asked = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free {
+                handed_as_asked = Some(assigned);
+                break;
+            }
+        }
+        let handed_as_asked = handed_as_asked.expect("a free port is assigned as asked");
+        assert!(handed_as_asked.skipped.is_none(), "nothing skipped");
+        drop(handed_as_asked);
 
         // The supervisor assigns the proxy port and hands it to the guest:
         // whatever the host picked, it is a real port the guest can bind as
@@ -3921,11 +3933,26 @@ mod tests {
         // (T93), so pin a port this test knows is free — and the one
         // resolved port is what both the handoff and the row carry.
         let previous = std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok();
-        let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let pin = freed_pin.local_addr().unwrap().port();
-        drop(freed_pin);
-        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
-        let pinned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // The released pin has the same race as the free port above (#2653):
+        // a pin another test took fails the start, so release a fresh one and
+        // pin again.
+        let mut last_refusal = None;
+        let mut resolved = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let pin = freed_pin.local_addr().unwrap().port();
+            drop(freed_pin);
+            unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
+            match super::assign_node_proxy_port(ports.path()) {
+                Ok(pinned) => {
+                    resolved = Some((pin, pinned));
+                    break;
+                }
+                Err(error) => last_refusal = Some(error.to_string()),
+            }
+        }
+        let (pin, pinned) = resolved
+            .unwrap_or_else(|| panic!("a free pin resolves, last refusal: {last_refusal:?}"));
         assert_eq!(pinned.port, pin, "the override is the resolution");
         assert!(
             pinned.configured,
