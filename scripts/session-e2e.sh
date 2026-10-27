@@ -13267,9 +13267,12 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #   1. box A declares no quic443 stance and holds no grant, so its own
 #      stance is open, and its UDP to port 443 is not rejected;
 #   2. box B declares quic443 = "block" and joins the cohort; the daemon
-#      log records the cohort's stance flipping to blocked, naming B, A's
-#      UDP to port 443 is now rejected at once with ICMP port unreachable,
-#      and so is B's;
+#      log records the cohort's stance flipping to blocked, naming B, and
+#      box A's own leaf added to the set that is refused UDP 443. A's UDP to
+#      port 443 is now rejected at once, and so is B's. A host-address box's
+#      socket is in the host netns, so the reject runs in the local OUTPUT
+#      hook and drops the packet: socat's send fails with "Operation not
+#      permitted". The leaf in the set tells this reject from a silent drop;
 #   3. box B is destroyed; the daemon log records the stance flipping
 #      back, naming B, and A's UDP to port 443 is not rejected again.
 # The daemon log tail of the cohort's stance changes prints at the end.
@@ -13286,6 +13289,7 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   local cq_slice=/sys/fs/cgroup/minimald.slice
   local cq_blocked_leaf=/sys/fs/cgroup/minimald.slice/boxes/quic443-blocked
   local cq_stance_msg="the host-address cohort's UDP 443 stance changed"
+  local cq_set_add_msg="added a host-address box's own leaf to the set that is refused UDP 443"
 
   if [ -n "$E2E_VM" ]; then
     not_run "$cq_case" "a VM lane: the host-address cohort block runs in a native daemon's classifier tree, which a VM guest does not have"
@@ -13329,26 +13333,32 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   }
   # One UDP datagram to TEST-NET-1 port 443 from box $1. Prints socat's own
   # output and a last line "rc=<exit> ms=<elapsed>". Under the block the
-  # table answers with ICMP port unreachable, so socat reads ECONNREFUSED at
-  # once. Without the block nothing answers, and socat waits its 3 s.
+  # table rejects the datagram in the local OUTPUT hook: it sends ICMP port
+  # unreachable and drops the packet, so socat's first send fails at once
+  # with EPERM ("Operation not permitted"). A later send or recv can read
+  # ECONNREFUSED ("Connection refused") instead. Without the block nothing
+  # answers, and socat waits its 3 s.
   cq_probe() {
     # shellcheck disable=SC2016
     mnl session exec "$1" \
       's=$(date +%s%N); printf q | /usr/bin/socat -t 3 -T 3 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
       2>&1 | tr -d '\r' || true
   }
-  # 0 when the probe output $1 shows the datagram rejected at once.
+  # 0 when the probe output $1 shows the datagram rejected at once. The
+  # errno alone cannot tell a reject from a drop: the timing tells it from
+  # the 3 s path where nothing answers, and the set check below tells it
+  # from a drop.
   cq_rejected() {
     local rc ms
     rc="$(printf '%s\n' "$1" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
     ms="$(printf '%s\n' "$1" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
     [ -n "$rc" ] && [ "$rc" != 0 ] && [ -n "$ms" ] && [ "$ms" -lt 2000 ] \
-      && printf '%s\n' "$1" | grep -q 'Connection refused'
+      && printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
   }
   # 0 when the probe output $1 ran to its end and shows no rejection.
   cq_not_rejected() {
     printf '%s\n' "$1" | grep -q '^rc=[0-9]* ms=[0-9]*$' \
-      && ! printf '%s\n' "$1" | grep -q 'Connection refused'
+      && ! printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
   }
   # The case's own teardown, in the order the uninstall needs: the boxes'
   # leaves empty when they are destroyed, the daemon's when it stops.
@@ -13379,6 +13389,8 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
     echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
     cq_log "$cq_stance_msg" | tail -n 20
+    echo "--- daemon log: the leaves added to the set that is refused UDP 443 (tail) ---"
+    cq_log "$cq_set_add_msg" | tail -n 20
     cq_unwind
     fail
   }
@@ -13537,17 +13549,30 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     echo "::error::the blocked leaf $cq_blocked_leaf holds no process while the cohort blocks UDP 443"
     cq_fail
   fi
+  # An errno cannot tell a reject from a silent drop, so box A's own leaf
+  # must be in the set that the table refuses UDP 443.
+  cq_flip=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_set_add_msg" | grep -F -- "\"box_id\":\"$cq_open_sid\"" || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no add of box A's ($cq_open_sid) own leaf to the set that is refused UDP 443 while box B blocks the cohort"
+    cq_fail
+  fi
+  echo "log: box A's ($cq_open_sid) own leaf was added to the set that is refused UDP 443"
   cq_probe_out="$(cq_probe "$cq_open_sid")"
   echo "box A ($cq_open_sid) beside B, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
   if ! cq_rejected "$cq_probe_out"; then
-    echo "::error::UDP to port 443 from box A was not rejected at once while box B's quic443 = \"block\" blocks the cohort (expected 'Connection refused' within 2000 ms)"
+    echo "::error::UDP to port 443 from box A was not rejected at once while box B's quic443 = \"block\" blocks the cohort (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
     printf '%s\n' "$cq_probe_out"
     cq_fail
   fi
   cq_probe_out="$(cq_probe "$cq_block_sid")"
   echo "box B ($cq_block_sid), UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
   if ! cq_rejected "$cq_probe_out"; then
-    echo "::error::UDP to port 443 from box B, which declares quic443 = \"block\", was not rejected at once"
+    echo "::error::UDP to port 443 from box B, which declares quic443 = \"block\", was not rejected at once (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
     printf '%s\n' "$cq_probe_out"
     cq_fail
   fi
