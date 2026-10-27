@@ -13109,6 +13109,12 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     return 0
   }
   cq_fail() {
+    local cq_err
+    for cq_err in "$WORK/$cq_case".*.err; do
+      [ -s "$cq_err" ] || continue
+      echo "--- stderr: ${cq_err##*/} ---"
+      cat "$cq_err" 2>/dev/null || true
+    done
     echo "--- daemon log: the boxes' classifier-leaf launch records (tail) ---"
     cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
     echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
@@ -13213,6 +13219,13 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     cq_fail
   }
   cq_open_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # A session's box launches on its first exec, not at the activate, so
+  # the launch record exists only after this exec.
+  if ! mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1; }; then
+    echo "::error::the open-stance box's own exec failed: the box this case is about cannot be driven"
+    cq_fail
+  fi
   cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
     | grep -F -- "boxes/allow/$cq_open_sid" || true)"
   if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
@@ -13245,6 +13258,12 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     cq_fail
   }
   cq_block_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # Box B joins the cohort when it launches, on its first exec.
+  if ! mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1; }; then
+    echo "::error::the exec in box B ($cq_block_sid) failed: the box with quic443 = \"block\" cannot be driven"
+    cq_fail
+  fi
   cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
     | grep -F -- '"blocked":true' || true)"
   if [ -z "$cq_flip" ]; then
