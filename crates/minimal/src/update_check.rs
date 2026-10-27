@@ -439,9 +439,8 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
 
     if tty && let Some(latest) = notice_due(&state, &install) {
         let text = notice(&install, latest);
-        state.notified = Some(latest.to_string());
         let _ = writeln!(std::io::stderr(), "{text}");
-        let _ = write_state(&state_path, &state);
+        record_notified(&state_path, latest);
     }
 }
 
@@ -476,6 +475,17 @@ fn spawn_background(global: &GlobalArgs) -> bool {
     // Not waited on: a child that outlives a short command is reparented;
     // one that outlives a long one is reaped with it.
     cmd.spawn().is_ok()
+}
+
+/// Records that the user was told about `latest`. The file is re-read and
+/// only `notified` changes: the child this command may have just spawned
+/// can finish in between, and its answer must not be overwritten with the
+/// state read before it (then the next command would check again, and the
+/// notice could repeat).
+pub fn record_notified(state_path: &Path, latest: &str) {
+    let mut state = read_state(state_path);
+    state.notified = Some(latest.to_string());
+    let _ = write_state(state_path, &state);
 }
 
 /// Writes a check's outcome into the state file: `checked_at` now, and the
@@ -889,6 +899,34 @@ mod tests {
         assert!(
             failed.checked_at.is_some(),
             "and still counts as a check, so there is no retry storm"
+        );
+    }
+
+    #[test]
+    fn recording_the_notice_keeps_an_answer_that_landed_meanwhile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(STATE_FILE);
+        write_state(
+            &path,
+            &State {
+                install_id: Some("id".into()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        // The child finished between this command's read and its notice.
+        record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+        record_notified(&path, "0.7.2");
+        let after = read_state(&path);
+        assert_eq!(after.notified.as_deref(), Some("0.7.2"));
+        assert_eq!(
+            after.latest.as_deref(),
+            Some("0.7.2"),
+            "the child's answer survives the notice"
+        );
+        assert!(
+            after.checked_at.is_some(),
+            "and so does its checked_at, so no second check is spawned"
         );
     }
 
