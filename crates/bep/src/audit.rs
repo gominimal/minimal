@@ -1241,10 +1241,8 @@ fn quarantine_bridges(dir: &Path, from: &[(u64, PathBuf, Vec<u8>)]) -> io::Resul
             .unwrap_or_default();
         moved.push((name, fs::read(&path)?));
     }
-    let Some((_, after, _)) = from.get(1) else {
-        return Ok(false);
-    };
-    if moved.is_empty() {
+    // `from[1]` is the segment after the gap.
+    if from.len() < 2 || moved.is_empty() {
         return Ok(false);
     }
     let segments: Vec<(PathBuf, Vec<u8>)> = from
