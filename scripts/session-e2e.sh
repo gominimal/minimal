@@ -13022,6 +13022,7 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   local cq_case=bep_host_ip_cohort_blocks_udp_443
   local cq_why="" cq_src="" cq_rust_log cq_sock cq_pid cq_proc cq_comm cq_daemons=""
   local cq_open_sid="" cq_block_sid="" cq_out cq_launch cq_probe_out cq_flip cq_try cq_members
+  local cq_warm_sid=""
   local cq_slice=/sys/fs/cgroup/minimald.slice
   local cq_blocked_leaf=/sys/fs/cgroup/minimald.slice/boxes/quic443-blocked
   local cq_stance_msg="the host-address cohort's UDP 443 stance changed"
@@ -13093,9 +13094,10 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   # leaves empty when they are destroyed, the daemon's when it stops.
   # Returns the uninstall's exit status.
   cq_unwind() {
+    [ -n "$cq_warm_sid" ] && mnl session destroy --force "$cq_warm_sid" >/dev/null 2>&1
     [ -n "$cq_block_sid" ] && mnl session destroy --force "$cq_block_sid" >/dev/null 2>&1
     [ -n "$cq_open_sid" ] && mnl session destroy --force "$cq_open_sid" >/dev/null 2>&1
-    cq_block_sid=""; cq_open_sid=""
+    cq_warm_sid=""; cq_block_sid=""; cq_open_sid=""
     [ -n "$COHORT_SEED_DIR" ] && rm -rf "${COHORT_SEED_DIR:?}"
     [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "${COHORT_SEED_BLOCK_DIR:?}"
     COHORT_SEED_DIR=""; COHORT_SEED_BLOCK_DIR=""
@@ -13107,6 +13109,8 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     return 0
   }
   cq_fail() {
+    echo "--- daemon log: the boxes' classifier-leaf launch records (tail) ---"
+    cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
     echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
     cq_log "$cq_stance_msg" | tail -n 20
     cq_unwind
@@ -13165,10 +13169,43 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   fi
   echo "place: $min_daemon $cq_pid is in the slice's daemon leaf"
 
-  # ---- box A: open stance, alone in the cohort.
   COHORT_SEED_DIR="$(hook_mktemp /tmp/mnlcohort.XXXXXX)"
   hook_seed_preamble >"$COHORT_SEED_DIR/minimal.toml"
   mkdir "$COHORT_SEED_DIR/.git"
+
+  # ---- a throwaway host-address box turns the daemon's classifier fact,
+  # as in proof_host_ip_deny_all. The daemon started outside the slice and
+  # was placed after, so its start-up read still carries that cause. Each
+  # host-address launch re-reads the host, so this box's launch turns the
+  # fact to per_box before box A is created against it.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-warm --network host_ip </dev/null 2>"$WORK/$cq_case.warm-box.err")" || {
+    echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+    cat "$WORK/$cq_case.warm-box.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_warm_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1; }; then
+    echo "::error::the throwaway box $cq_warm_sid did not run a command"
+    cat "$WORK/$cq_case.warm-gate.err" 2>/dev/null || true
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_warm_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the throwaway box $cq_warm_sid was not launched into its own leaf boxes/allow/$cq_warm_sid with per-box enforcement, so the placement did not take effect: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  if ! mnl session destroy --force "$cq_warm_sid" >/dev/null 2>"$WORK/$cq_case.warm-destroy.err"; then
+    echo "::error::the throwaway box $cq_warm_sid would not destroy"
+    cat "$WORK/$cq_case.warm-destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "refresh: the throwaway box's launch (leaf boxes/allow/$cq_warm_sid) says per_box"
+  cq_warm_sid=""
+
+  # ---- box A: open stance, alone in the cohort.
   cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-cohort-open --network host_ip </dev/null 2>"$WORK/$cq_case.open.err")" || {
     echo "::error::'min session activate --network host_ip' failed for the open-stance box"
@@ -13215,7 +13252,7 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
     cq_fail
   fi
   echo "log: the cohort's stance changed to blocked when box B ($cq_block_sid) joined"
-  cq_members="$(cat "$cq_blocked_leaf/cgroup.procs" 2>/dev/null | wc -l | tr -d ' ')"
+  cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
   echo "blocked leaf: $cq_members process(es) in $cq_blocked_leaf"
   if [ "$cq_members" = 0 ]; then
     echo "::error::the blocked leaf $cq_blocked_leaf holds no process while the cohort blocks UDP 443"
@@ -13257,7 +13294,7 @@ proof_bep_host_ip_cohort_blocks_udp_443() {
   cq_block_sid=""
   for cq_try in $(seq 1 20); do
     [ "$cq_try" -gt 1 ] && sleep 0.5
-    cq_members="$(cat "$cq_blocked_leaf/cgroup.procs" 2>/dev/null | wc -l | tr -d ' ')"
+    cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
     [ "$cq_members" = 0 ] && break
   done
   if [ "$cq_members" != 0 ]; then
