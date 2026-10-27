@@ -564,10 +564,10 @@ Review, audit and revocation
     verify: cargo nextest run -p minimal box_spec_flags_allowed_quic_stance_on_grant_box
     <!-- networking §5.3 (v0.9): the flag keys to the resolved stance, never the input; at v1.25 rollout a running grant-holding `auto` box under `proxy_env` or `off` flips from blocked to allowed with no event of its own -->
 
-- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the mapped resource and permission or `module_unmapped`, the decision and any marker.
+- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the handle's `jti` or empty, the mapped resource and permission or `module_unmapped`, the decision and any marker.
   tier:     T0
   verify:   cargo nextest run -p bep every_decision_appends_one_audit_record
-  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none` -->
+  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none`; the `jti` is the handle's correlation id (Gatehouse §6.10), empty when the request carries no handle or the handle does not parse, and on a refusal it is the handle's unverified claim, kept so a forged or tampered handle still correlates -->
 
 - **BEP-067** WHEN the client mints a member or a store handle, or a live box is destroyed (BEP-043) THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket.
   tier:     T0
@@ -577,7 +577,7 @@ Review, audit and revocation
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
-  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
+  property: for every two requests identical in every BEP-039 field, the handle's `jti` included, and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
 - **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record only by removing a whole segment that BEP-068 retention no longer retains.
   tier:     T0

@@ -468,7 +468,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let held = {
-            let (store, ids) = store_seeded_with(&dir, [record_named("held")]).await;
+            // Seed a record that already names its box type, so the
+            // one-time migration at the reopen below leaves it unchanged.
+            let seed = Record {
+                box_type: Some(boxes::SESSION_BOX_TYPE.to_string()),
+                ..record_named("held")
+            };
+            let (store, ids) = store_seeded_with(&dir, [seed]).await;
             let held = open(&store, RecordPredicate::Id(ids[0]))
                 .await
                 .record()
@@ -480,6 +486,13 @@ mod tests {
         HELD.set(held.id).unwrap();
 
         let store = Store::init_with_mint(daemon_dir(&dir), mint_the_held_id)
+            .await
+            .unwrap();
+        // Read the held record after the reopen, so the start-up migration
+        // is not part of what the refused create must leave unchanged.
+        let before = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
             .await
             .unwrap();
         let err = store
@@ -505,7 +518,7 @@ mod tests {
             .record()
             .await
             .unwrap();
-        assert_eq!(after, held, "the retained record is unchanged");
+        assert_eq!(after, before, "the retained record is unchanged");
     }
 
     /// Resolve a handle to a record expected to exist.

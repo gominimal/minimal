@@ -438,8 +438,13 @@ async fn serve_create_session(
             // connection cannot run the Draft shortcut while this one is
             // still mid-activation (uploading, then configuring).
             let creator = conn.liveness().await;
+            // BOX-068: the spec rides into the manager with the config, so
+            // the manager checks it before the record exists and stores it
+            // beside the record before the box starts.
+            let spec = req.spec.take();
+            let has_spec = spec.is_some();
             Ok(match mngr
-                .create_session_by(req.config, ssh_username, creator)
+                .create_box_with_spec(req.config, spec, ssh_username, creator)
                 .await
             {
                 Ok(id) => {
@@ -456,6 +461,7 @@ async fn serve_create_session(
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
                         egress_deny_subnets = egress_counts.deny_subnets,
+                        spec_stored = has_spec,
                         "session created"
                     );
                     // NET-079's observability: one info line per create

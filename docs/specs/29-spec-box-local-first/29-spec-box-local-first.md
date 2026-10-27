@@ -62,9 +62,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p minvmd vm_host_mints_box_id_before_in_vm_create
   <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
 
-- **BOX-003** WHEN the daemon starts and finds a record without `box_type` or `parent` THE SYSTEM SHALL migrate it once to `box_type = "session"` with no parent, assigning a fresh id only when the stored id is nil, and leave it unchanged on any later start.
+- **BOX-003** WHEN the daemon starts and finds a record without `box_type` or without a `parent` key THE SYSTEM SHALL migrate it once: a record without `box_type` takes `box_type = "session"`, a record that has a `box_type` keeps it, both record no parent, a fresh id is assigned only when the stored id is nil, and the record is left unchanged on any later start.
   tier:     T0
   verify:   cargo nextest run -p boxes restart_migrates_records_missing_type_or_parent_once
+  verify:   cargo nextest run -p boxes heal_migrate_keeps_box_type_of_record_without_parent_key
 
 - **BOX-004** THE SYSTEM SHALL keep a box name unique among the running boxes of one host, let a stopped or exited box keep its name, and allow a new box on that host to reuse it.
   tier:     T1
