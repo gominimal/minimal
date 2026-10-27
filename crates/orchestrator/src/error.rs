@@ -22,12 +22,14 @@ pub enum Error {
     /// A generic error occurred during the setup or execution of a sandbox.
     #[error("sandbox error: {0}")]
     Sandbox(#[from] sandbox::Error),
-    /// The remote index lists the spec but the store no longer has its
-    /// artifact (a dangling hit): the plan trusted the index and scheduled a
-    /// cache fill with no build behind it. The caller re-plans with the spec
-    /// masked out of every cache, which turns the fill into a build.
-    #[error("the remote cache lists {0:?} but no longer has its artifact")]
-    DanglingCacheHit(BuildSpecRef),
+    /// The remote index lists these specs but the store no longer has their
+    /// artifacts (dangling hits): the plan trusted the index and scheduled
+    /// cache fills with no build behind them. The run finishes everything
+    /// else it can first, so one pass learns every dangling spec it reaches
+    /// and no in-flight build is thrown away; the caller then re-plans with
+    /// the specs masked out of every cache, which turns the fills into builds.
+    #[error("the remote cache lists {0:?} but no longer has their artifacts")]
+    DanglingCacheHit(Vec<BuildSpecRef>),
     /// Other errors.
     #[error("other: {0}")]
     Other(anyhow::Error),

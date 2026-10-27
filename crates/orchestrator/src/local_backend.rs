@@ -317,7 +317,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     // but this deliverable is a cache fill with no build to
                     // fall back on, so the orchestrator hands the spec back
                     // for a re-plan that treats it as uncached.
-                    Err(rcache::Error::NotFound { .. }) => Err(Error::DanglingCacheHit(bsr)),
+                    Err(rcache::Error::NotFound { .. }) => Err(Error::DanglingCacheHit(vec![bsr])),
                     Err(e) => Err(Error::Other(anyhow::anyhow!("{}: {e}", build.name))),
                 }
             } else {

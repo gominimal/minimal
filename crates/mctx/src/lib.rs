@@ -881,14 +881,18 @@ impl Context {
             }
             match result {
                 Ok(()) => return Ok(()),
-                Err(orchestrator::Error::DanglingCacheHit(bsr)) if !dangling.contains(&bsr) => {
-                    let spec = graph.get(&bsr).map(|b| b.name.as_str()).unwrap_or("?");
-                    tracing::warn!(
-                        kind = "dangling_replan",
-                        spec,
-                        "the remote cache lists a package the store no longer has; building it locally"
-                    );
-                    dangling.push(bsr);
+                Err(orchestrator::Error::DanglingCacheHit(hits))
+                    if hits.iter().all(|b| !dangling.contains(b)) =>
+                {
+                    for bsr in hits {
+                        let spec = graph.get(&bsr).map(|b| b.name.as_str()).unwrap_or("?");
+                        tracing::warn!(
+                            kind = "dangling_replan",
+                            spec,
+                            "the remote cache lists a package the store no longer has; building it locally"
+                        );
+                        dangling.push(bsr);
+                    }
                 }
                 // propagate any other error (a dangling hit on a spec already
                 // masked cannot happen: a masked spec is never a cache fill)
@@ -1218,7 +1222,10 @@ impl Context {
                 .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
                 .map_err(Error::Other)?
             else {
-                continue; // a dangling hit: nothing to commit, the build will make it
+                // a dangling hit: nothing to commit. A build (`build_graph`) makes the
+                // package; a prefetch-only caller (mip add/update/check) leaves it
+                // uncached, which rcache's `dangling_hit` warning has recorded.
+                continue;
             };
             pending_dir
                 .finalize(meta)
