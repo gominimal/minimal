@@ -2368,6 +2368,7 @@ async fn in_box_root_cannot_append_events() {
         parent: None,
         ts: now_ms(),
         kind: BoxEventType::Exited,
+        data: EventData::new(),
     };
     let line = forged.to_line().unwrap();
     for seen in box_visible_dirs(&mngr, id).await {
@@ -2393,6 +2394,52 @@ async fn in_box_root_cannot_append_events() {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "only the daemon's user can open it");
     }
+}
+
+/// BOX-162: a complete line of the events file that is not an event
+/// makes the read fail with `InvalidData`, naming the line's byte offset.
+/// The read cannot return every retained event, so it does not end as
+/// complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_fails_on_a_refused_line() {
+    use std::io::Write as _;
+
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let path = reader.object.events_path();
+    let bad_at = std::fs::metadata(path.as_utf8_path()).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_utf8_path())
+        .unwrap()
+        .write_all(b"not an event\n")
+        .unwrap();
+
+    let err = reader.read_new().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&format!("byte {bad_at}")),
+        "the error names the offset: {err}"
+    );
+}
+
+/// BOX-040: the event a writer passes `data` to carries it, and reads back
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_event_carries_its_data() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let created = reader.read_new().unwrap();
+    assert!(created[0].data.is_empty(), "created carries an empty data");
+
+    let data: EventData = [("reason".to_string(), "stopped".into())]
+        .into_iter()
+        .collect();
+    let written = write_box_event(&reader.object, BoxEventType::Exited, data.clone()).unwrap();
+    assert_eq!(written.data, data);
+    assert_eq!(reader.read_new().unwrap(), [written]);
 }
 
 /// Drives the `ReadEvents` subsystem: writes the request and half-closes,
@@ -2452,7 +2499,7 @@ async fn events_read_returns_full_retained_stream_in_order() {
         BoxEventType::OomKilled,
         BoxEventType::Exited,
     ] {
-        written.push(write_box_event(&reader.object, kind).unwrap());
+        written.push(write_box_event(&reader.object, kind, EventData::new()).unwrap());
     }
 
     let mut lines = open_events_read(&mut client, id, false).await;
@@ -2487,7 +2534,7 @@ async fn events_follow_replays_then_tails_until_reaped() {
     let mngr = server.state.sessions_manager().await;
     let reader = mngr.box_events(id).await.unwrap();
     let mut retained = reader.object.read_events_from(0).unwrap().events;
-    retained.push(write_box_event(&reader.object, BoxEventType::Started).unwrap());
+    retained.push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
 
     let mut lines = open_events_read(&mut client, id, true).await;
     for event in retained {
@@ -2498,7 +2545,7 @@ async fn events_follow_replays_then_tails_until_reaped() {
     }
 
     for kind in [BoxEventType::Detached, BoxEventType::Resumed] {
-        let event = write_box_event(&reader.object, kind).unwrap();
+        let event = write_box_event(&reader.object, kind, EventData::new()).unwrap();
         assert_eq!(
             next_update(&mut lines).await,
             Some(ReadEventsUpdate::Event { event }),

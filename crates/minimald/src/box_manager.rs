@@ -6,7 +6,7 @@ use crate::{
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
 use boxes::SessionId;
-use boxes::events::{BoxEvent, BoxEventType};
+use boxes::events::{BoxEvent, BoxEventType, EventData};
 use paths::DaemonAbsPath;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
@@ -1585,7 +1585,7 @@ impl BoxManager {
                 return Err(e);
             }
         };
-        if let Err(e) = write_box_event(&object, BoxEventType::Created) {
+        if let Err(e) = write_box_event(&object, BoxEventType::Created, EventData::new()) {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
@@ -2213,7 +2213,8 @@ static EVENTS_WRITTEN: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
 const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Writes one lifecycle event of the box `object` is (BOX-040), stamped
-/// now with the box's id and parent, and wakes every follower. Only the
+/// now with the box's id and parent and carrying `data`, and wakes every
+/// follower. `created` passes an empty `data`. Only the
 /// daemon calls this, and the file it appends to is outside every path
 /// mounted into the box (BOX-041). Logs one line per event written.
 ///
@@ -2223,10 +2224,12 @@ const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 pub(crate) fn write_box_event(
     object: &boxes::store::DiskBox,
     kind: BoxEventType,
+    data: EventData,
 ) -> Result<BoxEvent, std::io::Error> {
     use boxes::store::BoxObject as _;
 
-    let event = BoxEvent::for_record(object.record(), kind);
+    let mut event = BoxEvent::for_record(object.record(), kind);
+    event.data = data;
     object.append_event(&event)?;
     EVENTS_WRITTEN.send_modify(|n| *n = n.wrapping_add(1));
     tracing::info!(
@@ -2263,7 +2266,9 @@ impl BoxEventsReader {
     ///
     /// # Errors
     ///
-    /// An I/O error if the events file exists but cannot be read.
+    /// An I/O error if the events file exists but cannot be read, and
+    /// `InvalidData`, naming the byte offset, if a complete line does not
+    /// parse as an event. The read then cannot be complete, so it fails.
     pub fn read_new(&mut self) -> Result<Vec<BoxEvent>, std::io::Error> {
         self.written.borrow_and_update();
         let decoded = self.object.read_events_from(self.offset)?;
@@ -2275,6 +2280,12 @@ impl BoxEventsReader {
                 events_path = %self.object.events_path().as_str(),
                 "refused a line of a box's events file: it does not parse as an event"
             );
+        }
+        if let Some((offset, error)) = decoded.refused.first() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the line at byte {offset} of the events file is not an event: {error}"),
+            ));
         }
         self.offset += decoded.consumed;
         Ok(decoded.events)
