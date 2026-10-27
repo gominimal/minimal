@@ -1824,6 +1824,13 @@ async fn pump_channel_input<M>(
 {
     let end = Arc::new(end);
     let _registered = Registered::new(&held, &end);
+    // The wait at a bound, kept across channel chunks: a client that feeds
+    // one byte per chunk while the command reads one byte per window would
+    // otherwise get every chunk in after one read and a fresh window for
+    // the next, and an exec at its cap would never be ended (#2238's
+    // trickle, in small chunks). The wait begins at the first chunk refused
+    // and ends only when a quantum has drained since it began.
+    let mut wait: Option<BoundWait> = None;
     let mut open = true;
     loop {
         match msgs.next().await {
@@ -1840,20 +1847,22 @@ async fn pump_channel_input<M>(
                 // The window restarts only on this exec's own reads; another
                 // exec's release wakes the pump to retry, at the daemon bound
                 // only, and leaves the window where it was.
-                let mut since = tokio::time::Instant::now();
-                let unstarted_from = since;
-                let mut starved_warned = false;
-                // The window's drain, measured from where `released` stood
-                // when it began against what was held then (#2238).
-                let mut window = DrainWindow::begin(&held);
-                // The holders a starved wait is waiting on, with where each
-                // stood when the wait began; taken once per window.
-                let mut holders: Option<Vec<HolderAtWindow>> = None;
                 loop {
                     let bound = match held.push(&data) {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            // A chunk that fits ends the wait only once a
+                            // quantum has drained since it began; a byte
+                            // read per chunk keeps the window where it is.
+                            if wait.as_ref().is_some_and(|w| w.window.drained(&held)) {
+                                wait = None;
+                            }
+                            break;
+                        }
                         Err(bound) => bound,
                     };
+                    let w = wait.get_or_insert_with(|| BoundWait::begin(&held));
+                    let since = w.since;
+                    let unstarted_from = w.since;
                     if !held.started() {
                         tokio::select! {
                             _ = held.progress.notified() => {}
@@ -1870,8 +1879,7 @@ async fn pump_channel_input<M>(
                                 return;
                             }
                         }
-                        since = tokio::time::Instant::now();
-                        window = DrainWindow::begin(&held);
+                        *w = BoundWait::begin(&held);
                         continue;
                     }
                     let daemon_bound = matches!(bound, HeldBound::Daemon);
@@ -1879,16 +1887,16 @@ async fn pump_channel_input<M>(
                     // this one holds nothing: it is not the one not reading,
                     // and it waits for them, up to `starved`.
                     let starved = daemon_bound && held.held_bytes() == 0;
-                    if starved && !starved_warned {
-                        starved_warned = true;
+                    if starved && !w.starved_warned {
+                        w.starved_warned = true;
                         tracing::warn!(
                             daemon = held.limits.daemon,
                             "exec: the daemon's input budget is held by other execs; this one waits for it",
                         );
                     }
                     let allowed = if starved {
-                        if holders.is_none() {
-                            holders = Some(HolderAtWindow::snapshot(&held));
+                        if w.holders.is_none() {
+                            w.holders = Some(HolderAtWindow::snapshot(&held));
                         }
                         held.limits.starved
                     } else {
@@ -1899,9 +1907,8 @@ async fn pump_channel_input<M>(
                             // The window restarts on a quantum, not a byte:
                             // a read that drains less keeps the window where
                             // it was, and the retry below still happens.
-                            if window.drained(&held) {
-                                since = tokio::time::Instant::now();
-                                window = DrainWindow::begin(&held);
+                            if w.window.drained(&held) {
+                                *w = BoundWait::begin(&held);
                             }
                             continue;
                         }
@@ -1914,7 +1921,8 @@ async fn pump_channel_input<M>(
                     // is draining (a genuinely busy daemon) does the wait
                     // end this exec, as the ceiling always did.
                     if starved
-                        && let Some(victim) = holders.take().and_then(HolderAtWindow::not_draining)
+                        && let Some(victim) =
+                            w.holders.take().and_then(HolderAtWindow::not_draining)
                     {
                         tracing::warn!(
                             held = victim.held.held_bytes(),
@@ -1925,8 +1933,7 @@ async fn pump_channel_input<M>(
                         victim
                             .end
                             .send_replace(Some(ExecEnd::InputHeldOver(HeldBound::Daemon)));
-                        since = tokio::time::Instant::now();
-                        window = DrainWindow::begin(&held);
+                        *w = BoundWait::begin(&held);
                         continue;
                     }
                     tracing::warn!(
@@ -1977,6 +1984,28 @@ impl DrainWindow {
 
     fn drained(&self, held: &HeldInput) -> bool {
         held.released_bytes().saturating_sub(self.released_at_start) >= self.due
+    }
+}
+
+/// The pump's wait at a bound, kept across channel chunks until a quantum
+/// drains ([`DrainWindow`]): when it began, the drain it is owed, the
+/// holders a starved wait is waiting on (taken once per window) and whether
+/// the starved warning went out.
+struct BoundWait {
+    since: tokio::time::Instant,
+    window: DrainWindow,
+    holders: Option<Vec<HolderAtWindow>>,
+    starved_warned: bool,
+}
+
+impl BoundWait {
+    fn begin(held: &HeldInput) -> Self {
+        Self {
+            since: tokio::time::Instant::now(),
+            window: DrainWindow::begin(held),
+            holders: None,
+            starved_warned: false,
+        }
     }
 }
 

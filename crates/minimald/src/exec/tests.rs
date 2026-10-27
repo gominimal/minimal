@@ -2110,6 +2110,61 @@ async fn a_trickle_reader_at_its_cap_is_ended_within_a_window() {
     );
 }
 
+/// #2238's trickle again, in small chunks: a client that feeds one byte per
+/// channel message while the command reads one byte per window gets each
+/// chunk in after one read. The wait at the bound must span chunks, or the
+/// exec at its cap is never ended.
+#[tokio::test]
+async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..200 {
+        msg_tx.send(data(1, 7)).unwrap(); // to the cap, one byte at a time
+    }
+    let feeder = tokio::spawn(async move {
+        loop {
+            // One more byte each time the reader has made room for it.
+            if msg_tx.send(data(1, 7)).is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    feeder.abort();
+    ended
+        .expect("a trickle reader fed in one-byte chunks is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
 /// The other side of the quantum: a command at its cap that reads a
 /// quantum or more per window is reading, and is never ended; it works
 /// through everything held.
