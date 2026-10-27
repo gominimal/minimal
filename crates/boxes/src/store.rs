@@ -1557,7 +1557,10 @@ mod tests {
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
         let key = loader.create(sample_record()).unwrap();
         let object = loader.get(&key).unwrap();
-        assert!(object.read_events_from(0).unwrap().events.is_empty());
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
         assert!(object.is_retained());
 
         let kinds = [
@@ -1580,7 +1583,7 @@ mod tests {
 
         let all = object.read_events_from(0).unwrap();
         assert_eq!(all.events, written);
-        assert!(all.refused.is_empty());
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
         let rest = object.read_events_from(first.consumed).unwrap();
         assert_eq!(rest.events, written[1..]);
         assert_eq!(rest.consumed + first.consumed, all.consumed);
@@ -1622,7 +1625,10 @@ mod tests {
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(EVENTS_FILE).exists());
         assert!(!object.is_retained());
-        assert!(object.read_events_from(0).unwrap().events.is_empty());
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
     }
 
     #[test]
