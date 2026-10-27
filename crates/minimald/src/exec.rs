@@ -2049,7 +2049,9 @@ impl HolderAtWindow {
     /// terms; it is not a holder another exec may end.
     ///
     /// The registry spans every session of this daemon, and the daemon
-    /// serves one user: every exec here is that user's, so ending the one
+    /// serves one user (`rpc.rs` refuses any peer whose uid is not the
+    /// daemon's own, and the socket is mode 0600): every exec here is that
+    /// user's, so ending the one
     /// that is not reading is a fairness rule among their own commands, not
     /// a boundary between tenants.
     fn snapshot(waiter: &Arc<HeldInput>) -> Vec<Self> {
