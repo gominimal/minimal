@@ -1873,7 +1873,11 @@ async fn pump_channel_input<M>(
                         w.holders = None;
                     }
                     let since = w.since;
-                    let unstarted_from = w.since;
+                    // The unstarted grace runs from the first refusal and is
+                    // not moved by wake-ups: another exec's release wakes
+                    // this wait, and must not keep an unstarted command's
+                    // exec alive past its grace.
+                    let unstarted_from = w.began;
                     if !held.started() {
                         tokio::select! {
                             _ = held.progress.notified() => {}
@@ -1890,7 +1894,9 @@ async fn pump_channel_input<M>(
                                 return;
                             }
                         }
+                        let began = w.began;
                         *w = BoundWait::begin(&held);
+                        w.began = began;
                         continue;
                     }
                     let daemon_bound = matches!(bound, HeldBound::Daemon);
@@ -2003,6 +2009,8 @@ impl DrainWindow {
 /// holders a starved wait is waiting on (taken once per window) and whether
 /// the starved warning went out.
 struct BoundWait {
+    /// When the wait first hit a bound; the unstarted grace runs from here.
+    began: tokio::time::Instant,
     since: tokio::time::Instant,
     window: DrainWindow,
     holders: Option<Vec<HolderAtWindow>>,
@@ -2014,8 +2022,10 @@ struct BoundWait {
 
 impl BoundWait {
     fn begin(held: &HeldInput) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
-            since: tokio::time::Instant::now(),
+            began: now,
+            since: now,
             window: DrainWindow::begin(held),
             holders: None,
             starved_warned: false,
