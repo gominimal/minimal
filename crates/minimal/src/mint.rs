@@ -1372,6 +1372,10 @@ impl fmt::Debug for StoreHandle {
         reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
     )
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint, and the caller holds each one"
+)]
 pub fn mint_store_handle(
     identity: &Identity,
     identity_path: &Path,
