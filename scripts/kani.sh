@@ -281,4 +281,4 @@ expect boxes 12
 expect rcache 3
 expect mlog 9
 expect minvmd 5
-expect bep 11
+expect bep 12

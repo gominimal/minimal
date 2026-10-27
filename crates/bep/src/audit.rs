@@ -314,29 +314,48 @@ pub fn verify_segment_with(
         .iter()
         .rposition(|&b| b == b'\n')
         .map_or(&contents[..0], |n| &contents[..n]);
-    let mut expected: Option<String> = start.map(str::to_owned);
-    let mut records = 0;
-    for line in complete.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        records += 1;
-        let Some(carried) = carried_hash(line) else {
-            return ChainCheck::Broken { record: records };
+    let lines: Vec<&[u8]> = complete
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .collect();
+    match verify_lines_with(
+        start.map(|s| s.as_bytes().to_vec()),
+        &lines,
+        |line| carried_hash(line).map(<[u8]>::to_vec),
+        |line| hash(line).into_bytes(),
+    ) {
+        Ok((head, records)) => ChainCheck::Verified {
+            // Every head is `start` or a value of `hash`, so it is UTF-8.
+            head: head.map(|h| String::from_utf8_lossy(&h).into_owned()),
+            records,
+        },
+        Err(record) => ChainCheck::Broken { record },
+    }
+}
+
+/// The chain rule over records already split into `lines`, apart from any
+/// byte scan. Each line must carry, as `carried` reads it, the `hash` of
+/// the line before it, and the first line must carry `start` when there is
+/// one. Returns the head and the count of lines, or the 1-based number of
+/// the first line that breaks the chain.
+fn verify_lines_with<L, H: Eq>(
+    start: Option<H>,
+    lines: &[L],
+    carried: impl Fn(&L) -> Option<H>,
+    hash: impl Fn(&L) -> H,
+) -> Result<(Option<H>, usize), usize> {
+    let mut expected = start;
+    for (k, line) in lines.iter().enumerate() {
+        let Some(found) = carried(line) else {
+            return Err(k + 1);
         };
-        if expected
-            .as_deref()
-            .is_some_and(|hash| hash.as_bytes() != carried)
-        {
-            return ChainCheck::Broken { record: records };
+        if expected.as_ref().is_some_and(|hash| *hash != found) {
+            return Err(k + 1);
         }
         expected = Some(hash(line));
     }
-    ChainCheck::Verified {
-        head: expected,
-        records,
-    }
+    Ok((expected, lines.len()))
 }
 
 /// The `kind` of a [`QuarantineRecord`].
@@ -2844,98 +2863,85 @@ mod tests {
     }
 }
 
-/// The audit chain's harness (BEP-049), over the pure verifier with a model
-/// of the hash that is free of collisions over the lines it sees.
-///
-/// Every buffer is a fixed-size array and only the payload bytes, the
-/// record count and the edit are symbolic, so the solver sees no symbolic
-/// length.
+/// The audit chain's harnesses (BEP-049). The chain rule runs over
+/// `verify_lines_with` with a model line and a model hash that is free of
+/// collisions over the lines it sees. The byte rule that reads the carried
+/// hash runs over `carried_hash` with fixed offsets. No harness has a
+/// symbolic offset or a symbolic buffer length.
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{ChainCheck, ZERO_HASH, verify_segment_with};
+    use super::{PREVIOUS_HASH_FIELD, carried_hash, verify_lines_with};
 
     const MAX_RECORDS: usize = 3;
-    /// The symbolic bytes that open each line.
-    const PAYLOAD: usize = 2;
-    const FIELD: &[u8] = b"\"previous_hash\":\"";
-    /// One line: the payload, the field, the 64-digit hash and `"}`.
-    const LINE: usize = PAYLOAD + FIELD.len() + 64 + 2;
+    /// A model line: its payload and the code it carries as `previous_hash`.
+    type Line = (u8, u8);
+    /// The model hash of a line that is not an original line.
+    const OTHER: u8 = 0xFF;
 
-    /// The model hash of line `k`: 64 hex digits, distinct per `k`, none of
-    /// them [`ZERO_HASH`].
-    const CODES: [&str; MAX_RECORDS] = [
-        "0000000000000000000000000000000000000000000000000000000000000001",
-        "0000000000000000000000000000000000000000000000000000000000000002",
-        "0000000000000000000000000000000000000000000000000000000000000003",
-    ];
-    /// The model hash of any line that is not an original line.
-    const OTHER: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-
-    /// The bytes of `lines`, skipping the line at `skip`, each with its
-    /// newline, and how many of them there are.
-    fn joined(
-        lines: &[[u8; LINE]; MAX_RECORDS],
-        n: usize,
-        skip: Option<usize>,
-    ) -> ([u8; MAX_RECORDS * (LINE + 1)], usize) {
-        let mut out = [b'\n'; MAX_RECORDS * (LINE + 1)];
-        let mut at = 0;
-        for (k, line) in lines.iter().enumerate().take(n) {
-            if skip != Some(k) {
-                out[at..at + LINE].copy_from_slice(line);
-                at += LINE + 1;
-            }
-        }
-        (out, at)
-    }
-
+    /// An edit to or a removal of any record with a successor breaks the
+    /// chain. `verify_segment_with` maps the `Err` to `ChainCheck::Broken`.
     #[kani::proof]
-    #[kani::unwind(87)]
+    #[kani::unwind(5)]
     fn kani_audit_chain_detects_edit() {
-        // The model's codes are hashes, and none is the first start.
-        assert!(CODES.iter().all(|c| c.len() == 64 && *c != ZERO_HASH));
-
         let n: usize = kani::any();
         kani::assume((2..=MAX_RECORDS).contains(&n));
-        let mut lines = [[0u8; LINE]; MAX_RECORDS];
-        for (k, line) in lines.iter_mut().enumerate() {
-            let payload: [u8; PAYLOAD] = kani::any();
-            kani::assume(!payload.contains(&b'\n'));
-            let previous = if k == 0 { ZERO_HASH } else { CODES[k - 1] };
-            line[..PAYLOAD].copy_from_slice(&payload);
-            line[PAYLOAD..PAYLOAD + FIELD.len()].copy_from_slice(FIELD);
-            line[PAYLOAD + FIELD.len()..LINE - 2].copy_from_slice(previous.as_bytes());
-            line[LINE - 2..].copy_from_slice(b"\"}");
-        }
-        let originals = lines;
-        // Collision-free over the original lines: each one hashes to its
-        // position's code, and any other line to a code no line carries.
-        let hash = |l: &[u8]| {
-            let k = (0..n).find(|&k| l == originals[k].as_slice());
-            k.map_or(OTHER, |k| CODES[k]).to_owned()
+        // Line k carries the code of line k - 1, which is k. Line 0
+        // carries 0, the model of the zero hash.
+        let originals: [Line; MAX_RECORDS] = [(kani::any(), 0), (kani::any(), 1), (kani::any(), 2)];
+        // Collision-free over the original lines: line k hashes to k + 1,
+        // and any other line to a code that no line carries.
+        let hash = |l: &Line| {
+            if *l == originals[0] {
+                1
+            } else if *l == originals[1] {
+                2
+            } else if n > 2 && *l == originals[2] {
+                3
+            } else {
+                OTHER
+            }
         };
-        let (bytes, len) = joined(&lines, n, None);
-        assert!(matches!(
-            verify_segment_with(Some(ZERO_HASH), &bytes[..len], hash),
-            ChainCheck::Verified { .. }
-        ));
+        let carried = |l: &Line| Some(l.1);
+        assert!(verify_lines_with(Some(0), &originals[..n], carried, hash).is_ok());
 
-        // An edit or a removal of any record that has a successor.
         let i: usize = kani::any();
         kani::assume(i + 1 < n);
-        let (bytes, len) = if kani::any() {
-            joined(&lines, n, Some(i))
+        let mut lines = originals;
+        let len = if kani::any() {
+            // Remove line i: shift its successors down by one.
+            if i == 0 {
+                lines[0] = lines[1];
+            }
+            if i <= 1 {
+                lines[1] = lines[2];
+            }
+            n - 1
         } else {
-            let j: usize = kani::any();
-            kani::assume(j < LINE);
-            let byte: u8 = kani::any();
-            kani::assume(byte != lines[i][j] && byte != b'\n');
-            lines[i][j] = byte;
-            joined(&lines, n, None)
+            // Edit line i: its payload, its carried field, or both.
+            let edited: Line = kani::any();
+            kani::assume(edited != originals[i]);
+            lines[i] = edited;
+            n
         };
-        assert!(matches!(
-            verify_segment_with(Some(ZERO_HASH), &bytes[..len], hash),
-            ChainCheck::Broken { .. }
-        ));
+        assert!(verify_lines_with(Some(0), &lines[..len], carried, hash).is_err());
+    }
+
+    /// One record line: two bytes, the field, the 64-digit hash and `"}`.
+    const LINE: usize = 2 + PREVIOUS_HASH_FIELD.len() + 64 + 2;
+
+    /// `carried_hash` returns the 64 bytes before the closing `"}` exactly
+    /// when the line ends in `"}` and the field opens those 64 bytes.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn kani_carried_hash_reads_the_field() {
+        let line: [u8; LINE] = kani::any();
+        let well_formed = line[83..] == *b"\"}" && line[2..19] == *PREVIOUS_HASH_FIELD;
+        // Compare where the result points, not its 64 bytes.
+        let found = carried_hash(&line).map(|h| (h.as_ptr(), h.len()));
+        if well_formed {
+            assert!(found == Some((line[19..83].as_ptr(), 64)));
+        } else {
+            assert!(found.is_none());
+        }
     }
 }
