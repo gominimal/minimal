@@ -12277,8 +12277,28 @@ proof_bep_store_reference_end_to_end() {
       sr_fail
     fi
   fi
-  BEP_LIVE_DAEMON=""
-  bep_live_gate "$sr_case" no_sign_in || sr_fail
+  # The gate at the start of this case passed, so the proxy must come back
+  # here. Restart the daemon pair directly, not through bep_live_gate, so a
+  # failure is one failure and never also a NOT RUN row.
+  local sr_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  unset MINVMD_BEP_STUB
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! mnl ls >/dev/null 2>"$WORK/$sr_case.restart.err"; then
+    echo "::error::the daemon did not start again for $sr_case"
+    cat "$WORK/$sr_case.restart.err" 2>/dev/null || true
+    sr_fail
+  fi
+  for _ in $(seq 1 60); do
+    bep_control_live "$sr_control" && break
+    sleep 1
+  done
+  if ! bep_control_live "$sr_control"; then
+    echo "::error::the Box Egress Proxy is not serving: nothing answers on $sr_control 60 s after the VM host daemon started again"
+    echo "--- $sr_log (tail) ---"; tail -40 "$sr_log" 2>/dev/null || echo "(absent)"
+    sr_fail
+  fi
+  BEP_LIVE_DAEMON=1
   echo "the proxy restarted with the rule for $sr_host"
 
   # 2. The box spec references the identifier (BEP-032), and `min box spec`
