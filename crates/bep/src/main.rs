@@ -418,11 +418,15 @@ fn store_authorities(rules: &[StoreRule], union: &Union) -> Vec<(String, u16)> {
         .collect()
 }
 
-/// The rules that the admitted store authorities came from, and those
-/// authorities.
+/// The rules that the published root was issued under, and the admitted
+/// store authorities.
 struct Admitted {
+    /// The rules of the last re-issue and publish that succeeded. A failed
+    /// one leaves them, so the next CONNECT tries again.
     rules: Vec<StoreRule>,
     authorities: Vec<(String, u16)>,
+    /// The CA holds a root that the identity file does not have yet.
+    unpublished: bool,
 }
 
 /// The store authorities that `bep serve` admits at each CONNECT. When the
@@ -433,6 +437,9 @@ struct Admitted {
 struct StoreAdmission<K: 'static> {
     rules: Arc<ClientRules>,
     ca: Arc<Mutex<Ca<'static, K>>>,
+    /// The `kid` of the root key that the CA holds. A root is published
+    /// only to an identity file that names this key.
+    root_kid: String,
     /// The published identity file, which gets each new root.
     identity: PathBuf,
     admitted: Mutex<Admitted>,
@@ -440,10 +447,11 @@ struct StoreAdmission<K: 'static> {
 
 impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
     /// The source over `rules`, which starts with the `held` rules that the
-    /// root of `ca` was issued under.
+    /// root of `ca` was issued under. `root_kid` names the root key of `ca`.
     fn new(
         rules: Arc<ClientRules>,
         ca: Arc<Mutex<Ca<'static, K>>>,
+        root_kid: String,
         identity: PathBuf,
         held: Vec<StoreRule>,
     ) -> Self {
@@ -456,39 +464,67 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
         Self {
             rules,
             ca,
+            root_kid,
             identity,
             admitted: Mutex::new(Admitted {
                 rules: held,
                 authorities,
+                unpublished: false,
             }),
         }
     }
 
     /// Issues the root again for `rules` when their names changed, and
-    /// publishes it. Gives the names the root in use permits. On an error the
-    /// old root stays in use, so the new names are not admitted.
-    fn reissue(&self, rules: &[StoreRule]) -> Union {
+    /// publishes it, or publishes a root that an earlier call did not.
+    /// Gives the names the root in use permits, and whether the re-issue
+    /// and the publish succeeded. On an error the root in use stays, and
+    /// the caller tries again at the next CONNECT.
+    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, bool) {
         let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
-        match ca.reissue_root(registered_union(rules), SystemTime::now()) {
-            Ok(true) => {
-                let published = Identity::read(&self.identity)
-                    .map(|identity| identity.with_root_certificate(ca.root()))
-                    .and_then(|identity| identity.publish(&self.identity));
-                if let Err(err) = published {
-                    tracing::error!(
-                        path = %self.identity.display(),
-                        error = %err,
-                        "did not publish the re-issued root; boxes created now get the old root"
-                    );
-                }
+        let issued = match ca.reissue_root(registered_union(rules), SystemTime::now()) {
+            Ok(issued) => issued,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
+                );
+                return (ca.union().clone(), false);
             }
-            Ok(false) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
-            ),
+        };
+        if issued || *unpublished {
+            *unpublished = true;
+            if let Err(err) = self.publish(ca.root()) {
+                tracing::error!(
+                    path = %self.identity.display(),
+                    error = %err,
+                    "did not publish the re-issued root; boxes created now get the old root"
+                );
+                return (ca.union().clone(), false);
+            }
+            *unpublished = false;
         }
-        ca.union().clone()
+        (ca.union().clone(), true)
+    }
+
+    /// Writes `root` to the identity file when the file names the root key
+    /// that the CA holds. A file whose root key was replaced while
+    /// `bep serve` runs is left as it is.
+    fn publish(&self, root: &[u8]) -> Result<(), String> {
+        let identity = Identity::read(&self.identity).map_err(|err| err.to_string())?;
+        let kid = identity
+            .key(Role::Root)
+            .map_err(|err| err.to_string())?
+            .kid();
+        if kid != self.root_kid {
+            return Err(format!(
+                "the file names root key {kid}, and bep serve holds root key {}",
+                self.root_kid
+            ));
+        }
+        identity
+            .with_root_certificate(root)
+            .publish(&self.identity)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -496,10 +532,10 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
     fn authorities(&self) -> Vec<(String, u16)> {
         let rules = self.rules.current();
         let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
-        if admitted.rules == rules {
+        if admitted.rules == rules && !admitted.unpublished {
             return admitted.authorities.clone();
         }
-        let union = self.reissue(&rules);
+        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
         let authorities = store_authorities(&rules, &union);
         if authorities != admitted.authorities {
             tracing::info!(
@@ -509,10 +545,10 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
                 "admits the changed secret-store upstreams with no restart"
             );
         }
-        *admitted = Admitted {
-            rules,
-            authorities: authorities.clone(),
-        };
+        admitted.authorities.clone_from(&authorities);
+        if done {
+            admitted.rules = rules;
+        }
         authorities
     }
 }
@@ -1247,6 +1283,7 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         Arc::new(StoreAdmission::new(
             Arc::clone(&rules),
             Arc::clone(&ca),
+            root_key.public().kid(),
             identity.to_path_buf(),
             held,
         )),
@@ -2537,6 +2574,7 @@ mod tests {
             Arc::new(StoreAdmission::new(
                 Arc::clone(&rules),
                 Arc::clone(&ca),
+                keys.root.public().kid(),
                 path.clone(),
                 held,
             )),
@@ -2566,6 +2604,41 @@ mod tests {
         // A narrowed rule takes the upstream out again.
         std::fs::write(&config, "").unwrap();
         assert!(!admitted.admits("api.openai.com", 443));
+        let narrowed = Identity::read(&path).unwrap();
+
+        // A root key replaced in the file while `bep serve` runs: the
+        // re-issued root is not published to the file.
+        let other: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let (replaced, _) = Identity::of(other)
+            .issuing_root(&other.root, registered_union(&[]), at)
+            .unwrap();
+        replaced.publish(&path).unwrap();
+        let foreign = Identity::read(&path).unwrap();
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            foreign.root_certificate_der().unwrap()
+        );
+
+        // The failed publish is tried again at the next CONNECT, with no
+        // change of the rules, once the file names the held root key.
+        narrowed.publish(&path).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            ca.lock().unwrap().root().to_vec()
+        );
     }
 
     // BEP-032: a redemption stats the files and reads them only when a
