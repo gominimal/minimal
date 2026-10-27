@@ -1907,6 +1907,108 @@ async fn write_update(
     Ok(())
 }
 
+/// Serves [`READ_EVENTS_SUBSYSTEM`](minimald_rpc::READ_EVENTS_SUBSYSTEM):
+/// one box's retained events in the order they were written, then, for a
+/// follower, each new one until the box is reaped or the client closes
+/// the channel (BOX-162). A refusal before the first event, such as an
+/// unknown id, leaves the payload stream empty and says why on extended
+/// data, the same split as [`serve_clean_cache`].
+async fn serve_read_events(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match read_events_stream(&s, &mut c).await {
+        Ok(()) => {
+            // A follower that closed its side is already gone: the close
+            // it answers is best-effort.
+            let _ = c.eof().await;
+            let _ = c.close().await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then streams the box's events. The `Err` arm is for
+/// a refusal before the first event, and for a channel that breaks.
+async fn read_events_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::{ReadEventsRequest, ReadEventsUpdate};
+
+    let req: ReadEventsRequest = read_channel_request(c).await?;
+    let mut reader = match s.sessions_manager().await.box_events(req.id).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::info!(
+                box_id = %req.id,
+                follow = req.follow,
+                refusal = %e,
+                "refused a read of a box's events"
+            );
+            return Err(ConnectionError::Internal(e.to_string()));
+        }
+    };
+    tracing::info!(box_id = %req.id, follow = req.follow, "reading a box's events");
+
+    let failed = |e: std::io::Error| {
+        tracing::warn!(box_id = %req.id, error = %e, "a read of a box's events failed");
+        ReadEventsUpdate::Failed {
+            error: format!("the events of box {} could not be read: {e}", req.id),
+        }
+    };
+    match reader.read_new() {
+        Ok(events) => {
+            for event in events {
+                write_events_update(c, &ReadEventsUpdate::Event { event }).await?;
+            }
+        }
+        Err(e) => return write_events_update(c, &failed(e)).await,
+    }
+    if !req.follow {
+        return write_events_update(c, &ReadEventsUpdate::Done).await;
+    }
+    loop {
+        tokio::select! {
+            next = reader.next_events() => match next {
+                Ok(Some(events)) => {
+                    for event in events {
+                        write_events_update(c, &ReadEventsUpdate::Event { event }).await?;
+                    }
+                }
+                Ok(None) => {
+                    tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read");
+                    return write_events_update(c, &ReadEventsUpdate::Reaped).await;
+                }
+                Err(e) => return write_events_update(c, &failed(e)).await,
+            },
+            msg = c.wait() => match msg {
+                None | Some(russh::ChannelMsg::Close) => {
+                    tracing::info!(box_id = %req.id, "the reader closed a followed read of a box's events");
+                    return Ok(());
+                }
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Writes one newline-delimited JSON events update.
+async fn write_events_update(
+    c: &mut RuChannel<Msg>,
+    update: &minimald_rpc::ReadEventsUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json_lenient::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
 /// Reads a JSON request body off `c`, draining until the client half-closes.
 /// The streaming handlers' equivalent of what
 /// [`ServeOneshot::handle_channel`] does inline.
@@ -2773,7 +2875,8 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
+        | minimald_rpc::READ_EVENTS_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -2862,6 +2965,7 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
+        minimald_rpc::READ_EVENTS_SUBSYSTEM => serve!(serve_read_events(s, channel)),
         _ => unreachable!(),
     };
 

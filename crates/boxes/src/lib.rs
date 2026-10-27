@@ -14,6 +14,7 @@ pub mod client;
 pub mod core;
 pub mod daemon;
 pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;

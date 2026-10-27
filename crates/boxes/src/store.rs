@@ -12,6 +12,7 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+    events::{BoxEvent, DecodedEvents, decode_lines},
 };
 
 /// Describes the session object yielded by [`Loader`].
@@ -292,6 +293,126 @@ impl DiskBox {
             Err(e) => Err(e),
         }
     }
+
+    /// The path of the box's events file, [`EVENTS_FILE`](crate::events::EVENTS_FILE), beside its
+    /// record (BOX-040). No path mounted into the box reaches it: the box
+    /// sees only the `tree`, `home`, `cache`, `patches` and `hooks`
+    /// directories beside it (BOX-041). A test pins the literal to
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "events.jsonl")
+    }
+
+    /// Appends `event` to the box's events file as one line (BOX-040). The
+    /// append holds an exclusive lock on the file from the read of its
+    /// length through the cut, the write and the sync. That lock is why two
+    /// writers never interleave and one never cuts the other's line, and
+    /// the file order is the write order (BOX-162). `O_APPEND` alone is not
+    /// enough, because a cut and a write are two steps.
+    /// The file is created owner-only.
+    ///
+    /// A last line torn by a crash has no newline. Its write was never
+    /// acknowledged, so no event is lost when it goes: the file is cut back
+    /// to the end of its last complete line before this event is written.
+    /// The event then never joins the torn bytes, and no line that does not
+    /// parse stays in the file. A warning names the box and the bytes cut.
+    ///
+    /// The box's directory is never created here. An event for a box whose
+    /// directory is gone, because the box was reaped, fails with
+    /// `NotFound` and leaves nothing on disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if the box's directory does not exist, and an I/O error
+    /// if the file cannot be read or written.
+    pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(self.events_path().as_utf8_path())?;
+        // Held until `file` drops after `sync_data`: the length, the cut and
+        // the write below are one step for every other appender.
+        file.lock()?;
+        let len = file.metadata()?.len();
+        let complete = complete_len(&mut file, len)?;
+        if complete < len {
+            file.set_len(complete)?;
+            tracing::warn!(
+                box_id = %self.key.id(),
+                dropped_bytes = len - complete,
+                events_path = %self.events_path().as_str(),
+                "cut a torn last line from a box's events file before an append"
+            );
+        }
+        file.write_all(&event.to_line()?)?;
+        file.sync_data()
+    }
+
+    /// Reads the box's events file from byte `offset` (BOX-162): every
+    /// complete line from there, in file order, and the offset after the
+    /// last of them. A box with no events file reads as no events.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file exists but cannot be read.
+    pub fn read_events_from(&self, offset: u64) -> Result<DecodedEvents, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match std::fs::File::open(self.events_path().as_utf8_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(DecodedEvents::default()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(decode_lines(&buf, offset))
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun. A follower of the
+    /// box's events stops once this is false (BOX-162).
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root_path();
+        let root = root.as_utf8_path();
+        let tombstone = root
+            .parent()
+            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
+    }
+}
+
+/// The length of `file` up to and including its last `\n`, or 0 if it has
+/// none. `len` is the file's length. Reads back from the end in chunks, so
+/// a file whose last byte is `\n` costs one byte read.
+fn complete_len(file: &mut std::fs::File, len: u64) -> Result<u64, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = if end == len {
+            end - 1
+        } else {
+            end.saturating_sub(CHUNK)
+        };
+        buf.resize(usize::try_from(end - start).unwrap_or(0), 0);
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 impl BoxObject for DiskBox {
@@ -1473,6 +1594,190 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-040, BOX-162: events append beside the record, outside every
+    /// directory the box sees, and read back in the order they were
+    /// written, from the start or from an offset. Deleting the box removes
+    /// the file and ends its retention.
+    #[test]
+    fn events_file_appends_in_write_order() {
+        use crate::events::{BoxEvent, BoxEventType, EVENTS_FILE};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+        assert!(object.is_retained());
+
+        let kinds = [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Detached,
+            BoxEventType::Resumed,
+            BoxEventType::Exited,
+        ];
+        let written: Vec<BoxEvent> = kinds
+            .iter()
+            .map(|kind| BoxEvent::for_record(object.record(), *kind))
+            .collect();
+        object.append_event(&written[0]).unwrap();
+        let first = object.read_events_from(0).unwrap();
+        assert_eq!(first.events, written[..1]);
+        for event in &written[1..] {
+            object.append_event(event).unwrap();
+        }
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, written);
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        let rest = object.read_events_from(first.consumed).unwrap();
+        assert_eq!(rest.events, written[1..]);
+        assert_eq!(rest.consumed + first.consumed, all.consumed);
+        assert!(written.iter().all(|e| e.box_id == key.session_id));
+        assert!(written.iter().all(|e| e.parent == object.record().parent));
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.events_path().as_utf8_path(),
+            record_dir.join(EVENTS_FILE)
+        );
+        for seen in [
+            object.workspace_path(),
+            object.home_path(),
+            object.cache_path(),
+            object.patches_path(),
+            object.hooks_path(),
+        ] {
+            assert!(
+                !object
+                    .events_path()
+                    .as_utf8_path()
+                    .starts_with(seen.as_utf8_path())
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(record_dir.join(EVENTS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(EVENTS_FILE).exists());
+        assert!(!object.is_retained());
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+    }
+
+    /// BOX-162: an append after a torn last line, one a crash left without
+    /// its newline, cuts the torn bytes first. The event before them and the
+    /// new event read back, the torn bytes are gone, and no line is refused.
+    #[test]
+    fn append_after_a_torn_line_drops_the_fragment() {
+        use crate::events::{BoxEvent, BoxEventType};
+        use std::io::Write as _;
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let before = BoxEvent::for_record(object.record(), BoxEventType::Created);
+        object.append_event(&before).unwrap();
+        let path = object.events_path();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.as_utf8_path())
+            .unwrap()
+            .write_all(b"{\"box\":\"torn")
+            .unwrap();
+        let after = BoxEvent::for_record(object.record(), BoxEventType::Started);
+        object.append_event(&after).unwrap();
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [before.clone(), after.clone()]);
+        assert_eq!(all.refused.len(), 0);
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+        assert_eq!(all.consumed, text.len() as u64);
+
+        // A file that holds only a torn line is cut to nothing.
+        std::fs::write(path.as_utf8_path(), b"{\"box\"").unwrap();
+        object.append_event(&after).unwrap();
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [after]);
+        assert_eq!(all.refused.len(), 0);
+    }
+
+    /// BOX-162: two threads append to a file with a torn tail at once. The
+    /// file lock makes each cut and write one step, so the second cut never
+    /// removes the first append's event. Every event reads back, and no line
+    /// is refused.
+    #[test]
+    fn concurrent_appends_after_a_torn_line_keep_every_event() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        const PER_THREAD: usize = 50;
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let path = object.events_path();
+        std::fs::write(path.as_utf8_path(), b"{\"box\":\"torn").unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for kind in [BoxEventType::Started, BoxEventType::Detached] {
+                let object = loader.get(&key).unwrap();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let event = BoxEvent::for_record(object.record(), kind);
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        object.append_event(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        assert_eq!(all.events.len(), 2 * PER_THREAD);
+        for kind in [BoxEventType::Started, BoxEventType::Detached] {
+            let count = all.events.iter().filter(|e| e.kind == kind).count();
+            assert_eq!(count, PER_THREAD, "events of {kind:?} lost");
+        }
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+    }
+
+    /// An event for a box whose directory is gone fails with `NotFound`
+    /// and does not create the directory again.
+    #[test]
+    fn append_after_delete_leaves_no_directory() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        loader.delete(&key).unwrap();
+        let event = BoxEvent::for_record(object.record(), BoxEventType::Exited);
+        let err = object.append_event(&event).unwrap_err();
+        assert_eq!(err.kind(), NotFound);
+        assert!(!object.root_path().as_utf8_path().exists());
     }
 
     #[test]

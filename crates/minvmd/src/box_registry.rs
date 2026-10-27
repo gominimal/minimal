@@ -3155,6 +3155,74 @@ fn proxy_revoked_box_ids(path: &std::path::Path) -> std::io::Result<Vec<String>>
         .collect())
 }
 
+/// How long [`BoxRegistry::send_live_boxes`] waits for the proxy's control
+/// socket to take connections. `bep serve` binds it just after its
+/// listener, the socket whose appearance starts the send.
+const LIVE_BOXES_WAIT: Duration = Duration::from_secs(10);
+
+impl BoxRegistry {
+    /// The id of every box this registry holds, a live row or a kept
+    /// creation, as 32 lowercase hex digits, each once.
+    pub fn live_box_ids(&self) -> Vec<String> {
+        let mut ids: BTreeSet<String> = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .values()
+            .map(|record| box_id_hex(record.box_id))
+            .collect();
+        ids.extend(
+            self.creations()
+                .values()
+                .map(|creation| box_id_hex(creation.id())),
+        );
+        ids.into_iter().collect()
+    }
+
+    /// Names every box this registry holds to the proxy's control socket,
+    /// in one `live_boxes` request (BEP-063, #2617). The proxy then frees
+    /// the client key of each box it kept from before its start that is not
+    /// in the list: a box that ended with no `forget_box`. It retries the
+    /// connect for [`LIVE_BOXES_WAIT`] while no proxy takes it. With no
+    /// control socket set, it sends nothing.
+    pub fn send_live_boxes(&self) {
+        let Some(path) = self.proxy_control.as_deref() else {
+            return;
+        };
+        let ids = self.live_box_ids();
+        let count = ids.len();
+        let request = serde_json::json!({ "op": "live_boxes", "box_ids": ids });
+        let deadline = Instant::now() + LIVE_BOXES_WAIT;
+        loop {
+            match exchange_control(path, "live_boxes", &request) {
+                Ok(_) => {
+                    tracing::info!(
+                        boxes = count,
+                        "named the live boxes to the Box Egress Proxy"
+                    );
+                    return;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "the Box Egress Proxy did not take the live box list: a client key of \
+                         a box that ended with no forget stays in use until the next start"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Sends one `op` request for the box id `id` to the proxy's control socket
 /// at `path`, and reads its reply. The protocol is one JSON object per line
 /// each way.
@@ -10506,6 +10574,36 @@ mod tests {
 
         let absent = super::submit_revocation(&dir.path().join("absent.sock"), id);
         assert!(absent.revoke.is_err() && absent.forget.is_err());
+    }
+
+    // BEP-063 (#2617): the live box list names each box the registry holds,
+    // in 32 hex digits, in one `live_boxes` line. A registry with no control
+    // socket sends nothing.
+    #[test]
+    fn live_boxes_names_every_box_the_registry_holds() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let db = registry
+            .register_client_box(client_spec("db"))
+            .expect("the plan has an address for the box");
+        let mut expected = vec![super::box_id_hex(web.box_id), super::box_id_hex(db.box_id)];
+        expected.sort();
+        assert_eq!(registry.live_box_ids(), expected);
+        registry.send_live_boxes();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(&path, &["{\"ok\":true}\n"]);
+        registry
+            .clone()
+            .with_proxy_control(Some(path))
+            .send_live_boxes();
+        assert_eq!(
+            server.join().unwrap(),
+            [serde_json::json!({"op": "live_boxes", "box_ids": expected})]
+        );
     }
 
     // T41: a refused `revoke_box` still sends `forget_box`, so the proxy
