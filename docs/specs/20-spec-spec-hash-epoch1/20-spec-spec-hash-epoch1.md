@@ -42,9 +42,10 @@ containers with different canonical forms are **canonically distinct**.
 Every **bounded spec** has at most 3 elements in any list and at most 8
 bytes in any string. Its dependency depth is at most 2. A **bounded
 container** has at most 3 elements in any list, set or map, at most 8
-bytes in any string, and bounded specs as members. Harnesses that are
-exhaustive over bounded specs or containers state nothing beyond that
-domain.
+bytes in any string, and up to 3 arbitrary 32-byte member keys: members
+enter a container's canonical form as keys, so a harness ranges over the
+keys and never runs the hash symbolically. Harnesses that are exhaustive
+over bounded specs or containers state nothing beyond that domain.
 The **epoch-1 context** is the Blake3 `derive_key` context string
 `minimal.dev spec-hash epoch 1`. The **epoch-0 defect catalog** is the list
 of nine collision-witness classes in minimal#1246.
@@ -64,9 +65,10 @@ the nine refutations as proved.
 **Roles:** security engineer and package author. Verification engineer and
 build-infra operator. Release manager.
 
-- AS A security engineer I WANT the cache key to be an injective function
-  of the spec's meaning SO THAT no two distinct specs can share a key and
-  cache poisoning by collision is impossible by construction
+- AS A security engineer I WANT the encoding to be an injective function
+  of the spec's meaning SO THAT no two distinct specs can share an
+  encoding, two keys agree only when Blake3 collides, and cache poisoning
+  by collision is impossible by construction
 - AS A package author I WANT dependency identity to be order-independent
   (deps as sets) SO THAT reordering imports in a recipe never forces a
   spurious catalog rebuild
@@ -79,9 +81,10 @@ build-infra operator. Release manager.
 - AS A security engineer I WANT the Container Spec Hash to carry the same
   guarantee as the package key SO THAT an OCI Archive fetched by key is as
   safe from substitution as a package tarball (D3.1, AT2)
-- AS A release manager I WANT additive evolution (reserved tags,
-  absent-means-epoch-1) after this change SO THAT this is the last breaking
-  keyspace change I ever schedule
+- AS A release manager I WANT every epoch-1 reader to read every epoch-1
+  encoding, and every later tag to be a later epoch SO THAT a keyspace
+  change is always a scheduled epoch flip and never a reader that fails on
+  data it should know
 
 ## Requirements
 
@@ -102,12 +105,20 @@ build-infra operator. Release manager.
   property: for all s, permutations p: encode(s) == encode(p(s))
 
 - **EPOCH-003** THE SYSTEM SHALL decode every epoch-1 encoding back to the
-  original spec.
+  canonical form of the spec it encodes.
   tier:     T2
   verify:   cargo nextest run -p graph epoch1_roundtrip_bounded
-  property: for all bounded specs x: decode(encode(x)) == x
+  property: for all bounded specs x: decode(encode(x)) == canon(x), and
+    canon(canon(x)) == canon(x)
   harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
     (3 elements per list, 8 bytes per string, depth 2)
+  - THE SYSTEM SHALL decode every epoch-1 container encoding back to the
+    canonical form of the container it encodes.
+    tier:   T2
+    verify: cargo nextest run -p graph epoch1_container_roundtrip_bounded
+    property: for all bounded containers c: decode(encode(c)) == canon(c)
+    harness: kani_epoch1_container_roundtrip_bounded, exhaustive over
+      bounded containers
 
 - **EPOCH-004** THE SYSTEM SHALL encode every epoch-0 collision-witness
   pair from the epoch-0 defect catalog to distinct outputs.
@@ -138,9 +149,21 @@ build-infra operator. Release manager.
 - **EPOCH-012** WHEN a consumer computes a lookup key THE SYSTEM SHALL use
   the epoch that the index of its registry pin declares.
   tier:     T1
-  verify:   cargo nextest run -p graph epoch_follows_pinned_index
+  verify:   cargo nextest run -p rcache epoch_follows_pinned_index
   property: for all pins p, specs s: lookup_key(p, s) == hash(epoch(index(p)),
     encode_epoch(index(p))(s))
+  - IF a lookup reads several indexes as one (an upstream with sideloads,
+    or a per-commit snapshot with the root index as its fallback) AND two
+    of them declare different epochs THEN THE SYSTEM SHALL refuse the
+    lookup and name both indexes.
+    tier:   T0
+    verify: cargo nextest run -p rcache union_of_two_epochs_is_refused
+  - WHERE an index holds no record THE SYSTEM SHALL treat it as declaring
+    no epoch: it constrains no union it is part of, and a lookup whose
+    every index is empty uses the consumer's own epoch, since no key can
+    match.
+    tier:   T0
+    verify: cargo nextest run -p rcache empty_index_declares_no_epoch
 
 - **EPOCH-006** WHEN the system encodes a number THE SYSTEM SHALL normalize
   negative zero to zero.
@@ -160,8 +183,11 @@ build-infra operator. Release manager.
   property: no two structural tags share a byte, and for all byte strings s
     with an unassigned tag: decode(s) errors
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
-    all 256 tag bytes with a bounded 8-byte payload
-  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1.
+    all 256 tag bytes with a bounded 8-byte payload, in spec and in
+    container position
+  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1, and
+    SHALL emit no tag in epoch 1 that an epoch-1 decoder does not know: a
+    new tag is a new epoch.
     tier:   T0
     verify: cargo nextest run -p graph epoch1_reserved_tags_unassigned
 
@@ -185,7 +211,7 @@ build-infra operator. Release manager.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_subset_key_follows_its_spec
   property: for all subsets u of spec s: epoch(key(u)) == epoch(key(s)), and
-    for all distinct output sets a, b of s: key(u_a) != key(u_b)
+    for all distinct output sets a, b of s: encode(u_a) != encode(u_b)
 
 - **EPOCH-013** THE SYSTEM SHALL encode canonically distinct containers to
   distinct byte strings.
@@ -210,6 +236,18 @@ build-infra operator. Release manager.
   property: for all containers c, permutations p of c's members:
     encode(c) == encode(p(c)); and for all members m of c: the member bytes
     of encode(c) are hash_e(m) for the epoch e of c's key
+  - IF a member's key is not of the container's epoch THEN THE SYSTEM SHALL
+    refuse to seal the container and name the member.
+    tier:   T0
+    verify: cargo nextest run -p rcache container_with_a_member_of_another_epoch_is_refused
+
+- **EPOCH-015** WHEN the system computes a container key THE SYSTEM SHALL
+  derive it under the epoch-1 context from the container's canonical
+  encoding, 32 bytes wide, as EPOCH-005 derives a spec key.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_container_key_derivation
+  property: for all containers c: key(c) == blake3_derive_key(epoch-1
+    context, encode(c)), and len(key(c)) == 32
 
 ## Non-goals
 
@@ -256,8 +294,12 @@ D3.1 has four commitments, and each maps to requirements:
   migration non-goal
 - additive evolution, with an unknown tag as a hard error: EPOCH-007
 
-Under EPOCH-007 a new optional field reuses epoch 1 only when its absence
-means epoch-1 semantics. Any other change is a new epoch.
+Under EPOCH-007 evolution within epoch 1 is one-directional: a new reader
+reads every epoch-1 encoding, because no epoch-1 writer ever emits a tag an
+epoch-1 reader does not know. A field that needs a new tag is a new epoch,
+whatever its default; the reserved range only keeps a later epoch's tags
+from colliding with epoch 1's. "Additive" names what a reader may gain,
+never what a writer may emit.
 
 The index records its epoch in the flags field of each record (EPOCH-009).
 The index format reserved that field for format changes, and the reader
@@ -289,16 +331,17 @@ The subset key (EPOCH-011) follows the spec key's epoch because witness
 class 9 is its collision family. A subset computed under another epoch
 cannot find the index of its spec.
 
-The container key (EPOCH-013, EPOCH-014) is the same codec with container
-tags, so EPOCH-003 and EPOCH-007 cover container encodings as they cover
-spec encodings. `ContainerHasher` chooses its encoder at its own call site,
+The container key (EPOCH-013, EPOCH-014, EPOCH-015) is the same codec with
+container tags; EPOCH-003's and EPOCH-007's container sub-bullets cover the
+container round-trip and the unknown-tag rejection in container position,
+with their own harnesses. `ContainerHasher` chooses its encoder at its own call site,
 so the flip must move that site together with `SpecHasher` and
 `SubsetHasher`, or containers stay on epoch 0 with the witness minimal#1331
 pinned. A container is a declaration over packages. Its members enter by
 key, and a key carries its epoch through the context, so a container key is
-well-defined only when every member key is of the container's epoch. An
-index declares one epoch (EPOCH-009, EPOCH-012), so a mixed container
-cannot be sealed into one. Today no index holds a container record
+well-defined only when every member key is of the container's epoch, which
+EPOCH-014's refusal makes a requirement rather than an inference from
+EPOCH-009: a member may well sit in another index of another epoch. Today no index holds a container record
 (build-servers#371), so the container keyspace has nothing to rotate.
 
 **Generality:** a second epoch is additive by construction, through
@@ -351,7 +394,8 @@ reuses them.
   architecture. D3.1 fixes it, and EPOCH-007 binds it.
 - Where the index records its epoch, decided 2026-10-06: in the flags field
   of each record (EPOCH-009). Design reasoning gives the alternative.
-- [NEEDS CLARIFICATION (LOW): decision 4, the migration shape. The options
-  are a one-time cold rebuild (recommended) or dual hashing. It affects
-  rollout only, and every requirement holds under both. Settle it at flip
-  time with build-infra.]
+- Decision 4, the migration shape, decided: a one-time cold rebuild, as
+  the Rollout section prescribes. Dual hashing (keeping epoch-0 keys live
+  beside epoch-1 keys) was rejected: it doubles every index and makes the
+  epoch a per-record question for the whole overlap, which EPOCH-009's
+  one-epoch-per-index rule exists to avoid.
