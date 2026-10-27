@@ -1153,25 +1153,27 @@ impl Context {
                 let fetch = async move {
                     let sema = semaphore.acquire().await;
                     let package = name.clone();
-                    let res = rc_clone
-                        .materialize(&spec_hash, &cache_clone, &name)
-                        .await
+                    let res = match rc_clone.materialize(&spec_hash, &cache_clone, &name).await {
+                        Ok((t, d)) => Ok(Some((
+                            d,
+                            lcache::EntryMeta {
+                                inner: lcache::MetaInner::Spec(name),
+                                fetched: true,
+                                fetch_ms: Some(t.as_millis() as usize),
+                                origin: Some(origin),
+                                ..Default::default()
+                            },
+                        ))),
+                        // A dangling index hit: the index lists an artifact the
+                        // store no longer has. That is a miss, not a failure;
+                        // the package is built locally like any other miss,
+                        // and rcache has logged it (`kind = "dangling_hit"`).
+                        Err(rcache::Error::NotFound { .. }) => Ok(None),
                         // The error names the package, not just the object:
                         // "the remote cache has no artifact for ..." alone
                         // tells the user nothing about which package.
-                        .map_err(move |e| anyhow::anyhow!("{package}: {e}"))
-                        .map(|(t, d)| {
-                            (
-                                d,
-                                lcache::EntryMeta {
-                                    inner: lcache::MetaInner::Spec(name),
-                                    fetched: true,
-                                    fetch_ms: Some(t.as_millis() as usize),
-                                    origin: Some(origin),
-                                    ..Default::default()
-                                },
-                            )
-                        });
+                        Err(e) => Err(anyhow::anyhow!("{package}: {e}")),
+                    };
                     drop(sema);
                     res
                 };
@@ -1185,9 +1187,12 @@ impl Context {
         // Wait for all materialization tasks to complete, committing each pending dir
         // to the cache as it is finished being staged
         while let Some(result) = task_set.join_next().await {
-            let (pending_dir, meta) = result
+            let Some((pending_dir, meta)) = result
                 .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
-                .map_err(Error::Other)?;
+                .map_err(Error::Other)?
+            else {
+                continue; // a dangling hit: nothing to commit, the build will make it
+            };
             pending_dir
                 .finalize(meta)
                 .map_err(|e| Error::Other(e.into()))?;
