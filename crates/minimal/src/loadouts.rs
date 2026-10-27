@@ -554,17 +554,20 @@ impl ActivationInputs {
     }
 }
 
-/// Whether [`prepare_activation_inputs`] validates the project's own hooks.
+/// What [`prepare_activation_inputs`] does with lifecycle hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectHookCheck {
-    /// Run the checks a staging pass would make: `min session activate` and
-    /// the dashboard create, which upload the project tree and so carry the
-    /// hooks to the daemon.
+pub(crate) enum HookPrep {
+    /// Stage the loadouts' scripts, check the project's own hooks, and size
+    /// the finalize budget: `min session activate` and the dashboard create,
+    /// which upload the project tree and so carry the hooks to the daemon.
     Enforce,
-    /// Skip them. `min task run` shares this prep for its loadout staging and
-    /// finalize budget, but it never checked the project's hooks before the
-    /// helper was shared, and it has no `--no-hooks` to get past a refusal.
-    Skip,
+    /// Stage the loadouts' scripts and size the budget, but leave the
+    /// project's own hooks unchecked. `min task run` shares this prep, never
+    /// checked them before the helper was shared, and has no `--no-hooks` to
+    /// get past a refusal.
+    StageOnly,
+    /// Leave every hook alone: `--no-hooks` already disabled them.
+    Disabled,
 }
 
 /// Read the client config and user policy, resolve `selection` into the
@@ -586,8 +589,7 @@ pub(crate) fn prepare_activation_inputs(
     global: &GlobalArgs,
     project: &camino::Utf8Path,
     selection: LoadoutSelection,
-    hooks_enabled: bool,
-    project_hooks: ProjectHookCheck,
+    hooks: HookPrep,
     user_policy_override: Option<boxes::core::policy::UserPolicy>,
 ) -> Result<ActivationInputs, anyhow::Error> {
     let cfg = read_client_config(global)?;
@@ -596,8 +598,7 @@ pub(crate) fn prepare_activation_inputs(
         global,
         project,
         selection,
-        hooks_enabled,
-        project_hooks,
+        hooks,
         user_policy_override,
     )
 }
@@ -611,10 +612,10 @@ pub(crate) fn prepare_activation_inputs_with_config(
     global: &GlobalArgs,
     project: &camino::Utf8Path,
     selection: LoadoutSelection,
-    hooks_enabled: bool,
-    project_hooks: ProjectHookCheck,
+    hooks: HookPrep,
     user_policy_override: Option<boxes::core::policy::UserPolicy>,
 ) -> Result<ActivationInputs, anyhow::Error> {
+    let hooks_enabled = hooks != HookPrep::Disabled;
     let project =
         paths::HostAbsPath::try_new(project.to_path_buf()).context("Invalid project root")?;
     let project = &project;
@@ -633,9 +634,8 @@ pub(crate) fn prepare_activation_inputs_with_config(
     let hook_scripts = stage_loadout_hook_scripts(&active, project, hooks_enabled)?;
     // The project's hooks reach the daemon inside the uploaded mfile, so they
     // never pass through the staging above; the checks a staging pass would
-    // have made are still worth making here. Callers whose pre-shared path did
-    // not make them opt out through `project_hooks`.
-    if hooks_enabled && project_hooks == ProjectHookCheck::Enforce {
+    // have made are still worth making here, for the callers that ask.
+    if hooks == HookPrep::Enforce {
         check_project_hooks(project)?;
     }
     let hook_budget = activate_hook_budget(&active, project.as_utf8_path(), hooks_enabled);
@@ -845,11 +845,11 @@ impl LoadoutRow {
 mod tests {
     use super::*;
 
-    /// `ProjectHookCheck::Skip` leaves alone a project whose hooks the
-    /// staging check would reject: `min task run` never refused one before the
-    /// prep was shared, and it has no `--no-hooks` to get past a refusal.
+    /// `HookPrep::StageOnly` leaves alone a project whose hooks the staging
+    /// check would reject: `min task run` never refused one before the prep
+    /// was shared, and it has no `--no-hooks` to get past a refusal.
     #[test]
-    fn project_hook_check_skip_keeps_task_runs_pre_shared_behaviour() {
+    fn hook_prep_stage_only_keeps_task_runs_pre_shared_behaviour() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(mfile::MFILE_NAME),
@@ -860,23 +860,22 @@ mod tests {
         let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         let global = GlobalArgs::default();
         let cfg = boxes::client::config::Config::default();
-        let prepare = |project_hooks| {
+        let prepare = |hooks| {
             prepare_activation_inputs_with_config(
                 &cfg,
                 &global,
                 root,
                 LoadoutSelection::None,
-                true,
-                project_hooks,
+                hooks,
                 Some(boxes::core::policy::UserPolicy::default()),
             )
         };
         assert!(
-            prepare(ProjectHookCheck::Enforce).is_err(),
+            prepare(HookPrep::Enforce).is_err(),
             "an empty inline hook is refused where the check runs"
         );
         assert!(
-            prepare(ProjectHookCheck::Skip).is_ok(),
+            prepare(HookPrep::StageOnly).is_ok(),
             "task run keeps its pre-shared behaviour"
         );
     }

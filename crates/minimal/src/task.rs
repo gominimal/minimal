@@ -692,7 +692,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // project root, not the directory `min task run` was invoked from, so a
     // task started in a subdirectory still finds the project's config.
     //
-    // `ProjectHookCheck::Skip` keeps this path's own behaviour: a task's hooks
+    // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
     // reach the daemon inside the uploaded mfile, and this command never
     // refused a project whose hook script the staging check rejects.
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
@@ -700,8 +700,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         global,
         &upload_root,
         selection,
-        true,
-        crate::loadouts::ProjectHookCheck::Skip,
+        crate::loadouts::HookPrep::StageOnly,
         Some(amended_policy),
     )?;
     inputs.announce_loadouts();

@@ -330,13 +330,11 @@ pub(crate) fn refuse_dropped_hooks_before_create(
     if decision != UploadDecision::SkipEmptyOrHome {
         return Ok(());
     }
-    refuse_dropped_hooks(
-        &WorkspaceUpload::SkippedEmptyOrHome {
-            dropped_hooks: project_lifecycle_hook_count(root),
-        },
-        root,
-        remedy,
-    )
+    let dropped_hooks = project_lifecycle_hook_count(root);
+    if dropped_hooks == 0 {
+        return Ok(());
+    }
+    Err(dropped_hooks_error(root, dropped_hooks, remedy))
 }
 
 /// What a refusing CLI caller tells the user of a `$HOME` create: which of
@@ -425,14 +423,6 @@ pub(crate) fn report_upload_outcome(
     }
 }
 
-/// The confirm `min session activate` and `min task run` ask before uploading
-/// an undeclared non-VCS root, with the root named in it.
-pub(crate) fn upload_confirm_prompt(root: &camino::Utf8Path) -> String {
-    format!(
-        "{root} is not a version control repository root. Upload all files from this directory?"
-    )
-}
-
 /// The CLI's whole workspace-upload step: the resolved-root notice, the
 /// interactive confirm, the spinner-bar transport, and the outcome's stderr
 /// lines. `decision` comes from the caller's plan step and `policy` is its
@@ -458,7 +448,15 @@ pub(crate) async fn cli_workspace_upload(
         id,
         root,
         decision,
-        || confirm(&upload_confirm_prompt(root), false),
+        || {
+            confirm(
+                &format!(
+                    "{root} is not a version control repository root. \
+                     Upload all files from this directory?"
+                ),
+                false,
+            )
+        },
         UploadProgress::Bar,
     )
     .await;

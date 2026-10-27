@@ -1044,6 +1044,18 @@ fn activation_project_root(
     }
 }
 
+/// The workspace upload a create planned, so the upload step holds one value
+/// instead of a root and a decision that are only meaningful together.
+enum UploadPlan {
+    /// `--sync none`: the daemon composes against an empty workspace.
+    Skip,
+    /// The tree to stream, and what the upload gate decided about it.
+    Workspace {
+        root: camino::Utf8PathBuf,
+        decision: UploadDecision,
+    },
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1227,16 +1239,15 @@ pub(crate) async fn activate_box(
     // `--sync tarball` (the escape hatch that force-uploads an empty dir
     // or `$HOME`) from the implicit default.
     let sync_explicit = args.sync.is_some();
-    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
 
     // Resolve the upload root before opening the daemon connection: a
     // malformed mfile in an ancestor should fail loudly before we create a
     // session on the daemon, so we don't leak a draft session. Resolved
     // before the loadout prep, which checks the project's own hooks and sizes
     // the finalize budget against the project root — not the directory the
-    // command was invoked from. Only needed for tarball sync: `--sync none`
-    // skips the upload entirely (#770).
-    let upload_root = match sync_mode {
+    // command was invoked from. Only needed for tarball sync, the default:
+    // `--sync none` skips the upload entirely (#770).
+    let upload_root = match args.sync.unwrap_or(SyncMode::Tarball) {
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
@@ -1265,14 +1276,13 @@ pub(crate) async fn activate_box(
             // The project root the upload will carry, so the project's own
             // hooks are checked and its `[session]` timeouts size the finalize
             // budget; a subdirectory invocation must not look empty.
-            let inputs = loadouts::prepare_activation_inputs(
-                global,
-                &project_root,
-                selection,
-                !args.no_hooks,
-                loadouts::ProjectHookCheck::Enforce,
-                None,
-            )?;
+            let hooks = if args.no_hooks {
+                loadouts::HookPrep::Disabled
+            } else {
+                loadouts::HookPrep::Enforce
+            };
+            let inputs =
+                loadouts::prepare_activation_inputs(global, &project_root, selection, hooks, None)?;
 
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
@@ -1314,31 +1324,29 @@ pub(crate) async fn activate_box(
     // at the upload step, once the session exists — so it is resolved here,
     // still before the create. A `$HOME` whose lifecycle hooks a skip would
     // drop refuses here rather than after a session and its row exist.
-    let upload_decision = ActivationStep::PlanUpload
+    let upload_plan = ActivationStep::PlanUpload
         .run(async {
-            set_project_root(&mut request, project_root.clone())?;
+            set_project_root(&mut request, project_root)?;
             // BOX-068: the box's spec, after every flag and the project's
             // policy are on the request.
             stamp_session_spec(&mut request, &utf8_path)?;
 
+            let Some(root) = upload_root else {
+                return Ok::<_, anyhow::Error>(UploadPlan::Skip);
+            };
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let upload_decision = upload_root.as_deref().map(|root| {
-                decide_workspace_upload(
-                    root,
-                    sync_explicit,
-                    headless,
-                    std::env::home_dir().as_deref(),
-                )
-            });
-            // `--no-hooks` already disabled the project's hooks, so a skip
-            // cannot drop anything by surprise.
-            if let Some(decision) = upload_decision
-                && !args.no_hooks
-                && let Some(root) = upload_root.as_deref()
-            {
-                refuse_dropped_hooks_before_create(decision, root, CLI_DROPPED_HOOKS_REMEDY)?;
+            let decision = decide_workspace_upload(
+                &root,
+                sync_explicit,
+                headless,
+                std::env::home_dir().as_deref(),
+            );
+            // Only a hooks-enabled activation refuses: `--no-hooks` already
+            // disabled the project's hooks, so it cannot drop any by surprise.
+            if !args.no_hooks {
+                refuse_dropped_hooks_before_create(decision, &root, CLI_DROPPED_HOOKS_REMEDY)?;
             }
-            Ok::<_, anyhow::Error>(upload_decision)
+            Ok(UploadPlan::Workspace { root, decision })
         })
         .await?;
 
@@ -1940,8 +1948,8 @@ pub(crate) async fn activate_box(
     // caller is on their own for getting files there.
     ActivationStep::UploadFiles
         .run(async {
-            match sync_mode {
-                SyncMode::None => {
+            match upload_plan {
+                UploadPlan::Skip => {
                     // `--sync none` skips the upload, so the daemon composes against
                     // an empty workspace and the project's `minimal.toml` — packages,
                     // vars, patches, hooks — is silently dropped. Say so when there
@@ -1951,11 +1959,7 @@ pub(crate) async fn activate_box(
                         eprintln!("{notice}");
                     }
                 }
-                SyncMode::Tarball => {
-                    let upload_root =
-                        upload_root.expect("upload_root is set for SyncMode::Tarball above");
-                    let decision =
-                        upload_decision.expect("decision is set for SyncMode::Tarball above");
+                UploadPlan::Workspace { root, decision } => {
                     // `--no-hooks` already disabled the project's hooks, so a
                     // skip cannot drop anything by surprise and says nothing
                     // about them.
@@ -1968,7 +1972,7 @@ pub(crate) async fn activate_box(
                         &mut client,
                         id,
                         &utf8_path,
-                        &upload_root,
+                        &root,
                         decision,
                         dropped_hooks,
                     )

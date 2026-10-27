@@ -1031,6 +1031,18 @@ fn next_confirm_token() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Discards keys already in flight when a prompt opens. They were typed
+/// before it appeared, so answering with one would make an `n` meant for the
+/// list create the box on an empty workspace; the prompt must wait for a
+/// deliberate answer.
+async fn discard_buffered_input(events: &mut crossterm::event::EventStream) {
+    use futures::StreamExt as _;
+    while tokio::time::timeout(std::time::Duration::ZERO, events.next())
+        .await
+        .is_ok()
+    {}
+}
+
 /// Show the oldest pending upload confirm if no other modal is open.
 fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) {
     if model.action.is_some() {
@@ -1135,17 +1147,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         let msg = match msg {
             Msg::CreateUploadConfirm { token, root, reply } => {
                 pending_confirms.push_back(PendingConfirm { token, root, reply });
-                // Keys already in flight were typed before this prompt
-                // appeared; answering with one would make a `n` meant for the
-                // list create the box on an empty workspace. Discard them so
-                // the prompt waits for a deliberate answer.
-                {
-                    use futures::StreamExt as _;
-                    while tokio::time::timeout(std::time::Duration::ZERO, events.next())
-                        .await
-                        .is_ok()
-                    {}
-                }
+                discard_buffered_input(&mut events).await;
                 show_pending_confirm(&mut model, &mut pending_confirms);
                 continue;
             }
@@ -1280,8 +1282,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                                 &global_blocking,
                                                 &root,
                                                 loadouts,
-                                                true,
-                                                crate::loadouts::ProjectHookCheck::Enforce,
+                                                crate::loadouts::HookPrep::Enforce,
                                                 Some(user_policy),
                                             )?;
                                         let decision = crate::decide_workspace_upload(
