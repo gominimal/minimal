@@ -12249,6 +12249,38 @@ proof_bep_store_reference_end_to_end() {
   fi
   echo "min secret set: stored $sr_id (${#sr_value} characters) with its rule for $sr_host, and printed no value"
 
+  # `bep serve` takes the root's names and the admitted CONNECT set from the
+  # store rules at start only (#2618), so a proxy that started before the
+  # rule refuses the upstream. Stop it, and let the restarted daemon pair
+  # start a proxy that reads the new rule. minvmd does not restart a
+  # `bep serve` that exits.
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock" sr_pids
+  sr_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+  if [ -n "$sr_pids" ]; then
+    # shellcheck disable=SC2086
+    kill -TERM $sr_pids 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      pgrep -f '/bep serve ' >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    sr_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    [ -n "$sr_pids" ] && kill -KILL $sr_pids 2>/dev/null
+    for _ in $(seq 1 20); do
+      bep_control_live "$sr_control" || break
+      sleep 0.5
+    done
+    if bep_control_live "$sr_control"; then
+      echo "::error::the proxy still answers on $sr_control after its process was stopped"
+      sr_fail
+    fi
+  fi
+  BEP_LIVE_DAEMON=""
+  bep_live_gate "$sr_case" no_sign_in || sr_fail
+  echo "the proxy restarted with the rule for $sr_host"
+
   # 2. The box spec references the identifier (BEP-032), and `min box spec`
   # shows the reference with its upstream (BEP-038).
   # Interim spelling: BEP-032 and Gatehouse 6.10 write a store reference as
