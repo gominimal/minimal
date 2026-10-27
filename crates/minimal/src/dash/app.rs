@@ -1037,10 +1037,12 @@ fn next_confirm_token() -> u64 {
 /// deliberate answer.
 async fn discard_buffered_input(events: &mut crossterm::event::EventStream) {
     use futures::StreamExt as _;
-    while tokio::time::timeout(std::time::Duration::ZERO, events.next())
-        .await
-        .is_ok()
-    {}
+    // Only a real event is discarded. A stream that ended (`None`) or failed
+    // (`Some(Err(_))`) stops the drain instead of spinning, and the main loop
+    // sees the stream end on its next read.
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(std::time::Duration::ZERO, events.next()).await
+    {
+    }
 }
 
 /// Show the oldest pending upload confirm if no other modal is open, and
