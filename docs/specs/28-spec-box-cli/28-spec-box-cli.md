@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/4d554e41e6e13ec55d3dc64d9282b883601f5818/architecture.md
 arch_sha: "4d554e41e6e13ec55d3dc64d9282b883601f5818"
-updated: 2026-10-16
+updated: 2026-10-27
 ---
 
 # BCLI — The box grammar — `min box`, the type nouns, and the migration from the session verbs
@@ -27,7 +27,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - AS A developer or an agent, I WANT `min box start|run|list|show|spec|stop|rm|prune|resume|logs|wait|events|cp|exec|attach` for any box and `min session list|start|attach|logs|stop|rm`, `min task run|list|logs|stop|rm` as aliases, SO THAT one verb means one thing under every noun, and a script written for a session works for a task.
 - AS A developer debugging any box, I WANT `min box exec <box> [-t] [--detach] -- <cmd>` to run a command inside a running box under its own namespaces, limits, and posture, with a re-attachable PTY when I ask for one, SO THAT I can get a shell into a task or check a session without another mechanism.
 - AS A developer with scripts and muscle memory, I WANT `min session activate`, `min session destroy`, `min session exec`, and bare `min stop` to keep working for one release with a hint naming the new verb, SO THAT the rename is a migration I can schedule, not a break I discover.
-- AS A developer, I WANT `min provider list --all` to show `local0` and `local-minvmd0`, and `min host list|show|stop` to work on them, SO THAT the daemon I stop, the VM I look at, and the provider a remote box will come from are one vocabulary.
+- AS A developer, I WANT `min provider list --all` to show `local` and `local-minvmd`, and `min host list|show|stop` to work on their hosts, SO THAT the daemon I stop, the VM I look at, and the provider a remote box will come from are one vocabulary.
 
 ## Requirements
 
@@ -414,10 +414,13 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal docs_describe_new_grammar_with_migration_note
 
-- **BCLI-046** THE SYSTEM SHALL name the well-known local providers `local0..N` (native daemon) and `local-minvmd0..N` (one per VM), each with exactly one host of the same name, and accept `local-minimald` and `local-minvmd` as aliases for one release with a hint.
-  <!-- was BOX-112 -->
+- **BCLI-046** THE SYSTEM SHALL name the well-known local providers `local`, `local-minvmd` and `local-box`, and name each of their hosts by its daemon instance (`local0..N`, `local-minvmd0..N`).
+  <!-- was BOX-112; one provider per local deployment style, hosts carry the instance names: ruled on gominimal/arch#45, 2026-10-27 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal local_provider_names_and_aliases
+  verify:   cargo nextest run -p minimal local_provider_and_host_names
+  - WHERE `--provider local-minimald` is given THE SYSTEM SHALL read it as `local` for one release and print one stderr hint naming `local`.
+    tier:   T0
+    verify: cargo nextest run -p minimal local_minimald_alias_reads_as_local
 
 - **BCLI-047** WHEN `min host list` runs THE SYSTEM SHALL render each local host with its name and state, beside the resource figures the resources spec (gominimal/inbox#698; BRES) adds.
   <!-- was BOX-113 -->
@@ -454,7 +457,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - Resource verbs and figures (`min host list|show` capacity, allocatable, allocated, default box size and enforcement; the 137 return on an OOM end): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - Volume verbs (`min volume list|show|rm|prune`): `docs/specs/27-spec-box-volumes` (BVOL), which carries them as BVOL-006, BVOL-007 and BVOL-012. BRES and BVOL keep their own verbs because they are small and move with the behaviour they render.
 - The dash (epic story S14): an amendment to `docs/specs/07-spec-min-dash-tui`.
-- The local providers serving the Box Provider API (epic story S16): they wait on gominimal/arch#45, and `min host` and `min provider` read the daemon directly until then.
+- The local providers serving the Box Provider API (epic story S16). The daemons serve them over their Unix sockets, and `min` calls them as it calls any provider (ruled on gominimal/arch#45, 2026-10-27). The Box Provider requirements spec (BPA) owns those listeners, and that ruling moves it into this repository. Until the daemons serve it, `min host` and `min provider` read the daemon directly.
 - `min box sync`, `min box port` and `min box add`: the architecture's `min box` reference. This epic does not schedule them.
 - `--provider` and `--all-providers` on the `min box` verbs: they select remote providers, which wait on the Box Provider API (gominimal/arch#45).
 - `min box list --using <pkg>[@<ver>]`: it reads a box's SBOM, which the SBOM epic owns (gominimal/inbox#582).
@@ -497,6 +500,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **`min box wait` returns 128 plus the stored signal.** The owner decided on 2026-09-25 that a stop ended by a signal stores that signal (BOX-011, BOX-013) and that BCLI-013 returns 128 plus it, the shell convention: 143 for SIGTERM, 137 for SIGKILL. The alternative, a fixed reserved code for every stop, was rejected by the owner. A record BOX-154 set to `stopped` stores no signal, because the daemon that ended it is gone; BCLI-013 returns 137 for it, the code of a process killed outright, which is what an unclean daemon end amounts to.
 
+**One provider per local deployment style, with hosts named after the instances.** Ruled on gominimal/arch#45 on 2026-10-27. It replaces this spec's earlier reading, one provider per daemon with one host of the same name. The `0..N` suffix is the state-directory convention, so it names hosts, not providers. `local` serves the native daemons on this machine, `local-minvmd` serves its VMs, and `local-box` serves the parent daemon of the box `min` runs in. `local-minvmd/local-minvmd0/<box>` is a box on the first VM, and `--provider local-minvmd --host local-minvmd0` names that VM. BCLI-046 no longer expires `local-minvmd`, so NET-049, NET-051 and TEL-034 already cite the right spelling. `local-box` exists only inside a box, which needs nesting (Non-goals), so BCLI-052 lists it only where it is present. A local host's endpoint is `unix:<path>` with port 0. The socket's file mode is its access control, as §3 of the Box Provider API states.
+
 **`min host show` names the host-side socket only.** On the VM provider it is the host-side socket the client connects to (BCLI-048); adding the in-VM path was rejected as an in-VM fact the client never uses.
 
 **Stopping a VM host runs on the VM lane.** It exists only with the VM host daemon in the loop, so BCLI-049's test names the VM lane (NET-107) rather than `tier: none`, which would have left the VM path unverified.
@@ -520,7 +525,6 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - `min session destroy`: BEP-043.
 - `min session exec`: a NET-015 sub-bullet.
 - Bare `min stop`: TEL-011.
-- `--provider local-minvmd`, which BCLI-046 expires: NET-049, NET-051 and TEL-034.
 
 BCLI-042's sub-bullet expires each BCLI-042 or BCLI-046 alias after the release that accepted it. That expiry takes effect only once every requirement listed for the alias cites the new spelling.
 
