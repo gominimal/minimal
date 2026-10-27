@@ -2286,3 +2286,284 @@ async fn restart_keeps_running_records_and_reaps_pending_ones() {
         "the restart keeps a running record"
     );
 }
+
+/// Milliseconds since the Unix epoch, the unit of an event's `ts`.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// The directories a box sees: every one of them is mounted into it.
+async fn box_visible_dirs(mngr: &BoxManagerHandle, id: SessionId) -> Vec<DaemonAbsPath> {
+    let paths = session(mngr, id).await.paths().await.unwrap();
+    vec![
+        paths.working,
+        paths.cache,
+        paths.home,
+        paths.patches,
+        paths.hooks,
+    ]
+}
+
+/// BOX-040: creating a box writes its `created` event, naming the box,
+/// its parent and when, into a file beside the record in the daemon's
+/// state directory, outside every directory the box sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_written_outside_box_filesystem_with_box_parent_ts_type() {
+    let (state, _cache, mngr) = manager().await;
+    let before = now_ms();
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let after = now_ms();
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(events.len(), 1, "one event per transition: {events:?}");
+    let created = &events[0];
+    assert_eq!(created.kind, BoxEventType::Created);
+    assert_eq!(created.box_id, id);
+    assert_eq!(
+        created.parent, None,
+        "a box created outside any box has no parent"
+    );
+    assert!(
+        (before..=after).contains(&created.ts),
+        "{before} <= {} <= {after}",
+        created.ts
+    );
+
+    let events_path = reader.object.events_path();
+    let events_path = events_path.as_utf8_path();
+    let sessions = camino::Utf8Path::from_path(state.path())
+        .unwrap()
+        .join("sessions");
+    assert!(events_path.starts_with(&sessions));
+    assert!(
+        events_path.parent().unwrap().join("record.json").exists(),
+        "the events file sits beside the record"
+    );
+    for seen in box_visible_dirs(&mngr, id).await {
+        assert!(
+            !events_path.starts_with(seen.as_utf8_path()),
+            "{events_path} is inside {seen}, which the box sees"
+        );
+    }
+}
+
+/// BOX-041, placement only: the box's events file is outside every
+/// directory the box can see. An events file written into those
+/// directories, whatever it claims, is not the box's events. The read
+/// returns only what the daemon wrote. No process runs inside a box here.
+/// The proof that uid 0 inside a real sandbox cannot append is the
+/// `_root_integration` test that #2661 owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_box_root_cannot_append_events() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+
+    let forged = BoxEvent {
+        box_id: id,
+        parent: None,
+        ts: now_ms(),
+        kind: BoxEventType::Exited,
+        data: EventData::new(),
+    };
+    let line = forged.to_line().unwrap();
+    for seen in box_visible_dirs(&mngr, id).await {
+        let dir = seen.as_utf8_path();
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [boxes::events::EVENTS_FILE, "record.json"] {
+            std::fs::write(dir.join(name), &line).unwrap();
+        }
+    }
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [BoxEventType::Created],
+        "no event written inside the box reaches its stream"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(reader.object.events_path().as_utf8_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "only the daemon's user can open it");
+    }
+}
+
+/// BOX-162: a complete line of the events file that is not an event
+/// makes the read fail with `InvalidData`, naming the line's byte offset.
+/// The read cannot return every retained event, so it does not end as
+/// complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_fails_on_a_refused_line() {
+    use std::io::Write as _;
+
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let path = reader.object.events_path();
+    let bad_at = std::fs::metadata(path.as_utf8_path()).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_utf8_path())
+        .unwrap()
+        .write_all(b"not an event\n")
+        .unwrap();
+
+    let err = reader.read_new().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&format!("byte {bad_at}")),
+        "the error names the offset: {err}"
+    );
+}
+
+/// BOX-040: the event a writer passes `data` to carries it, and reads back
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_event_carries_its_data() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let created = reader.read_new().unwrap();
+    assert!(created[0].data.is_empty(), "created carries an empty data");
+
+    let data: EventData = [("reason".to_string(), "stopped".into())]
+        .into_iter()
+        .collect();
+    let written = write_box_event(&reader.object, BoxEventType::Exited, data.clone()).unwrap();
+    assert_eq!(written.data, data);
+    assert_eq!(reader.read_new().unwrap(), [written]);
+}
+
+/// Drives the `ReadEvents` subsystem: writes the request and half-closes,
+/// and returns the response lines as they arrive.
+async fn open_events_read(
+    client: &mut crate::test_harness::TestClient,
+    id: SessionId,
+    follow: bool,
+) -> tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let channel = client
+        .open_subsystem(minimald_rpc::READ_EVENTS_SUBSYSTEM, &[])
+        .await;
+    let mut stream = channel.into_stream();
+    let req = minimald_rpc::ReadEventsRequest { id, follow };
+    stream
+        .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    tokio::io::BufReader::new(stream).lines()
+}
+
+/// The next update line, or `None` at the end of the stream.
+async fn next_update(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>>,
+) -> Option<minimald_rpc::ReadEventsUpdate> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+        .await
+        .expect("the read answers in time")
+        .unwrap()
+        .map(|line| serde_json_lenient::from_str(&line).expect("each line is an update"))
+}
+
+/// BOX-162: a read of a box's events returns every retained event, in
+/// the order the daemon wrote them, then `Done`. A read of a box no
+/// record names returns no event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_returns_full_retained_stream_in_order() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "evts", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut written = reader.object.read_events_from(0).unwrap().events;
+    assert_eq!(written[0].kind, BoxEventType::Created);
+    for kind in [
+        BoxEventType::Started,
+        BoxEventType::ExecStarted,
+        BoxEventType::ExecExited,
+        BoxEventType::Detached,
+        BoxEventType::Resumed,
+        BoxEventType::Renamed,
+        BoxEventType::OomKilled,
+        BoxEventType::Exited,
+    ] {
+        written.push(write_box_event(&reader.object, kind, EventData::new()).unwrap());
+    }
+
+    let mut lines = open_events_read(&mut client, id, false).await;
+    let mut read = Vec::new();
+    while let Some(update) = next_update(&mut lines).await {
+        read.push(update);
+    }
+    let mut expected: Vec<ReadEventsUpdate> = written
+        .into_iter()
+        .map(|event| ReadEventsUpdate::Event { event })
+        .collect();
+    expected.push(ReadEventsUpdate::Done);
+    assert_eq!(read, expected);
+
+    let mut lines = open_events_read(&mut client, SessionId::mint(), false).await;
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "an unknown box has no events"
+    );
+}
+
+/// BOX-162: a followed read returns every retained event, then each new
+/// one as it is written, and ends with `Reaped` once the box is reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_follow_replays_then_tails_until_reaped() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "tail", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut retained = reader.object.read_events_from(0).unwrap().events;
+    retained
+        .push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
+
+    let mut lines = open_events_read(&mut client, id, true).await;
+    for event in retained {
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event })
+        );
+    }
+
+    for kind in [BoxEventType::Detached, BoxEventType::Resumed] {
+        let event = write_box_event(&reader.object, kind, EventData::new()).unwrap();
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event }),
+            "a new event reaches the follower"
+        );
+    }
+
+    mngr.delete_session(id).await.unwrap();
+    assert_eq!(
+        next_update(&mut lines).await,
+        Some(ReadEventsUpdate::Reaped)
+    );
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "the stream ends at the reap"
+    );
+}
