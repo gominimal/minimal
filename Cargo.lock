@@ -463,10 +463,12 @@ dependencies = [
  "aes-gcm",
  "base64 0.23.1",
  "clap",
+ "client-config",
  "core-foundation",
  "getrandom 0.3.4",
  "libc",
  "p256",
+ "paths",
  "proptest",
  "rcgen",
  "reqwest",
@@ -687,6 +689,7 @@ name = "boxes"
 version = "0.0.1"
 dependencies = [
  "camino",
+ "client-config",
  "common",
  "globset",
  "hex",
@@ -1007,6 +1010,18 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "client-config"
+version = "0.0.1"
+dependencies = [
+ "indoc",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "close_fds"
