@@ -2534,7 +2534,8 @@ async fn events_follow_replays_then_tails_until_reaped() {
     let mngr = server.state.sessions_manager().await;
     let reader = mngr.box_events(id).await.unwrap();
     let mut retained = reader.object.read_events_from(0).unwrap().events;
-    retained.push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
+    retained
+        .push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
 
     let mut lines = open_events_read(&mut client, id, true).await;
     for event in retained {
