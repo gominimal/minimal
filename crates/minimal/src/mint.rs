@@ -130,6 +130,16 @@ pub enum MintError {
         /// The proxy's bound.
         max: usize,
     },
+    /// The rule is read from a `min --config-dir` override, and `bep serve`
+    /// does not hold the same rule, so it would not redeem the handle.
+    RuleNotRead {
+        /// The rule's item identifier.
+        id: String,
+        /// The client configuration that `bep serve` reads.
+        bep_config: PathBuf,
+        /// The `--config-dir` override.
+        config_dir: PathBuf,
+    },
 }
 
 impl fmt::Display for MintError {
@@ -203,6 +213,19 @@ impl fmt::Display for MintError {
                 f,
                 "min did not create the box: the Box Egress Proxy already holds {max} client keys, \
                  and running boxes use each one. A key is freed when the last box created under it ends."
+            ),
+            // The exact text the task fixes for a rule that `bep serve`
+            // does not read (BEP-032).
+            Self::RuleNotRead {
+                id,
+                bep_config,
+                config_dir,
+            } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                config_dir.display()
             ),
         }
     }
@@ -1340,6 +1363,8 @@ impl fmt::Debug for StoreHandle {
 /// [`MintError::Identity`] when the identity has no usable sealing key or
 /// root validity, [`MintError::RootExpired`] when that validity ended, and
 /// the control socket's errors. A refused key is [`MintError::Refused`].
+/// [`MintError::RuleNotRead`] when `config_dir`, the `min --config-dir`
+/// override, gives a rule that `bep serve` does not hold.
 #[cfg_attr(
     not(test),
     expect(
@@ -1354,8 +1379,18 @@ pub fn mint_store_handle(
     key: &ClientKey,
     box_id: &str,
     rule: &StoreRule,
+    config_dir: Option<&Path>,
     now: u64,
 ) -> Result<StoreHandle, MintError> {
+    if let Some(dir) = config_dir {
+        let bep_config = paths::minimal_config_dir_with_override(None).join("config.toml");
+        bep_reads_store_rule(
+            rule,
+            dir,
+            &bep_config,
+            Path::new(crate::config::ORGANIZATION_CONFIG_PATH),
+        )?;
+    }
     let box_id = box_id_hex(box_id)?;
     let node = identity
         .key(bep::keys::Role::Sealing)
@@ -1380,6 +1415,72 @@ pub fn mint_store_handle(
         "minted a store handle"
     );
     Ok(StoreHandle { jws, jti, expiry })
+}
+
+/// Refuses `rule`, read under the `min --config-dir` override `config_dir`,
+/// unless `bep serve` holds the same rule (BEP-032). `bep serve` reads
+/// `bep_config` merged over `organization` and never the override, because
+/// `minvmd` starts it with no `--config-dir`. A handle under a rule that it
+/// does not hold, or holds in another form, is not redeemed as minted.
+fn bep_reads_store_rule(
+    rule: &StoreRule,
+    config_dir: &Path,
+    bep_config: &Path,
+    organization: &Path,
+) -> Result<(), MintError> {
+    let user = paths::minimal_config_dir_with_override(Some(config_dir)).join("config.toml");
+    if user == bep_config {
+        return Ok(());
+    }
+    let module_hosts = crate::config::store_module_hosts();
+    // A file that does not read gives `bep serve` no rules at all.
+    let held = boxes::client::config::read_client_store_rules(
+        bep_config,
+        organization,
+        crate::config::store_deny_set(&module_hosts),
+    )
+    .ok()
+    .filter(|read| read.organization_error.is_none())
+    .and_then(|read| {
+        read.rules
+            .get(&rule.id)
+            .and_then(|held| proxy_rule(&rule.id, held))
+    });
+    if held.as_ref() == Some(rule) {
+        return Ok(());
+    }
+    Err(MintError::RuleNotRead {
+        id: rule.id.clone(),
+        bep_config: bep_config.to_owned(),
+        config_dir: config_dir.to_owned(),
+    })
+}
+
+/// The form `bep serve` holds a checked rule in, as its `store_rule` makes
+/// it: none for a `deny` rule or a rule with no single injection form.
+fn proxy_rule(id: &str, rule: &boxes::core::bep::StoreRuleConfig) -> Option<StoreRule> {
+    if rule.action == Some(boxes::core::bep::StoreAction::Deny) {
+        return None;
+    }
+    let inject = match (&rule.header, &rule.basic_auth) {
+        (Some(name), None) => handle::Inject::Header {
+            name: name.clone(),
+            prefix: rule.prefix.clone(),
+        },
+        (None, Some(field)) => handle::Inject::BasicAuth {
+            field: field.clone(),
+        },
+        _ => return None,
+    };
+    Some(StoreRule {
+        store: rule
+            .store
+            .clone()
+            .unwrap_or_else(|| bep::store::NATIVE_STORE.to_owned()),
+        id: id.to_owned(),
+        upstream: rule.upstream.clone(),
+        inject,
+    })
 }
 
 /// Tells the proxy at `path` to forget `box_id` over a new connection, so
@@ -1608,6 +1709,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1641,6 +1743,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1656,6 +1759,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1677,6 +1781,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1906,6 +2011,7 @@ mod tests {
                 key,
                 BOX_ID,
                 &rule(),
+                None,
                 NOW,
             )
             .unwrap();
@@ -2142,5 +2248,56 @@ mod tests {
         let err = local_client_key_at(&RefusingThenFailing, &path).unwrap_err();
         assert!(matches!(err, MintError::KeyStore(_)), "{err}");
         assert!(clients.read().unwrap().contains(&old.kid()));
+    }
+
+    // BEP-032: `bep serve` reads the default config dir only, so a store
+    // handle under a rule from a `--config-dir` override is minted only when
+    // `bep serve` holds the same rule, and refused with the reason otherwise.
+    #[test]
+    fn a_store_rule_under_config_dir_is_minted_only_when_bep_reads_it() {
+        const NPM: &str = "[secret-store-rules.npm-token]\n\
+                           upstream = [\"registry.npmjs.org\"]\n\
+                           header = \"Authorization\"\n\
+                           prefix = \"Bearer \"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let bep_config = dir.path().join("default/minimal/config.toml");
+        let organization = dir.path().join("etc/config.toml");
+        let over = dir.path().join("over");
+        std::fs::create_dir_all(over.join("minimal")).unwrap();
+        std::fs::write(over.join("minimal/config.toml"), NPM).unwrap();
+        let check = || bep_reads_store_rule(&rule(), &over, &bep_config, &organization);
+
+        // The rule exists only below the override: refused, with the reason.
+        let err = check().unwrap_err();
+        assert!(matches!(err, MintError::RuleNotRead { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                over.display()
+            )
+        );
+
+        // `bep serve` holds the rule in another form: refused.
+        std::fs::create_dir_all(bep_config.parent().unwrap()).unwrap();
+        std::fs::write(&bep_config, NPM.replace("Bearer ", "Token ")).unwrap();
+        assert!(matches!(check(), Err(MintError::RuleNotRead { .. })));
+
+        // `bep serve` holds the same rule: minted.
+        std::fs::write(&bep_config, NPM).unwrap();
+        check().unwrap();
+
+        // An override that names the default config dir is what `bep serve`
+        // reads, whatever the file holds.
+        std::fs::write(&bep_config, "").unwrap();
+        bep_reads_store_rule(
+            &rule(),
+            &dir.path().join("default"),
+            &bep_config,
+            &organization,
+        )
+        .unwrap();
     }
 }
