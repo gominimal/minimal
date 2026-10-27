@@ -1043,17 +1043,22 @@ async fn discard_buffered_input(events: &mut crossterm::event::EventStream) {
     {}
 }
 
-/// Show the oldest pending upload confirm if no other modal is open.
-fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) {
+/// Show the oldest pending upload confirm if no other modal is open, and
+/// report whether one opened. A queued confirm shown behind an open modal
+/// must leave that modal's keystrokes alone; the caller drains in-flight
+/// input only when the confirm actually appears.
+fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) -> bool {
     if model.action.is_some() {
-        return;
+        return false;
     }
-    if let Some(p) = pending.front() {
-        model.action = Some(Action::ConfirmCreateUpload {
-            token: p.token,
-            root: p.root.clone(),
-        });
-    }
+    let Some(p) = pending.front() else {
+        return false;
+    };
+    model.action = Some(Action::ConfirmCreateUpload {
+        token: p.token,
+        root: p.root.clone(),
+    });
+    true
 }
 
 /// Entry point for `min dash`: discover providers, then drive the
@@ -1147,8 +1152,9 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
         let msg = match msg {
             Msg::CreateUploadConfirm { token, root, reply } => {
                 pending_confirms.push_back(PendingConfirm { token, root, reply });
-                discard_buffered_input(&mut events).await;
-                show_pending_confirm(&mut model, &mut pending_confirms);
+                if show_pending_confirm(&mut model, &mut pending_confirms) {
+                    discard_buffered_input(&mut events).await;
+                }
                 continue;
             }
             other => other,
@@ -1170,7 +1176,9 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             let _ = p.reply.send(answer);
                         }
                     }
-                    show_pending_confirm(&mut model, &mut pending_confirms);
+                    if show_pending_confirm(&mut model, &mut pending_confirms) {
+                        discard_buffered_input(&mut events).await;
+                    }
                 }
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
@@ -1390,8 +1398,11 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
             }
         }
         // A modal may have just closed (a destroy/rename/create answered): if
-        // a create confirm was queued behind it, show it now.
-        show_pending_confirm(&mut model, &mut pending_confirms);
+        // a create confirm was queued behind it, show it now, dropping keys
+        // typed before it appeared.
+        if show_pending_confirm(&mut model, &mut pending_confirms) {
+            discard_buffered_input(&mut events).await;
+        }
         if model.quit {
             break;
         }
@@ -2108,14 +2119,15 @@ mod tests {
             },
         ]);
 
-        // Another modal owns the footer: the confirm waits.
+        // Another modal owns the footer: the confirm waits, and says so, so
+        // the caller leaves that modal's keystrokes alone.
         model.action = Some(Action::ConfirmDestroy(skey("host", 1), "x".into()));
-        show_pending_confirm(&mut model, &mut pending);
+        assert!(!show_pending_confirm(&mut model, &mut pending));
         assert!(matches!(model.action, Some(Action::ConfirmDestroy(..))));
 
         // With the footer free, the oldest confirm shows, keyed by its token.
         model.action = None;
-        show_pending_confirm(&mut model, &mut pending);
+        assert!(show_pending_confirm(&mut model, &mut pending));
         assert!(matches!(
             model.action,
             Some(Action::ConfirmCreateUpload { token: 1, .. })
