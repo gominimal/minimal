@@ -124,6 +124,12 @@ pub enum MintError {
     RootExpired,
     /// The client key store failed for a reason other than a refusal.
     KeyStore(String),
+    /// The proxy holds its bound of client keys, and running boxes use each
+    /// one, so it refused this client's key.
+    KeysInUse {
+        /// The proxy's bound.
+        max: usize,
+    },
 }
 
 impl fmt::Display for MintError {
@@ -190,6 +196,13 @@ impl fmt::Display for MintError {
             Self::KeyStore(detail) => write!(
                 f,
                 "Cannot start the box: the host keychain did not give this client's signing key: {detail}."
+            ),
+            // The exact text the task fixes for a registration that the
+            // bound refuses (BEP-063).
+            Self::KeysInUse { max } => write!(
+                f,
+                "min did not create the box: the Box Egress Proxy already holds {max} client keys, \
+                 and running boxes use each one. A key is freed when the last box created under it ends."
             ),
         }
     }
@@ -311,9 +324,12 @@ pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintErr
 ///    and the next creation tries again.
 /// 2. The store keeps the replacement. A store that fails leaves every old
 ///    key registered, so running boxes keep their store handles.
-/// 3. `replace_client_key` revokes every other key. Before this step, a
-///    pending-revoke file next to the control socket records the
-///    replacement's identifier, and a successful revoke removes the file.
+/// 3. `replace_client_key` revokes every other key that no running box
+///    uses. A key that a running box uses keeps verifying until the last
+///    such box is forgotten, and then the proxy revokes it. Before this
+///    step, a pending-revoke file next to the control socket records the
+///    replacement's identifier, and the client removes the file when the
+///    revoke succeeds.
 ///    A failure here leaves the replacement registered and in the store,
 ///    and is logged at warn. The next creation finds the replacement in the
 ///    store and the pending file under its identifier, and revokes again.
@@ -369,7 +385,7 @@ pub fn local_client_key_at(
     }
     let key = ClientKey::generate()?;
     if replacing {
-        ControlClient::connect(control)?.register_client_key(&key)?;
+        ControlClient::connect(control)?.register_client_key(&key, None)?;
     }
     if replacing && let Err(error) = std::fs::write(&pending, key.kid()) {
         // Without the file, a failed revoke below is not retried.
@@ -864,16 +880,26 @@ impl ControlClient {
     }
 
     /// Registers `key` with the proxy, so it verifies handles signed under
-    /// it (BEP-063).
+    /// it (BEP-063). With `box_id`, the proxy records that the box uses the
+    /// key, and keeps the key until the box is forgotten.
     ///
     /// # Errors
     ///
-    /// [`MintError::Control`] when the connection fails, and
-    /// [`MintError::Refused`] when the proxy refuses the key.
-    pub fn register_client_key(&mut self, key: &ClientKey) -> Result<(), MintError> {
+    /// [`MintError::Control`] when the connection fails,
+    /// [`MintError::KeysInUse`] when the proxy's bound is full of keys that
+    /// running boxes use, and [`MintError::Refused`] when the proxy refuses
+    /// the key for another reason.
+    pub fn register_client_key(
+        &mut self,
+        key: &ClientKey,
+        box_id: Option<&str>,
+    ) -> Result<(), MintError> {
         let kid = key.kid();
         match self.ask(
-            &Request::RegisterClientKey { key: key.public() },
+            &Request::RegisterClientKey {
+                key: key.public(),
+                box_id: box_id.map(str::to_owned),
+            },
             CLIENT_KEY,
         ) {
             Ok(_) => {
@@ -885,6 +911,9 @@ impl ControlClient {
             Err(error) => {
                 if let MintError::Refused { error: reason, .. } = &error {
                     tracing::warn!(kid, reason, "the proxy refused the client signing key");
+                    if let Some(max) = bep::control::keys_in_use_bound(reason) {
+                        return Err(MintError::KeysInUse { max });
+                    }
                 }
                 Err(error)
             }
@@ -1217,7 +1246,7 @@ pub fn mint_and_register(
     // delivered. It goes last, so no failed step leaves it registered.
     // A failed key reply, a read timeout for one, can leave the late reply
     // on this connection, so the forget goes over a new one here too.
-    if let Err(error) = control.register_client_key(key) {
+    if let Err(error) = control.register_client_key(key, Some(&box_id)) {
         forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
     }
@@ -1340,7 +1369,7 @@ pub fn mint_store_handle(
     let claims = store_claims(&box_id, &node, rule, now, expiry, jti.clone());
     let jws = Zeroizing::new(handle::sign(&key.0, &claims));
     // BEP-063: the key is registered before the handle leaves this process.
-    control.register_client_key(key)?;
+    control.register_client_key(key, Some(&box_id))?;
     tracing::info!(
         box_id = %box_id,
         store = %rule.store,
@@ -1374,7 +1403,8 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 /// behind (BEP-003).
 ///
 /// The client's key stays registered: the control socket has no request
-/// that withdraws a key. The client keeps that key for its next mint.
+/// that withdraws a key. The forget ends the box's use of the key, and the
+/// client keeps that key for its next mint.
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box
@@ -1828,7 +1858,7 @@ mod tests {
         let old = ClientKey::generate().unwrap();
         ControlClient::connect(&path)
             .unwrap()
-            .register_client_key(&old)
+            .register_client_key(&old, None)
             .unwrap();
         let store = RefusingOnce {
             replaced: RefCell::new(false),
@@ -1853,12 +1883,15 @@ mod tests {
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
     }
 
-    // BEP-063: a key the keychain refuses is revoked at the proxy when it is
-    // replaced. A store handle signed under it is refused, after a restart
-    // too, and a proxy that refuses the replacement leaves the store as it
-    // was, so the next creation tries again.
+    // BEP-063: a key the keychain refuses is replaced, and the proxy keeps
+    // the old key verifying the store handles and sign-in references of the
+    // boxes created under it until those boxes end, after a restart too
+    // (the ruling on gominimal/arch#144). The forget of the last such box
+    // revokes the old key. A proxy that refuses the replacement leaves the
+    // store as it was, so the next creation tries again.
     #[test]
-    fn a_replaced_client_key_is_revoked_at_the_proxy() {
+    fn a_replaced_client_key_keeps_verifying_until_its_boxes_end() {
+        const SIGNED_IN_BOX: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f6";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");
         let (_, identity) = proxy_identity(ROOT_END);
@@ -1881,10 +1914,18 @@ mod tests {
         let verifies = |clients: &Registry, jws: &str| {
             bep::handle::verify(jws, &clients.read().unwrap()).is_ok()
         };
+        let holds =
+            |clients: &Registry, key: &ClientKey| clients.read().unwrap().contains(&key.kid());
 
         let (runtime, clients) = serve_control(&path);
+        // One box holds a store handle under the old key, and another a
+        // sign-in reference.
         let before = mint(&old);
         assert!(verifies(&clients, &before));
+        let kept = Kept::default();
+        kept.replace(&old).unwrap();
+        let (signed, _) = create(&kept, &identity, &path, SIGNED_IN_BOX).unwrap();
+        assert_eq!(signed.kid(), old.kid());
 
         let store = RefusingOnce {
             replaced: RefCell::new(false),
@@ -1892,13 +1933,38 @@ mod tests {
         };
         let replacement = local_client_key_at(&store, &path).unwrap();
         assert_ne!(replacement.kid(), old.kid());
+        assert!(holds(&clients, &replacement));
+        // The replacement finished, and the old key still verifies.
+        assert!(!pending_revoke_path(&path).exists());
+        assert!(verifies(&clients, &before));
+        assert!(holds(&clients, &old));
+        drop(runtime);
+
+        let (runtime, clients) = serve_control(&path);
+        assert!(verifies(&clients, &before));
+        assert!(holds(&clients, &replacement));
+
+        // The store handle's box ends. The sign-in reference's box runs on,
+        // so the old key stays.
+        ControlClient::connect(&path)
+            .unwrap()
+            .forget_box(BOX_HEX)
+            .unwrap();
+        assert!(verifies(&clients, &before));
+        // The last box ends, and the old key no longer verifies.
+        ControlClient::connect(&path)
+            .unwrap()
+            .forget_box(&box_id_hex(SIGNED_IN_BOX).unwrap())
+            .unwrap();
         assert!(!verifies(&clients, &before));
-        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        assert!(!holds(&clients, &old));
+        assert!(holds(&clients, &replacement));
+        assert_eq!(kept_registrations(&path), vec![replacement.public()]);
         drop(runtime);
 
         let (_restarted, clients) = serve_control(&path);
         assert!(!verifies(&clients, &before));
-        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        assert!(holds(&clients, &replacement));
 
         let refusing = dir.path().join("refusing.sock");
         serve_refusing(&refusing);
@@ -1909,6 +1975,41 @@ mod tests {
         let err = local_client_key_at(&store, &refusing).unwrap_err();
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
         assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+    }
+
+    // BEP-063: when running boxes use every key the proxy holds, a
+    // replacement is refused, the creation fails with text that says why,
+    // and the store keeps the key it had.
+    #[test]
+    fn a_replacement_past_a_bound_of_keys_in_use_fails_the_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let mut control = ControlClient::connect(&path).unwrap();
+        for n in 0..bep::control::KeyBound::DEFAULT_MAX_KEYS {
+            let key = ClientKey::generate().unwrap();
+            control
+                .register_client_key(&key, Some(&format!("{n:032x}")))
+                .unwrap();
+        }
+        let old = ClientKey::generate().unwrap();
+        let store = RefusingOnce {
+            replaced: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let err = local_client_key_at(&store, &path).unwrap_err();
+        assert!(matches!(err, MintError::KeysInUse { max: 16 }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "min did not create the box: the Box Egress Proxy already holds 16 client keys, \
+             and running boxes use each one. A key is freed when the last box created under it ends."
+        );
+        assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert_eq!(
+            kept_registrations(&path).len(),
+            bep::control::KeyBound::DEFAULT_MAX_KEYS
+        );
     }
 
     /// A key store that refuses its key once, and that removes the proxy's
@@ -1941,7 +2042,7 @@ mod tests {
         let old = ClientKey::generate().unwrap();
         ControlClient::connect(&path)
             .unwrap()
-            .register_client_key(&old)
+            .register_client_key(&old, None)
             .unwrap();
         let store = RefusingThenUnlinking {
             inner: RefusingOnce {
@@ -1998,7 +2099,7 @@ mod tests {
         let other = ClientKey::generate().unwrap();
         ControlClient::connect(&path)
             .unwrap()
-            .register_client_key(&other)
+            .register_client_key(&other, None)
             .unwrap();
         let store = ReplacedMeanwhile {
             found: RefCell::new(false),
@@ -2035,7 +2136,7 @@ mod tests {
         let old = ClientKey::generate().unwrap();
         ControlClient::connect(&path)
             .unwrap()
-            .register_client_key(&old)
+            .register_client_key(&old, None)
             .unwrap();
 
         let err = local_client_key_at(&RefusingThenFailing, &path).unwrap_err();
