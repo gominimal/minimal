@@ -2185,9 +2185,6 @@ impl BoxManager {
     }
 }
 
-/// A teardown task that ended by a panic or a cancel took its responder
-/// with it, so its caller saw a closed channel and nothing said why: the
-/// join error is the only record of it, so it goes to the log.
 /// Deletes a record whose create failed before its id reached the caller.
 /// Best-effort: the create's own error is what the caller sees.
 async fn discard_new_record(handle: crate::store::BoxRecordHandle, why: &str) {
@@ -2346,6 +2343,9 @@ impl BoxManagerHandle {
     }
 }
 
+/// A teardown task that ended by a panic or a cancel took its responder
+/// with it, so its caller saw a closed channel and nothing said why: the
+/// join error is the only record of it, so it goes to the log.
 fn log_teardown_join(joined: Result<(), tokio::task::JoinError>) {
     if let Err(e) = joined {
         tracing::error!(error = %e, "a session teardown task did not finish on its own");
