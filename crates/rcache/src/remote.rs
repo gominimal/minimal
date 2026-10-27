@@ -720,8 +720,12 @@ impl<B: FetchBackend> RemoteCache<B> {
                 // mid-record as a shorter index — which the local write below
                 // would then launder into a well-formed (but incomplete) copy.
                 if !(buffer.len() as u64).is_multiple_of(crate::index_file::WIRE_RECORD_LEN) {
+                    // A body that ends mid-record is a cut-off response, the
+                    // same class of failure as a transport error: it is
+                    // `UnexpectedEof`, which the retry loop treats as
+                    // transient, not the `InvalidData` a malformed index is.
                     return Err(Error::IO(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                        std::io::ErrorKind::UnexpectedEof,
                         "fetched index length is not a whole number of records",
                     )));
                 }
@@ -851,6 +855,8 @@ impl<B: FetchBackend> RemoteCache<B> {
         match e {
             Error::Backend(_) | Error::HashMismatch { .. } => true,
             Error::Fetch { status } => *status >= 500 || *status == 429,
+            // A response cut off mid-record (the whole-record check above).
+            Error::IO(e) => e.kind() == std::io::ErrorKind::UnexpectedEof,
             _ => false,
         }
     }
@@ -1502,9 +1508,12 @@ mod tests {
         let err = RemoteCache::new_any_https(&base, None, None, source)
             .await
             .unwrap_err();
+        // A cut-off body is a transient failure: it is retried like a
+        // transport error, and when every attempt comes back cut off the
+        // index is reported unavailable, never accepted as a shorter one.
         assert!(
-            matches!(&err, Error::IO(e) if e.kind() == std::io::ErrorKind::InvalidData),
-            "expected InvalidData, got {err:?}"
+            matches!(&err, Error::Unavailable { status: None, .. }),
+            "expected Unavailable after retries, got {err:?}"
         );
     }
 
