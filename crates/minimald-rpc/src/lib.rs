@@ -1742,6 +1742,15 @@ pub struct CreateSessionRequest {
     /// [`CreateSessionResponse::daemon_version`] it fails to echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_match_version: Option<String>,
+    /// The box's spec, as the client built it from the project's entry and
+    /// the command's flags (BOX-068): a JSON object whose `v` names the
+    /// spec's shape. The daemon stores it beside the box's record before the
+    /// box starts, and refuses a create whose spec is not such an object.
+    /// `None` comes from three senders: a client that predates the field,
+    /// the dashboard create (#2635), and `min task run` of an interactive
+    /// task (#2411). The daemon then files a record with no stored spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json_lenient::Value>,
 }
 
 impl CreateSessionRequest {
@@ -1749,8 +1758,8 @@ impl CreateSessionRequest {
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, no attrs, no sealed deliveries, no root
-    /// certificate, the session verb, no project root, and no version
-    /// assertion.
+    /// certificate, the session verb, no project root, no version
+    /// assertion, and no spec.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1774,6 +1783,7 @@ impl CreateSessionRequest {
                 project_root: None,
             },
             must_match_version: None,
+            spec: None,
         }
     }
 }

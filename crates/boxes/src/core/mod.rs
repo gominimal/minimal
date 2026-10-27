@@ -10,6 +10,7 @@ pub mod loadout;
 pub mod loopback;
 pub mod policy;
 pub mod primitives;
+pub mod record;
 pub mod source;
 pub mod switch_request;
 pub mod zone_answer;
