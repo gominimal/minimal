@@ -160,8 +160,8 @@ build-infra operator. Release manager.
     verify: cargo nextest run -p rcache union_of_two_epochs_is_refused
   - WHERE an index holds no record THE SYSTEM SHALL treat it as declaring
     no epoch: it constrains no union it is part of, and a lookup whose
-    every index is empty uses the consumer's own epoch, since no key can
-    match.
+    every index is empty is a miss with no key computed, since there is no
+    epoch to compute one under and nothing it could match.
     tier:   T0
     verify: cargo nextest run -p rcache empty_index_declares_no_epoch
 
@@ -238,7 +238,10 @@ build-infra operator. Release manager.
     encode(c) == encode(p(c)); and for all members m of c: the member bytes
     of encode(c) are hash_e(m) for the epoch e of c's key
   - IF a member's key is not of the container's epoch THEN THE SYSTEM SHALL
-    refuse to seal the container and name the member.
+    refuse to seal the container and name the member. A key carries no
+    epoch in its bytes; the member's epoch is the one the index record its
+    key was read from declares (EPOCH-009), and the sealer hands the hasher
+    each member key with that epoch.
     tier:   T0
     verify: cargo nextest run -p rcache container_with_a_member_of_another_epoch_is_refused
 
@@ -383,9 +386,14 @@ reuses them.
   and build-infra schedules it on purpose (build-servers#271 and #272 hold
   the operational lessons). A staged catalog rebuild on the staging cache
   comes before the release.
-- **Rollback:** flip the producing side back to epoch 0. Epoch-0 indices,
-  objects and snapshots stay valid throughout, and consumers on epoch-0
-  pins see no change. Rollback takes minutes, and nothing rebuilds.
+- **Rollback:** a flip like any other, backwards: the producing side
+  returns to epoch 0 and seals no epoch-1 index after it. Epoch-0 indices,
+  objects and snapshots stay valid throughout, and a pin whose every index
+  declares epoch 0 sees no change. A per-commit snapshot sealed after the
+  rollback beside a root index still on epoch 1 is a mixed union, which
+  EPOCH-012 refuses, so the root index rolls back with the producers (or
+  the fallback is withheld for the window). Rollback takes minutes, and
+  nothing rebuilds.
 - **Blast radius:** catalog consumers during the one cold rebuild window
   see cache misses, and never wrong data. Record layouts do not change.
 
