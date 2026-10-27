@@ -704,10 +704,6 @@ mod tests {
             .expect("finalize cache entry");
     }
 
-    /// Ingests a single inline-Nickel package into a fresh graph and returns it
-    /// wrapped for the checker. The package declares no runtime deps, so its
-    /// transitive runtime-dep set is empty.
-    ///
     fn pkg_with_bin_output(name: &str) -> Arc<RwLock<Graph>> {
         graph_with_pkg(&format!(
             r#"
@@ -871,6 +867,10 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
 
+    /// Ingests a single inline-Nickel package into a fresh graph and returns it
+    /// wrapped for the checker. The package declares no runtime deps, so its
+    /// transitive runtime-dep set is empty.
+    ///
     /// `Layer::new_for_test` resolves `import "minimal.ncl"` relative to
     /// `CARGO_MANIFEST_DIR/minimal-ncl`, a directory the `check` crate does not
     /// ship. We point the variable at the `stdlib` crate (which owns the
