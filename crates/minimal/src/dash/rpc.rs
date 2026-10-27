@@ -804,7 +804,7 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
 /// Resolves the upload root of `dir` and whether it is a VCS root, on a
 /// blocking thread. The root is the directory that holds the project's
 /// `minimal.toml`, or `dir` when there is none.
-async fn resolve_project_off_worker(
+pub(super) async fn resolve_project_off_worker(
     dir: &camino::Utf8Path,
 ) -> Result<(camino::Utf8PathBuf, bool), anyhow::Error> {
     let dir = dir.to_path_buf();

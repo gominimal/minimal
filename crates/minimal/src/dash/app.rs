@@ -1232,11 +1232,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 // staging, the resolve walk), so run the batch
                                 // off the async worker: a stalled mount must
                                 // not stall the runtime.
-                                let invoked_from = abs.as_utf8_path().to_path_buf();
-                                let (inputs, upload_root, decision) = {
-                                    let dir = invoked_from.clone();
+                                let (upload_root, _) =
+                                    rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
+                                let (inputs, decision) = {
                                     let abs_blocking = abs.clone();
                                     let global_blocking = global.clone();
+                                    let root = upload_root.clone();
                                     tokio::task::spawn_blocking(move || {
                                         let inputs = crate::loadouts::prepare_activation_inputs(
                                             &global_blocking,
@@ -1245,14 +1246,13 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                             true,
                                             None,
                                         )?;
-                                        let root = crate::resolve_upload_root(&dir)?;
                                         let decision = crate::decide_workspace_upload(
                                             &root,
                                             false,
                                             false,
                                             std::env::home_dir().as_deref(),
                                         );
-                                        Ok::<_, anyhow::Error>((inputs, root, decision))
+                                        Ok::<_, anyhow::Error>((inputs, decision))
                                     })
                                     .await
                                     .context("preparing the session create")??
