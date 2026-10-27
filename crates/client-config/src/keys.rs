@@ -4,7 +4,7 @@
 //! chords.
 //!
 //! Two consumers share this module:
-//! - The *client* config ([`crate::client::config`]) holds keys as logical
+//! - The *client* config ([`crate::config`]) holds keys as logical
 //!   names and validates them loudly at load (the UX gate).
 //! - The *daemon* reads the same names from per-channel SSH env vars at
 //!   attach and re-runs [`validate_leader`] as a silent safety backstop

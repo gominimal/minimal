@@ -13,7 +13,7 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
 pub mod store;
 pub mod terminal;
 pub mod wire;
