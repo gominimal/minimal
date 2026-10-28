@@ -358,6 +358,20 @@ case "${1:-}" in
     ;;
 esac
 
+# The host exposure the VM-backed daemon opens host.min.internal at. minvmd
+# closes the alias at every port unless MINVMD_HOST_EXPOSURE_PORTS lists
+# ports, and it reads the list from its own environment at each VM boot, so
+# the export must precede the first `min` call, whose autospawn inherits it.
+# The list is the one port NET-003 reaches the host's loopback at from a
+# host-address box (the proxy proof's PROXY_HOST_PORT) and nothing wider:
+# the same proof asserts the alias stays refused at an unlisted port, and
+# own-address boxes stay refused at every port, listed or not. A native
+# daemon has no alias gate and ignores the variable.
+E2E_HOST_EXPOSURE_PORT=18081
+if [ -n "$E2E_VM" ]; then
+  export MINVMD_HOST_EXPOSURE_PORTS="$E2E_HOST_EXPOSURE_PORT"
+fi
+
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
 # sandbox — the `shell` stack composes `base` (bash, coreutils, tar, gzip, …)
@@ -409,6 +423,7 @@ PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
+PROXY_UNEXPOSED_SRV_PID="" # its listener at a port outside the host exposure; killed on teardown
 PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
 PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
 PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
@@ -1003,6 +1018,9 @@ teardown() {
   [ -n "$PROXY_HOST_DIR" ] && rm -rf "$PROXY_HOST_DIR"
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
+  fi
+  if [ -n "$PROXY_UNEXPOSED_SRV_PID" ]; then
+    kill "$PROXY_UNEXPOSED_SRV_PID" 2>/dev/null || true
   fi
   [ -n "$PAR_SEED_DIR" ] && rm -rf "$PAR_SEED_DIR"
   [ -n "$PAR_OWN_SEED_DIR" ] && rm -rf "$PAR_OWN_SEED_DIR"
@@ -18947,7 +18965,8 @@ proof_min_internal_names_through_proxy() {
   PROXY_OWN_NAME="e2e-own-proxy"     # the own-address box, on switch lanes
   PROXY_BOX_PORT=18080               # the in-box responders' listen port
   PROXY_OWN_EXTERNAL_PORT=18082      # ... published externally by --ingress
-  PROXY_HOST_PORT=18081              # the host-loopback listener (NET-003/004)
+  PROXY_HOST_PORT="$E2E_HOST_EXPOSURE_PORT" # the host-loopback listener (NET-003/004)
+  PROXY_UNEXPOSED_PORT=18089         # a host-loopback listener outside the exposure
   PROXY_DEAD_PORT=19090              # nothing listens: an upstream-refused 502
   PROXY_CLOSED_PORT=19091            # not in the own box's ingress map: a 403
   PROXY_HOST_ALIAS="100.64.255.254"  # the deprecated literal (NET-004)
@@ -19162,6 +19181,62 @@ proof_min_internal_names_through_proxy() {
   # ---- NET-003: host.min.internal from a host-address box -------------------
   proxy_assert_host_by_name "$proxy_sid" "NET-003" host
 
+  # ---- the host exposure is the only opening (design §7.1) ----------------
+  # A VM host's gate opens host.min.internal at the listed exposure alone
+  # (MINVMD_HOST_EXPOSURE_PORTS, exported at the top), so the same box, the
+  # same alias, at a port outside the list must not reach the host, even
+  # with a host-loopback listener answering there. A native host-address box
+  # shares the host's namespace, with no alias gate to assert.
+  if [ -n "$E2E_VM" ]; then
+    ( cd "$PROXY_HOST_DIR" && exec python3 -m http.server "$PROXY_UNEXPOSED_PORT" --bind 127.0.0.1 ) \
+      >/dev/null 2>"$WORK/proxy-unexposed-srv.err" &
+    PROXY_UNEXPOSED_SRV_PID=$!
+    proxy_unexposed_up=0
+    for _ in $(seq 1 40); do
+      if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$PROXY_UNEXPOSED_PORT/marker" 2>/dev/null || true)" = "200" ]; then
+        proxy_unexposed_up=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ "$proxy_unexposed_up" -ne 1 ]; then
+      echo "::error::the unexposed host-loopback http.server never answered on 127.0.0.1:$PROXY_UNEXPOSED_PORT"
+      cat "$WORK/proxy-unexposed-srv.err" 2>/dev/null || true
+      fail
+    fi
+    # One exec runs both fetches, so a broken exec, a missing curl or a
+    # failed lookup shows on the exposed fetch and cannot pass as a refusal.
+    # The exposed port must answer with the marker. The unexposed port must
+    # fail as a refused connection (curl exit 7) or a timeout (exit 28).
+    proxy_unexposed_out="$(mnl session exec "$proxy_sid" \
+      "curl -sS --max-time 8 http://host.min.internal:$PROXY_HOST_PORT/marker; echo \"exposed_rc=\$?\"; curl -sS --max-time 8 -o /dev/null http://host.min.internal:$PROXY_UNEXPOSED_PORT/marker; echo \"closed_rc=\$?\"" \
+      2>"$WORK/proxy-unexposed.err" || true)"
+    printf '%s\n' "$proxy_unexposed_out" >"$WORK/proxy-unexposed.out"
+    proxy_exposed_rc="$(sed -n 's/^.*exposed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-unexposed.out" | head -n1)"
+    proxy_unexposed_rc="$(sed -n 's/^closed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-unexposed.out" | tail -n1)"
+    if [ "$proxy_exposed_rc" != "0" ] || [[ "$proxy_unexposed_out" != *"$PROXY_HOST_MARKER"* ]]; then
+      echo "::error::the host-address box did not fetch the marker from host.min.internal at the exposed port $PROXY_HOST_PORT (curl exit '${proxy_exposed_rc:-none}'), so the unexposed-port check proves nothing"
+      echo "--- exec stdout ---"; cat "$WORK/proxy-unexposed.out" 2>/dev/null || true
+      echo "--- exec stderr ---"; cat "$WORK/proxy-unexposed.err" 2>/dev/null || true
+      fail
+    fi
+    case "$proxy_unexposed_rc" in
+      7 | 28) ;;
+      0)
+        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside MINVMD_HOST_EXPOSURE_PORTS=$MINVMD_HOST_EXPOSURE_PORTS"
+        fail
+        ;;
+      *)
+        echo "::error::the fetch from host.min.internal at port $PROXY_UNEXPOSED_PORT failed with curl exit '${proxy_unexposed_rc:-none}', not a refused connection (7) or a timeout (28)"
+        echo "--- exec stdout ---"; cat "$WORK/proxy-unexposed.out" 2>/dev/null || true
+        echo "--- exec stderr ---"; cat "$WORK/proxy-unexposed.err" 2>/dev/null || true
+        fail
+        ;;
+    esac
+    echo "host exposure: host.min.internal:$PROXY_HOST_PORT reached and host.min.internal:$PROXY_UNEXPOSED_PORT refused from the host-address box (curl exit $proxy_unexposed_rc: $(tail -n1 "$WORK/proxy-unexposed.err" 2>/dev/null)) OK"
+  fi
+
   # ---- NET-001's own-address half: a VM host's lease route -----------------
   # Gated like the own-IP proof: MINVMD_GVPROXY_BIN is the one signal that a
   # switch exists. On every lane that sets it the daemon is in a VM, so its
@@ -19228,8 +19303,9 @@ proof_min_internal_names_through_proxy() {
     # NET-003's own-address half, narrowed to resolution: the box resolves
     # host.min.internal through the switch zone, to the host alias. Box→host
     # reach over that alias is default-deny except configured host exposures
-    # (design §7.1), and this box's switch has none, so the reach is not
-    # asserted here. TODO(host-exposure): the positive reach arm comes back
+    # (design §7.1), and an own-address box is refused even at the one
+    # exposure this run lists, so the reach is not asserted here.
+    # TODO(host-exposure): the positive reach arm comes back
     # with a configured exposure (gominimal/inbox#867).
     proxy_own_resolved="$(mnl session exec "$PROXY_OWN_SID" \
       "getent ahostsv4 host.min.internal" 2>"$WORK/proxy-own-resolve.err" \
@@ -19243,7 +19319,9 @@ proof_min_internal_names_through_proxy() {
 
     # NET-004: the deprecated literal itself. Box→host reach over the alias
     # is default-deny except configured host exposures (design §7.1), and
-    # none is configured, so the box's own relay drops the connect — though
+    # an own-address box gets none — not even PROXY_HOST_PORT, the one this
+    # run lists for host-address boxes — so the box's own relay drops the
+    # connect — though
     # its egress rules admit every address (0.0.0.0/0 above), so the drop
     # is the infrastructure deny set's and not the deny-all default's: no
     # answer and no reset until the timeout, and the relay names the drop
@@ -19265,7 +19343,7 @@ proof_min_internal_names_through_proxy() {
     mnl session exec "$PROXY_OWN_SID" \
       "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
       >/dev/null 2>"$WORK/proxy-alias.err" && {
-      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT with no host exposure configured"
+      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT, which an own-address box must never reach"
       fail
     }
     proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
