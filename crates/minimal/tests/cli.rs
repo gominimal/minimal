@@ -295,7 +295,7 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("PROJECT PATH"),
         "header should list PROJECT PATH: {text}"
     );
-    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(text.contains("running"), "row should show status: {text}");
     assert!(
         text.contains("/work/proj"),
         "row should show project path: {text}"

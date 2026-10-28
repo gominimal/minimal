@@ -809,6 +809,10 @@ impl BoxActor {
                 std::io::ErrorKind::InvalidInput,
                 "session is Pending; configure the loadout first",
             )),
+            BoxState::Stopped | BoxState::Exited => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session has ended; it cannot be finalized",
+            )),
         }
     }
 
