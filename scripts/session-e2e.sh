@@ -13292,7 +13292,7 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             at its start. The injection of a store value into a box's
 #             request is NOT RUN until a box can carry a store handle
 #             (#2525): today no box creation mints one.
-#   key       (BEP-063, BEP-067, BEP-070) under CI, or opt-in with
+#   key       (BEP-063, BEP-067, BEP-070) runs only with
 #             E2E_BEP_KEY_REPLACE=1: a grant box A answers 'gh api
 #             user'. The case puts a value that is no key in the keychain
 #             item of the client's signing key, so the next creation (box
@@ -13407,7 +13407,7 @@ rt_leg_key() {
   local ck_a=e2e-bep-round-two-a ck_b=e2e-bep-round-two-b
   local ck_id_a ck_id_b ck_id_a2 ck_jti_a ck_jti_b ck_n
   local ck_v7='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-  if [ -z "${CI:-}" ] && [ "${E2E_BEP_KEY_REPLACE:-}" != 1 ]; then
+  if [ "${E2E_BEP_KEY_REPLACE:-}" != 1 ]; then
     not_run "$ck_leg" "the leg replaces the client signing key in this machine's login keychain: set E2E_BEP_KEY_REPLACE=1 to run it"
     return 0
   fi
