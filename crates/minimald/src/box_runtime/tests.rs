@@ -2707,6 +2707,7 @@ fn launcher_with(
         publications: Default::default(),
         // The test's own state directory, the one its context builds under.
         state_dir: state_path.to_path_buf(),
+        root_certificate: None,
     }
 }
 
@@ -6946,5 +6947,426 @@ async fn shell_exit_keep_item_names_the_restored_registration_for_a_registered_b
     assert!(
         registered.contains(delete) && unregistered.contains(delete),
         "both prompts keep the Delete item"
+    );
+}
+
+/// BEP-007: a grant's sealed value is placed in the grant's environment
+/// variable, over any value the session's environment held there, and is
+/// the only value the variable holds: in the published per-attach files the
+/// shell re-reads before every command, and in what the host runs in the
+/// box. A box with no grant gets no such variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_value_is_placed_in_its_grant_variable_only() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    const PLAINTEXT: &str = "ghp_plaintexttoken";
+    let tmp = tempfile::tempdir().unwrap();
+    let home =
+        DaemonAbsPath::try_new(camino::Utf8PathBuf::try_from(tmp.path().to_path_buf()).unwrap())
+            .unwrap();
+    let paths = BoxPaths {
+        home: home.clone(),
+        ..test_paths()
+    };
+    // A value already in the variable is the one a delivery must replace.
+    // The launch places the deliveries before the host is built, the way
+    // `launch_host` does.
+    let mut attach_env = AttachEnv {
+        inherited: vec![],
+        connection: vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
+        ],
+    };
+    let connection_env = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    let (host, _handle) = Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths,
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env,
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+
+    // The shell's half: the files it re-reads before every command.
+    let json = std::fs::read_to_string(home.sub_path_unchecked(ATTACH_ENV_JSON_REL).as_str())
+        .expect("the build publishes the per-attach environment");
+    let published: ConnectionEnv = serde_json_lenient::from_str(&json).expect("{json}");
+    assert_eq!(published.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(
+        published.get("TERM").map(String::as_str),
+        Some("xterm-256color")
+    );
+    assert_eq!(published.len(), 2, "nothing else is placed: {published:?}");
+    for rel in [ATTACH_ENV_SH_REL, ATTACH_ENV_FISH_REL, ATTACH_ENV_JSON_REL] {
+        let body = std::fs::read_to_string(home.sub_path_unchecked(rel).as_str()).unwrap();
+        assert!(body.contains(SEALED), "{rel}: {body}");
+        assert!(
+            !body.contains(PLAINTEXT),
+            "{rel} holds the plaintext: {body}"
+        );
+    }
+
+    // The host's half: what it runs in the box sees the sealed value.
+    let output = host
+        .command_in_session("sh", ["-c", "printenv GH_TOKEN"], Default::default())
+        .expect("a host-side command under test")
+        .output()
+        .expect("printenv runs");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), SEALED);
+
+    // A box with no grant places nothing.
+    let mut env = ConnectionEnv::new();
+    place_sealed_deliveries(&mut env, boxes::SessionId::nil(), &[]);
+    assert!(env.is_empty(), "{env:?}");
+
+    // A name that is not a variable name places nothing: it would be
+    // shell code in the file the box's shell sources.
+    place_sealed_deliveries(
+        &mut env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "X=1; touch /tmp/owned #".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert!(env.is_empty(), "{env:?}");
+}
+
+/// BEP-007: the `AttachEnv` a launch hands the launcher holds each grant's
+/// sealed value, so the shell's launch environment has it before its
+/// entrypoint runs. The connection layer sits above the composition, so the
+/// sealed value wins over a composition value in the same variable.
+#[test]
+fn sealed_value_reaches_the_shell_launch_environment() {
+    const SEALED: &str = "v1.sealed-to-this-host";
+    let mut attach_env = AttachEnv {
+        inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(
+        &mut attach_env,
+        boxes::SessionId::nil(),
+        &[boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: SEALED.to_string(),
+        }],
+    );
+    assert_eq!(kept.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(attach_env.connection_env(), kept);
+    assert!(
+        attach_env
+            .connection
+            .contains(&("GH_TOKEN".to_string(), SEALED.to_string())),
+        "{:?}",
+        attach_env.connection
+    );
+    let env = layer_session_env(
+        session_baseline_env("box-1", None),
+        attach_env.inherited.clone(),
+        vec![("GH_TOKEN".to_string(), "from-the-composition".to_string())],
+        attach_env.connection.clone(),
+    );
+    assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some(SEALED));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+    assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+
+    // A box with no grant changes nothing in the launch environment.
+    let mut plain = AttachEnv {
+        inherited: vec![],
+        connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+    };
+    let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        plain.connection,
+        vec![("TERM".to_string(), "xterm-256color".to_string())]
+    );
+}
+
+// BEP-011: a box with the proxy's root and its own bundle gets the three
+// trust variables, at its own bundle and root. A box whose packages ship no
+// bundle gets NODE_EXTRA_CA_CERTS alone, so a tool that reads the bundle
+// variables keeps its public roots. A box without the root gets none.
+#[test]
+fn trust_env_points_at_bundle_and_root() {
+    let vars = launch_trust_env(true, true);
+    let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, boxes::core::bep::TRUST_ENV_VARIABLES);
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(get("SSL_CERT_FILE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("REQUESTS_CA_BUNDLE"), Some(BOX_CA_BUNDLE));
+    assert_eq!(get("NODE_EXTRA_CA_CERTS"), Some(BOX_ROOT_CERTIFICATE));
+    assert!(BOX_CA_BUNDLE.starts_with(BOX_CA_DIR));
+    assert!(BOX_ROOT_CERTIFICATE.starts_with(BOX_CA_DIR));
+
+    assert_eq!(
+        launch_trust_env(true, false),
+        vec![(
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            BOX_ROOT_CERTIFICATE.to_string()
+        )],
+        "with no bundle only the root is named"
+    );
+    assert!(launch_trust_env(false, true).is_empty());
+    assert!(launch_trust_env(false, false).is_empty());
+}
+
+// BEP-011: the trust variables sit below the composed environment, so a box
+// spec that sets one keeps its own value, and the others still reach the box.
+#[test]
+fn trust_env_keeps_a_spec_value() {
+    let mut env = layer_session_env(
+        session_baseline_env("box", None),
+        Vec::new(),
+        vec![("SSL_CERT_FILE".to_string(), "/spec/roots.pem".to_string())],
+        Vec::new(),
+    )
+    .into_iter()
+    .collect::<std::collections::BTreeMap<_, _>>();
+    layer_trust_env(&mut env, true, true);
+    assert_eq!(env["SSL_CERT_FILE"], "/spec/roots.pem");
+    assert_eq!(env["REQUESTS_CA_BUNDLE"], BOX_CA_BUNDLE);
+    assert_eq!(env["NODE_EXTRA_CA_CERTS"], BOX_ROOT_CERTIFICATE);
+}
+
+/// BEP-018: a blocking member's admit that runs after `injection_leaf`
+/// handed a shim the box's own leaf, but before the shim joined it, finds
+/// no shim to move. The check after the join moves the shim, and the
+/// program it forked, into the blocked leaf, records both, and logs each
+/// move. A process that cannot be moved refuses the injection.
+#[test]
+fn an_admit_between_injection_leaf_and_the_join_ends_in_the_blocked_leaf() {
+    use crate::net::classifier::{CohortQuic443, StandinMoves, quic443_blocked_leaf};
+    use sandbox::config::ClassifierLeaf;
+
+    let tree = tempfile::tempdir().unwrap();
+    let blocked = quic443_blocked_leaf(tree.path());
+    std::fs::create_dir_all(&blocked).unwrap();
+    let own = ClassifierLeaf::new(tree.path().join("plain"));
+    let moves = StandinMoves::default();
+    let cohort = std::sync::Mutex::new(CohortQuic443::default());
+    {
+        let mut guard = cohort.lock().unwrap();
+        guard.learn_blocked_leaf(blocked.clone());
+        guard
+            .admit("plain", Some(own.dir().to_path_buf()), false, &moves)
+            .unwrap();
+    }
+
+    // The command is built while the cohort does not block.
+    let (leaf, adopt) = injection_leaf("plain", Some(own.clone()), &cohort);
+    assert_eq!(leaf.as_ref().map(ClassifierLeaf::dir), Some(own.dir()));
+    assert!(!adopt);
+
+    // A blocking member's admit runs before the shim joins: the box's own
+    // leaf is empty, so it moves nothing.
+    cohort
+        .lock()
+        .unwrap()
+        .admit("grant", None, true, &moves)
+        .unwrap();
+
+    // The shim joins the own leaf it was given, and forks its program.
+    let (shim, program) = (4100, 4101);
+    moves.spawn_in(shim, own.dir());
+    moves.fork(shim, program);
+    assert!(wait_for_injection_join(
+        shim,
+        &[own.dir(), blocked.as_path()],
+        &moves,
+        || true,
+        Duration::from_secs(5),
+    ));
+
+    let capture = crate::test_harness::CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let moved = tracing::subscriber::with_default(subscriber, || {
+        settle_injection("plain", shim, adopt, true, own.dir(), &cohort, &moves)
+    })
+    .expect("the shim and its program move into the blocked leaf");
+    assert_eq!(moved, 2);
+    assert_eq!(moves.where_is(shim), blocked);
+    assert_eq!(moves.where_is(program), blocked);
+    let log = capture.contents();
+    for pid in [shim, program] {
+        assert!(
+            log.lines().any(|l| l.contains("DEBUG")
+                && l.contains("UDP 443 blocked leaf")
+                && l.contains(&format!("pid={pid} "))),
+            "one debug line names {pid}: {log}"
+        );
+    }
+
+    // Both are recorded: they go home when the block lifts.
+    cohort.lock().unwrap().depart("grant", &moves);
+    assert_eq!(moves.where_is(shim), own.dir());
+    assert_eq!(moves.where_is(program), own.dir());
+
+    // An admit in the window again, and a process that cannot move: the
+    // check refuses the injection.
+    cohort
+        .lock()
+        .unwrap()
+        .admit("grant", None, true, &moves)
+        .unwrap();
+    let late = 4200;
+    moves.spawn_in(late, own.dir());
+    moves.refused.lock().unwrap().insert(late);
+    let refused = settle_injection("plain", late, false, true, own.dir(), &cohort, &moves)
+        .expect_err("a process that cannot move refuses the injection");
+    assert_eq!(refused.pid, late);
+    assert_eq!(
+        refused.stranded,
+        vec![late],
+        "the caller stops what stays in own"
+    );
+    assert_eq!(moves.where_is(late), own.dir());
+    moves.kill(late);
+
+    // A shim that did not join its own leaf in time while the cohort
+    // blocks is refused: a move now is undone by its later join.
+    let slow = 4250;
+    let refused = settle_injection("plain", slow, false, false, own.dir(), &cohort, &moves)
+        .expect_err("a shim that did not join in time refuses the injection");
+    assert_eq!(refused.pid, slow);
+    assert_eq!(refused.error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(refused.stranded.is_empty());
+
+    // A fork storm that refills the own leaf on every pass outlasts the
+    // move's passes: the check refuses, and names what is left in own.
+    struct Storm<'a> {
+        moves: &'a StandinMoves,
+        own: &'a std::path::Path,
+        next: std::sync::atomic::AtomicI32,
+    }
+    impl crate::net::classifier::CgroupMoves for Storm<'_> {
+        fn procs(&self, leaf: &std::path::Path) -> std::io::Result<Vec<i32>> {
+            self.moves.procs(leaf)
+        }
+        fn migrate(&self, pid: i32, to: &std::path::Path) -> std::io::Result<()> {
+            self.moves.migrate(pid, to)?;
+            let child = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.moves.spawn_in(child, self.own);
+            Ok(())
+        }
+        fn parent(&self, pid: i32) -> Option<i32> {
+            self.moves.parent(pid)
+        }
+    }
+    let storm = Storm {
+        moves: &moves,
+        own: own.dir(),
+        next: std::sync::atomic::AtomicI32::new(5000),
+    };
+    let forker = 4900;
+    moves.spawn_in(forker, own.dir());
+    let refused = settle_injection("plain", forker, false, true, own.dir(), &cohort, &storm)
+        .expect_err("an own leaf still full after the last pass refuses the injection");
+    assert!(!refused.stranded.is_empty());
+    for pid in &refused.stranded {
+        assert_eq!(&moves.where_is(*pid), own.dir());
+    }
+    assert_eq!(refused.pid, refused.stranded[0]);
+    for pid in refused.stranded {
+        moves.kill(pid);
+    }
+
+    // The caller stops a stranded process through a pidfd, and only while
+    // the own leaf still holds that pid.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let real = i32::try_from(child.id()).unwrap();
+    assert!(stop_stranded(&[real], own.dir(), &moves).is_empty());
+    moves.spawn_in(real, own.dir());
+    assert_eq!(stop_stranded(&[real], own.dir(), &moves), vec![real]);
+    let status = child.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    moves.kill(real);
+
+    // Only `ESRCH` says a process is gone. `/proc` says whether a process
+    // that could not be pinned for another reason still runs. A zombie, an
+    // exited child not yet reaped, does not.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let live = i32::try_from(child.id()).unwrap();
+    assert!(proc_alive(live));
+    assert!(pin_pid(live).is_ok());
+    child.kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while proc_alive(live) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!proc_alive(live), "a zombie is not alive");
+    child.wait().unwrap();
+    assert!(!proc_alive(live));
+    assert_eq!(
+        pin_pid(live).map(drop).unwrap_err().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+
+    // A shim given the own leaf while the cohort still does not block
+    // stays where it is.
+    cohort.lock().unwrap().depart("grant", &moves);
+    let calm = 4300;
+    moves.spawn_in(calm, own.dir());
+    assert_eq!(
+        settle_injection("plain", calm, false, true, own.dir(), &cohort, &moves).unwrap(),
+        0
+    );
+    assert_eq!(moves.where_is(calm), own.dir());
+}
+
+/// BEP-018: the join check takes an unpinned shim as gone only when its
+/// `/proc/<pid>/stat` is missing or names a zombie. A read error such as
+/// `EMFILE`, which also fails the pin, leaves a live shim alive.
+#[test]
+fn a_shim_stat_read_says_gone_only_for_a_zombie_or_a_missing_file() {
+    let stat = |state: &str| Ok(format!("42 (sh (x) y) {state} 1 42 42 0 -1"));
+    assert!(!stat_alive(stat("Z")), "a zombie is gone");
+    assert!(!stat_alive(stat("X")), "a dead process is gone");
+    assert!(stat_alive(stat("R")), "a running process is alive");
+    assert!(stat_alive(stat("S")), "a sleeping process is alive");
+    assert!(
+        !stat_alive(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+        "a missing stat file says the process is gone"
+    );
+    assert!(
+        stat_alive(Err(std::io::Error::from_raw_os_error(libc::EMFILE))),
+        "a read error says nothing about the process"
     );
 }

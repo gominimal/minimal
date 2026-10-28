@@ -709,20 +709,20 @@ impl ArgsSpec {
             if !matches.contains_id(name)
                 && let Some(default) = &ta.default
             {
-                result.insert(name.clone(), ta.spec.parse(default).map_err(&val_err)?);
+                result.insert(name.clone(), ta.spec.parse(default).map_err(val_err)?);
                 continue;
             }
 
             match &ta.spec {
                 ArgSchema::Scalar(p) => {
                     if let Some(raw) = matches.get_one::<String>(name) {
-                        result.insert(name.clone(), Arg::Scalar(p.parse(raw).map_err(&val_err)?));
+                        result.insert(name.clone(), Arg::Scalar(p.parse(raw).map_err(val_err)?));
                     }
                 }
                 ArgSchema::Array(p) => {
                     if let Some(values) = matches.get_many::<String>(name) {
                         let arr: Result<Vec<ScalarArg>, clap::Error> =
-                            values.map(|v| p.parse(v).map_err(&val_err)).collect();
+                            values.map(|v| p.parse(v).map_err(val_err)).collect();
                         result.insert(name.clone(), Arg::Array(arr?));
                     }
                 }

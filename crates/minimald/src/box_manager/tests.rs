@@ -133,6 +133,10 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
+        creating_verb: minimald_rpc::CreatingVerb::Session,
+        project_root: None,
     }
 }
 
@@ -410,8 +414,19 @@ async fn destroy_tears_down_a_running_session() {
         .await
         .unwrap()
         .expect("session should resolve");
+    assert!(
+        !handle.is_destroying(),
+        "a session nobody destroys is not destroying",
+    );
 
     mngr.delete_session(id).await.unwrap();
+
+    // The handle an exec holds sees the destroy, which is how the
+    // exec knows to tell its client why the command stopped.
+    assert!(
+        handle.is_destroying(),
+        "the destroy did not mark the session's handle destroying",
+    );
 
     // The destroy cascade completed: the record is gone, and a fresh
     // get_session no longer resolves the (now removed) session.
@@ -429,6 +444,521 @@ async fn destroy_tears_down_a_running_session() {
         "the session should no longer resolve after destroy"
     );
     drop(handle);
+}
+
+/// A destroy that waits on its actor must not hold the mainloop. Here
+/// the wait is an `on_destroy` hook that sleeps; in the lab (710d) it
+/// was the reap of a session whose actor sat inside a stalled
+/// package-graph clone after its client gave up, and `min ls` queued
+/// behind it for 70 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_destroy_does_not_hold_the_mainloop() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 5".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    // Measure once the destroy holds the session (its hook then runs
+    // on the teardown task).
+    until_claimed(&mngr, id).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mngr.list())
+        .await
+        .expect("`list` queued behind a destroy that was waiting on its actor")
+        .unwrap();
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
+/// Shutdown waits out a teardown in flight: the destroy runs on a task of
+/// its own, and its hook and record delete end before the state volume
+/// is quiesced, so neither races the unmount. The hook sleeps, so a
+/// shutdown that did not wait would return in milliseconds with the
+/// destroy still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_a_teardown_in_flight() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let started = std::time::Instant::now();
+    mngr.shutdown(false)
+        .await
+        .expect("a teardown in flight does not refuse an unforced shutdown");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "shutdown returned before the destroy hook could have ended"
+    );
+    // The destroy answered before shutdown returned: its result is
+    // already in, so the join does not wait.
+    let hook_failures = tokio::time::timeout(std::time::Duration::from_millis(500), destroy)
+        .await
+        .expect("shutdown returned with the teardown still running")
+        .unwrap()
+        .unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+}
+
+/// A resume during a teardown brings up nothing for it: the record is
+/// still there (it outlives the actor by the teardown's length) and has
+/// no actor in `running`, which is what resume looks for, but the
+/// session is being destroyed, not idle. Without the tearing-down check a
+/// resume mid-teardown started a second actor on the record the first
+/// was about to delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_during_a_teardown_does_not_bring_the_session_up() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let destroying = mngr.clone();
+    let destroy = crate::traced::spawn(async move { destroying.delete_session(id).await });
+    until_claimed(&mngr, id).await;
+    let resumed = mngr.resume_active_sessions().await.unwrap();
+    assert_eq!(resumed, 0, "a session being torn down is not resumed");
+    assert!(
+        mngr.get_composition(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down has no composition to read, as it has no record"
+    );
+    assert!(
+        !destroy.is_finished(),
+        "the destroy hook should still be running"
+    );
+
+    let hook_failures = destroy.await.unwrap().unwrap();
+    assert!(hook_failures.is_empty(), "{hook_failures:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the destroy, not resurrected by the resume"
+    );
+}
+
+/// A session being torn down is gone to everyone else: a second destroy
+/// in the window is refused, a resolve finds nothing, and the
+/// `on_destroy` hook runs once. With the teardown off the mainloop the
+/// window is real (the first review of #2224 found it): without the
+/// tearing-down set, the second destroy brought up a fresh actor from
+/// the still-present record and ran the hook again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_destroy_during_a_teardown_runs_no_hook_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("sleep 2; echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let first = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    // Once the first destroy holds the session.
+    until_claimed(&mngr, id).await;
+
+    let second = mngr.delete_session(id).await;
+    assert!(
+        matches!(&second, Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy),
+        "a second destroy during the teardown should be refused, got {second:?}"
+    );
+    assert!(
+        mngr.get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should resolve to nothing"
+    );
+    assert!(
+        mngr.list().await.unwrap().iter().all(|s| s.id != id),
+        "a session being torn down should not be listed"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a session being torn down should have no record to read"
+    );
+
+    first.await.unwrap().unwrap();
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(ran.lines().count(), 1, "the destroy hook ran {ran:?}");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record should be gone after destroy"
+    );
+}
+
+/// A create whose name is held by a session still being torn down says
+/// so, rather than reporting a plain collision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_during_a_teardown_names_the_destroy() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        sample_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: "sleep 2".to_string(),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let destroying = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.delete_session(id).await })
+    };
+    until_claimed(&mngr, id).await;
+
+    let err = mngr
+        .create_session(sample_config(), None)
+        .await
+        .expect_err("the name is still held by the session being destroyed");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        err.to_string().contains("still being destroyed"),
+        "the error should name the destroy: {err}"
+    );
+    destroying.await.unwrap().unwrap();
+}
+
+/// Waits until a destroy has claimed `id`: from that moment the
+/// listing no longer shows it (a session in the tearing-down set is
+/// gone to it), so a test can act on the teardown window itself rather
+/// than on a guess at how long reaching it takes.
+async fn until_claimed(mngr: &BoxManagerHandle, id: SessionId) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while mngr.list().await.unwrap().iter().any(|s| s.id == id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the destroy never claimed the session");
+}
+
+/// A cleanup destroy (`only_if_unfinalized`) keeps a session that
+/// finished activating and destroys one that did not (inbox#690).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_keeps_a_finished_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let kept = mngr.delete_session_if_unfinalized(id).await.unwrap();
+    assert!(kept.is_none(), "an Active session should be kept");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "a kept session keeps its record"
+    );
+    assert_eq!(mngr.list().await.unwrap().len(), 1, "and is listed");
+
+    let (_state, _cache, pending_mngr, pending, _response) = create_pending_session().await;
+    let destroyed = pending_mngr
+        .delete_session_if_unfinalized(pending)
+        .await
+        .unwrap();
+    assert!(
+        destroyed.is_some(),
+        "an unfinished session should be destroyed"
+    );
+    assert!(
+        pending_mngr
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap()
+            .is_none(),
+        "the destroyed session's record should be gone"
+    );
+}
+
+/// The race inbox#690 is about, pinned: a cleanup destroy queued in the
+/// session's mailbox behind a finalize that is still running waits for
+/// it, and keeps the session it finished. While the cleanup is in
+/// flight the session is in the tearing-down set: a second destroy is
+/// refused, and a listing skips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleanup_destroy_queued_behind_a_running_finalize_keeps_the_session() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let handle = session(&mngr, id).await;
+    assert!(
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("an empty loadout configures")
+            .is_none(),
+        "an empty loadout needs no verdict"
+    );
+
+    // The actor is held, so the finalize and then the cleanup queue in
+    // its mailbox in that order: the finalize is the one "still running".
+    let release = handle.hold_for_test().await;
+    let finalize = crate::traced::spawn({
+        let handle = handle.clone();
+        async move { handle.finalize().await }
+    });
+    handle.until_queued(1).await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(2).await;
+
+    let second = mngr
+        .delete_session(id)
+        .await
+        .expect_err("a second destroy while the cleanup is in flight is refused");
+    assert_eq!(second.kind(), ErrorKind::ResourceBusy);
+    assert!(
+        mngr.list().await.unwrap().is_empty(),
+        "a session a cleanup is in flight for is not listed"
+    );
+
+    release.send(()).expect("the actor is held");
+    finalize
+        .await
+        .unwrap()
+        .expect("the finalize ahead of the cleanup succeeds");
+    let kept = cleanup.await.unwrap().unwrap();
+    assert!(
+        kept.is_none(),
+        "the cleanup keeps the session the finalize finished"
+    );
+    let listed = mngr.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "the kept session is listed again");
+    assert_eq!(listed[0].status, boxes::BoxState::Active);
+}
+
+/// A cleanup destroy that does destroy — the session never finished —
+/// leaves a listing whole: the session is skipped while its actor
+/// deletes the record, and gone after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_survives_a_cleanup_destroy_of_an_unfinished_session() {
+    let (_state, _cache, mngr, id, _response) = create_pending_session().await;
+    let handle = session(&mngr, id).await;
+    let release = handle.hold_for_test().await;
+    let cleanup = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.delete_session_if_unfinalized(id).await }
+    });
+    handle.until_queued(1).await;
+    assert!(mngr.list().await.unwrap().is_empty());
+    release.send(()).expect("the actor is held");
+    let destroyed = cleanup.await.unwrap().unwrap();
+    assert!(destroyed.is_some(), "an unfinished session is destroyed");
+    assert!(mngr.list().await.unwrap().is_empty());
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A listing must not wait on a box actor: its attrs come from the host the
+/// actor last published, not from the actor's mailbox. With an actor parked
+/// (a clone inside `ConfigureLoadout`, an inline attach), `list` answered
+/// only after `HOST_PROBE_TIMEOUT` for that box: 2 s per `min ls` through
+/// the whole of a stalled activation (710d).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_does_not_wait_on_a_parked_actor() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    // Returns once the actor is inside the park: every earlier message, and
+    // its post-message publish, is done.
+    handle.park_for(std::time::Duration::from_secs(3)).await;
+    let started = std::time::Instant::now();
+    let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+        .await
+        .expect("`list` waited on the parked actor")
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].attrs.is_none(), "no host, so no attrs");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the listing took {:?}",
+        started.elapsed()
+    );
+    drop(handle);
+}
+
+/// The slot path with a live host, the 710d case itself: an actor parked in
+/// a long message still has its host's attrs listed, at once, read through
+/// the slot and not the actor's mailbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_actors_live_host_is_still_listed() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    handle.park_for(std::time::Duration::from_secs(3)).await;
+    // Published while the actor is parked (park_for returns once it is), as
+    // a host it had before would be: nothing overwrites it until the park ends.
+    handle.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+    let listed = tokio::time::timeout(std::time::Duration::from_millis(500), mngr.list())
+        .await
+        .expect("`list` waited on the parked actor")
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(
+        listed[0].attrs.is_some(),
+        "the live host's attrs come through the slot while the actor is parked"
+    );
+    drop(handle);
+}
+
+/// The slot is emptied when the actor ends, so a handle that outlives it
+/// reads no host, and holds no sender to one. The destroy's message ends the
+/// actor with a `break`, after which nothing is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_actors_slot_is_emptied() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session(&mngr).await;
+    let handle = mngr
+        .get_session(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    // The actor rewrites the slot after every message it handles, and it
+    // replies to a message before that rewrite, so a host put right after a
+    // reply can still be overwritten by the publish that follows it. Put
+    // until the put survives: once the mailbox is empty nothing rewrites
+    // the slot, and the host stays.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            handle.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if handle.get_attrs().await.is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no put of a host survived the actor's publishes");
+    mngr.delete_session(id).await.unwrap();
+    // The destroy replies just before the actor's loop ends.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while handle.get_attrs().await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the ended actor's slot still served a host");
 }
 
 /// Destroying an unknown ID is a `NotFound` error.
@@ -1508,5 +2038,532 @@ async fn start_materialize_rejects_an_unknown_output_by_name() {
     assert!(
         err.to_string().contains("no-such-output"),
         "the error must name the output that was asked for, got {err}"
+    );
+}
+
+/// The manager's holder of live boxes keeps them in the time order of
+/// their box ids, which is the order they were created in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creation_order_holder_follows_box_id_time_order() {
+    let (_state, _cache, mngr) = manager().await;
+
+    let mut created = Vec::new();
+    for n in 0..4 {
+        let mut config = sample_config();
+        config.name = Some(format!("box-{n}"));
+        created.push(mngr.create_session(config, None).await.unwrap());
+        // A clock tick between creates, so each id's timestamp is its own.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let (send, recv) = Responder::channel();
+    let _ = mngr.sender.send(ManagerMessage::RunningIds(send)).await;
+    let held = recv.await.unwrap().unwrap();
+    assert_eq!(held, created, "the holder keeps creation order");
+
+    let stamps: Vec<_> = held
+        .iter()
+        .map(|id| {
+            let uuid: &uuid::Uuid = id.as_ref();
+            assert_eq!(uuid.get_version_num(), 7, "every box id is a UUIDv7");
+            uuid.get_timestamp()
+                .expect("a UUIDv7 carries its mint time")
+                .to_unix()
+        })
+        .collect();
+    assert!(
+        stamps.windows(2).all(|w| w[0] <= w[1]),
+        "the holder's order is the ids' time order: {stamps:?}"
+    );
+    for id in &created {
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(*id))
+            .await
+            .unwrap()
+            .expect("each created box has a record");
+        assert_eq!(record.id, *id, "the record is keyed by the box id");
+    }
+}
+
+/// BEP-007: the sealed values a create request carries ride the box's
+/// stored record, and a host launch takes them from it, so every launch,
+/// after a daemon restart included, places them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_deliveries_ride_the_record_to_the_host_params() {
+    let (_state, _cache, mngr) = manager().await;
+    let deliveries = vec![
+        boxes::SealedDelivery {
+            variable: "GH_TOKEN".to_string(),
+            sealed: "v1.sealed-one".to_string(),
+        },
+        boxes::SealedDelivery {
+            variable: "GITHUB_TOKEN".to_string(),
+            sealed: "v1.sealed-two".to_string(),
+        },
+    ];
+    let config = minimald_rpc::BoxConfig {
+        sealed_deliveries: deliveries.clone(),
+        ..sample_config()
+    };
+    let id = mngr.create_session(config, None).await.unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.sealed_deliveries, deliveries);
+    assert_eq!(crate::box_runtime::launch_deliveries(&record), deliveries);
+
+    // The `GetSessionRecord` reply for the grant box carries no sealed
+    // value, on the wire or in the record, while the store keeps them.
+    let reply = crate::rpc::session_record_response(Some(record.clone()));
+    let replied = reply.record.as_ref().expect("the reply carries the record");
+    assert!(replied.sealed_deliveries.is_empty(), "{replied:?}");
+    assert_eq!(replied.id, record.id);
+    let wire = serde_json_lenient::to_string(&reply).unwrap();
+    assert!(
+        !wire.contains("v1.sealed-one") && !wire.contains("sealed_deliveries"),
+        "{wire}"
+    );
+    let stored = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the store still has the record");
+    assert_eq!(stored.sealed_deliveries, deliveries);
+
+    // A box with no grant carries none.
+    let id = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("no-grant".to_string()),
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert!(crate::box_runtime::launch_deliveries(&record).is_empty());
+
+    // A grant whose name is not a variable name is refused, and no record
+    // is stored for it.
+    let err = mngr
+        .create_session(
+            minimald_rpc::BoxConfig {
+                name: Some("bad-grant".to_string()),
+                sealed_deliveries: vec![boxes::SealedDelivery {
+                    variable: "X=1; touch /tmp/owned #".to_string(),
+                    sealed: "v1.sealed-three".to_string(),
+                }],
+                ..sample_config()
+            },
+            None,
+        )
+        .await
+        .expect_err("a grant name that is not a variable name is refused");
+    assert!(
+        err.to_string()
+            .contains("not a valid environment variable name"),
+        "{err}"
+    );
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Name("bad-grant".to_string()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// BEP-011: the root certificate a create request carries rides the box's
+/// stored record, and a host launch takes it from there, so every launch,
+/// after a daemon restart included, adds it to the box's trust store. A box
+/// with no grant, or with steering `off`, gets none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_carries_the_root_certificate_to_the_launch() {
+    use boxes::core::bep::{BepSettings, Steering};
+    let (_state, _cache, mngr) = manager().await;
+    let pem = "-----BEGIN CERTIFICATE-----\nUk9PVA==\n-----END CERTIFICATE-----\n".to_string();
+    let grant_policy = |steering: Steering| boxes::BoxPolicy {
+        credentialed_upstream: Some(boxes::CredentialedUpstream {
+            bep: BepSettings {
+                steering: Some(steering),
+                ..BepSettings::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let created =
+        |name: &str, policy: boxes::BoxPolicy, root: Option<String>| minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            policy,
+            root_certificate: root,
+            ..sample_config()
+        };
+
+    let id = mngr
+        .create_session(
+            created("grant", grant_policy(Steering::ProxyEnv), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate.as_deref(), Some(pem.as_str()));
+    assert_eq!(
+        crate::box_runtime::launch_root_certificate(&record).as_deref(),
+        Some(pem.as_str())
+    );
+    // The stored record reads back with it, as a restarted daemon reads it.
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    let reread: boxes::Record = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(reread.root_certificate, record.root_certificate);
+
+    // Steering `off` keeps the root out, whatever the record holds.
+    let id = mngr
+        .create_session(
+            created("off", grant_policy(Steering::Off), Some(pem.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+
+    // A box with no grant carries no root and gets none.
+    let id = mngr
+        .create_session(created("no-grant", Default::default(), None), None)
+        .await
+        .unwrap();
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created box has a record");
+    assert_eq!(record.root_certificate, None);
+    assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
+    let wire = serde_json_lenient::to_string(&record).unwrap();
+    assert!(!wire.contains("root_certificate"), "{wire}");
+}
+
+/// BOX-012: a restart reaps the pending record and keeps the running one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_keeps_running_records_and_reaps_pending_ones() {
+    let (state, cache, mngr, pending, _response) = create_pending_session().await;
+    let mut config = sample_config();
+    config.name = Some("still-running".to_string());
+    let running = create_active_session_with(&mngr, config).await;
+    assert_eq!(status_of(&mngr, pending).await, boxes::BoxState::Pending);
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+
+    assert_eq!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap(),
+        None,
+        "the restart reaps a pending record"
+    );
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(running))
+            .await
+            .unwrap()
+            .is_some(),
+        "the restart keeps a running record"
+    );
+}
+
+/// Milliseconds since the Unix epoch, the unit of an event's `ts`.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// The directories a box sees: every one of them is mounted into it.
+async fn box_visible_dirs(mngr: &BoxManagerHandle, id: SessionId) -> Vec<DaemonAbsPath> {
+    let paths = session(mngr, id).await.paths().await.unwrap();
+    vec![
+        paths.working,
+        paths.cache,
+        paths.home,
+        paths.patches,
+        paths.hooks,
+    ]
+}
+
+/// BOX-040: creating a box writes its `created` event, naming the box,
+/// its parent and when, into a file beside the record in the daemon's
+/// state directory, outside every directory the box sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_written_outside_box_filesystem_with_box_parent_ts_type() {
+    let (state, _cache, mngr) = manager().await;
+    let before = now_ms();
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let after = now_ms();
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(events.len(), 1, "one event per transition: {events:?}");
+    let created = &events[0];
+    assert_eq!(created.kind, BoxEventType::Created);
+    assert_eq!(created.box_id, id);
+    assert_eq!(
+        created.parent, None,
+        "a box created outside any box has no parent"
+    );
+    assert!(
+        (before..=after).contains(&created.ts),
+        "{before} <= {} <= {after}",
+        created.ts
+    );
+
+    let events_path = reader.object.events_path();
+    let events_path = events_path.as_utf8_path();
+    let sessions = camino::Utf8Path::from_path(state.path())
+        .unwrap()
+        .join("sessions");
+    assert!(events_path.starts_with(&sessions));
+    assert!(
+        events_path.parent().unwrap().join("record.json").exists(),
+        "the events file sits beside the record"
+    );
+    for seen in box_visible_dirs(&mngr, id).await {
+        assert!(
+            !events_path.starts_with(seen.as_utf8_path()),
+            "{events_path} is inside {seen}, which the box sees"
+        );
+    }
+}
+
+/// BOX-041, placement only: the box's events file is outside every
+/// directory the box can see. An events file written into those
+/// directories, whatever it claims, is not the box's events. The read
+/// returns only what the daemon wrote. No process runs inside a box here.
+/// The proof that uid 0 inside a real sandbox cannot append is the
+/// `_root_integration` test that #2661 owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_box_root_cannot_append_events() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+
+    let forged = BoxEvent {
+        box_id: id,
+        parent: None,
+        ts: now_ms(),
+        kind: BoxEventType::Exited,
+        data: EventData::new(),
+    };
+    let line = forged.to_line().unwrap();
+    for seen in box_visible_dirs(&mngr, id).await {
+        let dir = seen.as_utf8_path();
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [boxes::events::EVENTS_FILE, "record.json"] {
+            std::fs::write(dir.join(name), &line).unwrap();
+        }
+    }
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [BoxEventType::Created],
+        "no event written inside the box reaches its stream"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(reader.object.events_path().as_utf8_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "only the daemon's user can open it");
+    }
+}
+
+/// BOX-162: a complete line of the events file that is not an event
+/// makes the read fail with `InvalidData`, naming the line's byte offset.
+/// The read cannot return every retained event, so it does not end as
+/// complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_fails_on_a_refused_line() {
+    use std::io::Write as _;
+
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let path = reader.object.events_path();
+    let bad_at = std::fs::metadata(path.as_utf8_path()).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_utf8_path())
+        .unwrap()
+        .write_all(b"not an event\n")
+        .unwrap();
+
+    let err = reader.read_new().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&format!("byte {bad_at}")),
+        "the error names the offset: {err}"
+    );
+}
+
+/// BOX-040: the event a writer passes `data` to carries it, and reads back
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_event_carries_its_data() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let created = reader.read_new().unwrap();
+    assert!(created[0].data.is_empty(), "created carries an empty data");
+
+    let data: EventData = [("reason".to_string(), "stopped".into())]
+        .into_iter()
+        .collect();
+    let written = write_box_event(&reader.object, BoxEventType::Exited, data.clone()).unwrap();
+    assert_eq!(written.data, data);
+    assert_eq!(reader.read_new().unwrap(), [written]);
+}
+
+/// Drives the `ReadEvents` subsystem: writes the request and half-closes,
+/// and returns the response lines as they arrive.
+async fn open_events_read(
+    client: &mut crate::test_harness::TestClient,
+    id: SessionId,
+    follow: bool,
+) -> tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let channel = client
+        .open_subsystem(minimald_rpc::READ_EVENTS_SUBSYSTEM, &[])
+        .await;
+    let mut stream = channel.into_stream();
+    let req = minimald_rpc::ReadEventsRequest { id, follow };
+    stream
+        .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    tokio::io::BufReader::new(stream).lines()
+}
+
+/// The next update line, or `None` at the end of the stream.
+async fn next_update(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>>,
+) -> Option<minimald_rpc::ReadEventsUpdate> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+        .await
+        .expect("the read answers in time")
+        .unwrap()
+        .map(|line| serde_json_lenient::from_str(&line).expect("each line is an update"))
+}
+
+/// BOX-162: a read of a box's events returns every retained event, in
+/// the order the daemon wrote them, then `Done`. A read of a box no
+/// record names returns no event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_returns_full_retained_stream_in_order() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "evts", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut written = reader.object.read_events_from(0).unwrap().events;
+    assert_eq!(written[0].kind, BoxEventType::Created);
+    for kind in [
+        BoxEventType::Started,
+        BoxEventType::ExecStarted,
+        BoxEventType::ExecExited,
+        BoxEventType::Detached,
+        BoxEventType::Resumed,
+        BoxEventType::Renamed,
+        BoxEventType::OomKilled,
+        BoxEventType::Exited,
+    ] {
+        written.push(write_box_event(&reader.object, kind, EventData::new()).unwrap());
+    }
+
+    let mut lines = open_events_read(&mut client, id, false).await;
+    let mut read = Vec::new();
+    while let Some(update) = next_update(&mut lines).await {
+        read.push(update);
+    }
+    let mut expected: Vec<ReadEventsUpdate> = written
+        .into_iter()
+        .map(|event| ReadEventsUpdate::Event { event })
+        .collect();
+    expected.push(ReadEventsUpdate::Done);
+    assert_eq!(read, expected);
+
+    let mut lines = open_events_read(&mut client, SessionId::mint(), false).await;
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "an unknown box has no events"
+    );
+}
+
+/// BOX-162: a followed read returns every retained event, then each new
+/// one as it is written, and ends with `Reaped` once the box is reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_follow_replays_then_tails_until_reaped() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "tail", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut retained = reader.object.read_events_from(0).unwrap().events;
+    retained
+        .push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
+
+    let mut lines = open_events_read(&mut client, id, true).await;
+    for event in retained {
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event })
+        );
+    }
+
+    for kind in [BoxEventType::Detached, BoxEventType::Resumed] {
+        let event = write_box_event(&reader.object, kind, EventData::new()).unwrap();
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event }),
+            "a new event reaches the follower"
+        );
+    }
+
+    mngr.delete_session(id).await.unwrap();
+    assert_eq!(
+        next_update(&mut lines).await,
+        Some(ReadEventsUpdate::Reaped)
+    );
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "the stream ends at the reap"
     );
 }
