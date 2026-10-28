@@ -374,7 +374,10 @@ fn a_pinned_install_is_never_told_and_the_notice_waits_for_a_plain_command() {
         key: "0.8.0".into(),
     };
     assert_eq!(notice_due(&state, &pinned), None);
-    assert!(leaves_the_notice_visible(&None));
+    assert!(
+        !leaves_the_notice_visible(&None),
+        "bare `min` attaches to a box"
+    );
     assert!(leaves_the_notice_visible(&Some(crate::cli::Command::Dirs)));
     assert!(!leaves_the_notice_visible(&Some(crate::cli::Command::Dash)));
     assert!(!leaves_the_notice_visible(&Some(
@@ -488,4 +491,21 @@ async fn a_404_an_odd_body_and_a_slow_endpoint_are_silent_within_the_budget() {
     );
     let unreachable = "http://127.0.0.1:9/v1/stable/0.7.1";
     assert_eq!(fetch_latest(unreachable).await, None);
+}
+
+/// The disclosure is one sentence for a person: it names the switches by their
+/// settings, with no type name of this module's in it (a rename once put
+/// `UpdateDisabledReason:` where `Off:` belongs, review 2026-10-28).
+#[test]
+fn the_disclosure_reads_as_a_sentence() {
+    let text = disclosure();
+    assert!(
+        text.contains("Off: MINIMAL_TELEMETRY=0, or [telemetry] enabled = false in config.toml."),
+        "{text}"
+    );
+    assert!(
+        !text.contains("UpdateDisabledReason") && !text.contains("::"),
+        "{text}"
+    );
+    assert!(text.ends_with(DOCS_URL), "{text}");
 }

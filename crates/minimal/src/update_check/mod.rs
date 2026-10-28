@@ -124,16 +124,17 @@ pub fn skip_for(command: &Option<crate::cli::Command>) -> bool {
     )
 }
 
-/// The commands that leave the terminal to the notice: short ones whose
-/// output scrolls past. A command that takes the terminal (a session
-/// attach, `run`, a task, the dashboard) paints over a line written before
-/// it, so the notice waits for the next command of this kind, and is only
-/// recorded as shown once it was printed before one.
+/// The commands that leave the terminal to a line written before them:
+/// short ones whose output scrolls past. A command that takes the terminal
+/// (bare `min`, which attaches to a box; a session attach; `run`; a task;
+/// the dashboard; `proxy`, whose stderr is ssh's) paints over it, so the
+/// disclosure and the notice wait for the next command of this kind, and
+/// are recorded as shown only once printed before one.
 pub fn leaves_the_notice_visible(command: &Option<crate::cli::Command>) -> bool {
     use crate::cli::Command;
     matches!(
         command,
-        None | Some(
+        Some(
             Command::Ls(_)
                 | Command::Stop(_)
                 | Command::Loadout(_)
@@ -143,7 +144,6 @@ pub fn leaves_the_notice_visible(command: &Option<crate::cli::Command>) -> bool 
                 | Command::Add(_)
                 | Command::Update(_)
                 | Command::Login(_)
-                | Command::Proxy(_)
                 | Command::Auth(_)
                 | Command::Secret(_)
                 | Command::Bug(_)
@@ -173,7 +173,8 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     if first_run {
         state.install_id = Some(new_install_id());
     }
-    let disclose = disclosure_due(&state, tty);
+    let visible = leaves_the_notice_visible(command);
+    let disclose = disclosure_due(&state, tty) && visible;
     if disclose {
         state.disclosed = true;
         let _ = writeln!(std::io::stderr(), "{}", disclosure());
@@ -190,6 +191,15 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     if first_run || disclose {
         return;
     }
+    // A terminal that has not read the disclosure yet (its commands so far
+    // took the screen) sends nothing either: the first interactive command
+    // that leaves the line visible discloses, and the request waits for the
+    // one after. An install without a terminal is counted from its second
+    // command, as the module doc says: that is inbox#589's decision, not a
+    // gap here.
+    if tty && !state.disclosed {
+        return;
+    }
 
     if due(&state, now_secs()) {
         let lock = dir.join(LOCK_FILE);
@@ -201,7 +211,7 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     }
 
     if tty
-        && leaves_the_notice_visible(command)
+        && visible
         && let Some(latest) = notice_due(&state, &install)
     {
         let text = notice(&install, latest);

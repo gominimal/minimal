@@ -8,7 +8,7 @@ pub fn disclosure() -> String {
     format!(
         "min checks once a day whether a newer release of its channel exists, sending its channel, \
          version, OS, architecture, install method and a random install id to update.minimal.dev. \
-         UpdateDisabledReason: MINIMAL_TELEMETRY=0, or [telemetry] enabled = false in config.toml. {DOCS_URL}"
+         Off: MINIMAL_TELEMETRY=0, or [telemetry] enabled = false in config.toml. {DOCS_URL}"
     )
 }
 
