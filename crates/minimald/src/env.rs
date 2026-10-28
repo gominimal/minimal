@@ -1548,6 +1548,7 @@ const CHANNEL_METHODS: &[&str] = &[
     "build",
     "materialize",
     "net-expose",
+    "net-expose-public",
 ];
 
 /// The `method` a helper request is recorded under: the text before its
@@ -1653,6 +1654,13 @@ impl BoxChannel {
             // published by the session that owns it.
             Some(("net-expose", port)) => {
                 self.expose_port(stream, port).await;
+                None
+            }
+            // `<port>` or nothing: the box's own `min net expose --public
+            // [<port>]` (NET-145). No public surface exists on this host, so
+            // the request is refused and nothing is published.
+            Some(("net-expose-public", port)) => {
+                self.refuse_public_expose(stream, port);
                 None
             }
             // A new arm above also goes in `CHANNEL_METHODS`, or its span
@@ -2454,6 +2462,30 @@ impl BoxChannel {
                 let _ = writeln!(stream, "{line}");
             }
         }
+    }
+
+    /// Refuses the box's `min net expose --public [<port>]` (NET-145): this
+    /// host has no public surface, so nothing is published, neither locally
+    /// nor publicly. The request is never handed to the session, so no
+    /// mapping can result from it. One info line names the box, the port as
+    /// given (empty when none was given), the outcome and the reason.
+    fn refuse_public_expose(&self, stream: &mut UnixStream, port: &str) {
+        tracing::info!(
+            name = %self.name,
+            port = %port,
+            outcome = "refused: public exposure",
+            reason = %format_args!("public exposure is not available on this host"),
+            "dynamic ingress expose"
+        );
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the reply channel is best-effort: a peer may be gone before the reply \
+                      lands, and there is nowhere to report that to"
+        )]
+        let _ = writeln!(
+            stream,
+            "error: public exposure is not available on this host. Nothing was published."
+        );
     }
 
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
@@ -3849,6 +3881,49 @@ exit $rc
         );
     }
 
+    /// NET-145: the box's `min net expose --public [<port>]` arrives as its
+    /// own request, with or without a port, and is refused with the plain
+    /// line the helper prints before it exits 1. The session is never asked,
+    /// so nothing is published: the dangling session handle here would
+    /// answer `session is gone` if it were. The info line names the box, the
+    /// port as given and the outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_public_refused_without_public_surface() {
+        let capture = crate::test_harness::captured_log();
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        for request in ["net-expose-public%3000", "net-expose-public%"] {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            #[expect(
+                clippy::large_futures,
+                reason = "the handle future carries the harness's whole channel; the test \
+                          awaits it to completion"
+            )]
+            chan.handle(request, &mut ours).await;
+            drop(ours);
+            assert_eq!(
+                read_lines(&theirs),
+                vec![
+                    "error: public exposure is not available on this host. Nothing was published."
+                ],
+                "{request}: the public request is refused, and the session is not asked"
+            );
+        }
+        assert_eq!(
+            super::channel_method("net-expose-public%3000"),
+            "net-expose-public"
+        );
+        let logged = capture.contents();
+        let lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains("outcome=\"refused: public exposure\"")
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per request, got: {logged}");
+        assert!(lines[0].contains("port=3000"), "{}", lines[0]);
+    }
+
     /// NET-044's observability for the paths no session actor ever saw — the
     /// ones a `min net expose` request can take without one deciding it: a
     /// port that is not a number, a session that is gone, a reply channel an
@@ -4447,7 +4522,8 @@ exit $rc
         assert_eq!(
             read_lines(&theirs),
             vec![
-                "error: port 4200 is outside this box's declared dynamic range 3000-3999"
+                "error: port 4200 is outside this box's --dynamic-range 3000-3999. Nothing \
+                 was published."
                     .to_string()
             ],
             "the out-of-range request is refused with its own typed error"
