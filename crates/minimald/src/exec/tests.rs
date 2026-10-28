@@ -122,6 +122,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // No launch ever minted these records, so none has recorded its
         // outcome on one.

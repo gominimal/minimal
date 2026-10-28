@@ -139,6 +139,9 @@ fn build_record(
         // daemon draws nothing for a task either (NET-138).
         task_addresses: config.task_addresses,
         status,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: config.hooks_enabled,
         // Daemon-owned from its first line: a create holds no launch's
         // outcome to record, and the key a client might assert in `attrs`
@@ -1108,7 +1111,11 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
         };
         // BOX-012: the restart reaps only pending and materializing
         // records. Every other state, running included, is kept.
-        let state = record.state();
+        // A stopped or exited record whose ending this build cannot read
+        // is not pending or materializing, so the restart keeps it.
+        let Ok(state) = record.state() else {
+            continue;
+        };
         if !state.reaped_at_restart() {
             continue;
         }

@@ -757,6 +757,15 @@ impl BoxActor {
                      (restart-orphaned actor); destroy the session and re-activate",
                 ));
             }
+            // BOX-011: an ended box has no process to host. No path writes
+            // these states yet; until one does and the actor learns to
+            // hold an ended box, refuse it as for `Materializing`.
+            BoxState::Stopped | BoxState::Exited => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session record has ended (stopped or exited); no actor hosts an ended session",
+                ));
+            }
         };
 
         let (sender, receiver) = crate::traced::channel(8);

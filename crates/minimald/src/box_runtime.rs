@@ -2212,6 +2212,9 @@ mod proxy_env_tests {
                 ..Default::default()
             },
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
