@@ -279,7 +279,7 @@ pub struct Config {
     #[serde(default)]
     pub deny_all_opt_out: bool,
     /// How the create gate learns the host's verdict on the unprivileged
-    /// user namespace every session sandbox starts by unsharing (NET-141).
+    /// user namespace every session sandbox starts by unsharing (NET-143).
     /// Never persisted or handed in: the daemon binary decides it at start
     /// (live, or off under `MINIMALD_USERNS_GATE=off`), and the test harness
     /// fixes it per server.
@@ -304,7 +304,7 @@ pub fn this_daemon_path() -> String {
 /// dependency of their own.
 pub use sandbox::UsernsRestriction;
 
-/// Where the create gate's user-namespace verdict comes from (NET-141).
+/// Where the create gate's user-namespace verdict comes from (NET-143).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsernsGate {
     /// Probe this process on every create — a few `/proc` reads — so a
@@ -802,7 +802,7 @@ impl ServerStateHandle {
     }
 
     /// The host's user-namespace verdict the create gate decides on
-    /// (NET-141), per [`Config::user_namespace_gate`]: probed live from this
+    /// (NET-143), per [`Config::user_namespace_gate`]: probed live from this
     /// process on each call, so nothing is cached across creates; the lock
     /// is held for the copy of the gate alone, never across the probe.
     pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
@@ -1406,6 +1406,13 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         return;
     }
     let mngr = state.sessions_manager().await;
+    // Behind a VM host daemon the client's registration lease closed with
+    // its connection, and the host withdrew the box's row on that close. A
+    // session kept here would run with no row: its name would not resolve,
+    // and the host could hand its addresses to another box. Nothing in the
+    // VM can publish the row again, so here a finished session is reaped as
+    // an unfinished one is. A native daemon has no such row, and keeps it.
+    let keep_finished = !state.in_microvm().await;
     for id in ids {
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
@@ -1428,11 +1435,23 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         ) {
             continue;
         }
-        match mngr.delete_session(id).await {
-            Ok(_) => tracing::info!(
+        // Only if still unfinished when the session gets to it: a finalize
+        // already in flight ends first, and a session it finished is kept
+        // (inbox#690's reap half) — on a native daemon; see above.
+        let reaped = if keep_finished {
+            mngr.delete_session_if_unfinalized(id).await
+        } else {
+            mngr.delete_session(id).await.map(Some)
+        };
+        match reaped {
+            Ok(Some(_)) => tracing::info!(
                 session_id = %id,
                 ?status,
                 "reaped unfinalized session after its connection closed"
+            ),
+            Ok(None) => tracing::info!(
+                session_id = %id,
+                "kept a session whose connection closed: it finished activating first"
             ),
             Err(e) => tracing::warn!(
                 session_id = %id,

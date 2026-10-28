@@ -59,9 +59,9 @@ impl crate::GraphBasedChecker for OutputTypesValid {
                 .match_files_for_glob(cached_build.path(), glob)?
                 .iter()
             {
-                let data = std::fs::read(path)
+                let data = crate::open_output(path)
                     .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
-                match (object::File::parse(&*data), output) {
+                match (object::File::parse(&data), output) {
                     (Ok(f), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
                         match (f.architecture(), graph.target().arch()) {
                             (object::Architecture::Aarch64, Arch::Arm64) => {}
@@ -102,10 +102,10 @@ impl crate::GraphBasedChecker for OutputTypesValid {
                     ) if format!("{}", e) == "Unknown file magic"
                         || format!("{}", e) == "Could not read file magic" => {}
                     (Err(e), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
-                        if matches!(output, BuildOutput::Binary { .. }) && data.starts_with(b"#!") {
+                        if matches!(output, BuildOutput::Binary { .. }) && is_script(&data) {
                             // Special case for binaries - its valid for it to be a #! executable.
                         } else if matches!(output, BuildOutput::Library { .. })
-                            && object::read::archive::ArchiveFile::parse(&*data).is_ok()
+                            && object::read::archive::ArchiveFile::parse(&data).is_ok()
                         {
                             // Special case for libraries - its valid for it to be a .a archive object.
                         } else {
@@ -208,10 +208,10 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                     // Every output file gets read and ELF-parsed below, so this
                     // is where a large package spends its time.
                     crate::bail_if_cancelled(&cancel)?;
-                    let data = std::fs::read(path)
+                    let data = crate::open_output(path)
                         .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                     if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
-                        (object::File::parse(&*data), output)
+                        (object::File::parse(&data), output)
                         && let Ok(imports) = elf.imports()
                     {
                         let path_in_build = path.strip_prefix(cached_build.path()).unwrap();
@@ -276,14 +276,13 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                         glob: _,
                         allow_missing_interpreter: false,
                     } = output
-                        && data.starts_with(b"#!")
-                        && let Some(newline_idx) = data.iter().position(|c| c == &b'\n')
+                        && let Some(line) = shebang(&data)
                     {
                         // NOTE: most Linux kernels (and many Unix systems) treat everything after #!
                         // up to the first space as the interpreter, and everything after the first space
                         // as a single argument. So we just collect everything after the shebang up to
                         // the first space (or, newline).
-                        let interpreter = String::from_utf8(data[2..newline_idx].to_vec())
+                        let interpreter = String::from_utf8(line.to_vec())
                             .map_err(|e| Error::Other(e.into()))?
                             .trim_start()
                             .split(" ")
@@ -427,9 +426,40 @@ fn find_lib_in_deps(
     Ok(None)
 }
 
+/// Whether `data` starts with `#!`.
+fn is_script<'a, R: object::ReadRef<'a>>(data: R) -> bool {
+    data.read_bytes_at(0, 2).is_ok_and(|b| b == b"#!")
+}
+
+/// What follows `#!` up to the first newline: `None` if `data` is not a
+/// script, or is one with no newline (which names no interpreter).
+fn shebang<'a, R: object::ReadRef<'a>>(data: R) -> Option<&'a [u8]> {
+    if !is_script(data) {
+        return None;
+    }
+    let len = data.len().ok()?;
+    data.read_bytes_at_until(2..len, b'\n').ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shebang_reads_through_a_read_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("s");
+        std::fs::write(&script, b"#! /usr/bin/env python3 -u\nprint(1)\n").unwrap();
+        let cache = crate::open_output(&script).unwrap();
+        assert!(is_script(&cache));
+        assert_eq!(shebang(&cache), Some(&b" /usr/bin/env python3 -u"[..]));
+        let no_newline = dir.path().join("n");
+        std::fs::write(&no_newline, b"#!/bin/sh").unwrap();
+        assert_eq!(shebang(&crate::open_output(&no_newline).unwrap()), None);
+        let elf_ish = dir.path().join("e");
+        std::fs::write(&elf_ish, b"\x7fELF").unwrap();
+        assert!(!is_script(&crate::open_output(&elf_ish).unwrap()));
+    }
     use crate::{CheckCtx, CheckVerdict, GraphBasedChecker};
     use decode::Layer;
     use graph::Graph;

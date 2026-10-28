@@ -51,6 +51,9 @@ pub(crate) fn effective_session_policy(
         // the effective policy a box's gate reads keeps the lane the box
         // declared beside it.
         credentialed_upstream: policy.credentialed_upstream.clone(),
+        // BEP-018: the declared `quic443` stance resolves nothing here
+        // either. The gate resolves it, so it is carried verbatim.
+        quic443: policy.quic443,
     }
 }
 

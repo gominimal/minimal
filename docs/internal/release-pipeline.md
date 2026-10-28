@@ -20,8 +20,8 @@ Follow these steps in order. The examples use version `X.Y.Z` and commit
 
 ### Before you start
 
-- You start the promotion run in step 6, and a second person on the
-  approver list in `promote.yml` approves it. The workflow does not let you
+- You start the promotion run in step 6, and a second member of the
+  `@gominimal/minimalists` team approves it. The workflow does not let you
   approve your own run.
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
@@ -553,9 +553,13 @@ version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build.
 
 **Approval.** The `gate` job opens an approval issue, posts to Slack, and
-waits. A person on the approver list, other than the person who started the
-run, comments `approved` or `denied`. If someone closes the issue without an
-approval, the workflow stops.
+waits. The approvers are the members of the `@gominimal/minimalists` team,
+other than the person who started the run. The workflow reads the team once,
+when the gate opens, so a change to the team's membership applies from the
+next promotion, not to one already waiting. If the team cannot be read, or has
+no other member, the gate fails and nothing is promoted. An approver comments
+`approved` or `denied`. If someone closes the issue without an approval, the
+workflow stops.
 
 **Smoke check.** The `promote` job runs
 [`scripts/verify-smoked.sh`](../../scripts/verify-smoked.sh). It compares the

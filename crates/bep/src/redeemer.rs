@@ -12,13 +12,18 @@
 //!    keys ([`handle::read_opened`]),
 //! 4. gives the facts and the revocations it holds to [`redeem::decide`],
 //! 5. and on an admit only, resolves the sign-in reference to the member's
-//!    credential from the sign-in item in the host keychain.
+//!    credential from the sign-in item in the host keychain. A token that
+//!    has expired, or expires within 5 minutes, is renewed first, one
+//!    renewal in flight per item (BEP-069). An admitted store member is
+//!    given to the forwarder as [`Redeemed::Store`], and the forwarder reads
+//!    its value from the host store (BEP-032).
 //!
 //! A revoked value is refused at step 4, so no reference is resolved for it
 //! (BEP-071). The redeemer never logs or returns the credential except in
 //! [`Verdict::Admit`], which the forwarder substitutes and zeroes.
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
@@ -26,23 +31,28 @@ use zeroize::Zeroizing;
 use crate::audit::Mapping;
 use crate::boxes::BoxRegistry;
 use crate::control::Registry;
-use crate::forward::{Redeemer, Verdict};
-use crate::handle::{self, Handle, StoreRule};
+use crate::forward::{
+    Ran, Redeemed, Redeemer, SEALED_HEADER_MISPLACED, SingleFlight, StoreAdmit, Verdict,
+};
+use crate::handle::{self, Handle, Rules, StoreRule};
 use crate::keys::HeldKey;
 use crate::module::Module;
 use crate::redeem::{
     self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
 };
-use crate::seal::{self, Binding, OpenError, Opened};
-use crate::signin::{Keychain, Standing};
+use crate::seal::{self, Binding, MemberKind, OpenError, Opened};
+use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, TokenEndpoint};
 
 /// The audit marker of an admitted redemption whose sign-in reference
 /// resolves to no live sign-in: the item is gone, names another sign-in, or
-/// its token expired.
+/// its token expired and was not renewed.
 pub const SIGN_IN_REQUIRED: &str = "github_sign_in_required";
 
 /// The box ids that the revocations in force name.
 pub type Revocations = Arc<RwLock<Vec<String>>>;
+
+/// The source of the current `[secret-store-rules]`, asked at each request.
+pub type StoreRules = Arc<dyn Rules + Send + Sync>;
 
 /// The clock, in seconds since the Unix epoch.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -67,8 +77,19 @@ pub struct BoxRedeemer<K, C> {
     boxes: BoxRegistry,
     keychain: C,
     revocations: Revocations,
+    rules: StoreRules,
     clock: Clock,
+    endpoint: Arc<dyn TokenEndpoint>,
+    renewals: SingleFlight<Result<Resolved, RenewError>>,
+    /// When the last renewal of each item failed, by instance. Within
+    /// [`RENEW_RETRY_AFTER_SECS`] of it, no request calls GitHub again.
+    failed_renewals: Mutex<HashMap<String, u64>>,
 }
+
+/// How long the proxy waits after a failed renewal of an item before it asks
+/// GitHub again. A refused refresh token stays refused, and each attempt
+/// can take up to 30 seconds, so a request in this window does not retry.
+pub const RENEW_RETRY_AFTER_SECS: u64 = 60;
 
 impl<K, C> std::fmt::Debug for BoxRedeemer<K, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,6 +104,11 @@ impl<K, C> std::fmt::Debug for BoxRedeemer<K, C> {
 struct Facts {
     redemption: Redemption<String, String>,
     identifier: Option<String>,
+    /// The opened member's kind, or `None` when the value did not open.
+    kind: Option<MemberKind>,
+    /// The handle's `jti` for the audit record, or empty when the value did
+    /// not open or the handle does not parse.
+    jti: String,
 }
 
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
@@ -91,13 +117,10 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
     /// `boxes`, and resolves sign-in references from `keychain`. The clock
     /// is the system clock.
     ///
-    /// Interim: the redeemer starts with no revocation in force, and in
-    /// `bep serve` nothing writes one. T20
-    /// (<https://github.com/gominimal/minimal/issues/2277>) records
-    /// revocations over the control socket. T33
-    /// (<https://github.com/gominimal/minimal/issues/2290>) restores them
-    /// from every retained audit segment at start, the BEP-068
-    /// restore-on-start sub-requirement. Those two are the flip.
+    /// A `revoke_box` request on the control socket puts a revocation in
+    /// force ([`crate::revoke::record`]). `bep serve` passes the
+    /// revocations restored from every retained audit segment through
+    /// [`with_revocations`](Self::with_revocations) (BEP-068).
     #[must_use]
     pub fn new(
         key: K,
@@ -115,14 +138,35 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             boxes,
             keychain,
             revocations: Revocations::default(),
+            rules: Arc::new(Vec::<StoreRule>::new()),
             clock: system_clock(),
+            endpoint: Arc::new(NoTokenEndpoint),
+            renewals: SingleFlight::default(),
+            failed_renewals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// This redeemer, with `endpoint` as GitHub's token endpoint, which
+    /// renews an expiring sign-in (BEP-069). With none, an expired token is
+    /// refused.
+    #[must_use]
+    pub fn with_token_endpoint(mut self, endpoint: Arc<dyn TokenEndpoint>) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// This redeemer, with `revocations` as the revocations in force.
     #[must_use]
     pub fn with_revocations(mut self, revocations: Revocations) -> Self {
         self.revocations = revocations;
+        self
+    }
+
+    /// This redeemer, with `rules` as the current `[secret-store-rules]`.
+    /// With none, no store member is admitted.
+    #[must_use]
+    pub fn with_rules(mut self, rules: StoreRules) -> Self {
+        self.rules = rules;
         self
     }
 
@@ -195,12 +239,19 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
 
     /// Gathers the facts [`redeem::decide`] reads for one request.
     ///
-    /// The revoked set is what [`Self::with_revocations`] gave, which is
-    /// empty in `bep serve` until T20 (#2277) and T33 (#2290) land. The
-    /// store rules are empty until T25
-    /// (<https://github.com/gominimal/minimal/issues/2280>) reads
-    /// `[secret-store-rules]`, so this redeemer never admits a
-    /// store-handle member yet.
+    /// The revoked set is the revocations in force that cover the box id
+    /// the value names ([`crate::revoke::in_force_for`]). A `revoke_box` request on the
+    /// control socket puts one in force. `bep serve` passes the
+    /// revocations restored from every retained audit segment through
+    /// [`with_revocations`](Self::with_revocations) (BEP-068).
+    ///
+    /// For a store member, the bound set is the handle's `upstream` and the
+    /// current set is the current rule's authorities, so the checks that
+    /// read a module's host sets read those (BEP-032, BEP-064). The rules
+    /// are the ones [`Self::with_rules`] gives. `bep serve` gives the
+    /// `[secret-store-rules]` of the user-level client `config.toml` merged
+    /// over the organization's, less each rule the deny set refuses
+    /// (BEP-034), read again when either file changes.
     fn facts(
         &self,
         box_id: &str,
@@ -241,27 +292,51 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 port: a.port,
             })
             .collect();
-        let (bound_set, handle, identifier) = match &opened {
+        let kind = opened.as_ref().map(|opened| opened.member.kind);
+        let (bound_set, current_set, handle, identifier, jti) = match &opened {
             Some(opened) => {
-                // Only the module's current host-set version is known, so a
-                // value sealed under another version has an empty bound set.
-                let bound_set = if opened.context.host_set_version == self.module.host_set_version {
-                    current_set.clone()
-                } else {
-                    Vec::new()
-                };
-                // Interim: no store rules until T25 (#2280) reads
-                // `[secret-store-rules]`, so a store-handle member is not
-                // admitted here.
-                let rules: &[StoreRule] = &[];
                 let read = {
                     let clients = self.clients.read().unwrap_or_else(PoisonError::into_inner);
-                    handle::read_opened(opened, &clients, rules, &self.module, now)
+                    handle::read_opened(opened, &clients, &*self.rules, &self.module, now)
                 };
-                (bound_set, read.handle, read.identifier)
+                let (bound_set, current_set) = match opened.member.kind {
+                    MemberKind::Store => (
+                        read.handle.upstream.clone(),
+                        read.handle
+                            .rule
+                            .as_ref()
+                            .map(|rule| rule.upstream.clone())
+                            .unwrap_or_default(),
+                    ),
+                    // Only the module's current host-set version is known,
+                    // so a value sealed under another version has an empty
+                    // bound set.
+                    MemberKind::SignIn => {
+                        let bound_set =
+                            if opened.context.host_set_version == self.module.host_set_version {
+                                current_set.clone()
+                            } else {
+                                Vec::new()
+                            };
+                        (bound_set, current_set)
+                    }
+                };
+                // Gatehouse §6.10: the audit record carries the handle's
+                // `jti` as its correlation id. The `jti` is the claim even
+                // when the signature does not verify, so a refusal of a
+                // forged handle still correlates. `decide` admits only a
+                // verified handle, so an admitted record's `jti` is verified.
+                (
+                    bound_set,
+                    current_set,
+                    read.handle,
+                    read.identifier,
+                    read.jti.unwrap_or_default(),
+                )
             }
             None => (
                 Vec::new(),
+                current_set,
                 Handle {
                     verified: false,
                     bound: false,
@@ -271,13 +346,25 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                     rule: None,
                 },
                 None,
+                String::new(),
             ),
         };
-        let revoked = self
-            .revocations
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let revoked = {
+            let set = self
+                .revocations
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            // The value's own box id, which differs from the source's for a
+            // cohort member. A value that did not open names no box, and
+            // `decide` refuses it before it reads this set.
+            match &unsealed {
+                Unsealed::Opened { box_id: named, .. } => crate::revoke::in_force_for(&set, named)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                _ => Vec::new(),
+            }
+        };
         Facts {
             redemption: Redemption {
                 unsealed,
@@ -293,12 +380,87 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 handle,
             },
             identifier,
+            kind,
+            jti,
         }
     }
 
+    /// The verdict on a sign-in member, from its `facts` at clock reading
+    /// `now`.
+    fn sign_in_verdict(&self, box_id: &str, facts: Facts, now: u64) -> Verdict {
+        let verdict = match redeem::decide(&facts.redemption) {
+            Decision::Refuse(check) => Verdict::Refuse(check.marker()),
+            decision @ Decision::Admit { .. } => {
+                let identifier = facts.identifier.unwrap_or_default();
+                match self.credential(&identifier, now) {
+                    // The admission's marker reaches the audit record, so a
+                    // cohort admission is recorded `cohort_attributed`
+                    // (BEP-028).
+                    Some((credential, renewed)) => Verdict::Admit {
+                        credential,
+                        identifier,
+                        mapping: Mapping::ModuleUnmapped,
+                        renewed,
+                        marker: decision.marker(),
+                        cohort_attributed: decision.cohort_attributed(),
+                    },
+                    None => Verdict::Refuse(SIGN_IN_REQUIRED),
+                }
+            }
+        };
+        tracing::debug!(box_id, ?verdict, jti = ?facts.jti, "sealed value decided");
+        verdict
+    }
+
+    /// The decision on a store member, from its `facts` (BEP-032). An
+    /// admitted member names the store, the identifier and the injection
+    /// form for the forwarder, which reads the value. Nothing is read here.
+    fn store_decision(box_id: &str, facts: Facts) -> Redeemed {
+        let decided = match redeem::decide(&facts.redemption) {
+            Decision::Refuse(check) => Redeemed::Verdict(Verdict::Refuse(check.marker())),
+            decision @ Decision::Admit { .. } => {
+                let reference = facts
+                    .identifier
+                    .as_deref()
+                    .and_then(|identifier| identifier.split_once(':'));
+                match (reference, facts.redemption.handle.inject) {
+                    (Some((store, id)), Some(inject)) => Redeemed::Store(StoreAdmit {
+                        store: store.to_owned(),
+                        id: id.to_owned(),
+                        inject,
+                        mapping: Mapping::ModuleUnmapped,
+                        marker: decision.marker(),
+                        cohort_attributed: decision.cohort_attributed(),
+                    }),
+                    // A checked store handle names both, so this is not
+                    // reached. It refuses rather than inject nothing.
+                    _ => Redeemed::Verdict(Verdict::Refuse(
+                        redeem::Check::StoreHandleInvalid.marker(),
+                    )),
+                }
+            }
+        };
+        match &decided {
+            Redeemed::Store(admit) => tracing::debug!(
+                box_id,
+                store = %admit.store,
+                id = %admit.id,
+                "store reference admitted"
+            ),
+            Redeemed::Verdict(verdict) => {
+                tracing::debug!(box_id, ?verdict, "store reference decided")
+            }
+        }
+        decided
+    }
+
     /// The credential the sign-in reference `identifier` names, when the
-    /// held sign-in is that one and its token is live.
-    fn credential(&self, identifier: &str, now: u64) -> Option<Zeroizing<String>> {
+    /// held sign-in is that one, and whether this request renewed it.
+    ///
+    /// A token that has expired or expires within 5 minutes goes to the
+    /// renewal, one in flight per item (BEP-069). A request that finds a
+    /// renewal in flight waits for its outcome and does not renew again.
+    fn credential(&self, identifier: &str, now: u64) -> Option<(Zeroizing<String>, bool)> {
         let instance = identifier
             .strip_prefix(self.module.id)
             .and_then(|rest| rest.strip_prefix(':'))?;
@@ -310,23 +472,75 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
                 return None;
             }
         };
-        // Interim: a token that is `Standing::RenewsAtProxy` is refused here,
-        // and the request is refused `github_sign_in_required`. BEP-069
-        // renews the token at the proxy before it is substituted. T24
-        // (https://github.com/gominimal/minimal/issues/2279) wires that
-        // renewal, and is the flip. Until then the refusal stands, while
-        // `min auth status` tells the user that the token renews at the proxy.
-        if metadata.instance != instance || metadata.standing(now) != Standing::Live {
+        if metadata.instance != instance {
+            return None;
+        }
+        if metadata.needs_renewal(now) && !self.renewal_backed_off(instance, now) {
+            let ran = self.renewals.run(instance, || {
+                let outcome = signin::renew(&self.keychain, self.endpoint.as_ref(), instance, now);
+                self.record_renewal(instance, &outcome, now);
+                outcome
+            });
+            return match ran {
+                Ran::Led(Ok(resolved)) => Some((resolved.token, resolved.renewed)),
+                Ran::Waited(Ok(resolved)) => Some((resolved.token, false)),
+                Ran::Led(Err(error)) | Ran::Waited(Err(error)) => {
+                    tracing::debug!(%error, "the sign-in reference resolved to no token");
+                    None
+                }
+                Ran::Abandoned => None,
+                Ran::TimedOut => {
+                    tracing::warn!(
+                        "the sign-in renewal in flight did not end in time; the request is refused"
+                    );
+                    None
+                }
+            };
+        }
+        if now >= metadata.token_expires_at {
+            // A renewal failed within the back-off, and the token expired.
+            tracing::debug!("the sign-in reference resolved to an expired token");
             return None;
         }
         match self.keychain.material() {
             Ok(Some(material)) if material.instance == instance => {
-                Some(Zeroizing::new(material.access_token.clone()))
+                Some((Zeroizing::new(material.access_token.clone()), false))
             }
             Ok(_) => None,
             Err(error) => {
                 tracing::warn!(%error, "the sign-in item was not read");
                 None
+            }
+        }
+    }
+}
+
+impl<K, C> BoxRedeemer<K, C> {
+    /// True when the last renewal of `instance` failed less than
+    /// [`RENEW_RETRY_AFTER_SECS`] before `now`.
+    fn renewal_backed_off(&self, instance: &str, now: u64) -> bool {
+        self.failed_renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instance)
+            .is_some_and(|&failed| now < failed.saturating_add(RENEW_RETRY_AFTER_SECS))
+    }
+
+    /// Record the outcome of a renewal of `instance`. A renewal that gave no
+    /// new token starts the back-off. A renewed token ends it.
+    fn record_renewal(&self, instance: &str, outcome: &Result<Resolved, RenewError>, now: u64) {
+        let mut failed = self
+            .failed_renewals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match outcome {
+            // A renewed token, or a token that another renewal already wrote
+            // with time to live. Nothing failed.
+            Ok(resolved) if !resolved.failed => {
+                failed.remove(instance);
+            }
+            _ => {
+                failed.insert(instance.to_owned(), now);
             }
         }
     }
@@ -348,24 +562,54 @@ where
         request: &RequestAuthority<String>,
         sealed: &str,
     ) -> Verdict {
+        self.redeem_with_jti(box_id, authority, request, sealed).0
+    }
+
+    fn redeem_with_jti(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+    ) -> (Verdict, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
-        let verdict = match redeem::decide(&facts.redemption) {
-            Decision::Refuse(check) => Verdict::Refuse(check.marker()),
-            Decision::Admit { .. } => {
-                let identifier = facts.identifier.unwrap_or_default();
-                match self.credential(&identifier, now) {
-                    Some(credential) => Verdict::Admit {
-                        credential,
-                        identifier,
-                        mapping: Mapping::ModuleUnmapped,
-                    },
-                    None => Verdict::Refuse(SIGN_IN_REQUIRED),
-                }
-            }
-        };
-        tracing::debug!(box_id, ?verdict, "sealed value decided");
-        verdict
+        let jti = facts.jti.clone();
+        (self.sign_in_verdict(box_id, facts, now), jti)
+    }
+
+    /// Decides one request that carries `sealed` in the header named
+    /// `header`. An admitted store member is [`Redeemed::Store`], and the
+    /// forwarder checks that `header` is where the rule's injection form
+    /// puts the value (BEP-032).
+    ///
+    /// Any other value in a header other than `Authorization` is refused as
+    /// [`SEALED_HEADER_MISPLACED`] before it is decided, so no sign-in is
+    /// read or renewed for it.
+    fn redeem_reference(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String) {
+        let now = (self.clock)();
+        let facts = self.facts(box_id, authority, request, sealed, now);
+        let jti = facts.jti.clone();
+        if facts.kind == Some(MemberKind::Store) {
+            return (Self::store_decision(box_id, facts), jti);
+        }
+        if !header.eq_ignore_ascii_case("authorization") {
+            return (
+                Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
+                String::new(),
+            );
+        }
+        (
+            Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
+            jti,
+        )
     }
 }
 
@@ -402,9 +646,10 @@ mod tests {
     const NODE: &str = "node-1";
     const INSTANCE: &str = "0123456789abcdef0123456789abcdef";
     const TOKEN: &str = "ghu_the_real_token";
+    const REFRESH: &str = "ghr_refresh";
 
-    struct World<K = MemoryKey> {
-        redeemer: Arc<BoxRedeemer<K, MemoryKeychain>>,
+    struct World<K = MemoryKey, C = MemoryKeychain> {
+        redeemer: Arc<BoxRedeemer<K, C>>,
         boxes: BoxRegistry,
         revocations: Revocations,
         sealing: seal::ProxyPublicKey,
@@ -437,27 +682,42 @@ mod tests {
     fn new_world_with<K: HeldKey>(wrap: impl FnOnce(MemoryKey) -> K) -> World<K> {
         let store = MemoryStore::default();
         let key = wrap(store.generate(Role::Sealing).unwrap());
-        let sealing = key.public();
-        let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
-        let mut keys = ClientKeys::new();
-        keys.register(&client.verifying_key().to_sec1_bytes())
-            .unwrap();
         let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 3600, NOW + 7200);
+        world_over(key, keychain, |redeemer| redeemer)
+    }
+
+    /// Hold the sign-in `INSTANCE` in `keychain`, with token `TOKEN`.
+    fn seed(keychain: &dyn Keychain, token_expires_at: u64, refresh_expires_at: u64) {
         keychain
             .write(
                 &Metadata {
                     account: "octocat".into(),
                     instance: INSTANCE.into(),
                     flow: SignInFlow::Device,
-                    token_expires_at: NOW + 3600,
-                    refresh_expires_at: NOW + 7200,
+                    token_expires_at,
+                    refresh_expires_at,
                 },
                 &Material {
                     instance: INSTANCE.into(),
                     access_token: TOKEN.into(),
-                    refresh_token: "ghr_refresh".into(),
+                    refresh_token: REFRESH.into(),
                 },
             )
+            .unwrap();
+    }
+
+    /// A world over sealing key `key` and `keychain`, with the redeemer
+    /// that `configure` gives.
+    fn world_over<K: HeldKey, C: Keychain>(
+        key: K,
+        keychain: C,
+        configure: impl FnOnce(BoxRedeemer<K, C>) -> BoxRedeemer<K, C>,
+    ) -> World<K, C> {
+        let sealing = key.public();
+        let client = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let mut keys = ClientKeys::new();
+        keys.register(&client.verifying_key().to_sec1_bytes())
             .unwrap();
         let boxes: BoxRegistry = Arc::new(Boxes::new());
         let revocations = Revocations::default();
@@ -472,7 +732,7 @@ mod tests {
         .with_revocations(Arc::clone(&revocations))
         .with_clock(Arc::new(|| NOW));
         World {
-            redeemer: Arc::new(redeemer),
+            redeemer: Arc::new(configure(redeemer)),
             boxes,
             revocations,
             sealing,
@@ -481,7 +741,7 @@ mod tests {
     }
 
     /// A value sealed for `box_id` on this node, with a sign-in member.
-    fn sealed_for<K>(world: &World<K>, box_id: &str, expiry: u64, version: u32) -> String {
+    fn sealed_for<K, C>(world: &World<K, C>, box_id: &str, expiry: u64, version: u32) -> String {
         let jws = handle::sign(
             &world.client,
             &Claims {
@@ -524,8 +784,8 @@ mod tests {
     /// Sends one request from `box_id` to `authority`, with `host` as its
     /// `Host` header and `sealed` as its bearer token. Gives what reached the
     /// upstream, how the half ended, and the audit records.
-    fn send(
-        world: &World,
+    fn send<C: Keychain + Send + Sync + 'static>(
+        world: &World<MemoryKey, C>,
         box_id: &str,
         authority: &Authority<String>,
         host: &str,
@@ -653,6 +913,87 @@ mod tests {
         ));
     }
 
+    /// A value sealed for `box_id` on this node, with one store-handle
+    /// member whose `jti` is `jti`.
+    fn sealed_store_for<K, C>(world: &World<K, C>, box_id: &str, jti: &str) -> String {
+        let jws = handle::sign(
+            &world.client,
+            &Claims {
+                sub: box_id.into(),
+                node_id: NODE.into(),
+                store: "keychain".into(),
+                id: "anthropic".into(),
+                upstream: vec!["api.github.com".into()],
+                inject: Some(Inject::Header {
+                    name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                }),
+                iat: NOW - 10,
+                exp: NOW + 3600,
+                jti: jti.into(),
+            },
+        );
+        seal::seal(
+            &world.sealing,
+            &Context {
+                box_id: box_id.into(),
+                host: NODE.into(),
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: NOW - 10,
+                expiry: NOW + 600,
+                kid: world.sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::Store,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    // BEP-067 (Gatehouse §6.10): a redeemed member and a refused store
+    // member both write an audit record that carries the handle's `jti`.
+    // A value that does not open has no handle, so its `jti` is empty.
+    #[test]
+    fn a_store_handle_audit_record_carries_its_jti() {
+        let world = new_world();
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].jti, "jti-1");
+        let line = crate::audit::Record::from_decision(&records[0], crate::audit::ZERO_HASH);
+        assert_eq!(line.jti, "jti-1");
+
+        let sealed = sealed_store_for(&world, "b1", "jti-store-7");
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(Check::StoreHandleInvalid.marker()));
+        assert!(upstream.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some("store_handle_invalid"));
+        assert_eq!(records[0].jti, "jti-store-7");
+        let line = crate::audit::Record::from_decision(&records[0], crate::audit::ZERO_HASH);
+        assert_eq!(line.jti, "jti-store-7");
+
+        // A value sealed to another host's key does not open here.
+        let other = new_world();
+        other.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let (_, end, records) = send(&other, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(Check::Undecryptable.marker()));
+        assert_eq!(records[0].jti, "");
+    }
+
     /// A sealing key that counts its key agreements.
     struct Counting {
         inner: MemoryKey,
@@ -710,6 +1051,31 @@ mod tests {
         let verdict = world.redeemer.redeem("c0", &api(), &request, &sealed);
         assert!(matches!(verdict, Verdict::Refuse(m) if m == Check::CrossBox.marker()));
         assert_eq!(count(), 1);
+    }
+
+    // BEP-028: a `host_ip` sender that presents a value naming another live
+    // `host_ip` box is admitted, and its audit record is marked
+    // `cohort_attributed`. An admission from the named box itself carries
+    // no marker.
+    #[test]
+    fn host_ip_redemption_is_cohort_attributed_in_the_audit_record() {
+        let world = new_world();
+        world.boxes.register("c1", github(), Stance::HostIp);
+        world.boxes.register("c2", github(), Stance::HostIp);
+        let sealed = sealed_for(&world, "c2", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "c1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
+
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (_, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].marker, None);
     }
 
     /// One scenario for the property test.
@@ -925,5 +1291,681 @@ mod tests {
             sealing: world.sealing,
             client: world.client.clone(),
         }
+    }
+
+    const RENEWED: &str = "ghu_the_renewed_token";
+    const RENEWED_REFRESH: &str = "ghr_renewed";
+
+    /// A stand-in for GitHub's token endpoint. It counts the refreshes,
+    /// records the refresh tokens it got, and runs `during` before it
+    /// answers.
+    #[derive(Default)]
+    struct FakeEndpoint {
+        calls: std::sync::atomic::AtomicUsize,
+        got: std::sync::Mutex<Vec<String>>,
+        refuse: bool,
+        during: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl FakeEndpoint {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TokenEndpoint for FakeEndpoint {
+        fn refresh(
+            &self,
+            flow: SignInFlow,
+            refresh_token: &str,
+        ) -> Result<signin::Refreshed, signin::RefreshError> {
+            assert_eq!(flow, SignInFlow::Device);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.got.lock().unwrap().push(refresh_token.to_owned());
+            if let Some(during) = &self.during {
+                during();
+            }
+            if self.refuse {
+                return Err(signin::RefreshError::Refused("bad_refresh_token".into()));
+            }
+            Ok(signin::Refreshed {
+                access_token: RENEWED.into(),
+                refresh_token: RENEWED_REFRESH.into(),
+                expires_in: 28_800,
+                refresh_token_expires_in: 15_897_600,
+            })
+        }
+    }
+
+    /// A world whose held token expires at `token_expires_at`, renewed
+    /// through `endpoint`.
+    fn renewal_world<C: Keychain>(
+        keychain: C,
+        token_expires_at: u64,
+        refresh_expires_at: u64,
+        endpoint: Arc<FakeEndpoint>,
+    ) -> World<MemoryKey, C> {
+        seed(&keychain, token_expires_at, refresh_expires_at);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_token_endpoint(endpoint)
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        world
+    }
+
+    fn renewal_records(records: &[Record]) -> usize {
+        records
+            .iter()
+            .filter(|r| r.marker.as_deref() == Some(crate::forward::SIGN_IN_RENEWED))
+            .count()
+    }
+
+    // BEP-069: an expired token, and one that expires within 5 minutes, is
+    // renewed from the refresh material, written to the same item, and the
+    // renewed token is substituted. The renewal is its own audit record.
+    #[test]
+    fn an_expiring_sign_in_is_renewed_at_the_proxy() {
+        for token_expires_at in [NOW - 1, NOW + signin::RENEW_WITHIN_SECS] {
+            let endpoint = Arc::new(FakeEndpoint::default());
+            let world = renewal_world(
+                MemoryKeychain::default(),
+                token_expires_at,
+                NOW + 86_400,
+                Arc::clone(&endpoint),
+            );
+            let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+            let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(
+                upstream.contains(&format!("Bearer {RENEWED}")),
+                "{upstream}"
+            );
+            assert!(!upstream.contains(TOKEN));
+            assert_eq!(endpoint.calls(), 1);
+            assert_eq!(*endpoint.got.lock().unwrap(), vec![REFRESH.to_owned()]);
+
+            // The same item holds the renewed material, under the same
+            // instance.
+            let keychain = &world.redeemer.keychain;
+            let metadata = keychain.metadata().unwrap().unwrap();
+            assert_eq!(metadata.instance, INSTANCE);
+            assert_eq!(metadata.token_expires_at, NOW + 28_800);
+            assert_eq!(metadata.refresh_expires_at, NOW + 15_897_600);
+            let material = keychain.material().unwrap().unwrap();
+            assert_eq!(material.access_token, RENEWED);
+            assert_eq!(material.refresh_token, RENEWED_REFRESH);
+
+            // One renewal record, then the decision.
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert_eq!(
+                records[0].marker.as_deref(),
+                Some(crate::forward::SIGN_IN_RENEWED)
+            );
+            assert_eq!(
+                records[0].identifier.as_deref(),
+                Some(format!("github:{INSTANCE}").as_str())
+            );
+            assert_eq!(records[1].outcome, Outcome::Admit);
+            assert_eq!(records[1].marker, None);
+            assert!(!format!("{records:?}").contains(RENEWED));
+
+            // The next request uses the renewed token and renews nothing.
+            let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(upstream.contains(&format!("Bearer {RENEWED}")));
+            assert_eq!(endpoint.calls(), 1);
+            assert_eq!(renewal_records(&records), 0);
+        }
+    }
+
+    // BEP-069: while one renewal is in flight, the other requests for the
+    // item wait for its outcome and do not renew again.
+    #[test]
+    fn concurrent_redemptions_share_one_renewal() {
+        let endpoint = Arc::new(FakeEndpoint {
+            during: Some(Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })),
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let requests = 8;
+        let barrier = std::sync::Barrier::new(requests);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..requests)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        send(&world, "b1", &api(), "api.github.com", &sealed)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(endpoint.calls(), 1, "one renewal for every request");
+        let mut renewals = 0;
+        for (upstream, end, records) in &results {
+            assert_eq!(refused(end), None, "{end:?}");
+            assert!(
+                upstream.contains(&format!("Bearer {RENEWED}")),
+                "{upstream}"
+            );
+            renewals += renewal_records(records);
+        }
+        assert_eq!(renewals, 1, "the one renewal is audited once");
+    }
+
+    /// A keychain that reads from a memory keychain and refuses every write.
+    struct RefusingWrites(MemoryKeychain);
+
+    impl Keychain for RefusingWrites {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.0.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.0.material()
+        }
+        fn write(
+            &self,
+            metadata: &Metadata,
+            material: &Material,
+        ) -> Result<(), signin::SignInError> {
+            // The seed goes in. Every later write is refused.
+            if self.0.metadata()?.is_none() {
+                return self.0.write(metadata, material);
+            }
+            Err(signin::SignInError::Keychain {
+                action: "write the sign-in",
+                detail: "locked".into(),
+            })
+        }
+    }
+
+    // BEP-069: a renewal that is not written to the item refuses the
+    // request and substitutes nothing.
+    #[test]
+    fn renewal_not_persisted_is_refused() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            RefusingWrites(MemoryKeychain::default()),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+    }
+
+    /// A keychain over a memory keychain that refuses every write while
+    /// `refuse` is set.
+    struct SwitchedWrites {
+        inner: MemoryKeychain,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Keychain for SwitchedWrites {
+        fn metadata(&self) -> Result<Option<Metadata>, signin::SignInError> {
+            self.inner.metadata()
+        }
+        fn material(&self) -> Result<Option<Material>, signin::SignInError> {
+            self.inner.material()
+        }
+        fn write(
+            &self,
+            metadata: &Metadata,
+            material: &Material,
+        ) -> Result<(), signin::SignInError> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(signin::SignInError::Keychain {
+                    action: "write the sign-in",
+                    detail: "locked".into(),
+                });
+            }
+            self.inner.write(metadata, material)
+        }
+    }
+
+    // BEP-069: a renewal that the item did not take is discarded, and the
+    // request is refused. After the back-off, the next renewal asks GitHub
+    // again with the refresh token in the item, not with a held one.
+    #[test]
+    fn an_unsaved_renewal_is_discarded_and_renewed_from_the_item() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
+        let now = Arc::clone(&clock);
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keychain = SwitchedWrites {
+            inner: MemoryKeychain::default(),
+            refuse: Arc::clone(&refuse),
+        };
+        seed(&keychain, NOW - 1, NOW + 86_400);
+        refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer
+                .with_token_endpoint(Arc::clone(&endpoint) as Arc<dyn TokenEndpoint>)
+                .with_clock(Arc::new(move || {
+                    now.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(endpoint.calls(), 1);
+
+        clock.store(
+            NOW + RENEW_RETRY_AFTER_SECS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(endpoint.calls(), 2, "GitHub is asked again");
+        assert_eq!(
+            *endpoint.got.lock().unwrap(),
+            vec![REFRESH.to_owned(), REFRESH.to_owned()],
+            "each renewal presents the item's refresh token"
+        );
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+        assert_eq!(material.refresh_token, REFRESH, "the item is unchanged");
+    }
+
+    // BEP-069: an item deleted while its renewal runs stays deleted. The
+    // renewed material is discarded and the request is refused.
+    #[test]
+    fn renewal_finding_item_deleted_refuses_and_creates_nothing() {
+        let keychain = Arc::new(MemoryKeychain::default());
+        let logout = Arc::clone(&keychain);
+        let endpoint = Arc::new(FakeEndpoint {
+            during: Some(Box::new(move || logout.clear())),
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            Arc::clone(&keychain),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty(), "{upstream}");
+        assert_eq!(renewal_records(&records), 0);
+        assert_eq!(keychain.item(signin::SERVICE), None, "no item is created");
+        assert_eq!(
+            keychain.item(signin::META_SERVICE),
+            None,
+            "no item is created"
+        );
+    }
+
+    // BEP-069: a token that expires more than 5 minutes after the request is
+    // substituted without a renewal.
+    #[test]
+    fn a_sign_in_with_time_to_live_is_not_renewed() {
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW + signin::RENEW_WITHIN_SECS + 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")), "{upstream}");
+        assert_eq!(endpoint.calls(), 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(renewal_records(&records), 0);
+    }
+
+    // BEP-069: an expired token that GitHub refuses to renew, or whose
+    // refresh material expired too, is refused `github_sign_in_required`.
+    #[test]
+    fn unrenewable_sign_in_refuses_with_sign_in_required() {
+        // GitHub refuses the renewal of an expired token.
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 1,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].marker.as_deref(), Some(SIGN_IN_REQUIRED));
+        let material = world.redeemer.keychain.material().unwrap().unwrap();
+        assert_eq!(material.access_token, TOKEN, "the item is unchanged");
+
+        // The refresh material expired too: GitHub is not asked.
+        let endpoint = Arc::new(FakeEndpoint::default());
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW - 7200,
+            NOW - 1,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 0);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(records[0].marker.as_deref(), Some(SIGN_IN_REQUIRED));
+
+        // A token that has not expired yet is still substituted when GitHub
+        // refuses its early renewal.
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let world = renewal_world(
+            MemoryKeychain::default(),
+            NOW + 60,
+            NOW + 86_400,
+            Arc::clone(&endpoint),
+        );
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+    }
+
+    // BEP-069: a failed renewal is not retried on every request. Within the
+    // back-off the held token is used while it lives, and GitHub is not
+    // asked again. After the back-off, the next request asks once more.
+    #[test]
+    fn a_failed_renewal_is_not_retried_within_the_back_off() {
+        let endpoint = Arc::new(FakeEndpoint {
+            refuse: true,
+            ..FakeEndpoint::default()
+        });
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(NOW));
+        let now = Arc::clone(&clock);
+        let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 100, NOW + 86_400);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer
+                .with_token_endpoint(Arc::clone(&endpoint) as Arc<dyn TokenEndpoint>)
+                .with_clock(Arc::new(move || {
+                    now.load(std::sync::atomic::Ordering::SeqCst)
+                }))
+        });
+        world.boxes.register("b1", vec![api()], Stance::OwnIp);
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+
+        for _ in 0..3 {
+            let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), None, "{end:?}");
+            assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        }
+        assert_eq!(endpoint.calls(), 1, "one call to GitHub in the back-off");
+
+        clock.store(
+            NOW + RENEW_RETRY_AFTER_SECS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(endpoint.calls(), 2, "the back-off ended");
+
+        // The token expires inside the next back-off: the request is refused
+        // `github_sign_in_required`, and GitHub is not asked.
+        clock.store(NOW + 101, std::sync::atomic::Ordering::SeqCst);
+        let (upstream, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), Some(SIGN_IN_REQUIRED));
+        assert!(upstream.is_empty());
+        assert_eq!(endpoint.calls(), 2);
+    }
+
+    const STORE_ID: &str = "openai";
+    const STORED_KEY: &str = "sk-stored-key";
+
+    fn openai() -> Authority<String> {
+        Authority {
+            host: "api.openai.com".into(),
+            port: 443,
+        }
+    }
+
+    fn bearer() -> Inject {
+        Inject::Header {
+            name: "Authorization".into(),
+            prefix: Some("Bearer ".into()),
+        }
+    }
+
+    /// The `[secret-store-rules]` rule for [`STORE_ID`] in the keychain:
+    /// `api.openai.com`, as a bearer token.
+    fn openai_rule() -> StoreRule {
+        StoreRule {
+            store: crate::store::NATIVE_STORE.into(),
+            id: STORE_ID.into(),
+            upstream: vec!["api.openai.com".into()],
+            inject: bearer(),
+        }
+    }
+
+    /// A value sealed for `box_id` on this node, with a store member for
+    /// [`STORE_ID`] in the keychain, to `api.openai.com` as a bearer token.
+    fn store_sealed_for<K, C>(world: &World<K, C>, box_id: &str) -> String {
+        let jws = handle::sign(
+            &world.client,
+            &Claims {
+                sub: box_id.into(),
+                node_id: NODE.into(),
+                store: crate::store::NATIVE_STORE.into(),
+                id: STORE_ID.into(),
+                upstream: vec!["api.openai.com".into()],
+                inject: Some(bearer()),
+                iat: NOW - 10,
+                exp: NOW + 3600,
+                jti: "jti-store".into(),
+            },
+        );
+        seal::seal(
+            &world.sealing,
+            &Context {
+                box_id: box_id.into(),
+                host: NODE.into(),
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: NOW - 10,
+                expiry: NOW + 600,
+                kid: world.sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::Store,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Sends one request from `box_id` to `api.openai.com` with
+    /// `sealed_header` on a flow that reads store values from `store`, as
+    /// `bep serve` builds it. Gives what reached the upstream, how the half
+    /// ended, and the audit records.
+    fn send_to_store(
+        world: &World,
+        box_id: &str,
+        store: Arc<dyn crate::store::ValueReader>,
+        sealed_header: &str,
+    ) -> (String, HalfEnd, Vec<Record>) {
+        let records = Arc::new(std::sync::Mutex::new(Vec::<Record>::new()));
+        let audit: Arc<dyn AuditWriter> = records.clone();
+        let redeemer: Arc<dyn Redeemer> = world.redeemer.clone();
+        let flow = Flow::new(
+            box_id,
+            openai(),
+            audit,
+            redeemer,
+            Validated::unchecked(()).proof(),
+        )
+        .with_store(store);
+        let request =
+            format!("GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\n{sealed_header}\r\n\r\n");
+        let mut client = Cursor::new(request.into_bytes());
+        let mut upstream = Vec::new();
+        let end = forward_requests(&flow, &mut client, &mut upstream);
+        let records = records.lock().unwrap().clone();
+        (String::from_utf8(upstream).unwrap(), end, records)
+    }
+
+    // BEP-032: a store member that passes every check reaches the rule's
+    // registered upstream with the stored key in the registered form. The
+    // box holds only the sealed value, and the audit names the store and
+    // the identifier, never the key.
+    #[test]
+    fn serve_injects_a_stored_key_for_an_admitted_store_member() {
+        use crate::store::{MemoryReader, MemorySecretStore, SecretStore as _};
+
+        let keychain = MemoryKeychain::default();
+        seed(&keychain, NOW + 3600, NOW + 7200);
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_rules(Arc::new(vec![openai_rule()]))
+        });
+        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let program = std::path::PathBuf::from("/opt/minimal/bin/bep");
+        let store = Arc::new(MemorySecretStore::default());
+        store
+            .set(STORE_ID, STORED_KEY.as_bytes(), &program)
+            .unwrap();
+        let reader: Arc<dyn crate::store::ValueReader> = Arc::new(MemoryReader {
+            store: Arc::clone(&store),
+            app: program,
+        });
+        let sealed = store_sealed_for(&world, "b1");
+        assert!(!sealed.contains(STORED_KEY), "the box never holds the key");
+
+        let bearer_header = format!("Authorization: Bearer {sealed}");
+        let (upstream, end, records) =
+            send_to_store(&world, "b1", Arc::clone(&reader), &bearer_header);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(
+            upstream.contains(&format!("\r\nauthorization: Bearer {STORED_KEY}\r\n")),
+            "{upstream}"
+        );
+        assert!(!upstream.contains(&sealed), "the sealed value is replaced");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].identifier.as_deref(), Some("keychain:openai"));
+        assert!(!format!("{records:?}").contains(STORED_KEY));
+
+        // The same value from another box is refused, and nothing goes
+        // upstream (BEP-020).
+        world.boxes.register("b2", vec![openai()], Stance::OwnIp);
+        let (upstream, end, _) = send_to_store(&world, "b2", Arc::clone(&reader), &bearer_header);
+        assert_eq!(refused(&end), Some(Check::CrossBox.marker()));
+        assert!(upstream.is_empty());
+
+        // In a header that the rule does not name, it is refused before the
+        // store is read.
+        let (upstream, end, _) = send_to_store(
+            &world,
+            "b1",
+            Arc::clone(&reader),
+            &format!("x-api-key: {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(SEALED_HEADER_MISPLACED));
+        assert!(upstream.is_empty());
+
+        // A sign-in member outside `Authorization` is still refused before
+        // it is decided.
+        let sign_in = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, _) = send_to_store(
+            &world,
+            "b1",
+            Arc::clone(&reader),
+            &format!("x-api-key: {sign_in}"),
+        );
+        assert_eq!(refused(&end), Some(SEALED_HEADER_MISPLACED));
+        assert!(upstream.is_empty());
+
+        // With no rule for the item, the handle is invalid (BEP-064).
+        let keychain = MemoryKeychain::default();
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let bare = world_over(key, keychain, |redeemer| redeemer);
+        bare.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let sealed = store_sealed_for(&bare, "b1");
+        let (upstream, end, _) = send_to_store(
+            &bare,
+            "b1",
+            Arc::clone(&reader),
+            &format!("Authorization: Bearer {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(Check::StoreHandleInvalid.marker()));
+        assert!(upstream.is_empty());
+    }
+
+    // The store `bep serve` opens off macOS reads nothing, so an admitted
+    // store member is refused `store_item_unreadable`, never forwarded
+    // without the key.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn serve_refuses_an_unreadable_store_member() {
+        let keychain = MemoryKeychain::default();
+        let key = MemoryStore::default().generate(Role::Sealing).unwrap();
+        let world = world_over(key, keychain, |redeemer| {
+            redeemer.with_rules(Arc::new(vec![openai_rule()]))
+        });
+        world.boxes.register("b1", vec![openai()], Stance::OwnIp);
+        let sealed = store_sealed_for(&world, "b1");
+        let (upstream, end, records) = send_to_store(
+            &world,
+            "b1",
+            Arc::new(crate::store::HostStore),
+            &format!("Authorization: Bearer {sealed}"),
+        );
+        assert_eq!(refused(&end), Some(crate::forward::STORE_ITEM_UNREADABLE));
+        assert!(upstream.is_empty());
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(
+            records[0].marker.as_deref(),
+            Some(crate::forward::STORE_ITEM_UNREADABLE)
+        );
     }
 }

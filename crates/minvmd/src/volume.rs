@@ -8,6 +8,7 @@
 
 use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 /// Default size of a freshly provisioned data volume: 256 GiB. The image is a
@@ -169,10 +170,13 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
             source,
         })?;
     }
+    // 0600, never the mode the umask gives (BEP-047): only the VM user
+    // opens the data disk, and `min diag` reads only its size.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|source| VolumeError::Create {
             path: path.to_path_buf(),
@@ -265,6 +269,17 @@ mod tests {
         let p = PathBuf::from(base).join(format!("minvmd-vol-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// BEP-047: the data volume is created 0600 whatever the umask gives.
+    #[test]
+    fn data_volume_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("mode");
+        let path = dir.join("data-vol.raw");
+        ensure_sparse_raw(&path, 1024 * 1024).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:04o}");
     }
 
     #[test]
