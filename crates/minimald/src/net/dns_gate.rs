@@ -3827,12 +3827,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// The GitHub module's host set, as the caller hands it to
-    /// [`DnsGate::with_steering`].
     /// A name the steered boxes allow that is not credentialed: it is not
     /// steered, and the allow list matches it, so it is forwarded.
     const UNSTEERED_HOST: &str = "example.org";
 
+    /// The GitHub module's host set, as the caller hands it to
+    /// [`DnsGate::with_steering`].
     const STEERED_HOSTS: &[&str] = &[
         "github.com",
         "api.github.com",
