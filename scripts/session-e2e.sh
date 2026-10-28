@@ -13870,14 +13870,22 @@ proof_bep_r3_uninstall_removes_quic_helper() {
   echo "::endgroup::"
 }
 
-# Kills every `bep serve` and waits until nothing answers on its control
+# The pids of this run's `bep serve`, sorted, one per line. minvmd starts it
+# with `--listener` on a socket under this run's $XDG_STATE_HOME, so a proxy
+# from another checkout or a person's own proxy does not match.
+r3_proxy_pids() {
+  pgrep -f -- "serve --listener $XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock" \
+    2>/dev/null | sort || true
+}
+
+# Kills this run's `bep serve` and waits until nothing answers on its control
 # socket $1. Clears BEP_LIVE_DAEMON, so the next bep_live_gate restarts the
 # daemon pair with the proxy. Returns 1 when the proxy still answers.
 r3_proxy_down() {
   local pd_pids pd_try
-  pd_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+  pd_pids="$(r3_proxy_pids)"
   if [ -z "$pd_pids" ]; then
-    echo "::error::no 'bep serve' process runs, though the proxy answered on $1"
+    echo "::error::no 'bep serve' process runs for this VM host, though the proxy answered on $1"
     return 1
   fi
   # shellcheck disable=SC2086
@@ -14116,7 +14124,7 @@ proof_bep_r3_widened_store_rule_without_restart() {
   fi
   WR_SID="$(printf '%s\n' "$wr_sid" | tail -n1 | tr -d '\r')"
 
-  wr_pid_before="$(pgrep -f '/bep serve ' 2>/dev/null | sort | tr '\n' ' ')"
+  wr_pid_before="$(r3_proxy_pids | tr '\n' ' ')"
   wr_before="$(r3_connect_probe "$WR_SID")"
   echo "before the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_before")"
   if [[ "$(r3_status_line "$wr_before")" != "HTTP/1.1 403 "* ]] || [[ "$wr_before" != *"$wr_off"* ]]; then
@@ -14143,7 +14151,7 @@ proof_bep_r3_widened_store_rule_without_restart() {
     printf '%s\n' "$wr_after"
     wr_fail
   fi
-  wr_pid_after="$(pgrep -f '/bep serve ' 2>/dev/null | sort | tr '\n' ' ')"
+  wr_pid_after="$(r3_proxy_pids | tr '\n' ' ')"
   if [ -z "$wr_pid_before" ] || [ "$wr_pid_before" != "$wr_pid_after" ]; then
     echo "::error::the bep serve process changed across the rule change ('$wr_pid_before' -> '$wr_pid_after'), so the proxy restarted"
     wr_fail
