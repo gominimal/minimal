@@ -3143,6 +3143,153 @@ async fn absent_range_publishes_interim_and_readvises() {
     );
 }
 
+/// NET-123 on a VM-backed daemon, after `min finalize-install`: the
+/// create handler asks the forwarder's walk of the host's loopback, not the
+/// guest's own `lo`. While the landed verdict is absent each session start
+/// walks again. The walk after the host gains the range lands present: the
+/// box standing at the `127.0.0.1` interim moves onto a range address, the
+/// new box's grant comes from the range, and its reply clears the interim
+/// flag. A present verdict is not walked again. The stand-in walk stands in
+/// for the host forwarder, which a harness daemon does not have.
+#[allow(clippy::await_holding_lock)]
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn session_start_rewalks_range_after_finalize_install() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // No local-probe stand-in may leak into these creates: the walk, not
+    // the local probe, must decide every reply here.
+    let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mngr = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    let walks = Arc::new(AtomicUsize::new(0));
+    {
+        let installed = Arc::clone(&installed);
+        let walks = Arc::clone(&walks);
+        mngr.install_range_walk_standin(move || {
+            walks.fetch_add(1, Ordering::SeqCst);
+            if installed.load(Ordering::SeqCst) {
+                let hosts = ::switch::loopback::range_hosts().count();
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                absent_range_probe()
+            }
+        });
+    }
+    // The daemon-start walk's verdict on a host without the range.
+    mngr.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+
+    let before = client
+        .call::<CreateSession>(&req("before-install", "/uwu"))
+        .await
+        .ok()
+        .expect("an absent range must not refuse the session");
+    assert!(
+        before.interim_loopback,
+        "the host's walk found the range absent, so the reply carries the interim"
+    );
+    let line = probe_line(&log.contents(), &before.id);
+    assert!(
+        line.contains("via=\"forwarder\"") && line.contains("walked=true"),
+        "a session start on an absent verdict walks the forwarder: {line}"
+    );
+    assert!(
+        line.contains("surface=127.0.0.1-interim"),
+        "the line names the interim as the surface picked: {line}"
+    );
+    assert_eq!(walks.load(Ordering::SeqCst), 1);
+
+    // The box the absent verdict published at the interim.
+    let ports = std::collections::BTreeSet::from([8080]);
+    {
+        let registry = mngr.hostnames();
+        let mut routes = registry.write().expect("registry lock");
+        routes.publish_own_address(
+            before.id,
+            "before-install",
+            std::net::Ipv4Addr::LOCALHOST,
+            ports.clone(),
+        );
+        routes.register_own_ip(before.id, "before-install", ports);
+    }
+
+    // `min finalize-install` applies the range on the host.
+    installed.store(true, Ordering::SeqCst);
+    let after = client
+        .call::<CreateSession>(&req("after-install", "/uwu"))
+        .await
+        .ok()
+        .expect("a create with the range present");
+    assert!(
+        !after.interim_loopback,
+        "the walk found the range present, so the reply clears the interim"
+    );
+    assert_eq!(
+        walks.load(Ordering::SeqCst),
+        2,
+        "the session start walked again"
+    );
+    let line = probe_line(&log.contents(), &after.id);
+    assert!(
+        line.contains("surface=reserved-range") && line.contains("moved_off_interim=1"),
+        "the line names the range and the box it moved off the interim: {line}"
+    );
+
+    let moved = mngr
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .published_own_address(before.id)
+        .expect("the earlier box is still published");
+    assert!(
+        ::switch::loopback::range_hosts().any(|host| host == moved),
+        "the box at the interim moves onto a range address, got {moved}"
+    );
+    match mngr
+        .loopback_book()
+        .grant(crate::net::dns::LeaseNamespace::Box { session: after.id })
+    {
+        crate::net::dns::LoopbackGrant::Granted(address) => {
+            assert!(
+                ::switch::loopback::range_hosts().any(|host| host == address),
+                "the new box is granted a range address, got {address}"
+            );
+            assert_ne!(address, moved, "the two boxes hold distinct addresses");
+        }
+        other => panic!("the new box's grant must come from the range, got {other:?}"),
+    }
+    assert!(
+        log.contents().lines().any(|line| {
+            line.contains("loopback-range-present-box")
+                && line.contains(&format!("session_id={}", before.id))
+                && line.contains(&format!("to={moved}"))
+        }),
+        "the move is logged with the session id and both addresses"
+    );
+
+    // A present verdict is not walked again.
+    let later = client
+        .call::<CreateSession>(&req("later", "/uwu"))
+        .await
+        .ok()
+        .expect("a create with the range present");
+    assert!(!later.interim_loopback);
+    assert_eq!(
+        walks.load(Ordering::SeqCst),
+        2,
+        "a present verdict needs no walk"
+    );
+    assert!(probe_line(&log.contents(), &later.id).contains("walked=false"));
+}
+
 /// NET-018: once the answerer is serving beside the proxy, the replies
 /// report the one fact that is the daemon's to know — its answerer
 /// bound — and the one log line, emitted the moment the answerer binds,

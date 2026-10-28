@@ -1055,6 +1055,12 @@ async fn probe_publish_surface_within(
     budget: Duration,
     request: Duration,
 ) -> ::switch::loopback::RangeProbe {
+    // One walk at a time in this process. The daemon-start walk and each
+    // session-start walk ask the same forwarder to bind the same probe port,
+    // so a second walk that overlapped the first would read the first's
+    // bind as a refusal. The wait is outside the budget: a session-start
+    // walk queued behind the daemon-start one still gets its whole walk.
+    let _turn = RANGE_WALK_TURN.lock().await;
     let mut probe = ::switch::loopback::RangeProbe::failed_to_run();
     let hosts: Vec<Ipv4Addr> = ::switch::loopback::range_hosts().collect();
     let walk = tokio::time::timeout(budget, async {
@@ -1400,8 +1406,15 @@ const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 /// probes a given forwarder — the one that publishes through it, and a host
 /// gvproxy has one of those (the second-daemon-on-a-host shape is native,
 /// where the local bind probe runs instead) — so no concurrent walk can
-/// collide on it.
+/// collide on it. That daemon walks at its start and again at each session
+/// start while the range is not present, and [`RANGE_WALK_TURN`] runs those
+/// walks one at a time.
 const RANGE_PROBE_PORT: u16 = 21064;
+
+/// The turn every forwarder-conducted range walk in this process takes
+/// before its first round, so the daemon-start walk and the session-start
+/// walks never bind [`RANGE_PROBE_PORT`] at the same time.
+static RANGE_WALK_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Upper bound on the whole forwarder-conducted range walk — the backstop for
 /// the one pathology the per-request [`GVPROXY_CONTROL_TIMEOUT`] cannot
