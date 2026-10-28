@@ -1209,14 +1209,17 @@ mod tests {
     }
 
     /// The retired reverse proxy's client certificate is not collected: a
-    /// bundle has no `client.pem` entry, even when the file is still on disk
+    /// bundle has no entry for the client certificate, even when the file is still on disk
     /// from an older install (NET-109).
     #[tokio::test]
     async fn diag_collects_no_client_certificate() {
+        // Built from parts: `retired_surfaces_absent` scans this file for
+        // the literal name, and only this test may say it.
+        const CLIENT_CERT: &str = concat!("client", ".pem");
         let dir = tempfile::TempDir::new().unwrap();
         let diag = paths(dir.path());
         tokio::fs::create_dir_all(&diag.config).await.unwrap();
-        tokio::fs::write(diag.config.join("client.pem"), b"leftover")
+        tokio::fs::write(diag.config.join(CLIENT_CERT), b"leftover")
             .await
             .unwrap();
         let out = dir.path().join("diag.tar.zst");
@@ -1228,12 +1231,12 @@ mod tests {
         let files = unpack(&out, "r").await;
         for (path, contents) in &files {
             assert!(
-                !path.contains("client.pem"),
-                "the bundle carries a client.pem entry: {path}"
+                !path.contains(CLIENT_CERT),
+                "the bundle carries a {CLIENT_CERT} entry: {path}"
             );
             assert!(
-                !String::from_utf8_lossy(contents).contains("client.pem"),
-                "{path} names client.pem"
+                !String::from_utf8_lossy(contents).contains(CLIENT_CERT),
+                "{path} names {CLIENT_CERT}"
             );
         }
         assert!(

@@ -4462,6 +4462,11 @@ fn retired_surfaces_absent() {
         ("Cargo.toml", &["rcgen"]),
         // Nothing passes a removed feature to the daemon builds.
         ("justfile", &["networking-proxy", "{{features}}"]),
+        // A `min bug` bundle collects no client certificate.
+        ("crates/minimal/src/diag/collect.rs", &["client.pem"]),
+        // Neither answerer documents the retired proxy port.
+        ("crates/minimald/src/net/answerer.rs", &[":7655"]),
+        ("crates/minvmd/src/net/answerer.rs", &[":7655"]),
     ];
     for (rel, retired) in retired_surfaces.iter().copied() {
         let text = source(rel);
@@ -4471,6 +4476,41 @@ fn retired_surfaces_absent() {
                 "{rel} still names the retired surface `{token}` (NET-109)"
             );
         }
+    }
+}
+
+/// `min login` is the GitHub sign-in, the alias for `min auth login`
+/// (NET-109): it takes the same arguments, parses into the same arguments,
+/// and its help describes the sign-in, not a retired certificate.
+#[test]
+fn login_runs_auth_login() {
+    use clap::{CommandFactory as _, Parser as _};
+
+    let cli = Cli::try_parse_from(["min", "login", "--device"]).expect("min login --device parses");
+    let Some(Command::Login(AuthLoginArgs { device })) = cli.command else {
+        panic!("min login must parse into the auth login arguments");
+    };
+    assert!(device, "--device reaches the sign-in");
+
+    let mut cmd = Cli::command();
+    let login = cmd
+        .find_subcommand_mut("login")
+        .expect("min login is a command");
+    assert!(!login.is_hide_set(), "min login is listed in min --help");
+    let help = login.render_long_help().to_string();
+    assert!(
+        help.contains("Sign in to GitHub (the same as min auth login)"),
+        "min login --help must describe the GitHub sign-in, got: {help}"
+    );
+    assert!(
+        help.contains("--device"),
+        "min login --help lists --device: {help}"
+    );
+    for retired in ["mint", "certificate", "reverse proxy"] {
+        assert!(
+            !help.contains(retired),
+            "min login --help still names `{retired}`: {help}"
+        );
     }
 }
 
