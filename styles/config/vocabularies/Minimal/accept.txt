@@ -137,6 +137,7 @@ errno
 errored
 erroring
 euid
+evals
 executability
 exfiltrate
 exfiltrates
@@ -176,6 +177,7 @@ hasher
 headlessly
 Hostname
 Hostnames
+hotfix
 idempotence
 idempotency
 Idiomaticity
@@ -299,6 +301,7 @@ protoc
 protos
 proxied
 proxying
+PRs
 PTask
 PTasks
 pty
@@ -315,6 +318,7 @@ readlinks
 README
 rebuildable
 reflink
+refspecs
 regenerable
 regexes
 relicense

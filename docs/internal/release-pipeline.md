@@ -29,7 +29,7 @@ the branch of the release that it fixes. See
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
-- A release runs on a branch that outlives one build. Fixes land on
+- A release runs on a branch that outlives one build. Fixes merge into
   `release/<branch>` by PR while `main` keeps moving. Each release candidate
   uses up its own version number, such as `X.Y.Z-rc1`, because a staged
   number is permanent.
@@ -69,7 +69,7 @@ git push origin <commit>:refs/heads/release/<branch>
 
 The branch name must start with `release/`. CI runs the required checks on
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
-refuses each fix that lands on the branch.
+refuses each fix that merges into the branch.
 
 Keep the branch after the release. It carries the fixes that go into the
 release while `main` moves on, and each hotfix for the release goes out from
@@ -179,15 +179,16 @@ on the same run.
 
 ### 8. Forward port the release branch
 
-Bring the fixes that landed on `release/<branch>` back to `main`. `main`
+Bring the fixes that merged into `release/<branch>` back to `main`. `main`
 moves while a release is out, so a port that waits costs more than one that
-does not. Compare the branch, not the tag. A fix can land on the branch after
-the tag, and the tag does not contain it.
+does not. Compare the branch, not the tag. A fix can merge into the branch
+after the tag, and the tag does not contain it.
 
 The promotion created the tag on GitHub, so fetch it with the branch. The
 explicit refspecs write `origin/main` and `origin/release/<branch>` in any
-clone. `--force` replaces a stale local tag of the same name. If the branch
-is already on `main`, there is nothing to port and nothing to merge:
+clone. `--force` replaces a stale local tag of the same name. If the second
+command prints `branch already on main`, there is nothing to port and nothing
+to merge. Skip to the tag check at the end of this step:
 
 ```sh
 git fetch --force origin main:refs/remotes/origin/main release/<branch>:refs/remotes/origin/release/<branch> tag vX.Y.Z
@@ -223,9 +224,9 @@ git merge -s ours origin/release/<branch> -m "Merge branch 'release/<branch>' in
 
 Push the branch and open a PR. The PR must go in as a merge commit, because
 the other merge buttons drop the link to the branch and its tag. This
-repository turns off **Create a merge commit**. An admin turns it on in the
-repository settings, merges the PR with it, and turns it off again. Then
-check that the tag is on `main`:
+repository turns off **Create a merge commit**, so an admin turns it on in
+the repository settings and merges the PR with it. The admin then turns it
+off again. Then check that the tag is on `main`:
 
 ```sh
 git fetch origin main:refs/remotes/origin/main
@@ -250,7 +251,8 @@ go out from the branch in the same way. Do these steps:
    just check-version
    ```
 
-3. Follow steps 3 to 8 with `--ref release/<branch>`.
+3. Follow steps 3 to 6 with `--ref release/<branch>`. For the final version,
+   also follow steps 7 and 8. A release candidate stops after step 6.
 
 ### Roll back
 
