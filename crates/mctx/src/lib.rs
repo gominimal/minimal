@@ -1548,7 +1548,10 @@ mod tests {
 
         let boxed = plain.with_classifier_leaf(leaf.clone());
         assert_eq!(boxed.clone().classifier_leaf(), Some(&leaf));
-        assert_eq!(boxed.cloned_reinit().unwrap().classifier_leaf(), Some(&leaf));
+        assert_eq!(
+            boxed.cloned_reinit().unwrap().classifier_leaf(),
+            Some(&leaf)
+        );
         let orchestrator = boxed
             .local_orchestrator(&graph, None, None, Default::default())
             .await
