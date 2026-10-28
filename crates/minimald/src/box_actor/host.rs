@@ -1384,6 +1384,274 @@ impl BoxActor {
     }
 }
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). The daemon has no setting for it yet.
+pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a stop checks, inside its grace period, whether the box ended.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The name of a signal a stop sends, for the log.
+fn stop_signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGKILL => "SIGKILL",
+        _ => "signal",
+    }
+}
+
+/// Whether a host loop's exit code says a signal, not the entrypoint's own
+/// exit, ended the box: `hakoniwa` reports a signalled container as 125,
+/// and a process with no exit status of its own reads as a negative code.
+fn code_means_signalled(code: i32) -> bool {
+    code == 125 || code < 0
+}
+
+/// What a stop's signals did to the box (BOX-013).
+#[derive(Debug)]
+pub(crate) struct StopOutcome {
+    /// How the box ended, as its record stores it.
+    pub(crate) ending: boxes::core::record::StopEnding,
+    /// The signals the stop sent, in order.
+    pub(crate) sent: Vec<i32>,
+    /// The host's runtime loop, when it did not end inside
+    /// [`HOST_PROBE_TIMEOUT`] after the last signal. The caller stops it.
+    pub(crate) unfinished: Option<JoinHandle<Result<i32, std::io::Error>>>,
+}
+
+/// Sends a stop's signals to every process in the box (BOX-013), and reads
+/// how the entrypoint ended from the host loop `entrypoint`, which ends when
+/// the entrypoint does.
+///
+/// A graceful stop sends SIGTERM, waits up to `grace` for the box to have no
+/// process left, then sends SIGKILL to the processes still running. A forced
+/// stop sends SIGKILL at once. The ending stores the signal that the
+/// entrypoint ended after, unless the entrypoint exited with a status of its
+/// own. `processes` is `None` when the host did not name its container: the
+/// stop then signals nothing itself, and the caller's host kill ends the box.
+pub(crate) async fn stop_box_processes(
+    box_id: boxes::SessionId,
+    processes: Option<box_runtime::BoxProcesses>,
+    mut entrypoint: JoinHandle<Result<i32, std::io::Error>>,
+    force: bool,
+    grace: std::time::Duration,
+) -> StopOutcome {
+    use boxes::core::record::StopEnding;
+
+    let signal = |signal: i32| -> usize {
+        let reached = processes.map_or(0, |p| p.signal(signal));
+        tracing::info!(
+            box_id = %box_id,
+            signal = stop_signal_name(signal),
+            signal_number = signal,
+            processes = reached,
+            "stop: signalled every process in the box"
+        );
+        reached
+    };
+    let left = || processes.map_or(0, |p| p.pids().len());
+
+    // `Some(None)`: the entrypoint ended before the stop sent a signal.
+    // `Some(Some(s))`: it ended after the signal `s`.
+    let mut ended_after: Option<Option<i32>> = entrypoint.is_finished().then_some(None);
+    let mut sent = Vec::new();
+    if force {
+        signal(libc::SIGKILL);
+        sent.push(libc::SIGKILL);
+    } else {
+        signal(libc::SIGTERM);
+        sent.push(libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if ended_after.is_none() && entrypoint.is_finished() {
+                ended_after = Some(Some(libc::SIGTERM));
+            }
+            if ended_after.is_some() && left() == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+        let still_running = left();
+        tracing::info!(
+            box_id = %box_id,
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            entrypoint_ended = ended_after.is_some(),
+            still_running,
+            "stop: the grace period is over"
+        );
+        if ended_after.is_none() || still_running > 0 {
+            if ended_after.is_none() && entrypoint.is_finished() {
+                ended_after = Some(Some(libc::SIGTERM));
+            }
+            signal(libc::SIGKILL);
+            sent.push(libc::SIGKILL);
+        }
+    }
+
+    let last = sent.last().copied().unwrap_or(libc::SIGKILL);
+    let mut unfinished = None;
+    let code = match tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut entrypoint).await {
+        Ok(Ok(Ok(code))) => Some(code),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(box_id = %box_id, %error, "stop: the host loop ended on an error");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(box_id = %box_id, %error, "stop: the host loop task failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                box_id = %box_id,
+                "stop: the host loop did not end after the last signal; the host is killed"
+            );
+            unfinished = Some(entrypoint);
+            None
+        }
+    };
+    let ending = match (ended_after.unwrap_or(Some(last)), code) {
+        (_, Some(code)) if !code_means_signalled(code) => {
+            StopEnding::ExitedFirst { exit_code: code }
+        }
+        (Some(signal), _) => StopEnding::Signalled { signal },
+        // It ended before the stop, and no signal of this daemon ended it.
+        (None, _) => StopEnding::AtDaemonStart,
+    };
+    StopOutcome {
+        ending,
+        sent,
+        unfinished,
+    }
+}
+
+/// The `data` of the `exited` event a stop records (BOX-013): the reason,
+/// and the exit code or the signal the record stores.
+pub(crate) fn stopped_event_data(
+    ending: boxes::core::record::StopEnding,
+) -> boxes::events::EventData {
+    let state = boxes::core::record::RecordState::Stopped(ending);
+    let mut data = boxes::events::EventData::new();
+    data.insert("reason".to_string(), "stopped".into());
+    if let Some(code) = state.exit_code() {
+        data.insert("exit_code".to_string(), code.into());
+    }
+    if let Some(signal) = state.signal() {
+        data.insert("signal".to_string(), signal.into());
+    }
+    data
+}
+
+impl BoxActor {
+    /// Stops the box and keeps its record (BOX-013): signals every process
+    /// in it, tears its host down, sets the record to `stopped` with how the
+    /// entrypoint ended, and records an `exited` event. One `box.stop` span
+    /// covers the whole stop and carries the ending signal.
+    pub(super) async fn stop_box(
+        &mut self,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        let span = tracing::info_span!(
+            "box.stop",
+            box_id = %box_id,
+            force,
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            ending_signal = tracing::field::Empty,
+            ending_exit_code = tracing::field::Empty,
+        );
+        let stopped =
+            tracing::Instrument::instrument(self.stop_box_inner(force, grace), span.clone()).await;
+        if let Ok(ending) = &stopped {
+            let state = boxes::core::record::RecordState::Stopped(*ending);
+            if let Some(signal) = state.signal() {
+                span.record("ending_signal", signal);
+            }
+            if let Some(code) = state.exit_code() {
+                span.record("ending_exit_code", code);
+            }
+        }
+        stopped
+    }
+
+    async fn stop_box_inner(
+        &mut self,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(box_id = %box_id, force, "stop: requested");
+        let launched = match &mut self.inner {
+            BoxInner::Active { host, .. } => host.take(),
+            BoxInner::Draft { .. } => None,
+        };
+        self.publish_host();
+        let ending = match launched {
+            Some((host, task)) => {
+                let container_pid = probe_host(host.get_attrs())
+                    .await
+                    .and_then(|attrs| attrs.container_pid);
+                if container_pid.is_none() {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        "stop: the host did not name its container; the host kill ends the box"
+                    );
+                }
+                let outcome = stop_box_processes(
+                    box_id,
+                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    task,
+                    force,
+                    grace,
+                )
+                .await;
+                tracing::info!(
+                    box_id = %box_id,
+                    signals = ?outcome
+                        .sent
+                        .iter()
+                        .map(|s| stop_signal_name(*s))
+                        .collect::<Vec<_>>(),
+                    ending = ?outcome.ending,
+                    "stop: the box's processes ended"
+                );
+                if let Some(mut task) = outcome.unfinished {
+                    Self::kill_and_stop_loop(&host, &mut task, false).await;
+                }
+                outcome.ending
+            }
+            None => {
+                tracing::info!(box_id = %box_id, "stop: the box has no process to signal");
+                boxes::core::record::StopEnding::AtDaemonStart
+            }
+        };
+        // The host is gone: this takes down what ran beside it, as every
+        // other stop does.
+        self.stop_running(false).await;
+
+        let mut record = self.record.record().await?;
+        record.set_state(boxes::core::record::RecordState::Stopped(ending));
+        self.record.write(record).await?;
+        let state = boxes::core::record::RecordState::Stopped(ending);
+        tracing::info!(
+            box_id = %box_id,
+            exit_code = state.exit_code(),
+            signal = state.signal(),
+            "stop: set the record to stopped"
+        );
+        let object = self.record.object().await?;
+        crate::box_manager::write_box_event(
+            &object,
+            boxes::events::BoxEventType::Exited,
+            stopped_event_data(ending),
+        )?;
+        Ok(ending)
+    }
+}
+
 #[cfg(test)]
 mod quic443_cohort_tests {
     use super::{join_quic443_cohort, leave_quic443_cohort, quic443_placement_refused};

@@ -12299,3 +12299,148 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
             .is_symlink()
     );
 }
+
+/// BOX-013: a stop sends SIGTERM to every process in the box, waits the
+/// grace period, sends SIGKILL to those still running, and the record ends
+/// `stopped` with an `exited` event that carries `reason = "stopped"` and
+/// the signal that ended the entrypoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    // A box that ignores SIGTERM: the grace runs out and SIGKILL ends it.
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 0.05; done")
+        .spawn()
+        .expect("spawn the stand-in box");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        child.wait().map(|status| status.code().unwrap_or(-1))
+    });
+    // Let the loop start a child, so the box has more than one process.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !processes.pids().is_empty(),
+        "the stand-in box should be running"
+    );
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "a graceful stop waits the grace period before SIGKILL"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(outcome.unfinished.is_none());
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the stop"
+    );
+
+    // Through the daemon: the mock shell ends on SIGTERM, and the record
+    // and its events keep that signal.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+    assert!(host.is_alive());
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    assert_eq!(
+        ending,
+        StopEnding::Signalled {
+            signal: libc::SIGTERM
+        }
+    );
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+    assert_eq!(record.signal, Some(libc::SIGTERM));
+    assert_eq!(record.exit_code, None);
+
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the stop records an exited event");
+    assert_eq!(exited.data["reason"], "stopped");
+    assert_eq!(exited.data["signal"], libc::SIGTERM);
+    assert!(!exited.data.contains_key("exit_code"));
+}
+
+/// BOX-013: a forced stop kills every process in the box at once, without
+/// the grace period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_force_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 0.05; done")
+        .spawn()
+        .expect("spawn the stand-in box");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        child.wait().map(|status| status.code().unwrap_or(-1))
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        true,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a forced stop does not wait the grace period: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}

@@ -795,3 +795,127 @@ pub(super) fn place_box_processes(
 ) -> std::io::Result<()> {
     sandbox::classifier::place_pid(&leaf.procs(), supervisor)
 }
+
+/// Every process of one box, as a stop signals them (BOX-013): the
+/// entrypoint and its descendants, every exec and its descendants, and every
+/// process any of them moved to its own session with `setsid`.
+///
+/// The box's boundary is the PID namespace its container supervisor creates
+/// for its children. Every one of those processes is in it: the entrypoint
+/// is its init, a `setsid` does not leave it, and an exec joins it. Only a
+/// host-address box has a cgroup of its own, and a cohort's UDP 443 block can
+/// move several boxes' processes into one shared leaf, so no cgroup is the
+/// box's boundary on every host.
+///
+/// A supervisor whose children share the daemon's own PID namespace (the
+/// test launcher's plain process) has no namespace to scan. The box is then
+/// the supervisor and its descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoxProcesses {
+    /// The box's container supervisor.
+    root: u32,
+    /// The `(device, inode)` of the box's PID namespace, or `None` when it is
+    /// the daemon's own.
+    namespace: Option<(u64, u64)>,
+}
+
+impl BoxProcesses {
+    /// The processes of the box whose container supervisor is `root`.
+    pub(crate) fn of_container(root: u32) -> Self {
+        let own = namespace_id(std::path::Path::new("/proc/self/ns/pid"));
+        let boxed = namespace_id(std::path::Path::new(&format!(
+            "/proc/{root}/ns/pid_for_children"
+        )));
+        let namespace = match (boxed, own) {
+            (Some(boxed), Some(own)) if boxed != own => Some(boxed),
+            _ => None,
+        };
+        Self { root, namespace }
+    }
+
+    /// The box's live processes. A zombie has ended, so it is not one.
+    pub(crate) fn pids(&self) -> Vec<i32> {
+        match self.namespace {
+            Some(namespace) => procfs_pids()
+                .into_iter()
+                .filter(|pid| {
+                    namespace_id(std::path::Path::new(&format!("/proc/{pid}/ns/pid")))
+                        == Some(namespace)
+                })
+                .filter(|pid| is_live(*pid))
+                .collect(),
+            None => {
+                let mut tree = Vec::new();
+                let mut next = vec![i32::try_from(self.root).unwrap_or(i32::MAX)];
+                while let Some(pid) = next.pop() {
+                    if tree.contains(&pid) || !is_live(pid) {
+                        continue;
+                    }
+                    tree.push(pid);
+                    next.extend(children_of(pid));
+                }
+                tree
+            }
+        }
+    }
+
+    /// Sends `signal` to every live process of the box. Answers how many
+    /// processes it reached. A process that ends between the scan and the
+    /// signal is not counted.
+    pub(crate) fn signal(&self, signal: i32) -> usize {
+        self.pids()
+            .into_iter()
+            .filter(|pid| {
+                // SAFETY: `kill` reads no memory of ours. A pid that is gone
+                // answers ESRCH, which the count leaves out.
+                unsafe { libc::kill(*pid, signal) == 0 }
+            })
+            .count()
+    }
+}
+
+/// The `(device, inode)` that names the namespace `link` points at.
+fn namespace_id(link: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(link).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Every pid `/proc` lists.
+fn procfs_pids() -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The children of every thread of `pid`.
+fn children_of(pid: i32) -> Vec<i32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|children| {
+            children
+                .split_ascii_whitespace()
+                .filter_map(|child| child.parse().ok())
+                .collect::<Vec<i32>>()
+        })
+        .collect()
+}
+
+/// Whether `pid` names a process that has not ended: it exists, and its
+/// state is not zombie (`Z`) or dead (`X`).
+fn is_live(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state follows the last `)`, which closes the command name.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
+}

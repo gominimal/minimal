@@ -262,6 +262,14 @@ enum BoxMessage {
     /// Shutdown-stop: kill the host (if any), withdraw the hostname, and stop
     /// the actor — the on-disk record is kept.
     Stop(oneshot::Sender<()>),
+    /// Stop the box and keep its record (BOX-013): signal every process in
+    /// it, set the record to `stopped`, record an `exited` event, and end the
+    /// actor. Answered with how the box ended.
+    StopBox {
+        force: bool,
+        grace: std::time::Duration,
+        reply: oneshot::Sender<Result<boxes::core::record::StopEnding, std::io::Error>>,
+    },
     /// Full teardown: like [`Stop`](Self::Stop), but also deletes the on-disk
     /// record.
     Destroy(oneshot::Sender<Result<Vec<String>, std::io::Error>>),
@@ -937,6 +945,47 @@ impl BoxActor {
         deleted.map(|()| hook_failures)
     }
 
+    /// Marks the box's name stopped after a stop: the name stays held, and
+    /// a shared-address box answers NODATA until it runs again.
+    async fn mark_name_stopped(&self) {
+        // NET-013: a stop keeps the grant and the registry's publish
+        // row — the session still exists, a resume brings the same
+        // box back, and its address is its own until destroy.
+        // NET-128: the name stays held but a shared-address box
+        // answers NODATA while stopped, so the node's own listener
+        // at that port is not spoken for by a dead box. The marker
+        // is cleared on resume when the host starts.
+        #[cfg(target_os = "linux")]
+        {
+            // An unreadable record must not panic the Stop arm, and it
+            // must not fail open either: the box is stopped whether or
+            // not its record reads, and a shared-address name left
+            // answering would let a dead box speak for the node's own
+            // listener. The marker is keyed by the session id, which
+            // the actor holds without the record, so when the network
+            // mode cannot be read the name is marked stopped on the
+            // `Active` half of the route gate alone.
+            let owns_route = match self.record.record().await {
+                Ok(record) => self.owns_hostname_route(&record),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %self.record.id(),
+                        error = %e,
+                        "reading the session record failed while stopping; \
+                         marking the box's name stopped by its id",
+                    );
+                    matches!(self.inner, BoxInner::Active { .. })
+                }
+            };
+            if owns_route {
+                self.hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned")
+                    .mark_stopped(*self.record.id());
+            }
+        }
+    }
+
     /// The async task which handles interactions with the session.
     ///
     /// On an actor-initiated termination (abort, failed verdict resume) the
@@ -1107,44 +1156,24 @@ impl BoxActor {
             }
             BoxMessage::Stop(r) => {
                 self.stop_running(true).await;
-                // NET-013: a stop keeps the grant and the registry's publish
-                // row — the session still exists, a resume brings the same
-                // box back, and its address is its own until destroy.
-                // NET-128: the name stays held but a shared-address box
-                // answers NODATA while stopped, so the node's own listener
-                // at that port is not spoken for by a dead box. The marker
-                // is cleared on resume when the host starts.
-                #[cfg(target_os = "linux")]
-                {
-                    // An unreadable record must not panic the Stop arm, and it
-                    // must not fail open either: the box is stopped whether or
-                    // not its record reads, and a shared-address name left
-                    // answering would let a dead box speak for the node's own
-                    // listener. The marker is keyed by the session id, which
-                    // the actor holds without the record, so when the network
-                    // mode cannot be read the name is marked stopped on the
-                    // `Active` half of the route gate alone.
-                    let owns_route = match self.record.record().await {
-                        Ok(record) => self.owns_hostname_route(&record),
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = %self.record.id(),
-                                error = %e,
-                                "reading the session record failed while stopping; \
-                                 marking the box's name stopped by its id",
-                            );
-                            matches!(self.inner, BoxInner::Active { .. })
-                        }
-                    };
-                    if owns_route {
-                        self.hostnames
-                            .write()
-                            .expect("hostname registry lock poisoned")
-                            .mark_stopped(*self.record.id());
-                    }
-                }
+                self.mark_name_stopped().await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
+            }
+            BoxMessage::StopBox {
+                force,
+                grace,
+                reply,
+            } => {
+                // BOX-013: a stop of the box itself. The record stays, set
+                // to `stopped`, and the name is held as a shutdown stop
+                // holds it.
+                let stopped = self.stop_box(force, grace).await;
+                self.mark_name_stopped().await;
+                let _ = reply.send(stopped);
+                // The actor ends with the box, and evicts itself: no actor
+                // hosts a stopped box (#2393).
+                return ControlFlow::Break(Teardown::SelfInitiated);
             }
             BoxMessage::RunDetachHooks(r) => {
                 self.run_hooks_headless(crate::hooks::HookEvent::Detach)
@@ -1616,6 +1645,33 @@ pub(crate) mod listen_plan_seam {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(|sets| sets.get(&id).cloned())
+    }
+}
+
+impl BoxHandle {
+    /// Stops the box and keeps its record (BOX-013): SIGTERM to every
+    /// process, `grace` to end, then SIGKILL to the rest, or SIGKILL at once
+    /// with `force`. Answers how the box ended. The actor ends with the box.
+    pub(crate) async fn stop_box(
+        &self,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let (reply, recv) = oneshot::channel();
+        // A send error means the actor is gone: the recv fails as well.
+        let _ = self
+            .0
+            .send(BoxMessage::StopBox {
+                force,
+                grace,
+                reply,
+            })
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "the session ended before its stop finished",
+            ))
+        })
     }
 }
 

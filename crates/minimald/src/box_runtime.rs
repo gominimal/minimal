@@ -1233,6 +1233,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             )
         });
 
+        // Read before the process moves into the host: a stop signals the
+        // box's processes from it (BOX-013).
+        let container_pid = process.container_pid();
+
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
 
@@ -1269,6 +1273,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             // declared-and-enforced attribute).
             attrs: HostAttrs {
                 host_ip_enforcement,
+                container_pid: Some(container_pid),
                 ..HostAttrs::default()
             },
 
