@@ -1483,6 +1483,7 @@ fn run_probe_build(
         cancel: tokio_util::sync::CancellationToken::new(),
         cpu_weight: None,
         classifier_leaf: Some(leaf),
+        box_network: None,
     };
     let opts = op::Options {
         cache,

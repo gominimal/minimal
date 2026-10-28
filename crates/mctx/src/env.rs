@@ -268,6 +268,7 @@ impl EnvChannel<'_> {
                 // NET-155: a client-side patched build runs for no box, so it
                 // stays the caller's own traffic.
                 classifier_leaf: None,
+                box_network: None,
             }
             .run(&op::Options {
                 cache,

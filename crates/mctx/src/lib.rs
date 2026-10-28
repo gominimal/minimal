@@ -272,6 +272,11 @@ pub struct Context {
     /// box's egress verdict decides the build's connections. `None` for a
     /// context that builds as its caller's own traffic.
     pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The network of the own-address box this context builds for, if any
+    /// (NET-155). Every package build the context starts that needs the
+    /// network attaches to it, so the box's egress verdict decides the
+    /// build's connections.
+    pub(crate) box_network: Option<op::BuildNetwork>,
 }
 
 impl fmt::Display for Context {
@@ -431,6 +436,7 @@ impl Context {
             daemon,
             mfile,
             classifier_leaf: None,
+            box_network: None,
         })
     }
 
@@ -454,6 +460,7 @@ impl Context {
             daemon,
             mfile,
             classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -467,6 +474,7 @@ impl Context {
             daemon,
             mfile,
             classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -481,6 +489,20 @@ impl Context {
     /// The classifier leaf this context's package builds run in, if any.
     pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
         self.classifier_leaf.as_ref()
+    }
+
+    /// Runs every package build this context starts that needs the network
+    /// on `network`, the network of the own-address box the builds run for
+    /// (NET-155).
+    #[must_use]
+    pub fn with_box_network(mut self, network: op::BuildNetwork) -> Self {
+        self.box_network = Some(network);
+        self
+    }
+
+    /// The box network this context's package builds attach to, if any.
+    pub fn box_network(&self) -> Option<&op::BuildNetwork> {
+        self.box_network.as_ref()
     }
 
     /// Returns a clone of the shared daemon-scoped context. Cheap —
@@ -518,6 +540,7 @@ impl Context {
         let mfile = strategy.find_mfile()?;
         Ok(Self {
             classifier_leaf: self.classifier_leaf.clone(),
+            box_network: self.box_network.clone(),
             ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
         })
     }
@@ -858,6 +881,7 @@ impl Context {
             self.daemon.config.ot.clone(),
             cancel,
             self.classifier_leaf.clone(),
+            self.box_network.clone(),
         )?)
     }
 
@@ -1573,7 +1597,7 @@ mod tests {
             .unwrap();
         assert_eq!(orchestrator.backend.classifier_leaf(), None);
 
-        let boxed = plain.with_classifier_leaf(leaf.clone());
+        let boxed = plain.clone().with_classifier_leaf(leaf.clone());
         assert_eq!(boxed.clone().classifier_leaf(), Some(&leaf));
         assert_eq!(
             boxed.cloned_reinit().unwrap().classifier_leaf(),
@@ -1584,6 +1608,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(orchestrator.backend.classifier_leaf(), Some(&leaf));
+        assert!(orchestrator.backend.box_network().is_none());
+
+        // An own-address box has no leaf. Its context carries the box's
+        // network instead, across a clone and a reload, into the
+        // orchestrator.
+        assert!(plain.box_network().is_none());
+        let on_box_network = plain.with_box_network(op::BuildNetwork::new(|| {
+            Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>
+        }));
+        assert!(on_box_network.clone().box_network().is_some());
+        let reloaded = on_box_network.cloned_reinit().unwrap();
+        assert!(reloaded.box_network().is_some());
+        assert_eq!(reloaded.classifier_leaf(), None);
+        let orchestrator = reloaded
+            .local_orchestrator(&graph, None, None, Default::default())
+            .await
+            .unwrap();
+        assert!(orchestrator.backend.box_network().is_some());
+        assert_eq!(orchestrator.backend.classifier_leaf(), None);
     }
 
     #[test]

@@ -39,6 +39,10 @@ pub struct PatchedBuild<'a, SF: crate::SourceFetcher> {
     /// Carried to the spec build, so the box's egress verdict decides the
     /// build's connections. `None` keeps the build as the caller's traffic.
     pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+
+    /// The network of the own-address box this build runs for, if any
+    /// (NET-155). Carried to the spec build, the same as the leaf.
+    pub box_network: Option<crate::BuildNetwork>,
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
@@ -152,6 +156,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             cancel: tokio_util::sync::CancellationToken::new(),
             cpu_weight: None,
             classifier_leaf: self.classifier_leaf.clone(),
+            box_network: self.box_network.clone(),
         }
         .run(opts)
         .await?;
@@ -233,6 +238,7 @@ mod tests {
             stderr_writer: None,
             remote_cache: None,
             classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -343,6 +349,7 @@ mod tests {
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
             classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -402,6 +409,7 @@ mod tests {
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
             classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -454,6 +462,7 @@ mod tests {
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
             classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -498,6 +507,7 @@ mod tests {
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
             classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
