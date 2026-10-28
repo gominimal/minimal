@@ -12154,8 +12154,9 @@ fn build_events(package: &str, lines: &[&str]) -> Vec<orchestrator::BuildEvent> 
 /// so the box's egress verdict decides it. A deny-all box's build that
 /// cannot reach its download is reported as refused by the box's rules. A
 /// box allowed the destination is placed in its allow leaf, and its build
-/// is never reported as refused. A box with no leaf builds in the daemon's
-/// own cgroup, as before.
+/// is never reported as refused. A box never placed in a leaf builds in the
+/// daemon's own cgroup, as before. A placed box whose leaf is gone has its
+/// build refused, never run outside its egress verdict.
 #[test]
 fn box_package_build_under_box_egress_verdict() {
     use crate::box_ops::{BuildPlacement, BuildTap};
@@ -12163,17 +12164,34 @@ fn box_package_build_under_box_egress_verdict() {
 
     let tree = tempfile::tempdir().unwrap();
     let root = tree.path();
-    assert_eq!(super::setup::box_build_leaf(root, "sealed"), None);
+    // A box never placed in a leaf builds in the daemon's own cgroup.
+    assert_eq!(
+        super::setup::box_build_leaf(root, "sealed", "sealed", false),
+        Ok(None)
+    );
+    // A placed box whose leaf is gone fails closed: its build is refused.
+    assert_eq!(
+        super::setup::box_build_leaf(root, "sealed", "sealed", true),
+        Err(
+            "the build for box sealed did not start: box sealed runs under \
+             egress rules, and this host cannot apply them to the build"
+                .to_string()
+        )
+    );
 
     let deny_dir = sandbox::classifier::box_leaf(root, "sealed", Verdict::Deny);
     std::fs::create_dir_all(&deny_dir).unwrap();
     let allow_dir = sandbox::classifier::box_leaf(root, "open", Verdict::Allow);
     std::fs::create_dir_all(&allow_dir).unwrap();
 
-    let sealed = super::setup::box_build_leaf(root, "sealed").expect("the deny-all box's leaf");
+    let sealed = super::setup::box_build_leaf(root, "sealed", "sealed", true)
+        .unwrap()
+        .expect("the deny-all box's leaf");
     assert_eq!(sealed.dir(), deny_dir);
     assert!(sealed.is_deny());
-    let open = super::setup::box_build_leaf(root, "open").expect("the allowed box's leaf");
+    let open = super::setup::box_build_leaf(root, "open", "open", true)
+        .unwrap()
+        .expect("the allowed box's leaf");
     assert_eq!(open.dir(), allow_dir);
     assert!(!open.is_deny());
 

@@ -30,20 +30,36 @@ pub(crate) fn effective_egress_section(
 /// The classifier leaf a package build for the box `box_id` runs in
 /// (NET-155): the leaf the box's launch placed it in, under `root`. The
 /// launch places a box in exactly one subtree, so the leaf is the one of the
-/// two that exists. `None` when the box has no leaf: a box that is not
-/// host-address, a host with no classifier tree, or a box not running.
-/// The build then runs in the daemon's own cgroup, as it did before.
+/// two that exists.
+///
+/// `placed` is whether the box's launch recorded a leaf of its own
+/// ([`boxes::HostIpEnforcement::PerBox`]). A box that was never placed has no
+/// leaf by design (it is not host-address, or the host has no classifier
+/// tree), and its builds run in the daemon's own cgroup, as before. A placed
+/// box whose leaf is gone fails closed: the build is refused, never run
+/// outside the box's egress verdict. The `Err` is the refusal for the person
+/// who asked for the build.
 pub(crate) fn box_build_leaf(
     root: &std::path::Path,
     box_id: &str,
-) -> Option<sandbox::config::ClassifierLeaf> {
-    [
+    box_name: &str,
+    placed: bool,
+) -> Result<Option<sandbox::config::ClassifierLeaf>, String> {
+    let leaf = [
         sandbox::config::Verdict::Deny,
         sandbox::config::Verdict::Allow,
     ]
     .into_iter()
     .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
-    .find(|leaf| leaf.dir().is_dir())
+    .find(|leaf| leaf.dir().is_dir());
+    match leaf {
+        Some(leaf) => Ok(Some(leaf)),
+        None if placed => Err(format!(
+            "the build for box {box_name} did not start: box {box_name} runs under \
+             egress rules, and this host cannot apply them to the build"
+        )),
+        None => Ok(None),
+    }
 }
 
 /// The policy the gate enforces for a session: its declared ingress, and its
@@ -677,14 +693,24 @@ impl BoxActor {
         // NET-155: the box's builds run in the box's own classifier leaf, so
         // its egress verdict decides what the builds can reach.
         let record = self.record.record().await?;
+        // A box whose launch placed it in a leaf never builds outside it.
         let box_id = record.id.to_string();
-        let placement = crate::box_ops::BuildPlacement {
-            box_name: record.name.clone().unwrap_or_else(|| box_id.clone()),
-            leaf: box_build_leaf(
-                std::path::Path::new(sandbox::classifier::TREE_ROOT),
-                &box_id,
-            ),
-        };
+        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
+        let placed = record.host_ip_enforcement == Some(boxes::HostIpEnforcement::PerBox);
+        let leaf = box_build_leaf(
+            std::path::Path::new(sandbox::classifier::TREE_ROOT),
+            &box_id,
+            &box_name,
+            placed,
+        )
+        .map_err(|refusal| {
+            tracing::warn!(
+                box_name = %box_name,
+                "refusing a package build for a placed box whose classifier leaf is missing",
+            );
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal)
+        })?;
+        let placement = crate::box_ops::BuildPlacement { box_name, leaf };
         let (sop, rx) =
             SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, placement, 64).await?;
         match &mut self.inner {
