@@ -1195,9 +1195,23 @@ fn resume_reply(
         Err(error) => return refused(error),
     };
     let claim = boxes.begin_registration(&name);
-    let allocated = match allocate_box_address(answerer, &name) {
-        Ok(allocated) => allocated,
-        Err(reply) => return reply,
+    // A box created at the 127.0.0.1 interim (the host could not bind the
+    // box range then) keeps it: the answerer records no address for it, so
+    // asking it now would hand a range address once the host binds the
+    // range, and the resume would refuse it as moved. `resumable` checked
+    // the presented address against the creation's.
+    let interim = request.loopback_address == std::net::Ipv4Addr::LOCALHOST;
+    // A box created at a range address asks to keep it. A restarted
+    // answerer holds no record of a dormant box, and where the host cannot
+    // bind the range now it would hand a fresh ask the 127.0.0.1 interim,
+    // which the resume refuses as moved.
+    let allocated = if interim {
+        std::net::Ipv4Addr::LOCALHOST
+    } else {
+        match allocate_box_address_keeping(answerer, &name, Some(request.loopback_address)) {
+            Ok(allocated) => allocated,
+            Err(reply) => return reply,
+        }
     };
     order.apply(move || {
         match boxes.resume_client_box(
@@ -1215,9 +1229,10 @@ fn resume_reply(
                 task_addresses: record.task_addrs().to_vec(),
             }),
             Err(error) => {
-                let released = boxes.release_unless_owned(&claim, || {
-                    answerer.release_address(&name);
-                });
+                let released = !interim
+                    && boxes.release_unless_owned(&claim, || {
+                        answerer.release_address(&name);
+                    });
                 tracing::info!(
                     address_released = released,
                     box = %name,
@@ -1693,7 +1708,19 @@ fn allocate_box_address(
     answerer: &AnswererStatus,
     name: &str,
 ) -> Result<std::net::Ipv4Addr, BoxControlReply> {
-    answerer.allocate(name).map_err(|reason| {
+    // None: a fresh registration has no earlier address to keep. Only a
+    // resume knows the address its box was created at.
+    allocate_box_address_keeping(answerer, name, None)
+}
+
+/// [`allocate_box_address`] for a resumed box created at `keep`, which the
+/// answerer hands back while no other box holds it.
+fn allocate_box_address_keeping(
+    answerer: &AnswererStatus,
+    name: &str,
+    keep: Option<std::net::Ipv4Addr>,
+) -> Result<std::net::Ipv4Addr, BoxControlReply> {
+    answerer.allocate_keeping(name, keep).map_err(|reason| {
         tracing::warn!(
             box = %name,
             %reason,
@@ -5167,6 +5194,189 @@ mod tests {
             allocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "only the registration asked the answerer"
+        );
+    }
+
+    /// A box created while the host lacked the box range was handed the
+    /// 127.0.0.1 interim, and keeps it: once the aliases are installed and
+    /// its row is withdrawn, its creator's resume reinstates it at
+    /// 127.0.0.1 rather than refusing it as moved, while a new box gets an
+    /// address out of the range.
+    #[test]
+    fn an_interim_box_keeps_the_interim_across_a_resume() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let aliased = Arc::new(AtomicBool::new(false));
+        let probed = Arc::clone(&aliased);
+        let answerer = AnswererStatus::allocating_for_tests_probed(
+            "control-test-node",
+            || None,
+            |_, _| {},
+            move || {
+                let present = probed.load(Ordering::SeqCst);
+                switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                    if present {
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::AddrNotAvailable.into())
+                    }
+                })
+            },
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let request = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+        };
+        let web = handed(register(&sock_path, &request("web")).expect("registered"));
+        assert_eq!(
+            web.loopback_address,
+            Ipv4Addr::LOCALHOST,
+            "a host without the range hands the interim"
+        );
+
+        aliased.store(true, Ordering::SeqCst);
+        assert!(
+            boxes.withdraw(web.switch_address).is_some(),
+            "the row is withdrawn, its creation dormant"
+        );
+        let resumed = handed(
+            control(
+                &sock_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(
+            (resumed.box_id, resumed.loopback_address),
+            (web.box_id, Ipv4Addr::LOCALHOST),
+            "the interim box resumes at its own 127.0.0.1"
+        );
+
+        let api = handed(register(&sock_path, &request("api")).expect("registered"));
+        assert!(
+            api.loopback_address != Ipv4Addr::LOCALHOST,
+            "a new box gets a range address once the host binds the range: {}",
+            api.loopback_address
+        );
+    }
+
+    /// A box created at a range address keeps it across a resume after the
+    /// answerer restarts while the host lacks the range. The restarted
+    /// answerer holds no record of the dormant box. It hands back the
+    /// address the box was created at, not the 127.0.0.1 interim, so the
+    /// resume reinstates the box rather than refusing it as moved.
+    #[test]
+    fn a_range_box_keeps_its_address_across_an_answerer_restart() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let wait_for = |path: &std::path::Path| {
+            for _ in 0..500 {
+                if TestStream::connect(path).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            AnswererStatus::allocating_for_tests("control-test-node"),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        wait_for(&sock_path);
+        let request = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+        };
+        let web = handed(register(&sock_path, &request("web")).expect("registered"));
+        assert!(
+            web.loopback_address != Ipv4Addr::LOCALHOST,
+            "a host with the range hands a range address: {}",
+            web.loopback_address
+        );
+        assert!(
+            boxes.withdraw(web.switch_address).is_some(),
+            "the row is withdrawn, its creation dormant"
+        );
+
+        // The restarted answerer: an empty book, on a host that lacks the
+        // range aliases now.
+        let restarted_dir = tempfile::TempDir::new().expect("temp dir");
+        let restarted_path = restarted_dir.path().join(CONTROL_SOCK_FILE);
+        let _restarted = spawn(
+            restarted_path.clone(),
+            boxes.clone(),
+            AnswererStatus::allocating_for_tests_probed(
+                "control-test-node",
+                || None,
+                |_, _| {},
+                || {
+                    switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                        Err(std::io::ErrorKind::AddrNotAvailable.into())
+                    })
+                },
+            ),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        wait_for(&restarted_path);
+        let resumed = handed(
+            control(
+                &restarted_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(
+            (resumed.box_id, resumed.loopback_address),
+            (web.box_id, web.loopback_address),
+            "the range box resumes at its own address"
+        );
+
+        let api = handed(register(&restarted_path, &request("api")).expect("registered"));
+        assert_eq!(
+            api.loopback_address,
+            Ipv4Addr::LOCALHOST,
+            "a new box on a host without the range still gets the interim"
         );
     }
 

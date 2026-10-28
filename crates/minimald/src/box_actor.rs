@@ -1469,9 +1469,13 @@ pub(crate) mod mint_attach_seam {
                 // End the host's loop now, and wait for the end so the host
                 // (and its mailbox) is gone before the mint's attach sends:
                 // the send finds the channel closed rather than racing a
-                // loop that might still drain it.
+                // loop that might still drain it. The task can be the
+                // watcher a `host_ip` box's loop runs under, whose abort
+                // only asks the loop to abort, so wait on the mailbox
+                // itself.
                 launched.1.abort();
                 let _ = (&mut launched.1).await;
+                launched.0.closed().await;
             }
             Some(Failure::HostWedged) => {
                 // End the real host's loop, as above, so nothing of it
@@ -1483,6 +1487,7 @@ pub(crate) mod mint_attach_seam {
                 // out its deadline.
                 launched.1.abort();
                 let _ = (&mut launched.1).await;
+                launched.0.closed().await;
                 let (wedged, mailbox) = HostHandle::wedged();
                 launched = (wedged, tokio::spawn(std::future::pending()));
                 WEDGED_MAILBOXES
