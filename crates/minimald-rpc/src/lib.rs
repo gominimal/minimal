@@ -2132,6 +2132,47 @@ impl OneshotSshRpc for RenameSession {
     type Response = Errorable<RenameSessionResponse>;
 }
 
+/// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
+///
+/// The daemon sends SIGTERM to every process in the box, waits its grace
+/// period, sends SIGKILL to those still running, sets the record to
+/// `stopped` and records an `exited` event. With `force`, it sends SIGKILL
+/// to every process at once. The record, its events and the box's
+/// filesystem stay until the box is reaped.
+pub struct StopBox;
+
+/// The request for a [`StopBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxRequest {
+    /// The box to stop.
+    pub id: SessionId,
+    /// Kill every process in the box at once, with no grace period.
+    /// Absent, as from a client that does not send it, the stop is the
+    /// graceful one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`StopBox`] RPC: how the stopped box ended, as its
+/// record now stores it (BOX-011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxResponse {
+    /// The entrypoint's exit status, when it exited before a signal ended
+    /// it.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended the entrypoint, when a signal
+    /// of the stop ended it.
+    #[serde(default)]
+    pub signal: Option<i32>,
+}
+
+impl OneshotSshRpc for StopBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox");
+    type Request<'a> = StopBoxRequest;
+    type Response = Errorable<StopBoxResponse>;
+}
+
 /// An RPC to destroy an existing session.
 pub struct DestroySession;
 
@@ -2950,6 +2991,52 @@ mod read_events_tests {
             );
             assert_eq!(back, update);
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_box_tests {
+    use super::*;
+
+    /// BOX-013: the stop request and its response survive the wire, and a
+    /// request without `force` reads as the graceful stop.
+    #[test]
+    fn stop_box_request_round_trips() {
+        let id = SessionId::mint();
+        for force in [false, true] {
+            let req = StopBoxRequest { id, force };
+            let bytes = serde_json_lenient::to_vec(&req).unwrap();
+            let back: StopBoxRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare = format!(r#"{{"id":"{id}"}}"#);
+        let back: StopBoxRequest = serde_json_lenient::from_str(&bare).unwrap();
+        assert!(!back.force, "a request without force is the graceful stop");
+
+        let responses = [
+            StopBoxResponse {
+                exit_code: None,
+                signal: Some(15),
+            },
+            StopBoxResponse {
+                exit_code: Some(0),
+                signal: None,
+            },
+            StopBoxResponse::default(),
+        ];
+        for response in responses {
+            let wire: Errorable<StopBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<StopBoxResponse> = serde_json_lenient::from_slice(&bytes).unwrap();
+            match back {
+                Errorable::Ok(back) => assert_eq!(back, response),
+                Errorable::Err { error } => panic!("the response read back as an error: {error}"),
+            }
+        }
+        assert_eq!(
+            StopBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox")
+        );
     }
 }
 
