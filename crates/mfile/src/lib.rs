@@ -1197,7 +1197,7 @@ impl File {
     /// attributes: restoring the owner needs a `chown` the caller is usually
     /// not privileged for, and ACLs and xattrs have no portable Rust API, so
     /// the replacement is documented as dropping them rather than half-keeping
-    /// them per platform (review on PR #2302, lib.rs:1249).
+    /// them per platform.
     ///
     /// The `edit` closure receives the current content (`None` if the
     /// file does not exist yet) and returns `Ok(Some(new))` to write,

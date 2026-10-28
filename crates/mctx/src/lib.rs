@@ -1213,6 +1213,7 @@ impl Context {
         // lock so a concurrent `min` command cannot interleave between our read
         // and our write (the write itself is an atomic replace).
         let mut did_edit = false;
+        let mut added = None;
         mfile::File::edit_exclusively(&mfile_path, |content| {
             let toml = content.ok_or_else(|| {
                 Error::IO(
@@ -1236,7 +1237,10 @@ impl Context {
                 AddDepMode::BuildPackages => {
                     if let Some(h) = doc["stack"].as_table_like_mut() {
                         edited |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
-                        println!("Added {} to stack.build_packages", resolved.join(", "));
+                        added = Some(format!(
+                            "Added {} to stack.build_packages",
+                            resolved.join(", ")
+                        ));
                     } else {
                         return Err(Error::Other(anyhow!(
                             "could not find [stack] in minimal.toml: needed for update"
@@ -1246,7 +1250,10 @@ impl Context {
                 AddDepMode::RuntimePackages => {
                     if let Some(h) = doc["stack"].as_table_like_mut() {
                         edited |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
-                        println!("Added {} to stack.runtime_packages", resolved.join(", "));
+                        added = Some(format!(
+                            "Added {} to stack.runtime_packages",
+                            resolved.join(", ")
+                        ));
                     } else {
                         return Err(Error::Other(anyhow!(
                             "could not find [stack] in minimal.toml: needed for update"
@@ -1259,7 +1266,11 @@ impl Context {
                         && let Some(t) = t.as_table_like_mut()
                     {
                         edited |= upsert_toml_packages_list(t, "packages", &resolved)?;
-                        println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
+                        added = Some(format!(
+                            "Added {} to tasks.{}.packages",
+                            resolved.join(", "),
+                            name
+                        ));
                     } else {
                         return Err(Error::Other(anyhow!(
                             "could not find [tasks.{}] in minimal.toml: needed for update",
@@ -1280,7 +1291,7 @@ impl Context {
                         );
                         edited = true;
                     }
-                    println!("Added {} to session.packages", resolved.join(", "));
+                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
                 }
             }
 
@@ -1288,6 +1299,10 @@ impl Context {
             Ok(if edited { Some(doc.to_string()) } else { None })
         })?;
 
+        // Printed only once the write has succeeded.
+        if let Some(added) = added {
+            println!("{added}");
+        }
         if did_edit {
             *self = self.cloned_reinit()?;
         }
