@@ -496,7 +496,7 @@ pub(crate) async fn report_ask(
     let dial_timeout = |_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the VM host daemon did not accept the port prompt before its deadline",
+            "the port prompt did not get an answer in time",
         )
     };
     let reply = match &channel {
@@ -524,11 +524,15 @@ pub(crate) async fn report_ask(
     match reply {
         minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
         minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
-            "the VM host daemon refused the port prompt: {error}"
+            "the port prompt was refused: {error}"
         ))),
-        other => Err(io::Error::other(format!(
-            "the VM host daemon sent an unexpected reply to the port prompt: {other:?}"
-        ))),
+        other => {
+            // The reply itself goes to the log, not to the person.
+            tracing::warn!(reply = ?other, "the port prompt got an unexpected reply");
+            Err(io::Error::other(
+                "the port prompt got an answer it could not read",
+            ))
+        }
     }
 }
 
@@ -582,17 +586,17 @@ pub(crate) async fn report_admitted_port(
                 // the next attempt would draw the same refusal, and the
                 // rate window does not need it asked for again.
                 return Err(io::Error::other(format!(
-                    "the VM host daemon refused to open the port: {error}"
+                    "the request to open the port was refused: {error}"
                 )));
             }
             Ok(other) => {
                 // Not the admit's own answer, so not a decision either: the
                 // host's row may or may not name the port, and the unwind
                 // below withdraws it the way a lost reply's does.
-                unanswered = Some(io::Error::other(format!(
-                    "the VM host daemon sent an unexpected reply when asked to open the \
-                     port: {other:?}"
-                )));
+                tracing::warn!(reply = ?other, "the request to open the port got an unexpected reply");
+                unanswered = Some(io::Error::other(
+                    "the request to open the port got an answer it could not read",
+                ));
                 break;
             }
             // No reply: a lost answer, retried — the host's admit is
@@ -607,6 +611,15 @@ pub(crate) async fn report_admitted_port(
         }
     }
     let unanswered = unanswered.expect("the loop ran at least once without deciding");
+    // A deadline reads as the request's own words, not the door's.
+    let unanswered = if unanswered.kind() == io::ErrorKind::TimedOut {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the request to open the port did not get an answer in time",
+        )
+    } else {
+        unanswered
+    };
     // Fail-closed, and clean on the host's side too: the host may have
     // recorded the port before its reply was lost, so the unwind withdraws
     // it there — best-effort, because the publish is failing either way and
