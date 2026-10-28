@@ -2075,6 +2075,110 @@ pub struct SharedPortCollision {
     pub held_by: String,
 }
 
+/// What holds a declared host port that an activation refused (NET-144).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortHolder {
+    /// Another box on this machine holds the port. Carries its box name.
+    Box(String),
+    /// No box holds the port, so a program outside Minimal does.
+    Host,
+}
+
+impl PortHolder {
+    /// The holder as the daemon log names it: `box:<name>` or `host`.
+    #[must_use]
+    pub fn log_label(&self) -> String {
+        match self {
+            Self::Box(name) => format!("box:{name}"),
+            Self::Host => "host".to_string(),
+        }
+    }
+}
+
+/// An activation refused because a declared ingress host port is already in
+/// use on this machine (NET-144): the port, the box port the declaration
+/// maps it to, and what holds it.
+///
+/// The refusal travels as the daemon's error text, which is exactly this
+/// type's [`std::fmt::Display`]. The client reads it back with
+/// [`Self::find_in`], so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortInUseRefusal {
+    /// The host port the declaration names.
+    pub port: u16,
+    /// The box port the declaration maps the host port to.
+    pub box_port: u16,
+    /// What holds the host port.
+    pub holder: PortHolder,
+}
+
+/// The middle of the refusal's first line, after `Port <port>`.
+const PORT_IN_USE_MIDDLE: &str = " is already in use on this machine by ";
+/// The holder clause when no box holds the port.
+const PORT_IN_USE_HOST: &str = "a program outside Minimal.";
+/// The refusal's second line, up to the suggested host port.
+const PORT_IN_USE_REMEDY: &str = "\nChoose another host port in --ingress (for example --ingress ";
+/// The refusal's second line, after the suggested mapping.
+const PORT_IN_USE_REMEDY_END: &str = ") or in [network] ingress in minimal.toml.";
+
+impl PortInUseRefusal {
+    /// The host port the remedy suggests: the next port up, or the one
+    /// below when the refused port is the highest.
+    #[must_use]
+    pub fn suggested_port(&self) -> u16 {
+        self.port
+            .checked_add(1)
+            .unwrap_or_else(|| self.port.saturating_sub(1))
+    }
+
+    /// The refusal inside `error`, if it carries one. The daemon's text can
+    /// arrive inside other context, so the search does not need it to open
+    /// the string.
+    #[must_use]
+    pub fn find_in(error: &str) -> Option<Self> {
+        error
+            .match_indices("Port ")
+            .find_map(|(at, _)| Self::parse_at(&error[at + "Port ".len()..]))
+    }
+
+    fn parse_at(text: &str) -> Option<Self> {
+        let digits = text.find(|c: char| !c.is_ascii_digit())?;
+        let port: u16 = text[..digits].parse().ok()?;
+        let rest = text[digits..].strip_prefix(PORT_IN_USE_MIDDLE)?;
+        let remedy = rest.find(PORT_IN_USE_REMEDY)?;
+        let holder = match &rest[..remedy] {
+            PORT_IN_USE_HOST => PortHolder::Host,
+            clause => PortHolder::Box(clause.strip_prefix("box ")?.strip_suffix('.')?.to_string()),
+        };
+        let mapping = &rest[remedy + PORT_IN_USE_REMEDY.len()..];
+        let end = mapping.find(PORT_IN_USE_REMEDY_END)?;
+        let (_, box_port) = mapping[..end].split_once(':')?;
+        Some(Self {
+            port,
+            box_port: box_port.parse().ok()?,
+            holder,
+        })
+    }
+}
+
+impl std::fmt::Display for PortInUseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Port {}{PORT_IN_USE_MIDDLE}", self.port)?;
+        match &self.holder {
+            PortHolder::Box(name) => write!(f, "box {name}.")?,
+            PortHolder::Host => f.write_str(PORT_IN_USE_HOST)?,
+        }
+        write!(
+            f,
+            "{PORT_IN_USE_REMEDY}{}:{}{PORT_IN_USE_REMEDY_END}",
+            self.suggested_port(),
+            self.box_port
+        )
+    }
+}
+
+impl std::error::Error for PortInUseRefusal {}
+
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
 /// when it is `false`, so the common success payload is unchanged for
 /// clients that predate the field.

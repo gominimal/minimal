@@ -336,9 +336,11 @@ impl PortForwarder {
 ///
 /// A host port another process already holds is a failure like any other
 /// refused bind (NET-121): the rollback below runs and the caller withdraws
-/// the name. Only the returned error differs. It names the port and says
-/// the port is in use on the host, in place of the forwarder's raw
-/// refusal, and its kind is [`io::ErrorKind::AddrInUse`].
+/// the name. Only the returned error differs. It carries a
+/// [`minimald_rpc::PortInUseRefusal`] in place of the forwarder's raw
+/// refusal, and its kind is [`io::ErrorKind::AddrInUse`]. The refusal names
+/// the port and its holder (NET-144). Here the holder is always the host.
+/// [`apply_ingress_naming_holders`] reads it from the hostname registry.
 ///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
@@ -356,6 +358,35 @@ pub async fn apply_ingress(
     ingress: &IngressPolicy,
     gate: Option<&Arc<super::switch::BoxGate>>,
     yielded: &[super::dns::SharedPortCollision],
+) -> io::Result<Vec<PortForwarder>> {
+    apply_ingress_naming_holders(
+        control,
+        published,
+        ptask_ip,
+        ingress,
+        gate,
+        yielded,
+        &|_| minimald_rpc::PortHolder::Host,
+    )
+    .await
+}
+
+/// [`apply_ingress`], with `holder_of` to name what holds a taken port
+/// (NET-144). The attach path passes [`port_holder`] over the hostname
+/// registry, so the refusal names the box whose publish stands at that
+/// address and port, or the host when none does.
+///
+/// # Errors
+///
+/// As [`apply_ingress`].
+pub async fn apply_ingress_naming_holders(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    ingress: &IngressPolicy,
+    gate: Option<&Arc<super::switch::BoxGate>>,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
@@ -406,7 +437,11 @@ pub async fn apply_ingress(
                 // its declared ports is missing. Only the error's words
                 // differ: they name the port and the way out.
                 if is_address_in_use(&e) {
-                    return Err(address_in_use_error(mapping.external_port));
+                    return Err(address_in_use_error(minimald_rpc::PortInUseRefusal {
+                        port: mapping.external_port,
+                        box_port: mapping.internal_port,
+                        holder: holder_of(mapping.external_port),
+                    }));
                 }
                 return Err(e);
             }
@@ -466,21 +501,51 @@ pub fn host_ports_in_use(
         .collect()
 }
 
-/// The error [`apply_ingress`] returns for a declared port another process
-/// already holds on the host, and the error a finalize returns when
-/// [`host_ports_in_use`] finds one. A person reads it at the failed
-/// activation or command, so
-/// it names the port and the next step; the forwarder's own refusal is in
-/// the warn line [`apply_ingress`] logs, not here.
-pub fn address_in_use_error(port: u16) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AddrInUse,
-        format!(
-            "host port {port} is already in use on the host, so the \
-             session cannot forward it. Free the port, or activate again \
-             with --ingress <other>:<internal>."
-        ),
-    )
+/// The error [`apply_ingress`] returns for a declared port that something
+/// else already holds on the host, and the error a finalize returns when it
+/// finds one before the box is active. A person reads it at the failed
+/// activation or command, so it names the port, its holder and the next step
+/// (NET-144). The forwarder's own refusal is in the warn line
+/// [`apply_ingress`] logs, not here. The kind is
+/// [`io::ErrorKind::AddrInUse`], and the payload is the typed refusal, which
+/// [`port_in_use_refusal`] reads back.
+pub fn address_in_use_error(refusal: minimald_rpc::PortInUseRefusal) -> io::Error {
+    io::Error::new(io::ErrorKind::AddrInUse, refusal)
+}
+
+/// The typed refusal inside `error`, when it is one [`address_in_use_error`]
+/// built or when its text carries one, as an error wrapped on its way up
+/// does.
+#[must_use]
+pub fn port_in_use_refusal(error: &io::Error) -> Option<minimald_rpc::PortInUseRefusal> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<minimald_rpc::PortInUseRefusal>())
+        .cloned()
+        .or_else(|| minimald_rpc::PortInUseRefusal::find_in(&error.to_string()))
+}
+
+/// What holds `port` at `address` (NET-144): the box whose publish stands
+/// there in the hostname registry, or the host when no box does. A holder
+/// named `own_name` is the box that asks, so it does not count: then the
+/// host holds the port.
+#[must_use]
+pub fn port_holder(
+    registry: &std::sync::RwLock<super::dns::HostnameRegistry>,
+    own_name: &str,
+    address: Ipv4Addr,
+    port: u16,
+) -> minimald_rpc::PortHolder {
+    registry
+        .read()
+        .expect("hostname registry lock poisoned")
+        .own_port_holder(address, port)
+        .map(|(_, name)| name)
+        .filter(|name| name != own_name)
+        .map_or(
+            minimald_rpc::PortHolder::Host,
+            minimald_rpc::PortHolder::Box,
+        )
 }
 
 /// The body the forwarder answers an expose with when a forward is already
@@ -2758,7 +2823,7 @@ mod tests {
 
         use super::super::{
             ControlChannel, IngressPolicy, PortMapping, apply_ingress, host_ports_in_use,
-            is_address_in_use,
+            is_address_in_use, port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -2851,10 +2916,20 @@ mod tests {
 
             assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
             assert_eq!(
+                port_in_use_refusal(&err),
+                Some(minimald_rpc::PortInUseRefusal {
+                    port: 18999,
+                    box_port: 80,
+                    holder: minimald_rpc::PortHolder::Host,
+                }),
+                "the error carries the typed refusal for the finalize to read"
+            );
+            assert_eq!(
                 err.to_string(),
-                "host port 18999 is already in use on the host, so the session \
-                 cannot forward it. Free the port, or activate again with \
-                 --ingress <other>:<internal>.",
+                "Port 18999 is already in use on this machine by a program \
+                 outside Minimal.\nChoose another host port in --ingress (for \
+                 example --ingress 19000:80) or in [network] ingress in \
+                 minimal.toml.",
                 "the error names the taken port and the next step, and no \
                  forwarder internals"
             );

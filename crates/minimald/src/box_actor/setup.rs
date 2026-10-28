@@ -1,5 +1,24 @@
 use super::*;
 
+/// The daemon log's one line for an activation refused on a declared host
+/// port that something else holds (NET-144): the session, the port, the
+/// address and the holder (`box:<name>` or `host`).
+#[cfg(target_os = "linux")]
+fn warn_port_refusal(
+    record: &Record,
+    address: Option<std::net::Ipv4Addr>,
+    refusal: &minimald_rpc::PortInUseRefusal,
+) {
+    tracing::warn!(
+        session = %record.id,
+        port = refusal.port,
+        address = %address.map_or_else(|| "none".to_string(), |address| address.to_string()),
+        holder = %refusal.holder.log_label(),
+        action = "host-port-in-use",
+        "declared ingress port is already in use; activation refused"
+    );
+}
+
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`boxes::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
@@ -538,53 +557,107 @@ impl BoxActor {
                 #[cfg(not(target_os = "linux"))]
                 let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
 
-                // A declared TCP host port that another process already
-                // holds at this box's published address fails the finalize
-                // before the `Active` write (NET-121, design §7.1: the bind
-                // succeeds before the box is active, and a failed bind is an
-                // error). The probe needs the address the registration above
-                // publishes, so it runs here, and the client's activate
-                // cleanup withdraws the publish like any other failure after
-                // that point. On a native host the forwarder binds in the
-                // daemon's own network namespace, so the daemon probes. On a
-                // VM-backed host the forwarder binds on the host OS, so the
-                // probe finds nothing and the spawn's apply reports the port.
-                // Skipped when activate hooks run: their launch binds the
-                // forwards, and a taken port fails that apply with the same
-                // error.
+                // A declared host port that something else already holds
+                // fails the finalize before the `Active` write (NET-121,
+                // NET-144, design §7.1: the bind succeeds before the box is
+                // active, and a failed bind is an error). The refusal names
+                // the port and its holder, and the client's activate cleanup
+                // destroys the box, so no record stays behind. The checks need
+                // the address the registration above publishes, so they run
+                // here.
+                //
+                // Another box that holds the port at the shared `127.0.0.1`
+                // fallback refuses the box: nobody chose to share that
+                // address. Only a landed range verdict keeps a box there.
+                // Under a pending verdict the interim is a waypoint, the box
+                // moves to its hand when the verdict lands present, and the
+                // port is yielded as before. At a node's shared address the
+                // port is yielded too (NET-129). Then the daemon probes the ports that
+                // something outside the registry holds. On a native host the
+                // forwarder binds in the daemon's own network namespace, so
+                // the daemon probes. On a VM-backed host the forwarder binds
+                // on the host OS, so the probe finds nothing and the spawn's
+                // apply reports the port. The probe is skipped when activate
+                // hooks run: their launch binds the forwards, and a taken
+                // port fails that apply with the same refusal.
                 #[cfg(target_os = "linux")]
-                if let (boxes::NetworkMode::OwnIp, Some(ingress), false) = (
-                    &record.network,
-                    record.policy.ingress.as_ref(),
-                    self.has_hooks_for(crate::hooks::HookEvent::Activate),
-                ) {
-                    let control = self.switch_control().await;
-                    let published = self
-                        .hostnames
-                        .read()
-                        .expect("hostname registry lock poisoned")
-                        .published_own_address(record.id);
-                    let yielded: Vec<u16> = shared_port_collisions.iter().map(|c| c.port).collect();
-                    if let Some(published) = published
-                        && let Some(&port) = crate::net::policy::host_ports_in_use(
+                if let (boxes::NetworkMode::OwnIp, Some(ingress)) =
+                    (&record.network, record.policy.ingress.as_ref())
+                {
+                    let (published, fallback_refusal) = {
+                        let hostnames = self
+                            .hostnames
+                            .read()
+                            .expect("hostname registry lock poisoned");
+                        (
+                            hostnames.published_own_address(record.id),
+                            hostnames.fallback_port_refusal(record.id).filter(|_| {
+                                self.loopback.range_verdict()
+                                    != crate::net::dns::RangeVerdict::Pending
+                            }),
+                        )
+                    };
+                    let box_port = |port: u16| {
+                        ingress
+                            .port_mappings
+                            .iter()
+                            .find(|mapping| mapping.external_port == port)
+                            .map_or(port, |mapping| mapping.internal_port)
+                    };
+                    let mut refusal =
+                        fallback_refusal.map(|(port, holder)| minimald_rpc::PortInUseRefusal {
+                            port,
+                            box_port: box_port(port),
+                            holder: minimald_rpc::PortHolder::Box(holder),
+                        });
+                    if refusal.is_none()
+                        && !self.has_hooks_for(crate::hooks::HookEvent::Activate)
+                        && let Some(published) = published
+                    {
+                        let control = self.switch_control().await;
+                        let yielded: Vec<u16> =
+                            shared_port_collisions.iter().map(|c| c.port).collect();
+                        if let Some(&port) = crate::net::policy::host_ports_in_use(
                             &control, published, ingress, &yielded,
                         )
                         .first()
-                    {
-                        tracing::warn!(
-                            port,
-                            session = %record.id,
-                            action = "host-port-in-use",
-                            "declared ingress port is already in use on the host; \
-                             finalize fails"
-                        );
-                        return Err(crate::net::policy::address_in_use_error(port));
+                        {
+                            refusal = Some(minimald_rpc::PortInUseRefusal {
+                                port,
+                                box_port: box_port(port),
+                                holder: crate::net::policy::port_holder(
+                                    &self.hostnames,
+                                    &super::helpers::registry_name(&record),
+                                    published,
+                                    port,
+                                ),
+                            });
+                        }
+                    }
+                    if let Some(refusal) = refusal {
+                        warn_port_refusal(&record, published, &refusal);
+                        return Err(crate::net::policy::address_in_use_error(refusal));
                     }
                 }
 
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
-                    self.launch_host_for_hooks(LaunchPhase::Activating).await?;
+                    self.launch_host_for_hooks(LaunchPhase::Activating)
+                        .await
+                        .inspect_err(|e| {
+                            // The launch's attach binds the declared forwards.
+                            // A taken port fails it with the typed refusal,
+                            // which this finalize logs like its own (NET-144).
+                            #[cfg(target_os = "linux")]
+                            if let Some(refusal) = crate::net::policy::port_in_use_refusal(e) {
+                                let published = self
+                                    .hostnames
+                                    .read()
+                                    .expect("hostname registry lock poisoned")
+                                    .published_own_address(record.id);
+                                warn_port_refusal(&record, published, &refusal);
+                            }
+                        })?;
                     let outcomes = run_session_hooks(
                         &self.inner,
                         &self.record,
