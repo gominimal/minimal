@@ -9276,7 +9276,14 @@ mod tests {
         // proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9290,7 +9297,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
@@ -9597,7 +9604,14 @@ mod tests {
         // that proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9611,7 +9625,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
