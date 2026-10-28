@@ -23800,19 +23800,20 @@ PAR_EO
 # ---------------------------------------------------------------------------
 # The retired surfaces are gone, end to end (NET-109, NET-110). The mTLS/OIDC
 # HTTPS reverse proxy, its daemon-issued client certificates and the
-# `min ssh-forward` verb came out of the tree, `min login` stopped minting,
-# and `direct-tcpip` stayed — serving in EVERY build now that the feature
-# gate is gone. The source-scan unit tests (`retired_surfaces_absent`,
-# `login_mints_no_certificate`, `cli_reference_has_no_retired_commands`)
+# `min ssh-forward` verb came out of the tree, `min login` became the
+# GitHub sign-in (the same as `min auth login`), and `direct-tcpip` stayed — serving in EVERY build now that the feature
+# gate is gone. The unit tests (`retired_surfaces_absent`,
+# `login_runs_auth_login`, `cli_reference_has_no_retired_commands`)
 # hold the tree to that statically; this case holds the runtime to it, on
 # the build the lane actually drives:
 #
 #   * `min ssh-forward` does not parse — the argument parser refuses the
 #     verb by name, with its usage.
-#   * `min login` mints nothing: it succeeds without a daemon, prints the
-#     one nothing-to-mint line, and leaves no client.pem / client.key /
-#     ca.pem in the config directory where the mint used to write them —
-#     and the `--cert-dir` flag that steered those writes is refused too.
+#   * `min login --help` describes the GitHub sign-in. The case does not run
+#     `min login` itself: the lane has no terminal and no keychain, so the
+#     sign-in would fail or wait on GitHub. No client.pem / client.key /
+#     ca.pem exists in the config or state directory, and the `--cert-dir`
+#     flag that steered the retired writes is refused.
 #   * the retired proxy's :7655 listener is gone: with this run's daemon up,
 #     nothing answers HTTP there (the egress proxy's :7654 is the one
 #     listener left). No gate in front of this probe on purpose: a dev host
@@ -23876,29 +23877,20 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   fi
   echo "retired surface: min ssh-forward → refused (exit $retired_sf_rc: unrecognized subcommand 'ssh-forward')"
 
-  # ---- the retired mint: `min login` mints nothing --------------------------
-  # Runs without a daemon, prints the one notice, and leaves the config
-  # directory — where the minted client.pem/client.key/ca.pem used to land —
-  # exactly as it found it. The file list is snapshotted around the call so
-  # the assertion is about what THIS login did, not what the tree contains.
-  retired_config_before="$(find "$XDG_CONFIG_HOME" -type f 2>/dev/null | sort)"
-  retired_login="$(mnl login 2>"$WORK/retired-login.err")"
+  # ---- `min login` is the GitHub sign-in -----------------------------------
+  # Only its help: the sign-in itself needs a terminal or a keychain, and
+  # the lane has neither. No retired certificate material may exist either.
+  retired_login="$(mnl login --help 2>"$WORK/retired-login.err")"
   retired_login_rc=$?
   retired_login="$(printf '%s\n' "$retired_login" | tr -d '\r')"
-  if [ "$retired_login_rc" -ne 0 ] || [[ "$retired_login" != *"Nothing to mint"* ]]; then
-    echo "::error::'min login' did not print the nothing-to-mint notice (exit $retired_login_rc):"
+  if [ "$retired_login_rc" -ne 0 ] \
+    || [[ "$retired_login" != *"Sign in to GitHub (the same as min auth login)"* ]]; then
+    echo "::error::'min login --help' did not describe the GitHub sign-in (exit $retired_login_rc):"
     printf '%s\n' "$retired_login" | head -5 | sed 's/^/  /'
     echo "--- stderr ---"; cat "$WORK/retired-login.err" 2>/dev/null || true
     fail
   fi
-  echo "retired surface: min login → \"$retired_login\""
-  retired_config_after="$(find "$XDG_CONFIG_HOME" -type f 2>/dev/null | sort)"
-  if [ "$retired_config_before" != "$retired_config_after" ]; then
-    echo "::error::'min login' wrote to the config directory, where the minted certificates used to land:"
-    diff <(printf '%s\n' "$retired_config_before") <(printf '%s\n' "$retired_config_after") \
-      | sed 's/^/  /'
-    fail
-  fi
+  echo "min login --help → exit 0, describes the GitHub sign-in"
   if find "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" -type f \( -name 'client.pem' -o -name 'client.key' -o -name 'ca.pem' \) 2>/dev/null \
     | grep -q .; then
     echo "::error::the retired client certificate material exists on this host (client.pem / client.key / ca.pem):"

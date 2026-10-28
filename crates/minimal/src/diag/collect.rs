@@ -156,23 +156,8 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
     }
 
-    // mTLS material: cert/CA metadata only, private key never touched.
-    w.skip(
-        "config/client.key",
-        "private key material — never collected",
-    );
-    let certs: std::collections::BTreeMap<&str, Option<FileMeta>> = [
-        (
-            "client.pem",
-            file_meta(&paths.config.join("client.pem")).await,
-        ),
-        ("ca.pem", file_meta(&paths.config.join("ca.pem")).await),
-    ]
-    .into_iter()
-    .collect();
-    let json = serde_json_lenient::to_vec_pretty(&certs).context("serializing cert metadata")?;
-    w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
-        .await?;
+    // The retired reverse proxy's client certificate, key and CA are not
+    // collected, and their absence is not recorded either (NET-109).
 
     // Mesh enrolment holds only a host:port endpoint. No-follow like every
     // other content read: it ships verbatim, so a symlink here would
@@ -226,24 +211,6 @@ async fn read_string_nofollow(src: &Path) -> Result<String, anyhow::Error> {
         .await
         .with_context(|| format!("reading {}", src.display()))?;
     Ok(content)
-}
-
-#[derive(Serialize)]
-struct FileMeta {
-    bytes: u64,
-    mtime_unix: Option<u64>,
-}
-
-async fn file_meta(path: &Path) -> Option<FileMeta> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    Some(FileMeta {
-        bytes: meta.len(),
-        mtime_unix: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs()),
-    })
 }
 
 // ── state/ ───────────────────────────────────────────────────────────────────
@@ -1210,6 +1177,44 @@ mod tests {
             );
         }
         files
+    }
+
+    /// The retired reverse proxy's client certificate is not collected: a
+    /// bundle has no entry for the client certificate, even when the file is still on disk
+    /// from an older install (NET-109).
+    #[tokio::test]
+    async fn diag_collects_no_client_certificate() {
+        // Built from parts: `retired_surfaces_absent` scans this file for
+        // the literal name, and only this test may say it.
+        const CLIENT_CERT: &str = concat!("client", ".pem");
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = paths(dir.path());
+        tokio::fs::create_dir_all(&diag.config).await.unwrap();
+        tokio::fs::write(diag.config.join(CLIENT_CERT), b"leftover")
+            .await
+            .unwrap();
+        let out = dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        config(&mut w, &diag).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        for (path, contents) in &files {
+            assert!(
+                !path.contains(CLIENT_CERT),
+                "the bundle carries a {CLIENT_CERT} entry: {path}"
+            );
+            assert!(
+                !String::from_utf8_lossy(contents).contains(CLIENT_CERT),
+                "{path} names {CLIENT_CERT}"
+            );
+        }
+        assert!(
+            !files.contains_key("config/client-cert.json"),
+            "the retired CA metadata is still collected: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
     }
 
     fn paths(state: &Path) -> DiagPaths {
