@@ -1187,7 +1187,9 @@ impl File {
     /// path. That lock only excludes processes that share the state
     /// directory. The lock is best-effort. The edit runs unlocked after one
     /// warning, still with the atomic write, when neither lock can be had.
-    /// Errors reading or writing `path` itself still fail the edit. A wait
+    /// Errors reading or writing `path` itself still fail the edit, and so
+    /// does an existing file the caller may not write, as with
+    /// `std::fs::write`, although the rename alone would replace it. A wait
     /// for the lock that outlasts 60 s (or `MINIMAL_MFILE_LOCK_TIMEOUT_SECS`)
     /// fails the edit, so a stuck holder cannot block it forever. An edit
     /// made inside a session VM does not exclude one made on the host. The
@@ -1286,6 +1288,16 @@ impl File {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => return Err(Error::IO("statting", path.to_path_buf(), e).into()),
                 };
+                // Replacing by rename needs only write access to the parent
+                // directory, so open the existing file for writing first: a
+                // file the caller may not write (a read-only minimal.toml)
+                // fails here with the error std::fs::write gave, and root
+                // still passes. Nothing is truncated or written.
+                if existing.is_some()
+                    && let Err(e) = std::fs::OpenOptions::new().write(true).open(path)
+                {
+                    return Err(Error::IO("writing", path.to_path_buf(), e).into());
+                }
                 // Over an existing file, the temp starts owner-only and takes
                 // that file's mode just before the rename, so a private file
                 // is never exposed through the temp. A new file gets 0o666
@@ -1311,14 +1323,6 @@ impl File {
                 {
                     return Err(Error::IO("setting permissions", path.to_path_buf(), e).into());
                 }
-                // Replacing by rename needs only write access to the parent
-                // directory, so a read-only minimal.toml no longer fails the
-                // edit the way std::fs::write did. A writability probe here
-                // could not restore the old error faithfully — it would also
-                // reject an edit a user runs through sudo, and the fix belongs
-                // with the atomic write as a whole — so it is deferred with
-                // the maintainer's sign-off on PR #2302 (lib.rs:1306), not
-                // patched in isolation.
                 match tmp.persist(path) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(Error::IO("replacing", path.to_path_buf(), e.error).into()),
@@ -3666,6 +3670,36 @@ mod tests {
         assert!(capture.contents().contains("waiting 60s"));
 
         drop(guard);
+    }
+
+    #[test]
+    fn edit_exclusively_refuses_a_read_only_minimal_toml() {
+        // Root may write a 0o444 file, as std::fs::write let it.
+        // SAFETY: geteuid reads the caller's effective uid. It has no side
+        // effects and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+        std::fs::write(&path, "k = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let err = File::edit_exclusively_in::<Error>(None, TEST_TIMEOUT, &path, |_| {
+            Ok(Some("k = \"new\"\n".to_string()))
+        })
+        .unwrap_err();
+
+        match err {
+            Error::IO("writing", p, e) => {
+                assert_eq!(p, std::fs::canonicalize(&path).unwrap());
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "k = \"old\"\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444);
     }
 
     #[test]
