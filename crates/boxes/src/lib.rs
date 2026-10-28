@@ -13,7 +13,8 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;
@@ -326,14 +327,15 @@ impl IngressPolicy {
 /// proxy's own address on the switch whatever the box's egress rules say.
 ///
 /// The declaration carries the Box Egress Proxy settings: the
-/// `[network.bep]` table and the `[secrets]` grants
-/// ([`core::bep`]). Both default to empty and are skipped when empty, so a
-/// declaration with no settings serializes as `{}`, exactly as it did before
-/// the settings existed, and an old `{}` reads as no settings. A policy that
-/// carries `Some` declaration puts its box on a credentialed lane; one that
-/// carries `None` declares nothing, and its box's frames to the proxy's
-/// address are refused under the box-to-host default-deny, never decided by
-/// its egress rules.
+/// `[network.bep]` table and the `[secrets]` grants ([`core::bep`]). The
+/// declared `quic443` stance is not here: it is a setting of every box, so it
+/// rides [`BoxPolicy::quic443`]. Both default to empty and are skipped when
+/// empty, so a declaration with no settings serializes as `{}`, exactly as
+/// it did before the settings existed, and an old `{}` reads as no settings.
+/// A policy that carries `Some` declaration puts its box on a credentialed
+/// lane; one that carries `None` declares nothing, and its box's frames to
+/// the proxy's address are refused under the box-to-host default-deny, never
+/// decided by its egress rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // An unknown field is one the proxy document has not bound here — refused
 // like every other field the policy schemas do not know (the same
@@ -411,6 +413,14 @@ pub struct BoxPolicy {
     /// record and every reading client already holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
+    /// The `[session.network] quic443` stance, `None` when the project
+    /// declares none. `None` reads as `auto`. `block` and `allow` override
+    /// the `auto` resolution on the lane's grants and steering (BEP-018).
+    /// It is a setting of every box, lane or not, so a declared `block`
+    /// reaches the gate of a box with no credentialed upstream. Skipped when
+    /// `None`, so a policy that declares none serializes as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic443: Option<core::bep::Quic443>,
 }
 
 impl BoxPolicy {
@@ -423,6 +433,7 @@ impl BoxPolicy {
             egress,
             ingress,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 }
@@ -885,37 +896,10 @@ pub fn normalized_cidr(s: &str) -> Option<String> {
     Some(format!("{normalized}/{prefix}"))
 }
 
-/// A session ID, a newtype over a UUID.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionId(Uuid);
-
-impl SessionId {
-    #[must_use]
-    pub fn nil() -> Self {
-        Self(Uuid::nil())
-    }
-
-    /// Parses the given UUID as a session ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the given string is not a UUID.
-    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
-        Uuid::parse_str(s).map(Self)
-    }
-}
-
-impl AsRef<Uuid> for SessionId {
-    fn as_ref(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+/// The name the session-plane code spelled a record's key by before the
+/// box id became the one key. It is the same type as [`BoxId`], kept so
+/// the code that still says session compiles unchanged.
+pub type SessionId = BoxId;
 
 /// Lifecycle status of a [`Record`].
 ///
@@ -960,8 +944,10 @@ pub enum BoxState {
     Materializing,
     /// Composition complete and every side-channel upload is on
     /// disk; the record is ready to apply and the session is
-    /// attachable.
+    /// attachable. This is the stored spelling of the `running` state
+    /// (BOX-011), and a record that spells it `running` loads as it.
     #[default]
+    #[serde(alias = "running")]
     Active,
 }
 
@@ -987,62 +973,171 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
-/// A box's identity on its host: 16 bytes — one `UUIDv7`, 32 lowercase hex
-/// digits on the wire — minted once per box by the host-side creator
-/// outside the VM, with its random fields from the host's OS CSPRNG
-/// (BEP-070): never a counter, never a digest of the box's facts, never
-/// anything a process inside the VM could predict or arrange. The
-/// registration that publishes the box's row mints it — a client never
-/// presents one — the row and the proxy's attachment hold it, and the
-/// reply hands it back so the client records the id its box was created
-/// as.
+/// A box's identity: one `UUIDv7`, the one id type every record, event and
+/// reply names a box by, with its random fields from the OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts. The
+/// daemon's store mints a record's id ([`Record::id`]) at creation. On a
+/// VM host the host-side registration mints the box's id outside the VM,
+/// where no process inside the VM can predict or arrange it, and its row
+/// holds that id. On a VM guest the in-VM store still mints
+/// [`Record::id`] inside the VM, so there the box's id is
+/// [`Record::box_id`] until
+/// <https://github.com/gominimal/minimal/issues/2397> files the record
+/// under it. That interim ends when `DiskLoader::create` keys a record by
+/// a handed `config.box_id` instead of minting one. Both are this type. A
+/// client never presents one of its own.
 ///
 /// Unique per creation by construction: a box recreated with the same
 /// name and the same addresses is a new box, and its id says so. Ids are
-/// never reused — no registration can present one, and the host refuses a
-/// mint that collides with a record it holds — so a revocation scoped to
-/// an id stays scoped forever. The all-zero id is not
-/// a mint's output and never names a box: the delivery header carried it
-/// for "no box named" before ids were the box's own, and the acceptor
-/// that reads a delivered header refuses it like any other id the
-/// source's attachment does not hold.
+/// never reused, so a revocation scoped to an id stays scoped forever.
+/// The all-zero id is not a mint's output and never names a live box: a
+/// record read without an id carries it until it is migrated, and the
+/// acceptor that reads a delivered header refuses it like any other id
+/// the source's attachment does not hold.
 ///
-/// On the wire it is one hex string, the same 32 lowercase digits a
-/// diagnostic names a box id by — so a log line, a transcript and a
-/// socket capture all read the same spelling.
+/// One id has one printed spelling for each surface. The hyphenated UUID
+/// form ([`Display`] and the default serde form) is what a record on disk,
+/// a reply, a log line and `min ls` all show. An audit record spells the
+/// same 16 bytes as 32 lowercase hex digits (`Uuid::simple`): the BEP
+/// audit `subject`, the ask audit record's `box_id` and every
+/// `box-admissions.log` line. The VM host's box control wire uses the same
+/// 32-hex spelling, and its fields keep it through [`box_id_hex`]. A
+/// reader accepts either spelling, so a record or a reply written before
+/// the two id types merged reads back as the same id.
+///
+/// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
+/// millisecond: a map keyed by box id holds its boxes sorted by the
+/// millisecond each id was minted in. One process mints no two ids in the
+/// same millisecond, so its ids sort in creation order.
+///
+/// [`Display`]: std::fmt::Display
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BoxId([u8; 16]);
+pub struct BoxId(Uuid);
 
 impl BoxId {
     /// Wraps `bytes` as a box id — the shape a registration's reply
     /// carries and a delivery header fills from the box's attachment.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
+        Self(Uuid::from_bytes(bytes))
     }
 
     /// The id's own 16 bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; 16] {
-        self.0
+        self.0.into_bytes()
+    }
+
+    /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
+    /// and all 74 of its random bits from the OS CSPRNG, with no counter.
+    /// No two ids minted in one process share a mint millisecond, and each
+    /// takes a later one than the id before it. A mint whose clock reading
+    /// is not after the last mint millisecond takes the millisecond after
+    /// the last one: see [`next_mint_ms`]. So the last mint millisecond
+    /// never goes back, nothing waits for the clock, and ids minted in one
+    /// process sort in mint order, which is creation order (NET-129).
+    #[must_use]
+    pub fn mint() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // The mint millisecond of the last id this process minted.
+        static LAST_MINT_MS: AtomicU64 = AtomicU64::new(0);
+
+        loop {
+            let last = LAST_MINT_MS.load(Ordering::Acquire);
+            let now = uuid::Timestamp::now(uuid::NoContext);
+            let (secs, nanos) = now.to_unix();
+            let clock_ms = secs * 1000 + u64::from(nanos) / 1_000_000;
+            let ms = next_mint_ms(last, clock_ms);
+            // A CAS that another mint overtook fails, and the loop reads
+            // the new `last`. So `LAST_MINT_MS` only moves forward.
+            if LAST_MINT_MS
+                .compare_exchange(last, ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let stamp = if ms == clock_ms {
+                    now
+                } else {
+                    uuid::Timestamp::from_unix(
+                        uuid::NoContext,
+                        ms / 1000,
+                        // A remainder below 1000 always fits in a `u32`.
+                        u32::try_from(ms % 1000).unwrap_or(0) * 1_000_000,
+                    )
+                };
+                // `NoContext` gives the timestamp no counter bits, so
+                // `new_v7` fills `rand_a` and `rand_b` with fresh random
+                // bits.
+                return Self(Uuid::new_v7(stamp));
+            }
+        }
+    }
+
+    /// The all-zero id: what a record read without an id carries until it
+    /// is migrated. It never names a live box.
+    #[must_use]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Whether this is the all-zero id.
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0.is_nil()
+    }
+
+    /// Parses a box id from either spelling it is written in: the
+    /// hyphenated UUID form or 32 hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the given string is not a UUID.
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+
+    /// The id as 32 lowercase hex digits: the spelling the VM host's box
+    /// control wire carries.
+    #[must_use]
+    pub fn simple(&self) -> String {
+        self.0.simple().to_string()
     }
 }
 
-impl std::fmt::Display for BoxId {
-    /// 32 lowercase hex digits — the one fixed form every diagnostic that
-    /// names a box id uses, so a tail can compare two lines for the same
+/// The mint millisecond for a box id, given the `last` one this process
+/// minted and the clock's reading `clock_ms`. It is the clock's reading
+/// when that is after `last`. Otherwise it is `last + 1`: the clock read
+/// in the same millisecond as the last mint, read before a mint that
+/// overtook this one, or stepped back. The result is always after `last`.
+#[must_use]
+fn next_mint_ms(last: u64, clock_ms: u64) -> u64 {
+    clock_ms.max(last.saturating_add(1))
+}
+
+impl From<Uuid> for BoxId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl AsRef<Uuid> for BoxId {
+    fn as_ref(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl fmt::Display for BoxId {
+    /// The hyphenated UUID form — the one spelling every surface that
+    /// prints a box id uses, so a tail can compare two lines for the same
     /// box.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
 impl Serialize for BoxId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(self.0))
+        self.0.serialize(serializer)
     }
 }
 
@@ -1051,17 +1146,75 @@ impl<'de> Deserialize<'de> for BoxId {
         // Owned, not borrowed: a record read from a file or a request read
         // off a socket is deserialized from a reader, which lends no `&str`.
         let text = String::deserialize(deserializer)?;
-        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
-        let bytes: [u8; 16] = match bytes.try_into() {
-            Ok(bytes) => bytes,
-            Err(bytes) => {
-                return Err(serde::de::Error::custom(format!(
-                    "a box id is 32 hex digits (16 bytes); got {} bytes",
-                    bytes.len()
-                )));
+        box_id_from_text(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reads a box id from either spelling. The error names both spellings,
+/// so a reader of a log line sees what a box id looks like.
+fn box_id_from_text(text: &str) -> Result<BoxId, String> {
+    BoxId::parse_str(text)
+        .map_err(|_| format!("a box id is a UUID or 32 hex digits (16 bytes); got `{text}`"))
+}
+
+/// The serde adapter for a field whose wire spells a [`BoxId`] as 32
+/// lowercase hex digits: the VM host's box control wire, and the record's
+/// [`Record::box_id`] field that copies it. It writes the same bytes those
+/// fields carried before the two id types merged, and reads either
+/// spelling.
+pub mod box_id_hex {
+    use super::BoxId;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes `id` as 32 lowercase hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error.
+    pub fn serialize<S: Serializer>(id: &BoxId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&id.simple())
+    }
+
+    /// Reads a box id in either spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text is not a box id.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BoxId, D::Error> {
+        BoxId::deserialize(deserializer)
+    }
+
+    /// The same adapter for an optional field.
+    pub mod option {
+        use super::BoxId;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        /// Writes `Some(id)` as 32 lowercase hex digits and `None` as null.
+        ///
+        /// # Errors
+        ///
+        /// Returns the serializer's error.
+        #[allow(clippy::ref_option)] // serde's `with` hands the field by reference
+        pub fn serialize<S: Serializer>(
+            id: &Option<BoxId>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match id {
+                Some(id) => serializer.serialize_some(&id.simple()),
+                None => serializer.serialize_none(),
             }
-        };
-        Ok(Self(bytes))
+        }
+
+        /// Reads an optional box id in either spelling.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the text is not a box id.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<BoxId>, D::Error> {
+            Option::<BoxId>::deserialize(deserializer)
+        }
     }
 }
 
@@ -1148,9 +1301,15 @@ impl fmt::Debug for SealedDelivery {
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// Unique ID describing this session.
-    #[serde(default = "SessionId::nil")]
-    pub id: SessionId,
+    /// The record's key: the id the store files this record under, and
+    /// the id every event and reply names the box by. On a VM guest it is
+    /// the in-VM store's key, not the id the VM host minted: that one is
+    /// [`Self::box_id`] until
+    /// <https://github.com/gominimal/minimal/issues/2397> files the record
+    /// under the handed id. Written in the hyphenated form, and read in
+    /// either spelling.
+    #[serde(default = "BoxId::nil")]
+    pub id: BoxId,
     /// The name a user assigned to this session, if
     /// one was specifically assigned.
     ///
@@ -1230,7 +1389,11 @@ pub struct Record {
     /// that handed no box addresses, and for one that predates the field:
     /// a registered box with no id is never answered as standing, so it
     /// must be re-activated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 
     /// The per-box egress enforcement this session's own launch placed its
@@ -1294,11 +1457,51 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_certificate: Option<String>,
 
+    /// The Box Type this box was created as (BOX-001): the type the
+    /// creating verb names: [`SESSION_BOX_TYPE`] for every box
+    /// `min session activate` creates, and [`TASK_BOX_TYPE`] for every box
+    /// `min task run` creates. Daemon-owned: the create stamps it from
+    /// the request's creating verb, and no client field names the type.
+    /// `None` for a record that predates the field.
+    #[serde(default)]
+    pub box_type: Option<String>,
+
+    /// The box whose workload created this one (BOX-001), stamped by the
+    /// creating daemon from the caller's per-box identity and never from
+    /// the request. `None` when the caller runs outside any box, which is
+    /// every caller on a host with no nesting, and for a record that
+    /// predates the field. Written as `null` when there is no parent, so
+    /// a record that carries the key reads apart from one that predates it.
+    #[serde(default)]
+    pub parent: Option<BoxId>,
+
+    /// The root of the project whose `minimal.toml` this box's entry came
+    /// from (BOX-001): the resolved project directory the creating client
+    /// named, as the daemon stamped it at creation. `None` for a record
+    /// that predates the field.
+    #[serde(default)]
+    pub project_root: Option<HostAbsPath>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
 
+/// The Box Type of a box `min session activate` creates (BOX-001).
+pub const SESSION_BOX_TYPE: &str = "session";
+
+/// The Box Type of a box `min task run` creates (BOX-001).
+pub const TASK_BOX_TYPE: &str = "task";
+
 impl Record {
+    /// The one state the record is in (BOX-011). A stored record is
+    /// `pending`, `materializing` or `running`: the store does not yet
+    /// hold an ending, so no stored record reads as `stopped` or `exited`.
+    /// Issue #2634 owns storing `reason`, `exit_code` and `signal`.
+    #[must_use]
+    pub fn state(&self) -> crate::core::record::RecordState {
+        crate::core::record::RecordState::from(self.status)
+    }
+
     /// [`Record::validate_policy`] plus the checks a record must pass only
     /// when it is created: added after records were already stored, they
     /// would strand an existing session if they ran on every launch.
@@ -1435,6 +1638,40 @@ impl Record {
 mod tests {
     use super::*;
 
+    /// A clock reading at or behind the last mint millisecond never moves
+    /// the mint back: a stale reading, a same-millisecond reading and a
+    /// backward clock step each take the millisecond after the last mint.
+    #[test]
+    fn next_mint_ms_never_goes_back() {
+        // A clock ahead of the last mint is taken as read.
+        assert_eq!(next_mint_ms(1_000, 1_005), 1_005);
+        // The same millisecond as the last mint takes the next one.
+        assert_eq!(next_mint_ms(1_000, 1_000), 1_001);
+        // A stale reading behind the last mint, as a mint overtaken by
+        // another reads, takes the millisecond after the last mint.
+        assert_eq!(next_mint_ms(1_000, 990), 1_001);
+        // A clock stepped far back does the same.
+        assert_eq!(next_mint_ms(1_000, 0), 1_001);
+        // The first mint of a process takes the clock.
+        assert_eq!(next_mint_ms(0, 1_700_000_000_000), 1_700_000_000_000);
+    }
+
+    /// Ids minted back to back sort in mint order, each in a later
+    /// millisecond than the one before it.
+    #[test]
+    fn minted_ids_take_strictly_later_milliseconds() {
+        let ids: Vec<BoxId> = (0..64).map(|_| BoxId::mint()).collect();
+        let ms = |id: &BoxId| {
+            let mut stamp = [0u8; 8];
+            stamp[2..].copy_from_slice(&id.to_bytes()[..6]);
+            u64::from_be_bytes(stamp)
+        };
+        for pair in ids.windows(2) {
+            assert!(ms(&pair[0]) < ms(&pair[1]), "{} then {}", pair[0], pair[1]);
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
     /// A box id reads back from a reader, which lends no borrowed string —
     /// the path a record on disk and a request off a socket both take.
     #[test]
@@ -1523,6 +1760,9 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: BTreeMap::new(),
         }
     }

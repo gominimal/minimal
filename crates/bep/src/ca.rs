@@ -37,23 +37,59 @@ use zeroize::Zeroizing;
 use crate::keys::{HeldKey, KeyError, Role};
 use crate::module::Module;
 
-/// The names that the root never permits, also when a module or a store rule
-/// registers them. A name in this set, or a subdomain of one, is outside the
-/// union. The root also carries the set as its excluded-names constraint.
+/// The infrastructure deny set: the names that the root never permits, also
+/// when a module or a store rule registers them. A name in this set, or a
+/// subdomain of one, is outside the union. The root also carries the set as
+/// its excluded-names constraint.
 ///
-/// This set is provisional and partial. `DENY_SET` takes only the
-/// infrastructure names of the BEP-034 set. Gatehouse §6.10 also names the
-/// tenant issuer, the BEP, EGW and relay endpoints, the registry and build
-/// cache, and the node-plane baseline set. The module host sets stay in the
-/// union: the store-rule check of BEP-034 refuses a rule that names them,
-/// but the root permits them. When the BEP-034 task lands its deny set, the
-/// infrastructure names of that set replace this list. The full set is
-/// tracked in <https://github.com/gominimal/minimal/issues/2441>.
+/// This is the one definition of the set. The store-rule check of BEP-034
+/// reads it too: the client passes it as the `infrastructure` part of
+/// `boxes::core::bep::StoreDenySet`.
+///
+/// The task text gives the categories of the set: `min.internal`,
+/// `minimal.dev`, the tenant issuer, the BEP, EGW and relay endpoints, the
+/// registry and build cache, and the node-plane baseline set. It also keeps
+/// `localhost`, `.local`, `home.arpa` and `.internal` allowed. The mapping
+/// of each category to a domain, and the `minimal.farm` entry, are this
+/// change's reading of those categories. That reading waits for a
+/// confirmation on <https://github.com/gominimal/minimal/issues/2441>, the
+/// tracking issue. Each entry covers the endpoints in its comment.
+///
+/// The built-in baseline of an un-enrolled host
+/// (`NodePlaneBaseline::built_in` in `crates/minvmd/src/net/baseline.rs`)
+/// is addresses, not names. The root excludes every IP address, so no
+/// entry here is needed for those addresses. This set does not cover a
+/// configured cache (`MINIMAL_REMOTE_CACHE_URL`), registry or baseline
+/// endpoint outside its domains, a gap that waits on
+/// <https://github.com/gominimal/minimal/issues/2441>.
+///
+/// The `minimal.dev` entry covers the hosted tenant issuers only. A
+/// self-hosted Gatehouse issuer (Gatehouse §2.1 F14) is under no entry.
+/// That gap is residual on <https://github.com/gominimal/minimal/issues/2441>.
+///
+/// Only `min.internal` under `.internal` is denied. The module host sets
+/// stay in the union: the store-rule check refuses a rule that names them,
+/// but the root permits them.
+///
+/// Keep one quoted name on each line: the `boxes` tests read this list from
+/// the source text.
 pub const DENY_SET: &[&str] = &[
-    // The box-internal names (`host.min.internal` and the services under it).
+    // The box-internal names: `host.min.internal`, `minimald.min.internal`,
+    // the services under them, and the proxy's in-box address.
     "min.internal",
-    // Minimal's own infrastructure.
+    // Minimal's own infrastructure: the hosted tenant issuers, the
+    // registry, the build cache (`cache.minimal.dev`) and the installer.
+    // A self-hosted issuer is not under this entry (#2441).
     "minimal.dev",
+    // The build cache by the name the design gives it (architecture.md
+    // line 844). Gatehouse §6.10 refuses an upstream that names it. Only
+    // this host is denied, not the rest of `gominimal.dev`.
+    "cache.gominimal.dev",
+    // Minimal's hosted endpoints: the BEP, EGW and relay endpoints, the
+    // hosted build cache (`cache.minimal.farm`) and the agent runtime.
+    // This entry is this change's reading. No design line names this
+    // domain, so the entry waits for the confirmation on #2441.
+    "minimal.farm",
 ];
 
 /// The subject common name of the root.
@@ -559,7 +595,9 @@ impl<'k, K: CaKey> Ca<'k, K> {
     }
 
     /// Issues the signing CA again under the same key, from `now`, issued by
-    /// the current root. A long-running caller runs it before
+    /// the current root. The root certificate does not change, and the new
+    /// signing CA names the root by the same key identifier, so a box that
+    /// trusts the root trusts the leaves of either signing CA. A long-running caller runs it before
     /// [`Ca::signing_expiry`]. Leaves that the earlier signing CA issued stay
     /// valid until their own expiry, because the key and subject are the same.
     /// The new signing CA never outlives the current root.
@@ -582,7 +620,14 @@ impl<'k, K: CaKey> Ca<'k, K> {
             now,
             self.root_expiry,
         )?;
-        tracing::info!(expiry = %params.not_after, "renewed the signing CA under the same key");
+        // BEP-061: one line per rotation, naming the certificate it replaced
+        // and the one now in use.
+        tracing::info!(
+            old_fingerprint = %crate::publish::certificate_fingerprint(&self.signing),
+            new_fingerprint = %crate::publish::certificate_fingerprint(&signing),
+            expiry = %params.not_after,
+            "rotated the signing CA under the unchanged root and key identifier"
+        );
         self.signing_params = params;
         self.signing = signing;
         Ok(())
@@ -998,6 +1043,64 @@ mod tests {
             .any(|d| host == *d || host.ends_with(&format!(".{d}")))
     }
 
+    // BEP-013 (#2441): the root excludes every name of the decided deny set,
+    // also when a store rule registers it or a name under it, and the names
+    // the ruling leaves allowed stay registrable.
+    #[test]
+    fn root_excludes_every_deny_set_name() {
+        assert_eq!(
+            DENY_SET,
+            [
+                "min.internal",
+                "minimal.dev",
+                "cache.gominimal.dev",
+                "minimal.farm"
+            ]
+        );
+        let (root_key, signing_key) = keys();
+        let allowed = ["printer.local", "nas.home.arpa", "svc.corp.internal"];
+        let registered: Vec<String> = DENY_SET
+            .iter()
+            .flat_map(|name| [format!("{name}:443"), format!("api.{name}")])
+            .chain(allowed.iter().map(|name| (*name).to_owned()))
+            .collect();
+        let ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], &registered),
+            now(),
+        )
+        .unwrap();
+        let (permitted, excluded) = name_constraints(ca.root());
+        for name in DENY_SET {
+            assert!(excluded.contains(*name), "{name} is not excluded");
+            for host in [(*name).to_owned(), format!("api.{name}")] {
+                assert!(!permitted.contains(&host), "{host} is permitted");
+                assert!(!ca.union().contains(&host), "{host} is in the union");
+                assert!(ca.issue_leaf(&host, now()).is_err(), "{host} got a leaf");
+                let forged = ca.sign_leaf(&host, now()).unwrap();
+                assert!(!validates(ca.root(), &forged, &host), "{host} validates");
+            }
+        }
+        for name in allowed {
+            assert!(permitted.contains(name), "{name} is not permitted");
+            let leaf = ca.issue_leaf(name, now()).unwrap();
+            assert!(
+                validates(ca.root(), &leaf, name),
+                "{name} does not validate"
+            );
+        }
+        for name in [
+            "localhost",
+            "local",
+            "home.arpa",
+            "internal",
+            "corp.internal",
+        ] {
+            assert!(!denied(name), "{name} is denied");
+        }
+    }
+
     #[test]
     fn github_leaves_validate_and_other_names_do_not() {
         let (root_key, signing_key) = keys();
@@ -1296,6 +1399,50 @@ mod tests {
             seq = next;
         }
         tags
+    }
+
+    /// The authority key identifier extension value of `cert`.
+    fn akid(cert: &[u8]) -> Vec<u8> {
+        const OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x23];
+        let at = cert
+            .windows(OID.len())
+            .position(|w| w == OID)
+            .expect("an authority key identifier extension");
+        let mut rest = &cert[at + OID.len()..];
+        if rest[0] == 0x01 {
+            rest = tlv(rest).2;
+        }
+        tlv(rest).1.to_vec()
+    }
+
+    // BEP-061: a box holds the root alone. The rotation leaves the root as
+    // it was, so leaves from the old and the new signing CA both validate
+    // against the trust store the box got at creation.
+    #[test]
+    fn signing_ca_rotation_invisible_to_boxes() {
+        let (root_key, signing_key) = keys();
+        let mut ca = Ca::new(
+            &root_key,
+            &signing_key,
+            Union::new(&[GITHUB], [""; 0]),
+            now(),
+        )
+        .unwrap();
+        let host = GITHUB.hosts[0].host;
+        let box_trust = ca.root().clone();
+        let before = ca.signing().clone();
+        let old_leaf = ca.issue_leaf(host, now()).unwrap();
+
+        ca.renew_signing(now()).unwrap();
+
+        assert_eq!(*ca.root(), box_trust, "the root changed");
+        assert_ne!(*ca.signing(), before, "no new signing CA was issued");
+        assert_eq!(akid(ca.signing()), akid(&before));
+        assert_eq!(subject_and_key(ca.signing()), subject_and_key(&before));
+        let new_leaf = ca.issue_leaf(host, now()).unwrap();
+        assert_eq!(new_leaf.chain[1], *ca.signing());
+        assert!(validates(&box_trust, &new_leaf, host));
+        assert!(validates(&box_trust, &old_leaf, host));
     }
 
     #[test]

@@ -6,13 +6,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
-    Record, SessionId,
+    Record, SESSION_BOX_TYPE, SessionId,
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+    events::{BoxEvent, DecodedEvents, decode_lines},
 };
 
 /// Describes the session object yielded by [`Loader`].
@@ -236,11 +236,183 @@ pub struct DiskBox {
     record: Record,
 }
 
+/// The name of the file beside `record.json` that holds the box's spec as
+/// its creating client sent it (BOX-068).
+pub const SPEC_FILE: &str = "spec.json";
+
 impl DiskBox {
     fn root_path(&self) -> DaemonAbsPath {
         sub_path!(self.minimal_state_dir, "sessions")
             .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
     }
+
+    /// The path of the box's spec file, [`SPEC_FILE`], beside its record.
+    /// `sub_path!` takes only a literal, so a test pins the literal to
+    /// [`SPEC_FILE`].
+    pub fn spec_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "spec.json")
+    }
+
+    /// Writes the box's spec beside its record (BOX-068), atomically (tmp +
+    /// rename, the same crash safety as the record). The bytes are stored
+    /// as given: the spec's shape belongs to its builder, not to the store.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the box's directory or the file cannot be written.
+    pub fn store_spec(&self, spec: &[u8]) -> Result<(), std::io::Error> {
+        let dir = self.root_path();
+        let dir = dir.as_utf8_path();
+        std::fs::create_dir_all(dir)?;
+        // One source for the path: the file this writes is the one
+        // `spec_path` reports and the daemon logs.
+        let dest = self.spec_path();
+        let dest = dest.as_utf8_path();
+        let tmp = dir.join("spec.json.tmp");
+        std::fs::write(&tmp, spec)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, dest)?;
+
+        Ok(())
+    }
+
+    /// Reads the box's spec from beside its record. `Ok(None)` for a box
+    /// with no spec file: one created before specs were stored, or by a
+    /// client that sent none.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the spec file exists but cannot be read.
+    pub fn load_spec(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        match std::fs::read(self.spec_path().as_utf8_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's events file, [`EVENTS_FILE`](crate::events::EVENTS_FILE), beside its
+    /// record (BOX-040). No path mounted into the box reaches it: the box
+    /// sees only the `tree`, `home`, `cache`, `patches` and `hooks`
+    /// directories beside it (BOX-041). A test pins the literal to
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "events.jsonl")
+    }
+
+    /// Appends `event` to the box's events file as one line (BOX-040). The
+    /// append holds an exclusive lock on the file from the read of its
+    /// length through the cut, the write and the sync. That lock is why two
+    /// writers never interleave and one never cuts the other's line, and
+    /// the file order is the write order (BOX-162). `O_APPEND` alone is not
+    /// enough, because a cut and a write are two steps.
+    /// The file is created owner-only.
+    ///
+    /// A last line torn by a crash has no newline. Its write was never
+    /// acknowledged, so no event is lost when it goes: the file is cut back
+    /// to the end of its last complete line before this event is written.
+    /// The event then never joins the torn bytes, and no line that does not
+    /// parse stays in the file. A warning names the box and the bytes cut.
+    ///
+    /// The box's directory is never created here. An event for a box whose
+    /// directory is gone, because the box was reaped, fails with
+    /// `NotFound` and leaves nothing on disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if the box's directory does not exist, and an I/O error
+    /// if the file cannot be read or written.
+    pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(self.events_path().as_utf8_path())?;
+        // Held until `file` drops after `sync_data`: the length, the cut and
+        // the write below are one step for every other appender.
+        file.lock()?;
+        let len = file.metadata()?.len();
+        let complete = complete_len(&mut file, len)?;
+        if complete < len {
+            file.set_len(complete)?;
+            tracing::warn!(
+                box_id = %self.key.id(),
+                dropped_bytes = len - complete,
+                events_path = %self.events_path().as_str(),
+                "cut a torn last line from a box's events file before an append"
+            );
+        }
+        file.write_all(&event.to_line()?)?;
+        file.sync_data()
+    }
+
+    /// Reads the box's events file from byte `offset` (BOX-162): every
+    /// complete line from there, in file order, and the offset after the
+    /// last of them. A box with no events file reads as no events.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file exists but cannot be read.
+    pub fn read_events_from(&self, offset: u64) -> Result<DecodedEvents, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match std::fs::File::open(self.events_path().as_utf8_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(DecodedEvents::default()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(decode_lines(&buf, offset))
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun. A follower of the
+    /// box's events stops once this is false (BOX-162).
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root_path();
+        let root = root.as_utf8_path();
+        let tombstone = root
+            .parent()
+            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
+    }
+}
+
+/// The length of `file` up to and including its last `\n`, or 0 if it has
+/// none. `len` is the file's length. Reads back from the end in chunks, so
+/// a file whose last byte is `\n` costs one byte read.
+fn complete_len(file: &mut std::fs::File, len: u64) -> Result<u64, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = if end == len {
+            end - 1
+        } else {
+            end.saturating_sub(CHUNK)
+        };
+        buf.resize(usize::try_from(end - start).unwrap_or(0), 0);
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 impl BoxObject for DiskBox {
@@ -390,6 +562,19 @@ fn is_valid_short(short: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether a stored record predates `box_type` and `parent` (BOX-003): it
+/// has no `box_type`, or a null one, or no `parent` key. A record with no
+/// parent writes the key as `null`, so only an absent key reads as old.
+fn record_predates_box_types(raw: &serde_json_lenient::Value) -> bool {
+    let Some(fields) = raw.as_object() else {
+        return false;
+    };
+    fields
+        .get("box_type")
+        .is_none_or(serde_json_lenient::Value::is_null)
+        || !fields.contains_key("parent")
+}
+
 /// Read `record_file` and compare its name against `index_name` to
 /// decide what pass B should do with this index entry. Returns `None`
 /// when the record exists, parses, and agrees with the index.
@@ -497,7 +682,87 @@ impl DiskLoader {
         let session_dirs = enumerate_session_dirs(&sessions_dir)?;
         self.heal_reconcile_index(&sessions_dir, &mut changed);
         self.heal_reindex_orphans(&session_dirs, &reaped, &mut changed);
+        self.heal_migrate_untyped_records(&sessions_dir, &mut changed);
         Ok(changed)
+    }
+
+    /// Pass D (BOX-003): migrate each indexed record written before the
+    /// record carried `box_type` and `parent`. A record with no `box_type`
+    /// becomes a `session` box with no parent. A record with a `box_type`
+    /// keeps it, and an absent `parent` key is written as no parent. A
+    /// record gets a fresh id only when its stored id is nil. A migrated
+    /// record carries both keys, so a later start leaves it unchanged. A record that cannot be read or written
+    /// is logged and left for the next start.
+    fn heal_migrate_untyped_records(
+        &mut self,
+        sessions_dir: &camino::Utf8Path,
+        changed: &mut bool,
+    ) {
+        let indexed: Vec<(String, SessionId)> = self
+            .index
+            .iter()
+            .map(|(short, id)| (short.clone(), *id))
+            .collect();
+        for (short, indexed_id) in indexed {
+            let record_file = sessions_dir.join(&short).join("record.json");
+            // Pass B already logged a record it could not read.
+            let Ok(raw) = std::fs::File::open(&record_file).and_then(|f| {
+                serde_json_lenient::from_reader::<_, serde_json_lenient::Value>(f)
+                    .map_err(std::io::Error::from)
+            }) else {
+                continue;
+            };
+            if !record_predates_box_types(&raw) {
+                continue;
+            }
+            let mut record: Record = match serde_json_lenient::from_value(raw) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "could not migrate a box record without box_type or parent: \
+                         record.json does not parse; leaving it unchanged",
+                    );
+                    continue;
+                }
+            };
+            let stored_id = record.id;
+            // Keep a type the record already has. A record with an absent or
+            // null `box_type` becomes a `session` box with no parent. An
+            // absent `parent` key reads as `None` and is written as `null`.
+            if record.box_type.is_none() {
+                record.box_type = Some(SESSION_BOX_TYPE.to_string());
+                record.parent = None;
+            }
+            if record.id.is_nil() {
+                record.id = SessionId::mint();
+            }
+            if let Err(e) = self.write_record(&short, &record) {
+                tracing::warn!(
+                    short = %short,
+                    box_id = %record.id,
+                    error = %e,
+                    "could not write a migrated box record; it migrates on the next start",
+                );
+                continue;
+            }
+            if record.id != indexed_id {
+                self.index.short_to_id.insert(short.clone(), record.id);
+                if let Some(name) = &record.name {
+                    self.index.name_to_id.insert(name.clone(), record.id);
+                }
+                *changed = true;
+            }
+            tracing::info!(
+                short = %short,
+                box_id = %record.id,
+                stored_id = %stored_id,
+                box_type = record.box_type.as_deref().unwrap_or(SESSION_BOX_TYPE),
+                parent = ?record.parent,
+                "migrated a box record without box_type or parent",
+            );
+        }
     }
 
     /// Pass A: reap any session dir whose external `.deleting-<short>`
@@ -852,11 +1117,44 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-impl Loader for DiskLoader {
-    type Key = DiskBoxKey;
-    type Object = DiskBox;
-
-    fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+impl DiskLoader {
+    /// Files `record` under the id it already carries, which the caller
+    /// minted: [`Loader::create`] mints one, and the daemon's store mints
+    /// its own and refuses an id a retained record names before it calls
+    /// this (BOX-001). The name checks are the same as [`Loader::create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for the nil id or an invalid name, `Other`
+    /// when the index already holds the id, `AlreadyExists` when another
+    /// session holds the name, and an I/O error if the session directory,
+    /// record, or index cannot be written. A held id is never
+    /// `AlreadyExists`: a caller reads that kind as a name collision and
+    /// retries under another name.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the directory key is always five hex digits, a
+    /// valid relative path.
+    pub fn create_with_id(&mut self, record: Record) -> Result<DiskBoxKey, std::io::Error> {
+        if record.id.is_nil() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a box record cannot be filed under the nil id",
+            ));
+        }
+        // BOX-001: an id names one box. A handed id that the index already
+        // holds fails closed here, before anything is written.
+        if self.index.short_by_id(&record.id).is_some() {
+            tracing::warn!(
+                box_id = %record.id,
+                "refused to file a box record: the index already holds its id"
+            );
+            return Err(std::io::Error::other(format!(
+                "the box id {} is already in use by another box",
+                record.id
+            )));
+        }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
             if let Some(existing_id) = self.index.find_by_name_folded(name) {
@@ -874,11 +1172,9 @@ impl Loader for DiskLoader {
             }
         }
 
-        let uuid = Uuid::now_v7();
-        record.id = SessionId(uuid);
-
-        let uuid_str = uuid.simple().to_string();
-        let mut short = uuid_str[uuid_str.len() - 5..].to_string();
+        let id = record.id;
+        let id_hex = id.simple();
+        let mut short = id_hex[id_hex.len() - 5..].to_string();
         // We got unlucky and the short name collided, 20 bits of entropy
         // so rare but very possible. Increment the short name past
         // any collisions in this case.
@@ -890,14 +1186,25 @@ impl Loader for DiskLoader {
 
         self.write_record(&short, &record)?;
 
-        self.index
-            .insert(short.clone(), SessionId(uuid), record.name);
+        self.index.insert(short.clone(), id, record.name);
         self.flush_index()?;
 
         Ok(DiskBoxKey {
-            session_id: SessionId(uuid),
+            session_id: id,
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
+    }
+}
+
+impl Loader for DiskLoader {
+    type Key = DiskBoxKey;
+    type Object = DiskBox;
+
+    fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+        // The box id is the record's one key, minted here: a client never
+        // names it, so `record.id` is overwritten whatever it held.
+        record.id = SessionId::mint();
+        self.create_with_id(record)
     }
 
     fn keys(&self) -> impl Iterator<Item = Self::Key> {
@@ -1128,7 +1435,7 @@ impl Loader for DiskLoader {
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, dest)?;
 
         Ok(())
     }
@@ -1164,7 +1471,7 @@ impl Loader for DiskLoader {
         #[cfg(target_os = "linux")]
         common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, dest)?;
 
         Ok(())
     }
@@ -1177,6 +1484,7 @@ mod tests {
     use paths::HostAbsPath;
     use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn loader_dir(tmp: &TempDir) -> DaemonAbsPath {
         DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
@@ -1226,10 +1534,250 @@ mod tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            // Set, so a field dropped on write shows up as a diff: `None` is
+            // the serde default of all three.
+            box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+            parent: Some(SessionId::mint()),
+            project_root: Some(HostAbsPath::try_new("/home/alice/proj").unwrap()),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
         }
+    }
+
+    /// BOX-001: `create_with_id` refuses an id the index already holds,
+    /// with a kind that is not `AlreadyExists`, and writes nothing.
+    #[test]
+    fn create_with_id_refuses_an_id_the_index_holds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let held = loader.create(sample_record()).unwrap();
+
+        let mut again = sample_record();
+        again.id = held.session_id;
+        again.name = Some("another-name".to_string());
+        let err = loader.create_with_id(again).unwrap_err();
+
+        assert_ne!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.keys().count(), 1, "nothing new is filed");
+        assert_eq!(loader.find_by_name("another-name").unwrap(), None);
+        assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
+    }
+
+    /// BOX-068: a box's spec is stored beside its record, in the box's
+    /// own directory, and is read back as it was written. A box with no
+    /// spec file reads as none, and deleting the box removes the file.
+    #[test]
+    fn spec_file_is_stored_beside_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(object.load_spec().unwrap(), None);
+
+        let spec = br#"{"box":{"type":"session"},"v":0}"#;
+        object.store_spec(spec).unwrap();
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.spec_path().as_utf8_path(),
+            record_dir.join(SPEC_FILE)
+        );
+        assert!(record_dir.join("record.json").exists());
+        assert_eq!(
+            loader.get(&key).unwrap().load_spec().unwrap().as_deref(),
+            Some(&spec[..])
+        );
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-040, BOX-162: events append beside the record, outside every
+    /// directory the box sees, and read back in the order they were
+    /// written, from the start or from an offset. Deleting the box removes
+    /// the file and ends its retention.
+    #[test]
+    fn events_file_appends_in_write_order() {
+        use crate::events::{BoxEvent, BoxEventType, EVENTS_FILE};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+        assert!(object.is_retained());
+
+        let kinds = [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Detached,
+            BoxEventType::Resumed,
+            BoxEventType::Exited,
+        ];
+        let written: Vec<BoxEvent> = kinds
+            .iter()
+            .map(|kind| BoxEvent::for_record(object.record(), *kind))
+            .collect();
+        object.append_event(&written[0]).unwrap();
+        let first = object.read_events_from(0).unwrap();
+        assert_eq!(first.events, written[..1]);
+        for event in &written[1..] {
+            object.append_event(event).unwrap();
+        }
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, written);
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        let rest = object.read_events_from(first.consumed).unwrap();
+        assert_eq!(rest.events, written[1..]);
+        assert_eq!(rest.consumed + first.consumed, all.consumed);
+        assert!(written.iter().all(|e| e.box_id == key.session_id));
+        assert!(written.iter().all(|e| e.parent == object.record().parent));
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.events_path().as_utf8_path(),
+            record_dir.join(EVENTS_FILE)
+        );
+        for seen in [
+            object.workspace_path(),
+            object.home_path(),
+            object.cache_path(),
+            object.patches_path(),
+            object.hooks_path(),
+        ] {
+            assert!(
+                !object
+                    .events_path()
+                    .as_utf8_path()
+                    .starts_with(seen.as_utf8_path())
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(record_dir.join(EVENTS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(EVENTS_FILE).exists());
+        assert!(!object.is_retained());
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+    }
+
+    /// BOX-162: an append after a torn last line, one a crash left without
+    /// its newline, cuts the torn bytes first. The event before them and the
+    /// new event read back, the torn bytes are gone, and no line is refused.
+    #[test]
+    fn append_after_a_torn_line_drops_the_fragment() {
+        use crate::events::{BoxEvent, BoxEventType};
+        use std::io::Write as _;
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let before = BoxEvent::for_record(object.record(), BoxEventType::Created);
+        object.append_event(&before).unwrap();
+        let path = object.events_path();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.as_utf8_path())
+            .unwrap()
+            .write_all(b"{\"box\":\"torn")
+            .unwrap();
+        let after = BoxEvent::for_record(object.record(), BoxEventType::Started);
+        object.append_event(&after).unwrap();
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [before.clone(), after.clone()]);
+        assert_eq!(all.refused.len(), 0);
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+        assert_eq!(all.consumed, text.len() as u64);
+
+        // A file that holds only a torn line is cut to nothing.
+        std::fs::write(path.as_utf8_path(), b"{\"box\"").unwrap();
+        object.append_event(&after).unwrap();
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [after]);
+        assert_eq!(all.refused.len(), 0);
+    }
+
+    /// BOX-162: two threads append to a file with a torn tail at once. The
+    /// file lock makes each cut and write one step, so the second cut never
+    /// removes the first append's event. Every event reads back, and no line
+    /// is refused.
+    #[test]
+    fn concurrent_appends_after_a_torn_line_keep_every_event() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        const PER_THREAD: usize = 50;
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let path = object.events_path();
+        std::fs::write(path.as_utf8_path(), b"{\"box\":\"torn").unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for kind in [BoxEventType::Started, BoxEventType::Detached] {
+                let object = loader.get(&key).unwrap();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let event = BoxEvent::for_record(object.record(), kind);
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        object.append_event(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        assert_eq!(all.events.len(), 2 * PER_THREAD);
+        for kind in [BoxEventType::Started, BoxEventType::Detached] {
+            let count = all.events.iter().filter(|e| e.kind == kind).count();
+            assert_eq!(count, PER_THREAD, "events of {kind:?} lost");
+        }
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+    }
+
+    /// An event for a box whose directory is gone fails with `NotFound`
+    /// and does not create the directory again.
+    #[test]
+    fn append_after_delete_leaves_no_directory() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        loader.delete(&key).unwrap();
+        let event = BoxEvent::for_record(object.record(), BoxEventType::Exited);
+        let err = object.append_event(&event).unwrap_err();
+        assert_eq!(err.kind(), NotFound);
+        assert!(!object.root_path().as_utf8_path().exists());
     }
 
     #[test]
@@ -1269,6 +1817,73 @@ mod tests {
         );
     }
 
+    /// A record written before the session id and the box id merged into
+    /// one type carries the record's id in the hyphenated form and the
+    /// host-handed id as 32 hex digits. The store reads it from disk under
+    /// the same id, and writes both fields back in the spelling they were
+    /// read in, so the file a newer daemon saves reads the same to an
+    /// older one.
+    #[test]
+    fn record_json_written_before_the_merge_round_trips() {
+        const OLD_ID: &str = "0190b3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b";
+        const OLD_BOX_ID: &str = "0190b3c45d6e7f809a1b2c3d4e5f6a7b";
+
+        // The pre-merge record: every other field as a record writes it,
+        // and the two ids spelled the way each type wrote them then.
+        let mut old = serde_json_lenient::to_value(sample_record()).unwrap();
+        old["id"] = serde_json_lenient::Value::String(OLD_ID.to_string());
+        old["box_id"] = serde_json_lenient::Value::String(OLD_BOX_ID.to_string());
+        let old_bytes = serde_json_lenient::to_vec(&old).unwrap();
+
+        // Read straight from the bytes: both spellings name the one id.
+        let read: Record = serde_json_lenient::from_slice(&old_bytes).unwrap();
+        let expected = SessionId::parse_str(OLD_ID).unwrap();
+        assert_eq!(read.id, expected);
+        assert_eq!(
+            read.box_id,
+            Some(expected),
+            "the hex spelling reads as the same id"
+        );
+        assert_eq!(read.id.to_string(), OLD_ID);
+        assert_eq!(read.id.simple(), OLD_BOX_ID);
+        let rewritten = serde_json_lenient::to_value(&read).unwrap();
+        assert_eq!(
+            rewritten, old,
+            "a read and a write leave every field as it was"
+        );
+
+        // Read through the store, from a record planted on disk.
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let dir = root.as_utf8_path().join("sessions").join("a6a7b");
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(dir.join("record.json").as_std_path(), &old_bytes).unwrap();
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&expected)
+            .unwrap()
+            .expect("the old record is indexed under its id");
+        assert_eq!(key.id(), &expected);
+        let by_name = loader
+            .find_by_name("my-session")
+            .unwrap()
+            .expect("found by name");
+        assert_eq!(by_name.id(), &expected, "a name resolves to the same id");
+        let got = loader.get(&key).unwrap().record().clone();
+        assert_eq!(got, read);
+
+        // Save it back and read the file: the same spellings, the same values.
+        loader.save(&key, &got).unwrap();
+        let saved: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(dir.join("record.json").as_std_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved, old,
+            "a saved record keeps the pre-merge bytes of both ids"
+        );
+    }
+
     #[test]
     fn create_assigns_a_fresh_id_and_key_uuid_matches_stored_record() {
         let tmp = TempDir::new().unwrap();
@@ -1278,7 +1893,11 @@ mod tests {
         input.id = SessionId::nil();
         let key = loader.create(input).unwrap();
 
-        assert_ne!(key.id().0, Uuid::nil(), "create must overwrite caller id");
+        assert_ne!(
+            *key.id().as_ref(),
+            Uuid::nil(),
+            "create must overwrite caller id"
+        );
         let stored = loader.get(&key).unwrap();
         assert_eq!(&stored.record().id, key.id());
     }
@@ -1510,7 +2129,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("host".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1613,7 +2232,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("bad name/y".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1643,7 +2262,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("dot.ted.name".to_string());
         std::fs::write(
             orphan_dir.join("record.json").as_std_path(),
@@ -1663,6 +2282,225 @@ mod tests {
         promoted.status = BoxState::Active;
         loader.save(&key, &promoted).unwrap();
         assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    /// BOX-001: a record written before `box_type`, `parent` and
+    /// `project_root` existed still loads, with all three absent and every
+    /// other field as it was written. A record written now carries all
+    /// three keys, `parent` as `null` when the box has none.
+    #[test]
+    fn records_without_the_new_fields_still_load() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let old_short = "0ld00";
+        let old_dir = root.as_utf8_path().join("sessions").join(old_short);
+        std::fs::create_dir_all(old_dir.as_std_path()).unwrap();
+        let mut old_record = sample_record();
+        old_record.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        let mut raw = serde_json_lenient::to_value(&old_record).unwrap();
+        let object = raw.as_object_mut().unwrap();
+        for key in ["box_type", "parent", "project_root"] {
+            assert!(object.remove(key).is_some(), "{key} is written today");
+        }
+        std::fs::write(
+            old_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_id(&old_record.id)
+            .unwrap()
+            .expect("the old record is indexed");
+        let read_back = loader.get(&key).unwrap().record().clone();
+        // BOX-003: the start migrated the record to a session box.
+        assert_eq!(read_back.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
+        assert_eq!(read_back.parent, None);
+        assert_eq!(read_back.project_root, None);
+        assert_eq!(
+            read_back,
+            Record {
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+                parent: None,
+                project_root: None,
+                ..old_record
+            },
+            "every other field loads as it was written"
+        );
+
+        let mut fresh = sample_record();
+        fresh.name = Some("fresh".to_string());
+        fresh.parent = None;
+        let fresh_key = loader.create(fresh).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(
+                loader_dir(&tmp)
+                    .as_utf8_path()
+                    .join("sessions")
+                    .join(fresh_key.dir_key.as_str())
+                    .join("record.json")
+                    .as_std_path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "session");
+        assert!(written["parent"].is_null());
+        assert!(
+            written.as_object().unwrap().contains_key("parent"),
+            "no parent is written as null, not left out"
+        );
+        assert_eq!(written["project_root"], "/home/alice/proj");
+    }
+
+    /// Writes `raw` as the record of a session dir the index does not
+    /// hold yet, the way a record from an older daemon sits on disk.
+    fn write_raw_record(root: &DaemonAbsPath, short: &str, raw: &serde_json_lenient::Value) {
+        let dir = root.as_utf8_path().join("sessions").join(short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(raw).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Every file under the sessions dir, with its bytes.
+    fn sessions_tree(root: &DaemonAbsPath) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut dirs = vec![root.as_utf8_path().join("sessions").into_std_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    // BOX-003: a record without box_type or parent becomes a session box
+    // with no parent, a nil id is replaced, and a later start changes
+    // nothing.
+    #[test]
+    fn restart_migrates_records_missing_type_or_parent_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // An old session with an id, and neither key.
+        let mut old = sample_record();
+        old.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        old.name = Some("old".to_string());
+        let mut raw_old = serde_json_lenient::to_value(&old).unwrap();
+        for key in ["box_type", "parent"] {
+            raw_old.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "0ld00", &raw_old);
+
+        // An older one still: no id, and no box_type.
+        let mut idless = sample_record();
+        idless.name = Some("idless".to_string());
+        let mut raw_idless = serde_json_lenient::to_value(&idless).unwrap();
+        for key in ["id", "box_type"] {
+            raw_idless.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "1d1e5", &raw_idless);
+
+        // A task box that carries both keys is left as it is.
+        let mut task = sample_record();
+        task.id = SessionId::mint();
+        task.name = Some("task".to_string());
+        task.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        task.parent = None;
+        let raw_task = serde_json_lenient::to_value(&task).unwrap();
+        write_raw_record(&root, "7a5c0", &raw_task);
+        let task_bytes = serde_json_lenient::to_vec(&raw_task).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+
+        let key = loader.find_by_id(&old.id).unwrap().expect("old is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(
+            migrated,
+            Record {
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+                parent: None,
+                ..old
+            },
+            "only the type and the parent change, and the id is kept"
+        );
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0ld00").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(written["parent"].is_null());
+        assert!(written.as_object().unwrap().contains_key("parent"));
+
+        let key = loader
+            .find_by_name("idless")
+            .unwrap()
+            .expect("the idless record is still found by its name");
+        let fresh = loader.get(&key).unwrap().record().clone();
+        assert!(!fresh.id.is_nil(), "a nil id is replaced");
+        assert_eq!(*key.id(), fresh.id, "the index files it under the new id");
+        assert_eq!(loader.find_by_id(&SessionId::nil()).unwrap(), None);
+        assert_eq!(fresh.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
+        assert_eq!(fresh.parent, None);
+
+        assert_eq!(
+            std::fs::read(session_dir_path(&root, "7a5c0").join("record.json")).unwrap(),
+            task_bytes,
+            "a record with both keys is not rewritten"
+        );
+
+        let after_first = sessions_tree(&root);
+        drop(loader);
+        let again = DiskLoader::new(root.clone()).unwrap();
+        assert_eq!(
+            sessions_tree(&root),
+            after_first,
+            "a later start leaves every migrated record unchanged"
+        );
+        assert_eq!(again.find_by_name("idless").unwrap(), Some(key));
+    }
+
+    // BOX-003: a record that has a `box_type` but no `parent` key keeps its
+    // type. The migration only adds `parent: null`.
+    #[test]
+    fn heal_migrate_keeps_box_type_of_record_without_parent_key() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut typed = sample_record();
+        typed.id = SessionId::from(uuid::Uuid::from_u128(0x7a5c_0001));
+        typed.name = Some("typed".to_string());
+        typed.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        let mut raw = serde_json_lenient::to_value(&typed).unwrap();
+        raw.as_object_mut().unwrap().remove("parent");
+        assert_eq!(raw["box_type"], "task");
+        write_raw_record(&root, "7a5c1", &raw);
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&typed.id)
+            .unwrap()
+            .expect("typed is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(migrated.box_type.as_deref(), Some(crate::TASK_BOX_TYPE));
+        assert_eq!(migrated.parent, None);
+
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "7a5c1").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "task");
+        assert!(written.as_object().unwrap().contains_key("parent"));
+        assert!(written["parent"].is_null());
     }
 
     #[test]
@@ -1995,7 +2833,7 @@ mod tests {
         let before = loader.get(&key).unwrap().record().clone();
 
         let mut tampered = before.clone();
-        tampered.id = SessionId(uuid::Uuid::from_u128(0xCAFE_BABE));
+        tampered.id = SessionId::from(uuid::Uuid::from_u128(0xCAFE_BABE));
         tampered.username = Some("intruder".into());
 
         let err = loader.save(&key, &tampered).unwrap_err();
@@ -2086,7 +2924,7 @@ mod tests {
         // directly: a new session dir at the freed short with a
         // freshly-minted record id, then surface it to the loader by
         // re-opening (self-heal picks it up as an orphan).
-        let new_id = SessionId(uuid::Uuid::from_u128(0xFACE_FEED));
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
         assert_ne!(new_id, stale_id, "test setup: ids must differ");
         let sessions_dir = loader_dir(&tmp).as_utf8_path().join("sessions");
         let dir = sessions_dir.join(&stale_short);
@@ -2168,7 +3006,7 @@ mod tests {
 
         // We can't make `create` reliably collide on the 20-bit short, so we
         // craft the on-disk state directly at the freed short.
-        let new_id = SessionId(uuid::Uuid::from_u128(0xFACE_FEED));
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
         assert_ne!(new_id, *stale_key.id(), "test setup: ids must differ");
         let dir = loader_dir(tmp)
             .as_utf8_path()
@@ -2379,7 +3217,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         let record_file = orphan_dir.join("record.json");
         let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
         std::fs::write(record_file.as_std_path(), buf).unwrap();
@@ -2414,7 +3252,7 @@ mod tests {
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
-        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
         orphan_record.name = Some("MY-SESSION".to_string());
         let record_file = orphan_dir.join("record.json");
         let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();

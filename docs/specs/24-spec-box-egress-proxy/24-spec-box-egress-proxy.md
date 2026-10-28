@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-10-18
+updated: 2026-10-26
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -239,6 +239,7 @@ Steering and the interception CA
   verify:   cargo nextest run -p bep prop_root_constraints_equal_registered_union
   property: for every family of module host sets and registered authorities on a host, the root's permitted-names constraint equals their union less the deny set, a leaf for a name in the union validates against the root alone, a leaf for any name outside the subtrees the union permits fails validation, and the proxy issues leaves for names in the union alone
   <!-- Gatehouse §6.10 per-node interception CA and trust-store injection: the constraints come from the host's registrations, never a spec-chosen name, and sit on the self-signed anchor itself; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; X.509 permitted subtrees admit a name's subdomains (RFC 5280 §4.2.1.10), so exact admission is by leaf issuance, never by the constraint alone; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021); a rule's authority written with no port is port 443 -->
+  <!-- the fixed deny set: the T55 task text gives its categories (`min.internal`, `minimal.dev`, the tenant issuer, the BEP, EGW and relay endpoints, the registry and build cache, and the node-plane baseline set) and keeps `localhost`, `.local`, `home.arpa` and `.internal` allowed; the mapping of each category to a domain is this change's reading, which waits for a confirmation on gominimal/minimal#2441: `min.internal` (the box-internal names and the proxy's in-box address), `minimal.dev` (the hosted tenant issuers, the registry and the build cache), `cache.gominimal.dev` (the build cache by the name the design gives it, that host alone) and `minimal.farm` (the BEP, EGW and relay endpoints and the hosted build cache), each with every name under it; the built-in baseline of an un-enrolled host (`NodePlaneBaseline::built_in`, `crates/minvmd/src/net/baseline.rs`) is addresses, and the root excludes every IP address; this claim holds for that built-in baseline only; the deny set does not cover a configured cache (`MINIMAL_REMOTE_CACHE_URL`), registry or baseline endpoint outside its domains, a gap that waits on gominimal/minimal#2441; `minimal.dev` covers the hosted tenant issuers only, and a self-hosted Gatehouse issuer (Gatehouse §2.1 F14) is under no entry, a gap that is residual on gominimal/minimal#2441; `localhost`, `.local`, `home.arpa` and `.internal` other than `min.internal` stay allowed; `bep::ca::DENY_SET` is the one definition, and the BEP-034 store-rule check reads it -->
   - WHEN the registered authorities change THE SYSTEM SHALL re-issue the root under the same key and subject with the changed constraints, and leave every running box's trust store as it was.
     tier:   T0
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
@@ -282,6 +283,15 @@ Steering and the interception CA
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
   <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL carry from creation a git credential helper that answers `git credential fill` with the sealed value as the password for each host in the GitHub module's host set, and for no other host.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    verify: ./scripts/session-e2e.sh bep_git_credential_helper_sends_header
+    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper logs one line per answer naming the host, never the value -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL make the shipped git credential helper git's sole credential helper for each host in the GitHub module's host set, so that a `store` or `cache` helper that the box configures does not run for those hosts.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    <!-- Gatehouse §6.4 (line 718): the helper is the sole helper, with `store` and `cache` disabled; the launch sets the helper's entries at command scope (`GIT_CONFIG_COUNT`), which git reads after `~/.gitconfig` and the repository configuration, as an empty `helper` that clears the list and then the shipped helper; the host set is `bep::module::GITHUB`'s (Gatehouse §6.10 line 851); no git configuration file in the box is changed; the test puts a `store` helper in `~/.gitconfig` and in a repository configuration, and `git credential fill` and `git credential approve` for each grant host write nothing to `~/.git-credentials` -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
@@ -465,15 +475,31 @@ Store references
 - **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle of JWS `typ` `gatehouse-store-handle+jws`, signed under the client's local key, carrying the box id (`sub`), the host (`node_id`), the store, the identifier, the registered upstream authorities, the injection form, the issue time (`iat`), a unique handle id (`jti`) and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request and item deletion revokes it at once, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request, item deletion revokes it at once, and revoking the signing key by its `kid` ends every handle signed under it, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
   - WHEN the proxy restarts THE SYSTEM SHALL verify store handles under every client key registered before the restart.
     tier:   T0
     verify: cargo nextest run -p bep client_key_registrations_survive_restart
     <!-- event-driven; a registration held only by the running process would refuse every running box's store references after a restart, until the next mint registered the key again -->
   - IF the host keychain refuses the running client its handle-signing key THEN THE SYSTEM SHALL replace the key and register the replacement before minting.
     tier:   T0
-    verify: cargo nextest run -p bep a_client_key_this_program_is_refused_is_replaced
-    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step -->
+    verify: cargo nextest run -p minimal a_refused_client_key_is_replaced_and_registered_before_the_mint
+    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step; the verify line names the client-side test, because `a_client_key_this_program_is_refused_is_replaced` in `bep` proves only that a second registered key goes in beside the first -->
+  - WHEN the control socket's owner revokes a registered client key by its `kid` THE SYSTEM SHALL remove the key from the registry and from the kept registrations before the reply, so no store handle signed under it verifies again, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep a_revoked_client_key_no_longer_verifies_a_store_handle
+    <!-- event-driven; `revoke_client_key` on the control socket; the other registered keys stay; `a_key_removal_survives_a_restart` holds the removal across a restart -->
+  - WHEN the client replaces a client key that the host keychain refused THE SYSTEM SHALL register the replacement with `register_client_key`, then keep the replacement in the keychain, then revoke with `replace_client_key` every other registered key that no running box uses, and keep each key that a running box uses verifying until the last such box ends.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_keeps_verifying_until_its_boxes_end
+    <!-- event-driven; the client cannot read the refused key, so it cannot name its `kid`, and `replace_client_key` revokes every key but the one it carries and those that running boxes use; the [gominimal/arch#144 ruling](https://github.com/gominimal/arch/issues/144#issuecomment-6409882482) keeps the old key verifying until the boxes minted under it end (Gatehouse §6.10), so a replacement is not a cause to re-create a box; each mint names its box in `register_client_key`, the proxy keeps each key's running boxes in the registrations file, so the keep holds across a restart, and `forget_box` at the box's destroy ends the box's use; a box can end with no `forget_box` (a creation stopped by Ctrl-C before `minvmd` records the box, a stopped `minvmd`, or a failed write of the file at the forget), and a restart keeps every box in the file as a user of its key, so a box created before the restart keeps redeeming; each time `bep serve` starts to listen, `minvmd` sends `live_boxes` with every box id its registry holds, and the proxy frees the key of each box that the file held at that start and that the list leaves out, revokes a retired key whose boxes all ended, and logs an info line that names each freed `kid`, so the bound counts only the keys that running boxes use (`a_stranded_box_frees_its_key_at_start`, `proxy_gets_the_live_box_ids_when_it_starts_to_listen`); until the list arrives, the proxy frees no key; a replaced key that a running box uses is retired, and the forget of the last such box revokes it, with an info log line that names its `kid`; on the failure paths the order keeps running boxes redeeming: a proxy that refuses step one leaves the refused key in the store for the next creation to try again, and a store that fails step two leaves every old key registered; a lock file beside the control socket serialises the replacement across `min` processes, so two creations that both meet a refusal revoke once (`a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations`), and a replacement the store does not keep revokes no key (`a_replacement_the_store_does_not_keep_revokes_no_key`) -->
+  - IF the revoke of the other client keys fails after the keychain keeps the replacement THEN THE SYSTEM SHALL keep the replacement registered and revoke again at the next box creation, from the pending-revoke file beside the control socket that names the replacement's `kid`.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke
+    <!-- unwanted; the client writes the file after step one and before step two, so the file exists even when step two fails; the proxy never removes the file, and the client removes it when `replace_client_key` succeeds, at the replacement or at the retry; after a failed step two the store still refuses, so the next creation makes a new key and overwrites the file with that key's `kid`; a file that names a key other than the one the store holds is stale, and the next creation removes it; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
+  - THE SYSTEM SHALL hold at most a bounded count of client keys in the registry, 16 by default, and drop the key registered least recently that no running box uses when a registration passes the bound, or refuse the registration when running boxes use every key, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep the_registry_bound_never_drops_a_key_a_running_box_uses
+    <!-- ubiquitous; the client keeps one key for each user and a replacement revokes the others that no running box uses, so the registry usually holds one key, and the bound limits what other registrations on the socket can add; the bound never drops a key that a running box uses, so no running box loses its store handles or sign-in references to it; when running boxes use every key, the proxy refuses the new key, and the creation fails with "min did not create the box: the Box Egress Proxy already holds 16 client keys, and running boxes use each one. A key is freed when the last box created under it ends." on stderr (`a_replacement_past_a_bound_of_keys_in_use_fails_the_creation`); `the_registry_never_holds_more_keys_than_its_bound` holds the count and the idle period for keys no box uses; `bep serve --max-client-keys <N>` sets the bound, 16 by default (`KeyBound::DEFAULT_MAX_KEYS`), and refuses a value below 1 when the arguments parse (`serve_passes_its_key_bound_to_the_control_socket`); the idle period stays unset until gominimal/arch#85 decides the root validity, and it never drops a key that a running box uses; an embedder that sets a bound above the count of keys in the file keeps every key the file holds (`a_larger_key_bound_keeps_every_key_the_file_holds`); each dropped key is a warn log line -->
   - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
     tier:   T0
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
@@ -538,10 +564,10 @@ Review, audit and revocation
     verify: cargo nextest run -p minimal box_spec_flags_allowed_quic_stance_on_grant_box
     <!-- networking §5.3 (v0.9): the flag keys to the resolved stance, never the input; at v1.25 rollout a running grant-holding `auto` box under `proxy_env` or `off` flips from blocked to allowed with no event of its own -->
 
-- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the mapped resource and permission or `module_unmapped`, the decision and any marker.
+- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the handle's `jti` or empty, the mapped resource and permission or `module_unmapped`, the decision and any marker.
   tier:     T0
   verify:   cargo nextest run -p bep every_decision_appends_one_audit_record
-  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none` -->
+  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none`; the `jti` is the handle's correlation id (Gatehouse §6.10), empty when the request carries no handle or the handle does not parse, and on a refusal it is the handle's unverified claim, kept so a forged or tampered handle still correlates -->
 
 - **BEP-067** WHEN the client mints a member or a store handle, or a live box is destroyed (BEP-043) THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket.
   tier:     T0
@@ -551,11 +577,12 @@ Review, audit and revocation
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
-  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
+  property: for every two requests identical in every BEP-039 field, the handle's `jti` included, and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
-- **BEP-041** THE SYSTEM SHALL open the audit log for append only and modify or remove no existing record.
+- **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record from the retained set only by removing a whole segment that BEP-068 retention no longer retains, or by moving a whole segment that holds an unreadable line into the `quarantine` directory under BEP-068.
   tier:     T0
   verify:   cargo nextest run -p bep audit_log_is_opened_append_only
+  <!-- the quarantine move (`bep serve --quarantine-unreadable`, #2613) moves a segment and edits none: it appends the `quarantine` record and re-records the segment's readable revocations before the move, so the moved bytes stay intact under `quarantine/` and the chain still verifies across the gap -->
 
 - **BEP-068** WHEN the active audit segment reaches its size bound THE SYSTEM SHALL open a new segment whose first record carries the previous segment's final hash.
   tier:     T0
@@ -571,6 +598,18 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p bep segment_with_live_revocation_is_retained
     <!-- ubiquitous; Gatehouse §6.10 v1.24: a revocation record is compactable once no value naming its box can be unexpired, and the credentialed-lane ceiling bounds that; pruning earlier would lose the revocation at the next start -->
+  - WHEN the proxy starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL refuse the start and name `bep serve --quarantine-unreadable`.
+    tier:   T0
+    verify: cargo nextest run -p bep serve_refuses_start_on_unreadable_audit_line
+    <!-- an unreadable line can be a revocation, and a start without it redeems a value for a destroyed box; the partial last line of a torn write is cut at open and does not count -->
+  - WHEN `bep serve --quarantine-unreadable` starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL append one record of kind `quarantine` for that segment, then append again each revocation it reads in that segment with the marker `quarantine_restated`, then move the segment into the `quarantine` directory beside the log, and log one warn line for the move.
+    tier:   T0
+    verify: cargo nextest run -p bep quarantine_of_the_active_segment_opens_the_next
+    <!-- the `quarantine` record carries `segment` (the moved file's name), `from_hash` (the hash the moved segment's first record chains to), `final_hash` (the hash the record after it chains to), `unreadable` (its complete lines that did not parse) and BEP-048's `previous_hash`; the records go to the log before the move, so a crash between the two leaves the segment in place for the next quarantine and never leaves a moved segment unrecorded; a quarantine of the active segment first opens the next segment; the `quarantine_restated` marker tells the copy from the revocation a destroy wrote, so a reader does not count one destroy twice; the warn line names the segment, where it moved, the unreadable count, the count of records of a kind this bep does not know, and the final hash, and says that a revocation on such a line is no longer in force -->
+  - WHEN the chain is verified THE SYSTEM SHALL bridge a gap before the first record of a segment only through a `quarantine` record whose moved segment is present under `quarantine/`, agrees with the record's `from_hash` and `final_hash`, and sits between the two segments the gap separates.
+    tier:   T0
+    verify: cargo nextest run -p bep forged_quarantine_record_bridges_no_gap
+    <!-- a forged `quarantine` record, or one whose moved segment is absent or altered, bridges nothing, so the break still reports (BEP-049) -->
 
 - **BEP-042** WHEN `min box audit <id> [-o jsonl]` is run with a box id THE SYSTEM SHALL output the retained audit records whose subject is that box and no other, a reaped box included.
   tier:     T0
@@ -623,6 +662,9 @@ Review, audit and revocation
   - IF a minted box id is named by any retained record THEN THE SYSTEM SHALL refuse the creation.
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
+    verify: cargo nextest run -p minvmd colliding_box_id_refused
+    verify: cargo nextest run -p minvmd a_minted_id_a_revocation_holds_is_refused_with_no_proxy
+    <!-- The host's collision check reads live rows, kept creations and attachments, then the revocation records. When the proxy answers its control socket, the check reads the records the proxy holds in force. When no proxy answers, the check reads the revocation records in the audit log beside the socket, `~/.minimal/bep/audit`. These are the records that the next `bep serve` start restores. When that log is not read whole, the check refuses the creation, because a line that does not parse can be a revocation. The refusal names `bep serve --quarantine-unreadable`, which moves those segments aside and starts the proxy. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems

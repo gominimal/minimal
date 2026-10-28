@@ -3490,6 +3490,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             credentialed_upstream: None,
+            quic443: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the
@@ -3830,6 +3831,7 @@ mod tests {
                     }
                 }),
                 credentialed_upstream: None,
+                quic443: None,
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
@@ -3884,6 +3886,7 @@ mod tests {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
                         credentialed_upstream: None,
+                        quic443: None,
                     },
                     subnet,
                     None,
@@ -3996,6 +3999,7 @@ mod tests {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
@@ -4940,6 +4944,7 @@ mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -4953,6 +4958,7 @@ mod tests {
             }),
             ingress: None,
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 }

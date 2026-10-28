@@ -422,6 +422,45 @@ pub(crate) async fn host_row_standing(
     None
 }
 
+/// Whether the Box Egress Proxy's listener is live on the host (BEP-062):
+/// asked over the report door the way [`host_row_standing`] asks, because
+/// the proxy runs on the host and its listener state lives in the VM host
+/// daemon. `None` when the host could not be asked: a native host, which
+/// runs no proxy, or a door that did not answer within [`REPORT_DEADLINE`]
+/// over its attempts. The caller reads `None` as not live, so a steered
+/// name fails closed with SERVFAIL.
+pub(crate) async fn proxy_listening(control: &ControlChannel) -> Option<bool> {
+    let channel = box_report_channel(control)?;
+    let request = minimald_rpc::BoxControlRequest::ProxyListening;
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    for attempt in 1..=REPORT_ATTEMPTS {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
+            Ok(minimald_rpc::BoxControlReply::ProxyListening { listening }) => {
+                return Some(listening);
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    reply = ?other,
+                    "the VM host daemon answered the proxy-listening read with another \
+                     verb's reply"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::debug!(attempt, %error, "the proxy-listening read was not answered");
+            }
+        }
+        if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    None
+}
+
 /// Raise one ask with the VM host daemon (NET-045): an expose decided `ask`
 /// on a VM-backed host is answered by the human attached on the host, not
 /// by a dialog this daemon renders, so the ask crosses the report door as
@@ -2832,6 +2871,7 @@ mod tests {
             // No credentialed upstream (NET-134): these tests hold no lane,
             // so the compiled egress they observe is the rules' alone.
             credentialed_upstream: None,
+            quic443: None,
         }
     }
 
@@ -3046,6 +3086,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 
@@ -3945,6 +3986,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let mut shared = None;
         let (watcher, _gate, server, mut served) =
@@ -4199,6 +4241,7 @@ mod tests {
             }),
             egress: None,
             credentialed_upstream: None,
+            quic443: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 

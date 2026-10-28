@@ -4,6 +4,15 @@ use super::*;
 ///
 /// Intended for use as an SSH `ProxyCommand`: ssh writes to our stdin and
 /// reads from our stdout, while we bridge both directions to the UDS.
+/// Without an explicit socket path, ensures the selected daemon is running
+/// and resolves its socket. An owner PID or lock enables the lifetime watch
+/// described by [`owner_gone`]; detecting owner loss closes the socket and
+/// returns successfully.
+///
+/// # Errors
+///
+/// Propagates daemon startup, socket resolution, connection, and bridge I/O
+/// errors. Broken-pipe errors during copying are treated as normal termination.
 pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyhow::Error> {
     let socket_path = match args.socket {
         Some(socket_path) => socket_path,
@@ -19,7 +28,267 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 
     let stream = connect_with_retry(&socket_path).await?;
 
-    proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+    proxy_while_owner_lives(
+        stream,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        args.owner,
+        args.owner_lock,
+    )
+    .await
+}
+
+/// Bridges stdio to the daemon, watching for owner loss when `owner` or
+/// `lock` is supplied (see [`owner_gone`]). With neither, waits only for
+/// [`proxy_bridge`], which drains daemon output after stdin closes.
+/// Detecting owner loss cancels the bridge and returns `Ok(())`, closing
+/// the daemon socket without waiting for pending output.
+///
+/// # Errors
+///
+/// Propagates bridge copy and socket shutdown errors if the bridge finishes
+/// first; broken-pipe copy errors are treated as normal termination.
+async fn proxy_while_owner_lives<I, O>(
+    stream: tokio::net::UnixStream,
+    stdin: I,
+    stdout: O,
+    owner: Option<u32>,
+    lock: Option<PathBuf>,
+) -> Result<(), anyhow::Error>
+where
+    I: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+{
+    let bridge = proxy_bridge(stream, stdin, stdout);
+    match (owner, lock) {
+        (None, None) => bridge.await,
+        (owner, lock) => tokio::select! {
+            res = bridge => res,
+            () = owner_gone(owner, lock) => {
+                tracing::debug!(?owner, "the proxy's owner is gone; closing the daemon connection");
+                Ok(())
+            }
+        },
+    }
+}
+
+/// How often the proxy looks for its owner.
+const OWNER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Resolves once the `min` process this proxy serves is gone.
+///
+/// ssh is that process's child and this proxy is ssh's. A `min session exec`
+/// that dies without a chance to take ssh down (SIGKILL, an OOM kill; the
+/// catchable signals are handled in the exec path) leaves both running with
+/// the daemon's socket open, and the daemon, which learns of a lost client
+/// only from its connection closing, keeps the command running — a silent
+/// `sleep` outlived its killed client indefinitely (lab scenario 732).
+/// Polled, since the owner is a grandparent this process cannot wait on.
+///
+/// The lock is the watch: the owner holds an exclusive `flock` on `lock`
+/// for its life, and the kernel releases it when the process's descriptors
+/// close at exit — before any reaping, so a SIGKILLed owner its parent has
+/// not waited on reads as gone too. The path is unique to that one process
+/// (pid and start time), so a recycled pid names a different file. The pid
+/// is the fallback where no lock was handed (an older `min`): gone when
+/// `kill(pid, 0)` finds nothing or, on Linux, when the process is a zombie
+/// (`EPERM` is alive). A pid that does not fit a `pid_t` names no process
+/// and reads as gone.
+///
+/// Checks immediately, then every 250 ms. When `lock` is supplied, ignores
+/// the PID and resolves if the file cannot be opened for any reason or its
+/// lock can be acquired; lock-acquisition errors keep the watch running.
+/// With no lock and no usable PID, resolves immediately. Filesystem and
+/// process-probe errors are handled by the watch and do not reach callers.
+async fn owner_gone(pid: Option<u32>, lock: Option<PathBuf>) {
+    let pid = pid.and_then(|pid| i32::try_from(pid).ok().map(nix::unistd::Pid::from_raw));
+    loop {
+        if let Some(path) = &lock
+            && owner_lock_is_free(path)
+        {
+            return;
+        }
+        if lock.is_none()
+            && let Some(pid) = pid
+            && pid_gone(pid)
+        {
+            return;
+        }
+        if lock.is_none() && pid.is_none() {
+            // A pid that fit no `pid_t` and no lock: nothing to watch.
+            return;
+        }
+        tokio::time::sleep(OWNER_POLL).await;
+    }
+}
+
+/// Whether a pid no longer names a live process: nothing answers to it, or
+/// (Linux) it is a zombie, exited and not yet reaped by its parent.
+/// Signal-probe errors other than `ESRCH` do not establish process loss;
+/// an unreadable or unrecognized Linux proc status is also inconclusive.
+fn pid_gone(pid: nix::unistd::Pid) -> bool {
+    if matches!(
+        nix::sys::signal::kill(pid, None),
+        Err(nix::errno::Errno::ESRCH)
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesised command name, which may itself
+        // contain `)`: split on the last one.
+        if let Some((_, rest)) = stat.rsplit_once(')')
+            && rest.trim_start().starts_with('Z')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` if the owner's lock file is gone (the owner unlinked it on
+/// its way out) or its exclusive `flock` can be acquired. Any other error,
+/// opening the file (`EACCES`, `EMFILE`) or taking the lock, returns `false`:
+/// a watch that cannot tell keeps watching, rather than ending a live attach
+/// over a transient fault of its own.
+///
+/// On acquiring the lock, attempts to unlink its file while still holding
+/// the lock, then releases it. An unlink failure does not change the result.
+fn owner_lock_is_free(path: &std::path::Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(err) => {
+            tracing::debug!(error = %err, path = %path.display(), "the proxy's owner lock could not be opened; still watching");
+            return false;
+        }
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            let removed = std::fs::remove_file(path);
+            drop(lock);
+            tracing::debug!(?removed, path = %path.display(), "the proxy's owner lock was free");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod owner_watch_tests {
+    use super::{owner_gone, proxy_while_owner_lives};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt as _;
+
+    /// A SIGKILLed owner its parent has not reaped is a zombie, which
+    /// `kill(pid, 0)` still answers for: the pid watch reads it as gone
+    /// anyway. The child is reaped only after the assertion.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_zombie_owner_reads_as_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        child.kill().expect("sleep is killable");
+        tokio::time::timeout(Duration::from_secs(2), owner_gone(Some(pid), None))
+            .await
+            .expect("an unreaped (zombie) owner should read as gone");
+        child.wait().expect("sleep is reaped");
+    }
+
+    /// The path the fix relies on end to end: while the owner holds its
+    /// lock the proxy bridges, and once the lock is released the proxy
+    /// returns and the daemon side of the socket reads EOF.
+    #[tokio::test]
+    async fn the_daemon_reads_eof_once_the_owner_is_gone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("proxy-owner-eof.lock");
+        let file = std::fs::File::create(&path).expect("the lock file is created");
+        let held = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let (proxy_side, mut daemon_side) = tokio::net::UnixStream::pair().expect("a socket pair");
+        // stdin that stays open (ssh holds it open for the proxy's life)
+        let (_stdin_writer, stdin) = tokio::io::duplex(64);
+        let proxy = tokio::spawn(proxy_while_owner_lives(
+            proxy_side,
+            stdin,
+            tokio::io::sink(),
+            None,
+            Some(path.clone()),
+        ));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !proxy.is_finished(),
+            "the proxy ended while its owner lived"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("the proxy did not end after its owner was gone")
+            .expect("the proxy task should not panic")
+            .expect("the proxy should end cleanly");
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), daemon_side.read(&mut buf))
+            .await
+            .expect("the daemon side should see the close")
+            .expect("reading the daemon side");
+        assert_eq!(n, 0, "the daemon side should read EOF");
+    }
+
+    /// The pid fallback holds while the owner lives and resolves once it is
+    /// gone.
+    #[tokio::test]
+    async fn the_watch_resolves_when_the_owner_dies() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), owner_gone(Some(pid), None))
+                .await
+                .is_err(),
+            "the watch resolved while the owner was alive"
+        );
+        child.kill().expect("sleep is killable");
+        child.wait().expect("sleep is reaped");
+        tokio::time::timeout(Duration::from_secs(2), owner_gone(Some(pid), None))
+            .await
+            .expect("the watch did not resolve after the owner died");
+    }
+
+    /// The lock watch holds while the owner holds its lock and resolves
+    /// once the lock is released — what the kernel does for a process that
+    /// ends any way at all, SIGKILL included. The pid handed beside it is a
+    /// live one (this process), so only the lock can end the watch.
+    #[tokio::test]
+    async fn the_watch_resolves_when_the_owner_lock_is_released() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("proxy-owner-test.lock");
+        let file = std::fs::File::create(&path).expect("the lock file is created");
+        let held = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let me = std::process::id();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(600),
+                owner_gone(Some(me), Some(path.clone()))
+            )
+            .await
+            .is_err(),
+            "the watch resolved while the lock was held"
+        );
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            owner_gone(Some(me), Some(path.clone())),
+        )
+        .await
+        .expect("the watch did not resolve after the lock was released");
+        assert!(!path.exists(), "the freed lock file is removed");
+    }
 }
 
 /// Connect to the daemon UDS, retrying a bounded number of times when the

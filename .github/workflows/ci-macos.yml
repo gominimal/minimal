@@ -333,6 +333,28 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
+            - name: Reap VM processes an earlier run left on the runner
+              # The runner persists across jobs, and a run that failed or was
+              # cancelled before the mid-job reap below leaves its testbed
+              # minvmd (and its __krun-vmm child) and gvproxy running. They
+              # hold the host proxy ports, so every later run failed at the
+              # first boot with `hostname proxy port 7654 held by pid … (gvproxy)`
+              # or `port 127.0.0.1:7656 … is in use by pid … (minvmd)` (#2456).
+              # `--root "$RUNNER_TEMP"` scopes the match there: every leftover
+              # runs from it (testbed/bin/minvmd, the harness's minimal-gvproxy/
+              # and the CLI e2e's gvproxy), so nothing else on the mini is hit.
+              # Then fail fast, naming the holder, if a port is still taken.
+              run: |
+                  scripts/reap-vms.sh --root "$RUNNER_TEMP"
+                  sleep 1
+                  held=0
+                  for port in 7654 7656; do
+                      if pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); then
+                          echo "::error::port $port is still held after the reap: $(ps -o pid=,command= -p "$(printf '%s\n' "$pids" | paste -sd, -)")"
+                          held=1
+                      fi
+                  done
+                  exit "$held"
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
@@ -453,6 +475,17 @@ jobs:
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
+            - name: Fetch pinned gvproxy switch binary
+              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
+              # provides the guest's egress (NAT + DNS). Without it minvmd boots
+              # the VM switchless (gvproxy resolution is best-effort and never
+              # errors), so the guest overlay has no other end and every egress —
+              # including the in-guest `pkgs` clone during session mint — dies
+              # with "Could not resolve host". Fetched before the lifecycle step,
+              # which points MINVMD_GVPROXY_BIN here too: every gvproxy this job
+              # starts then runs from $RUNNER_TEMP, where the scoped reaps match
+              # it, and never from a gvproxy installed on the mini (#2456).
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Daemon lifecycle (run --detach → status → stop)
               # Exercises the supervised daemon path (detach, status polling,
               # documented stop semantics) that the integration harnesses and
@@ -466,15 +499,8 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
               run: ./scripts/minvmd-lifecycle.sh
-            - name: Fetch pinned gvproxy switch binary
-              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
-              # provides the guest's egress (NAT + DNS). Without it minvmd boots
-              # the VM switchless (gvproxy resolution is best-effort and never
-              # errors), so the guest overlay has no other end and every egress —
-              # including the in-guest `pkgs` clone during session mint — dies
-              # with "Could not resolve host".
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed
@@ -509,6 +535,13 @@ jobs:
                       ${{ runner.temp }}/boot-daemon.log
                       ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
+            - name: Reap this run's VM processes
+              # Always, so a failed or cancelled run does not leave the next
+              # one a held port (#2456). The same $RUNNER_TEMP-scoped reap as
+              # the first step, which stays as the backstop for a runner that
+              # died before reaching this one.
+              if: always()
+              run: scripts/reap-vms.sh --root "$RUNNER_TEMP"
 
     unit:
         # GitHub-hosted Apple Silicon (macos-latest is arm64). minvmd links

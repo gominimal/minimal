@@ -108,8 +108,9 @@ impl std::error::Error for ProjectFileInvalid {
     }
 }
 
-/// A GitHub grant the box cannot receive in its environment (BEP-007). The
-/// creation is refused with exit 3, before the box exists.
+/// A grant the box cannot receive: a GitHub grant whose value cannot land
+/// in its environment (BEP-007), or a store reference that no rule admits
+/// (BEP-035). The creation is refused with exit 3, before the box exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantNotDelivered {
     /// The grant's name is not a POSIX environment variable name, so it
@@ -123,6 +124,36 @@ pub enum GrantNotDelivered {
     NotSealed {
         /// The grant's name.
         grant: String,
+    },
+    /// No `[secret-store-rules]` rule names the item a store reference
+    /// reads, so nothing says where its value may go.
+    NoStoreRule {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "deny"`.
+    StoreReferenceDenied {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "ask"`, and the command cannot ask
+    /// (BEP-035).
+    AskWithoutTerminal {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
+    },
+    /// The item's rule sets `action = "ask"`, and the person answered no.
+    StoreReferenceDeclined {
+        /// The grant's name.
+        grant: String,
+        /// The reference, `<store>:<id>` or `<id>`.
+        item: String,
     },
 }
 
@@ -142,16 +173,46 @@ impl std::fmt::Display for GrantNotDelivered {
                 "Cannot create the box: no sealed value was made for its GitHub grant \
                  {grant}, so {grant} would be empty in the box. No box was created."
             ),
+            Self::NoStoreRule { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                 reads the item {item} from the host's secret store, and no rule in \
+                 [secret-store-rules] in your config.toml names that item. Add a rule for \
+                 it, or remove the secret from {name}. Run `min dirs` to find config.toml.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreReferenceDenied { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} in [session.secrets] in {name} \
+                 reads the item {item} from the host's secret store, and the rule for that \
+                 item in [secret-store-rules] denies it. Remove the secret from {name}.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::AskWithoutTerminal { grant, item } => write!(
+                f,
+                "Cannot create the box: the secret {grant} reads the item {item} from the \
+                 host's secret store. The rule for that item in [secret-store-rules] sets \
+                 action = \"ask\", and this command cannot ask: it has no terminal, or \
+                 --no-input is set. The secret was denied. Run the command in a terminal \
+                 without --no-input, or remove the secret from {name}.",
+                name = mfile::MFILE_NAME,
+            ),
+            Self::StoreReferenceDeclined { grant, item } => write!(
+                f,
+                "Cannot create the box: you did not allow the secret {grant} to read the \
+                 item {item} from the host's secret store. No box was created."
+            ),
         }
     }
 }
 
 impl std::error::Error for GrantNotDelivered {}
 
-/// The project's `[session.network.bep]` settings and `[session.secrets]`
-/// grants. Only a missing project file reads as empty. A file that exists
-/// but does not load refuses the activation, so a broken file can never
-/// skip the grant checks (BEP-008).
+/// The project's `[session.network.bep]` settings, `[session.secrets]`
+/// grants, the box spec's own variable names and the `[session.network]
+/// quic443` stance. Only a missing project file reads as empty. A file that
+/// exists but does not load refuses the activation, so a broken file can
+/// never skip the grant checks (BEP-008).
 fn project_bep_and_grants(
     project: &camino::Utf8Path,
 ) -> Result<
@@ -159,6 +220,7 @@ fn project_bep_and_grants(
         boxes::core::bep::BepSettings,
         boxes::core::bep::SecretGrants,
         Vec<String>,
+        Option<boxes::core::bep::Quic443>,
     ),
     ProjectFileInvalid,
 > {
@@ -189,11 +251,10 @@ fn project_bep_and_grants(
                     .map(|entry| entry.name().as_ref().to_string()),
             )
             .collect();
-        (
-            session.network.and_then(|n| n.bep).unwrap_or_default(),
-            session.secrets,
-            spec_env,
-        )
+        let (bep, quic443) = session
+            .network
+            .map_or_else(Default::default, |n| (n.bep.unwrap_or_default(), n.quic443));
+        (bep, session.secrets, spec_env, quic443)
     }))
 }
 
@@ -201,7 +262,8 @@ fn project_bep_and_grants(
 /// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
 /// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
-/// ride the declaration.
+/// ride the declaration. The declared `quic443` stance does not: it rides
+/// the policy of every box (BEP-018).
 fn credentialed_upstream_for(
     flag: bool,
     bep: &boxes::core::bep::BepSettings,
@@ -257,6 +319,160 @@ fn refuse_unhonourable_grants(
         eprintln!("warning: {warning}");
     }
     Ok(plan.warnings)
+}
+
+/// The reference as the box spec writes it: `<store>:<id>` or `<id>`.
+fn store_item(reference: &boxes::core::bep::StoreReference<'_>) -> String {
+    match reference.store {
+        Some(store) => format!("{store}:{}", reference.id),
+        None => reference.id.to_owned(),
+    }
+}
+
+/// Checks the box spec's store references at creation, and gives the rules
+/// it accepts, by item. Does nothing, and reads no configuration, for a box
+/// with no store reference. Otherwise it reads the rules through
+/// [`crate::config::read_client_config_and_store_rules`], which fails
+/// closed. `can_ask` says whether the command can ask the person.
+///
+/// # Errors
+///
+/// [`boxes::core::bep::ActivationRefused`] for a reference to the GitHub
+/// sign-in item or a rule upstream outside the egress (BEP-034, BEP-036),
+/// and [`GrantNotDelivered`] for a reference with no rule or one its rule
+/// denies (BEP-035). Each ends the run with exit 3.
+fn check_store_grants(
+    global: &GlobalArgs,
+    secrets: &boxes::core::bep::SecretGrants,
+    egress: Option<&boxes::EgressPolicy>,
+    can_ask: bool,
+) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
+    if boxes::core::bep::store_references(secrets).next().is_none() {
+        return Ok(boxes::core::bep::StoreRules::new());
+    }
+    let (_, rules) = crate::config::read_client_config_and_store_rules(global)?;
+    accept_store_references(secrets, egress, &rules, can_ask, &mut |question| {
+        crate::cmd::confirm(question, false)
+    })
+}
+
+/// Judges each store reference in `secrets` against `rules`, and gives the
+/// rules of the references it accepts, by item. First every reference is
+/// checked against the deny set and the egress (BEP-034, BEP-036). Then a
+/// reference with no rule, a `deny` rule, or an `ask` rule without
+/// `can_ask` is refused (BEP-035). Only when no reference is refused does
+/// it call `ask`, once per distinct item that an `ask` rule names. Logs one
+/// info line naming each reference checked and its outcome.
+///
+/// # Errors
+///
+/// As [`check_store_grants`] says. `ask`'s own error ends the check.
+fn accept_store_references(
+    secrets: &boxes::core::bep::SecretGrants,
+    egress: Option<&boxes::EgressPolicy>,
+    rules: &boxes::core::bep::StoreRules,
+    can_ask: bool,
+    ask: &mut dyn FnMut(&str) -> Result<bool, anyhow::Error>,
+) -> Result<boxes::core::bep::StoreRules, anyhow::Error> {
+    use boxes::core::bep::{StoreConsent, check_store_references, store_consent, store_references};
+    let module_hosts = crate::config::store_module_hosts();
+    let deny = crate::config::store_deny_set(&module_hosts);
+    let mut checked: Vec<String> = Vec::new();
+    let outcome = (|| {
+        if let Err(refused) = check_store_references(secrets, egress, rules, deny) {
+            checked.extend(
+                refused
+                    .refusals
+                    .iter()
+                    .map(|refusal| format!("refused: {refusal}")),
+            );
+            return Err(anyhow::Error::from(refused));
+        }
+        // Every refusal that needs no answer comes first, so the person is
+        // never asked about a creation that a later reference refuses.
+        let mut to_ask: Vec<(String, Vec<String>, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
+        let mut allowed: Vec<(String, &str, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
+        for reference in store_references(secrets) {
+            let item = store_item(&reference);
+            let grant = reference.grant.to_owned();
+            let Some(rule) = reference.rule(rules) else {
+                checked.push(format!("{item}: no rule"));
+                return Err(GrantNotDelivered::NoStoreRule { grant, item }.into());
+            };
+            match store_consent(rule, can_ask) {
+                StoreConsent::Allow => {}
+                StoreConsent::Deny if rule.action == Some(boxes::core::bep::StoreAction::Ask) => {
+                    checked.push(format!("{item}: denied, no terminal to ask"));
+                    return Err(GrantNotDelivered::AskWithoutTerminal { grant, item }.into());
+                }
+                StoreConsent::Deny => {
+                    checked.push(format!("{item}: denied by its rule"));
+                    return Err(GrantNotDelivered::StoreReferenceDenied { grant, item }.into());
+                }
+                // One question per distinct item, naming every grant that reads it.
+                StoreConsent::Ask => match to_ask.iter_mut().find(|(seen, ..)| *seen == item) {
+                    Some((_, grants, _)) => grants.push(grant),
+                    None => to_ask.push((item.clone(), vec![grant], rule)),
+                },
+            }
+            allowed.push((item, reference.id, rule));
+        }
+        for (item, grants, rule) in &to_ask {
+            let upstream: Vec<String> = rule.upstream.iter().map(|host| printable(host)).collect();
+            let names: Vec<String> = grants.iter().map(|grant| printable(grant)).collect();
+            let (subject, verbs) = if names.len() == 1 {
+                (format!("The secret {}", names[0]), ("reads", "sends"))
+            } else {
+                (
+                    format!("The secrets {}", names.join(", ")),
+                    ("read", "send"),
+                )
+            };
+            let question = format!(
+                "{subject} {} the item {} from the host's secret store and {} it to {}. \
+                 Allow it for this box?",
+                verbs.0,
+                printable(item),
+                verbs.1,
+                upstream.join(", ")
+            );
+            if !ask(&question)? {
+                checked.push(format!("{item}: declined"));
+                return Err(GrantNotDelivered::StoreReferenceDeclined {
+                    grant: grants[0].clone(),
+                    item: item.clone(),
+                }
+                .into());
+            }
+        }
+        let mut accepted = boxes::core::bep::StoreRules::new();
+        for (item, id, rule) in allowed {
+            checked.push(format!("{item}: allowed"));
+            accepted.insert(id.to_owned(), rule.clone());
+        }
+        Ok(accepted)
+    })();
+    tracing::info!(
+        references = ?checked,
+        accepted = outcome.is_ok(),
+        "checked the box's store references"
+    );
+    outcome
+}
+
+/// `text` with each control character escaped, so a name from an
+/// untrusted `minimal.toml` cannot move the cursor or fake a line in the
+/// question the person answers.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The names of the project's GitHub grants, in name order.
@@ -495,7 +711,8 @@ fn mint_grants(
     network: boxes::NetworkMode,
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
-        ClientKey, ControlClient, GrantBox, MintError, ProxyRegistration, mint_and_register,
+        ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
+        local_client_key, mint_and_register,
     };
     let Some((box_id, stance)) = grant_box_facts(&grants, box_id, network)? else {
         return Ok(MintedGrants {
@@ -521,7 +738,11 @@ fn mint_grants(
     // at the proxy.
     let root_certificate = grant_root_certificate(&identity)?;
     let mut control = ControlClient::connect(&control_path)?;
-    let key = ClientKey::generate()?;
+    // BEP-063: every creation signs under the client's one kept key, so the
+    // proxy holds one registration for this client, not one for each box. A
+    // key the keychain refuses this program is replaced here, and the mint
+    // registers the replacement before any handle leaves this process.
+    let key = local_client_key(&HostClientKeyStore)?;
     let grant_box = GrantBox {
         box_id,
         grants,
@@ -728,6 +949,113 @@ impl ActivationStep {
     }
 }
 
+/// Puts the root of the project at `dir` on the create request: the
+/// directory that holds the project's `minimal.toml`, found the way the
+/// upload finds it. The daemon records it as the box's project root
+/// (BOX-001).
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
+pub(crate) fn stamp_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let root = resolve_upload_root(dir)?;
+    set_project_root(request, root)
+}
+
+/// Puts `root` on the create request as the box's project root (BOX-001).
+fn set_project_root(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    root: camino::Utf8PathBuf,
+) -> Result<(), anyhow::Error> {
+    request.config.project_root =
+        Some(paths::HostAbsPath::try_new(root).context("Invalid project root")?);
+    Ok(())
+}
+
+/// The spec flags of the create request: the network mode, the policy and
+/// the hooks choice that the command's flags and the project resolved.
+pub(crate) fn spec_flags(request: &minimald_rpc::CreateSessionRequest) -> mfile::spec::SpecFlags {
+    mfile::spec::SpecFlags {
+        network: request.config.network,
+        policy: request.config.policy.clone(),
+        hooks_enabled: request.config.hooks_enabled,
+    }
+}
+
+/// Puts `spec` on the create request, for the daemon to store with the
+/// box's record (BOX-068).
+///
+/// # Errors
+///
+/// Fails if the spec cannot be encoded as JSON.
+pub(crate) fn put_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    spec: &mfile::spec::BoxSpec,
+) -> Result<(), anyhow::Error> {
+    request.spec = Some(serde_json_lenient::to_value(spec).context("Cannot encode the box spec")?);
+    Ok(())
+}
+
+/// Puts the spec of a session box from `dir` on the create request
+/// (BOX-068): the project's `[session]` table, with the request's network
+/// mode, policy and hooks choice as the flags. A project with no
+/// `minimal.toml` has no `[session]` table.
+///
+/// Known gap: the dashboard's activation in `crates/minimal/src/dash/rpc.rs`
+/// builds its own `CreateSessionRequest` and does not call this yet, so a
+/// session box created from `min dash` has no stored spec. That file is
+/// outside this change. A follow-up must call this function there.
+///
+/// # Errors
+///
+/// Fails on a `minimal.toml` in `dir` or a parent of it that does not load.
+pub(crate) fn stamp_session_spec(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    dir: &camino::Utf8Path,
+) -> Result<(), anyhow::Error> {
+    let session = match mfile::File::from_dir_recursive(dir.as_std_path()) {
+        Ok(file) => file.session,
+        Err(mfile::Error::NotFound) => None,
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+    };
+    let spec = mfile::spec::BoxSpec::for_session(session.as_ref(), spec_flags(request));
+    put_spec(request, &spec)
+}
+
+/// The project root to record for an activation from `dir`. Tarball sync
+/// already resolved it as `upload_root`, so it is reused. Otherwise the root
+/// is resolved here. `CheckProject` already refuses a `minimal.toml` that does
+/// not load under every `--sync` mode, before `PlanUpload` runs, so an error
+/// here is not expected and propagates.
+///
+/// # Errors
+///
+/// Fails on a broken `minimal.toml` in `dir` or a parent of it.
+fn activation_project_root(
+    upload_root: Option<&camino::Utf8Path>,
+    dir: &camino::Utf8Path,
+) -> Result<camino::Utf8PathBuf, anyhow::Error> {
+    match upload_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => resolve_upload_root(dir),
+    }
+}
+
+/// The workspace upload a create planned, so the upload step holds one value
+/// instead of a root and a decision that are only meaningful together.
+enum UploadPlan {
+    /// `--sync none`: the daemon composes against an empty workspace.
+    Skip,
+    /// The tree to stream, and what the upload gate decided about it.
+    Workspace {
+        root: camino::Utf8PathBuf,
+        decision: UploadDecision,
+    },
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -814,7 +1142,8 @@ pub(crate) async fn activate_box(
             let has_ingress = !port_mappings.is_empty()
                 || args.dynamic_ingress.is_some()
                 || args.dynamic_range.is_some();
-            let (project_bep, project_secrets, project_env) = project_bep_and_grants(&utf8_path)?;
+            let (project_bep, project_secrets, project_env, project_quic443) =
+                project_bep_and_grants(&utf8_path)?;
             let policy = boxes::BoxPolicy {
                 egress,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
@@ -831,6 +1160,10 @@ pub(crate) async fn activate_box(
                     &project_bep,
                     &project_secrets,
                 ),
+                // BEP-018: the declared stance is a setting of every box, lane
+                // or not, so a declared `block` reaches the gate of a box with
+                // no credentialed upstream.
+                quic443: project_quic443,
             };
 
             // BEP-008/009/010/017/056: a box spec with a grant it cannot honour is
@@ -849,6 +1182,14 @@ pub(crate) async fn activate_box(
                 full_breadth_acknowledged,
                 &project_env,
             )?;
+            // BEP-034/035/036: each store reference needs a rule that admits
+            // it, inside the box's egress, before anything is created.
+            let can_ask = !global.no_input && crate::can_prompt_interactively();
+            // The accepted rules wait on a sealed `store` member kind to
+            // carry their handles (#2525). The registration already carries
+            // the egress their upstreams are checked to lie within.
+            let _accepted_store_rules =
+                check_store_grants(global, &project_secrets, policy.egress.as_ref(), can_ask)?;
             // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
             // proxy, and then a held sign-in. Only the item's metadata is
             // read, and nothing asks for a sign-in.
@@ -887,10 +1228,32 @@ pub(crate) async fn activate_box(
     let mut request =
         minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
     request.config.hooks_enabled = !args.no_hooks;
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
     // outright, before it allocates anything to tear down. `None` under the
     // skew override, which is what lets an operator proceed.
     request.must_match_version = version_assertion();
+
+    // `--sync` defaults to tarball; `sync_explicit` records whether the
+    // user actually typed the flag, which distinguishes a deliberate
+    // `--sync tarball` (the escape hatch that force-uploads an empty dir
+    // or `$HOME`) from the implicit default.
+    let sync_explicit = args.sync.is_some();
+
+    // Resolve the upload root before opening the daemon connection: a
+    // malformed mfile in an ancestor should fail loudly before we create a
+    // session on the daemon, so we don't leak a draft session. Resolved
+    // before the loadout prep, which checks the project's own hooks and sizes
+    // the finalize budget against the project root — not the directory the
+    // command was invoked from. Only needed for tarball sync, the default:
+    // `--sync none` skips the upload entirely (#770).
+    let upload_root = match args.sync.unwrap_or(SyncMode::Tarball) {
+        SyncMode::None => None,
+        SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
+    };
+    // The record's project root (BOX-001), set on the request below under
+    // every `--sync` mode, `none` included.
+    let project_root = activation_project_root(upload_root.as_deref(), &utf8_path)?;
 
     let (
         policy_path,
@@ -905,20 +1268,28 @@ pub(crate) async fn activate_box(
             // Resolve and compose the loadouts BEFORE opening the daemon
             // connection: a missing loadout file or a malformed one should
             // fail loudly on the client side without ever touching the
-            // daemon.
-            let cfg = config::read_client_config(global)?;
+            // daemon. The same sequence stages the loadout hook scripts and
+            // sizes the finalize hook budget, so `min session activate`,
+            // `min task run`, and the dashboard share it.
             let policy_path = config::user_policy_path(global);
-            let user_policy = config::read_user_policy(global)?;
-            let initial_policy = user_policy.clone();
-            let compose_options = loadouts::compose_options_from_config(&cfg);
             let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
-            let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+            // The project root the upload will carry, so the project's own
+            // hooks are checked and its `[session]` timeouts size the finalize
+            // budget; a subdirectory invocation must not look empty.
+            let hooks = if args.no_hooks {
+                loadouts::HookPrep::Disabled
+            } else {
+                loadouts::HookPrep::Enforce
+            };
+            let inputs =
+                loadouts::prepare_activation_inputs(global, &project_root, selection, hooks, None)?;
 
-            // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
-            // a bad `--loadout` must error before anything prints, so the user is
-            // never told the session is proceeding and then that it is not.
-            // `--sync none` never sends a `minimal.toml`, so offering to create
-            // one there would only write a file the session then ignores.
+            // Scaffold-offer a missing `minimal.toml` only after the loadouts
+            // resolve and compose: a bad `--loadout` must error before anything
+            // prints, so the user is never told the session is proceeding and
+            // then that it is not. `--sync none` never sends a `minimal.toml`,
+            // so offering to create one there would only write a file the
+            // session then ignores.
             if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
                 offer_mfile_scaffold(
                     &utf8_path,
@@ -930,85 +1301,52 @@ pub(crate) async fn activate_box(
                 )?;
             }
 
-            if !active.loadouts.is_empty() {
-                let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-                eprintln!("Applying loadouts: {}", names.join(", "));
-            }
+            inputs.announce_loadouts();
+
             // The contribution carries the banner's loadout display list as a
             // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
             // from it in the launcher baseline). The banner's other dynamic
             // clause — blueprint presence — is a session-filesystem fact,
             // tested by the templates in-shell when they print.
-            // Resolve the loadouts' external hook scripts before anything
-            // touches the daemon: a mistyped path, a symlinked script, or a
-            // missing loadout script directory should fail here, on this
-            // machine, rather than after a session exists on the daemon.
-            let hook_scripts =
-                loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
-
-            // Same idea for the *project's* hooks, which the daemon composes from
-            // the uploaded mfile and which therefore never pass through the
-            // staging above. Nothing here is uploaded — the project tree carries
-            // its own scripts — but the checks a staging pass would have made are
-            // still worth making on this machine, before a session exists.
-            if !args.no_hooks {
-                loadouts::check_project_hooks(&abs_path)?;
-            }
-
-            // The daemon runs the composition's `on_activate` hooks inside
-            // `FinalizeSession`; size that call's deadline to their summed declared
-            // timeouts, computed here while the loadouts are still in hand.
-            let finalize_hook_budget =
-                loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
-
-            let (contribution, user_policy) = loadouts::compose_user_contribution(
-                active,
-                user_policy,
-                compose_options,
-                !args.no_hooks,
-            )?;
             Ok::<_, anyhow::Error>((
                 policy_path,
-                initial_policy,
-                compose_options,
-                hook_scripts,
-                finalize_hook_budget,
-                contribution,
-                user_policy,
+                inputs.initial_policy,
+                inputs.compose_options,
+                inputs.hook_scripts,
+                inputs.hook_budget,
+                inputs.contribution,
+                inputs.user_policy,
             ))
         })
         .await?;
 
-    // `--sync` defaults to tarball; `sync_explicit` records whether the
-    // user actually typed the flag, which distinguishes a deliberate
-    // `--sync tarball` (the escape hatch that force-uploads an empty dir
-    // or `$HOME`) from the implicit default.
-    let sync_explicit = args.sync.is_some();
-    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
-
-    // Resolve the upload root before opening the daemon connection:
-    // a malformed mfile in an ancestor should fail loudly before
-    // we create a session on the daemon, so we don't leak a draft
-    // session. Only needed for tarball sync — `--sync none` skips
-    // the upload entirely (#770).
-    let (upload_root, skip_empty_or_home) = ActivationStep::PlanUpload
+    // The upload decision needs no TTY — the interactive `Confirm` is answered
+    // at the upload step, once the session exists — so it is resolved here,
+    // still before the create. A `$HOME` whose lifecycle hooks a skip would
+    // drop refuses here rather than after a session and its row exist.
+    let upload_plan = ActivationStep::PlanUpload
         .run(async {
-            let upload_root = match sync_mode {
-                SyncMode::None => None,
-                SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
-            };
+            set_project_root(&mut request, project_root)?;
+            // BOX-068: the box's spec, after every flag and the project's
+            // policy are on the request.
+            stamp_session_spec(&mut request, &utf8_path)?;
 
-            // Skip the upload without prompting when the resolved root is an
-            // empty directory or `$HOME` — unless the user asked for it with an
-            // explicit `--sync tarball`, the escape hatch.
-            let skip_empty_or_home = !sync_explicit
-                && upload_root.as_ref().is_some_and(|root| {
-                    file_upload::is_empty_or_home(
-                        root.as_std_path(),
-                        std::env::home_dir().as_deref(),
-                    )
-                });
-            Ok::<_, anyhow::Error>((upload_root, skip_empty_or_home))
+            let Some(root) = upload_root else {
+                return Ok::<_, anyhow::Error>(UploadPlan::Skip);
+            };
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            let decision = decide_workspace_upload(
+                &root,
+                sync_explicit,
+                headless,
+                std::env::home_dir().as_deref(),
+            );
+            // Only a hooks-enabled activation refuses: `--no-hooks` already
+            // disabled the project's hooks, so it cannot drop any by surprise.
+            if !args.no_hooks {
+                refuse_dropped_hooks_before_create(decision, &root, CLI_DROPPED_HOOKS_REMEDY)?;
+            }
+            Ok(UploadPlan::Workspace { root, decision })
         })
         .await?;
 
@@ -1608,116 +1946,56 @@ pub(crate) async fn activate_box(
     // has to run before `ConfigureLoadout`. `--sync none` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
-    ActivationStep::UploadFiles.run(async {
-    match sync_mode {
-        SyncMode::None => {
-            // `--sync none` skips the upload, so the daemon composes against
-            // an empty workspace and the project's `minimal.toml` — packages,
-            // vars, patches, hooks — is silently dropped. Say so when there
-            // is a config to lose, so the default-config session is not a
-            // surprise.
-            if let Some(notice) = sync_none_notice(&utf8_path) {
-                eprintln!("{notice}");
-            }
-        }
-        SyncMode::Tarball if skip_empty_or_home => {
-            // An empty directory has nothing to sync, and `$HOME` is far
-            // too much to ship on a stray confirmation keypress — and if
-            // `$HOME` is itself a VCS root the old gate uploaded it with
-            // no prompt at all. Skip both silently by default; a
-            // deliberate `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that still uploads them.
-            eprintln!("Starting with an empty box (nothing here to sync)");
-        }
-        SyncMode::Tarball => {
-            // Upload from the project root — the directory the mfile
-            // lives in — rather than wherever the user invoked us. This
-            // matches the CLI's config-discovery walk: a user running
-            // `minimal activate ./subdir` still uploads the whole
-            // project. Falls back to `utf8_path` when no mfile is found
-            // anywhere up the tree (#770).
-            let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-            }
-            // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root, or a directory carrying a
-            // `minimal.toml` (a declared project), uploads unconditionally.
-            // For an undeclared non-VCS root an interactive caller gets the
-            // confirm (default No); a headless caller (CI, pipes, agents,
-            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
-            // upload with a warning rather than silently shipping a directory
-            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that force-uploads it anyway (#770).
-            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let should_upload = match file_upload::upload_gate(
-                file_upload::is_vcs_root(upload_root.as_std_path()),
-                sync_explicit,
-                project_has_mfile(&upload_root),
-                headless,
-            ) {
-                file_upload::UploadGate::Upload => true,
-                file_upload::UploadGate::SkipHeadless => {
-                    // Skipping the upload means the project's minimal.toml
-                    // never reaches the daemon, so any lifecycle hooks it
-                    // declares are discarded and never run. Refuse loudly
-                    // instead of exiting 0 on a session silently missing
-                    // them; the caller can force the upload or opt out on
-                    // purpose.
-                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
-                    if dropped_hooks > 0 {
-                        bail!(
-                            "{upload_root} is not a version control repository root, so its \
-                             file upload is being skipped — but its {name} declares \
-                             {dropped_hooks} lifecycle hook(s) that reach the session only \
-                             through that upload. They would be silently dropped and never \
-                             run. Pass `--sync tarball` to upload the project (hooks \
-                             included), or `--sync none` to start without them deliberately.",
-                            name = mfile::MFILE_NAME,
-                        );
+    ActivationStep::UploadFiles
+        .run(async {
+            match upload_plan {
+                UploadPlan::Skip => {
+                    // `--sync none` skips the upload, so the daemon composes against
+                    // an empty workspace and the project's `minimal.toml` — packages,
+                    // vars, patches, hooks — is silently dropped. Say so when there
+                    // is a config to lose, so the default-config session is not a
+                    // surprise.
+                    if let Some(notice) = sync_none_notice(&utf8_path) {
+                        eprintln!("{notice}");
                     }
-                    eprintln!(
-                        "{}",
-                        file_upload::skipped_upload_warning(upload_root.as_std_path())
-                    );
-                    false
                 }
-                file_upload::UploadGate::Prompt => confirm(
-                    &format!(
-                        "{upload_root} is not a version control repository root. \
-                         Upload all files from this directory?"
-                    ),
-                    false,
-                )?,
-            };
-            if should_upload {
-                let uploaded = client
-                    .upload_workspace_files(id, upload_root.as_std_path())
-                    .await;
-                if let Err(error) = uploaded {
-                    // The upload failed: the activation is abandoned, and the
-                    // row its registration bought goes with it (T66).
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        request.config.name.as_deref(),
-                        request.config.box_addresses,
-                        registered
-                            .as_ref()
-                            .and_then(|registration| registration.box_id),
+                UploadPlan::Workspace { root, decision } => {
+                    // `--no-hooks` already disabled the project's hooks, so a
+                    // skip cannot drop anything by surprise and says nothing
+                    // about them.
+                    let dropped_hooks = if args.no_hooks {
+                        DroppedHooksPolicy::Ignore
+                    } else {
+                        DroppedHooksPolicy::Refuse
+                    };
+                    if let Err(error) = cli_workspace_upload(
+                        &mut client,
+                        id,
+                        &utf8_path,
+                        &root,
+                        decision,
+                        dropped_hooks,
                     )
-                    .await;
-                    return Err(error.context("Failed to upload project files"));
+                    .await
+                    {
+                        // The upload failed: the activation is abandoned, and
+                        // the row its registration bought goes with it (T66).
+                        withdraw_box_row(
+                            control_sock.clone(),
+                            request.config.name.as_deref(),
+                            request.config.box_addresses,
+                            registered
+                                .as_ref()
+                                .and_then(|registration| registration.box_id),
+                        )
+                        .await;
+                        return Err(error);
+                    }
                 }
-            } else if !headless {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
-            }
-        }
-    };
-    Ok::<_, anyhow::Error>(())
-    }).await?;
+            };
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
 
     // Collect the client-side patches (from loadouts, already gated
     // in Phase 1) *before* the wire contribution moves into the
@@ -2089,6 +2367,135 @@ mod tests {
     use super::*;
     use boxes::DynamicIngress;
 
+    /// BOX-001: a create from `<root>/sub` sends `<root>`, the directory
+    /// that holds `minimal.toml`, as the project root.
+    #[test]
+    fn create_from_a_subdirectory_sends_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "rooted",
+            paths::HostAbsPath::try_new(sub.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+
+        stamp_project_root(&mut request, &sub).unwrap();
+
+        assert_eq!(
+            request.config.project_root,
+            Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
+        );
+        assert_eq!(request.config.project_path.as_str(), sub.as_str());
+    }
+
+    /// BOX-068: the create request carries the box's spec: the project's
+    /// `[session]` table with the request's flags for an activation, and
+    /// the declared task for `min task run`.
+    #[test]
+    fn activation_puts_the_spec_on_the_create_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[session]\npackages = [\"git\"]\n\n[tasks.lint]\nexec = [\"true\"]\npackages = [\"rust\"]\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy::deny_all()),
+            ..Default::default()
+        };
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "specced",
+            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            policy.clone(),
+        );
+        request.config.hooks_enabled = false;
+        assert_eq!(request.spec, None);
+
+        stamp_session_spec(&mut request, root).unwrap();
+
+        let wire = request.spec.clone().expect("the spec is on the request");
+        // The request carries the `box.toml` tables and the mode's spec word.
+        assert_eq!(wire["v"], mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(wire["box"]["type"], boxes::SESSION_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], true);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["git"])
+        );
+        assert_eq!(wire["network"]["mode"], "own_ip");
+        assert_eq!(
+            wire["network"]["egress"]["allow_subnets"],
+            serde_json_lenient::json!([])
+        );
+        assert!(wire.get("type").is_none() && wire.get("packages").is_none());
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent.v, mfile::spec::BOX_SPEC_VERSION);
+        assert_eq!(sent.box_type, boxes::SESSION_BOX_TYPE);
+        assert_eq!(sent.packages, vec!["git".to_string()]);
+        assert!(!sent.hooks_enabled, "--no-hooks reaches the spec");
+        assert_eq!(sent.network.mode, boxes::NetworkMode::OwnIp);
+        assert_eq!(sent.network.policy, policy);
+
+        // The task path: the declared task's spec, through the same helper.
+        let file = mfile::File::from_dir_recursive(dir.path()).unwrap();
+        let task =
+            mfile::spec::BoxSpec::for_task("lint", &file.tasks["lint"], spec_flags(&request))
+                .expect("a task that is not interactive has a spec");
+        put_spec(&mut request, &task).unwrap();
+        let wire = request.spec.clone().unwrap();
+        assert_eq!(wire["box"]["type"], boxes::TASK_BOX_TYPE);
+        assert_eq!(wire["io"]["pty_enabled"], false);
+        assert_eq!(
+            wire["install"]["packages"],
+            serde_json_lenient::json!(["rust"])
+        );
+        let sent: mfile::spec::BoxSpec = serde_json_lenient::from_value(wire).unwrap();
+        assert_eq!(sent, task);
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(stamp_session_spec(&mut request, root).is_err());
+    }
+
+    /// BOX-001: with no tarball upload root, a subdirectory resolves to the
+    /// directory that holds `minimal.toml`, and a `minimal.toml` that does
+    /// not load is an error. A resolved upload root is reused as it is.
+    #[test]
+    fn activation_project_root_resolves_the_root_and_refuses_a_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        assert_eq!(
+            activation_project_root(None, &sub).unwrap(),
+            root.to_path_buf()
+        );
+
+        let resolved = camino::Utf8Path::new("/resolved/root");
+        assert_eq!(
+            activation_project_root(Some(resolved), &sub).unwrap(),
+            resolved.to_path_buf()
+        );
+
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        assert!(activation_project_root(None, &sub).is_err());
+    }
+
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
         assert_eq!(
@@ -2354,7 +2761,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         // The egress here is unset, so both runs refuse for that too. Only
         // the narrow-scope refusal depends on the acknowledgement.
         let narrow = |acknowledged: bool| {
@@ -2399,7 +2806,7 @@ mod tests {
             )
             .expect("write minimal.toml");
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-            let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
             let egress = boxes::EgressPolicy {
                 allow_dns_hosts: Some(
                     bep::module::GITHUB
@@ -2445,7 +2852,7 @@ mod tests {
         )
         .expect("write minimal.toml");
         let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
-        let (bep, secrets, spec_env) = project_bep_and_grants(path).expect("loads");
+        let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
         assert_eq!(bep.steering, Some(boxes::core::bep::Steering::ProxyEnv));
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
         refuse_unhonourable_grants(
@@ -2475,6 +2882,227 @@ mod tests {
         assert!(credentialed_upstream_for(true, &bep, &client).is_some());
         let broker = SecretGrants::from([("GH_TOKEN".into(), grant(GrantSource::Broker))]);
         assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
+    }
+
+    /// One broker grant `OPENAI_KEY` that reads the item `openai-key`.
+    fn store_grant() -> boxes::core::bep::SecretGrants {
+        boxes::core::bep::SecretGrants::from([(
+            "OPENAI_KEY".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["openai-key".into()],
+                mode: None,
+            },
+        )])
+    }
+
+    /// A rule for `openai-key` that sends it to `api.openai.com`.
+    fn store_rule(action: Option<boxes::core::bep::StoreAction>) -> boxes::core::bep::StoreRules {
+        boxes::core::bep::StoreRules::from([(
+            "openai-key".into(),
+            boxes::core::bep::StoreRuleConfig {
+                store: None,
+                upstream: vec!["api.openai.com".into()],
+                header: Some("Authorization".into()),
+                prefix: Some("Bearer ".into()),
+                basic_auth: None,
+                action,
+            },
+        )])
+    }
+
+    fn egress_of(hosts: &[&str]) -> boxes::EgressPolicy {
+        boxes::EgressPolicy {
+            allow_dns_hosts: Some(hosts.iter().map(|h| (*h).to_owned()).collect()),
+            ..boxes::EgressPolicy::default()
+        }
+    }
+
+    fn never_ask(question: &str) -> Result<bool, anyhow::Error> {
+        panic!("asked with no terminal: {question}")
+    }
+
+    /// BEP-035: a store reference that no rule names is refused at
+    /// creation, through the reader creation uses, with exit 3. A box with
+    /// no store reference reads no configuration and passes.
+    #[test]
+    fn store_reference_without_rule_is_refused_at_creation() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let global = crate::cli::GlobalArgs {
+            config_dir: Some(config_dir.path().to_path_buf()),
+            ..crate::cli::GlobalArgs::default()
+        };
+        let egress = egress_of(&["api.openai.com"]);
+        let err = check_store_grants(&global, &store_grant(), Some(&egress), false)
+            .expect_err("a reference with no rule is refused");
+        let refused = err
+            .downcast_ref::<GrantNotDelivered>()
+            .expect("a refusal main.rs ends with exit 3");
+        assert_eq!(
+            refused,
+            &GrantNotDelivered::NoStoreRule {
+                grant: "OPENAI_KEY".into(),
+                item: "openai-key".into(),
+            }
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("OPENAI_KEY") && text.contains("openai-key"),
+            "{text}"
+        );
+        assert!(text.contains("[secret-store-rules]"), "{text}");
+
+        let none = check_store_grants(&global, &boxes::core::bep::SecretGrants::new(), None, false)
+            .expect("no store reference, nothing to refuse");
+        assert!(none.is_empty());
+
+        // A rule in another store does not name the reference.
+        let mut other = store_rule(None);
+        other.get_mut("openai-key").expect("rule").store = Some("vault".into());
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &other, true, &mut never_ask)
+                .expect_err("a rule in another store is no rule");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::NoStoreRule { .. })
+        ));
+
+        let accepted = accept_store_references(
+            &store_grant(),
+            Some(&egress),
+            &store_rule(None),
+            false,
+            &mut never_ask,
+        )
+        .expect("a matching rule inside the egress is accepted");
+        assert_eq!(accepted, store_rule(None));
+    }
+
+    /// BEP-036: a rule whose upstream the box's egress does not admit
+    /// refuses the creation with exit 3, naming the missing host.
+    #[test]
+    fn store_rule_outside_egress_exits_3() {
+        for egress in [None, Some(egress_of(&["example.com"]))] {
+            let err = accept_store_references(
+                &store_grant(),
+                egress.as_ref(),
+                &store_rule(None),
+                true,
+                &mut never_ask,
+            )
+            .expect_err("an upstream outside the egress is refused");
+            let refused = err
+                .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                .expect("an activation refusal");
+            assert_eq!(refused.exit_code(), 3);
+            assert_eq!(
+                refused.refusals,
+                [boxes::core::bep::BepRefusal::StoreHostsOutsideEgress {
+                    grant: "OPENAI_KEY".into(),
+                    missing: vec!["api.openai.com".into()],
+                }]
+            );
+            assert!(err.to_string().contains("api.openai.com"), "{err}");
+        }
+    }
+
+    /// BEP-035: an `ask` rule with no terminal denies the reference, and
+    /// asks nothing. With a terminal it asks, and the answer decides.
+    #[test]
+    fn ask_rule_without_a_terminal_denies() {
+        let egress = egress_of(&["api.openai.com"]);
+        let ask = store_rule(Some(boxes::core::bep::StoreAction::Ask));
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &ask, false, &mut never_ask)
+                .expect_err("no terminal denies");
+        let refused = err.downcast_ref::<GrantNotDelivered>().expect("exit 3");
+        assert_eq!(
+            refused,
+            &GrantNotDelivered::AskWithoutTerminal {
+                grant: "OPENAI_KEY".into(),
+                item: "openai-key".into(),
+            }
+        );
+        assert!(refused.to_string().contains("--no-input"), "{refused}");
+
+        let mut questions = Vec::new();
+        let accepted =
+            accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |q| {
+                questions.push(q.to_owned());
+                Ok(true)
+            })
+            .expect("a yes accepts");
+        assert_eq!(accepted, ask);
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].contains("api.openai.com"), "{}", questions[0]);
+        assert_eq!(
+            printable("KEY\u{1b}[2K\nAllow? y"),
+            "KEY\\u{1b}[2K\\nAllow? y"
+        );
+
+        let err = accept_store_references(&store_grant(), Some(&egress), &ask, true, &mut |_| {
+            Ok(false)
+        })
+        .expect_err("a no refuses");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDeclined { .. })
+        ));
+
+        let deny = store_rule(Some(boxes::core::bep::StoreAction::Deny));
+        let err =
+            accept_store_references(&store_grant(), Some(&egress), &deny, true, &mut never_ask)
+                .expect_err("a deny rule refuses");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDenied { .. })
+        ));
+
+        // A deny after an ask asks nothing: every refusal comes first.
+        let mut two = store_grant();
+        two.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["other-key".into()],
+                mode: None,
+            },
+        );
+        let mut ask_then_deny = ask.clone();
+        let mut denied = deny["openai-key"].clone();
+        denied.upstream = vec!["api.openai.com".into()];
+        ask_then_deny.insert("other-key".into(), denied);
+        let err =
+            accept_store_references(&two, Some(&egress), &ask_then_deny, true, &mut never_ask)
+                .expect_err("the deny refuses before any question");
+        assert!(matches!(
+            err.downcast_ref::<GrantNotDelivered>(),
+            Some(GrantNotDelivered::StoreReferenceDenied { .. })
+        ));
+
+        // One item under two grants is asked once, and names both grants.
+        let mut shared = store_grant();
+        shared.insert(
+            "ZZ_TOKEN".into(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["openai-key".into()],
+                mode: None,
+            },
+        );
+        let mut questions = Vec::new();
+        let accepted = accept_store_references(&shared, Some(&egress), &ask, true, &mut |q| {
+            questions.push(q.to_owned());
+            Ok(true)
+        })
+        .expect("a yes accepts both grants");
+        assert_eq!(accepted, ask);
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(
+            questions[0].contains("OPENAI_KEY") && questions[0].contains("ZZ_TOKEN"),
+            "{}",
+            questions[0]
+        );
     }
 
     /// BEP-010: `steering = "off"` with `proxy_env = true` is refused with

@@ -75,14 +75,16 @@
 //! A socket in the pool is a lane onto the host for the box whose share
 //! holds it, so binding one is gated: **T69 is the only task that may
 //! bind a socket on the peer** — it carries the per-source caps and the
-//! pre-screen that holds a share before the stack assigns a listener —
-//! and not even T69 binds on a production boot yet. The credentialed-
-//! only gate rule (NET-145, T45, #1665) is still ahead, so the
-//! supervisor wires [`NoBoxes`] there: no row, no share, no socket, and
-//! a box's connection to the proxy's address is answered the way a
-//! stack with no listener answers it. Only the stand-in's own boot
-//! (`MINVMD_BEP_STUB`, a test/e2e surface) wires rows, and only where a
-//! lane asked for it.
+//! pre-screen that holds a share before the stack assigns a listener.
+//! The credentialed-only gate is `egress::proxy_lane_admits` (T45,
+//! #1885). `bep_box_source` in `minvmd`'s `cmd/run.rs` picks the source
+//! the supervisor wires. A boot with no listening acceptor wires
+//! [`NoBoxes`]: no row, no share, no socket, and a box's connection to
+//! the proxy's address is answered the way a stack with no listener
+//! answers it. A boot whose `bep serve` listens wires
+//! `CredentialedBoxes`, and only the registered rows that declare a
+//! credentialed upstream get a share (§7.1). When the acceptor stops
+//! listening, that source gives no rows again, and the shares go.
 //!
 //! The peer is silent until spoken to. It originates no frame except in
 //! answer to one that addressed it — the ARP reply, the TCP reset for an
@@ -331,12 +333,12 @@ pub trait BepBoxSource: Send + Sync {
 
 /// A box source with no rows: the wiring that binds nothing. A socket in
 /// the pool is a lane onto the host for the box whose share holds it, so
-/// until the credentialed-only gate rule (NET-145, T45, #1665) decides who
-/// may reach one, a production boot hands the peer this source — no row,
-/// no share, no socket — and a box's connection to the proxy's address
-/// meets the stack's own reset, the answer an acceptor that is down is
-/// specified to give. The stand-in's own boot is the one wiring that
-/// registers rows, and it runs only where a lane asked for it.
+/// where the gate `egress::proxy_lane_admits` (T45, #1885) decides who
+/// may reach one, a boot with no listening acceptor hands the peer this
+/// source — no row, no share, no socket — and a box's connection to the
+/// proxy's address meets the stack's own reset, the answer an acceptor
+/// that is down is specified to give. A boot whose `bep serve` listens
+/// uses `CredentialedBoxes` in `minvmd` instead.
 #[derive(Debug, Default)]
 pub struct NoBoxes;
 
