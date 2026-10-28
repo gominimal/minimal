@@ -238,8 +238,9 @@ while [ $# -gt 0 ]; do
             case "$2" in ''|*[!0-9]*)
                 die "--cohort-dscp needs a numeric DSCP value, got: $2" ;;
             esac
-            [ "$2" -ge 1 ] && [ "$2" -le 63 ] ||
+            if [ "$2" -lt 1 ] || [ "$2" -gt 63 ]; then
                 die "--cohort-dscp needs a DSCP value from 1 to 63, got: $2"
+            fi
             cohort_dscp=$2
             shift 2
             ;;
