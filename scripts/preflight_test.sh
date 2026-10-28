@@ -158,6 +158,8 @@ if grep -qF "Docker daemon" <<<"$out"; then
 else
     expect "Linux, native musl skips the cross checks" 0 "all required checks passed"
 fi
+FORCE_CROSS=1 run all
+expect "Linux, native musl with FORCE_CROSS=1 checks cross" 0 "warn  running Docker daemon"
 
 setup Linux x86_64
 stub pkg-config 'exit 1'

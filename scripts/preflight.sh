@@ -123,9 +123,12 @@ check_cross() {
     fi
 }
 
-# native_musl: true when scripts/build-initramfs.sh can build the guest
-# minimald without `cross`. Keep this in step with the detection there.
+# native_musl: true when `just initramfs` builds the guest minimald without
+# `cross`. Keep this in step with the detection in scripts/build-initramfs.sh.
+# The recipe passes the host arch as the target, so the arch check there always
+# holds for it. A direct call to that script defaults to aarch64 instead.
 native_musl() {
+    [ "${FORCE_CROSS:-0}" != 1 ] || return 1
     local target="$host_arch-unknown-linux-musl" list=""
     if have rustup; then list="$(rustup target list --installed 2>/dev/null || true)"; fi
     grep -qx -- "$target" <<<"$list" && have "$host_arch-linux-musl-gcc"
