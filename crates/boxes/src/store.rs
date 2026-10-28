@@ -1551,6 +1551,9 @@ mod tests {
             box_id: None,
             host_row_bound: true,
             bound_ports: std::collections::BTreeSet::new(),
+            // Non-default for the same reason: `false` is its serde default, and
+            // a dropped marker would strand a run box on resume (NET-131).
+            ends_with_run: true,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             // Set, so a field dropped on write shows up as a diff: `None` is

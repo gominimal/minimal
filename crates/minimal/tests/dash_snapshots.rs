@@ -87,6 +87,8 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // No run ever minted these records, so none ends with one.
+        ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
         box_type: None,

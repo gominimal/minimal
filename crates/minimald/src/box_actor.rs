@@ -131,6 +131,12 @@ pub(crate) struct BoxActorConfig {
     /// `CreateSession`, or `None` for a session brought up any other way
     /// (from disk, or by an in-process caller). See `BoxActor::creator`.
     pub creator: Option<std::sync::Weak<()>>,
+    /// Whether [`BoxActor::run`] registers the box's name route before the
+    /// actor goes live. `true` for every bring-up but the restart resume's
+    /// teardown of a box that ends with its run (NET-131): that actor
+    /// lives only to run its destroy hooks, so it must never take over a
+    /// name that another box already routes.
+    pub registers_name: bool,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -622,6 +628,8 @@ impl BoxActor {
             manager,
             deny_all_opt_out,
             creator,
+            // Read by `run` before the actor is assembled.
+            registers_name: _,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -820,6 +828,8 @@ impl BoxActor {
             destroying.clone(),
             Arc::clone(&host_slot),
         );
+        #[cfg(target_os = "linux")]
+        let registers_name = conf.registers_name;
         let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
@@ -834,8 +844,14 @@ impl BoxActor {
         // session's operation behind it. A resumed handed box the verdict
         // has not vouched for publishes at the `127.0.0.1` interim at once,
         // and the present landing's sweep moves it to its hand.
+        //
+        // A teardown-only bring-up (`registers_name: false`) skips this:
+        // the box is about to be destroyed, and a registration here would
+        // take over a name another box already routes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record(), false).await;
+        if registers_name {
+            actor.register_hostname(obj.record(), false).await;
+        }
 
         // The actor outlives the message that brought it up (a create, the
         // resume an RPC naming the box makes): its own root, linked to that

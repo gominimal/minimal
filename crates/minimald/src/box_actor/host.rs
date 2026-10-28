@@ -1416,6 +1416,7 @@ mod quic443_cohort_tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            ends_with_run: false,
             box_type: None,
             parent: None,
             project_root: None,

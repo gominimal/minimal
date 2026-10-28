@@ -177,6 +177,13 @@ impl Store {
                 let _ = r.send(self.store.save(&k, &v));
             }
             StoreMessage::SessionDelete(k, r) => {
+                #[cfg(test)]
+                if test_faults::take_delete_failure(k.id()) {
+                    let _ = r.send(Err(std::io::Error::other(
+                        "test fault: the record delete failed",
+                    )));
+                    return;
+                }
                 let _ = r.send(self.store.delete(&k));
             }
             StoreMessage::CompositionLoad(k, r) => {
@@ -399,6 +406,44 @@ impl WeakStoreHandle {
     }
 }
 
+/// Test-only faults the store actor injects, keyed by the box id so
+/// tests that run in parallel do not see each other's faults.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use boxes::SessionId;
+    use std::sync::Mutex;
+
+    static FAIL_NEXT_DELETE: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// Makes the next record delete of `id` fail once.
+    pub(crate) fn fail_next_delete(id: SessionId) {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .push(id);
+    }
+
+    /// Whether a delete failure of `id` is armed and not yet consumed.
+    pub(crate) fn delete_failure_armed(id: &SessionId) -> bool {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .contains(id)
+    }
+
+    /// Consumes the armed delete failure of `id`, if there is one.
+    pub(super) fn take_delete_failure(id: &SessionId) -> bool {
+        let mut armed = FAIL_NEXT_DELETE.lock().expect("test fault lock poisoned");
+        match armed.iter().position(|armed_id| armed_id == id) {
+            Some(index) => {
+                armed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +479,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
