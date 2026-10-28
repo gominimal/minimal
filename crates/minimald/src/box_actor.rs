@@ -1622,7 +1622,7 @@ fn survives_conditional_destroy(status: BoxState) -> bool {
 
 #[cfg(test)]
 mod destroy_if_unfinalized_tests {
-    use super::{survives_conditional_destroy, BoxState};
+    use super::{BoxState, survives_conditional_destroy};
 
     #[test]
     fn destroy_if_unfinalized_keeps_a_stopped_or_exited_record() {
