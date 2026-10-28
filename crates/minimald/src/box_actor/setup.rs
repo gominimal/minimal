@@ -678,22 +678,12 @@ impl BoxActor {
         }
     }
 
-    /// Kicks off a background package build as a side-op and registers it on
-    /// this session, returning the receiver end of its event stream. The build
-    /// runs against a fresh workspace-rooted context (rebuilt per call so it
-    /// tracks `minimal.toml` edits).
-    ///
-    /// The returned receiver closes when the build ends.
-    pub(super) async fn start_build(
-        &mut self,
-        rebuild: bool,
-        pkgs: Vec<String>,
-    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
-        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
-        // NET-155: the box's builds run in the box's own classifier leaf, so
-        // its egress verdict decides what the builds can reach.
+    /// Where this box's package builds run (NET-155): the box's own
+    /// classifier leaf, so its egress verdict decides what the builds can
+    /// reach. A box whose launch placed it in a leaf never builds outside it,
+    /// so a missing leaf refuses the build.
+    async fn build_placement(&self) -> Result<crate::box_ops::BuildPlacement, std::io::Error> {
         let record = self.record.record().await?;
-        // A box whose launch placed it in a leaf never builds outside it.
         let box_id = record.id.to_string();
         let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
         let placed = record.host_ip_enforcement == Some(boxes::HostIpEnforcement::PerBox);
@@ -710,7 +700,22 @@ impl BoxActor {
             );
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal)
         })?;
-        let placement = crate::box_ops::BuildPlacement { box_name, leaf };
+        Ok(crate::box_ops::BuildPlacement { box_name, leaf })
+    }
+
+    /// Kicks off a background package build as a side-op and registers it on
+    /// this session, returning the receiver end of its event stream. The build
+    /// runs against a fresh workspace-rooted context (rebuilt per call so it
+    /// tracks `minimal.toml` edits).
+    ///
+    /// The returned receiver closes when the build ends.
+    pub(super) async fn start_build(
+        &mut self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let placement = self.build_placement().await?;
         let (sop, rx) =
             SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, placement, 64).await?;
         match &mut self.inner {
@@ -756,6 +761,20 @@ impl BoxActor {
         opts: MaterializeOpts,
     ) -> Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        // NET-155: the package builds a materialize starts run in the box's
+        // leaf, the same as a build side-op's.
+        let placement = self.build_placement().await?;
+        let ctx = match placement.leaf {
+            Some(leaf) => {
+                tracing::info!(
+                    box_name = %placement.box_name,
+                    leaf = %leaf.dir().display(),
+                    "starting a materialize for a box in the box's classifier leaf",
+                );
+                ctx.with_classifier_leaf(leaf)
+            }
+            None => ctx,
+        };
         let (sop, rx) = SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),

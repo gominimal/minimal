@@ -451,9 +451,18 @@ impl BuildTap {
     }
 
     /// The refusal to report, if the box's egress rules refused a
-    /// destination one of its package builds tried to reach.
-    pub(crate) fn refusal(&self, placement: &BuildPlacement) -> Option<String> {
-        let mut builds: Vec<_> = self.builds.iter().collect();
+    /// destination that the failed package build tried to reach.
+    ///
+    /// `failure` is the error the build returned. Only a build that the
+    /// error names as failed is read, so a package that printed a failed
+    /// download and still built is never blamed for another package's
+    /// failure. When the error names no build, nothing is reported.
+    pub(crate) fn refusal(&self, placement: &BuildPlacement, failure: &str) -> Option<String> {
+        let mut builds: Vec<_> = self
+            .builds
+            .iter()
+            .filter(|(_, (package, _))| failure.contains(&format!("`{package}` failed to build")))
+            .collect();
         builds.sort_by_key(|(idx, _)| **idx);
         builds.into_iter().find_map(|(_, (package, lines))| {
             crate::env::egress_refusal(
@@ -589,7 +598,7 @@ impl SideOp {
                             let _ = sink.try_send(BuildUpdate::Event(event.clone()));
                         }
                     }
-                    tap.refusal(&placement)
+                    (tap, placement)
                 });
 
                 // Do the build. Reduce its `!Send` error (`mctx::Error` holds
@@ -605,7 +614,7 @@ impl SideOp {
                         Some(e.to_string())
                     }
                 };
-                let refusal = pump.await.ok().flatten();
+                let tap = pump.await.ok();
 
                 // Classify the terminal outcome. A build that returned `Ok` is
                 // a success even if the token was cancelled afterwards (e.g. a
@@ -617,10 +626,15 @@ impl SideOp {
                     Some(_) if cancel_flag.is_cancelled() => BuildOutcome::Cancelled,
                     // NET-155: a build the box's rules refused names the
                     // destination and the box before the build's own error.
-                    Some(msg) => BuildOutcome::Failed(match refusal {
-                        Some(refusal) => format!("{refusal}\n{msg}"),
-                        None => msg,
-                    }),
+                    Some(msg) => {
+                        let refusal = tap
+                            .as_ref()
+                            .and_then(|(tap, placement)| tap.refusal(placement, &msg));
+                        BuildOutcome::Failed(match refusal {
+                            Some(refusal) => format!("{refusal}\n{msg}"),
+                            None => msg,
+                        })
+                    }
                 };
 
                 finish(&build_inner, BuildUpdate::Finished(outcome)).await;

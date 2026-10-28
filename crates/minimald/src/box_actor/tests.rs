@@ -12289,6 +12289,14 @@ fn box_package_build_under_box_egress_verdict() {
         "curl: (6) Could not resolve host: downloads.example.org",
         "build command failed",
     ];
+    // The error the build returns, as the daemon receives it.
+    let failed = |package: &str| {
+        mctx::Error::from(orchestrator::Error::BuildFailed(
+            package.to_string(),
+            op::Error::Other(anyhow::anyhow!("build command failed")),
+        ))
+        .to_string()
+    };
     let run = |name: &str, leaf| {
         let placement = BuildPlacement {
             box_name: name.to_string(),
@@ -12298,10 +12306,10 @@ fn box_package_build_under_box_egress_verdict() {
         for event in build_events("fetcher", &download) {
             tap.observe(&event, &placement);
         }
-        tap.refusal(&placement)
+        tap.refusal(&placement, &failed("fetcher"))
     };
     assert_eq!(
-        run("sealed", Some(sealed)).as_deref(),
+        run("sealed", Some(sealed.clone())).as_deref(),
         Some(
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it"
@@ -12309,6 +12317,27 @@ fn box_package_build_under_box_egress_verdict() {
     );
     assert_eq!(run("open", Some(open)), None);
     assert_eq!(run("unplaced", None), None);
+
+    // Only the build that failed is read. A package that printed a failed
+    // download and still built is not blamed when another package fails.
+    let placement = BuildPlacement {
+        box_name: "sealed".to_string(),
+        leaf: Some(sealed),
+    };
+    let mut tap = BuildTap::default();
+    let other = build_events("compiler", &["error: cc failed"])
+        .into_iter()
+        .map(|mut event| {
+            event.idx = 8;
+            event
+        });
+    for event in build_events("fetcher", &download).into_iter().chain(other) {
+        tap.observe(&event, &placement);
+    }
+    assert_eq!(tap.refusal(&placement, &failed("compiler")), None);
+    assert!(tap.refusal(&placement, &failed("fetcher")).is_some());
+    // An error that names no build reports no refusal.
+    assert_eq!(tap.refusal(&placement, "the build was cancelled"), None);
 }
 
 /// NET-155: the error of a build the box's egress rules refused names the
