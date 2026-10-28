@@ -63,7 +63,18 @@ else
   else
     echo "build-initramfs: cross build ($TARGET)" >&2
     command -v cross >/dev/null || cargo install cross --locked
-    cross "$@"
+    # On macOS, check what cross needs before it runs, so a missing toolchain
+    # or Docker daemon prints its fix instead of an error from inside cross.
+    # The check runs after the install line above, so a missing cross still
+    # installs itself. Only this branch calls cross, so the prebuilt and native
+    # builds skip the check.
+    if [ "$(uname -s)" = Darwin ]; then
+      "$ROOT/scripts/preflight.sh" cross
+    fi
+    # The cross-rs images are amd64-only. cross builds its pre-build image
+    # without --platform, and Docker Desktop on arm64 then fails with "no match
+    # for platform in manifest" (OrbStack falls back to amd64 on its own).
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" cross "$@"
   fi
   BIN="$ROOT/target/$TARGET/initramfs/minimald"
   [ -x "$BIN" ] || { echo "minimald not built at $BIN" >&2; exit 1; }

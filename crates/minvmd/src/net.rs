@@ -795,8 +795,12 @@ impl HostGvproxy {
         // In force, the gate decides a frame from the daemon's own address
         // by it, beside the boxes' rows; announced — the shipped posture —
         // the allow-all interim node row still does, and the gate's
-        // start-up line names the posture deciding.
-        let baseline = NodePlaneBaseline::built_in(subnet);
+        // start-up line names the posture deciding. The host exposures the
+        // alias is opened at for the node row — none unless the deployment
+        // names ports — are read from the daemon's environment here, on each
+        // spawn, an unparseable list failing it.
+        let baseline = NodePlaneBaseline::built_in(subnet)
+            .with_host_exposure(baseline::host_exposure_ports_from_env()?);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
