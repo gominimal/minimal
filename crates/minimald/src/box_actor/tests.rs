@@ -12427,3 +12427,42 @@ fn box_package_build_refusal_names_destination_and_box() {
         .is_some()
     );
 }
+
+/// NET-155: a task of a box whose launch placed it in a classifier leaf is
+/// refused when the task's context has no leaf, with the same text the build
+/// side operation gives. Its builds never run outside the box's egress verdict.
+#[test]
+fn box_package_build_under_box_egress_verdict_refuses_task_of_placed_box_without_leaf() {
+    let refusal =
+        crate::exec::task_build_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", false)
+            .expect_err("a placed box with no leaf has its task refused");
+    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        refusal.to_string(),
+        "the build for box sealed did not start: box sealed runs under \
+         egress rules, and this host cannot apply them to the build"
+    );
+    assert_eq!(
+        Err(refusal.to_string()),
+        super::setup::box_build_leaf(
+            tempfile::tempdir().unwrap().path(),
+            "sealed",
+            "sealed",
+            true
+        ),
+        "the task refusal and the build refusal say the same thing"
+    );
+    // A placed box with its leaf builds in that leaf.
+    crate::exec::task_build_refusal(Some(boxes::HostIpEnforcement::PerBox), "sealed", true)
+        .expect("a placed box with its leaf builds");
+}
+
+/// NET-155: a task of a box that was never placed in a leaf still builds,
+/// in the daemon's own cgroup, as before.
+#[test]
+fn box_package_build_under_box_egress_verdict_builds_task_of_box_never_placed() {
+    for enforcement in [None, Some(boxes::HostIpEnforcement::None)] {
+        crate::exec::task_build_refusal(enforcement, "plain", false)
+            .expect("a box that was never placed builds without a leaf");
+    }
+}

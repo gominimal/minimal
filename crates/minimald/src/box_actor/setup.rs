@@ -54,12 +54,20 @@ pub(crate) fn box_build_leaf(
     .find(|leaf| leaf.dir().is_dir());
     match leaf {
         Some(leaf) => Ok(Some(leaf)),
-        None if placed => Err(format!(
-            "the build for box {box_name} did not start: box {box_name} runs under \
-             egress rules, and this host cannot apply them to the build"
-        )),
+        None if placed => Err(placed_box_build_refusal(box_name)),
         None => Ok(None),
     }
+}
+
+/// The refusal for a build of the box `box_name` when its launch placed it
+/// in a classifier leaf and that leaf is gone (NET-155). Every refusal of
+/// this kind uses this text: [`box_build_leaf`] and the task path
+/// (`exec::task_build_refusal`).
+pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
+    format!(
+        "the build for box {box_name} did not start: box {box_name} runs under \
+         egress rules, and this host cannot apply them to the build"
+    )
 }
 
 /// The policy the gate enforces for a session: its declared ingress, and its
