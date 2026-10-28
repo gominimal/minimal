@@ -1346,6 +1346,16 @@ impl BoxManager {
             // surviving run client's `DeleteSession`, reaches this actor
             // rather than bringing up a second one.
             //
+            // The interim is deliberate, not an oversight: the
+            // architecture's stopped-with-reason flip is BOX-012/BOX-154
+            // work owned by gominimal/inbox#731. The stored status enum
+            // (`BoxState`) has no `stopped` spelling and `Record`
+            // carries no `reason` field yet, so a restart cannot set
+            // `stopped` with `reason = "stopped"` here without adding
+            // both first. Applying that change on this PR would grow
+            // its scope past the run-owned-box reap it ships. Keeping
+            // this TODO until the inbox work lands and removes it.
+            //
             // TODO(gominimal/inbox#731, BOX-012/BOX-154): this reap of a
             // run's `running` record at restart is an interim against
             // architecture line 495: a restart sets an orphaned `running`
