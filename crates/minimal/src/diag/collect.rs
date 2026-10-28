@@ -156,19 +156,8 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
     }
 
-    // CA metadata only, and the private key is never touched. The retired
-    // reverse proxy's client certificate is not collected (NET-109).
-    w.skip(
-        "config/client.key",
-        "private key material — never collected",
-    );
-    let certs: std::collections::BTreeMap<&str, Option<FileMeta>> =
-        [("ca.pem", file_meta(&paths.config.join("ca.pem")).await)]
-            .into_iter()
-            .collect();
-    let json = serde_json_lenient::to_vec_pretty(&certs).context("serializing cert metadata")?;
-    w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
-        .await?;
+    // The retired reverse proxy's client certificate, key and CA are not
+    // collected, and their absence is not recorded either (NET-109).
 
     // Mesh enrolment holds only a host:port endpoint. No-follow like every
     // other content read: it ships verbatim, so a symlink here would
@@ -222,24 +211,6 @@ async fn read_string_nofollow(src: &Path) -> Result<String, anyhow::Error> {
         .await
         .with_context(|| format!("reading {}", src.display()))?;
     Ok(content)
-}
-
-#[derive(Serialize)]
-struct FileMeta {
-    bytes: u64,
-    mtime_unix: Option<u64>,
-}
-
-async fn file_meta(path: &Path) -> Option<FileMeta> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    Some(FileMeta {
-        bytes: meta.len(),
-        mtime_unix: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs()),
-    })
 }
 
 // ── state/ ───────────────────────────────────────────────────────────────────
@@ -1240,8 +1211,8 @@ mod tests {
             );
         }
         assert!(
-            files.contains_key("config/client-cert.json"),
-            "the CA metadata is still collected: {:?}",
+            !files.contains_key("config/client-cert.json"),
+            "the retired CA metadata is still collected: {:?}",
             files.keys().collect::<Vec<_>>()
         );
     }

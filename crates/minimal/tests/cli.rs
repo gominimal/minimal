@@ -4386,8 +4386,8 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 /// client-certificate RPC, or the `ssh-forward` feature that compiled
 /// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
 /// daemon's build flags from here, so assert on its sources and manifests —
-/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
-/// uses to prove a verb dropped a surface.
+/// a source scan, the way `minimal`'s own unit tests prove a verb dropped
+/// a surface.
 #[test]
 fn retired_surfaces_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4512,6 +4512,15 @@ fn login_runs_auth_login() {
             "min login --help still names `{retired}`: {help}"
         );
     }
+
+    // The flag that steered the retired certificate writes is refused.
+    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
+        panic!("--cert-dir is retired and must not parse");
+    };
+    assert!(
+        err.to_string().contains("--cert-dir"),
+        "the refusal must name the retired flag, got: {err}"
+    );
 }
 
 /// The daemon's `ListSessions` reply no longer carries the mTLS field, and a

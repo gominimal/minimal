@@ -1301,11 +1301,6 @@ pub struct SecretRmArgs {
     pub store: Option<String>,
 }
 
-/// Arguments for the retired no-op `cmd_login`, which no verb dispatches
-/// to now. `min login` takes [`AuthLoginArgs`].
-#[derive(Debug, Args)]
-pub struct LoginArgs {}
-
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]
 pub struct CompleteSessionStrArgs {

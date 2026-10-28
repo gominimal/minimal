@@ -430,7 +430,7 @@ async fn planted_secrets_never_reach_the_bundle() {
         );
     }
 
-    // Key material is never collected, and that is recorded.
+    // The retired key is never collected, and no skip names it (NET-109).
     assert!(find(&files, "client.key").is_none());
     let manifest: serde_json_lenient::Value =
         serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
@@ -444,12 +444,12 @@ async fn planted_secrets_never_reach_the_bundle() {
         manifest["skipped"]
     );
     assert!(
-        manifest["skipped"]
+        !manifest["skipped"]
             .as_array()
             .unwrap()
             .iter()
             .any(|s| s["what"].as_str().unwrap().contains("client.key")),
-        "client.key skip must be recorded: {}",
+        "the retired client.key must not be recorded as a skip: {}",
         manifest["skipped"]
     );
 }
@@ -730,10 +730,10 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
     assert!(find(&files, "client.key").is_none());
     let skipped = manifest["skipped"].as_array().unwrap();
     assert!(
-        skipped
+        !skipped
             .iter()
             .any(|s| s["what"].as_str().unwrap().contains("client.key")),
-        "client.key skip must be recorded: {skipped:?}"
+        "the retired client.key must not be recorded as a skip: {skipped:?}"
     );
 }
 
