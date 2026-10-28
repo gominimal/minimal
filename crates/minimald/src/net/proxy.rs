@@ -3730,6 +3730,141 @@ mod tests {
         );
     }
 
+    /// The target lease [`proxy_refuses_a_withdrawn_port_like_direct`]
+    /// registers its box's live gate under. The live-gate table is
+    /// process-wide, so the address is this test's alone.
+    #[cfg(target_os = "linux")]
+    const WITHDRAWN_LEASE: Ipv4Addr = Ipv4Addr::new(127, 0, 71, 2);
+
+    /// NET-069 for a port published while the box runs (NET-016): once the
+    /// listener's publication is withdrawn, a proxied request to the port is
+    /// refused with the same refusal a direct connection gets — the verdict
+    /// and the logged rule a port the box never published meets. The publish
+    /// and the withdrawal are the listen watcher's own steps: the gate's
+    /// admission, then its withdrawal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_refuses_a_withdrawn_port_like_direct() {
+        let probe = TcpListener::bind((WITHDRAWN_LEASE, 0)).await.unwrap();
+        let backend_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        spawn_backend_on(
+            SocketAddr::new(IpAddr::V4(WITHDRAWN_LEASE), backend_port),
+            "withdrawn",
+        )
+        .await;
+        let never_published = 9000;
+
+        // The own-address box on a VM host, declaring no ingress: every port
+        // it serves is a runtime one.
+        let target = SessionId::parse_str("00000000-0000-0000-0000-000000000072").unwrap();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(target, "wdweb", WITHDRAWN_LEASE, BTreeMap::new());
+        let registry = Arc::new(RwLock::new(reg));
+        let router = Router::new(Arc::clone(&registry), proxied_request_verdict);
+
+        // The box's relay gate, registered under its lease as the relay's
+        // spawn registers it: the gate a direct connection meets.
+        let gate = Arc::new(SessionGate::for_session(
+            "wdweb".to_string(),
+            WITHDRAWN_LEASE,
+            &SessionPolicy::default(),
+            SwitchSubnet::default(),
+            None,
+        ));
+        crate::net::switch::register_live_gate_for_test(WITHDRAWN_LEASE, &gate);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+        let authority = format!("wdweb.min.internal:{backend_port}");
+
+        // The listener's publication, as the watcher makes it once its
+        // forward stands: the gate admits the port.
+        gate.admit_published(backend_port);
+        assert!(gate.admits_tcp(backend_port));
+        let published = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            published.contains("200 OK") && published.ends_with("withdrawn"),
+            "a listen-published port opens through the proxy, got: {published}"
+        );
+
+        // The listener closes: the watcher withdraws the admission.
+        gate.withdraw_published(backend_port);
+
+        // The direct half: the gate refuses a direct connection to the
+        // withdrawn port, as it refuses one to a port never published.
+        assert!(
+            !gate.admits_tcp(backend_port),
+            "the target's gate refuses a direct connection to the withdrawn port"
+        );
+        assert!(!gate.admits_tcp(never_published));
+
+        // The proxy's verdict for the withdrawn port is the direct
+        // connection's refusal: the ingress rule a direct drop carries, and
+        // exactly the refusal a never-published port meets.
+        let route = registry
+            .read()
+            .unwrap()
+            .resolve("wdweb.min.internal")
+            .expect("the target's name still resolves");
+        let direct = ProxiedRequest::Refused(Refusal {
+            rule: NO_INGRESS_MAPPING_RULE,
+            direction: Direction::Ingress,
+            other: None,
+        });
+        assert_eq!(
+            proxied_request_verdict(None, &route, backend_port),
+            direct,
+            "the withdrawn port's proxied verdict must equal the direct refusal"
+        );
+        assert_eq!(
+            proxied_request_verdict(None, &route, never_published),
+            direct,
+            "a never-published port meets the same refusal"
+        );
+
+        let (buf, guard) = capture_logs();
+        let withdrawn = proxy_get(proxy_addr, &authority).await;
+        let unpublished =
+            proxy_get(proxy_addr, &format!("wdweb.min.internal:{never_published}")).await;
+        drop(guard);
+        assert!(
+            withdrawn.contains("403 Forbidden"),
+            "expected the withdrawn port to be refused, got: {withdrawn}"
+        );
+        assert!(
+            unpublished.contains("403 Forbidden"),
+            "expected the never-published port to be refused, got: {unpublished}"
+        );
+
+        // Both refusals log the same violation, field for field, apart from
+        // the port they name.
+        let logged = buf.contents();
+        for port in [backend_port, never_published] {
+            let line = logged
+                .lines()
+                .find(|line| {
+                    line.contains("network policy violation")
+                        && line.contains(&format!(" port={port} "))
+                })
+                .unwrap_or_else(|| panic!("expected a refusal line for port {port}: {logged}"));
+            for field in [
+                r#"session="wdweb""#,
+                format!("rule_matched=\"{NO_INGRESS_MAPPING_RULE}\"").as_str(),
+                "direction=ingress",
+                r#"route_source="none""#,
+                "the box has not published this port",
+                r#"status="403 Forbidden""#,
+            ] {
+                assert!(
+                    line.contains(field),
+                    "the refusal for port {port} must carry {field}, got: {line}"
+                );
+            }
+        }
+    }
+
     /// NET-070's verify line: a request through the hostname proxy from a
     /// caller whose egress rules deny the target is refused — put to the same
     /// pure verdict the caller's own outbound frames meet on the relay,
