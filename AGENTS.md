@@ -313,8 +313,9 @@ that a command prints on stdout for a script to read is output, not a message.
   text in a spec. A spec binds the behaviour, and the wording can change
   without it.
 - Write the exact text in the issue or the plan task, and pin it in the
-  test that checks it. A wording change is a code and test change, never a
-  spec change.
+  test that checks it. A wording change updates the code and the test. It
+  changes a spec only to remove a quote of the old text, as the last item
+  says.
 - Say why it is true: name the code path or state that makes it so.
 - List the tests and scripts that pin the text, so the change updates them.
 - If a spec still quotes the old text, say so. Replace the quote with what
