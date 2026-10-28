@@ -2926,8 +2926,8 @@ mod tests {
             );
             assert_eq!(
                 err.to_string(),
-                "Port 18999 is already in use on this machine by a program \
-                 outside Minimal.\nChoose another host port in --ingress (for \
+                "Port 18999 is already in use on this machine by another \
+                 program on this machine.\nChoose another host port in --ingress (for \
                  example --ingress 19000:80) or in [network] ingress in \
                  minimal.toml.",
                 "the error names the taken port and the next step, and no \

@@ -725,7 +725,7 @@ mod tests {
             ),
             (
                 minimald_rpc::PortHolder::Host,
-                "Port 8080 is already in use on this machine by a program outside Minimal.",
+                "Port 8080 is already in use on this machine by another program on this machine.",
             ),
         ] {
             let refusal = minimald_rpc::PortInUseRefusal {

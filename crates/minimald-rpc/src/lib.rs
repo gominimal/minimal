@@ -2080,7 +2080,9 @@ pub struct SharedPortCollision {
 pub enum PortHolder {
     /// Another box on this machine holds the port. Carries its box name.
     Box(String),
-    /// No box holds the port, so a program outside Minimal does.
+    /// No box in this daemon's hostname registry holds the port, so
+    /// another program on this machine does. That program can be this
+    /// daemon's own proxy or a box of another daemon on the machine.
     Host,
 }
 
@@ -2115,7 +2117,7 @@ pub struct PortInUseRefusal {
 /// The middle of the refusal's first line, after `Port <port>`.
 const PORT_IN_USE_MIDDLE: &str = " is already in use on this machine by ";
 /// The holder clause when no box holds the port.
-const PORT_IN_USE_HOST: &str = "a program outside Minimal.";
+const PORT_IN_USE_HOST: &str = "another program on this machine.";
 /// The refusal's second line, up to the suggested host port.
 const PORT_IN_USE_REMEDY: &str = "\nChoose another host port in --ingress (for example --ingress ";
 /// The refusal's second line, after the suggested mapping.
