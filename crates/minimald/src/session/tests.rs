@@ -9004,8 +9004,8 @@ async fn expose_out_of_range_refusal_names_range() {
     let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     for (name, stance, octet) in [
-        ("rangeallow", boxes::DynamicIngress::Allow, 41),
-        ("rangeask", boxes::DynamicIngress::Ask, 42),
+        ("rangeallow", sessions::DynamicIngress::Allow, 41),
+        ("rangeask", sessions::DynamicIngress::Ask, 42),
     ] {
         let id = finalize_dynamic_ingress_session(
             &mut client,
@@ -9017,7 +9017,7 @@ async fn expose_out_of_range_refusal_names_range() {
         )
         .await;
         let handle = manager
-            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
             .await
             .unwrap()
             .expect("the box resolves");
@@ -9031,11 +9031,11 @@ async fn expose_out_of_range_refusal_names_range() {
             other => panic!("{name}: a port outside the range is refused by range: {other:?}"),
         };
         assert_eq!(
-            refusal.for_caller(name, boxes::NetworkMode::OwnIp, 4500),
+            refusal.for_caller(name, sessions::NetworkMode::OwnIp, 4500),
             "port 4500 is outside this box's --dynamic-range 3000-3999. Nothing was published.",
             "{name}: the refusal names the port and the range"
         );
-        if stance == boxes::DynamicIngress::Ask {
+        if stance == sessions::DynamicIngress::Ask {
             // The in-range ask is routed, and nobody is attached to answer:
             // the out-of-range one above never got that far.
             match handle.expose_dynamic(3000).await {

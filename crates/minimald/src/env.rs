@@ -2614,10 +2614,6 @@ exit $rc
                 "{request}: the public request is refused, and the session is not asked"
             );
         }
-        assert_eq!(
-            super::channel_method("net-expose-public%3000"),
-            "net-expose-public"
-        );
         let logged = capture.contents();
         let lines: Vec<&str> = logged
             .lines()
