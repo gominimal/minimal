@@ -121,14 +121,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
     Secret(SecretArgs),
-    /// Print that there is nothing to mint
+    // NET-109: `min login` is the alias for `min auth login`, so it takes
+    // the same arguments and runs the same sign-in.
+    /// Sign in to GitHub (the same as min auth login)
     ///
-    /// The HTTPS reverse proxy this verb once served is retired, so it
-    /// issues nothing and writes nothing to disk. The verb stays as the
-    /// future home of the sign-in that replaces it.
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -1300,10 +1300,6 @@ pub struct SecretRmArgs {
     #[arg(long)]
     pub store: Option<String>,
 }
-
-/// Arguments for `min login`.
-#[derive(Debug, Args)]
-pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]
