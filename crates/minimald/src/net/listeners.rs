@@ -225,7 +225,7 @@ enum BoxReportChannel {
 /// polls reach the stand-in exactly the expose path's own reports do.
 #[cfg(test)]
 static VM_REPORT_SEAM: LazyLock<Mutex<HashMap<std::path::PathBuf, std::path::PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Seed a stand-in report door for the session whose switch control socket
 /// is `control_socket` (tests only, T94): the door at `door` answers every
@@ -626,6 +626,200 @@ pub(crate) async fn unreport_port(
              unwound failed; the host's row may still name it"
         );
     }
+}
+
+/// Where one box's audit reports go (NET-046): the VM host daemon's door,
+/// and the row key the host names the box by. Registered while the box's
+/// listen watcher runs on a VM host ([`register_host_audit_route`]), so a
+/// box with no switch, or a box on a native host, has none and reports
+/// nothing.
+#[derive(Debug, Clone)]
+struct HostAuditRoute {
+    /// The box's name, as the in-VM audit record names it.
+    box_name: String,
+    /// The door the reports go to.
+    channel: BoxReportChannel,
+}
+
+/// The live audit routes, by the box's switch address: the relay's drop
+/// line knows the box by its lease, and the expose decision record by its
+/// name, so both look here.
+static HOST_AUDIT_ROUTES: std::sync::LazyLock<Mutex<HashMap<Ipv4Addr, HostAuditRoute>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The most audit reports in flight at once. A report past it is not sent
+/// and the in-VM record stays the only one, so a box that refuses frames
+/// in a loop cannot grow the daemon's tasks. The drop line's own rate limit
+/// keeps a box far under it.
+const HOST_AUDIT_IN_FLIGHT: usize = 64;
+
+/// The audit reports in flight now ([`HOST_AUDIT_IN_FLIGHT`]).
+static HOST_AUDIT_SENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers where `box_name`'s audit reports go, while its watcher runs:
+/// the VM host daemon's door over `control`, keyed by the box's switch
+/// address. A native host's control channel has no door, so nothing is
+/// registered there.
+fn register_host_audit_route(box_name: &str, switch_address: Ipv4Addr, control: &ControlChannel) {
+    let channel = match control {
+        ControlChannel::Vsock { cid, .. } => BoxReportChannel::Vsock { cid: *cid },
+        ControlChannel::Unix(_) => return,
+    };
+    HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            switch_address,
+            HostAuditRoute {
+                box_name: box_name.to_string(),
+                channel,
+            },
+        );
+}
+
+/// Removes the audit route [`register_host_audit_route`] made for the box
+/// at `switch_address`, when it is still that box's.
+fn deregister_host_audit_route(box_name: &str, switch_address: Ipv4Addr) {
+    let mut routes = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if routes
+        .get(&switch_address)
+        .is_some_and(|route| route.box_name == box_name)
+    {
+        routes.remove(&switch_address);
+    }
+}
+
+/// Seeds an audit route for `box_name` at `switch_address` whose reports go
+/// to the stand-in door at `door` (tests only): the harness runs boxes on a
+/// native-shaped switch, which registers no route of its own.
+#[cfg(test)]
+pub(crate) fn seed_host_audit_route_for_tests(
+    box_name: &str,
+    switch_address: Ipv4Addr,
+    door: impl Into<std::path::PathBuf>,
+) {
+    HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            switch_address,
+            HostAuditRoute {
+                box_name: box_name.to_string(),
+                channel: BoxReportChannel::Unix(door.into()),
+            },
+        );
+}
+
+/// Removes an audit route a test seeded (tests only).
+#[cfg(test)]
+pub(crate) fn clear_host_audit_route_for_tests(box_name: &str, switch_address: Ipv4Addr) {
+    deregister_host_audit_route(box_name, switch_address);
+}
+
+/// Sends one audit report to the VM host daemon in the background, once,
+/// under [`REPORT_DEADLINE`]. Best-effort: the in-VM record is already
+/// written or already failed on its own, so a host that cannot be reached
+/// costs only the host's copy. A report the host does not take says so in
+/// one debug line.
+fn send_host_audit(channel: BoxReportChannel, request: minimald_rpc::BoxControlRequest) {
+    use std::sync::atomic::Ordering;
+    if HOST_AUDIT_SENDING.fetch_add(1, Ordering::AcqRel) >= HOST_AUDIT_IN_FLIGHT {
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+        tracing::debug!(
+            request = ?request,
+            "too many audit reports are in flight; the host keeps no copy of this one"
+        );
+        return;
+    }
+    // A caller off a runtime (a sync test) has nothing to send on.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+        return;
+    };
+    runtime.spawn(async move {
+        let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+        match report_exchange(&channel, &request, deadline).await {
+            Ok(minimald_rpc::BoxControlReply::Audited { .. }) => {}
+            Ok(other) => tracing::debug!(
+                reply = ?other,
+                "the VM host daemon did not take an audit report"
+            ),
+            Err(error) => tracing::debug!(
+                %error,
+                "an audit report did not reach the VM host daemon"
+            ),
+        }
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
+/// Reports one dynamic ingress decision to the VM host daemon (NET-046), so
+/// the host keeps its own copy outside the VM. Nothing is sent for a box
+/// with no audit route: a native host, or a box with no switch.
+pub(crate) fn report_expose_decision(
+    box_name: &str,
+    port: u16,
+    decision: boxes::DynamicIngress,
+    decided_by: minimald_rpc::ExposeDecidedBy,
+    outcome: minimald_rpc::ExposeDecisionOutcome,
+) {
+    let route = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(_, route)| route.box_name == box_name)
+        .map(|(switch_address, route)| (*switch_address, route.channel.clone()));
+    let Some((switch_address, channel)) = route else {
+        return;
+    };
+    send_host_audit(
+        channel,
+        minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+            switch_address,
+            port,
+            decision,
+            decided_by,
+            outcome,
+        }),
+    );
+}
+
+/// Reports one refused own-address egress flow to the VM host daemon: the
+/// relay calls this when its rate-limited drop line fires, so the report
+/// shares that line's rate limit and is never sent once per frame. Nothing
+/// is sent for a box with no audit route.
+pub(crate) fn report_refused_egress(
+    switch_address: Ipv4Addr,
+    destination: Option<std::net::SocketAddrV4>,
+    proto: &str,
+    rule: &str,
+) {
+    let channel = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&switch_address)
+        .map(|route| route.channel.clone());
+    let Some(channel) = channel else {
+        return;
+    };
+    let clamp = |text: &str| {
+        let mut end = text.len().min(minimald_rpc::REFUSED_EGRESS_TEXT_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
+    };
+    send_host_audit(
+        channel,
+        minimald_rpc::BoxControlRequest::ReportRefusedEgress(minimald_rpc::RefusedEgressReport {
+            switch_address,
+            destination,
+            proto: clamp(proto),
+            rule: clamp(rule),
+        }),
+    );
 }
 
 /// The withdrawal's attempts over a resolved report channel, shared by
@@ -1183,6 +1377,10 @@ impl ListenWatcher {
             leader = ?leader,
             "listen watcher started"
         );
+        // The box's audit reports reach the VM host daemon while the
+        // watcher runs (NET-046), and stop when it ends.
+        register_host_audit_route(&plan.box_name, plan.lease, &plan.control);
+        let route = (plan.box_name.clone(), plan.lease);
         let task = tokio::spawn(async move {
             let mut state = WatchState::new(plan, leader);
             loop {
@@ -1195,6 +1393,7 @@ impl ListenWatcher {
             // The stop's own work: everything the box's processes published
             // comes down here, before the stopper's teardown continues.
             state.withdraw_all().await;
+            deregister_host_audit_route(&route.0, route.1);
         });
         Self { stop, task }
     }

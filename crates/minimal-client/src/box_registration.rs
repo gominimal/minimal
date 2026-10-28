@@ -283,6 +283,12 @@ pub async fn register_box_with_vm_host(
                  read for {switch_address}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::Audited { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an audit report's \
+                 answer; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the name-hold \
