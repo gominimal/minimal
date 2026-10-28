@@ -84,7 +84,9 @@ async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
 
     // A loop that accepted the kill but never resolves — models the
     // mainloop parked mid-`step()`.
-    let mut task = crate::traced::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+    let mut task = crate::traced::spawn(std::future::pending::<
+        Result<crate::box_runtime::HostExit, std::io::Error>,
+    >());
 
     // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
     // the deadline that returns this call. Reaching GIVE_UP would mean the
@@ -12300,6 +12302,38 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
 }
 
+/// A stand-in host loop for `child`: it reaps the child and reports the end
+/// as `hakoniwa` does. A signalled child has no exit status of its own and
+/// carries the container's 125.
+fn stand_in_entrypoint(
+    child: std::process::Child,
+) -> tokio::task::JoinHandle<Result<crate::box_runtime::HostExit, std::io::Error>> {
+    crate::traced::spawn_blocking(move || {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = child;
+        let status = child.wait()?;
+        let reason = match status.code() {
+            Some(code) => crate::box_runtime::ExitReason {
+                code,
+                exit_code: Some(code),
+                reason: format!("process(stand-in) exited with code {code}"),
+            },
+            None => crate::box_runtime::ExitReason {
+                code: 125,
+                exit_code: None,
+                reason: format!(
+                    "container received signal {}",
+                    status.signal().unwrap_or_default()
+                ),
+            },
+        };
+        Ok(crate::box_runtime::HostExit {
+            code: reason.code,
+            reason: Some(reason),
+        })
+    })
+}
+
 /// BOX-013: a stop sends SIGTERM to every process in the box, waits the
 /// grace period, sends SIGKILL to those still running, and the record ends
 /// `stopped` with an `exited` event that carries `reason = "stopped"` and
@@ -12315,10 +12349,7 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
         .spawn()
         .expect("spawn the stand-in box");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
-    let entrypoint = crate::traced::spawn_blocking(move || {
-        let mut child = child;
-        child.wait().map(|status| status.code().unwrap_or(-1))
-    });
+    let entrypoint = stand_in_entrypoint(child);
     // Let the loop start a child, so the box has more than one process.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -12412,10 +12443,7 @@ async fn stop_force_kills_at_once() {
         .spawn()
         .expect("spawn the stand-in box");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
-    let entrypoint = crate::traced::spawn_blocking(move || {
-        let mut child = child;
-        child.wait().map(|status| status.code().unwrap_or(-1))
-    });
+    let entrypoint = stand_in_entrypoint(child);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let started = std::time::Instant::now();
@@ -12443,4 +12471,53 @@ async fn stop_force_kills_at_once() {
         processes.pids().is_empty(),
         "no process of the box outlives the forced stop"
     );
+}
+
+/// BOX-013: an entrypoint that exits 125 on SIGTERM inside the grace period
+/// keeps its own exit status. `hakoniwa` reports 125 for a signalled
+/// container as well, so only the reaped reason tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap 'exit 125' TERM; while :; do sleep 0.05; done")
+        .spawn()
+        .expect("spawn the stand-in box");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(outcome.sent[0], libc::SIGTERM);
+    let ending = outcome.ending;
+    assert_eq!(ending, StopEnding::ExitedFirst { exit_code: 125 });
+    assert!(outcome.unfinished.is_none());
+
+    // The record and the event the stop writes for this ending.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let mut record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("the box has a record");
+    record.set_state(RecordState::Stopped(ending));
+    assert_eq!(record.exit_code, Some(125));
+    assert_eq!(record.signal, None);
+
+    let exited = super::stopped_event_data(ending);
+    assert_eq!(exited["reason"], "stopped");
+    assert_eq!(exited["exit_code"], 125);
+    assert!(!exited.contains_key("signal"));
 }

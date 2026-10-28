@@ -4,7 +4,7 @@ use super::*;
 /// loop so teardown can be awaited on destroy.
 pub(super) type LaunchedHost = (
     box_runtime::HostHandle,
-    JoinHandle<Result<i32, std::io::Error>>,
+    JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
 );
 
 /// The root-owned helper the privileged step installs (BEP-018). It adds
@@ -305,9 +305,9 @@ impl Drop for AbortLoopOnDrop {
 /// aborted loop leaves nothing here, because the stop that aborts it leaves
 /// the cohort itself.
 pub(super) fn watch_quic443_exit(
-    task: JoinHandle<Result<i32, std::io::Error>>,
+    task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     exit: Quic443Exit,
-) -> JoinHandle<Result<i32, std::io::Error>> {
+) -> JoinHandle<Result<box_runtime::HostExit, std::io::Error>> {
     let mut abort_loop = AbortLoopOnDrop(Some(task.abort_handle()));
     // The watcher lives as long as the loop it watches: its own root, as the
     // loop has.
@@ -484,7 +484,7 @@ impl BoxActor {
     /// end of `Host::mainloop` can still run once the loop drains.
     pub(super) async fn kill_and_stop_loop(
         host: &box_runtime::HostHandle,
-        task: &mut JoinHandle<Result<i32, std::io::Error>>,
+        task: &mut JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
         for_shutdown: bool,
     ) {
         let killed = host.kill(for_shutdown).await.is_ok();
@@ -1400,13 +1400,6 @@ fn stop_signal_name(signal: i32) -> &'static str {
     }
 }
 
-/// Whether a host loop's exit code says a signal, not the entrypoint's own
-/// exit, ended the box: `hakoniwa` reports a signalled container as 125,
-/// and a process with no exit status of its own reads as a negative code.
-fn code_means_signalled(code: i32) -> bool {
-    code == 125 || code < 0
-}
-
 /// What a stop's signals did to the box (BOX-013).
 #[derive(Debug)]
 pub(crate) struct StopOutcome {
@@ -1416,7 +1409,7 @@ pub(crate) struct StopOutcome {
     pub(crate) sent: Vec<i32>,
     /// The host's runtime loop, when it did not end inside
     /// [`HOST_PROBE_TIMEOUT`] after the last signal. The caller stops it.
-    pub(crate) unfinished: Option<JoinHandle<Result<i32, std::io::Error>>>,
+    pub(crate) unfinished: Option<JoinHandle<Result<box_runtime::HostExit, std::io::Error>>>,
 }
 
 /// Sends a stop's signals to every process in the box (BOX-013), and reads
@@ -1432,7 +1425,7 @@ pub(crate) struct StopOutcome {
 pub(crate) async fn stop_box_processes(
     box_id: boxes::SessionId,
     processes: Option<box_runtime::BoxProcesses>,
-    mut entrypoint: JoinHandle<Result<i32, std::io::Error>>,
+    mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     force: bool,
     grace: std::time::Duration,
 ) -> StopOutcome {
@@ -1493,8 +1486,20 @@ pub(crate) async fn stop_box_processes(
 
     let last = sent.last().copied().unwrap_or(libc::SIGKILL);
     let mut unfinished = None;
-    let code = match tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut entrypoint).await {
-        Ok(Ok(Ok(code))) => Some(code),
+    // The entrypoint's own exit status, from the reaped reason. The exit
+    // code alone cannot say it: `hakoniwa` reports 125 both for a signalled
+    // container and for an entrypoint that exits 125 itself.
+    let exit_status = match tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut entrypoint).await {
+        Ok(Ok(Ok(exit))) => {
+            tracing::info!(
+                box_id = %box_id,
+                code = exit.code,
+                exit_code = exit.reason.as_ref().and_then(|r| r.exit_code),
+                reason = exit.reason.as_ref().map_or("", |r| r.reason.as_str()),
+                "stop: the host loop reaped the entrypoint"
+            );
+            exit.reason.and_then(|r| r.exit_code)
+        }
         Ok(Ok(Err(error))) => {
             tracing::warn!(box_id = %box_id, %error, "stop: the host loop ended on an error");
             None
@@ -1512,11 +1517,9 @@ pub(crate) async fn stop_box_processes(
             None
         }
     };
-    let ending = match (ended_after.unwrap_or(Some(last)), code) {
-        (_, Some(code)) if !code_means_signalled(code) => {
-            StopEnding::ExitedFirst { exit_code: code }
-        }
-        (Some(signal), _) => StopEnding::Signalled { signal },
+    let ending = match (ended_after.unwrap_or(Some(last)), exit_status) {
+        (_, Some(status)) => StopEnding::ExitedFirst { exit_code: status },
+        (Some(signal), None) => StopEnding::Signalled { signal },
         // It ended before the stop, and no signal of this daemon ended it.
         (None, _) => StopEnding::AtDaemonStart,
     };
@@ -1957,7 +1960,7 @@ mod quic443_cohort_tests {
             let task = crate::traced::spawn(async move {
                 let code = exited.await.unwrap_or(137);
                 assert!(code >= 0, "the host loop panics");
-                Ok(code)
+                Ok(crate::box_runtime::HostExit { code, reason: None })
             });
             let watched = watch_quic443_exit(
                 task,
@@ -1983,7 +1986,7 @@ mod quic443_cohort_tests {
         // the shell's code, and the block lifts with no Stop.
         moves.kill(200);
         strict_exit.send(0).unwrap();
-        assert_eq!(strict_task.await.unwrap().unwrap(), 0);
+        assert_eq!(strict_task.await.unwrap().unwrap().code, 0);
         assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
         assert_eq!(cohort.lock().unwrap().blocking_members().count(), 0);
         assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
