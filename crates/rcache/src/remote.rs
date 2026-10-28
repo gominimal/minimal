@@ -113,6 +113,45 @@ pub const DEFAULT_FETCH_RETRIES: u32 = 3;
 /// First retry delay; doubles with each subsequent retry.
 const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
+/// The retry policy, in one place: `once` is tried until it succeeds, fails
+/// in a way `is_transient` does not cover, or has failed `retries` more
+/// times than the first attempt, with the bounded exponential backoff
+/// (`FETCH_BACKOFF_BASE` doubling per attempt) between tries. `what` names
+/// the object in the log. The caller decides what a spent retry budget
+/// means (the index reports `Unavailable`; an artifact surfaces the error).
+async fn retrying_transient<T, E, Fut>(
+    what: &str,
+    retries: u32,
+    is_transient: impl Fn(&E) -> bool,
+    mut once: impl FnMut() -> Fut,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match once().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt <= retries && is_transient(&e) => {
+                let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    "fetching {what} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
+                    retries + 1,
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                if attempt > 1 {
+                    tracing::warn!("fetching {what} failed after {attempt} attempts: {e}");
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Which index object a [`RemoteCache`] reader loads. The choice is made by
 /// the caller (see `mfile::File::cache_config`); this layer only executes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,48 +633,30 @@ impl<B: FetchBackend> RemoteCache<B> {
         // that future is computed (`cmd/mod.rs`, the `run_command` box).
         // Pinned on the heap, the loop's state is a pointer in the caller's
         // state, and the depth stops here.
-        let mut attempt = 0u32;
         let (index, gcs_generation) = Box::pin(async {
-            loop {
-                attempt += 1;
-                match Self::fetch_index_once(
-                    &backend,
-                    &url,
-                    &source,
-                    index_dir.as_deref(),
-                    &fetch_op,
-                )
-                .await
-                {
-                    Ok(pair) => break Ok(pair),
-                Err(e) if attempt <= DEFAULT_FETCH_RETRIES && Self::is_transient(&e) => {
-                    let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
-                    tracing::warn!(
-                        "fetching {} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
-                        source.object(),
-                        DEFAULT_FETCH_RETRIES + 1,
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+            let fetched = retrying_transient(
+                source.object(),
+                DEFAULT_FETCH_RETRIES,
+                Self::is_transient,
+                || Self::fetch_index_once(&backend, &url, &source, index_dir.as_deref(), &fetch_op),
+            )
+            .await;
+            match fetched {
+                Ok(pair) => Ok(pair),
+                // The same class of failure artifact downloads already
+                // survive: report it in terms of what was fetched, not
+                // the raw transport error.
                 Err(e) if Self::is_transient(&e) => {
-                    // The same class of failure artifact downloads already
-                    // survive: report it in terms of what was fetched, not
-                    // the raw transport error.
-                    tracing::warn!(
-                        "fetching {} failed after {attempt} attempts: {e}",
-                        source.object()
-                    );
                     let status = match &e {
                         Error::Fetch { status } => Some(*status),
                         _ => None,
                     };
-                    return Err(Error::Unavailable {
+                    Err(Error::Unavailable {
                         object: source.object().to_string(),
                         status,
-                    });
+                    })
                 }
-                    Err(e) => return Err(e),
-                }
+                Err(e) => Err(e),
             }
         })
         .await?;
@@ -849,23 +870,13 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let mut attempt = 0u32;
-        let mut tar_file = loop {
-            attempt += 1;
-            match self.fetch_verified(sha256, &materialize_op).await {
-                Ok(f) => break f,
-                Err(e) if attempt <= self.fetch_retries && Self::is_transient(&e) => {
-                    let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
-                    tracing::warn!(
-                        "fetching {} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
-                        hex::encode(sha256),
-                        self.fetch_retries + 1,
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let mut tar_file = retrying_transient(
+            &hex::encode(sha256),
+            self.fetch_retries,
+            Self::is_transient,
+            || self.fetch_verified(sha256, &materialize_op),
+        )
+        .await?;
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
