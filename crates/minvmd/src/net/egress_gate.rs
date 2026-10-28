@@ -5295,10 +5295,13 @@ fn node_plane_verdict(
 /// tables, nothing else — and deliberately separate from the relay loop that
 /// applies it, the same discipline the shared verdict keeps.
 ///
-/// The frame's source address is the whole of the routing: the node plane's
-/// own address is decided by the baseline set ([`NodePlaneBaseline`], the
-/// helper's enumeration of the categories the in-VM daemon's traffic may
-/// reach, NET-130), the published namespace that holds any other source
+/// The frame's source address is the routing, with one split at the node
+/// address: the node plane's own frames there are decided by the baseline
+/// set ([`NodePlaneBaseline`], the helper's enumeration of the categories
+/// the in-VM daemon's traffic may reach, NET-130), and a frame the guest's
+/// classifier marked as a box's (`BOX_COHORT_DSCP`, written from the
+/// sender's cgroup) is decided by the node row like any other row's. The
+/// published namespace that holds any other source
 /// supplies the rules its frames are decided by, and an address neither
 /// covers is the phase's to decide — [`UnregisteredSourcePhase`] carries what
 /// that means and why. The node plane is decided before the table because the
@@ -5434,7 +5437,18 @@ fn gate_verdict(
     // The arm sits after the reply record, so the answers to connections the
     // node's published ports received still pass, and after the
     // control-surface check, so the switch's own ports stay refused.
-    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+    // The node address is not the node plane's alone: a host-address box,
+    // the default network mode, leaves from it too. What tells them apart
+    // is the sender's cgroup, which the guest's classifier writes into the
+    // frame as `BOX_COHORT_DSCP` for a connection a box opened and clears
+    // on every other packet. A marked frame is a box's, and the node row
+    // and the box's own classifier leaf decide it below. An unmarked frame
+    // is the daemon's own, and the baseline set decides it, so a guest
+    // whose classifier never loaded fails closed to the baseline.
+    if baseline.phase() == NodeBaselinePhase::InForce
+        && src == baseline.node_addr()
+        && !summary.box_cohort_marked()
+    {
         return node_plane_verdict(summary, l4, table, baseline, pins);
     }
     // No namespace holds the source — NET-081's failure case, held
@@ -6841,6 +6855,13 @@ pub(crate) mod test_support {
         frame
     }
 
+    /// `frame` as the guest's classifier leaves a box's packet: the IPv4
+    /// DSCP field set to [`boxes::core::egress::BOX_COHORT_DSCP`].
+    pub(crate) fn box_cohort_frame(mut frame: Vec<u8>) -> Vec<u8> {
+        frame[15] = boxes::core::egress::BOX_COHORT_DSCP << 2;
+        frame
+    }
+
     /// An Ethernet II ARP frame announcing `spa` as its sender protocol
     /// address — the address an ARP frame's source is read from.
     pub(crate) fn arp_frame(spa: [u8; 4]) -> Vec<u8> {
@@ -6890,11 +6911,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_control, connect_over,
-        expect_frame, expect_silence, expect_teardown, expose_request, gate_connected,
-        gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped, gate_over_with,
-        gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within, send_frame,
-        unexpose_request, wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, box_cohort_frame, capture_log, connect_control,
+        connect_over, expect_frame, expect_silence, expect_teardown, expose_request,
+        gate_connected, gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped,
+        gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within,
+        send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter, EgressGate,
@@ -15230,6 +15251,103 @@ mod tests {
             decide(6, SUBNET.dns_server().octets(), 80),
             Err(GateDrop::SwitchControlSurface { .. })
         ));
+    }
+
+    /// The node address carries two senders: the guest daemon and every
+    /// host-address box, the default network mode. The sender's cgroup tells
+    /// them apart, as the guest's classifier writes it into the frame. A
+    /// frame from a box's cgroup at the node address is judged by the box's
+    /// verdict (the node row, beside the box's own classifier leaf in the
+    /// guest), so a default session keeps its outbound network (NET-107).
+    #[test]
+    fn box_cgroup_frame_at_node_address_judged_by_box_verdict() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let outside = [8, 8, 8, 8];
+        let frame = box_cohort_frame(ipv4_frame(node, 6, outside, 443));
+        let summary = boxes::core::egress::summarize(&frame);
+        assert!(summary.box_cohort_marked());
+        assert_eq!(
+            gate_verdict(
+                &summary,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Ok(GateAdmit::Row),
+            "a box's frame at the node address is the box's to decide, not the baseline's"
+        );
+        // The box's verdict still keeps the floors every row keeps: the
+        // link-local metadata service and the switch's own ports stay
+        // refused.
+        let metadata = box_cohort_frame(ipv4_frame(node, 6, [169, 254, 169, 254], 80));
+        assert!(matches!(
+            gate_verdict(
+                &boxes::core::egress::summarize(&metadata),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Err(GateDrop::Infrastructure { .. })
+        ));
+        let control = box_cohort_frame(ipv4_frame(node, 6, SUBNET.dns_server().octets(), 80));
+        assert!(matches!(
+            gate_verdict(
+                &boxes::core::egress::summarize(&control),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Err(GateDrop::SwitchControlSurface { .. })
+        ));
+    }
+
+    /// The daemon's own frame at the node address carries no box mark, and
+    /// the baseline set still judges it: an address no baseline entry
+    /// pinned is refused. A DSCP value other than the box mark is not a box
+    /// either, so the baseline decides a frame the guest left unmarked.
+    #[test]
+    fn daemon_frame_at_node_address_still_judged_by_baseline() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let outside = [8, 8, 8, 8];
+        let mut other_dscp = ipv4_frame(node, 6, outside, 443);
+        other_dscp[15] = 0b10_1110 << 2;
+        for frame in [ipv4_frame(node, 6, outside, 443), other_dscp] {
+            let summary = boxes::core::egress::summarize(&frame);
+            assert!(!summary.box_cohort_marked());
+            assert_eq!(
+                gate_verdict(
+                    &summary,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new()
+                ),
+                Err(GateDrop::NodePlaneUnpinned {
+                    src: node,
+                    dst: outside,
+                    dst_port: 443
+                }),
+                "the daemon's own frame is the baseline's to decide"
+            );
+        }
     }
 
     /// The host alias's default-deny is a box row's alone, and the node

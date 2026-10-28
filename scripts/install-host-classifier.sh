@@ -21,6 +21,7 @@
 #         [--answerer-address ADDR] [--answerer-port PORT]
 #         [--ct-mark-mask 0x30000000]
 #         [--cohort-address ADDR --node-plane-address ADDR]
+#         [--cohort-dscp 1-63]                          # VM guest only
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
 #   sudo scripts/install-host-classifier.sh --uninstall
@@ -181,6 +182,11 @@ answerer_port=7656
 # cgroup matches, translated to nothing.
 cohort_address=
 node_plane_address=
+# The DSCP value a VM guest writes on a box's packets, so the VM host's
+# gate can tell a box's frame from the guest daemon's own when both leave
+# from the guest's one address. Only the guest's own render passes it. A
+# native host renders no DSCP rule and leaves the field alone.
+cohort_dscp=
 # The unix socket --place-listener reads the daemon's pid from: every
 # process of the delegated account holding it is placed in the daemon leaf.
 listener=
@@ -225,6 +231,16 @@ while [ $# -gt 0 ]; do
         --node-plane-address)
             [ $# -ge 2 ] || die "--node-plane-address needs an address"
             node_plane_address=$2
+            shift 2
+            ;;
+        --cohort-dscp)
+            [ $# -ge 2 ] || die "--cohort-dscp needs a DSCP value"
+            case "$2" in ''|*[!0-9]*)
+                die "--cohort-dscp needs a numeric DSCP value, got: $2" ;;
+            esac
+            [ "$2" -ge 1 ] && [ "$2" -le 63 ] ||
+                die "--cohort-dscp needs a DSCP value from 1 to 63, got: $2"
+            cohort_dscp=$2
             shift 2
             ;;
         --ct-mark-mask)
@@ -897,6 +913,14 @@ install_quic443_helper() {
 # un-enrolled host's two identities are the classify chain's matches and
 # nothing is translated, and the chain stands so an association can add
 # the reserved addresses to the same two marks without a reinstall.
+#
+# With --cohort-dscp, a VM guest's render adds the mark_cohort chain. It
+# runs at postrouting as a filter chain, so it sees every packet, not only
+# a connection's first. A packet of a connection the boxes cohort opened
+# leaves with the given DSCP value. Every other packet leaves with the
+# field cleared, so no process outside the cohort can wear the value. The
+# VM host's gate reads the value to decide a frame from the guest's one
+# address by the box's rules, and an unmarked frame by the node plane's.
 render_ruleset() {
     leaf_elements=
     if [ -n "${quic443_kept_leaves:-}" ]; then
@@ -912,6 +936,15 @@ render_ruleset() {
         snat_rules="
         ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
         ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
+    fi
+    dscp_chain=
+    if [ -n "$cohort_dscp" ]; then
+        dscp_chain="
+    chain mark_cohort {
+        type filter hook postrouting priority mangle; policy accept;
+        ct mark and $mask_hex == $cohort_hex ip dscp set $cohort_dscp
+        ct mark and $mask_hex != $cohort_hex ip dscp set 0
+    }"
     fi
     carve_out_rule="
         ip daddr $answerer_address udp dport $answerer_port accept"
@@ -946,7 +979,7 @@ table inet $TABLE_NAME {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;$snat_rules
-    }
+    }$dscp_chain
 }
 RULES
 }
