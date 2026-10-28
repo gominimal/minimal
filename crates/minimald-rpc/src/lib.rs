@@ -149,7 +149,7 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
-/// How a user-namespace refusal opens (NET-141): the daemon formats a
+/// How a user-namespace refusal opens (NET-143): the daemon formats a
 /// create refused on the host's user-namespace verdict as this lead, the
 /// cause (`sandbox::UsernsRestriction::cause`) closing the parenthesis,
 /// and the cause's remedy for the daemon on a second line. Clients print
