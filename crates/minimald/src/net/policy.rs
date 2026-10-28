@@ -1097,6 +1097,20 @@ async fn probe_publish_surface_within(
                         );
                     }
                 }
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    // Something already holds the probe port at this address:
+                    // a box's forward or a host_ip mirror on the same port.
+                    // The bind reached the address, so the address exists and
+                    // counts as bound (NET-123). Nothing of the probe's is
+                    // bound, so no unexpose runs: one would tear down the
+                    // holder's forward.
+                    probe.bound += 1;
+                    tracing::debug!(
+                        local = %expose.local,
+                        error = %error,
+                        "the loopback range probe port is held at this address, so it counts as bound",
+                    );
+                }
                 Err(error) => {
                     probe.first_failure.get_or_insert((*address, error.kind()));
                     if error.kind() == io::ErrorKind::TimedOut {
@@ -1274,10 +1288,22 @@ pub(crate) async fn post_json_within<T: Serialize>(
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "gvproxy {path} returned HTTP {status}: {}",
-            String::from_utf8_lossy(body_after_headers(&response))
-        )))
+        let said = String::from_utf8_lossy(body_after_headers(&response));
+        // A refusal that says the listener is already held, by another host
+        // process (the OS's bind text) or by a forward this forwarder already
+        // runs, carries `AddrInUse`: the address exists, and a caller that
+        // reads the kind (the range walk) can tell it from a missing one.
+        let kind = if status == 500
+            && (said.contains(ADDRESS_IN_USE_BODY) || said.contains(ALREADY_RUNNING_BODY))
+        {
+            io::ErrorKind::AddrInUse
+        } else {
+            io::ErrorKind::Other
+        };
+        Err(io::Error::new(
+            kind,
+            format!("gvproxy {path} returned HTTP {status}: {said}"),
+        ))
     }
 }
 
@@ -1407,8 +1433,9 @@ const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 /// gvproxy has one of those (the second-daemon-on-a-host shape is native,
 /// where the local bind probe runs instead) — so no concurrent walk can
 /// collide on it. That daemon walks at its start and again at each session
-/// start while the range is not present, and [`RANGE_WALK_TURN`] runs those
-/// walks one at a time.
+/// start, and [`RANGE_WALK_TURN`] runs those walks one at a time. A round
+/// that finds the port already held at an address (a box's forward or a
+/// host_ip mirror) counts that address as bound.
 const RANGE_PROBE_PORT: u16 = 21064;
 
 /// The turn every forwarder-conducted range walk in this process takes
@@ -2332,6 +2359,86 @@ mod tests {
                     .keys()
                     .all(|local| local.ends_with(&format!(":{RANGE_PROBE_PORT}"))),
                 "every round asked at the probe's fixed port: {rounds:?}"
+            );
+        }
+
+        /// A range address whose probe port something already holds: a box's
+        /// forward through this forwarder (`proxy already running`) at one
+        /// address, a host_ip mirror held by another host process (the OS's
+        /// bind text) at another. Both refusals say the address exists, so
+        /// the walk counts each one bound and reads the range present. The
+        /// walk sends no unexpose for a held address, so the holder's forward
+        /// stays up.
+        #[tokio::test]
+        async fn counts_an_address_whose_probe_port_is_held_as_bound() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let box_held = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 3));
+            let mirror_held = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 9));
+            let (tx, mut asked) = mpsc::channel::<(String, String)>(1024);
+            let (box_held_s, mirror_held_s) = (box_held.clone(), mirror_held.clone());
+            let forwarder = crate::traced::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // An expose body carries `remote`, an unexpose body
+                    // does not: that tells the two verbs apart.
+                    let body = read_request(&mut conn).await;
+                    let local = local_of(&body);
+                    let verb = if String::from_utf8_lossy(&body).contains("\"remote\"") {
+                        "expose"
+                    } else {
+                        "unexpose"
+                    };
+                    let said = if verb == "expose" && local == box_held_s {
+                        Some("proxy already running".to_string())
+                    } else if verb == "expose" && local == mirror_held_s {
+                        Some(format!("listen tcp {local}: bind: address already in use"))
+                    } else {
+                        None
+                    };
+                    let answer = match said {
+                        Some(said) => format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                            said.len()
+                        ),
+                        None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    };
+                    conn.write_all(answer.as_bytes())
+                        .await
+                        .expect("the fake forwarder must answer");
+                    if tx.send((verb.to_string(), local)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+
+            assert!(
+                probe.present(),
+                "a held probe port says the address exists: {}",
+                probe.summary()
+            );
+            assert_eq!(probe.first_failure, None);
+            assert_eq!(probe.bound, 254, "{}", probe.summary());
+
+            let mut unexposed = Vec::new();
+            while let Some((verb, local)) = asked.recv().await {
+                if verb == "unexpose" {
+                    unexposed.push(local);
+                }
+            }
+            assert_eq!(
+                unexposed.len(),
+                252,
+                "one release per address the probe bound"
+            );
+            assert!(
+                !unexposed.contains(&box_held) && !unexposed.contains(&mirror_held),
+                "the walk never releases a forward it did not bind: {unexposed:?}"
             );
         }
 

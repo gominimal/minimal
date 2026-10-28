@@ -3156,7 +3156,9 @@ async fn absent_range_publishes_interim_and_readvises() {
 /// have.
 #[allow(clippy::await_holding_lock)]
 #[cfg(target_os = "linux")]
-#[tokio::test]
+// Multi-thread: the held-forward step runs the real forwarder walk from
+// inside the sync stand-in, through `block_in_place`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_start_rewalks_range_after_finalize_install() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3169,12 +3171,24 @@ async fn session_start_rewalks_range_after_finalize_install() {
     let mngr = server.state.sessions_manager().await;
     let installed = Arc::new(AtomicBool::new(false));
     let walks = Arc::new(AtomicUsize::new(0));
+    // When set, the stand-in runs the real forwarder walk against this
+    // control socket, in place of a fixed verdict.
+    let forwarder: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+        Arc::new(std::sync::Mutex::new(None));
     {
         let installed = Arc::clone(&installed);
         let walks = Arc::clone(&walks);
+        let forwarder = Arc::clone(&forwarder);
         mngr.install_range_walk_standin(move || {
             walks.fetch_add(1, Ordering::SeqCst);
-            if installed.load(Ordering::SeqCst) {
+            let sock = forwarder.lock().expect("forwarder lock").clone();
+            if let Some(sock) = sock {
+                let control = crate::net::policy::ControlChannel::Unix(sock);
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(crate::net::policy::probe_publish_surface(&control))
+                })
+            } else if installed.load(Ordering::SeqCst) {
                 let hosts = ::switch::loopback::range_hosts().count();
                 crate::net::loopback::RangeProbe {
                     bound: hosts,
@@ -3256,7 +3270,7 @@ async fn session_start_rewalks_range_after_finalize_install() {
         ::switch::loopback::range_hosts().any(|host| host == moved),
         "the box at the interim moves onto a range address, got {moved}"
     );
-    match mngr
+    let after_address = match mngr
         .loopback_book()
         .grant(crate::net::dns::LeaseNamespace::Box { session: after.id })
     {
@@ -3266,9 +3280,10 @@ async fn session_start_rewalks_range_after_finalize_install() {
                 "the new box is granted a range address, got {address}"
             );
             assert_ne!(address, moved, "the two boxes hold distinct addresses");
+            address
         }
         other => panic!("the new box's grant must come from the range, got {other:?}"),
-    }
+    };
     assert!(
         log.contents().lines().any(|line| {
             line.contains("loopback-range-present-box")
@@ -3297,6 +3312,57 @@ async fn session_start_rewalks_range_after_finalize_install() {
         "the session start walked the range and found it present: {line}"
     );
 
+    // A box holds a forward at its range address on the probe's own port:
+    // the real walk asks the stand-in forwarder, which refuses that
+    // address's round as in use. The address exists, so the walk counts it
+    // bound, the range stays present, and every box keeps its address.
+    let dir = tempfile::TempDir::new().unwrap();
+    let sock = dir.path().join("gvproxy.sock");
+    let held = format!("{moved}:21064");
+    let (unexposed_tx, mut unexposed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let stand_in = spawn_holding_forwarder(sock.clone(), held.clone(), unexposed_tx);
+    *forwarder.lock().expect("forwarder lock") = Some(sock);
+    let held_start = client
+        .call::<CreateSession>(&req("forward-held", "/uwu"))
+        .await
+        .ok()
+        .expect("a create with the range present");
+    *forwarder.lock().expect("forwarder lock") = None;
+    stand_in.abort();
+    assert!(
+        !held_start.interim_loopback,
+        "a held probe port at one range address does not read the range absent"
+    );
+    assert_eq!(walks.load(Ordering::SeqCst), 4);
+    let line = probe_line(&log.contents(), &held_start.id);
+    assert!(
+        line.contains("walked=true") && line.contains("surface=reserved-range"),
+        "the walk found the range present beside the held forward: {line}"
+    );
+    {
+        let registry = mngr.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert_eq!(
+            routes.published_own_address(before.id),
+            Some(moved),
+            "the box holding the forward keeps its range address"
+        );
+    }
+    assert_eq!(
+        mngr.loopback_book()
+            .grant(crate::net::dns::LeaseNamespace::Box { session: after.id }),
+        crate::net::dns::LoopbackGrant::Granted(after_address),
+        "the other box keeps its range address"
+    );
+    let mut unexposed = Vec::new();
+    while let Ok(local) = unexposed_rx.try_recv() {
+        unexposed.push(local);
+    }
+    assert!(
+        !unexposed.contains(&held),
+        "the walk never releases the forward the box holds: {unexposed:?}"
+    );
+
     // The range goes away under the running VM.
     installed.store(false, Ordering::SeqCst);
     let gone = client
@@ -3309,7 +3375,7 @@ async fn session_start_rewalks_range_after_finalize_install() {
         "the walk found the range absent after a present landing, so the \
          reply carries the interim"
     );
-    assert_eq!(walks.load(Ordering::SeqCst), 4);
+    assert_eq!(walks.load(Ordering::SeqCst), 5);
     let line = probe_line(&log.contents(), &gone.id);
     assert!(
         line.contains("walked=true") && line.contains("surface=127.0.0.1-interim"),
@@ -3331,6 +3397,70 @@ async fn session_start_rewalks_range_after_finalize_install() {
         }),
         "the move back to the interim is logged with the session id and both addresses"
     );
+}
+
+/// A stand-in host forwarder on `path` for the range walk: it answers every
+/// expose `200`, except an expose of `held`, which it refuses as a forward
+/// it already runs (`proxy already running`, HTTP 500). It reports each
+/// unexpose's `local` on `unexposed`.
+#[cfg(target_os = "linux")]
+fn spawn_holding_forwarder(
+    path: std::path::PathBuf,
+    held: String,
+    unexposed: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    crate::traced::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut scratch = [0u8; 512];
+            let body = loop {
+                let n = conn.read(&mut scratch).await.unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&scratch[..n]);
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    break Some(String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned());
+                }
+            };
+            let Some(body) = body else { continue };
+            let local = body
+                .split("\"local\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            let is_expose = body.contains("\"remote\"");
+            let answer = if is_expose && local == held {
+                let said = "proxy already running";
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                    said.len()
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+            };
+            let _ = conn.write_all(answer.as_bytes()).await;
+            if !is_expose {
+                let _ = unexposed.send(local);
+            }
+        }
+    })
 }
 
 /// NET-018: once the answerer is serving beside the proxy, the replies
