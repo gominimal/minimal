@@ -425,6 +425,9 @@ mod tests {
             box_addresses: None,
             hooks_enabled: true,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,

@@ -922,6 +922,7 @@ pub type SessionId = BoxId;
 ///
 /// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum BoxState {
     /// Composition is in flight; the record is a stub awaiting the
@@ -949,6 +950,13 @@ pub enum BoxState {
     #[default]
     #[serde(alias = "running")]
     Active,
+    /// A stop ended the box, or the daemon found it running with no
+    /// process left (BOX-011). The record's `reason`, `exit_code` and
+    /// `signal` say how it ended.
+    Stopped,
+    /// The box ended on its own, by timeout, or by an OOM kill (BOX-011).
+    /// The record's `reason`, `exit_code` and `signal` say how it ended.
+    Exited,
 }
 
 /// Default for [`Record::hooks_enabled`] (and for the matching field on
@@ -1342,6 +1350,24 @@ pub struct Record {
     #[serde(default)]
     pub status: BoxState,
 
+    /// The `reason` a `stopped` or `exited` record ended for (BOX-011),
+    /// as written: a reason this build does not know loads and saves
+    /// unchanged. `None` for every other state, and for records that
+    /// predate the field. Write it with [`Self::set_state`] and read it
+    /// with [`Self::state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::core::record::StoredReason>,
+
+    /// The exit code the BOX-011 table gives a `stopped` or `exited`
+    /// record, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+
+    /// The number of the signal that ended a `stopped` box's entrypoint
+    /// (BOX-013), else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+
     /// Whether this session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`.
     ///
@@ -1493,13 +1519,34 @@ pub const SESSION_BOX_TYPE: &str = "session";
 pub const TASK_BOX_TYPE: &str = "task";
 
 impl Record {
-    /// The one state the record is in (BOX-011). A stored record is
-    /// `pending`, `materializing` or `running`: the store does not yet
-    /// hold an ending, so no stored record reads as `stopped` or `exited`.
-    /// Issue #2634 owns storing `reason`, `exit_code` and `signal`.
-    #[must_use]
-    pub fn state(&self) -> crate::core::record::RecordState {
-        crate::core::record::RecordState::from(self.status)
+    /// The one state the record is in (BOX-011), read from its `status`
+    /// and its stored ending.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::core::record::UnreadableEnding`] when the record is `stopped` or
+    /// `exited` and its `reason`, `exit_code` and `signal` are not a row
+    /// of the BOX-011 table, such as a reason this build does not know.
+    pub fn state(
+        &self,
+    ) -> Result<crate::core::record::RecordState, crate::core::record::UnreadableEnding> {
+        crate::core::record::RecordState::from_stored(
+            self.status,
+            self.reason.as_ref(),
+            self.exit_code,
+            self.signal,
+        )
+    }
+
+    /// Puts the record in `state`: its `status` and the `reason`,
+    /// `exit_code` and `signal` the BOX-011 table gives the state. A state
+    /// with no ending clears all three.
+    pub fn set_state(&mut self, state: crate::core::record::RecordState) {
+        let stored = state.to_stored();
+        self.status = stored.status;
+        self.reason = stored.reason;
+        self.exit_code = stored.exit_code;
+        self.signal = stored.signal;
     }
 
     /// [`Record::validate_policy`] plus the checks a record must pass only
@@ -1751,6 +1798,9 @@ mod tests {
             network,
             policy,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,

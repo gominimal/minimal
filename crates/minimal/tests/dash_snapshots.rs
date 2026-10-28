@@ -77,6 +77,9 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
