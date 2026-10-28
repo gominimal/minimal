@@ -1,5 +1,5 @@
 # Pinned toolchain for CI and local builds (bumped by PR, not by runner-image
 # rolls). The nightly beta canary floats ahead of this pin.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

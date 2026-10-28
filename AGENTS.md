@@ -112,6 +112,9 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## System dependencies
 
+Run `just preflight` to check this host for everything below. Each failed
+check prints the command that fixes it.
+
 - **Rust**: pinned by [rust-toolchain.toml](rust-toolchain.toml) (rustup picks
   it up automatically; components `rustfmt` and `clippy`).
 - **protoc**: required by `crates/remote-proto/build.rs` (prost + tonic).
@@ -130,6 +133,12 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
   `just test-vm`, `just e2e`); `jq`, `zstd`, and `cpio` (`brew install jq zstd
   cpio`) for the `artifacts`/`initramfs` scripts those recipes run.
+  `just initramfs` and `just test-cross` build through `cross`, which needs
+  a running Docker daemon and the x86_64 Linux toolchain at the pinned
+  version. The cross-rs images are x86_64, and rustup installs that
+  toolchain on an arm64 Mac only with `--force-non-host`:
+  `rustup toolchain add <channel>-x86_64-unknown-linux-gnu --profile minimal
+  --force-non-host`.
 - **python3**, on any host: `just crates` runs it (stdlib only). The session e2e
   needs it too, because its interactive attaches run through a real pty
   ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)). Only a tty can
@@ -308,13 +317,19 @@ that a command prints on stdout for a script to read is output, not a message.
 
 **When you specify or plan work that adds or changes a message:**
 
-- Write the exact text in the spec or the issue, with the condition that
-  prints it and the surface it appears on.
+- In the spec, state what the message must tell the user, the condition
+  that prints it, and the surface it appears on. Do not write the exact
+  text in a spec. A spec binds the behaviour, and the wording can change
+  without it.
+- Write the exact text in the issue or the plan task, and pin it in the
+  test that checks it. A wording change updates the code and the test. It
+  changes a spec only to remove a quote of the old text, as the last item
+  says.
 - Say why it is true: name the code path or state that makes it so.
 - List the tests and scripts that pin the text, so the change updates them.
-- If a spec pins the old text, say so. Change the spec in the same piece of
-  work, or record the spec line that must follow in an issue linked from the
-  PR.
+- If a spec still quotes the old text, say so. Replace the quote with what
+  the message must convey in the same piece of work, or in an issue linked
+  from the PR.
 
 **When you review such work**, read each new string as a user who has never
 seen the design. Apply the test above before you approve.

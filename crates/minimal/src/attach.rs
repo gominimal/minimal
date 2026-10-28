@@ -401,11 +401,15 @@ impl fmt::Display for SessionCandidate {
 /// `Materializing` ones aren't attachable yet — `Pending` is still awaiting
 /// the client's verdict, `Materializing` has finalized its composition but
 /// is still ingesting patches. Both render with the hollow glyph so the
-/// picker communicates "not-yet-ready" uniformly.
+/// picker communicates "not-yet-ready" uniformly. A `Stopped` or `Exited`
+/// box is not attachable either, so it renders hollow too.
 fn state_glyph(status: boxes::BoxState) -> &'static str {
     match status {
         boxes::BoxState::Active => "●",
-        boxes::BoxState::Pending | boxes::BoxState::Materializing => "◯",
+        boxes::BoxState::Pending
+        | boxes::BoxState::Materializing
+        | boxes::BoxState::Stopped
+        | boxes::BoxState::Exited => "◯",
     }
 }
 

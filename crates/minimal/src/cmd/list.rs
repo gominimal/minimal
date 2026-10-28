@@ -257,11 +257,13 @@ pub(crate) fn duplicate_session_warning(
                 "{lead} To reuse it instead: min session attach {key}"
             ))
         }
-        _ => Some(format!(
+        boxes::BoxState::Pending | boxes::BoxState::Materializing => Some(format!(
             "{lead} The existing session is still being created; run `min ls` \
-             until its status is active, then attach to it with `min session \
+             until its status is running, then attach to it with `min session \
              attach <session>` instead of creating a second."
         )),
+        // An ended session is not one attach accepts, so no reuse command.
+        boxes::BoxState::Stopped | boxes::BoxState::Exited => Some(lead),
     }
 }
 
@@ -290,24 +292,15 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     if !host_up && !vm_up {
         ensure_daemon(global)?;
     }
-    // Compose the default loadout contribution up front, mirroring
-    // cmd_activate: the dash module takes a pre-composed contribution so its
-    // `run` stays free of this crate's config/loadout plumbing, and an empty
-    // contribution would silently skip `default_loadouts` and the user policy
-    // for sessions created from the dashboard.
-    let cfg = config::read_client_config(global)?;
-    let user_policy = config::read_user_policy(global)?;
-    let compose_options = loadouts::compose_options_from_config(&cfg);
-    let active =
-        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
-    // `true`: the dashboard has no `--no-hooks`, matching the `hooks_enabled`
-    // the TUI sends on `CreateSession`.
-    let (contribution, _user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    // When dash creates a session, it resolves the activation inputs through
+    // the same helper `min session activate` uses, against that session's own
+    // project path — so a loadout with an external hook, or one whose scripts
+    // sit beside the project, works from the dashboard too. The default
+    // selection is passed here; composition happens per create.
     crate::dash::run(crate::dash::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         config_dir: global.config_dir.clone(),
-        contribution,
+        loadouts: loadouts::LoadoutSelection::Defaults,
     })
     .await
 }
@@ -1281,13 +1274,18 @@ pub fn format_ls_across_vms_on(
     Ok(())
 }
 
-/// Human-readable lifecycle status for the `ls` table, using the same
-/// snake_case tokens the `--json` surface emits so the two agree.
+/// Human-readable lifecycle status for the `ls` table: the state names
+/// BOX-011 gives, which the `--json` surface also emits, except that it
+/// still spells `running` as `active`.
 pub(crate) fn status_label(status: boxes::BoxState) -> &'static str {
     match status {
         boxes::BoxState::Pending => "pending",
         boxes::BoxState::Materializing => "materializing",
-        boxes::BoxState::Active => "active",
+        // BOX-011 names the state `running`. The record still stores it as
+        // `active`, so `--json` prints that word.
+        boxes::BoxState::Active => "running",
+        boxes::BoxState::Stopped => "stopped",
+        boxes::BoxState::Exited => "exited",
     }
 }
 
@@ -1304,5 +1302,23 @@ pub(crate) fn format_memory(bytes: u64) -> String {
         }
     } else {
         format!("{} MiB", bytes / MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_label;
+
+    // BOX-011: `min ls` labels each state with its BOX-011 name.
+    #[test]
+    fn list_labels_a_running_box_running() {
+        assert_eq!(status_label(boxes::BoxState::Active), "running");
+        assert_eq!(status_label(boxes::BoxState::Pending), "pending");
+        assert_eq!(
+            status_label(boxes::BoxState::Materializing),
+            "materializing"
+        );
+        assert_eq!(status_label(boxes::BoxState::Stopped), "stopped");
+        assert_eq!(status_label(boxes::BoxState::Exited), "exited");
     }
 }

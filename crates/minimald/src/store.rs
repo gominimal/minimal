@@ -177,6 +177,13 @@ impl Store {
                 let _ = r.send(self.store.save(&k, &v));
             }
             StoreMessage::SessionDelete(k, r) => {
+                #[cfg(test)]
+                if test_faults::take_delete_failure(k.id()) {
+                    let _ = r.send(Err(std::io::Error::other(
+                        "test fault: the record delete failed",
+                    )));
+                    return;
+                }
                 let _ = r.send(self.store.delete(&k));
             }
             StoreMessage::CompositionLoad(k, r) => {
@@ -399,6 +406,44 @@ impl WeakStoreHandle {
     }
 }
 
+/// Test-only faults the store actor injects, keyed by the box id so
+/// tests that run in parallel do not see each other's faults.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use boxes::SessionId;
+    use std::sync::Mutex;
+
+    static FAIL_NEXT_DELETE: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// Makes the next record delete of `id` fail once.
+    pub(crate) fn fail_next_delete(id: SessionId) {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .push(id);
+    }
+
+    /// Whether a delete failure of `id` is armed and not yet consumed.
+    pub(crate) fn delete_failure_armed(id: &SessionId) -> bool {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .contains(id)
+    }
+
+    /// Consumes the armed delete failure of `id`, if there is one.
+    pub(super) fn take_delete_failure(id: &SessionId) -> bool {
+        let mut armed = FAIL_NEXT_DELETE.lock().expect("test fault lock poisoned");
+        match armed.iter().position(|armed_id| armed_id == id) {
+            Some(index) => {
+                armed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,12 +470,17 @@ mod tests {
             box_addresses: None,
             hooks_enabled: true,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
@@ -468,7 +518,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let held = {
-            let (store, ids) = store_seeded_with(&dir, [record_named("held")]).await;
+            // Seed a record that already names its box type, so the
+            // one-time migration at the reopen below leaves it unchanged.
+            let seed = Record {
+                box_type: Some(boxes::SESSION_BOX_TYPE.to_string()),
+                ..record_named("held")
+            };
+            let (store, ids) = store_seeded_with(&dir, [seed]).await;
             let held = open(&store, RecordPredicate::Id(ids[0]))
                 .await
                 .record()
@@ -480,6 +536,13 @@ mod tests {
         HELD.set(held.id).unwrap();
 
         let store = Store::init_with_mint(daemon_dir(&dir), mint_the_held_id)
+            .await
+            .unwrap();
+        // Read the held record after the reopen, so the start-up migration
+        // is not part of what the refused create must leave unchanged.
+        let before = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
             .await
             .unwrap();
         let err = store
@@ -505,7 +568,7 @@ mod tests {
             .record()
             .await
             .unwrap();
-        assert_eq!(after, held, "the retained record is unchanged");
+        assert_eq!(after, before, "the retained record is unchanged");
     }
 
     /// Resolve a handle to a record expected to exist.

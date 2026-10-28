@@ -13,7 +13,8 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;
@@ -921,6 +922,7 @@ pub type SessionId = BoxId;
 ///
 /// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum BoxState {
     /// Composition is in flight; the record is a stub awaiting the
@@ -943,9 +945,18 @@ pub enum BoxState {
     Materializing,
     /// Composition complete and every side-channel upload is on
     /// disk; the record is ready to apply and the session is
-    /// attachable.
+    /// attachable. This is the stored spelling of the `running` state
+    /// (BOX-011), and a record that spells it `running` loads as it.
     #[default]
+    #[serde(alias = "running")]
     Active,
+    /// A stop ended the box, or the daemon found it running with no
+    /// process left (BOX-011). The record's `reason`, `exit_code` and
+    /// `signal` say how it ended.
+    Stopped,
+    /// The box ended on its own, by timeout, or by an OOM kill (BOX-011).
+    /// The record's `reason`, `exit_code` and `signal` say how it ended.
+    Exited,
 }
 
 /// Default for [`Record::hooks_enabled`] (and for the matching field on
@@ -1339,6 +1350,24 @@ pub struct Record {
     #[serde(default)]
     pub status: BoxState,
 
+    /// The `reason` a `stopped` or `exited` record ended for (BOX-011),
+    /// as written: a reason this build does not know loads and saves
+    /// unchanged. `None` for every other state, and for records that
+    /// predate the field. Write it with [`Self::set_state`] and read it
+    /// with [`Self::state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::core::record::StoredReason>,
+
+    /// The exit code the BOX-011 table gives a `stopped` or `exited`
+    /// record, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+
+    /// The number of the signal that ended a `stopped` box's entrypoint
+    /// (BOX-013), else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+
     /// Whether this session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`.
     ///
@@ -1440,6 +1469,24 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
 
+    /// Set on a box created for a single `min task run` without `--keep`,
+    /// so the box dies with its run even if the daemon that accepted it
+    /// does not (NET-131): a restart's resume destroys a marked box
+    /// instead of bringing it back, which is the same teardown a finished
+    /// run's own box-end takes. Written once, by the create that mints the
+    /// record (the client's `BoxConfig::ends_with_run`), and read only by
+    /// the resume (`resume_active_sessions`, which runs on Linux only, so
+    /// on other hosts the mark is written and never read). Defaults to
+    /// `false` for every record that predates the field.
+    ///
+    /// The destroy of a run's `running` record at restart is an interim
+    /// against architecture line 495: a restart sets an orphaned
+    /// `running` record to `stopped` and keeps it (spec 29 BOX-012,
+    /// BOX-154). gominimal/inbox#731 owns the flip. The flip sets the
+    /// record to `stopped` and keeps it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
+
     /// The sealed value of each of the box's GitHub grants, as the
     /// creating client minted them (BEP-007). Every host launch places
     /// each one in its grant's environment variable. Empty for a box with
@@ -1490,6 +1537,36 @@ pub const SESSION_BOX_TYPE: &str = "session";
 pub const TASK_BOX_TYPE: &str = "task";
 
 impl Record {
+    /// The one state the record is in (BOX-011), read from its `status`
+    /// and its stored ending.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::core::record::UnreadableEnding`] when the record is `stopped` or
+    /// `exited` and its `reason`, `exit_code` and `signal` are not a row
+    /// of the BOX-011 table, such as a reason this build does not know.
+    pub fn state(
+        &self,
+    ) -> Result<crate::core::record::RecordState, crate::core::record::UnreadableEnding> {
+        crate::core::record::RecordState::from_stored(
+            self.status,
+            self.reason.as_ref(),
+            self.exit_code,
+            self.signal,
+        )
+    }
+
+    /// Puts the record in `state`: its `status` and the `reason`,
+    /// `exit_code` and `signal` the BOX-011 table gives the state. A state
+    /// with no ending clears all three.
+    pub fn set_state(&mut self, state: crate::core::record::RecordState) {
+        let stored = state.to_stored();
+        self.status = stored.status;
+        self.reason = stored.reason;
+        self.exit_code = stored.exit_code;
+        self.signal = stored.signal;
+    }
+
     /// [`Record::validate_policy`] plus the checks a record must pass only
     /// when it is created: added after records were already stored, they
     /// would strand an existing session if they ran on every launch.
@@ -1739,6 +1816,9 @@ mod tests {
             network,
             policy,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1746,6 +1826,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
@@ -1787,6 +1869,38 @@ mod tests {
         }"#;
         let r: Record = serde_json_lenient::from_str(json).expect("record must load");
         assert!(!r.hooks_enabled);
+    }
+
+    /// A record written before `ends_with_run` existed loads unmarked:
+    /// the run-owned teardown must not claim a pre-existing session's
+    /// box, so an absent field reads as `false`, never as `true`.
+    #[test]
+    fn record_predating_ends_with_run_defaults_to_plain() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("legacy record must still load");
+        assert!(!r.ends_with_run);
+    }
+
+    /// An explicit `ends_with_run: true` survives deserialization rather
+    /// than being dropped by the default.
+    #[test]
+    fn record_honours_explicit_ends_with_run() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "ends_with_run": true,
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("record must load");
+        assert!(r.ends_with_run);
     }
 
     /// NET-134: the session policy gains a box's declaration of a

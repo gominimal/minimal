@@ -32,7 +32,8 @@
 //! deployment's to say, and neither category is ever dropped from the
 //! enumeration by saying it.
 
-use boxes::core::egress::{EgressRules, Ipv4Cidr};
+use boxes::core::egress::{EgressRules, IPPROTO_TCP, Ipv4Cidr};
+use std::io;
 use switch::SwitchSubnet;
 
 /// A category of the node-plane baseline enumeration: one of the design's
@@ -150,8 +151,102 @@ impl NodeBaselinePhase {
 /// point them — is the change that flips this constant, and the constant is
 /// the whole cutover: the gate's decision reads it off the baseline it was
 /// built with ([`NodePlaneBaseline::phase`]), the start-up line logs it, and
-/// the tests pin both of its arms, so the flip is one line and nothing else.
+/// the tests pin both of its arms, so the flip is one line here, beside the
+/// listener that feeds [`REGISTRY_CACHE_FETCH_PORTS`].
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
+
+/// The environment variable the daemon's host-exposure port list is read
+/// from, each time the daemon starts the VM's network — from the daemon's
+/// own environment, so a change takes a daemon restart, the same shape the
+/// hostname proxy port and the egress-default opt-out carry.
+pub(crate) const HOST_EXPOSURE_PORTS_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
+
+/// The host-exposure port list the daemon starts with, as the deployment
+/// spelled it. The design holds the alias default-deny except explicitly
+/// configured host exposures (design §7.1), so absent or empty, the list is
+/// empty and the alias is refused at every port for every row. The list is
+/// comma-separated, each term a port (`4200`) or an inclusive range
+/// (`3000-3999`), port 0 excluded; a term that is neither, a reversed range,
+/// or a value that is not Unicode fails the start, the error naming the term
+/// and the fix.
+pub(crate) fn host_exposure_ports_from_env() -> io::Result<Vec<(u16, u16)>> {
+    match std::env::var(HOST_EXPOSURE_PORTS_ENV) {
+        Ok(raw) => host_exposure_ports_from_raw(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => host_exposure_ports_from_raw(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::other(format!(
+            "{HOST_EXPOSURE_PORTS_ENV} is not valid Unicode. {HOST_EXPOSURE_FIX}"
+        ))),
+    }
+}
+
+/// The correction every parse error ends with.
+const HOST_EXPOSURE_FIX: &str = "Set it to ports and ranges such as 8080,3000-3999, \
+     or set it empty to close host.min.internal.";
+
+/// Parses one deployment's spelling of the host-exposure port list: every
+/// term a port or an inclusive range from 1 to 65535, whitespace trimmed;
+/// absent or empty, no exposure at all.
+fn host_exposure_ports_from_raw(raw: Option<&str>) -> io::Result<Vec<(u16, u16)>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let port = |text: &str, term: &str| match text.trim().parse::<u16>() {
+        Ok(0) | Err(_) => Err(bad_host_exposure_term(term)),
+        Ok(port) => Ok(port),
+    };
+    raw.split(',')
+        .filter(|term| !term.trim().is_empty())
+        .map(|term| {
+            let term = term.trim();
+            match term.split_once('-') {
+                Some((lo, hi)) => {
+                    let (lo, hi) = (port(lo, term)?, port(hi, term)?);
+                    if lo <= hi {
+                        Ok((lo, hi))
+                    } else {
+                        Err(io::Error::other(format!(
+                            "{HOST_EXPOSURE_PORTS_ENV}: `{term}` is a reversed range; write it \
+                             low-high, as `{hi}-{lo}`. {HOST_EXPOSURE_FIX}"
+                        )))
+                    }
+                }
+                None => port(term, term).map(|port| (port, port)),
+            }
+        })
+        .collect()
+}
+
+/// The start-failing error for one unparseable term: the variable, the term
+/// as it was read, and the correction.
+fn bad_host_exposure_term(term: &str) -> io::Error {
+    io::Error::other(format!(
+        "{HOST_EXPOSURE_PORTS_ENV}: `{term}` is not a port from 1 to 65535 or a low-high port \
+         range. {HOST_EXPOSURE_FIX}"
+    ))
+}
+
+/// The IP protocol the in-force arm opens on the switch's host alias: TCP
+/// alone, because the store surface the built-in endpoints name is HTTPS.
+/// QUIC is not admitted; carrying it would be a stated choice that adds UDP
+/// here. Every other protocol to the alias, ICMP and GRE among them, is the
+/// infrastructure drop, whatever its bytes read as a port.
+pub(crate) const REGISTRY_CACHE_FETCH_PROTOCOL: u8 = IPPROTO_TCP;
+
+/// The ports the in-force arm opens on the switch's host alias, over
+/// [`REGISTRY_CACHE_FETCH_PROTOCOL`]. The compiled set has no port
+/// dimension, so without this bound the alias would be admitted at every
+/// port.
+///
+/// 443 is the planned port of the helper's store surface on the alias. No
+/// listener serves a registry or a cache there yet, and the daemon's own
+/// fetches go to `cache.minimal.dev`, not to the alias. When that listener
+/// lands, this list must be read from the listener's stack, the way
+/// `switch::bep_host::PROXY_PORT` is. `[443]` is the planned port, and no
+/// listener serves it. While [`NODE_BASELINE_PHASE`] is
+/// [`NodeBaselinePhase::Announced`], only the in-force tests exercise this
+/// list. The endpoint-configuration change (#1786) replaces it with the
+/// listener's port, or with an empty list if no listener exists.
+pub(crate) const REGISTRY_CACHE_FETCH_PORTS: [u16; 1] = [443];
 
 /// The node-plane baseline set: the categories in force, each with the
 /// subnets it admits, and the compiled rules the host-side gate decides
@@ -165,6 +260,10 @@ pub struct NodePlaneBaseline {
     /// The switch's resolver, carried into every recompilation so the
     /// resolver carve-out survives a re-pointed category.
     resolver: [u8; 4],
+    /// The switch's host alias: the address the in-force arm bounds to
+    /// [`REGISTRY_CACHE_FETCH_PROTOCOL`] at [`REGISTRY_CACHE_FETCH_PORTS`],
+    /// carried so the policy display spells that bound beside the endpoint.
+    host_alias: [u8; 4],
     /// The categories in force, in the order the display spells them.
     entries: Vec<BaselineEntry>,
     /// The compiled allow list the gate decides node-plane frames by: every
@@ -174,6 +273,14 @@ pub struct NodePlaneBaseline {
     /// The posture the gate decides the set under: the shipped constant,
     /// until the store-surface configuration flips it.
     phase: NodeBaselinePhase,
+    /// The configured host exposures over the alias, as inclusive port
+    /// ranges: the ports the node row still reaches the host alias at while
+    /// the baseline is announced, every other port refused through the
+    /// alias. Empty unless the deployment names ports. The host-side gate
+    /// alone reads it: the guest-side verdict's own alias list starts empty
+    /// and nothing in the run path fills it, so own-address boxes stay
+    /// refused at every port.
+    host_exposure: Vec<(u16, u16)>,
 }
 
 impl NodePlaneBaseline {
@@ -198,7 +305,9 @@ impl NodePlaneBaseline {
     /// the enumerated set.
     ///
     /// The compiled set allows every IP protocol within the admitted
-    /// subnets — the categories bound destinations, not protocols — and is
+    /// subnets — the categories bound destinations, not protocols; the
+    /// gate's in-force arm bounds the host alias to TCP at
+    /// [`REGISTRY_CACHE_FETCH_PORTS`] before the set is consulted — and is
     /// keyed to the in-VM daemon's own address as its lease: the verdict
     /// rejects any frame wearing another source, so the set decides
     /// node-plane frames and only those. The resolver's carve-out keeps the
@@ -210,6 +319,7 @@ impl NodePlaneBaseline {
         Self::from_entries(
             subnet.daemon_ip().octets(),
             subnet.dns_server().octets(),
+            host_alias.octets(),
             vec![
                 BaselineEntry {
                     category: BaselineCategory::Registry,
@@ -249,6 +359,72 @@ impl NodePlaneBaseline {
     #[must_use]
     pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
+    }
+
+    /// The host exposures over the alias this gate carries: the inclusive
+    /// port ranges the announced node row still reaches the host alias at,
+    /// empty unless the deployment configured ports.
+    #[must_use]
+    pub(crate) fn host_exposure_ports(&self) -> &[(u16, u16)] {
+        &self.host_exposure
+    }
+
+    /// Points the host exposures at `ports`, replacing the current list: a
+    /// host names or clears its own exposure surface, and a cleared list is an
+    /// alias with no opening — refused at every port for every row — not
+    /// an absent arm. The compiled set is untouched: the list scopes the
+    /// alias alone.
+    #[must_use]
+    pub fn with_host_exposure(mut self, ports: Vec<(u16, u16)>) -> Self {
+        self.host_exposure = ports;
+        self
+    }
+
+    /// The host-exposure list as the daemon's start-up line spells it: one
+    /// `lo-hi` term per range, a bare port for a single-port term, and
+    /// `(none)` when the deployment cleared the list.
+    #[must_use]
+    pub(crate) fn render_host_exposure(&self) -> String {
+        if self.host_exposure.is_empty() {
+            return "(none)".to_string();
+        }
+        self.host_exposure
+            .iter()
+            .map(|&(lo, hi)| {
+                if lo == hi {
+                    lo.to_string()
+                } else {
+                    format!("{lo}-{hi}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// One entry's endpoints as the policy display spells them (NET-061): an
+    /// endpoint naming the host alias carries the in-force arm's bound
+    /// beside it (`100.64.255.254/32 tcp/443`), because the set has no port
+    /// dimension and the bound is what in force admits there. Any other
+    /// endpoint is spelled as the set holds it.
+    #[must_use]
+    pub fn display_endpoints(&self, entry: &BaselineEntry) -> Vec<String> {
+        let alias = format!("{}/32", std::net::Ipv4Addr::from(self.host_alias));
+        let ports = REGISTRY_CACHE_FETCH_PORTS
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        entry
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                if *endpoint == alias {
+                    format!("{endpoint} tcp/{ports}")
+                } else {
+                    endpoint.clone()
+                }
+            })
+            .collect()
     }
 
     /// The set as the daemon's start-up line spells it: one
@@ -314,14 +490,23 @@ impl NodePlaneBaseline {
     }
 
     /// Assembles the set from its parts: the categories carried, and the
-    /// addresses the compiled rules are keyed to.
-    fn from_entries(node_addr: [u8; 4], resolver: [u8; 4], entries: Vec<BaselineEntry>) -> Self {
+    /// addresses the compiled rules are keyed to. The host exposures start
+    /// empty, the alias closed; the deployment's spelling replaces them in
+    /// the run path's builder.
+    fn from_entries(
+        node_addr: [u8; 4],
+        resolver: [u8; 4],
+        host_alias: [u8; 4],
+        entries: Vec<BaselineEntry>,
+    ) -> Self {
         Self {
             node_addr,
             resolver,
+            host_alias,
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
+            host_exposure: Vec::new(),
         }
     }
 
@@ -344,7 +529,10 @@ impl NodePlaneBaseline {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaselineCategory, BaselineEntry, NodePlaneBaseline};
+    use super::{
+        BaselineCategory, BaselineEntry, HOST_EXPOSURE_PORTS_ENV, NodePlaneBaseline,
+        host_exposure_ports_from_raw,
+    };
     use boxes::core::egress::{FrameVerdict, summarize, verdict};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
@@ -522,5 +710,100 @@ mod tests {
             FrameVerdict::Drop(reason) => assert_eq!(reason.rule(), "egress-foreign-source"),
             FrameVerdict::Admit => panic!("a foreign source is not admitted by the set"),
         }
+    }
+
+    /// The deployment's spelling of the host-exposure list: absent or
+    /// empty, no exposure — the alias closed; every term a port or an
+    /// inclusive range from 1 to 65535; an undecodable term, port 0, or a
+    /// reversed range a surfaced error naming the variable, the term and
+    /// the fix.
+    #[test]
+    fn host_exposure_ports_read_from_the_environment() {
+        assert!(
+            host_exposure_ports_from_raw(None).unwrap().is_empty(),
+            "an unset variable is no exposure: the alias stays closed"
+        );
+        assert_eq!(
+            host_exposure_ports_from_raw(Some("8080")).unwrap(),
+            vec![(8080, 8080)],
+            "a bare port is a single-port range"
+        );
+        assert_eq!(
+            host_exposure_ports_from_raw(Some(" 3000-3999, 4200 ")).unwrap(),
+            vec![(3000, 3999), (4200, 4200)],
+            "terms are inclusive ranges and ports, whitespace trimmed"
+        );
+        assert!(
+            host_exposure_ports_from_raw(Some("")).unwrap().is_empty(),
+            "a set-but-empty list is no exposure"
+        );
+        let garbage = host_exposure_ports_from_raw(Some("8080:nope"))
+            .expect_err("an undecodable term is a surfaced error")
+            .to_string();
+        assert!(
+            garbage.contains(HOST_EXPOSURE_PORTS_ENV)
+                && garbage.contains("`8080:nope` is not a port")
+                && garbage.contains("set it empty to close host.min.internal"),
+            "an undecodable term names the variable, the term and the fix, got: {garbage}"
+        );
+        for zero in ["0", "0-65535"] {
+            let error = host_exposure_ports_from_raw(Some(zero))
+                .expect_err("port 0 is refused")
+                .to_string();
+            assert!(
+                error.contains(&format!("`{zero}` is not a port")),
+                "port 0 names the term, got: {error}"
+            );
+        }
+        let reversed = host_exposure_ports_from_raw(Some("4000-3000"))
+            .expect_err("a reversed range is not an inclusive one")
+            .to_string();
+        assert!(
+            reversed.contains("`4000-3000` is a reversed range")
+                && reversed.contains("`3000-4000`")
+                && !reversed.contains("is not a port"),
+            "a reversed range gets its own message, got: {reversed}"
+        );
+    }
+
+    /// The baseline carries no exposure until the deployment's spelling
+    /// replaces the list: the builder replaces rather than merges, and a
+    /// cleared list reaches the accessor empty.
+    #[test]
+    fn baseline_carries_the_configured_host_exposures() {
+        let built_in = NodePlaneBaseline::built_in(SUBNET);
+        assert!(
+            built_in.host_exposure_ports().is_empty(),
+            "the built-in enumeration carries no host exposure"
+        );
+        let re_exposed = built_in.with_host_exposure(vec![(8080, 8080)]);
+        assert_eq!(
+            re_exposed.host_exposure_ports(),
+            &[(8080, 8080)],
+            "the builder sets the list"
+        );
+        let cleared = re_exposed.with_host_exposure(vec![]);
+        assert!(
+            cleared.host_exposure_ports().is_empty(),
+            "a cleared list is carried empty"
+        );
+    }
+
+    /// NET-061: the policy display spells the in-force arm's bound beside
+    /// an endpoint naming the host alias, and a re-pointed endpoint as the
+    /// set holds it.
+    #[test]
+    fn display_endpoints_spell_the_alias_bound() {
+        let baseline =
+            NodePlaneBaseline::built_in(SUBNET).with_cache(vec!["198.51.100.0/24".to_owned()]);
+        let alias = format!("{}/32 tcp/443", SUBNET.host_alias());
+        assert_eq!(
+            baseline.display_endpoints(entry(&baseline, BaselineCategory::Registry)),
+            vec![alias]
+        );
+        assert_eq!(
+            baseline.display_endpoints(entry(&baseline, BaselineCategory::Cache)),
+            vec!["198.51.100.0/24".to_owned()]
+        );
     }
 }

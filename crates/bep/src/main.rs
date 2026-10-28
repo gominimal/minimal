@@ -37,15 +37,17 @@ use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
 use bep::control::{Control, KeyBound, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
+use bep::handle::{self as store_handle, Rules, StoreRule};
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
-use bep::proxy::{self, Admission, AuditWriter, Proxy, SystemResolver};
+use bep::proxy::{self, Admission, AuditWriter, Proxy, StoreAuthorities, SystemResolver};
 use bep::publish::{Identity, PublishError, certificate_fingerprint};
-use bep::redeemer::{BoxRedeemer, Revocations};
+use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
 use clap::{Parser, Subcommand};
+use client_config::store_rules::StoreDenySet;
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// Runs the box egress proxy on this host.
@@ -188,7 +190,7 @@ where
             );
             return ExitCode::FAILURE;
         }
-        return replace_key(store, role, &path);
+        return replace_key(store, role, &path, &client_store_rules().current());
     }
     if args.rotate_signing {
         if args.command.is_some() {
@@ -219,8 +221,12 @@ where
             }
         };
     }
-    let started = start(store, &path).and_then(|(keys, root)| match &args.command {
-        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root),
+    let rules = Arc::new(client_store_rules());
+    // One read feeds the root's names and the admitted set, so the proxy
+    // never admits an authority that the published root does not permit.
+    let held = rules.current();
+    let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
+        Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held, &path),
         None => Ok(()),
     });
     match started {
@@ -234,7 +240,7 @@ where
 
 /// `bep --replace-key <role>`. It needs no other key and no file, so it
 /// works when the proxy does not start.
-fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path) -> ExitCode
+fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path, rules: &[StoreRule]) -> ExitCode
 where
     S::Key: CaKey,
 {
@@ -296,7 +302,7 @@ where
     let identity = if role == Role::Root {
         match identity
             .clone()
-            .issuing_root(&key, registered_union(), SystemTime::now())
+            .issuing_root(&key, registered_union(rules), SystemTime::now())
         {
             Ok((identity, root)) => {
                 log_root(&root);
@@ -343,6 +349,7 @@ where
 fn start<S: KeyStore>(
     store: &S,
     path: &Path,
+    rules: &[StoreRule],
 ) -> Result<(ProxyKeys<S::Key>, RootCertificate), String>
 where
     S::Key: CaKey,
@@ -369,7 +376,7 @@ where
     // so a changed set of registered names reaches the next box created.
     let (identity, root) = Identity::of(&loaded)
         .with_root_validity(previous.as_ref(), root_made_at)
-        .issuing_root(&loaded.root, registered_union(), SystemTime::now())
+        .issuing_root(&loaded.root, registered_union(rules), SystemTime::now())
         .map_err(root_refusal)?;
     log_root(&root);
     identity.publish(path).map_err(|err| err.to_string())?;
@@ -377,12 +384,428 @@ where
     Ok((loaded, root))
 }
 
-/// The names the root permits: the configured modules' hosts, less the
-/// deny set. The store rules' authorities join them when
-/// `[secret-store-rules]` is read at start, which is T25
-/// (<https://github.com/gominimal/minimal/issues/2280>).
-fn registered_union() -> Union {
-    Union::new(&[GITHUB], [""; 0])
+/// The names the root permits: the configured modules' hosts and the hosts
+/// the client's store `rules` register, less the deny set (BEP-013).
+fn registered_union(rules: &[StoreRule]) -> Union {
+    Union::new(
+        &[GITHUB],
+        rules.iter().flat_map(|rule| rule.upstream.iter()),
+    )
+}
+
+/// The authorities the proxy carries requests to: the configured modules'
+/// host sets and the `host:port` authorities the client's store `rules`
+/// register (BEP-032). A store authority whose host the root does not
+/// permit is left out, so the deny set is never admitted.
+#[cfg(test)]
+fn admission(rules: &[StoreRule]) -> Admission {
+    Admission::new(
+        &[GITHUB],
+        store_authorities(rules, &registered_union(rules)),
+    )
+}
+
+/// The `host:port` authorities that the store `rules` register, less each
+/// one whose host `union` does not permit.
+fn store_authorities(rules: &[StoreRule], union: &Union) -> Vec<(String, u16)> {
+    rules
+        .iter()
+        .flat_map(|rule| rule.upstream.iter())
+        .filter_map(|written| store_handle::parse_authority(written))
+        .filter(|authority| union.contains(&authority.host))
+        .map(|authority| (authority.host, authority.port))
+        .collect()
+}
+
+/// The rules that the published root was issued under, and the admitted
+/// store authorities.
+struct Admitted {
+    /// The rules of the last re-issue and publish that succeeded. A failed
+    /// one leaves them, so the next CONNECT tries again.
+    rules: Vec<StoreRule>,
+    authorities: Vec<(String, u16)>,
+    /// The CA holds a root that the identity file does not have yet.
+    unpublished: bool,
+    /// The rules of the last re-issue or publish that failed, and when the
+    /// next try for those same rules is due. Until then a CONNECT gives
+    /// the admitted set and does not read the file or log again.
+    failed: Option<(Vec<StoreRule>, Instant)>,
+}
+
+/// How long `bep serve` waits to re-issue or publish the root again after
+/// a try failed, while the rules stay the same.
+const REISSUE_RETRY: Duration = Duration::from_secs(60);
+
+/// The store authorities that `bep serve` admits at each CONNECT. When the
+/// client's rules change, the root is issued again under the same key and
+/// subject with the new names, the published identity gets that root, and
+/// the admitted set follows. A rule that adds an upstream is admitted
+/// without a restart (#2618, BEP-032).
+struct StoreAdmission<K: 'static> {
+    rules: Arc<ClientRules>,
+    ca: Arc<Mutex<Ca<'static, K>>>,
+    /// The `kid` of the root key that the CA holds. A root is published
+    /// only to an identity file that names this key.
+    root_kid: String,
+    /// The published identity file, which gets each new root.
+    identity: PathBuf,
+    admitted: Mutex<Admitted>,
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
+    /// The source over `rules`, which starts with the `held` rules that the
+    /// root of `ca` was issued under. `root_kid` names the root key of `ca`.
+    fn new(
+        rules: Arc<ClientRules>,
+        ca: Arc<Mutex<Ca<'static, K>>>,
+        root_kid: String,
+        identity: PathBuf,
+        held: Vec<StoreRule>,
+    ) -> Self {
+        let union = ca
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .union()
+            .clone();
+        let authorities = store_authorities(&held, &union);
+        Self {
+            rules,
+            ca,
+            root_kid,
+            identity,
+            admitted: Mutex::new(Admitted {
+                rules: held,
+                authorities,
+                unpublished: false,
+                failed: None,
+            }),
+        }
+    }
+
+    /// Issues the root again for `rules` when their names changed, and
+    /// publishes it, or publishes a root that an earlier call did not.
+    /// Gives the names the root in use permits, and whether the re-issue
+    /// and the publish succeeded. On an error the root in use stays, and
+    /// the caller tries again at the next CONNECT.
+    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, bool) {
+        let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
+        let issued = match ca.reissue_root(registered_union(rules), SystemTime::now()) {
+            Ok(issued) => issued,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
+                );
+                return (ca.union().clone(), false);
+            }
+        };
+        if issued || *unpublished {
+            *unpublished = true;
+            if let Err(err) = self.publish(ca.root()) {
+                tracing::error!(
+                    path = %self.identity.display(),
+                    error = %err,
+                    "did not publish the re-issued root; boxes created now get the old root"
+                );
+                return (ca.union().clone(), false);
+            }
+            *unpublished = false;
+        }
+        (ca.union().clone(), true)
+    }
+
+    /// Writes `root` to the identity file when the file names the root key
+    /// that the CA holds. A file whose root key was replaced while
+    /// `bep serve` runs is left as it is.
+    fn publish(&self, root: &[u8]) -> Result<(), String> {
+        let identity = Identity::read(&self.identity).map_err(|err| err.to_string())?;
+        let kid = identity
+            .key(Role::Root)
+            .map_err(|err| err.to_string())?
+            .kid();
+        if kid != self.root_kid {
+            return Err(format!(
+                "the file names root key {kid}, and bep serve holds root key {}",
+                self.root_kid
+            ));
+        }
+        identity
+            .with_root_certificate(root)
+            .publish(&self.identity)
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
+    fn authorities(&self) -> Vec<(String, u16)> {
+        let rules = self.rules.current();
+        let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if admitted.rules == rules && !admitted.unpublished {
+            return admitted.authorities.clone();
+        }
+        if let Some((failed, due)) = &admitted.failed
+            && *failed == rules
+            && Instant::now() < *due
+        {
+            return admitted.authorities.clone();
+        }
+        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
+        let authorities = store_authorities(&rules, &union);
+        if authorities != admitted.authorities {
+            tracing::info!(
+                before = ?admitted.authorities,
+                after = ?authorities,
+                identity = %self.identity.display(),
+                "admits the changed secret-store upstreams with no restart"
+            );
+        }
+        admitted.authorities.clone_from(&authorities);
+        if done {
+            admitted.rules = rules;
+            admitted.failed = None;
+        } else {
+            tracing::info!(
+                retry_secs = REISSUE_RETRY.as_secs(),
+                "re-issues or publishes the root again after the retry delay, or when the rules change"
+            );
+            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
+        }
+        authorities
+    }
+}
+
+/// The client's `[secret-store-rules]` that `bep` holds: the rules of the
+/// user-level `config.toml` that `min secret set` writes, merged over the
+/// organization's `/etc/minimal/config.toml` as `min` merges them, less
+/// each rule the deny set refuses (BEP-034). With no config dir (no
+/// absolute `XDG_CONFIG_HOME` and no home directory) there are none.
+///
+/// The redeemer asks the source at each request, and the source re-reads
+/// the files when one changes, so an edited rule decides the next
+/// redemption (BEP-032). One limit holds. `bep` reads the default config
+/// dir only, because `minvmd` starts `bep serve` and does not know a
+/// `min --config-dir` override, so rules written under an override are not
+/// read. `min` refuses to mint a store handle under such a rule unless this
+/// dir holds the same rule, and the refusal names both dirs. The root's
+/// names and the admitted CONNECT set follow the rules at each
+/// CONNECT ([`StoreAdmission`]). The start log line names the file.
+fn client_store_rules() -> ClientRules {
+    let paths = client_config_path().map(|user| {
+        (
+            user,
+            PathBuf::from(client_config::config::ORGANIZATION_CONFIG_PATH),
+        )
+    });
+    if paths.is_none() {
+        tracing::warn!(
+            "found no XDG_CONFIG_HOME and no home directory, so bep holds no secret-store rules"
+        );
+    }
+    ClientRules::new(paths)
+}
+
+/// The user-level `config.toml` in the default config dir, or `None` when
+/// neither an absolute `XDG_CONFIG_HOME` nor a home directory names it.
+fn client_config_path() -> Option<PathBuf> {
+    // `paths` takes an absolute `XDG_CONFIG_HOME` first, and stops the
+    // process when it then finds no home directory. Check the same order.
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").is_some_and(|dir| Path::new(&dir).is_absolute());
+    if !xdg {
+        std::env::home_dir()?;
+    }
+    Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
+}
+
+/// What identifies one version of a file without a read of it, or `None`
+/// when it does not stat.
+type Stamp = Option<FileStamp>;
+
+/// The stat of one file version: its modification time and its length,
+/// and on unix the inode change time, the inode and the device. An edit
+/// that keeps the length and the modification time (`cp -p`, `touch -r`,
+/// `rsync -t`, a package install) still sets the change time, and a file
+/// replaced by a rename gets a new inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    /// The inode change time, `None` off unix or when it does not convert.
+    changed: Option<SystemTime>,
+    /// The device and the inode, `None` off unix.
+    inode: Option<(u64, u64)>,
+}
+
+impl FileStamp {
+    /// The later of the modification time and the change time, or `None`
+    /// with no modification time.
+    fn latest(&self) -> Option<SystemTime> {
+        let modified = self.modified?;
+        Some(
+            self.changed
+                .map_or(modified, |changed| modified.max(changed)),
+        )
+    }
+}
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let (changed, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        let changed = u64::try_from(meta.ctime())
+            .ok()
+            .zip(u32::try_from(meta.ctime_nsec()).ok())
+            .and_then(|(secs, nanos)| {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+            });
+        (changed, Some((meta.dev(), meta.ino())))
+    };
+    #[cfg(not(unix))]
+    let (changed, inode) = (None, None);
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        changed,
+        inode,
+    })
+}
+
+/// How close to a read a file change can be and still hide from a stat.
+/// An edit that keeps the length inside one timestamp tick keeps the stamp,
+/// and the coarsest common tick (FAT) is two seconds.
+const RACY: Duration = Duration::from_secs(2);
+
+/// Whether a file with `stamp` is older than the read at `read_at` by more
+/// than one tick, so a stamp that did not change means content that did
+/// not change. The later of the modification time and the change time
+/// decides. A file with no modification time is never settled.
+fn settled(stamp: &Stamp, read_at: SystemTime) -> bool {
+    match stamp {
+        None => true,
+        Some(file) => file
+            .latest()
+            .and_then(|latest| latest.checked_add(RACY))
+            .is_some_and(|edge| edge < read_at),
+    }
+}
+
+/// The rules of the last read, with the stamps of the two files before it
+/// and the time it started.
+struct Read {
+    stamps: [Stamp; 2],
+    read_at: SystemTime,
+    rules: Vec<StoreRule>,
+}
+
+/// The source of the client's store rules that `bep serve` owns. It holds
+/// the rules of the user and the organization file. Each request stats the
+/// two files, and reads them again only when a stamp changed, or when a
+/// file changed so near the last read that a same-tick edit can hide.
+struct ClientRules {
+    /// The user file and the organization file, or `None` with no home
+    /// directory.
+    paths: Option<(PathBuf, PathBuf)>,
+    /// The last read, or `None` before the first.
+    cache: Mutex<Option<Read>>,
+}
+
+impl ClientRules {
+    fn new(paths: Option<(PathBuf, PathBuf)>) -> Self {
+        Self {
+            paths,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// The current rules: read again when a file changed since the last read.
+    fn current(&self) -> Vec<StoreRule> {
+        let Some((user, organization)) = &self.paths else {
+            return Vec::new();
+        };
+        let stamps = [stamp(user), stamp(organization)];
+        let changed = {
+            let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            match &*cache {
+                Some(last)
+                    if last.stamps == stamps && stamps.iter().all(|s| settled(s, last.read_at)) =>
+                {
+                    return last.rules.clone();
+                }
+                Some(last) => last.stamps != stamps,
+                None => false,
+            }
+        };
+        // The files are read outside the lock, so one slow read does not
+        // hold up the other redemptions.
+        let read_at = SystemTime::now();
+        let rules = store_rules_in(user, organization);
+        if changed {
+            tracing::info!(
+                store_rules = rules.len(),
+                "read the secret-store rules again after the client configuration changed"
+            );
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.as_ref().is_none_or(|last| last.read_at <= read_at) {
+            *cache = Some(Read {
+                stamps,
+                read_at,
+                rules: rules.clone(),
+            });
+        }
+        rules
+    }
+}
+
+impl Rules for ClientRules {
+    fn rule(&self, store: &str, id: &str) -> Option<StoreRule> {
+        self.current().rule(store, id)
+    }
+}
+
+/// The store rules of the client configuration at `user` merged over the
+/// organization configuration at `organization`, checked as `min` checks
+/// them (BEP-034), through the one merge `min` mints under. A missing file
+/// holds none. A file that exists and does not read or parse gives no rules
+/// at all, as `min` refuses to mint on it, and an error line names it. Each
+/// refused rule gets a warning line that names it.
+fn store_rules_in(user: &Path, organization: &Path) -> Vec<StoreRule> {
+    let module_hosts: Vec<&str> = GITHUB
+        .hosts
+        .iter()
+        .map(|authority| authority.host)
+        .collect();
+    let deny = StoreDenySet {
+        module_hosts: &module_hosts,
+        infrastructure: bep::ca::DENY_SET,
+        sign_in_items: &[signin::SERVICE, signin::META_SERVICE],
+    };
+    let read = match client_config::config::read_client_store_rules(user, organization, deny) {
+        Ok(read) => read,
+        Err(err) => {
+            tracing::error!(
+                file = %user.display(),
+                error = %err,
+                "did not read the client configuration, so bep holds no secret-store rules"
+            );
+            return Vec::new();
+        }
+    };
+    if let Some(err) = &read.organization_error {
+        tracing::error!(
+            file = %organization.display(),
+            error = %err,
+            "did not read the organization configuration, so bep holds no secret-store rules"
+        );
+        return Vec::new();
+    }
+    for refusal in &read.refused {
+        tracing::warn!(rule = %refusal.rule, file = refusal.file, "{refusal}");
+    }
+    read.rules
+        .into_iter()
+        .filter_map(|(id, rule)| StoreRule::from_config(&id, &rule))
+        .collect()
 }
 
 /// The one start line for the root certificate. It names the certificate's
@@ -623,13 +1046,16 @@ struct Wiring {
 /// `keychain`, and the registries it reads. The Box Host a sealed value and
 /// its handle name is this proxy's sealing key fingerprint, which the
 /// published identity carries. `restored` is the box ids that the
-/// revocations recorded before this start name.
+/// revocations recorded before this start name. `rules` is the source of
+/// the client's `[secret-store-rules]`, which the redeemer asks at each
+/// request to decide a store member (BEP-032).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn wire<K, C>(
     sealing: K,
     keychain: C,
     endpoint: Arc<dyn TokenEndpoint>,
     restored: Vec<String>,
+    rules: StoreRules,
 ) -> Wiring
 where
     K: HeldKey + Send + Sync + 'static,
@@ -647,10 +1073,6 @@ where
     // with the revocations restored from every retained audit segment
     // (BEP-068).
     let revocations: Revocations = Arc::new(std::sync::RwLock::new(restored));
-    //
-    // Interim: the redeemer reads no store rules until T25
-    // (https://github.com/gominimal/minimal/issues/2280) reads
-    // `[secret-store-rules]`, so a store-handle member is never admitted yet.
     let redeemer = Arc::new(
         BoxRedeemer::new(
             sealing,
@@ -661,6 +1083,8 @@ where
             keychain,
         )
         .with_revocations(Arc::clone(&revocations))
+        // BEP-032: a store member is judged against the client's rules.
+        .with_rules(rules)
         // BEP-069: an expiring sign-in renews here, at the proxy.
         .with_token_endpoint(endpoint),
     );
@@ -802,6 +1226,9 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     args: &ServeArgs,
     keys: ProxyKeys<K>,
     root: RootCertificate,
+    rules: Arc<ClientRules>,
+    held: Vec<StoreRule>,
+    identity: &Path,
 ) -> Result<(), String> {
     let token = read_token(io::stdin().lock())?;
     // Watched from here, so a supervisor that dies while the proxy starts
@@ -824,11 +1251,14 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     let segment = log.path().to_path_buf();
     let roots = proxy::native_roots()
         .map_err(|err| format!("bep did not load the host's root certificates: {err}."))?;
-    // The store rules' authorities join the admitted set when
-    // `[secret-store-rules]` is read at start, which is T25
-    // (https://github.com/gominimal/minimal/issues/2280). Until it lands the
-    // GitHub module's host set is the set, so a CONNECT to a registered store
-    // authority is refused and audited `off_module`.
+    // The file names where the rules came from: the default config dir
+    // (see `client_store_rules`).
+    let config = client_config_path().map(|path| path.display().to_string());
+    tracing::info!(
+        store_rules = held.len(),
+        file = config.as_deref().unwrap_or("none"),
+        "holds the secret-store rules of the client configuration"
+    );
     let ProxyKeys {
         sealing,
         root: root_key,
@@ -842,18 +1272,39 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         .map_err(|err| format!("bep did not issue its signing CA: {err}."))?;
     let endpoint = GitHubTokenEndpoint::new(roots.clone())?;
     let ca = Arc::new(Mutex::new(ca));
+    // The store rules' authorities join the admitted set, so a CONNECT to
+    // an authority that no module and no rule admits is refused and audited
+    // `off_module`. The set starts with the rules that `start` issued the
+    // root under, and each CONNECT asks for the current rules, so a widened
+    // rule re-issues the root and is admitted with no restart (#2618).
+    let admitted = Admission::with_source(
+        &[GITHUB],
+        Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            root_key.public().kid(),
+            identity.to_path_buf(),
+            held,
+        )),
+    );
     // One log, one writer: the proxy's decisions and the control socket's
     // mint and revocation records share the chain (BEP-067).
     let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
     let proxy = Proxy::new(
-        Admission::new(&[GITHUB], [("", 0); 0]),
+        admitted,
         ca.clone(),
         roots,
         Arc::new(SystemResolver),
         log.clone(),
     )
     .map_err(|err| err.to_string())?;
-    let wiring = wire(sealing, HostKeychain, Arc::new(endpoint), restored.box_ids);
+    let wiring = wire(
+        sealing,
+        HostKeychain,
+        Arc::new(endpoint),
+        restored.box_ids,
+        rules,
+    );
     let proxy = Arc::new(wiring.install(proxy, &control));
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     runtime.block_on(async {
@@ -868,7 +1319,6 @@ fn serve<K: CaKey + Send + Sync + 'static>(
             .control(&control, log, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
             .with_rotation(ca);
-        tracing::warn!("A store-handle member is not admitted until #2280 lands.");
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
@@ -1250,10 +1700,11 @@ mod tests {
     use bep::boxes::Stance;
     use bep::control::{Reply, Request};
     use bep::forward::Verdict;
-    use bep::handle::{self, Claims};
+    use bep::handle::{self, Claims, Inject};
     use bep::redeem::{Authority, RequestAuthority};
     use bep::seal::{self, Breadth, Context, Member, MemberKind, MemberList, Mode, ProxyPublicKey};
     use bep::signin::{Flow, Material, MemoryKeychain, Metadata};
+    use bep::store::NATIVE_STORE;
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -1517,7 +1968,7 @@ mod tests {
         let root_key = CaTestKey::new(Role::Root);
         let signing_key = CaTestKey::new(Role::Signing);
         let at = SystemTime::now();
-        let root = bep::ca::issue_root(&root_key, registered_union(), at).unwrap();
+        let root = bep::ca::issue_root(&root_key, registered_union(&[]), at).unwrap();
         let ca = Ca::with_root(&root_key, &signing_key, root, at).unwrap();
         let expiry = ca.signing_expiry();
         let at = SystemTime::now();
@@ -1613,7 +2064,7 @@ mod tests {
             signed_on: Mutex::new(Vec::new()),
         }));
         let at = SystemTime::now();
-        let root = bep::ca::issue_root(root_key, registered_union(), at).unwrap();
+        let root = bep::ca::issue_root(root_key, registered_union(&[]), at).unwrap();
         let ca = Arc::new(Mutex::new(
             Ca::with_root(root_key, signing_key, root, at).unwrap(),
         ));
@@ -1727,7 +2178,13 @@ mod tests {
                 },
             )
             .unwrap();
-        let wiring = wire(key, keychain, Arc::new(signin::NoTokenEndpoint), Vec::new());
+        let wiring = wire(
+            key,
+            keychain,
+            Arc::new(signin::NoTokenEndpoint),
+            Vec::new(),
+            Arc::new(Vec::<StoreRule>::new()),
+        );
 
         let proxy = Proxy::new(
             Admission::new(&[GITHUB], [("", 0); 0]),
@@ -1838,6 +2295,419 @@ mod tests {
         ));
     }
 
+    /// A store handle for box [`BOX`] on the Box Host `node`, for `id` in
+    /// the keychain, to `api.openai.com` as a bearer token, sealed to
+    /// `sealing`.
+    fn store_sealed(client: &SigningKey, sealing: &ProxyPublicKey, id: &str, now: u64) -> String {
+        let node = sealing.kid();
+        let jws = handle::sign(
+            client,
+            &Claims {
+                sub: BOX.into(),
+                node_id: node.clone(),
+                store: NATIVE_STORE.into(),
+                id: id.into(),
+                upstream: vec!["api.openai.com".into()],
+                inject: Some(Inject::Header {
+                    name: "Authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                }),
+                iat: now,
+                exp: now + 3600,
+                jti: format!("jti-{id}"),
+            },
+        );
+        seal::seal(
+            sealing,
+            &Context {
+                box_id: BOX.into(),
+                host: node,
+                module: GITHUB.id.into(),
+                host_set_version: GITHUB.host_set_version,
+                mode: Mode::User,
+                iat: now,
+                expiry: now + 600,
+                kid: sealing.kid(),
+            },
+            &MemberList {
+                members: vec![Member {
+                    kind: MemberKind::Store,
+                    breadth: Breadth::Full,
+                    jws: Zeroizing::new(jws),
+                    exp: None,
+                }],
+                default_owner: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A wired redeemer over `rules`, with its control socket under `dir`,
+    /// a client key registered and box [`BOX`] registered with egress to
+    /// `api.openai.com`. It returns the wiring, the sealing public key and
+    /// the client key.
+    async fn store_wiring(dir: &Path, rules: StoreRules) -> (Wiring, ProxyPublicKey, SigningKey) {
+        let key = TestKey(SecretKey::from_slice(&[5u8; 32]).unwrap());
+        let sealing = key.public();
+        let wiring = wire(
+            key,
+            MemoryKeychain::default(),
+            Arc::new(signin::NoTokenEndpoint),
+            Vec::new(),
+            rules,
+        );
+        let path = dir.join("bep/control.sock");
+        tokio::spawn(
+            wiring
+                .control(
+                    &path,
+                    Arc::new(Mutex::new(Vec::<Decision>::new())),
+                    KeyBound::default(),
+                )
+                .unwrap()
+                .run(),
+        );
+        let client = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
+        let mut stream = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        let registered = ask(
+            &mut stream,
+            &Request::RegisterClientKey {
+                key: URL_SAFE_NO_PAD.encode(client.verifying_key().to_sec1_bytes()),
+                box_id: None,
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+        let registered = ask(
+            &mut stream,
+            &Request::RegisterBox {
+                box_id: BOX.into(),
+                egress: vec!["api.openai.com".into()],
+                stance: Stance::OwnIp,
+            },
+        )
+        .await;
+        assert!(registered.ok, "{registered:?}");
+        (wiring, sealing, client)
+    }
+
+    /// The redemption of the store handle `sealed` on a request from box
+    /// [`BOX`] to `api.openai.com:443`.
+    fn redeem_openai(wiring: &Wiring, sealed: &str) -> bep::forward::Redeemed {
+        let openai = Authority {
+            host: "api.openai.com".to_owned(),
+            port: 443,
+        };
+        let request = RequestAuthority {
+            host: Some(openai.clone()),
+            target: None,
+        };
+        wiring
+            .redeemer
+            .redeem_reference(BOX, &openai, &request, sealed, "authorization")
+            .0
+    }
+
+    /// The `openai` rule: `api.openai.com` as a bearer token.
+    const OPENAI_RULE: &str = "[secret-store-rules.openai]\n\
+                               upstream = [\"api.openai.com\"]\n\
+                               header = \"Authorization\"\n\
+                               prefix = \"Bearer \"\n";
+
+    /// Assert that `redeemed` admits the `openai` item as a bearer token.
+    fn assert_openai_admitted(redeemed: bep::forward::Redeemed) {
+        match redeemed {
+            bep::forward::Redeemed::Store(admit) => {
+                assert_eq!(admit.store, NATIVE_STORE);
+                assert_eq!(admit.id, "openai");
+                assert_eq!(
+                    admit.inject,
+                    Inject::Header {
+                        name: "Authorization".into(),
+                        prefix: Some("Bearer ".into()),
+                    }
+                );
+            }
+            bep::forward::Redeemed::Verdict(verdict) => panic!("not admitted: {verdict:?}"),
+        }
+    }
+
+    // BEP-032, BEP-034: `bep serve` reads the client's
+    // `[secret-store-rules]`, merged over the organization's, less the
+    // rules the deny set refuses. A rule's authority joins the root's names
+    // and the admitted set, and a store member under the rule is admitted in
+    // the rule's injection form. A handle for an item with no rule stays
+    // refused `store_handle_invalid`.
+    #[tokio::test]
+    async fn serve_admits_a_store_member_under_the_clients_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let organization = dir.path().join("organization.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "{OPENAI_RULE}\n\
+                 [secret-store-rules.leak]\n\
+                 upstream = [\"api.github.com\"]\n\
+                 header = \"x-key\"\n\
+                 \n\
+                 [secret-store-rules.blocked]\n\
+                 upstream = [\"api.example.com\"]\n\
+                 header = \"x-key\"\n\
+                 action = \"deny\"\n"
+            ),
+        )
+        .unwrap();
+        let rules = store_rules_in(&config, &organization);
+        assert_eq!(
+            rules,
+            vec![StoreRule {
+                store: NATIVE_STORE.into(),
+                id: "openai".into(),
+                upstream: vec!["api.openai.com".into()],
+                inject: Inject::Header {
+                    name: "Authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+            }],
+            "the rule on a GitHub host is refused, and a deny rule is not held"
+        );
+        assert_eq!(
+            store_rules_in(&dir.path().join("missing.toml"), &organization),
+            Vec::<StoreRule>::new()
+        );
+
+        assert!(registered_union(&rules).contains("api.openai.com"));
+        assert!(!registered_union(&[]).contains("api.openai.com"));
+        let admitted = admission(&rules);
+        assert!(admitted.admits("api.openai.com", 443));
+        assert!(!admitted.admits("api.openai.com", 8443));
+        assert!(!admitted.admits("api.example.com", 443), "off_module");
+        assert!(admitted.admits("api.github.com", 443));
+
+        let source = Arc::new(ClientRules::new(Some((config, organization))));
+        let (wiring, sealing, client) = store_wiring(dir.path(), source).await;
+        let now = now();
+        assert_openai_admitted(redeem_openai(
+            &wiring,
+            &store_sealed(&client, &sealing, "openai", now),
+        ));
+
+        // An item with no rule, and an item whose rule was refused, are not
+        // admitted.
+        for id in ["other", "leak"] {
+            let redeemed = redeem_openai(&wiring, &store_sealed(&client, &sealing, id, now));
+            assert!(
+                matches!(
+                    redeemed,
+                    bep::forward::Redeemed::Verdict(Verdict::Refuse("store_handle_invalid"))
+                ),
+                "{id}: {redeemed:?}"
+            );
+        }
+    }
+
+    // BEP-032, Gatehouse §6.10: the current rule decides each request. A
+    // handle admitted under a rule is refused on the next request once the
+    // rule narrows its upstream, with no restart of the proxy.
+    #[tokio::test]
+    async fn edited_store_rule_applies_to_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        let source = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let (wiring, sealing, client) = store_wiring(dir.path(), source).await;
+        let sealed = store_sealed(&client, &sealing, "openai", now());
+        assert_openai_admitted(redeem_openai(&wiring, &sealed));
+
+        std::fs::write(
+            &config,
+            OPENAI_RULE.replace("\"api.openai.com\"", "\"api.openai.com:8443\""),
+        )
+        .unwrap();
+        let redeemed = redeem_openai(&wiring, &sealed);
+        assert!(
+            matches!(
+                redeemed,
+                bep::forward::Redeemed::Verdict(Verdict::Refuse(_))
+            ),
+            "{redeemed:?}"
+        );
+    }
+
+    // BEP-032, #2618: a rule that adds an upstream while `bep serve` runs
+    // re-issues the root under the same key with the new name, publishes it,
+    // and the next CONNECT to the new upstream is admitted with no restart.
+    #[test]
+    fn a_widened_store_rule_is_admitted_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&config, "").unwrap();
+        let rules = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let keys: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let held = rules.current();
+        let at = SystemTime::now();
+        let (identity, root) = Identity::of(keys)
+            .issuing_root(&keys.root, registered_union(&held), at)
+            .unwrap();
+        identity.publish(&path).unwrap();
+        let before = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
+        ));
+        let source = Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            keys.root.public().kid(),
+            path.clone(),
+            held,
+        ));
+        let admitted = Admission::with_source(&[GITHUB], Arc::clone(&source) as _);
+        assert!(!admitted.admits("api.openai.com", 443), "off_module");
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_err());
+
+        // The rule widens the client's upstreams, with no restart.
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert!(!admitted.admits("api.openai.com", 8443));
+        assert!(admitted.admits("api.github.com", 443));
+        assert!(ca.lock().unwrap().union().contains("api.openai.com"));
+        assert!(proxy::LeafIssuer::issue(&*ca, "api.openai.com", SystemTime::now()).is_ok());
+
+        // The published root is the re-issued one, under the same key.
+        let published = Identity::read(&path).unwrap();
+        let after = published.root_certificate_der().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after, ca.lock().unwrap().root().to_vec());
+        assert_eq!(
+            published.key(Role::Root).unwrap().kid(),
+            keys.root.public().kid()
+        );
+
+        // A narrowed rule takes the upstream out again.
+        std::fs::write(&config, "").unwrap();
+        assert!(!admitted.admits("api.openai.com", 443));
+        let narrowed = Identity::read(&path).unwrap();
+
+        // A root key replaced in the file while `bep serve` runs: the
+        // re-issued root is not published to the file.
+        let other: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let (replaced, _) = Identity::of(other)
+            .issuing_root(&other.root, registered_union(&[]), at)
+            .unwrap();
+        replaced.publish(&path).unwrap();
+        let foreign = Identity::read(&path).unwrap();
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            foreign.root_certificate_der().unwrap()
+        );
+
+        // With no change of the rules, a CONNECT before the retry delay
+        // ends does not try the failed publish again.
+        narrowed.publish(&path).unwrap();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            narrowed.root_certificate_der().unwrap()
+        );
+
+        // The failed publish is tried again at the first CONNECT after the
+        // retry delay, once the file names the held root key.
+        source.admitted.lock().unwrap().failed.as_mut().unwrap().1 = Instant::now();
+        assert!(admitted.admits("api.openai.com", 443));
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            ca.lock().unwrap().root().to_vec()
+        );
+    }
+
+    // BEP-032: a redemption stats the files and reads them only when a
+    // stamp changed or a file changed inside the racy window.
+    #[test]
+    fn settled_store_rules_are_read_again_only_on_a_new_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let old = SystemTime::now() - Duration::from_secs(60);
+        let write = |text: &str, modified: SystemTime| {
+            std::fs::write(&config, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&config)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        };
+        write(OPENAI_RULE, old);
+        let source = ClientRules::new(Some((config.clone(), dir.path().join("organization.toml"))));
+        assert_eq!(source.current().len(), 1);
+
+        // The same length and the same old modification time: the change
+        // time is new, so the file is read again.
+        let blank = " ".repeat(OPENAI_RULE.len());
+        write(&blank, old);
+        assert_eq!(source.current(), Vec::<StoreRule>::new());
+
+        // No write between two calls: the second call gives the same rules.
+        assert_eq!(source.current(), Vec::<StoreRule>::new());
+    }
+
+    // C2: an organization `deny` holds against a user `allow`, and an
+    // organization file that exists and does not parse gives `bep` no
+    // store rules, as `min` refuses to mint on it.
+    #[test]
+    fn organization_deny_holds_against_a_user_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let organization = dir.path().join("organization.toml");
+        std::fs::write(&config, format!("{OPENAI_RULE}action = \"allow\"\n")).unwrap();
+        assert_eq!(store_rules_in(&config, &organization).len(), 1);
+        std::fs::write(
+            &organization,
+            "[secret-store-rules.openai]\naction = \"deny\"\n\
+             upstream = [\"api.openai.com\"]\nheader = \"Authorization\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store_rules_in(&config, &organization),
+            Vec::<StoreRule>::new()
+        );
+        std::fs::write(&organization, "not toml [").unwrap();
+        assert_eq!(
+            store_rules_in(&config, &organization),
+            Vec::<StoreRule>::new()
+        );
+    }
+
     /// #2501: a supervisor asks for the lifeline with a flag, so a person
     /// who pipes the token in by hand keeps a proxy that outlives the pipe.
     #[test]
@@ -1896,6 +2766,7 @@ mod tests {
             MemoryKeychain::default(),
             Arc::new(signin::NoTokenEndpoint),
             Vec::new(),
+            Arc::new(Vec::<StoreRule>::new()),
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bep/control.sock");

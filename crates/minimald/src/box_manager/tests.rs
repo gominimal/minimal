@@ -132,6 +132,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         box_id: None,
         box_addresses: None,
         hooks_enabled: true,
+        ends_with_run: false,
         attrs: Default::default(),
         sealed_deliveries: Vec::new(),
         root_certificate: None,
@@ -358,6 +359,364 @@ async fn destroying_an_idle_session_goes_through_its_actor() {
             .unwrap()
             .is_none(),
         "the record should be gone after destroy"
+    );
+}
+
+/// `sample_config` for a box created for a `min task run` without
+/// `--keep`: marked to end with its run from its create.
+fn run_owned_config() -> minimald_rpc::BoxConfig {
+    let mut config = sample_config();
+    config.ends_with_run = true;
+    config
+}
+
+/// Waits for the resume's detached teardown of `id` to remove its
+/// record. The resume returns before the teardown ends, by design.
+///
+/// A read that lands while the teardown deletes the record can find
+/// the index entry and then miss the record, and answers `NotFound`
+/// rather than `None`. Both mean the record is gone.
+async fn wait_for_record_gone(mngr: &BoxManagerHandle, id: SessionId) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match mngr.get_record(BoxKeyPredicate::Id(id)).await {
+            Ok(None) => break,
+            Err(error) if error.kind() == NotFound => break,
+            Ok(Some(_)) => {}
+            Err(error) => panic!("reading the run-owned box's record failed: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run-owned box's record should be gone after the resume"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A box marked run-owned is destroyed by the restart's resume, not
+/// resumed: the run it was minted for is over the moment the daemon
+/// that accepted it died, and bringing the box back would strand it
+/// `Active` forever. The teardown goes through the actor — the same
+/// path `DeleteSession` takes — so the box's `on_destroy` hooks run,
+/// which the marker file stands in for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_destroys_a_run_owned_box_instead_of_resuming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("echo ran > {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A second manager over the same store: a daemon restart's view,
+    // holding a box whose run died with the first daemon.
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart",
+    );
+    wait_for_record_gone(&restarted, id).await;
+    assert!(
+        marker.exists(),
+        "destroying the run-owned box on resume skipped its on_destroy hook",
+    );
+    wait_for_no_actors(&restarted).await;
+}
+
+/// Waits for the manager to hold `count` actors. The resume's teardown
+/// evicts its actor only after the actor has deleted the record and
+/// answered, so the record goes first.
+async fn wait_for_actor_count(mngr: &BoxManagerHandle, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mngr.running_count().await != count {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits for the manager to hold no actor.
+async fn wait_for_no_actors(mngr: &BoxManagerHandle) {
+    wait_for_actor_count(mngr, 0, "the destroyed box must leave no actor behind").await;
+}
+
+/// A `DeleteSession` that lands while the resume's teardown of a run-owned
+/// box runs its `on_destroy` hooks reaches the teardown's own actor, so
+/// the hooks run once. The realistic sender is the surviving `min task run`
+/// client on Ctrl-C. The hook marks its start, then waits, so the delete
+/// lands inside it, and appends one line per run to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!(
+                            "touch {}; sleep 3; echo ran >> {}",
+                            started.display(),
+                            marker.display()
+                        ),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never started the on_destroy hook",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    match restarted.delete_session(id).await {
+        Ok(hook_failures) => assert!(
+            hook_failures.is_empty(),
+            "the delete reported hook failures: {hook_failures:?}"
+        ),
+        // The teardown won the race to the record; still one run.
+        Err(error) if error.kind() == NotFound => {}
+        Err(error) => panic!("deleting the box during its resume teardown failed: {error}"),
+    }
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once, got {lines:?}",
+    );
+}
+
+/// A resume teardown of a run-owned box whose record delete fails keeps
+/// its closed actor, so a later `DeleteSession` reaches that actor and
+/// removes the record without running the `on_destroy` hooks again. The
+/// store fails the record delete once. The hook appends one line per run
+/// to the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_after_a_failed_resume_teardown_runs_the_destroy_hooks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_contributing(
+        &mngr,
+        run_owned_config(),
+        WireContribution {
+            lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                hook: boxes::wire::primitives::WireLifecycleHook {
+                    on_destroy: Some(boxes::wire::primitives::WireHookScript::Inline {
+                        body: format!("echo ran >> {}", marker.display()),
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: boxes::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    crate::store::test_faults::fail_next_delete(id);
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(
+        resumed, 0,
+        "a run-owned box must not be resumed by a restart"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::store::test_faults::delete_failure_armed(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resume's teardown never tried to delete the record",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Give the detached teardown time to finish after its failed delete,
+    // so an eviction on failure lands before the retry below.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed delete must leave the record on disk",
+    );
+    assert_eq!(
+        restarted.running_count().await,
+        1,
+        "the failed teardown must keep its closed actor",
+    );
+
+    let hook_failures = restarted.delete_session(id).await.unwrap();
+    assert!(
+        hook_failures.is_empty(),
+        "the retry reported hook failures: {hook_failures:?}"
+    );
+
+    wait_for_record_gone(&restarted, id).await;
+    wait_for_no_actors(&restarted).await;
+    let lines = std::fs::read_to_string(&marker).expect("the on_destroy hook never ran");
+    assert_eq!(
+        lines.lines().count(),
+        1,
+        "the on_destroy hook must run exactly once across the retry, got {lines:?}",
+    );
+}
+
+/// The run-owned check takes only the boxes it marked: a plain
+/// session in the same store survives the restart and resumes as
+/// before, so the fix does not cost every session its restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
+    let (state, cache, mngr) = manager().await;
+    let marked = create_active_session_with(&mngr, run_owned_config()).await;
+    let mut keeper_config = sample_config();
+    keeper_config.name = Some("keeper".to_string());
+    let keeper = create_active_session_with(&mngr, keeper_config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+
+    assert_eq!(resumed, 1, "exactly the plain session should resume");
+    wait_for_record_gone(&restarted, marked).await;
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(keeper))
+            .await
+            .unwrap()
+            .is_some(),
+        "the plain session's record should survive the resume"
+    );
+    wait_for_actor_count(
+        &restarted,
+        1,
+        "the plain session should have its actor back",
+    )
+    .await;
+}
+
+/// The create writes the run-owned mark on the record itself, so the
+/// mark is there before any task starts, and a fresh manager over the
+/// same store (a restart's) reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_persists_the_run_owned_mark_on_the_record() {
+    let (state, cache, mngr) = manager().await;
+    let marked = create_active_session_with(&mngr, run_owned_config()).await;
+    let mut plain_config = sample_config();
+    plain_config.name = Some("plain".to_string());
+    let plain = create_active_session_with(&mngr, plain_config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let read = |id| {
+        let restarted = &restarted;
+        async move {
+            restarted
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("the record must survive the create")
+        }
+    };
+    assert!(
+        read(marked).await.ends_with_run,
+        "a run-owned create must mark its record",
+    );
+    assert!(
+        !read(plain).await.ends_with_run,
+        "a plain create must leave its record unmarked",
+    );
+}
+
+/// The resume's teardown of a run-owned box leaves alone the route of
+/// a box with the same name that the same resume brought back. Both
+/// boxes are unnamed, with projects that share the basename "app", so
+/// both derive the registry name "app". The plain box is the older
+/// one, so the resume registers its route first.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
+    let (state, cache, mngr) = manager().await;
+    let plain_project = TempDir::new().unwrap();
+    let plain_dir = plain_project.path().join("app");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    let run_project = TempDir::new().unwrap();
+    let run_dir = run_project.path().join("app");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    let mut config = sample_config();
+    config.name = None;
+    config.network = boxes::NetworkMode::HostNet;
+    config.project_path = HostAbsPath::try_new(plain_dir.to_str().unwrap()).unwrap();
+    let plain = create_active_session_with(&mngr, config).await;
+
+    let mut config = run_owned_config();
+    config.name = None;
+    config.network = boxes::NetworkMode::HostNet;
+    config.project_path = HostAbsPath::try_new(run_dir.to_str().unwrap()).unwrap();
+    let marked = create_active_session_with(&mngr, config).await;
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+    let resumed = restarted.resume_active_sessions().await.unwrap();
+    assert_eq!(resumed, 1, "exactly the plain box should resume");
+    wait_for_record_gone(&restarted, marked).await;
+
+    assert!(
+        restarted
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .name_held_by(plain, "app"),
+        "the run-owned box's teardown must not take over or withdraw \
+         the resumed box's route",
     );
 }
 
@@ -2256,4 +2615,314 @@ async fn record_carries_the_root_certificate_to_the_launch() {
     assert_eq!(crate::box_runtime::launch_root_certificate(&record), None);
     let wire = serde_json_lenient::to_string(&record).unwrap();
     assert!(!wire.contains("root_certificate"), "{wire}");
+}
+
+/// BOX-012: a restart reaps the pending record and keeps the running one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_keeps_running_records_and_reaps_pending_ones() {
+    let (state, cache, mngr, pending, _response) = create_pending_session().await;
+    let mut config = sample_config();
+    config.name = Some("still-running".to_string());
+    let running = create_active_session_with(&mngr, config).await;
+    assert_eq!(status_of(&mngr, pending).await, boxes::BoxState::Pending);
+
+    let restarted = manager_over(state.path(), cache.path()).await;
+
+    assert_eq!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(pending))
+            .await
+            .unwrap(),
+        None,
+        "the restart reaps a pending record"
+    );
+    assert!(
+        restarted
+            .get_record(BoxKeyPredicate::Id(running))
+            .await
+            .unwrap()
+            .is_some(),
+        "the restart keeps a running record"
+    );
+}
+
+/// Milliseconds since the Unix epoch, the unit of an event's `ts`.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// The directories a box sees: every one of them is mounted into it.
+async fn box_visible_dirs(mngr: &BoxManagerHandle, id: SessionId) -> Vec<DaemonAbsPath> {
+    let paths = session(mngr, id).await.paths().await.unwrap();
+    vec![
+        paths.working,
+        paths.cache,
+        paths.home,
+        paths.patches,
+        paths.hooks,
+    ]
+}
+
+/// BOX-040: creating a box writes its `created` event, naming the box,
+/// its parent and when, into a file beside the record in the daemon's
+/// state directory, outside every directory the box sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_written_outside_box_filesystem_with_box_parent_ts_type() {
+    let (state, _cache, mngr) = manager().await;
+    let before = now_ms();
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let after = now_ms();
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(events.len(), 1, "one event per transition: {events:?}");
+    let created = &events[0];
+    assert_eq!(created.kind, BoxEventType::Created);
+    assert_eq!(created.box_id, id);
+    assert_eq!(
+        created.parent, None,
+        "a box created outside any box has no parent"
+    );
+    assert!(
+        (before..=after).contains(&created.ts),
+        "{before} <= {} <= {after}",
+        created.ts
+    );
+
+    let events_path = reader.object.events_path();
+    let events_path = events_path.as_utf8_path();
+    let sessions = camino::Utf8Path::from_path(state.path())
+        .unwrap()
+        .join("sessions");
+    assert!(events_path.starts_with(&sessions));
+    assert!(
+        events_path.parent().unwrap().join("record.json").exists(),
+        "the events file sits beside the record"
+    );
+    for seen in box_visible_dirs(&mngr, id).await {
+        assert!(
+            !events_path.starts_with(seen.as_utf8_path()),
+            "{events_path} is inside {seen}, which the box sees"
+        );
+    }
+}
+
+/// BOX-041, placement only: the box's events file is outside every
+/// directory the box can see. An events file written into those
+/// directories, whatever it claims, is not the box's events. The read
+/// returns only what the daemon wrote. No process runs inside a box here.
+/// The proof that uid 0 inside a real sandbox cannot append is the
+/// `_root_integration` test that #2661 owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_box_root_cannot_append_events() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+
+    let forged = BoxEvent {
+        box_id: id,
+        parent: None,
+        ts: now_ms(),
+        kind: BoxEventType::Exited,
+        data: EventData::new(),
+    };
+    let line = forged.to_line().unwrap();
+    for seen in box_visible_dirs(&mngr, id).await {
+        let dir = seen.as_utf8_path();
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [boxes::events::EVENTS_FILE, "record.json"] {
+            std::fs::write(dir.join(name), &line).unwrap();
+        }
+    }
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events = reader.read_new().unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [BoxEventType::Created],
+        "no event written inside the box reaches its stream"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(reader.object.events_path().as_utf8_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "only the daemon's user can open it");
+    }
+}
+
+/// BOX-162: a complete line of the events file that is not an event
+/// makes the read fail with `InvalidData`, naming the line's byte offset.
+/// The read cannot return every retained event, so it does not end as
+/// complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_fails_on_a_refused_line() {
+    use std::io::Write as _;
+
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let path = reader.object.events_path();
+    let bad_at = std::fs::metadata(path.as_utf8_path()).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_utf8_path())
+        .unwrap()
+        .write_all(b"not an event\n")
+        .unwrap();
+
+    let err = reader.read_new().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&format!("byte {bad_at}")),
+        "the error names the offset: {err}"
+    );
+}
+
+/// BOX-040: the event a writer passes `data` to carries it, and reads back
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_event_carries_its_data() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = mngr.create_session(sample_config(), None).await.unwrap();
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let created = reader.read_new().unwrap();
+    assert!(created[0].data.is_empty(), "created carries an empty data");
+
+    let data: EventData = [("reason".to_string(), "stopped".into())]
+        .into_iter()
+        .collect();
+    let written = write_box_event(&reader.object, BoxEventType::Exited, data.clone()).unwrap();
+    assert_eq!(written.data, data);
+    assert_eq!(reader.read_new().unwrap(), [written]);
+}
+
+/// Drives the `ReadEvents` subsystem: writes the request and half-closes,
+/// and returns the response lines as they arrive.
+async fn open_events_read(
+    client: &mut crate::test_harness::TestClient,
+    id: SessionId,
+    follow: bool,
+) -> tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let channel = client
+        .open_subsystem(minimald_rpc::READ_EVENTS_SUBSYSTEM, &[])
+        .await;
+    let mut stream = channel.into_stream();
+    let req = minimald_rpc::ReadEventsRequest { id, follow };
+    stream
+        .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    tokio::io::BufReader::new(stream).lines()
+}
+
+/// The next update line, or `None` at the end of the stream.
+async fn next_update(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<russh::ChannelStream<russh::client::Msg>>>,
+) -> Option<minimald_rpc::ReadEventsUpdate> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+        .await
+        .expect("the read answers in time")
+        .unwrap()
+        .map(|line| serde_json_lenient::from_str(&line).expect("each line is an update"))
+}
+
+/// BOX-162: a read of a box's events returns every retained event, in
+/// the order the daemon wrote them, then `Done`. A read of a box no
+/// record names returns no event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_read_returns_full_retained_stream_in_order() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "evts", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut written = reader.object.read_events_from(0).unwrap().events;
+    assert_eq!(written[0].kind, BoxEventType::Created);
+    for kind in [
+        BoxEventType::Started,
+        BoxEventType::ExecStarted,
+        BoxEventType::ExecExited,
+        BoxEventType::Detached,
+        BoxEventType::Resumed,
+        BoxEventType::Renamed,
+        BoxEventType::OomKilled,
+        BoxEventType::Exited,
+    ] {
+        written.push(write_box_event(&reader.object, kind, EventData::new()).unwrap());
+    }
+
+    let mut lines = open_events_read(&mut client, id, false).await;
+    let mut read = Vec::new();
+    while let Some(update) = next_update(&mut lines).await {
+        read.push(update);
+    }
+    let mut expected: Vec<ReadEventsUpdate> = written
+        .into_iter()
+        .map(|event| ReadEventsUpdate::Event { event })
+        .collect();
+    expected.push(ReadEventsUpdate::Done);
+    assert_eq!(read, expected);
+
+    let mut lines = open_events_read(&mut client, SessionId::mint(), false).await;
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "an unknown box has no events"
+    );
+}
+
+/// BOX-162: a followed read returns every retained event, then each new
+/// one as it is written, and ends with `Reaped` once the box is reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_follow_replays_then_tails_until_reaped() {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let server = crate::test_harness::TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = crate::test_harness::create_configured_session(&mut client, "tail", "/tmp").await;
+    let mngr = server.state.sessions_manager().await;
+    let reader = mngr.box_events(id).await.unwrap();
+    let mut retained = reader.object.read_events_from(0).unwrap().events;
+    retained
+        .push(write_box_event(&reader.object, BoxEventType::Started, EventData::new()).unwrap());
+
+    let mut lines = open_events_read(&mut client, id, true).await;
+    for event in retained {
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event })
+        );
+    }
+
+    for kind in [BoxEventType::Detached, BoxEventType::Resumed] {
+        let event = write_box_event(&reader.object, kind, EventData::new()).unwrap();
+        assert_eq!(
+            next_update(&mut lines).await,
+            Some(ReadEventsUpdate::Event { event }),
+            "a new event reaches the follower"
+        );
+    }
+
+    mngr.delete_session(id).await.unwrap();
+    assert_eq!(
+        next_update(&mut lines).await,
+        Some(ReadEventsUpdate::Reaped)
+    );
+    assert_eq!(
+        next_update(&mut lines).await,
+        None,
+        "the stream ends at the reap"
+    );
 }

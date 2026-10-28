@@ -2806,7 +2806,7 @@ fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
     );
 }
 
-/// The user-namespace gate (NET-141): a host whose verdict refuses the
+/// The user-namespace gate (NET-143): a host whose verdict refuses the
 /// sandbox refuses the create itself, and the reply carries the verdict
 /// — the cause in words and that cause's own remedy — with nothing
 /// allocated for a caller to tear down. The gate is this server's own

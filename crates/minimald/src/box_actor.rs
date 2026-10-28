@@ -131,6 +131,12 @@ pub(crate) struct BoxActorConfig {
     /// `CreateSession`, or `None` for a session brought up any other way
     /// (from disk, or by an in-process caller). See `BoxActor::creator`.
     pub creator: Option<std::sync::Weak<()>>,
+    /// Whether [`BoxActor::run`] registers the box's name route before the
+    /// actor goes live. `true` for every bring-up but the restart resume's
+    /// teardown of a box that ends with its run (NET-131): that actor
+    /// lives only to run its destroy hooks, so it must never take over a
+    /// name that another box already routes.
+    pub registers_name: bool,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -260,7 +266,8 @@ enum BoxMessage {
     /// record.
     Destroy(oneshot::Sender<Result<Vec<String>, std::io::Error>>),
     /// [`Self::Destroy`] for a session that has not finished activating:
-    /// `Ok(None)` and nothing done when the record is `Active`. Decided here,
+    /// `Ok(None)` and nothing done when the record is past activation
+    /// (see [`survives_conditional_destroy`]). Decided here,
     /// in mailbox order, so a finalize ahead of it ends first (inbox#690).
     DestroyIfUnfinalized(oneshot::Sender<Result<Option<Vec<String>>, std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
@@ -621,6 +628,8 @@ impl BoxActor {
             manager,
             deny_all_opt_out,
             creator,
+            // Read by `run` before the actor is assembled.
+            registers_name: _,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -757,6 +766,16 @@ impl BoxActor {
                      (restart-orphaned actor); destroy the session and re-activate",
                 ));
             }
+            // BOX-011: an ended box has no process to host. No path writes
+            // these states yet, so refuse it as for `Materializing`. #2393
+            // (T6, BOX-025) makes resume bring a stopped PTY box back up
+            // from its record, and there the actor learns to host an ended box.
+            BoxState::Stopped | BoxState::Exited => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session record has ended (stopped or exited); no actor hosts an ended session",
+                ));
+            }
         };
 
         let (sender, receiver) = crate::traced::channel(8);
@@ -809,6 +828,8 @@ impl BoxActor {
             destroying.clone(),
             Arc::clone(&host_slot),
         );
+        #[cfg(target_os = "linux")]
+        let registers_name = conf.registers_name;
         let actor = Self::assemble(conf, receiver, inner, weak_self, destroying.clone());
 
         // Register the PTask hostname before the actor goes live, so the
@@ -823,8 +844,14 @@ impl BoxActor {
         // session's operation behind it. A resumed handed box the verdict
         // has not vouched for publishes at the `127.0.0.1` interim at once,
         // and the present landing's sweep moves it to its hand.
+        //
+        // A teardown-only bring-up (`registers_name: false`) skips this:
+        // the box is about to be destroyed, and a registration here would
+        // take over a name another box already routes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record(), false).await;
+        if registers_name {
+            actor.register_hostname(obj.record(), false).await;
+        }
 
         // The actor outlives the message that brought it up (a create, the
         // resume an RPC naming the box makes): its own root, linked to that
@@ -1133,12 +1160,12 @@ impl BoxActor {
                 // unconditional destroy would: keeping is the exception.
                 let finished = matches!(
                     self.record.record().await,
-                    Ok(record) if record.status == BoxState::Active
+                    Ok(record) if survives_conditional_destroy(record.status)
                 );
                 if finished {
                     tracing::info!(
                         session_id = %self.record.id(),
-                        "kept a session a cleanup destroy was sent for: it finished activating first"
+                        "kept a session a cleanup destroy was sent for: it is past activation"
                     );
                     let _ = r.send(Ok(None));
                 } else {
@@ -1469,9 +1496,13 @@ pub(crate) mod mint_attach_seam {
                 // End the host's loop now, and wait for the end so the host
                 // (and its mailbox) is gone before the mint's attach sends:
                 // the send finds the channel closed rather than racing a
-                // loop that might still drain it.
+                // loop that might still drain it. The task can be the
+                // watcher a `host_ip` box's loop runs under, whose abort
+                // only asks the loop to abort, so wait on the mailbox
+                // itself.
                 launched.1.abort();
                 let _ = (&mut launched.1).await;
+                launched.0.closed().await;
             }
             Some(Failure::HostWedged) => {
                 // End the real host's loop, as above, so nothing of it
@@ -1483,6 +1514,7 @@ pub(crate) mod mint_attach_seam {
                 // out its deadline.
                 launched.1.abort();
                 let _ = (&mut launched.1).await;
+                launched.0.closed().await;
                 let (wedged, mailbox) = HostHandle::wedged();
                 launched = (wedged, tokio::spawn(std::future::pending()));
                 WEDGED_MAILBOXES
@@ -1592,5 +1624,35 @@ pub(crate) mod listen_plan_seam {
 // real session's publish rather than a parallel fixture of it; and the
 // session-host tests, which host the runtime port-publish ask tests (NET-045)
 // and drive them through the session actor's own flow, reuse them too.
+/// Whether a record in `status` is kept by
+/// [`BoxMessage::DestroyIfUnfinalized`]. Only a box that has not finished
+/// activating (`Pending`, `Materializing`) is destroyed. An `Active` box and
+/// an ended one (`Stopped`, `Exited`, whose record BOX-018 retains) are kept.
+/// The match is exhaustive so a new state needs a decision here.
+fn survives_conditional_destroy(status: BoxState) -> bool {
+    match status {
+        BoxState::Pending | BoxState::Materializing => false,
+        BoxState::Active | BoxState::Stopped | BoxState::Exited => true,
+    }
+}
+
+#[cfg(test)]
+mod destroy_if_unfinalized_tests {
+    use super::{BoxState, survives_conditional_destroy};
+
+    #[test]
+    fn destroy_if_unfinalized_keeps_a_stopped_or_exited_record() {
+        assert!(survives_conditional_destroy(BoxState::Stopped));
+        assert!(survives_conditional_destroy(BoxState::Exited));
+        assert!(survives_conditional_destroy(BoxState::Active));
+    }
+
+    #[test]
+    fn destroy_if_unfinalized_destroys_a_pending_or_materializing_record() {
+        assert!(!survives_conditional_destroy(BoxState::Pending));
+        assert!(!survives_conditional_destroy(BoxState::Materializing));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;

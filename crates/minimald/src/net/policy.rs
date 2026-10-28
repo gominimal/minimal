@@ -334,6 +334,12 @@ impl PortForwarder {
 /// not a failure. It is skipped, with one warn line naming the port and the
 /// box that holds it, and the box's other forwards bind as usual.
 ///
+/// A host port another process already holds is a failure like any other
+/// refused bind (NET-121): the rollback below runs and the caller withdraws
+/// the name. Only the returned error differs. It names the port and says
+/// the port is in use on the host, in place of the forwarder's raw
+/// refusal, and its kind is [`io::ErrorKind::AddrInUse`].
+///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
 /// error is returned. The failure says its own line first (NET-121's sub 2):
@@ -393,11 +399,88 @@ pub async fn apply_ingress(
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
                 release_declared_ingress(control, &bound).await;
+                // A taken host port fails the apply like any other refusal:
+                // NET-121 (docs/specs/18-spec-box-networking, design §7.1)
+                // makes a failed bind a surfaced error, never a silent
+                // fallback, so the box never publishes a name while one of
+                // its declared ports is missing. Only the error's words
+                // differ: they name the port and the way out.
+                if is_address_in_use(&e) {
+                    return Err(address_in_use_error(mapping.external_port));
+                }
                 return Err(e);
             }
         }
     }
     Ok(bound)
+}
+
+/// The OS's own text for a bind onto a port another process already holds,
+/// as it reaches [`apply_ingress`] inside the forwarder's refusal.
+const ADDRESS_IN_USE_BODY: &str = "address already in use";
+
+/// Whether `error` is the forwarder refusing an `expose` because the host
+/// port it binds is already in use — the OS's `EADDRINUSE` text, matched on
+/// the message's own words rather than the forwarder's surrounding wording,
+/// so a differently-phrased listener on the same bind is still read as the
+/// same fact.
+fn is_address_in_use(error: &io::Error) -> bool {
+    let said = error.to_string();
+    said.contains("returned HTTP 500") && said.contains(ADDRESS_IN_USE_BODY)
+}
+
+/// The declared TCP host ports of `ingress` that another process already
+/// holds at `published`, found by a short-lived bind of each one in this
+/// daemon's network namespace — the same bind the forwarder makes at the
+/// box's first spawn when `control` reaches a switch this daemon spawned.
+/// When the host unbinds the declared forwards
+/// ([`ControlChannel::host_unbinds_declared_forwards`]), the forwarder
+/// binds on the host OS, not where this daemon runs, so a bind here would
+/// test the wrong ports: the probe reports nothing and the spawn's own
+/// apply says a taken port. A port in `yielded` is skipped, because another
+/// box at the shared address holds it and the collision report already
+/// names it. A bind that fails for any reason other than `EADDRINUSE`
+/// reports nothing: the spawn's own apply says that failure. Call this only
+/// when the box's forwards are not bound, or it finds the box's own
+/// forwards.
+#[must_use]
+pub fn host_ports_in_use(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ingress: &IngressPolicy,
+    yielded: &[u16],
+) -> Vec<u16> {
+    if control.host_unbinds_declared_forwards() {
+        return Vec::new();
+    }
+    ingress
+        .port_mappings
+        .iter()
+        .filter(|mapping| mapping.proto == boxes::IpProto::Tcp)
+        .map(|mapping| mapping.external_port)
+        .filter(|port| !yielded.contains(port))
+        .filter(|&port| {
+            std::net::TcpListener::bind((published, port))
+                .is_err_and(|e| e.kind() == io::ErrorKind::AddrInUse)
+        })
+        .collect()
+}
+
+/// The error [`apply_ingress`] returns for a declared port another process
+/// already holds on the host, and the error a finalize returns when
+/// [`host_ports_in_use`] finds one. A person reads it at the failed
+/// activation or command, so
+/// it names the port and the next step; the forwarder's own refusal is in
+/// the warn line [`apply_ingress`] logs, not here.
+pub fn address_in_use_error(port: u16) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "host port {port} is already in use on the host, so the \
+             session cannot forward it. Free the port, or activate again \
+             with --ingress <other>:<internal>."
+        ),
+    )
 }
 
 /// The body the forwarder answers an expose with when a forward is already
@@ -736,6 +819,9 @@ impl ExposeRefusal {
                 host_loopback: false,
                 ..
             } => format!("{self}, so it already answers at {box_name}.min.internal:{port}"),
+            // The same words for an allow-stance and an ask-stance box: the
+            // range refused the port before any prompt (NET-047).
+            Self::OutOfRange { .. } => format!("{self}. Nothing was published."),
             _ => self.to_string(),
         }
     }
@@ -761,7 +847,7 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::OutOfRange { requested, range } => write!(
                 f,
-                "port {requested} is outside this box's declared dynamic range {}-{}",
+                "port {requested} is outside this box's --dynamic-range {}-{}",
                 range.0, range.1
             ),
             Self::NoPublishedAddress => write!(
@@ -863,7 +949,8 @@ impl fmt::Display for ExposeFailure {
 /// derive — the one derivation this decision and the listen watcher's
 /// verdict share, so the two runtime ingress surfaces cannot part ways on a
 /// port — and this is the half that renders each fact as the refusal the
-/// box's `min net expose` prints.
+/// box's `min net expose` prints. An `ask` box's range is checked here too,
+/// so a port outside it is refused without a prompt.
 pub fn dynamic_ingress_decision(
     ingress: Option<&IngressPolicy>,
     port: u16,
@@ -871,7 +958,15 @@ pub fn dynamic_ingress_decision(
     match IngressRules::from_policy(ingress).dynamic_verdict(port) {
         DynamicPortVerdict::Allow => Ok(boxes::DynamicIngress::Allow),
         DynamicPortVerdict::Deny => Err(ExposeRefusal::DeniedByPolicy),
-        DynamicPortVerdict::Ask => Err(ExposeRefusal::AskNeedsAnswer),
+        // An `ask` box with a range refuses a port outside it here, before
+        // any prompt is routed: no answer could publish it (NET-047).
+        DynamicPortVerdict::Ask => match ingress.and_then(|i| i.dynamic_allowed_range) {
+            Some(range) if port < range.0 || port > range.1 => Err(ExposeRefusal::OutOfRange {
+                requested: port,
+                range,
+            }),
+            _ => Err(ExposeRefusal::AskNeedsAnswer),
+        },
         DynamicPortVerdict::NoRange => Err(ExposeRefusal::NoDynamicRange),
         DynamicPortVerdict::OutOfRange { range } => Err(ExposeRefusal::OutOfRange {
             requested: port,
@@ -1865,7 +1960,15 @@ mod tests {
                     // range, in the words `min net expose` prints.
                     let expected_decision = match stance {
                         None | Some(DynamicIngress::Deny) => Err(ExposeRefusal::DeniedByPolicy),
-                        Some(DynamicIngress::Ask) => Err(ExposeRefusal::AskNeedsAnswer),
+                        Some(DynamicIngress::Ask) => match range {
+                            Some((low, high)) if port < low || port > high => {
+                                Err(ExposeRefusal::OutOfRange {
+                                    requested: port,
+                                    range: (low, high),
+                                })
+                            }
+                            _ => Err(ExposeRefusal::AskNeedsAnswer),
+                        },
                         Some(DynamicIngress::Allow) => match range {
                             None => Err(ExposeRefusal::NoDynamicRange),
                             Some((low, high)) if low <= port && port <= high => {
@@ -2663,6 +2766,219 @@ mod tests {
                 Some("127.0.64.202:18202"),
                 "the daemon asked the switch to unbind the declared forward"
             );
+        }
+    }
+
+    // ---- a host port another process already holds (reported as EADDRINUSE) --
+    mod host_port_in_use {
+        use std::net::Ipv4Addr;
+
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixListener;
+
+        use super::super::{
+            ControlChannel, IngressPolicy, PortMapping, apply_ingress, host_ports_in_use,
+            is_address_in_use,
+        };
+        use super::forwarder_probe::read_request;
+
+        const PUBLISHED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 128, 10);
+
+        fn mapping(external_port: u16) -> PortMapping {
+            PortMapping {
+                external_port,
+                internal_port: 80,
+                proto: boxes::IpProto::Tcp,
+            }
+        }
+
+        fn ingress(ports: &[u16]) -> IngressPolicy {
+            IngressPolicy {
+                port_mappings: ports.iter().map(|&port| mapping(port)).collect(),
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }
+        }
+
+        /// Serves a gvproxy-shaped control channel at `path`: one request per
+        /// entry of `answers`, each answered with its status and body — the
+        /// stand-in for the host forwarder whose `expose` of a taken port
+        /// answers `500` with the OS's bind text in its body. The OS's own
+        /// words arrive as an HTTP body, so the answers here carry them.
+        fn forwarder_answering_in_turn(
+            path: std::path::PathBuf,
+            answers: Vec<(u16, &'static str)>,
+        ) -> tokio::task::JoinHandle<Vec<String>> {
+            let listener = UnixListener::bind(&path).unwrap();
+            crate::traced::spawn(async move {
+                let mut asked = Vec::new();
+                for (status, body) in answers {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return asked;
+                    };
+                    asked
+                        .push(String::from_utf8_lossy(&read_request(&mut sock).await).into_owned());
+                    sock.write_all(
+                        format!(
+                            "HTTP/1.1 {status} Internal Server Error\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("the fake forwarder must answer");
+                }
+                asked
+            })
+        }
+
+        /// The OS's bind text as the forwarder returns it to the caller of
+        /// `expose`: the status line in the wrapper's own words, the OS's
+        /// message in the body.
+        const IN_USE: (u16, &str) = (
+            500,
+            "listen tcp 127.0.0.1:18999: bind: address already in use",
+        );
+
+        /// One declared port taken by another process fails the apply
+        /// (NET-121): the forward already bound is rolled back with an
+        /// unexpose, and the error names the taken port in place of the
+        /// forwarder's raw refusal. The caller then withdraws the name, as
+        /// it does for every failed apply.
+        #[tokio::test]
+        async fn a_taken_host_port_fails_the_apply_and_rolls_back() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            // Two declared ports: the first binds, the second is taken, and
+            // the third request is the rollback of the first.
+            let forwarder =
+                forwarder_answering_in_turn(sock.clone(), vec![(200, ""), IN_USE, (200, "")]);
+            let err = match apply_ingress(
+                &ControlChannel::Unix(sock),
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18080, 18999]),
+                None,
+                &[],
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a taken host port must fail the apply"),
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            assert_eq!(
+                err.to_string(),
+                "host port 18999 is already in use on the host, so the session \
+                 cannot forward it. Free the port, or activate again with \
+                 --ingress <other>:<internal>.",
+                "the error names the taken port and the next step, and no \
+                 forwarder internals"
+            );
+            let asked = forwarder
+                .await
+                .expect("the fake forwarder served every round");
+            assert_eq!(asked.len(), 3, "expose, expose, rollback: {asked:?}");
+            assert!(
+                asked[2].contains("127.0.64.9:18080"),
+                "the rollback releases the forward that bound: {asked:?}"
+            );
+        }
+
+        /// The activation probe names exactly the TCP ports another process
+        /// holds at the published address. A free port, a yielded port and
+        /// a UDP mapping on the held port all stay out of the list, and a
+        /// host that binds the forwards itself is not probed at all.
+        #[test]
+        fn the_probe_names_only_a_port_another_process_holds() {
+            let native = ControlChannel::Unix("/nonexistent/gvproxy.sock".into());
+            let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let held_port = held.local_addr().unwrap().port();
+            let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let free_port = free.local_addr().unwrap().port();
+            drop(free);
+
+            let mut declared = ingress(&[held_port, free_port]);
+            assert_eq!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]),
+                [held_port]
+            );
+            assert!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[held_port]).is_empty(),
+                "a yielded port is the collision report's to name"
+            );
+            let vm_backed = ControlChannel::Vsock { cid: 2, port: 1024 };
+            assert!(
+                host_ports_in_use(&vm_backed, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
+                "on a VM-backed host the forwarder binds on the host OS, so a \
+                 bind in the guest proves nothing and the probe is skipped"
+            );
+            declared.port_mappings[0].proto = boxes::IpProto::Udp;
+            assert!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
+                "a UDP mapping is not probed with a TCP bind"
+            );
+        }
+
+        /// Only the OS's own words get the taken-port error: any other
+        /// refusal of the bind — a permission denied, a missing address, a
+        /// crashed forwarder — rolls back and fails with the forwarder's
+        /// refusal as it came.
+        #[tokio::test]
+        async fn any_other_refusal_still_rolls_back_and_fails() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_in_turn(
+                sock.clone(),
+                vec![(200, ""), (500, "listen tcp: permission denied")],
+            );
+            let err = match apply_ingress(
+                &ControlChannel::Unix(sock),
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18080, 18181]),
+                None,
+                &[],
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a refusal that is not the OS's bind text still fails"),
+            };
+
+            assert!(
+                !is_address_in_use(&err),
+                "a permission-denied refusal is not the bind text: {err}"
+            );
+            forwarder
+                .await
+                .expect("the fake forwarder served both rounds");
+        }
+
+        /// The classifier's own words: the status line the wrapper writes,
+        /// the OS's phrase the body carries. A refusal that says either half
+        /// alone — a 200 that carries the phrase, a 500 that does not — is
+        /// not the bind text.
+        #[test]
+        fn the_classifier_reads_the_wrappers_own_words() {
+            let said = |body: &str| {
+                std::io::Error::other(format!(
+                    "gvproxy /services/forwarder/expose returned HTTP 500: {body}"
+                ))
+            };
+            assert!(is_address_in_use(&said(
+                "listen tcp 127.0.0.1:18999: bind: address already in use"
+            )));
+            assert!(!is_address_in_use(&said(
+                "listen tcp 127.0.0.1:18999: bind: permission denied"
+            )));
+            assert!(!is_address_in_use(&said("proxy already running")));
+            assert!(!is_address_in_use(&std::io::Error::other(
+                "connection closed before the answer"
+            )));
         }
     }
 }

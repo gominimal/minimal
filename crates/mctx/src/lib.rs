@@ -1253,74 +1253,101 @@ impl Context {
             }
         };
 
-        let toml = std::fs::read_to_string(&mfile_path)
-            .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
-        let mut doc = toml
-            .parse::<DocumentMut>()
-            .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
-
-        let resolved: Vec<String> = deps
-            .as_bsrs(graph)?
-            .into_iter()
-            .map(|bsr| graph.get(&bsr).unwrap().name.clone())
-            .collect();
-
+        // The whole read-edit-write runs under `File::edit_exclusively`'s
+        // lock so a concurrent `min` command cannot interleave between our read
+        // and our write (the write itself is an atomic replace).
         let mut did_edit = false;
-        match mode {
-            AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
-                    println!("Added {} to stack.build_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
-                    println!("Added {} to stack.runtime_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::TaskPackages { name } => {
-                if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_like_mut()
-                {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
-                    println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [tasks.{}] in minimal.toml: needed for update",
-                        name
-                    )));
-                }
-            }
-            AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
-                } else {
-                    doc.insert(
-                        "session",
-                        Item::Table(toml_edit::Table::from_iter([(
-                            "packages",
-                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                        )])),
-                    );
-                    did_edit = true;
-                }
-                println!("Added {} to session.packages", resolved.join(", "));
-            }
-        }
+        let mut added = None;
+        mfile::File::edit_exclusively(&mfile_path, |content| {
+            let toml = content.ok_or_else(|| {
+                Error::IO(
+                    "reading minimal.toml for add",
+                    mfile_path.to_path_buf(),
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "minimal.toml disappeared"),
+                )
+            })?;
+            let mut doc = toml
+                .parse::<DocumentMut>()
+                .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
 
+            let resolved: Vec<String> = deps
+                .as_bsrs(graph)?
+                .into_iter()
+                .map(|bsr| graph.get(&bsr).unwrap().name.clone())
+                .collect();
+
+            let mut edited = false;
+            match mode {
+                AddDepMode::BuildPackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.build_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::RuntimePackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.runtime_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::TaskPackages { name } => {
+                    if let Some(tasks) = doc.get_mut("tasks")
+                        && let Some(t) = tasks.get_mut(&name)
+                        && let Some(t) = t.as_table_like_mut()
+                    {
+                        edited |= upsert_toml_packages_list(t, "packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to tasks.{}.packages",
+                            resolved.join(", "),
+                            name
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [tasks.{}] in minimal.toml: needed for update",
+                            name
+                        )));
+                    }
+                }
+                AddDepMode::SessionPackages => {
+                    if let Some(h) = doc["session"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    } else {
+                        doc.insert(
+                            "session",
+                            Item::Table(toml_edit::Table::from_iter([(
+                                "packages",
+                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                            )])),
+                        );
+                        edited = true;
+                    }
+                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
+                }
+            }
+
+            did_edit = edited;
+            Ok(if edited { Some(doc.to_string()) } else { None })
+        })?;
+
+        // Printed only once the write has succeeded.
+        if let Some(added) = added {
+            println!("{added}");
+        }
         if did_edit {
-            std::fs::write(&mfile_path, doc.to_string())
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
             *self = self.cloned_reinit()?;
         }
         Ok(())

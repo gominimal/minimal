@@ -512,6 +512,7 @@ fn create_session_request_round_trips() {
             // default, so a fixture using it would round-trip green
             // even if the field never reached the wire.
             hooks_enabled: false,
+            ends_with_run: false,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -528,6 +529,7 @@ fn create_session_request_round_trips() {
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
         },
         must_match_version: Some("0.6.0".into()),
+        spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
     };
     assert_eq!(round_trip(&req), req);
 }
@@ -555,6 +557,7 @@ fn create_request_constructor_round_trips() {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
@@ -562,9 +565,58 @@ fn create_request_constructor_round_trips() {
                 project_root: None,
             },
             must_match_version: None,
+            spec: None,
         }
     );
     assert_eq!(round_trip(&req), req);
+}
+
+/// BOX-068: the create request carries the box's expanded spec whole, as
+/// the daemon receives and stores it. A request with no spec leaves the key
+/// off the wire, and a request from a client that predates the field
+/// decodes with no spec. The daemon half, the spec stored beside the
+/// record, is `create_stores_the_spec_beside_the_record` in `minimald`.
+#[test]
+fn create_sends_expanded_spec_and_stores_it() {
+    let spec = serde_json_lenient::json!({
+        "v": 0,
+        "entry": "default",
+        "hooks_enabled": false,
+        "box": {"type": "session"},
+        "io": {"pty_enabled": true},
+        "install": {"packages": ["git", "ripgrep"]},
+        "network": {
+            "mode": "own_ip",
+            "egress": {"allow_dns_hosts": [], "allow_subnets": [], "allow_protocols": []},
+            "ingress": null,
+        },
+    });
+    let mut req = CreateSessionRequest::new(
+        "spec-box",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::OwnIp,
+        BoxPolicy::default(),
+    );
+    req.spec = Some(spec.clone());
+
+    let wire = serde_json_lenient::to_string(&req).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(sent["spec"], spec, "the spec reaches the wire whole");
+    assert_eq!(round_trip(&req).spec, Some(spec));
+
+    req.spec = None;
+    let wire = serde_json_lenient::to_string(&req).unwrap();
+    assert!(!wire.contains("\"spec\""), "no spec, no key: {wire}");
+
+    let legacy = r#"{"config":{
+        "name": "s",
+        "project_path": "/p",
+        "network": "host_net",
+        "attrs": {}
+    }}"#;
+    let req: CreateSessionRequest =
+        serde_json_lenient::from_str(legacy).expect("a request with no spec must load");
+    assert_eq!(req.spec, None);
 }
 
 /// A client that predates `must_match_version` sends no such field, and

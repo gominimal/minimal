@@ -299,7 +299,7 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("PROJECT PATH"),
         "header should list PROJECT PATH: {text}"
     );
-    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(text.contains("running"), "row should show status: {text}");
     assert!(
         text.contains("/work/proj"),
         "row should show project path: {text}"
@@ -808,12 +808,25 @@ async fn dashboard_activate_uploads_loadout_patches() {
         .as_ref()
         .unwrap()
         .join("providers/local-minimald0/ssh.sock");
+    let project_path = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let upload_root = project_path.as_utf8_path().to_path_buf();
+    let inputs = minimal::loadouts::ActivationInputs {
+        contribution,
+        hook_scripts: Vec::new(),
+        hook_budget: std::time::Duration::from_secs(30),
+        user_policy: Default::default(),
+        initial_policy: Default::default(),
+        compose_options: Default::default(),
+        loadout_names: Vec::new(),
+    };
     let activated = minimal::dash::rpc::activate(
         &sock,
         Some("dash-patched".to_string()),
-        paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap(),
+        project_path,
+        upload_root,
         boxes::NetworkMode::NoNet,
-        contribution,
+        minimal::UploadDecision::Upload,
+        inputs,
     )
     .await
     .expect("a patch-carrying dashboard create finalizes");
@@ -1315,7 +1328,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
 
 /// Drives `min session activate` through the compiled binary against this
 /// process's harness daemon while its user-namespace verdict is `verdict`
-/// (NET-141), and returns the refusal: the `error:` block on stderr, exactly
+/// (NET-143), and returns the refusal: the `error:` block on stderr, exactly
 /// — the activation's own progress lines (`Applying loadouts: ...`) precede
 /// it. Asserts the contract every cause shares on the way: exit 1, nothing
 /// on stdout, and no session left behind. The binary is used because the
@@ -1389,7 +1402,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
 }
 
 /// A host whose user-namespace verdict refuses the sandbox fails the
-/// activation before any session exists (NET-141): the daemon refuses the
+/// activation before any session exists (NET-143): the daemon refuses the
 /// create on its verdict, `min session activate` prints that refusal as its
 /// error, exits 1, and leaves no session behind. The cause-specific texts
 /// are the two tests below; this one holds the shape they share.
@@ -1458,7 +1471,7 @@ async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
 }
 
 /// Drives `min task run` through the compiled binary against this process's
-/// harness daemon while its user-namespace verdict is `verdict` (NET-141),
+/// harness daemon while its user-namespace verdict is `verdict` (NET-143),
 /// and returns the refusal: the `error:` block on stderr, exactly. A task
 /// run creates its ephemeral session through the same create the daemon
 /// refuses, so the refusal must reach the user as the daemon's verdict —
@@ -1533,7 +1546,7 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
 }
 
 /// A refused host reaches `min task run` through the same create as an
-/// activate, so the refusal is the machine verdict there too (NET-141):
+/// activate, so the refusal is the machine verdict there too (NET-143):
 /// printed verbatim, never wrapped as `CreateSession failed: ...` — a
 /// wrapper that called the daemon's verdict an RPC failure would mislabel
 /// it and bury the remedy's shape under a generic prefix.
@@ -3077,24 +3090,41 @@ fn policy_shows_baseline_set() {
 
     // The rows are the enumeration the helper carries, one per category —
     // the set the host-side gate decides the daemon's own frames by once the
-    // baseline is in force.
-    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
-    let rendered_baseline = baseline
-        .entries()
-        .iter()
-        .map(|entry| {
-            format!(
-                "  {}  {}",
-                entry.category().as_str(),
-                entry.endpoints().join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // baseline is in force — each alias endpoint with the in-force arm's
+    // protocol and port bound beside it (NET-061).
+    let alias = fabric.host_alias();
+    let rendered_baseline =
+        format!("  registry  {alias}/32 tcp/443\n  cache  {alias}/32 tcp/443\n");
     assert!(
         text.contains(&rendered_baseline),
-        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+        "the baseline rows are the enumeration's entries, one per category, \
+         with the alias bound:\n{text}"
     );
+
+    // The JSON view carries the same bounded endpoints.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &deny_all,
+        boxes::NetworkMode::OwnIp,
+        Some(fabric),
+        Ok(Vec::new()),
+        &[],
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let bounded = Value::String(format!("{alias}/32 tcp/443"));
+    let entries = document["node_plane_baseline"]["entries"]
+        .as_array()
+        .expect("the JSON view carries the baseline entries");
+    assert_eq!(entries.len(), 2, "registry and cache:\n{document}");
+    for entry in entries {
+        assert_eq!(
+            entry["endpoints"],
+            Value::Array(vec![bounded.clone()]),
+            "the JSON view spells the alias bound:\n{document}"
+        );
+    }
     // Beside, not instead: the egress block comes first, the baseline set
     // after it, the ingress block last.
     let egress_at = text.find("egress").expect("the egress block renders");
@@ -4360,8 +4390,8 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 /// client-certificate RPC, or the `ssh-forward` feature that compiled
 /// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
 /// daemon's build flags from here, so assert on its sources and manifests —
-/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
-/// uses to prove a verb dropped a surface.
+/// a source scan, the way `minimal`'s own unit tests prove a verb dropped
+/// a surface.
 #[test]
 fn retired_surfaces_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4436,6 +4466,11 @@ fn retired_surfaces_absent() {
         ("Cargo.toml", &["rcgen"]),
         // Nothing passes a removed feature to the daemon builds.
         ("justfile", &["networking-proxy", "{{features}}"]),
+        // A `min bug` bundle collects no client certificate.
+        ("crates/minimal/src/diag/collect.rs", &["client.pem"]),
+        // Neither answerer documents the retired proxy port.
+        ("crates/minimald/src/net/answerer.rs", &[":7655"]),
+        ("crates/minvmd/src/net/answerer.rs", &[":7655"]),
     ];
     for (rel, retired) in retired_surfaces.iter().copied() {
         let text = source(rel);
@@ -4446,6 +4481,50 @@ fn retired_surfaces_absent() {
             );
         }
     }
+}
+
+/// `min login` is the GitHub sign-in, the alias for `min auth login`
+/// (NET-109): it takes the same arguments, parses into the same arguments,
+/// and its help describes the sign-in, not a retired certificate.
+#[test]
+fn login_runs_auth_login() {
+    use clap::{CommandFactory as _, Parser as _};
+
+    let cli = Cli::try_parse_from(["min", "login", "--device"]).expect("min login --device parses");
+    let Some(Command::Login(AuthLoginArgs { device })) = cli.command else {
+        panic!("min login must parse into the auth login arguments");
+    };
+    assert!(device, "--device reaches the sign-in");
+
+    let mut cmd = Cli::command();
+    let login = cmd
+        .find_subcommand_mut("login")
+        .expect("min login is a command");
+    assert!(!login.is_hide_set(), "min login is listed in min --help");
+    let help = login.render_long_help().to_string();
+    assert!(
+        help.contains("Sign in to GitHub (the same as min auth login)"),
+        "min login --help must describe the GitHub sign-in, got: {help}"
+    );
+    assert!(
+        help.contains("--device"),
+        "min login --help lists --device: {help}"
+    );
+    for retired in ["mint", "certificate", "reverse proxy"] {
+        assert!(
+            !help.contains(retired),
+            "min login --help still names `{retired}`: {help}"
+        );
+    }
+
+    // The flag that steered the retired certificate writes is refused.
+    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
+        panic!("--cert-dir is retired and must not parse");
+    };
+    assert!(
+        err.to_string().contains("--cert-dir"),
+        "the refusal must name the retired flag, got: {err}"
+    );
 }
 
 /// The daemon's `ListSessions` reply no longer carries the mTLS field, and a

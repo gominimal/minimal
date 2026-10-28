@@ -502,6 +502,7 @@ maybe_remove_finalize_install() {
     _fi_owned=
     _fi_undo=
     _aa_unowned=
+    _qb_found=
     for _ns_p in $_ns_paths; do
         if [ -e "$_fi_root$_ns_p" ]; then
             _fi_list="the host DNS setup ($_ns_p)"
@@ -541,6 +542,22 @@ maybe_remove_finalize_install() {
             _fi_undo="$_fi_undo${_fi_undo:+
 }      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
         fi
+        # The QUIC block helper and its sudoers rule, an item of their own.
+        # `min finalize-install --undo` does not remove them, so a yes
+        # removes them here, and either one left prints the manual remedy.
+        _qb_rm=
+        for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
+            _qb_rm="$_qb_rm $(shq "$_fi_root$_qb_p")"
+            if [ -z "$_qb_found" ] && [ -e "$_fi_root$_qb_p" ]; then
+                _qb_found="$_qb_p"
+            fi
+        done
+        if [ -n "$_qb_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the QUIC block helper and its sudoers rule ($_qb_found)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo rm -f$_qb_rm; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+        fi
         # The tree, by the step's record only: a tree without the record was
         # installed another way and stays. The record goes once the tree has.
         if [ -e "$_cls_record" ]; then
@@ -577,6 +594,17 @@ maybe_remove_finalize_install() {
                 _fi_ok=1
                 if [ -n "$_fi_owned" ]; then
                     { [ -x "$_fi_min" ] && "$_fi_min" finalize-install --undo; } || _fi_ok=
+                fi
+                # `min finalize-install --undo` does not remove the QUIC
+                # block helper or its sudoers rule, so remove them here.
+                if [ -n "$_qb_found" ]; then
+                    for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
+                        if [ -e "$_fi_root$_qb_p" ]; then
+                            sudo rm -f "$_fi_root$_qb_p" || _fi_ok=
+                        fi
+                        [ ! -e "$_fi_root$_qb_p" ] || _fi_ok=
+                    done
+                    sudo rmdir "$_lib_dir" 2>/dev/null || true
                 fi
                 if [ -n "$_aa_unowned" ]; then
                     { [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
