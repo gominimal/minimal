@@ -314,7 +314,8 @@ impl<T: HostRoute> Router<T> {
     /// client can close its socket before the proxy looks, and the gate must
     /// not open for that. A socket owned by a box the registry holds no
     /// caller facts for is [`CallerLookup::Unattributed`] too: an unknown box
-    /// is denied by default (design §7.1). Only a socket that no box owns is
+    /// is denied by default (design §7.1). Only a socket that no box owns,
+    /// or a peer at an address the node does not hold, is
     /// [`CallerLookup::NoBox`].
     async fn caller_for(&self, peer: SocketAddrV4, local: Option<SocketAddr>) -> CallerLookup {
         if let Some(caller) = self.caller_at(*peer.ip()) {

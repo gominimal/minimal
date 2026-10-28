@@ -2954,8 +2954,19 @@ pub enum ConnectingOwner {
 /// box's id. [`ConnectingOwner::NoBox`] when the holder runs in no box's
 /// leaf, and [`ConnectingOwner::Unknown`] when any step finds nothing, so a
 /// caller can refuse a connection it cannot attribute.
+///
+/// A peer whose address this node does not hold is [`ConnectingOwner::NoBox`]
+/// with no lookup. A host-address box shares the node's network namespace,
+/// so it connects from an address the node holds. A client off the node,
+/// such as the host side of a VM's forwarded port that arrives through the
+/// switch's gateway, is never in this node's socket tables. Without this
+/// rule its lookup finds nothing, and the proxy refuses every host request
+/// while a host-address box is live.
 #[must_use]
 pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
+    if !node_holds_address(*peer.ip()) {
+        return ConnectingOwner::NoBox;
+    }
     #[cfg(target_os = "linux")]
     {
         let holder = client_socket_inode(peer, local)
@@ -2973,6 +2984,15 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
         let _ = (peer, local);
         ConnectingOwner::Unknown
     }
+}
+
+/// Whether `ip` is an address this node holds: a loopback address, or one
+/// a socket can bind to. A bind to port 0 fails with `EADDRNOTAVAIL` for an
+/// address no interface holds. A host that permits non-local binds
+/// (`ip_nonlocal_bind`) answers true for every address, so the caller's
+/// lookup still runs and fails closed.
+fn node_holds_address(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
 /// The kernel's socket-table spelling of an IPv4 socket address: the
@@ -3219,6 +3239,21 @@ mod tests {
         // A test process runs in no box's leaf, so it is no box.
         assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
         drop(client);
+    }
+
+    /// A peer at an address this node does not hold is no box, with no
+    /// socket lookup: a host-address box connects from the node's own
+    /// addresses, and an off-node client, such as a VM host's forwarded
+    /// request through the switch's gateway, is never in the node's tables
+    /// (NET-070).
+    #[test]
+    fn off_node_peer_is_no_box() {
+        // TEST-NET-1 (RFC 5737): no interface holds it.
+        let peer = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7654);
+        assert!(!node_holds_address(*peer.ip()));
+        assert!(node_holds_address(Ipv4Addr::new(127, 0, 0, 4)));
+        assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
     }
 
     /// A lease an attach path would report, with an `18080:8080` ingress
