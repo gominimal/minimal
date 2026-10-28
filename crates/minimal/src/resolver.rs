@@ -63,6 +63,90 @@ pub(crate) const ZONE_LINK: &str = "minzone0";
 /// beyond the address itself.
 pub(crate) const ZONE_LINK_ADDR: Ipv4Addr = Ipv4Addr::new(100, 127, 255, 254);
 
+/// The systemd unit that re-creates [`ZONE_LINK`] and its `resolvectl`
+/// settings at every boot (NET-122's Linux names step): the link is a dummy
+/// interface and resolved's per-link settings live in `/run`, so neither
+/// survives a restart without it.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ZONE_LINK_SYSTEMD_UNIT: &str = "minzone0-link";
+
+/// Where the names step writes [`ZONE_LINK_SYSTEMD_UNIT`]: root's unit
+/// directory, never a user-session unit.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ZONE_LINK_UNIT_PATH: &str = "/etc/systemd/system/minzone0-link.service";
+
+/// The link `systemctl enable` makes for [`ZONE_LINK_UNIT_PATH`]: its
+/// presence is what says the unit runs at boot.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ZONE_LINK_UNIT_WANTS_PATH: &str =
+    "/etc/systemd/system/multi-user.target.wants/minzone0-link.service";
+
+/// The heredoc delimiter the names step writes the boot unit under.
+#[cfg(any(test, not(target_os = "macos")))]
+const ZONE_LINK_UNIT_HEREDOC: &str = "MINIMAL_ZONE_LINK_UNIT_EOF";
+
+/// The `ExecStart=` prefix of the boot unit's line that points the link at
+/// the answerer: the line the detection reads the unit's port from.
+#[cfg(any(test, not(target_os = "macos")))]
+fn zone_link_unit_dns_prefix() -> String {
+    format!("ExecStart=resolvectl dns {ZONE_LINK} 127.0.0.1:")
+}
+
+/// The boot unit for the answerer on `port`: a oneshot that runs after
+/// systemd-resolved starts and applies the same settings the names step's
+/// own resolver lines apply. It runs no shell and reads no configuration.
+/// A link that is already there is not an error (the `-` prefix), and the
+/// address is replaced, so the unit is safe to run again. Its last line
+/// writes one info line to the system journal.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn zone_link_boot_unit(port: u16) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Minimal box names: route *.{ZONE} lookups to Minimal's DNS service\n\
+         After=systemd-resolved.service\n\
+         Wants=systemd-resolved.service\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart=-ip link add {ZONE_LINK} type dummy\n\
+         ExecStart=ip link set {ZONE_LINK} up\n\
+         ExecStart=ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK}\n\
+         ExecStart=resolvectl default-route {ZONE_LINK} false\n\
+         {dns}{port}\n\
+         ExecStart=resolvectl domain {ZONE_LINK} ~{ZONE}\n\
+         ExecStartPost=echo \"re-created {ZONE_LINK}: *.{ZONE} lookups go to 127.0.0.1:{port}\"\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        dns = zone_link_unit_dns_prefix(),
+    )
+}
+
+/// The answerer port an installed boot unit points the link at, read from
+/// its own text.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn zone_link_unit_port(text: &str) -> Option<u16> {
+    let prefix = zone_link_unit_dns_prefix();
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+        .and_then(|port| port.trim().parse().ok())
+}
+
+/// The boot unit's state on this host: the unit file and its enable link.
+#[cfg(not(target_os = "macos"))]
+async fn read_zone_link_boot_unit() -> BootUnit {
+    let enabled = tokio::fs::symlink_metadata(ZONE_LINK_UNIT_WANTS_PATH)
+        .await
+        .is_ok();
+    match tokio::fs::read_to_string(ZONE_LINK_UNIT_PATH).await {
+        Ok(text) if enabled => BootUnit::Installed {
+            port: zone_link_unit_port(&text),
+        },
+        _ => BootUnit::Absent,
+    }
+}
+
 /// The reserved local range the daemon publishes per-box addresses from and
 /// whose presence at session start NET-123's bind probe verifies: the one
 /// definition of the range, owned by the `switch` crate and re-exported by
@@ -1935,6 +2019,26 @@ pub(crate) struct Hook {
     pub port: Option<u16>,
     /// One line describing the state, for the advisory and the bundle.
     pub detail: String,
+    /// The unit that re-applies the hook at every boot, where the host's
+    /// hook needs one (Linux).
+    pub boot_unit: BootUnit,
+}
+
+/// The state of the unit that re-applies the Linux hook at every boot
+/// ([`ZONE_LINK_SYSTEMD_UNIT`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub(crate) enum BootUnit {
+    /// Not read: this host's hook survives a restart on its own (macOS's
+    /// resolver file), or nothing read it.
+    #[default]
+    NotRead,
+    /// The unit file or its enable link is not there.
+    Absent,
+    /// The unit is installed and enabled, pointing the link at `port`.
+    Installed {
+        /// The answerer port the unit's `resolvectl dns` line names.
+        port: Option<u16>,
+    },
 }
 
 impl Hook {
@@ -1943,6 +2047,7 @@ impl Hook {
             source: source.into(),
             port,
             detail: detail.into(),
+            boot_unit: BootUnit::NotRead,
         }
     }
 
@@ -1951,6 +2056,24 @@ impl Hook {
             source: source.into(),
             port: None,
             detail: detail.into(),
+            boot_unit: BootUnit::NotRead,
+        }
+    }
+
+    /// This hook with the boot unit's state beside it.
+    #[cfg(any(test, not(target_os = "macos")))]
+    pub(crate) fn with_boot_unit(self, boot_unit: BootUnit) -> Self {
+        Hook { boot_unit, ..self }
+    }
+
+    /// Whether the hook was read to need a boot unit that is not there, or
+    /// that points the link at a port other than `answerer_port`: the
+    /// state where `*.{ZONE}` stops resolving after the next restart.
+    pub(crate) fn boot_unit_missing(&self, answerer_port: u16) -> bool {
+        match self.boot_unit {
+            BootUnit::NotRead => false,
+            BootUnit::Absent => true,
+            BootUnit::Installed { port } => port != Some(answerer_port),
         }
     }
 
@@ -2551,7 +2674,8 @@ async fn host_detection(bound: Duration) -> (Hook, Option<String>, RangeStep) {
     let nsswitch = tokio::fs::read_to_string(NSSWITCH_CONF).await.ok();
     let resolve_module = resolve_module_installed().await;
     (
-        routing_domain_hook(domain.as_deref(), dns.as_deref()),
+        routing_domain_hook(domain.as_deref(), dns.as_deref())
+            .with_boot_unit(read_zone_link_boot_unit().await),
         stub_bypass_blocker(
             domain.as_deref(),
             resolv_conf.as_deref(),
@@ -3269,10 +3393,44 @@ pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) ->
          resolvectl dns {ZONE_LINK} 127.0.0.1:{port}\n\
          resolvectl domain {ZONE_LINK} '~{ZONE}'\n",
     ));
+    script.push_str(&linux_zone_link_unit_steps(port));
     if let Some(install) = install {
         script.push_str(&linux_answerer_unit_steps(install));
     }
     script
+}
+
+/// The boot half of the Linux resolver step: write the root-owned unit
+/// that re-creates [`ZONE_LINK`] and its settings at every boot
+/// ([`zone_link_boot_unit`]) and enable it. The link is already set up by
+/// the lines before, so the unit is enabled, not started.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_zone_link_unit_steps(port: u16) -> String {
+    format!(
+        "\n\
+         # The boot unit: systemd re-creates {ZONE_LINK} with the settings above at\n\
+         # every boot, after systemd-resolved starts, so box names keep resolving.\n\
+         cat > {ZONE_LINK_UNIT_PATH} <<\\{ZONE_LINK_UNIT_HEREDOC}\n\
+         {unit}\
+         {ZONE_LINK_UNIT_HEREDOC}\n\
+         chown root:root {ZONE_LINK_UNIT_PATH}\n\
+         chmod 0644 {ZONE_LINK_UNIT_PATH}\n\
+         systemctl daemon-reload\n\
+         systemctl enable {ZONE_LINK_SYSTEMD_UNIT}.service\n",
+        unit = zone_link_boot_unit(port),
+    )
+}
+
+/// The lines that remove the boot unit: disable it (tolerating a unit that
+/// is not there), remove its file and reload the manager. They run before
+/// the link is deleted, so nothing re-creates it.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_zone_link_unit_removal() -> String {
+    format!(
+        "systemctl disable {ZONE_LINK_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
+         rm -f {ZONE_LINK_UNIT_PATH}\n\
+         systemctl daemon-reload || true\n"
+    )
 }
 
 /// The lines that take the Linux answerer service down and remove what its
@@ -3679,7 +3837,9 @@ pub(crate) fn linux_undo_command(channel: &str) -> String {
          rm -f \"{channel}\"\n\
          {channel_dirs}\
          \n\
-         # The resolver: revert the dedicated link's DNS configuration and delete it.\n\
+         # The resolver: remove the unit that re-creates the dedicated link at\n\
+         # boot, then revert the link's DNS configuration and delete it.\n\
+         {boot_unit}\
          if [ -e /sys/class/net/{ZONE_LINK} ] ; then\n\
          \x20 resolvectl revert {ZONE_LINK} 2>/dev/null || true\n\
          \x20 ip link del {ZONE_LINK}\n\
@@ -3687,6 +3847,7 @@ pub(crate) fn linux_undo_command(channel: &str) -> String {
          {host_items}",
         header = script_header(LINUX_UNDO_WHAT, UNDO_SHOWN_BY),
         service = linux_service_removal(""),
+        boot_unit = linux_zone_link_unit_removal(),
         channel_dirs = channel_dir_removal(channel),
         host_items = linux_host_items_removal(),
     )
@@ -3981,6 +4142,11 @@ pub(crate) enum NamesVerdict {
     },
 }
 
+/// The names item's fact for a Linux host whose hook routes now but has
+/// no boot unit to re-apply it.
+pub(crate) const BOOT_UNIT_MISSING: &str =
+    "box names stop resolving after a restart until `min finalize-install` runs again";
+
 /// [`advisory_at`]'s decision, before it is rendered: see [`NamesVerdict`].
 pub(crate) fn names_verdict_at(
     hook: &Hook,
@@ -4007,12 +4173,16 @@ pub(crate) fn names_verdict_at(
     // host service): a host without it is one whose zone answers only
     // while a session holds it, which is a fact the note says, not one
     // it hides.
+    // The Linux hook lives in `/run` and on a dummy link, so a hook that
+    // routes now with no boot unit behind it stops routing at the next
+    // restart: that is a missing part of the item too.
     if hook.routes(port)
         && !interim
         && !matches!(range_present, Some(false))
         && blocker.is_none()
         && range_step.custody_holds()
         && answerer.holds()
+        && !hook.boot_unit_missing(port)
     {
         return NamesVerdict::Done;
     }
@@ -4133,6 +4303,10 @@ pub(crate) fn names_verdict_at(
             "*.{ZONE} does not resolve in browsers or other programs on \
              this machine"
         ));
+    } else if hook.boot_unit_missing(port) {
+        // Said only while the hook routes: a hook that does not route is
+        // already the fact above, and the step installs both.
+        facts.push(BOOT_UNIT_MISSING.to_string());
     }
     match blocker {
         // The note is built from the parts that are there. A blocker can be
@@ -5598,6 +5772,70 @@ mod tests {
                 "the interim advisory must name the exact command ({marker}): {interim}"
             );
         }
+
+        // The Linux hook routes now but has no boot unit behind it: the
+        // item names the missing unit and the script that installs it.
+        for stale_unit in [
+            BootUnit::Absent,
+            BootUnit::Installed {
+                port: Some(port - 1),
+            },
+            BootUnit::Installed { port: None },
+        ] {
+            let no_boot = configured.clone().with_boot_unit(stale_unit);
+            let advisory = advisory_at(
+                &no_boot,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                &AnswererStep::Installed,
+                None,
+            )
+            .expect("a hook with no boot unit behind it must be advised");
+            assert!(
+                advisory.contains(
+                    "box names stop resolving after a restart until `min finalize-install` \
+                     runs again"
+                ),
+                "the advisory names the missing boot unit ({stale_unit:?}): {advisory}"
+            );
+            for marker in command_markers(port) {
+                assert!(
+                    advisory.contains(&marker),
+                    "the boot-unit advisory names the exact command ({marker}): {advisory}"
+                );
+            }
+        }
+        let with_boot = configured
+            .clone()
+            .with_boot_unit(BootUnit::Installed { port: Some(port) });
+        assert!(
+            advisory_at(
+                &with_boot,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                &AnswererStep::Installed,
+                None
+            )
+            .is_none(),
+            "a hook whose boot unit re-applies it is not re-advised"
+        );
+        // A hook that does not route says that, and not the boot unit too:
+        // the step installs both.
+        let advisory = advisory_at(
+            &unconfigured.clone().with_boot_unit(BootUnit::Absent),
+            port,
+            false,
+            None,
+            &range_step_on_this_os(),
+            &AnswererStep::Installed,
+            None,
+        )
+        .expect("an unconfigured host must be advised");
+        assert!(!advisory.contains(BOOT_UNIT_MISSING), "{advisory}");
     }
 
     // The full path on this host: whatever `detect` finds, the advisory
@@ -5619,7 +5857,11 @@ mod tests {
             &AnswererStep::Installed,
         );
         let (hook, blocker, range_step) = &detection;
-        if hook.routes(port) && blocker.is_none() && range_step.custody_holds() {
+        if hook.routes(port)
+            && blocker.is_none()
+            && range_step.custody_holds()
+            && !hook.boot_unit_missing(port)
+        {
             assert!(advisory.is_none(), "configured host must not be advised");
         } else if let Some(blocker) = blocker {
             let advisory = advisory.expect("a host the command cannot reach must be told why");
@@ -6049,12 +6291,20 @@ mod tests {
             "rm -f \"/run/minimal/answerer.sock\"".to_string(),
             "rmdir \"/run/minimal\" 2>/dev/null || true".to_string(),
             format!("rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true"),
+            format!("systemctl disable {ZONE_LINK_SYSTEMD_UNIT}.service 2>/dev/null || true"),
+            format!("rm -f {ZONE_LINK_UNIT_PATH}"),
         ] {
             assert!(
                 linux.contains(&step),
                 "the Linux removal runs {step:?}: {linux}"
             );
         }
+        // The boot unit goes before the link, so nothing re-creates it.
+        assert!(
+            linux.find(&format!("rm -f {ZONE_LINK_UNIT_PATH}")).unwrap()
+                < linux.find(&format!("ip link del {ZONE_LINK}")).unwrap(),
+            "{linux}"
+        );
         assert!(!linux.contains("rmdir \"/run\""), "{linux}");
         assert!(linux.contains(&linux_service_removal("")), "{linux}");
         // Linux: the other items the step installs come away too — the
@@ -8127,9 +8377,12 @@ resolvectl default-route minzone0 false
 resolvectl dns minzone0 127.0.0.1:15353
 resolvectl domain minzone0 '~min.internal'
 ";
+        // The resolver's boot unit follows its steps (NET-122's restart
+        // half, pinned by `linux_zone_link_restored_at_boot`).
+        let boot_unit_steps = linux_zone_link_unit_steps(port);
         let alone = linux_command(port, None);
         assert!(
-            alone.ends_with(&format!("set -eu\n\n{resolver_steps}")),
+            alone.ends_with(&format!("set -eu\n\n{resolver_steps}{boot_unit_steps}")),
             "without the answerer step the script is the resolver's alone: {alone}"
         );
         let command = linux_command(port, Some(&test_install()));
@@ -8141,6 +8394,9 @@ resolvectl domain minzone0 '~min.internal'
                 && copy_steps.contains("\n[ -d \"/usr/local/lib/minimal\" ] || install -d"),
             "the answerer's verified copy runs ahead of them: {copy_steps}"
         );
+        let unit_steps = unit_steps
+            .strip_prefix(boot_unit_steps.as_str())
+            .unwrap_or_else(|| panic!("the boot unit follows the resolver steps: {unit_steps}"));
         assert!(
             unit_steps.starts_with("\n# The box-name service: a systemd socket and service pair"),
             "the answerer service's units follow them: {unit_steps}"
@@ -8309,6 +8565,119 @@ resolvectl domain minzone0 '~min.internal'
     }
 
     #[cfg(any(test, not(target_os = "macos")))]
+    // NET-122 on Linux: the resolver link and its settings live on a dummy
+    // interface and in `/run`, so the names step installs a root-owned
+    // boot unit that re-applies exactly what the step's own lines apply,
+    // after systemd-resolved starts, at every boot; the detection reads the
+    // unit back, and the removal takes it away before the link.
+    #[test]
+    fn linux_zone_link_restored_at_boot() {
+        let port = 15353;
+        let unit = zone_link_boot_unit(port);
+        // Ordered after systemd-resolved, wanted at every boot, a oneshot
+        // that stays active, with one info line for the journal.
+        for line in [
+            "After=systemd-resolved.service",
+            "Wants=systemd-resolved.service",
+            "Type=oneshot",
+            "RemainAfterExit=yes",
+            "WantedBy=multi-user.target",
+        ] {
+            assert!(unit.lines().any(|l| l == line), "{line}: {unit}");
+        }
+        assert_eq!(
+            unit.lines()
+                .filter(|l| l.starts_with("ExecStartPost=echo "))
+                .count(),
+            1,
+            "one journal line when the unit re-applies the link: {unit}"
+        );
+        // The unit runs no shell and reads no configuration: every command
+        // is a plain `ip` or `resolvectl` call.
+        let exec: Vec<&str> = unit
+            .lines()
+            .filter_map(|l| l.strip_prefix("ExecStart="))
+            .map(|l| l.trim_start_matches('-'))
+            .collect();
+        assert!(
+            exec.iter()
+                .all(|cmd| cmd.starts_with("ip ") || cmd.starts_with("resolvectl ")),
+            "{unit}"
+        );
+        assert!(!unit.contains("sh -c") && !unit.contains('%'), "{unit}");
+        // It re-applies every setting the step's own resolver lines apply,
+        // with the same values: the link, its address, its server and its
+        // routing domain.
+        let script = linux_names_steps(port, None);
+        for setting in [
+            format!("ip link add {ZONE_LINK} type dummy"),
+            format!("ip link set {ZONE_LINK} up"),
+            format!("ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK}"),
+            format!("resolvectl default-route {ZONE_LINK} false"),
+            format!("resolvectl dns {ZONE_LINK} 127.0.0.1:{port}"),
+        ] {
+            assert!(script.contains(&setting), "the step sets {setting}");
+            assert!(
+                exec.contains(&setting.as_str()),
+                "the unit re-applies {setting}"
+            );
+        }
+        assert!(script.contains(&format!("resolvectl domain {ZONE_LINK} '~{ZONE}'")));
+        assert!(exec.contains(&format!("resolvectl domain {ZONE_LINK} ~{ZONE}").as_str()));
+        // A link that is already there does not fail the unit.
+        assert!(
+            unit.contains(&format!("ExecStart=-ip link add {ZONE_LINK} type dummy")),
+            "{unit}"
+        );
+
+        // The step writes the unit root-owned and enables it, after the
+        // resolver lines and under its own comment.
+        for statement in [
+            format!("cat > {ZONE_LINK_UNIT_PATH} <<\\{ZONE_LINK_UNIT_HEREDOC}"),
+            format!("chown root:root {ZONE_LINK_UNIT_PATH}"),
+            format!("chmod 0644 {ZONE_LINK_UNIT_PATH}"),
+            format!("systemctl enable {ZONE_LINK_SYSTEMD_UNIT}.service"),
+        ] {
+            assert!(
+                script.lines().any(|l| l == statement),
+                "the step runs {statement:?}: {script}"
+            );
+        }
+        assert!(
+            script.contains(&format!("{unit}{ZONE_LINK_UNIT_HEREDOC}\n")),
+            "the unit rides whole under its delimiter: {script}"
+        );
+        assert!(
+            script.find("resolvectl domain").unwrap() < script.find(ZONE_LINK_UNIT_PATH).unwrap(),
+            "{script}"
+        );
+        assert!(script.contains("# The boot unit: "), "{script}");
+        let full = linux_command(port, Some(&test_install()));
+        assert!(sh_parses(&full), "{full}");
+        assert!(full.contains(&zone_link_boot_unit(port)), "{full}");
+
+        // The detection reads the port back from the unit's own text.
+        assert_eq!(zone_link_unit_port(&unit), Some(port));
+        assert_eq!(zone_link_unit_port("[Unit]\n"), None);
+
+        // The removal disables and removes the unit before it deletes the
+        // link, so nothing re-creates the link once it is gone.
+        let undo = linux_undo_command("/run/minimal/answerer.sock");
+        assert!(sh_parses(&undo), "{undo}");
+        let disable = undo
+            .find(&format!(
+                "systemctl disable {ZONE_LINK_SYSTEMD_UNIT}.service"
+            ))
+            .expect("the removal disables the boot unit");
+        let remove = undo
+            .find(&format!("rm -f {ZONE_LINK_UNIT_PATH}"))
+            .expect("the removal deletes the unit file");
+        let link = undo
+            .find(&format!("ip link del {ZONE_LINK}"))
+            .expect("the removal deletes the link");
+        assert!(disable < remove && remove < link, "{undo}");
+    }
+
     #[test]
     fn linux_command_targets_a_dedicated_link_off_the_default_route() {
         let command = linux_command(15353, Some(&test_install()));
