@@ -220,6 +220,10 @@ pub struct SwitchOwnAddresses {
     /// default-deny: reached only at the exposures the host configures,
     /// as local reach under the box's rules there.
     host_alias: [u8; 4],
+    /// The documented literal when it is not the alias (a native daemon's
+    /// /24 inside the default plane, minimal#2636): decided exactly as the
+    /// alias is, since the switch routes both to the host.
+    legacy_host_alias: Option<[u8; 4]>,
     /// The node address — the daemon's own address on the switch: the
     /// machine's plane, opened only at the interim hostname proxy's port.
     node: [u8; 4],
@@ -246,11 +250,22 @@ impl SwitchOwnAddresses {
         Self {
             gateway,
             host_alias,
+            legacy_host_alias: None,
             node,
             bep_peer,
             host_exposure_ports: Vec::new(),
             hostname_proxy_port: None,
         }
+    }
+
+    /// The documented host-reach literal when the switch's alias is not it
+    /// (NET-004 on a native daemon's /24, minimal#2636): a second address
+    /// decided as the alias is, open at the host's exposures and the set's
+    /// drop at every other port.
+    #[must_use]
+    pub fn with_legacy_host_alias(mut self, addr: [u8; 4]) -> Self {
+        self.legacy_host_alias = Some(addr);
+        self
     }
 
     /// The configured host exposures over the host alias (NET-062's third
@@ -315,7 +330,9 @@ impl SwitchOwnAddresses {
             // the set holds the address for a compile that carries none,
             // where no lane exists to open it.
             Some(reason)
-        } else if dst == self.host_alias && !self.host_exposure_ports.contains(&dst_port) {
+        } else if (dst == self.host_alias || Some(dst) == self.legacy_host_alias)
+            && !self.host_exposure_ports.contains(&dst_port)
+        {
             Some(reason)
         } else {
             None
@@ -1305,6 +1322,15 @@ impl InfrastructureDenySet {
                 cidr("192.168.0.0/16"),
             ],
         }
+    }
+
+    /// One more address refused under every declaration: the documented
+    /// host-reach literal on a switch whose alias is not it (NET-004 on a
+    /// native daemon's /24, minimal#2636), held as a `/32` like the alias.
+    #[must_use]
+    pub fn also_refusing(mut self, addr: [u8; 4]) -> Self {
+        self.fixed.push(Ipv4Cidr::exact(addr));
+        self
     }
 }
 
@@ -2750,6 +2776,58 @@ mod tests {
         assert!(
             admits(&sibling, &covering),
             "a sibling box's lease is not one of the switch's own addresses"
+        );
+    }
+
+    /// NET-004 on a native daemon's /24 (minimal#2636): the documented literal,
+    /// handed as the legacy alias, is decided exactly as the alias is: the set's
+    /// drop at every port without an exposure, the exposure's port falling
+    /// through to the box's own rules, and nothing changes for the alias itself.
+    #[test]
+    fn the_documented_literal_is_decided_as_the_alias_on_a_native_subnet() {
+        const LEGACY: [u8; 4] = [100, 64, 255, 254];
+        let own = own_addresses().with_legacy_host_alias(LEGACY);
+        let allow_all =
+            EgressRules::from_policy(None, RESOLVER, LEASE).with_switch_own_addresses(own.clone());
+        assert_eq!(
+            verdict(&summarize(&ipv4_frame(IPPROTO_TCP, LEGACY, 80)), &allow_all),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: LEGACY,
+                proto: IPPROTO_TCP
+            }),
+            "with no exposure the literal has no opening, like the alias"
+        );
+        let exposed = own.with_host_exposure_ports([18081u16]);
+        let allow_all_exposed = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(exposed.clone());
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, LEGACY, 18081), &allow_all_exposed),
+            "the exposure opens the literal as it opens the alias"
+        );
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 18081),
+                &allow_all_exposed
+            ),
+            "and the alias is still open there"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, LEGACY, 80)),
+                &allow_all_exposed
+            ),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: LEGACY,
+                proto: IPPROTO_TCP
+            }),
+            "every other port at the literal is the set's drop"
+        );
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, LEGACY, 18081),
+                &deny_all().with_switch_own_addresses(exposed)
+            ),
+            "a default-deny box still gets nothing"
         );
     }
 

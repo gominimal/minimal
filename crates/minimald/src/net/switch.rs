@@ -600,10 +600,17 @@ fn node_dns_layer(subnet: SwitchSubnet, lease: Ipv4Addr) -> DnsGate {
         "node",
         None,
         compiled_egress(None, subnet, lease, None),
-        egress::InfrastructureDenySet::new(
-            subnet.dns_server().octets(),
-            subnet.host_alias().octets(),
-        ),
+        match subnet.legacy_host_literal() {
+            Some(literal) => egress::InfrastructureDenySet::new(
+                subnet.dns_server().octets(),
+                subnet.host_alias().octets(),
+            )
+            .also_refusing(literal.octets()),
+            None => egress::InfrastructureDenySet::new(
+                subnet.dns_server().octets(),
+                subnet.host_alias().octets(),
+            ),
+        },
         subnet.host_alias().octets(),
         Arc::new(PolicyWarnLimiter::new()),
     )
@@ -1118,13 +1125,19 @@ struct LegacyHostNotice {
 impl LegacyHostNotice {
     /// Builds the notice from the relay's session gate, which carries the
     /// box's session label, and the subnet of the switch the relay is attached
-    /// to, whose host alias is the deprecated literal — never a hardcoded
-    /// default, so a custom-subnet switch's literal is watched too. The gate's
-    /// limiter is shared, not the whole gate: the notice is egress-side.
+    /// to. The address watched is the deprecated literal: on a subnet carved
+    /// inside the default plane (a native daemon's /24) that is the plane's
+    /// `100.64.255.254` and not the subnet's own alias, which is what
+    /// `host.min.internal` resolves to and must never be called deprecated
+    /// (minimal#2636); elsewhere it is the subnet's alias, so a custom-subnet
+    /// switch's literal is watched too. The gate's limiter is shared, not the
+    /// whole gate: the notice is egress-side.
     fn for_gate(gate: &BoxGate, subnet: SwitchSubnet) -> Self {
         Self {
             label: gate.label.clone(),
-            alias: subnet.host_alias(),
+            alias: subnet
+                .legacy_host_literal()
+                .unwrap_or_else(|| subnet.host_alias()),
             limiter: Arc::clone(&gate.limiter),
         }
     }
@@ -2676,6 +2689,13 @@ pub fn compiled_egress(
         subnet.daemon_ip().octets(),
         proxy,
     );
+    // NET-004 on a native daemon's /24 (minimal#2636): the switch routes the
+    // documented literal to the host as it routes the alias, so the verdict
+    // decides it as the alias: the host's exposures, and nothing else.
+    let own = match subnet.legacy_host_literal() {
+        Some(literal) => own.with_legacy_host_alias(literal.octets()),
+        None => own,
+    };
     rules.with_switch_own_addresses(match hostname_proxy_port {
         Some(port) => own.with_hostname_proxy_port(port),
         None => own,
@@ -6488,6 +6508,33 @@ pub(crate) mod tests {
         );
         let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
         assert_eq!(notice.alias, alias, "the notice watches the switch's alias");
+
+        // A native daemon's /24 inside the plane (minimal#2636): the notice
+        // watches the plane's literal, and a frame to the /24's own alias —
+        // what `host.min.internal` resolves to there — notices nothing.
+        let native = SwitchSubnet::new(Ipv4Addr::new(100, 64, 230, 0), 24).unwrap();
+        let native_notice = LegacyHostNotice::for_gate(
+            &BoxGate::for_session(
+                "100.64.230.9".into(),
+                Ipv4Addr::new(100, 64, 230, 9),
+                &boxes::BoxPolicy::default(),
+                native,
+                None,
+            ),
+            native,
+        );
+        assert_eq!(
+            native_notice.alias, alias,
+            "the plane's literal, not the /24's alias"
+        );
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            native_notice.alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, native.host_alias(), 53),
+            native_notice.alias
+        ));
 
         // The alias comes from the switch the relay is attached to, never a
         // hardcoded default: a custom-subnet switch's literal is the one

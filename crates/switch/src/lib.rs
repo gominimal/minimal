@@ -346,6 +346,21 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
+    /// The documented host-reach literal (NET-004, `100.64.255.254`: the
+    /// default plane's host alias) when it is not this subnet's own alias:
+    /// `Some` for a subnet carved inside the default plane, such as a native
+    /// daemon's /24 (minimal#2636), whose alias is `100.64.<octet>.254` and
+    /// where the literal would otherwise be routed nowhere; `None` for the
+    /// default plane itself, where the literal is the alias, and for a
+    /// custom plane, which the literal has nothing to do with.
+    #[must_use]
+    pub fn legacy_host_literal(self) -> Option<Ipv4Addr> {
+        let inside_plane = self.prefix() > DEFAULT_SUBNET.prefix()
+            && u32::from(self.network()) & u32::from(DEFAULT_SUBNET.netmask())
+                == u32::from(DEFAULT_SUBNET.network());
+        inside_plane.then(|| DEFAULT_SUBNET.host_alias())
+    }
+
     /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
     /// `broadcast - 3`): a second infrastructure address above the PTask lease
     /// pool that the host-side stack peer owns directly. Reserved, never
@@ -650,10 +665,21 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!(
         "  tcpConnectTimeout: {TCP_CONNECT_TIMEOUT_SECS}\n"
     ));
+    // NET-004: the documented literal reaches the host too, on a subnet
+    // carved inside the default plane whose own alias it is not (a native
+    // daemon's /24): a second nat entry and virtual IP, so the deprecation
+    // window the spec promises holds there and not only in a microVM.
+    let legacy = subnet.legacy_host_literal();
     s.push_str("  nat:\n");
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
+    if let Some(literal) = legacy {
+        s.push_str(&format!("    \"{literal}\": \"127.0.0.1\"\n"));
+    }
     s.push_str("  gatewayVirtualIPs:\n");
     s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
+    if let Some(literal) = legacy {
+        s.push_str(&format!("    - \"{literal}\"\n"));
+    }
     // NET-003: the switch answers `host.min.internal` itself, with the host
     // alias — the address its `nat` table maps to the host's loopback. Rendered
     // from first boot, ahead of any dynamic `min.internal.` registration; the
@@ -678,6 +704,47 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-004 on a native daemon (minimal#2636): a /24 inside the default
+    /// plane routes the documented literal as well as its own alias; the
+    /// default plane routes the literal once, as its alias; a custom plane
+    /// never names it.
+    #[test]
+    fn a_subnet_inside_the_plane_routes_the_documented_literal_too() {
+        let native = SwitchSubnet::new(Ipv4Addr::new(100, 64, 230, 0), 24).unwrap();
+        assert_eq!(native.host_alias(), Ipv4Addr::new(100, 64, 230, 254));
+        assert_eq!(
+            native.legacy_host_literal(),
+            Some(Ipv4Addr::new(100, 64, 255, 254))
+        );
+        let cfg = render_gvproxy_config(native, &[]);
+        assert!(
+            cfg.contains(
+                "    \"100.64.230.254\": \"127.0.0.1\"\n    \"100.64.255.254\": \"127.0.0.1\"\n"
+            ),
+            "{cfg}"
+        );
+        assert!(
+            cfg.contains("    - \"100.64.230.254\"\n    - \"100.64.255.254\"\n"),
+            "{cfg}"
+        );
+        // `host.min.internal` still names the subnet's own alias
+        assert!(
+            cfg.contains("        - name: \"host\"\n          ip: \"100.64.230.254\"\n"),
+            "{cfg}"
+        );
+
+        assert_eq!(SwitchSubnet::default().legacy_host_literal(), None);
+        assert_eq!(
+            render_gvproxy_config(SwitchSubnet::default(), &[])
+                .matches("100.64.255.254")
+                .count(),
+            3
+        );
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 1, 0, 0), 24).unwrap();
+        assert_eq!(custom.legacy_host_literal(), None);
+        assert!(!render_gvproxy_config(custom, &[]).contains("100.64.255.254"));
+    }
 
     #[test]
     fn default_is_cgnat_slash16() {
