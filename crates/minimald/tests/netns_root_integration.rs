@@ -27,6 +27,12 @@
 //! * `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace` — a
 //!   member that outlives the leader's SIGTERM is SIGKILLed when the shim's
 //!   grace period runs out.
+//! * `a_blocked_cohort_rejects_a_pre_flip_udp_443_socket` — against the
+//!   installer's loaded classifier table, a `host_ip` member's UDP 443
+//!   socket opened before its cohort turns blocked is refused with
+//!   ECONNREFUSED after the flip, and sends again after the block lifts
+//!   (BEP-018). It prints NOT RUN with its gate on a host with no `nft` or
+//!   outside the root network namespace.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
 //! `crates/sandbox/tests/caps_root_integration.rs`
@@ -100,6 +106,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use boxes::BoxPolicy;
+use minimald::net::classifier::{QUIC443_BLOCKED_DIR, QUIC443_LEAF_SET, quic443_blocked_leaf};
 use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 use minimald::nsenter::GROUP_GRACE;
@@ -2140,4 +2147,549 @@ fn spawn_netns_holder() -> (u32, std::process::Child) {
     // holder's host PID.
     let netns_pid: u32 = line.trim().parse().expect("parse netns holder pid");
     (netns_pid, child)
+}
+
+// ---------------------------------------------------------------------------
+// BEP-018, live: a blocked cohort rejects a UDP 443 socket opened before the
+// flip (issue #2606).
+// ---------------------------------------------------------------------------
+
+/// The table the installer loads, by the installer's own name for it.
+const QUIC443_TABLE: &str = "minimal_class";
+
+/// The leg's name, as nextest and the NOT RUN line spell it.
+const QUIC443_LEG: &str = "a_blocked_cohort_rejects_a_pre_flip_udp_443_socket";
+
+/// The privileged step that lays out the tree and loads the table.
+fn classifier_installer() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install-host-classifier.sh")
+}
+
+/// Whether this binary itself runs as root. The lane runs it unprivileged
+/// and every privileged step goes through `sudo -n`.
+fn quic443_as_root() -> bool {
+    // SAFETY: `geteuid(2)` has no failure modes or preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A command that needs root: direct when this binary is root, else
+/// through `sudo -n`, so a host that asks for a password fails at once.
+fn quic443_privileged(program: &str) -> Command {
+    if quic443_as_root() {
+        Command::new(program)
+    } else {
+        let mut sudo = Command::new("sudo");
+        sudo.arg("-n").arg(program);
+        sudo
+    }
+}
+
+/// One line per step of the leg, on the proof's own stderr.
+fn quic443_step(text: &str) {
+    eprintln!("{QUIC443_LEG}: {text}");
+}
+
+/// The NOT RUN record for a gate this host does not meet.
+fn quic443_not_run(gate: &str) {
+    let line = format!("NOT RUN {QUIC443_LEG}: {gate}");
+    eprintln!("{line}");
+    tell_the_runner(&line);
+}
+
+/// The deepest cgroup2 mount that is the hierarchy itself and carries
+/// `nsdelegate`, the two facts the installer's `verify_mount` demands.
+/// The same reading as `classifier_root_integration`'s.
+fn quic443_cgroup2_mount() -> Option<PathBuf> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut mount: Option<(usize, PathBuf)> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let Some(sep) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        if fields.len() < sep + 4 || fields[sep + 1] != "cgroup2" {
+            continue;
+        }
+        if fields[3] != "/" || !fields[sep + 3].split(',').any(|o| o == "nsdelegate") {
+            continue;
+        }
+        if mount
+            .as_ref()
+            .is_none_or(|(depth, _)| fields[4].len() > *depth)
+        {
+            mount = Some((fields[4].len(), fields[4].into()));
+        }
+    }
+    mount.map(|(_, mountpoint)| mountpoint)
+}
+
+/// The account the scratch tree is delegated to: this process's own when
+/// it runs unprivileged, else the first human-range account, because the
+/// install refuses to delegate to root.
+fn quic443_delegated_account() -> String {
+    // SAFETY: `getuid(2)` has no failure modes or preconditions.
+    let uid = unsafe { libc::getuid() };
+    let passwd = std::fs::read_to_string("/etc/passwd").expect("reading /etc/passwd");
+    passwd
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let line_uid: u32 = fields.get(2)?.parse().ok()?;
+            let wanted = if uid == 0 {
+                (1000..=60000).contains(&line_uid)
+            } else {
+                line_uid == uid
+            };
+            wanted.then(|| fields[0].to_string())
+        })
+        .expect("an account to delegate the scratch tree to (never root)")
+}
+
+/// Whether this process shares the network namespace of pid 1: the table
+/// the leg loads is the host's, so the leg runs only in the root netns.
+/// `None` when the root netns cannot be read even with root reach.
+fn quic443_in_root_netns() -> Option<bool> {
+    let own = std::fs::read_link("/proc/self/ns/net").ok()?;
+    let init = match std::fs::read_link("/proc/1/ns/net") {
+        Ok(init) => init,
+        Err(_) => {
+            let out = quic443_privileged("readlink")
+                .arg("/proc/1/ns/net")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+        }
+    };
+    Some(own == init)
+}
+
+/// Moves this whole process (every thread) into the cgroup at `dir`.
+fn quic443_move_self(dir: &Path) {
+    sandbox::classifier::place_pid(&dir.join("cgroup.procs"), std::process::id())
+        .unwrap_or_else(|e| panic!("moving this proof process into {}: {e}", dir.display()));
+}
+
+/// A root-bound UDP listener on 127.0.0.1:443, run as `python3` through
+/// the root reach: port 443 is privileged, and the leg needs a listener
+/// so a delivered datagram draws no port unreachable from the kernel
+/// itself. Each datagram it receives is one line on its stdout.
+struct Quic443Listener {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Quic443Listener {
+    fn spawn() -> Self {
+        const SCRIPT: &str = "import socket\n\
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+            s.bind(('127.0.0.1', 443))\n\
+            print('ready', flush=True)\n\
+            while True:\n    \
+                print(s.recv(256).decode(errors='replace'), flush=True)\n";
+        let mut child = quic443_privileged("python3")
+            .args(["-u", "-c", SCRIPT])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawning the root-bound UDP 443 listener (python3)");
+        let stdout = child.stdout.take().expect("the listener's stdout");
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let listener = Self { child, lines };
+        assert_eq!(
+            listener.next_line(Duration::from_secs(10)).as_deref(),
+            Some("ready"),
+            "the UDP listener binds 127.0.0.1:443 (is something already bound there?)"
+        );
+        listener
+    }
+
+    /// The next datagram, or `None` when none arrives within `wait`.
+    fn next_line(&self, wait: Duration) -> Option<String> {
+        self.lines.recv_timeout(wait).ok()
+    }
+}
+
+impl Drop for Quic443Listener {
+    fn drop(&mut self) {
+        // SIGTERM, not SIGKILL: sudo relays SIGTERM to python3, and a
+        // SIGKILL to sudo would leave python3 holding port 443.
+        let Ok(pid) = libc::pid_t::try_from(self.child.id()) else {
+            return;
+        };
+        // SAFETY: `kill(2)` addresses this proof's own child.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..50 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("the UDP 443 listener did not stop on SIGTERM; killing pid {pid}");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Everything the leg lays out, removed however the leg ends: this
+/// process leaves the tree, the box leaf goes, then the installer's own
+/// uninstall removes the table, the helper, its sudoers rule and the tree.
+struct Quic443Scratch {
+    root: PathBuf,
+    mountpoint: PathBuf,
+    helper_dir: PathBuf,
+    leaf: Option<PathBuf>,
+}
+
+impl Quic443Scratch {
+    fn helper(&self) -> PathBuf {
+        self.helper_dir.join("quic443-leaf")
+    }
+
+    /// The installer run through the root reach, with the helper and its
+    /// sudoers rule under this leg's own root-owned directory, never at
+    /// the host's own paths.
+    fn installer(&self) -> Command {
+        let mut step = quic443_privileged("env");
+        step.arg(format!(
+            "MINIMAL_OVERRIDE_QUIC443_HELPER={}",
+            self.helper().display()
+        ))
+        .arg(format!(
+            "MINIMAL_OVERRIDE_QUIC443_SUDOERS={}",
+            self.helper_dir.join("sudoers").display()
+        ))
+        .arg("bash")
+        .arg(classifier_installer())
+        .arg("--root")
+        .arg(&self.root);
+        step
+    }
+
+    /// Runs the helper the daemon runs, as root, on the box leaf.
+    fn helper_on_leaf(&self, verb: &str, leaf: &Path) {
+        let out = quic443_privileged(&self.helper().to_string_lossy())
+            .arg(verb)
+            .arg(leaf)
+            .output()
+            .expect("running the QUIC block helper");
+        assert!(
+            out.status.success(),
+            "the QUIC block helper runs `{verb}` on {}: {}",
+            leaf.display(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// The elements of the blocked-leaves set in the loaded table.
+    fn listed_set(&self) -> String {
+        let out = quic443_privileged("nft")
+            .args(["list", "set", "inet", QUIC443_TABLE, QUIC443_LEAF_SET])
+            .output()
+            .expect("listing the blocked-leaves set");
+        assert!(
+            out.status.success(),
+            "nft lists the set {QUIC443_LEAF_SET}: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+impl Drop for Quic443Scratch {
+    fn drop(&mut self) {
+        // Out of the tree first: the kernel refuses to remove a cgroup that
+        // still holds a process.
+        let back = quic443_privileged("tee")
+            .arg("-a")
+            .arg(self.mountpoint.join("cgroup.procs"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut tee| {
+                if let Some(mut stdin) = tee.stdin.take() {
+                    stdin.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                }
+                tee.wait()
+            });
+        if !back.is_ok_and(|status| status.success()) {
+            eprintln!("could not return this proof process to the cgroup2 root");
+        }
+        if let Some(leaf) = self.leaf.take() {
+            let _ = sandbox::classifier::remove_box_leaf(&leaf);
+        }
+        match self.installer().arg("--uninstall").output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "the uninstall over {} failed: {}",
+                self.root.display(),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => eprintln!("running the uninstall: {e}"),
+        }
+        let _ = quic443_privileged("rm")
+            .arg("-rf")
+            .arg(&self.helper_dir)
+            .status();
+    }
+}
+
+/// The errno of one datagram on `socket`, `None` when the send succeeded.
+fn quic443_send(socket: &std::net::UdpSocket, payload: &str) -> Option<i32> {
+    socket
+        .send(payload.as_bytes())
+        .err()
+        .map(|e| e.raw_os_error().unwrap_or(-1))
+}
+
+/// BEP-018, live on this kernel against the installer's loaded table: a
+/// `host_ip` member's UDP socket to port 443, opened in its own allow leaf
+/// before the cohort flips to blocked, is rejected after the flip, and
+/// sends again after the block lifts.
+///
+/// A socket keeps the cgroup it was created in, so the flip's process move
+/// into `boxes/quic443-blocked` does not cover it. What covers it is the
+/// own leaf in the table's `quic443_blocked_leaves` set, added and removed
+/// by the root-owned helper the install writes, the way the daemon runs it.
+/// The proof process plays the member: it opens the socket in its own
+/// leaf, then moves itself as the daemon moves a member.
+///
+/// Gated on `MINIMALD_NETNS_TEST` like every proof here. Where the host
+/// has no `nft`, or this process is not in the root network namespace,
+/// the leg prints NOT RUN with the gate and returns. Every other missing
+/// precondition fails it.
+#[test]
+#[ignore = "loads the installer's nftables table over this host's real cgroup2; gated on MINIMALD_NETNS_TEST; runs in the native lane's minimald-root-integration job"]
+fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
+    use std::os::unix::io::AsRawFd as _;
+
+    if !gated() {
+        return;
+    }
+    let has_nft = Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nft {
+        quic443_not_run("no nft on this host (apt install nftables)");
+        return;
+    }
+    assert!(
+        quic443_as_root()
+            || quic443_privileged("true")
+                .status()
+                .is_ok_and(|status| status.success()),
+        "the install and the helper need root: run the lane's recipe under \
+         sudo, or give this account passwordless sudo"
+    );
+    match quic443_in_root_netns() {
+        Some(true) => {}
+        Some(false) => {
+            quic443_not_run("this process is not in the root network namespace");
+            return;
+        }
+        None => {
+            quic443_not_run("the root network namespace cannot be read on this host");
+            return;
+        }
+    }
+    announce_to_the_runner(QUIC443_LEG);
+
+    // One table at a time across binaries: classifier_root_integration
+    // loads the same table under the same lock.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join("minimald-classifier-root-proof.lock"))
+        .expect("the classifier proofs' lock file");
+    // SAFETY: `flock(2)` on the descriptor just opened. The kernel releases
+    // the lock when the descriptor closes at the end of the leg.
+    let taken = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(taken, 0, "locking the classifier proofs against each other");
+
+    assert!(
+        !Path::new(sandbox::classifier::TREE_ROOT).exists(),
+        "a classifier tree is already installed at {}: this leg never runs \
+         over a host's own install",
+        sandbox::classifier::TREE_ROOT
+    );
+    assert!(
+        !quic443_privileged("nft")
+            .args(["list", "table", "inet", QUIC443_TABLE])
+            .output()
+            .is_ok_and(|out| out.status.success()),
+        "a table named {QUIC443_TABLE} is already loaded: this leg never \
+         replaces a host's own table"
+    );
+    let mountpoint =
+        quic443_cgroup2_mount().expect("no cgroup2 mounted with nsdelegate on this host");
+    let account = quic443_delegated_account();
+
+    // The helper runs as root, so the install wants its directory and every
+    // one above it root-only: a fresh directory under /run is.
+    let made = quic443_privileged("mktemp")
+        .args(["-d", "/run/minimald-quic443-proof.XXXXXX"])
+        .output()
+        .expect("making the helper's root-owned directory");
+    assert!(
+        made.status.success(),
+        "mktemp -d under /run: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let helper_dir = PathBuf::from(String::from_utf8_lossy(&made.stdout).trim());
+
+    let mut scratch = Quic443Scratch {
+        root: mountpoint.join(format!("minimald-quic443-proof-{}", std::process::id())),
+        mountpoint,
+        helper_dir,
+        leaf: None,
+    };
+    // Outside the tree, so it never holds a cgroup the cleanup removes.
+    // Declared after the scratch, so it stops before the scratch goes.
+    let listener = Quic443Listener::spawn();
+    quic443_step("step 1: a root-bound UDP listener is on 127.0.0.1:443");
+
+    let installed = scratch
+        .installer()
+        .arg("--user")
+        .arg(&account)
+        .output()
+        .expect("running the install over the scratch tree");
+    assert!(
+        installed.status.success(),
+        "the install lays out the scratch tree and loads its table: {}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr),
+    );
+    quic443_step(&format!(
+        "step 2: the installer loaded table inet {QUIC443_TABLE} over {}",
+        scratch.root.display()
+    ));
+
+    // The daemon's leaf first: every migration below is checked at the
+    // tree's root, which only a process inside the tree can write.
+    let placed = scratch
+        .installer()
+        .arg("--pid")
+        .arg(std::process::id().to_string())
+        .output()
+        .expect("running the step's placement half");
+    assert!(
+        placed.status.success(),
+        "placing this proof process in the scratch tree's daemon leaf: {}",
+        String::from_utf8_lossy(&placed.stderr),
+    );
+    let leaf = sandbox::classifier::create_box_leaf(
+        &scratch.root,
+        &format!("quic443-proof-{}", std::process::id()),
+        sandbox::config::Verdict::Allow,
+    )
+    .expect("creating the member's own leaf under boxes/allow");
+    scratch.leaf = Some(leaf.clone());
+    quic443_move_self(&leaf);
+    quic443_step(&format!(
+        "step 3: this process runs as a host_ip member in {}",
+        leaf.display()
+    ));
+
+    // The socket is made here, so it keeps the member's own leaf.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP socket");
+    socket
+        .connect("127.0.0.1:443")
+        .expect("connecting the UDP socket to 127.0.0.1:443");
+    assert_eq!(
+        quic443_send(&socket, "before"),
+        None,
+        "the pre-flip datagram sends"
+    );
+    assert_eq!(
+        listener.next_line(Duration::from_secs(5)).as_deref(),
+        Some("before"),
+        "the listener receives the pre-flip datagram"
+    );
+    quic443_step("step 4: a UDP 443 socket opened in the own leaf sends before the flip");
+
+    // The flip, as the daemon makes it: the member's processes move into
+    // the blocked leaf, and its own leaf joins the blocked-leaves set.
+    quic443_move_self(&quic443_blocked_leaf(&scratch.root));
+    scratch.helper_on_leaf("add", &leaf);
+    let set = scratch.listed_set();
+    let leaf_rel = leaf
+        .strip_prefix(&scratch.mountpoint)
+        .expect("the leaf is under the cgroup2 mount")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        set.contains(&leaf_rel),
+        "the set {QUIC443_LEAF_SET} lists the own leaf {leaf_rel}: {set}"
+    );
+    quic443_step(&format!(
+        "step 5: the cohort is blocked: the process is in {QUIC443_BLOCKED_DIR}, \
+         and {leaf_rel} is in {QUIC443_LEAF_SET}"
+    ));
+
+    // The rejected datagram: the output chain drops it with an ICMP port
+    // unreachable, and the send itself reports the drop or nothing.
+    let rejected = quic443_send(&socket, "during");
+    assert!(
+        matches!(rejected, None | Some(libc::EPERM | libc::ECONNREFUSED)),
+        "the first datagram after the flip is dropped, got errno {rejected:?}"
+    );
+    if rejected != Some(libc::ECONNREFUSED) {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = quic443_send(&socket, "during-next");
+        assert_eq!(
+            next,
+            Some(libc::ECONNREFUSED),
+            "the next datagram after the flip reports ECONNREFUSED (the first gave {rejected:?})"
+        );
+    }
+    assert_eq!(
+        listener.next_line(Duration::from_millis(500)),
+        None,
+        "no datagram reaches the listener while the cohort is blocked"
+    );
+    quic443_step("step 6: after the flip the pre-flip socket is refused with ECONNREFUSED");
+
+    // The lift: the own leaf leaves the set, the processes go home.
+    scratch.helper_on_leaf("remove", &leaf);
+    let set = scratch.listed_set();
+    assert!(
+        !set.contains(&leaf_rel),
+        "the set {QUIC443_LEAF_SET} no longer lists {leaf_rel}: {set}"
+    );
+    quic443_move_self(&leaf);
+    quic443_step("step 7: the block lifted: the own leaf left the set, the process is home");
+
+    assert_eq!(
+        quic443_send(&socket, "after"),
+        None,
+        "the same socket sends after the block lifts"
+    );
+    assert_eq!(
+        listener.next_line(Duration::from_secs(5)).as_deref(),
+        Some("after"),
+        "the listener receives the datagram sent after the block lifts"
+    );
+    quic443_step("step 8: the pre-flip socket sends again after the block lifts");
+
+    drop(socket);
+    drop(listener);
+    drop(scratch);
+    drop(lock);
+    quic443_step("step 9: the table, the helper and the scratch tree are removed");
 }

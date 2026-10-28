@@ -34,6 +34,7 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use client_config::store_rules::{StoreAction, StoreRuleConfig};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -272,6 +273,40 @@ pub struct StoreRule {
     pub inject: Inject,
 }
 
+impl StoreRule {
+    /// The proxy's form of the checked rule `rule` for the item `id`: none
+    /// for a `deny` rule, which is never redeemed, and none for a rule with
+    /// no single injection form. `bep serve` holds its rules in this form,
+    /// and `min` checks a rule against it at mint, so the two decide
+    /// `inject` with this one function (BEP-032).
+    #[must_use]
+    pub fn from_config(id: &str, rule: &StoreRuleConfig) -> Option<Self> {
+        if rule.action == Some(StoreAction::Deny) {
+            return None;
+        }
+        let inject = match (&rule.header, &rule.basic_auth) {
+            (Some(name), None) => Inject::Header {
+                name: name.clone(),
+                prefix: rule.prefix.clone(),
+            },
+            (None, Some(field)) => Inject::BasicAuth {
+                field: field.clone(),
+            },
+            // The check refuses a rule with no form or with both.
+            _ => return None,
+        };
+        Some(Self {
+            store: rule
+                .store
+                .clone()
+                .unwrap_or_else(|| crate::store::NATIVE_STORE.to_owned()),
+            id: id.to_owned(),
+            upstream: rule.upstream.clone(),
+            inject,
+        })
+    }
+}
+
 /// The source of the current `[secret-store-rules]`. [`read`] asks it once
 /// for each request, so an edited rule decides the next request.
 pub trait Rules {
@@ -458,9 +493,18 @@ fn read<R: Rules + ?Sized>(
     module: &Module,
     now: u64,
 ) -> Read {
-    let (claims, verified) = match verify(jws, keys) {
-        Ok(claims) => (Some(claims), Ok(())),
-        Err(error) => (unverified_claims(jws).ok().map(|(_, c)| c), Err(error)),
+    let (claims, verified, refused_kid) = match verify(jws, keys) {
+        Ok(claims) => (Some(claims), Ok(()), None),
+        Err(error) => match unverified_claims(jws) {
+            // An unknown key is named by the header's `kid`, so the line
+            // says which key the proxy does not hold (BEP-063).
+            Ok((header, claims)) => (
+                Some(claims),
+                Err(error),
+                (error == VerifyError::UnknownKey).then_some(header.kid),
+            ),
+            Err(_) => (None, Err(error), None),
+        },
     };
     let Some(claims) = claims else {
         tracing::debug!(
@@ -517,14 +561,24 @@ fn read<R: Rules + ?Sized>(
         rule,
     };
     let outcome = outcome(verified, upstream_parsed, handle.check(now));
-    // The store and identifier can come from a handle that did not verify,
-    // so they are logged escaped.
-    tracing::debug!(
-        store = ?claims.store,
-        id = ?claims.id,
-        outcome = %outcome,
-        "store handle checked"
-    );
+    // The store, the identifier and the `kid` can come from a handle that
+    // did not verify, so they are logged escaped.
+    if let Some(kid) = refused_kid {
+        tracing::debug!(
+            store = ?claims.store,
+            id = ?claims.id,
+            kid = ?kid,
+            outcome = %outcome,
+            "store handle checked"
+        );
+    } else {
+        tracing::debug!(
+            store = ?claims.store,
+            id = ?claims.id,
+            outcome = %outcome,
+            "store handle checked"
+        );
+    }
     Read {
         identifier: Some(claims.identifier()),
         jti: Some(claims.jti),
@@ -679,6 +733,76 @@ mod tests {
             verify("a.b", &registered(&key)),
             Err(VerifyError::Malformed)
         );
+    }
+
+    /// The lines the debug log took while `f` ran.
+    fn logged(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// BEP-063: a handle signed under a key the proxy does not hold is
+    /// refused, and the debug line names that key's `kid`.
+    #[test]
+    fn an_unknown_key_refusal_names_the_kid() {
+        let held = client_key(7);
+        let foreign = client_key(9);
+        let foreign_kid = kid(foreign.verifying_key());
+        let keys = registered(&held);
+        let rules = vec![store_rule()];
+        let jws = sign(&foreign, &store_claims());
+        let mut result = None;
+        let log = logged(|| {
+            result = Some(read(&jws, &STORE, &keys, &rules, &GITHUB, 1_000));
+        });
+        let result = result.expect("read ran");
+        assert_eq!(result.handle.check(1_000), Err(Invalid::Signature));
+        assert_eq!(result.jti.as_deref(), Some("jti-store"));
+        assert_eq!(
+            decide(&redemption(
+                parse_authority("api.anthropic.com").expect("authority"),
+                result,
+                true
+            )),
+            Decision::Refuse(Check::StoreHandleInvalid)
+        );
+        let line = log
+            .lines()
+            .find(|l| l.contains("store handle checked"))
+            .expect("a store handle checked line");
+        assert!(line.contains("outcome=unknown_key"), "{line}");
+        assert!(line.contains(&format!("kid={foreign_kid:?}")), "{line}");
+
+        // A refusal for another reason does not name a `kid`.
+        let held_jws = sign(&held, &store_claims());
+        let (input, _) = held_jws.rsplit_once('.').expect("three parts");
+        let (_, sig) = jws.rsplit_once('.').expect("three parts");
+        let tampered = format!("{input}.{sig}");
+        let log = logged(|| {
+            let _ = read(&tampered, &STORE, &keys, &rules, &GITHUB, 1_000);
+        });
+        assert!(log.contains("outcome=bad_signature"), "{log}");
+        assert!(!log.contains("kid="), "{log}");
     }
 
     #[test]

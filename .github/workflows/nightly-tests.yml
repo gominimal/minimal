@@ -213,7 +213,7 @@ jobs:
 
   beta-canary:
     # Run the workspace suite on beta rustc to catch upcoming-toolchain
-    # breakage ahead of the 1.99.0 pin. Non-blocking (the pin is the gate);
+    # breakage ahead of the 1.99.1 pin. Non-blocking (the pin is the gate);
     # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for this job only.
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -354,7 +354,7 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     env:
-      # rust-toolchain.toml pins 1.99.0, which has no miri component; override it
+      # rust-toolchain.toml pins 1.99.1, which has no miri component; override it
       # for this job so `cargo miri` resolves the nightly installed below (same
       # mechanism the beta/nightly-rustc canaries use).
       RUSTUP_TOOLCHAIN: nightly

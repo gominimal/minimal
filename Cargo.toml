@@ -6,6 +6,7 @@ members = [
     "crates/lcache",
     "crates/rcache",
     "crates/check",
+    "crates/client-config",
     "crates/checkouts",
     "crates/common",
     "crates/decode",
@@ -268,6 +269,7 @@ lcache = { path = "crates/lcache" }
 rcache = { path = "crates/rcache" }
 check = { path = "crates/check" }
 checkouts = { path = "crates/checkouts" }
+client-config = { path = "crates/client-config" }
 common = { path = "crates/common" }
 decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }

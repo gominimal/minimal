@@ -6,6 +6,7 @@ use crate::{
     store::{BoxRecordHandle, RecordPredicate, Store, StoreHandle},
 };
 use boxes::SessionId;
+use boxes::events::{BoxEvent, BoxEventType, EventData};
 use paths::DaemonAbsPath;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
@@ -87,10 +88,18 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
 /// The `CreateSession` handler always persists the record as
 /// `Pending`; the session actor's create flow promotes it to
 /// `Active` once composition finalizes.
+///
+/// The daemon stamps the box's type, parent and project root here
+/// (BOX-001): `box_type` is the creating verb's, `parent` is `parent`, which
+/// the caller derives from the creating connection and never from the
+/// request, and `project_root` is the project root the client resolved,
+/// or the project path when an older client sends no root.
 fn build_record(
     config: minimald_rpc::BoxConfig,
     username: Option<String>,
     status: boxes::BoxState,
+    box_type: &str,
+    parent: Option<SessionId>,
 ) -> Result<boxes::Record, std::io::Error> {
     // BEP-007: a delivery's variable is written into the box's environment
     // and into the file its shell sources, so a name that is not a POSIX
@@ -110,6 +119,14 @@ fn build_record(
         id: SessionId::nil(),
         name: config.name,
         username,
+        // The root the client resolved from the project's `minimal.toml`.
+        // A client that predates the field sends none: the working path is
+        // the best root the daemon has then.
+        project_root: Some(
+            config
+                .project_root
+                .unwrap_or_else(|| config.project_path.clone()),
+        ),
         project_path: config.project_path,
         network: config.network,
         policy: config.policy,
@@ -139,6 +156,8 @@ fn build_record(
         // host launch of the box, after a daemon restart included, adds it
         // to the box's own trust store.
         root_certificate: config.root_certificate,
+        box_type: Some(box_type.to_string()),
+        parent,
         attrs: config.attrs,
     };
     record
@@ -182,9 +201,76 @@ struct CreateSessionMsg {
     responder: Responder<SessionId>,
 }
 
+/// A create that carries the box's spec (BOX-068): the create itself and
+/// the spec the client sent on its request.
+#[derive(Debug)]
+struct CreateBoxMsg {
+    create: CreateSessionMsg,
+    spec: Option<serde_json_lenient::Value>,
+}
+
+impl BoxManagerHandle {
+    /// [`Self::create_session_by`] for a create request that carries the
+    /// box's spec (BOX-068). The manager checks the spec before it files
+    /// the record, and writes it beside the record before the box's actor
+    /// starts. A create whose spec is refused files nothing.
+    pub async fn create_box_with_spec(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::CreateBox(Box::new(CreateBoxMsg {
+                create: CreateSessionMsg {
+                    config,
+                    username,
+                    creator,
+                    responder: send,
+                },
+                spec,
+            })))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+}
+
+/// The bytes the daemon stores for a box's spec (BOX-068): the spec the
+/// client sent, serialized with its keys in order. A spec must be a JSON
+/// object whose `v` is a whole number, the spec's version.
+///
+/// # Errors
+///
+/// `InvalidInput`, naming the problem, for a spec that is not such an
+/// object.
+fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerError> {
+    let has_version = spec
+        .as_object()
+        .and_then(|object| object.get("v"))
+        .is_some_and(serde_json_lenient::Value::is_u64);
+    if !has_version {
+        return Err(BoxManagerError::new(
+            std::io::ErrorKind::InvalidInput,
+            "The create request carries a box spec without a version. \
+             The daemon accepts a spec that is a JSON object with a whole number `v`. \
+             No box was created.",
+        ));
+    }
+    serde_json_lenient::to_vec(spec)
+        .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
+    /// The retained box an events read follows (BOX-162): its on-disk
+    /// object, so the read runs off the mainloop. `None` for an id no
+    /// retained record names.
+    EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -214,6 +300,8 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningIds(Responder<Vec<SessionId>>),
     CreateSession(Box<CreateSessionMsg>),
+    /// A create that carries the box's spec (BOX-068).
+    CreateBox(Box<CreateBoxMsg>),
     /// Destroy a session; with `true`, only if it has not finished
     /// activating (`None` when it was kept).
     DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
@@ -237,6 +325,7 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::GetRecord(..) => "GetRecord",
+            Self::EventsSource(..) => "EventsSource",
             Self::GetSession(..) => "GetSession",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
@@ -245,6 +334,10 @@ impl ManagerMessage {
             #[cfg(test)]
             Self::RunningIds(..) => "RunningIds",
             Self::CreateSession(..) => "CreateSession",
+            // A create with a spec is still the create RPC's message: the
+            // span kind stays `CreateSession`, so traces and the trace tests
+            // see one kind for every create (BOX-068).
+            Self::CreateBox(..) => "CreateSession",
             Self::DeleteSession(..) => "DeleteSession",
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
@@ -1013,26 +1106,26 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
                 continue;
             }
         };
-        match record.status {
-            boxes::BoxState::Pending | boxes::BoxState::Materializing => {
-                let id = *handle.id();
-                let status = record.status;
-                if let Err(e) = handle.delete().await {
-                    tracing::warn!(
-                        session_id = %id,
-                        error = %e,
-                        ?status,
-                        "reap: failed to delete unresumable record",
-                    );
-                } else {
-                    tracing::info!(
-                        session_id = %id,
-                        ?status,
-                        "reap: deleted unresumable record left over from a prior daemon lifetime",
-                    );
-                }
-            }
-            boxes::BoxState::Active => {}
+        // BOX-012: the restart reaps only pending and materializing
+        // records. Every other state, running included, is kept.
+        let state = record.state();
+        if !state.reaped_at_restart() {
+            continue;
+        }
+        let id = *handle.id();
+        if let Err(e) = handle.delete().await {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                state = state.name(),
+                "reap: failed to delete unresumable record",
+            );
+        } else {
+            tracing::info!(
+                session_id = %id,
+                state = state.name(),
+                "reap: deleted unresumable record left over from a prior daemon lifetime",
+            );
         }
     }
     Ok(())
@@ -1339,9 +1432,21 @@ impl BoxManager {
     /// never received an id, so nothing else could ever reach the session to
     /// abort it, and a `Pending` record left parked would hold its name
     /// hostage.
+    #[tracing::instrument(
+        level = "info",
+        name = "box.create",
+        skip_all,
+        fields(
+            box_id = tracing::field::Empty,
+            box_type = tracing::field::Empty,
+            parent = tracing::field::Empty,
+            spec_bytes = tracing::field::Empty,
+        )
+    )]
     async fn create_session(
         &mut self,
         config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -1383,6 +1488,22 @@ impl BoxManager {
             );
             return Err(refusal);
         }
+        // BOX-068: the spec is checked before the record exists, so a
+        // refused spec leaves no record, id or name behind.
+        let spec = match spec.as_ref().map(spec_bytes).transpose() {
+            Ok(spec) => spec,
+            Err(refusal) => {
+                tracing::info!(
+                    session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                    refusal = %refusal,
+                    "refused the box spec on a create"
+                );
+                return Err(refusal);
+            }
+        };
+        if let Some(bytes) = &spec {
+            tracing::Span::current().record("spec_bytes", bytes.len());
+        }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
         // On a VM guest the box id is the one the VM host handed in
@@ -1391,7 +1512,21 @@ impl BoxManager {
         // record under the handed id). Elsewhere the
         // record key is the box id.
         let handed_box_id = config.box_id;
-        let record = build_record(config, username, boxes::BoxState::Pending)?;
+        // BOX-001, BOX-140: no caller reaches this daemon from inside a box
+        // (a host with no nesting carries no per-box caller identity), so
+        // every box created here has no parent. A parent comes from the
+        // creating connection once one can carry that identity, never from
+        // the request body.
+        let parent = None;
+        // BOX-001: the type is the creating verb's. A client that predates
+        // the field sends none, which reads as the session verb.
+        let box_type = match config.creating_verb {
+            minimald_rpc::CreatingVerb::Session => boxes::SESSION_BOX_TYPE,
+            minimald_rpc::CreatingVerb::Task => boxes::TASK_BOX_TYPE,
+        };
+        let record = build_record(config, username, boxes::BoxState::Pending, box_type, parent)?;
+        tracing::Span::current().record("box_type", box_type);
+        let project_root = record.project_root.clone();
         let name = record.name.clone();
         let retry = record.clone();
         let handle = match self.store.create(record).await {
@@ -1426,11 +1561,72 @@ impl BoxManager {
         };
         let session_id = *handle.id();
         let box_id = handed_box_id.unwrap_or(session_id);
+        let parent_field = parent.map_or_else(|| "none".to_string(), |p: SessionId| p.to_string());
+        let span = tracing::Span::current();
+        span.record("box_id", tracing::field::display(box_id));
+        span.record("parent", parent_field.as_str());
         tracing::info!(
             session_id = %session_id,
             box_id = %box_id,
+            box_type = %box_type,
+            parent = %parent_field,
+            project_root = ?project_root.as_ref().map(paths::HostAbsPath::as_str),
             "filed the box record"
         );
+
+        // BOX-040: the `created` event is the first line of the box's
+        // events, written as its record is filed. An event that cannot be
+        // written takes the record with it, as a spec that cannot be stored
+        // does below: the caller never received the id.
+        let object = match handle.object().await {
+            Ok(object) => object,
+            Err(e) => {
+                discard_new_record(handle, "the box record could not be read back").await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = write_box_event(&object, BoxEventType::Created, EventData::new()) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "could not write the box's created event; deleting the record"
+            );
+            discard_new_record(handle, "the created event was not written").await;
+            return Err(e);
+        }
+
+        // BOX-068: the spec is written beside the record before the actor
+        // starts. A spec that cannot be written takes the record with it:
+        // the caller never received the id, so nothing else could reach it.
+        if let Some(bytes) = &spec {
+            let stored = object.store_spec(bytes).map(|()| object.spec_path());
+            match stored {
+                Ok(path) => tracing::info!(
+                    session_id = %session_id,
+                    spec_bytes = bytes.len(),
+                    spec_path = %path.as_str(),
+                    "stored the box spec"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "could not store the box spec; deleting the record"
+                    );
+                    if let Err(del_err) = handle.delete().await
+                        && del_err.kind() != NotFound
+                    {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %del_err,
+                            "failed to delete the session record after the spec \
+                             was not stored; it will linger until it is deleted explicitly",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         let mut seed = self.session_config(handle.clone());
         seed.creator = creator;
@@ -1523,6 +1719,17 @@ impl BoxManager {
                         Some(handle) => Some(handle.record().await?),
                         None => None,
                     })
+                })
+                .await;
+            }
+            ManagerMessage::EventsSource(id, r) => {
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            Some(handle) => Some(handle.object().await?),
+                            None => None,
+                        },
+                    )
                 })
                 .await;
             }
@@ -1623,7 +1830,21 @@ impl BoxManager {
                     creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, username, creator).await;
+                let created = self.create_session(config, None, username, creator).await;
+                responder.handle(async move { created }).await;
+            }
+            ManagerMessage::CreateBox(msg) => {
+                let CreateBoxMsg {
+                    create:
+                        CreateSessionMsg {
+                            config,
+                            username,
+                            creator,
+                            responder,
+                        },
+                    spec,
+                } = *msg;
+                let created = self.create_session(config, spec, username, creator).await;
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: tears down its running host and actor (if
@@ -1964,6 +2185,179 @@ impl BoxManager {
     }
 }
 
+/// Deletes a record whose create failed before its id reached the caller.
+/// Best-effort: the create's own error is what the caller sees.
+async fn discard_new_record(handle: crate::store::BoxRecordHandle, why: &str) {
+    let session_id = *handle.id();
+    if let Err(e) = handle.delete().await
+        && e.kind() != NotFound
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            why,
+            "failed to delete the session record after a create failure; \
+             it will linger until it is deleted explicitly",
+        );
+    }
+}
+
+/// Counts the box events this daemon wrote. A follower of a box's events
+/// (BOX-162) waits on it, so a new event wakes the follower at once.
+static EVENTS_WRITTEN: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::Sender::new(0));
+
+/// How often a follower that saw no new event checks whether its box was
+/// reaped. A reap deletes the box's directory on any of several paths, and
+/// none of them wakes the follower.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Writes one lifecycle event of the box `object` is (BOX-040), stamped
+/// now with the box's id and parent and carrying `data`, and wakes every
+/// follower. `created` passes an empty `data`. Only the
+/// daemon calls this, and the file it appends to is outside every path
+/// mounted into the box (BOX-041). Logs one line per event written.
+///
+/// # Errors
+///
+/// An I/O error if the event cannot be appended.
+pub(crate) fn write_box_event(
+    object: &boxes::store::DiskBox,
+    kind: BoxEventType,
+    data: EventData,
+) -> Result<BoxEvent, std::io::Error> {
+    use boxes::store::BoxObject as _;
+
+    let mut event = BoxEvent::for_record(object.record(), kind);
+    event.data = data;
+    object.append_event(&event)?;
+    EVENTS_WRITTEN.send_modify(|n| *n = n.wrapping_add(1));
+    tracing::info!(
+        box_id = %event.box_id,
+        parent = %event.parent.map_or_else(|| "none".to_string(), |p| p.to_string()),
+        event_type = kind.name(),
+        ts = event.ts,
+        events_path = %object.events_path().as_str(),
+        "wrote a box event"
+    );
+    Ok(event)
+}
+
+/// A read of one box's events (BOX-162): every retained event in the order
+/// it was written, then, for a follower, each new one as it is written.
+#[derive(Debug)]
+pub struct BoxEventsReader {
+    object: boxes::store::DiskBox,
+    /// The byte offset after the last complete line read.
+    offset: u64,
+    /// Subscribed before the first read, so no write after it is missed.
+    written: tokio::sync::watch::Receiver<u64>,
+}
+
+impl BoxEventsReader {
+    /// The id of the box whose events this reads.
+    pub fn box_id(&self) -> SessionId {
+        use boxes::store::BoxObject as _;
+        self.object.record().id
+    }
+
+    /// Every event written since the last read, in the order it was
+    /// written. The first call returns every retained event.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the events file exists but cannot be read, and
+    /// `InvalidData`, naming the byte offset, if a complete line does not
+    /// parse as an event. The read then cannot be complete, so it fails.
+    pub fn read_new(&mut self) -> Result<Vec<BoxEvent>, std::io::Error> {
+        self.written.borrow_and_update();
+        let decoded = self.object.read_events_from(self.offset)?;
+        for (offset, error) in &decoded.refused {
+            tracing::warn!(
+                box_id = %self.box_id(),
+                offset,
+                error = %error,
+                events_path = %self.object.events_path().as_str(),
+                "refused a line of a box's events file: it does not parse as an event"
+            );
+        }
+        if let Some((offset, error)) = decoded.refused.first() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the line at byte {offset} of the events file is not an event: {error}"),
+            ));
+        }
+        self.offset += decoded.consumed;
+        Ok(decoded.events)
+    }
+
+    /// Waits for the next events written. `None` once the box is reaped,
+    /// with no event left to read.
+    ///
+    /// Cancel-safe: an event read is returned in the same poll, so a
+    /// dropped call loses none.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the events file exists but cannot be read.
+    pub async fn next_events(&mut self) -> Result<Option<Vec<BoxEvent>>, std::io::Error> {
+        loop {
+            let events = self.read_new()?;
+            if !events.is_empty() {
+                return Ok(Some(events));
+            }
+            if !self.object.is_retained() {
+                // An event written after the read above and before the reap
+                // is still returned. The stream ends on the first empty
+                // read after the box is gone.
+                let last = self.read_new()?;
+                return Ok((!last.is_empty()).then_some(last));
+            }
+            tokio::select! {
+                _ = self.written.changed() => {}
+                () = tokio::time::sleep(REAP_POLL) => {}
+            }
+        }
+    }
+}
+
+impl BoxManagerHandle {
+    /// Opens a read of the events of the box `id` (BOX-162).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if no retained record names `id`.
+    pub async fn box_events(&self, id: SessionId) -> Result<BoxEventsReader, BoxManagerError> {
+        // Subscribe first: an event written between the lookup and the
+        // first read then wakes the follower.
+        let written = EVENTS_WRITTEN.subscribe();
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EventsSource(id, send))
+            .await;
+        match recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        {
+            Some(object) => Ok(BoxEventsReader {
+                object,
+                offset: 0,
+                written,
+            }),
+            None => Err(std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            )),
+        }
+    }
+}
+
 /// A teardown task that ended by a panic or a cancel took its responder
 /// with it, so its caller saw a closed channel and nothing said why: the
 /// join error is the only record of it, so it goes to the log.
@@ -1992,3 +2386,216 @@ impl Drop for TearingDown {
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// The create path's stamping (BOX-001), driven through the manager actor
+/// the `CreateSession` handler calls.
+#[cfg(test)]
+mod create_stamp_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// A manager over fresh state and cache directories, its sessions on
+    /// the mock launcher, so no create here starts a real box.
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = BoxManager::init(
+            daemon_abs(state.path()),
+            daemon_abs(cache.path()),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap();
+        (state, cache, mngr)
+    }
+
+    /// A create request that tries to assert a parent and a type through
+    /// the one free-form field a client fills.
+    fn config(name: &str, project: &str) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new(project).unwrap(),
+            network: boxes::NetworkMode::default(),
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            attrs: [
+                ("parent".to_string(), SessionId::mint().to_string()),
+                ("box_type".to_string(), "task".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    /// The bytes of the spec file beside the record of box `id`, if any.
+    fn stored_spec(state: &TempDir, id: SessionId) -> Option<Vec<u8>> {
+        for dir in std::fs::read_dir(state.path().join("sessions")).unwrap() {
+            let dir = dir.unwrap().path();
+            let Ok(record) = std::fs::read_to_string(dir.join("record.json")) else {
+                continue;
+            };
+            if record.contains(&id.to_string()) {
+                return std::fs::read(dir.join(boxes::store::SPEC_FILE)).ok();
+            }
+        }
+        None
+    }
+
+    /// BOX-068: the spec on the create request is stored beside the new
+    /// box's record. A create with no spec stores none, and a spec without
+    /// a version is refused before any record is filed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_the_spec_beside_the_record() {
+        let (state, _cache, mngr) = manager().await;
+        let spec = serde_json_lenient::json!({
+            "v": 0,
+            "entry": "default",
+            "box": {"type": "session"},
+            "install": {"packages": ["git"]},
+            "network": {"mode": "host_ip"},
+        });
+        let id = mngr
+            .create_box_with_spec(
+                config("specced", "/home/dev/proj"),
+                Some(spec.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = stored_spec(&state, id).expect("the spec is stored beside the record");
+        let stored: serde_json_lenient::Value = serde_json_lenient::from_slice(&stored).unwrap();
+        assert_eq!(stored, spec);
+
+        let id = mngr
+            .create_box_with_spec(config("no-spec", "/home/dev/proj"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored_spec(&state, id), None);
+
+        let err = mngr
+            .create_box_with_spec(
+                config("bad-spec", "/home/dev/proj"),
+                Some(serde_json_lenient::json!({"box": {"type": "session"}})),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            mngr.get_record(BoxKeyPredicate::Name("bad-spec".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused spec files no record"
+        );
+    }
+
+    async fn record(mngr: &BoxManagerHandle, id: SessionId) -> boxes::Record {
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the created record is filed")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_assigns_uuidv7_id_type_and_parent() {
+        let (_state, _cache, mngr) = manager().await;
+        let first = mngr
+            .create_session(config("first", "/home/dev/proj"), None)
+            .await
+            .unwrap();
+        let second = mngr
+            .create_session(config("second", "/home/dev/proj"), None)
+            .await
+            .unwrap();
+        assert_ne!(first, second, "each create mints its own id");
+
+        for id in [first, second] {
+            let record = record(&mngr, id).await;
+            assert_eq!(record.id, id);
+            assert_eq!(
+                record.id.as_ref().get_version(),
+                Some(uuid::Version::SortRand),
+                "the box id is a UUIDv7"
+            );
+            assert_eq!(record.box_type.as_deref(), Some(boxes::SESSION_BOX_TYPE));
+            assert_eq!(
+                record.parent, None,
+                "a caller outside any box creates a box with no parent, \
+                 whatever the request carries"
+            );
+        }
+    }
+
+    /// BOX-001: the record's type is the creating verb's, one box per verb.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_create_path_records_type_from_creating_verb() {
+        let (_state, _cache, mngr) = manager().await;
+        for (name, verb, expected) in [
+            (
+                "by-session",
+                minimald_rpc::CreatingVerb::Session,
+                boxes::SESSION_BOX_TYPE,
+            ),
+            (
+                "by-task",
+                minimald_rpc::CreatingVerb::Task,
+                boxes::TASK_BOX_TYPE,
+            ),
+        ] {
+            let mut config = config(name, "/home/dev/proj");
+            config.creating_verb = verb;
+            let id = mngr.create_session(config, None).await.unwrap();
+            assert_eq!(record(&mngr, id).await.box_type.as_deref(), Some(expected));
+        }
+    }
+
+    /// BOX-001: the record holds the project root the client resolved, not
+    /// the working path. A client that sends no root gets the working path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_records_project_root() {
+        let (_state, _cache, mngr) = manager().await;
+        let mut rooted = config("rooted", "/home/dev/proj/sub");
+        rooted.project_root = Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap());
+        let id = mngr.create_session(rooted, None).await.unwrap();
+        assert_eq!(
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap())
+        );
+
+        let id = mngr
+            .create_session(config("older-client", "/home/dev/proj/sub"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            record(&mngr, id).await.project_root,
+            Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
+        );
+    }
+}

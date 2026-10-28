@@ -395,6 +395,7 @@ RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; res
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
+E2E_NOT_RUN_WHY="" # one line per NOT RUN case: the case, a tab, and its gate
 E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
@@ -475,6 +476,11 @@ SETUP_CLASSIFIER_INSTALLED=""
 HIDA_SEED_DIR="" # the decided half's project seed; removed on teardown
 HIDA_UNENFORCED_SEED_DIR="" # the unenforced half's project seed; removed on teardown
 HIDA_CLASSIFIER_INSTALLED=""
+# The host_ip cohort proof's classifier install and its two project seeds;
+# removed on teardown.
+COHORT_CLASSIFIER_INSTALLED=""
+COHORT_SEED_DIR=""
+COHORT_SEED_BLOCK_DIR=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -875,6 +881,7 @@ switch_spawn_fault() {
 not_run() {
   echo "$1: NOT RUN ($2)"
   E2E_NOT_RUN="$E2E_NOT_RUN $1"
+  E2E_NOT_RUN_WHY="$E2E_NOT_RUN_WHY$1"$'\t'"$2"$'\n'
 }
 
 # A check a case carries against a known product gap: one named line citing
@@ -918,6 +925,13 @@ teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
     HIDA_CLASSIFIER_INSTALLED=""
   fi
+  # The host_ip cohort proof's own classifier install, by the same net.
+  if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    COHORT_CLASSIFIER_INSTALLED=""
+  fi
+  [ -n "$COHORT_SEED_DIR" ] && rm -rf "$COHORT_SEED_DIR"
+  [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "$COHORT_SEED_BLOCK_DIR"
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
@@ -12259,6 +12273,144 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   echo "::endgroup::"
 }
 
+# Re-creation proof (BEP-070). A grant box starts under a name, and the case
+# copies its sealed GH_TOKEN value. 'min session destroy' removes the box, and
+# a new grant box starts under the same name.
+#   - 'min box audit <name>' names a different box id for each box: the name
+#     is an alias, and each creation gets an id of its own.
+#   - In the new box, 'gh api user' answers with the box's own value, and
+#     'min box audit' shows an admit record for api.github.com that names a
+#     member: the proxy redeemed the new value.
+#   - The value copied from the destroyed box is refused in the new box,
+#     though both boxes have one name: the value names the old id.
+# It needs a live proxy, so bep_live_gate records it NOT RUN elsewhere. The
+# values are never printed: the transcript names only their lengths.
+
+# Prints the box id that 'min box audit $2' names for case $1, from its
+# "Showing <name> (box <id>)." line.
+bep_recreate_audited_id() {
+  local ai_err
+  if ! mnl box audit "$2" -o jsonl </dev/null >"$WORK/$1.$2.audit" 2>"$WORK/$1.$2.audit.err"; then
+    echo "::error::'min box audit $2' failed" >&2
+    cat "$WORK/$1.$2.audit.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  ai_err="$(cat "$WORK/$1.$2.audit.err" 2>/dev/null || true)"
+  if ! [[ "$ai_err" =~ \(box\ ([0-9a-fA-F-]+)\)\. ]]; then
+    echo "::error::'min box audit $2' names no box id" >&2
+    printf '%s\n' "$ai_err" >&2
+    return 1
+  fi
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+proof_bep_box_recreated_under_its_name_redeems() {
+  echo "::group::a box re-created under its name redeems its own values, and the old value stays refused"
+  local rc_case=bep_box_recreated_under_its_name_redeems
+  local rc_name=e2e-bep-recreate
+  local rc_old_value rc_new_value rc_old_id rc_new_id rc_try rc_count=0 rc_out
+  bep_live_gate "$rc_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: rc_cleanup reads it.
+  RC_SID=""
+  rc_cleanup() {
+    [ -n "$RC_SID" ] && mnl session destroy --force "$RC_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  rc_fail() { rc_cleanup; fail; }
+
+  # The first box under the name, and the value copied from it.
+  bep_revoke_seed "$rc_case"
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_old_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || rc_fail
+  rc_old_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  echo "first $rc_name (box $rc_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#rc_old_value} characters)"
+
+  if ! mnl session destroy --force "$RC_SID" </dev/null >/dev/null 2>"$WORK/$rc_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $rc_name failed"
+    cat "$WORK/$rc_case.destroy.err" 2>/dev/null || true
+    rc_fail
+  fi
+  RC_SID=""
+  # The destroy's revocation record, by the old id: the name is the new
+  # box's from here on.
+  for rc_try in $(seq 1 12); do
+    [ "$rc_try" -gt 1 ] && sleep 5
+    mnl box audit "$rc_old_id" -o jsonl </dev/null >"$WORK/$rc_case.old.audit" 2>"$WORK/$rc_case.old.audit.err" \
+      || continue
+    rc_count="$(bep_revoke_count "$WORK/$rc_case.old.audit" revocation)"
+    [ "$rc_count" -ge 1 ] && break
+  done
+  if [ "$rc_count" != 1 ]; then
+    echo "::error::'min box audit $rc_old_id' shows $rc_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$rc_case.old.audit" "$WORK/$rc_case.old.audit.err" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "min box audit $rc_old_id: 1 revocation record after the destroy"
+
+  # The second box under the same name: an id of its own, and its own value
+  # redeems.
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_new_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || {
+    echo "::error::the box re-created under $rc_name did not redeem its own value"
+    rc_fail
+  }
+  rc_new_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  if [ "$rc_new_id" = "$rc_old_id" ]; then
+    echo "::error::'min box audit $rc_name' names box $rc_new_id for both boxes: the re-created box reused the destroyed box's id"
+    rc_fail
+  fi
+  if [ "$rc_new_value" = "$rc_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    rc_fail
+  fi
+  if ! rc_out="$(python3 - "$WORK/$rc_case.$rc_name.audit" <<'PY'
+import json, sys
+admits = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            admits.append(r)
+if not admits:
+    print("no admit record for api.github.com:443 names a member")
+    sys.exit(1)
+print("%d admit record(s) for api.github.com:443" % len(admits))
+PY
+)"; then
+    echo "::error::'min box audit $rc_name' shows the re-created box's value was not redeemed: $rc_out"
+    cat "$WORK/$rc_case.$rc_name.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "second $rc_name (box $rc_new_id): 'gh api user' answered with its own value (${#rc_new_value} characters), and min box audit shows $rc_out"
+
+  # The destroyed box's value, in the box that now has its name.
+  if mnl session exec "$RC_SID" sh -c "GH_TOKEN='$rc_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$rc_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    rc_fail
+  fi
+  if ! mnl box audit "$rc_new_id" -o jsonl </dev/null >"$WORK/$rc_case.new.audit" 2>&1 \
+    || ! rc_out="$(bep_slice_jsonl_check "$WORK/$rc_case.new.audit" cross_box)"; then
+    echo "::error::'min box audit $rc_new_id' shows no refusal of the destroyed box's value: $rc_out"
+    cat "$WORK/$rc_case.new.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $rc_out"
+
+  rc_cleanup
+  rm -f "${WORK:?}/${rc_case:?}".*
+  echo "Re-created box OK (a new box id under the old name, its own value redeemed, the old value refused)"
+  echo "::endgroup::"
+}
+
 proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   echo "::group::min session destroy with the proxy down: the destroy completes, and the value is refused"
   local pd_case=bep_destroy_with_proxy_down_refuses_by_attachment
@@ -12653,6 +12805,266 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
   echo "::endgroup::"
 }
 
+# Revoke and sign out, end to end (BEP T23). One box name carries the whole
+# story, and each step shows its refusal or its admit in 'min box audit':
+#   1. A grant box starts under the name, 'gh api user' answers, and the case
+#      copies its sealed GH_TOKEN value.
+#   2. 'min session destroy' removes it. 'min box audit <old id>' shows one
+#      revocation record within 60 s.
+#   3. A new grant box starts under the same name. It gets a new box id, its
+#      own value redeems (an admit record), and the copied value is refused
+#      in it (a cross_box refusal).
+#   4. 'min auth logout' runs. The next 'gh api user' in the box is refused
+#      (a github_sign_in_required refusal), and the box keeps running.
+#   5. 'min auth login --device' signs this machine in again. The person who
+#      runs the case enters the code that the command prints.
+#   6. The box's own value stays refused (one more github_sign_in_required
+#      refusal), and the destroyed box's value stays refused (one more
+#      cross_box refusal). A box started after the sign-in redeems.
+# The case signs this machine out of GitHub and needs a person at the device
+# flow, so it runs only with E2E_BEP_LOGOUT=1, and bep_live_gate records it
+# NOT RUN where no proxy can run. The values are never printed: the
+# transcript names only their lengths.
+
+# Counts the refuse records marked $2 in the jsonl file $1.
+bep_e2e_refusals() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if r.get("kind") == "decision" and r.get("decision") == "refuse" and r.get("marker") == sys.argv[2]:
+            n += 1
+print(n)
+PY
+}
+
+# Counts the admit records for api.github.com:443 that name a member, in the
+# jsonl file $1.
+bep_e2e_admits() {
+  python3 - "$1" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            n += 1
+print(n)
+PY
+}
+
+proof_bep_revoke_and_sign_out_end_to_end() {
+  echo "::group::destroy, re-create, log out and sign in again: each refusal and admit"
+  local ee_case=bep_revoke_and_sign_out_end_to_end
+  local ee_name=e2e-bep-end-to-end ee_after=e2e-bep-end-to-end-after
+  local ee_old_value ee_new_value ee_old_id ee_new_id ee_try ee_count=0 ee_n
+  local ee_out ee_status ee_cross ee_signin
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$ee_case" "the case signs this machine out of GitHub and asks for a sign-in code: set E2E_BEP_LOGOUT=1 to run it"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$ee_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: ee_cleanup reads them.
+  EE_SID="" EE_SID2=""
+  ee_cleanup() {
+    [ -n "$EE_SID" ] && mnl session destroy --force "$EE_SID" >/dev/null 2>&1
+    [ -n "$EE_SID2" ] && mnl session destroy --force "$EE_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  ee_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection\|revocation\|logout' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    ee_cleanup
+    fail
+  }
+  # Writes 'min box audit $1' to $WORK/$ee_case.audit, or fails the case.
+  ee_audit() {
+    if ! mnl box audit "$1" -o jsonl </dev/null >"$WORK/$ee_case.audit" 2>"$WORK/$ee_case.audit.err"; then
+      echo "::error::'min box audit $1' failed"
+      cat "$WORK/$ee_case.audit.err" 2>/dev/null || true
+      ee_fail
+    fi
+  }
+
+  # 1. The first box under the name, and the value copied from it.
+  bep_revoke_seed "$ee_case"
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_old_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || ee_fail
+  ee_old_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  echo "first $ee_name (box $ee_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#ee_old_value} characters)"
+
+  # 2. The destroy, and its revocation record within 60 s.
+  if ! mnl session destroy --force "$EE_SID" </dev/null >/dev/null 2>"$WORK/$ee_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $ee_name failed"
+    cat "$WORK/$ee_case.destroy.err" 2>/dev/null || true
+    ee_fail
+  fi
+  EE_SID=""
+  for ee_try in $(seq 1 12); do
+    [ "$ee_try" -gt 1 ] && sleep 5
+    mnl box audit "$ee_old_id" -o jsonl </dev/null >"$WORK/$ee_case.old.audit" 2>"$WORK/$ee_case.old.audit.err" \
+      || continue
+    ee_count="$(bep_revoke_count "$WORK/$ee_case.old.audit" revocation)"
+    [ "$ee_count" -ge 1 ] && break
+  done
+  if [ "$ee_count" != 1 ]; then
+    echo "::error::'min box audit $ee_old_id' shows $ee_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$ee_case.old.audit" "$WORK/$ee_case.old.audit.err" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "min box audit $ee_old_id: 1 revocation record within 60 s of the destroy"
+
+  # 3. The box re-created under the name: a new id, its own value admitted,
+  # and the destroyed box's value refused.
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_new_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || {
+    echo "::error::the box re-created under $ee_name did not redeem its own value"
+    ee_fail
+  }
+  ee_new_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  if [ "$ee_new_id" = "$ee_old_id" ]; then
+    echo "::error::'min box audit $ee_name' names box $ee_new_id for both boxes: the re-created box reused the destroyed box's id"
+    ee_fail
+  fi
+  if [ "$ee_new_value" = "$ee_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    ee_fail
+  fi
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.$ee_name.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_name' shows no admit record for api.github.com:443 that names a member: the re-created box's value was not redeemed"
+    cat "$WORK/$ee_case.$ee_name.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "second $ee_name (box $ee_new_id): 'gh api user' answered with its own value (${#ee_new_value} characters), and min box audit shows $ee_n admit record(s) for api.github.com:443"
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_cross="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_cross" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no cross_box refusal of the destroyed box's value"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $ee_cross cross_box refusal(s)"
+
+  # 4. The logout: the box's next request is refused, and the box runs on.
+  if ! ee_out="$(mnl auth logout </dev/null 2>"$WORK/$ee_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$ee_out"
+    echo "--- stderr ---"; cat "$WORK/$ee_case.logout.err" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$ee_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$ee_status"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-logout" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after 'min auth logout'"
+    ee_fail
+  fi
+  if ! mnl session exec "$EE_SID" true >/dev/null 2>"$WORK/$ee_case.alive"; then
+    echo "::error::the box $ee_name does not run a command after the logout: the logout must keep the box's processes running"
+    cat "$WORK/$ee_case.alive" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_count" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no github_sign_in_required refusal after the logout"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the logout: 'gh api user' in $ee_name failed, the box still runs, and min box audit shows $ee_count github_sign_in_required refusal(s)"
+
+  # 5. The sign-in again. The device flow prints a code on stderr, and the
+  # person who runs the case enters it. The command waits until the code
+  # expires.
+  echo "Sign in to GitHub again: open the address below and enter the code."
+  if ! mnl auth login --device </dev/null 2>&1 | tee "$WORK/$ee_case.login"; then
+    echo "::error::'min auth login --device' did not sign this machine in again"
+    ee_fail
+  fi
+  ee_signin="$(mnl auth status </dev/null 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$ee_signin" != "Signed in to GitHub"* ]]; then
+    echo "::error::'min auth status' after 'min auth login' does not report a sign-in"
+    printf '%s\n' "$ee_signin"
+    ee_fail
+  fi
+  echo "min auth status: ${ee_signin%%$'\n'*}"
+
+  # 6. The sign-in revives nothing: the box's own value and the destroyed
+  # box's value stay refused, each with one more refusal in the audit.
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-login" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after the sign-in: the sign-in revived a value made before the logout"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded with the destroyed box's value after the sign-in"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_n="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_n" -le "$ee_count" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new github_sign_in_required refusal after the sign-in ($ee_n, $ee_count before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_count" -le "$ee_cross" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new cross_box refusal after the sign-in ($ee_count, $ee_cross before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the sign-in: both values in $ee_name are still refused, and min box audit shows $ee_n github_sign_in_required and $ee_count cross_box refusal(s)"
+
+  # A box started after the sign-in redeems, so the refusals above are not a
+  # broken sign-in.
+  EE_SID2="$(bep_revoke_activate "$ee_case" "$ee_after")" || ee_fail
+  if ! mnl session exec "$EE_SID2" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.fresh" 2>&1; then
+    echo "::error::'gh api user' failed in the box $ee_after, started after the sign-in"
+    cat "$WORK/$ee_case.fresh" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_after"
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_after' shows no admit record for api.github.com:443 that names a member"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "$ee_after, started after the sign-in: 'gh api user' answered, and min box audit shows $ee_n admit record(s)"
+
+  ee_cleanup
+  rm -f "${WORK:?}/${ee_case:?}".*
+  echo "Revoke and sign out OK (the destroyed box's value refused within 60 s, the re-created box redeemed, the logout refused its next request, and the sign-in revived neither value)"
+  echo "::endgroup::"
+}
+
 # DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
 # the gvproxy switch. A box on a credentialed lane with the default `dns`
 # steering and `quic443 = "block"` starts. Then the case stops the Box Egress
@@ -12665,10 +13077,9 @@ proof_bep_logout_refuses_every_reference_at_next_request() {
 #   3. a UDP datagram to port 443 must be rejected at once: the switch
 #      answers ICMP port unreachable, so socat reads "Connection refused"
 #      well inside its 5 s wait (BEP-018).
-# Legs 2 and 3 are hard assertions. Leg 1 is a KNOWN GAP while
-# https://github.com/gominimal/minimal/issues/2523 is open: no production
-# code wires the steering into the relay's DNS gate yet, so the lookup is
-# forwarded. When that issue lands, change its known_gap to a fail.
+# All three legs are hard assertions. The relay's DNS gate asks minvmd over
+# the guest report door whether the proxy listens, so leg 1 holds on every
+# host (Networking §5.3).
 # Admission refuses `dns` steering for a box with a broker secret on every
 # host today (no box-zone resolver, BEP-017), so the lane comes from
 # --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
@@ -12793,12 +13204,12 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   # Leg 1: the steered A lookup fails closed.
   ds_ans="$(ds_dns api.github.com 1)"
   echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
-  ds_a_gap=""
   if [ "${ds_ans%% *}" = 2 ]; then
     echo "steered A lookup: SERVFAIL while the proxy is down"
   else
-    ds_a_gap=1
-    known_gap "$ds_case" "the steered A lookup of api.github.com got '${ds_ans:-no reply}', not SERVFAIL: the relay's DNS gate is not wired to the steering yet (https://github.com/gominimal/minimal/issues/2523)"
+    echo "::error::the A lookup of the steered name api.github.com was not answered SERVFAIL while the Box Egress Proxy is down: got '${ds_ans:-no reply}'"
+    cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+    ds_fail
   fi
 
   # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
@@ -12843,14 +13254,412 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   rm -f "${WORK:?}/${ds_case:?}".*
 
   ds_cleanup
-  # The closing line claims a full pass only when leg 1 got SERVFAIL. With
-  # the known gap, the steered A lookup did not fail closed.
-  if [ -n "$ds_a_gap" ]; then
-    echo "DNS steering does not fail closed yet: the steered A lookup got no SERVFAIL (known gap). AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
-  else
-    echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
-  fi
+  echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
   echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The host_ip cohort's UDP 443 block (BEP-018, T53), end to end on a native
+# host that decides per box. Under this case's own classifier install (the
+# arrangement host_ip_deny_all carries: the privileged step's tree and
+# table, removed before it returns), two host-address boxes share the
+# cohort address:
+#   1. box A declares no quic443 stance and holds no grant, so its own
+#      stance is open, and its UDP to port 443 is not rejected;
+#   2. box B declares quic443 = "block" and joins the cohort; the daemon
+#      log records the cohort's stance flipping to blocked, naming B, and
+#      box A's own leaf added to the set that is refused UDP 443. A's UDP to
+#      port 443 is now rejected at once, and so is B's. A host-address box's
+#      socket is in the host netns, so the reject runs in the local OUTPUT
+#      hook and drops the packet: socat's send fails with "Operation not
+#      permitted". The leaf in the set tells this reject from a silent drop;
+#   3. box B is destroyed; the daemon log records the stance flipping
+#      back, naming B, and A's UDP to port 443 is not rejected again.
+# The daemon log tail of the cohort's stance changes prints at the end.
+# Records NOT RUN on a VM lane (the classifier is a host install and the
+# guest daemon has no cohort leaf), and where the classifier table cannot
+# be loaded: no nft or ip, no passwordless sudo, a classifier install the
+# host already carries, or the installer's own mount check refusing.
+proof_bep_host_ip_cohort_blocks_udp_443() {
+  echo "::group::host-address cohort: one box with quic443 = \"block\" blocks UDP 443 for the cohort, and leaving lifts it (BEP-018)"
+  local cq_case=bep_host_ip_cohort_blocks_udp_443
+  local cq_why="" cq_src="" cq_rust_log cq_sock cq_pid cq_proc cq_comm cq_daemons=""
+  local cq_open_sid="" cq_block_sid="" cq_out cq_launch cq_probe_out cq_flip cq_try cq_members
+  local cq_warm_sid=""
+  local cq_slice=/sys/fs/cgroup/minimald.slice
+  local cq_blocked_leaf=/sys/fs/cgroup/minimald.slice/boxes/quic443-blocked
+  local cq_stance_msg="the host-address cohort's UDP 443 stance changed"
+  local cq_set_add_msg="added a host-address box's own leaf to the set that is refused UDP 443"
+
+  if [ -n "$E2E_VM" ]; then
+    not_run "$cq_case" "a VM lane: the host-address cohort block runs in a native daemon's classifier tree, which a VM guest does not have"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! command -v nft >/dev/null 2>&1; then
+    cq_why="no nft on PATH: the classifier table is loaded with it"
+  elif ! command -v ip >/dev/null 2>&1; then
+    cq_why="no ip on PATH: the install needs the default-route source address"
+  elif ! sudo -n true >/dev/null 2>&1; then
+    cq_why="no passwordless sudo: the classifier install needs root"
+  elif [ -e "$cq_slice" ] || sudo -n nft list table inet minimal_class >/dev/null 2>&1; then
+    cq_why="this host already has a classifier install ($cq_slice or the table inet minimal_class), and this case replaces no host's own"
+  elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+      --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+      >/dev/null 2>"$WORK/$cq_case.mount.err"; then
+    cq_why="the installer's mount check refuses this host: $(head -n1 "$WORK/$cq_case.mount.err" 2>/dev/null || true)"
+  else
+    cq_src="$(ip route get 1.1.1.1 2>/dev/null \
+      | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$cq_src" ] || cq_why="no default-route source address for the install"
+  fi
+  if [ -n "$cq_why" ]; then
+    # A native CI lane carries every gate above, so a missing one there is a
+    # lane fault, as in proof_host_ip_deny_all, never a NOT RUN.
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $cq_why"
+      fail
+    fi
+    not_run "$cq_case" "$cq_why"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The daemon's file log is JSON lines with the event's fields under
+  # "fields" (crates/mlog/src/lib.rs). Prints the lines that hold $1.
+  cq_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -hF -- "$1" {} + 2>/dev/null || true
+  }
+  # One UDP datagram to TEST-NET-1 port 443 from box $1. Prints socat's own
+  # output and a last line "rc=<exit> ms=<elapsed>". Under the block the
+  # table rejects the datagram in the local OUTPUT hook: it sends ICMP port
+  # unreachable and drops the packet, so socat's first send fails at once
+  # with EPERM ("Operation not permitted"). A later send or recv can read
+  # ECONNREFUSED ("Connection refused") instead. Without the block nothing
+  # answers, and socat waits its 3 s.
+  cq_probe() {
+    # shellcheck disable=SC2016
+    mnl session exec "$1" \
+      's=$(date +%s%N); printf q | /usr/bin/socat -t 3 -T 3 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+      2>&1 | tr -d '\r' || true
+  }
+  # 0 when the probe output $1 shows the datagram rejected at once. The
+  # errno alone cannot tell a reject from a drop: the timing tells it from
+  # the 3 s path where nothing answers, and the set check below tells it
+  # from a drop.
+  cq_rejected() {
+    local rc ms
+    rc="$(printf '%s\n' "$1" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+    ms="$(printf '%s\n' "$1" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+    [ -n "$rc" ] && [ "$rc" != 0 ] && [ -n "$ms" ] && [ "$ms" -lt 2000 ] \
+      && printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # 0 when the probe output $1 ran to its end and shows no rejection.
+  cq_not_rejected() {
+    printf '%s\n' "$1" | grep -q '^rc=[0-9]* ms=[0-9]*$' \
+      && ! printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # The case's own teardown, in the order the uninstall needs: the boxes'
+  # leaves empty when they are destroyed, the daemon's when it stops.
+  # Returns the uninstall's exit status.
+  cq_unwind() {
+    [ -n "$cq_warm_sid" ] && mnl session destroy --force "$cq_warm_sid" >/dev/null 2>&1
+    [ -n "$cq_block_sid" ] && mnl session destroy --force "$cq_block_sid" >/dev/null 2>&1
+    [ -n "$cq_open_sid" ] && mnl session destroy --force "$cq_open_sid" >/dev/null 2>&1
+    cq_warm_sid=""; cq_block_sid=""; cq_open_sid=""
+    [ -n "$COHORT_SEED_DIR" ] && rm -rf "${COHORT_SEED_DIR:?}"
+    [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "${COHORT_SEED_BLOCK_DIR:?}"
+    COHORT_SEED_DIR=""; COHORT_SEED_BLOCK_DIR=""
+    mnl stop --force >/dev/null 2>&1 || true
+    if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+      sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || return 1
+      COHORT_CLASSIFIER_INSTALLED=""
+    fi
+    return 0
+  }
+  cq_fail() {
+    local cq_err
+    for cq_err in "$WORK/$cq_case".*.err; do
+      [ -s "$cq_err" ] || continue
+      echo "--- stderr: ${cq_err##*/} ---"
+      cat "$cq_err" 2>/dev/null || true
+    done
+    echo "--- daemon log: the boxes' classifier-leaf launch records (tail) ---"
+    cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
+    echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+    cq_log "$cq_stance_msg" | tail -n 20
+    echo "--- daemon log: the leaves added to the set that is refused UDP 443 (tail) ---"
+    cq_log "$cq_set_add_msg" | tail -n 20
+    cq_unwind
+    fail
+  }
+
+  # ---- the install. The daemon stops first, so the one this case drives
+  # starts under the install.
+  mnl stop --force >/dev/null 2>&1 || true
+  COHORT_CLASSIFIER_INSTALLED=1
+  # The notes are captured as this lane's user: sudo's privilege ends at
+  # the script it runs.
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+      --cohort-address "$cq_src" --node-plane-address "$cq_src" \
+      >"$WORK/$cq_case.install.out" 2>"$WORK/$cq_case.install.err"; then
+    echo "::error::the classifier install failed, so no table rejects the cohort's UDP 443"
+    cat "$WORK/$cq_case.install.err" 2>/dev/null || true
+    cq_fail
+  fi
+  if [ ! -d "$cq_blocked_leaf" ]; then
+    echo "::error::the classifier install laid out no blocked leaf at $cq_blocked_leaf"
+    cq_fail
+  fi
+  echo "install: the classifier tree at $cq_slice with the blocked leaf $cq_blocked_leaf, and the table inet minimal_class, cohort address $cq_src"
+
+  # ---- the daemon, up under a filter that keeps the classifier's and the
+  # launcher's INFO records, then placed in the slice's daemon leaf.
+  cq_rust_log="warn,minimald::net::classifier=info,minimald::box_runtime=info,minimald::box_actor=info"
+  if ! RUST_LOG="$cq_rust_log" mnl ls >/dev/null 2>"$WORK/$cq_case.warm.err"; then
+    echo "::error::the daemon for $cq_case did not come up under its record filter"
+    cat "$WORK/$cq_case.warm.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_proc in /proc/[0-9]*; do
+    [ -r "$cq_proc/comm" ] || continue
+    read -r cq_comm <"$cq_proc/comm" 2>/dev/null || continue
+    [ "$cq_comm" = "$min_daemon" ] || continue
+    [ -O "$cq_proc" ] || continue
+    cq_daemons="$cq_daemons${cq_daemons:+ }${cq_proc#/proc/}"
+  done
+  cq_pid="${cq_daemons%% *}"
+  if [ -z "$cq_pid" ] || [ "${cq_daemons#"$cq_pid"}" != "" ]; then
+    echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${cq_daemons:-none}"
+    cq_fail
+  fi
+  cq_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+      --place-listener "$cq_sock" \
+      >"$WORK/$cq_case.place.out" 2>"$WORK/$cq_case.place.err" \
+    || ! grep -qx "$cq_pid" "$cq_slice/daemon/cgroup.procs" 2>/dev/null; then
+    echo "::error::the installer's --place-listener step did not place $min_daemon $cq_pid in $cq_slice/daemon"
+    cat "$WORK/$cq_case.place.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "place: $min_daemon $cq_pid is in the slice's daemon leaf"
+
+  COHORT_SEED_DIR="$(hook_mktemp /tmp/mnlcohort.XXXXXX)"
+  hook_seed_preamble >"$COHORT_SEED_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_DIR/.git"
+
+  # ---- a throwaway host-address box turns the daemon's classifier fact,
+  # as in proof_host_ip_deny_all. The daemon started outside the slice and
+  # was placed after, so its start-up read still carries that cause. Each
+  # host-address launch re-reads the host, so this box's launch turns the
+  # fact to per_box before box A is created against it.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-warm --network host_ip </dev/null 2>"$WORK/$cq_case.warm-box.err")" || {
+    echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+    cat "$WORK/$cq_case.warm-box.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_warm_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1; }; then
+    echo "::error::the throwaway box $cq_warm_sid did not run a command"
+    cat "$WORK/$cq_case.warm-gate.err" 2>/dev/null || true
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_warm_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the throwaway box $cq_warm_sid was not launched into its own leaf boxes/allow/$cq_warm_sid with per-box enforcement, so the placement did not take effect: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  if ! mnl session destroy --force "$cq_warm_sid" >/dev/null 2>"$WORK/$cq_case.warm-destroy.err"; then
+    echo "::error::the throwaway box $cq_warm_sid would not destroy"
+    cat "$WORK/$cq_case.warm-destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "refresh: the throwaway box's launch (leaf boxes/allow/$cq_warm_sid) says per_box"
+  cq_warm_sid=""
+
+  # ---- box A: open stance, alone in the cohort.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-open --network host_ip </dev/null 2>"$WORK/$cq_case.open.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the open-stance box"
+    cat "$WORK/$cq_case.open.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_open_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # A session's box launches on its first exec, not at the activate, so
+  # the launch record exists only after this exec.
+  if ! mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1; }; then
+    echo "::error::the open-stance box's own exec failed: the box this case is about cannot be driven"
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_open_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the open-stance box $cq_open_sid was not launched into its own leaf boxes/allow/$cq_open_sid with per-box enforcement: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  mnl session exec "$cq_open_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the open-stance box has no /usr/bin/socat (a launcher baseline package)"
+    cq_fail
+  }
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) alone, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from a host-address box with an open stance, alone in the cohort, was rejected or did not run"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B: quic443 = "block" joins, and the whole cohort is blocked.
+  COHORT_SEED_BLOCK_DIR="$(hook_mktemp /tmp/mnlcohortb.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } >"$COHORT_SEED_BLOCK_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_BLOCK_DIR/.git"
+  cq_out="$(cd "$COHORT_SEED_BLOCK_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-block --network host_ip </dev/null 2>"$WORK/$cq_case.block.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the box with quic443 = \"block\""
+    cat "$WORK/$cq_case.block.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_block_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # Box B joins the cohort when it launches, on its first exec.
+  if ! mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1; }; then
+    echo "::error::the exec in box B ($cq_block_sid) failed: the box with quic443 = \"block\" cannot be driven"
+    cq_fail
+  fi
+  cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+    | grep -F -- '"blocked":true' || true)"
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance to blocked when box B ($cq_block_sid) joined"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed to blocked when box B ($cq_block_sid) joined"
+  cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+  echo "blocked leaf: $cq_members process(es) in $cq_blocked_leaf"
+  if [ "$cq_members" = 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf holds no process while the cohort blocks UDP 443"
+    cq_fail
+  fi
+  # An errno cannot tell a reject from a silent drop, so box A's own leaf
+  # must be in the set that the table refuses UDP 443.
+  cq_flip=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_set_add_msg" | grep -F -- "\"box_id\":\"$cq_open_sid\"" || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no add of box A's ($cq_open_sid) own leaf to the set that is refused UDP 443 while box B blocks the cohort"
+    cq_fail
+  fi
+  echo "log: box A's ($cq_open_sid) own leaf was added to the set that is refused UDP 443"
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) beside B, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A was not rejected at once while box B's quic443 = \"block\" blocks the cohort (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_block_sid")"
+  echo "box B ($cq_block_sid), UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box B, which declares quic443 = \"block\", was not rejected at once (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B leaves, and the block lifts for box A.
+  if ! mnl session destroy --force "$cq_block_sid" >/dev/null 2>"$WORK/$cq_case.destroy.err"; then
+    echo "::error::box B ($cq_block_sid) would not destroy"
+    cat "$WORK/$cq_case.destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+      | grep -F -- '"blocked":false' || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance back to open when box B ($cq_block_sid) left"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed back to open when box B ($cq_block_sid) left"
+  local cq_left_sid="$cq_block_sid"
+  cq_block_sid=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+    [ "$cq_members" = 0 ] && break
+  done
+  if [ "$cq_members" != 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf still holds $cq_members process(es) after the last blocking box left"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) after B left, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A is still rejected after the last blocking box left the cohort"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+  cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_left_sid\"" | tail -n 4
+  if ! cq_unwind; then
+    echo "::error::the classifier uninstall failed, so this case left the tree and the table on the host"
+    fail
+  fi
+  rm -f "${WORK:?}/${cq_case:?}".*
+  echo "host-address cohort: UDP 443 open alone, rejected for every member while one blocks, open again after it leaves"
+  echo "::endgroup::"
+}
+
+# The BEP conditions closed, end to end (T56): one walk over the residual
+# cases the slice's arch conditions held open at merge.
+#   * bep_git_credential_helper_sends_header: git in a grant box sends a
+#     header the proxy substitutes (BEP-015).
+#   * bep_signing_rotation_keeps_running_box_working: the signing
+#     certificate rotates under a running proxy, and the box keeps
+#     pushing (BEP-061).
+#   * bep_host_ip_cohort_blocks_udp_443: a blocked host_ip cohort sends no
+#     UDP to port 443 (BEP-018).
+# The first two need the macOS lane with a sign-in and E2E_BEP_PRIVATE_REPO.
+# The third needs a native Linux host that can load the classifier table.
+# Each case records NOT RUN with its gate where it cannot run, and the walk
+# prints PASS or NOT RUN for each at its end. A failing case ends the run,
+# as every case does. The store-reference check at creation (BEP-034) and
+# the CA deny set have their own unit tests in crates/bep.
+proof_bep_conditions_closed_end_to_end() {
+  local cc_case cc_before cc_why cc_ran=0 cc_summary=""
+  for cc_case in bep_git_credential_helper_sends_header \
+      bep_signing_rotation_keeps_running_box_working \
+      bep_host_ip_cohort_blocks_udp_443; do
+    cc_before="$E2E_NOT_RUN"
+    "proof_$cc_case"
+    if [ "$E2E_NOT_RUN" = "$cc_before" ]; then
+      cc_ran=$((cc_ran + 1))
+      cc_summary="$cc_summary$cc_case: PASS"$'\n'
+    else
+      cc_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$cc_case" '$1 == c { w = $2 } END { print w }')"
+      cc_summary="$cc_summary$cc_case: NOT RUN (${cc_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP conditions closed: each case"
+  printf '%s' "$cc_summary"
+  echo "::endgroup::"
+  if [ "$cc_ran" = 0 ]; then
+    not_run bep_conditions_closed_end_to_end "none of its cases can run on this lane"
+  fi
 }
 
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
@@ -24416,8 +25225,10 @@ case "${1:-}" in
     proof_bep_root_ca_absent_from_box_without_credentialed_upstream
     proof_bep_trust_env_points_at_bundle_and_root
     proof_bep_destroyed_box_values_refused_within_60s
+    proof_bep_box_recreated_under_its_name_redeems
     proof_bep_destroy_with_proxy_down_refuses_by_attachment
     proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
@@ -24440,6 +25251,11 @@ case "${1:-}" in
     # already carries a classifier install, and a residue here would read as
     # one there.
     proof_host_ip_deny_all
+    # After proof_host_ip_deny_all and before the daemon-fetch proof, for the
+    # same reasons: it installs its own host classifier tree and table
+    # (removed before it returns) and respawns the daemon under its own
+    # record filter, and a residue would trip the daemon-fetch proof's gates.
+    proof_bep_host_ip_cohort_blocks_udp_443
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
@@ -24486,9 +25302,13 @@ case "${1:-}" in
     | bep_root_ca_absent_from_box_without_credentialed_upstream \
     | bep_trust_env_points_at_bundle_and_root \
     | bep_destroyed_box_values_refused_within_60s \
+    | bep_box_recreated_under_its_name_redeems \
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
-    | bep_dns_steering_fails_closed_end_to_end)
+    | bep_revoke_and_sign_out_end_to_end \
+    | bep_dns_steering_fails_closed_end_to_end \
+    | bep_host_ip_cohort_blocks_udp_443 \
+    | bep_conditions_closed_end_to_end)
     "proof_$1"
     ;;
   *)
@@ -24533,7 +25353,9 @@ case "${1:-}" in
     echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
     echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
+    echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
     echo "         bep_dns_steering_fails_closed_end_to_end"
+    echo "         bep_host_ip_cohort_blocks_udp_443 bep_conditions_closed_end_to_end"
     exit 2
     ;;
 esac

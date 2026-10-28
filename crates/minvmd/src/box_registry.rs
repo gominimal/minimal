@@ -1587,17 +1587,53 @@ pub enum AllocationError {
     /// addresses.
     #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
     UnplannedSubnet(SwitchSubnet),
-    /// The id minted for the registration is already held by a live row or
-    /// attachment: one id names one box (BEP-070), so the registration is
-    /// refused — never re-minted — before any address is spent, so the
+    /// The id minted for the registration is already held by a live row, a
+    /// kept creation, an attachment or a revocation record the Box Egress
+    /// Proxy retains: one id names one box (BEP-070), so the registration
+    /// is refused — never re-minted — before any address is spent, so the
     /// refusal leaves no new fact on the host.
     #[error(
-        "box id {} is already held by a live row or attachment",
+        "box id {} is already in use. A running box, a stopped box that can resume, a Box \
+         Egress Proxy attachment, or a revocation record of the Box Egress Proxy holds it",
         crate::bep_attach::BoxIdText(id)
     )]
     CollidingBoxId {
-        /// The id a live row or attachment already holds.
+        /// The id a live row, a kept creation, an attachment or a retained
+        /// revocation record already holds.
         id: BoxId,
+    },
+    /// The Box Egress Proxy answers its control socket but did not list the
+    /// box ids its revocation records hold: a timeout, a refusal or a
+    /// malformed reply. The check cannot show that no record holds the
+    /// minted id, so the registration is refused before any address is
+    /// spent (BEP-070).
+    #[error(
+        "the box was not created. The Box Egress Proxy did not list its revocation records, so \
+         box id {} was not checked against them: {why}",
+        crate::bep_attach::BoxIdText(id)
+    )]
+    RevocationsUnread {
+        /// The minted id the check did not finish on.
+        id: BoxId,
+        /// Why the proxy's list was not read.
+        why: String,
+    },
+    /// No Box Egress Proxy runs, and its audit log was not read whole: an
+    /// I/O error, or a complete line that does not parse. The check cannot
+    /// show that no revocation record holds the minted id, so the
+    /// registration is refused before any address is spent (BEP-070).
+    #[error(
+        "the box was not created. Box id {} was not checked against the revocation records in \
+         the Box Egress Proxy audit log in {audit}: {why}",
+        crate::bep_attach::BoxIdText(id)
+    )]
+    AuditUnread {
+        /// The minted id the check did not finish on.
+        id: BoxId,
+        /// The audit log's directory.
+        audit: String,
+        /// Why the log was not read whole.
+        why: String,
     },
     /// The address is still held by a withdrawn box's revocation: the host
     /// has not finished unbinding the forwards that box published there
@@ -2985,6 +3021,208 @@ fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> Submitted {
     Submitted { revoke, forget }
 }
 
+/// The source that already holds a minted box id ([`BoxRegistry::holds_box_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdHolder {
+    /// A published row.
+    LiveRow,
+    /// A kept creation, live or dormant.
+    KeptCreation,
+    /// The proxy's attachment table.
+    Attachment,
+    /// A revocation record the proxy retains.
+    RevocationRecord,
+    /// A revocation record in the proxy's audit log, read with no proxy
+    /// running: the record's line, and the log's directory.
+    AuditedRevocation {
+        /// The record's line, as the log holds it.
+        record: String,
+        /// The directory of the log that holds the record.
+        audit: std::path::PathBuf,
+    },
+}
+
+impl IdHolder {
+    /// The source's name in a log line.
+    fn as_str(&self) -> &'static str {
+        match self {
+            IdHolder::LiveRow => "live row",
+            IdHolder::KeptCreation => "kept creation",
+            IdHolder::Attachment => "attachment",
+            IdHolder::RevocationRecord => "revocation record",
+            IdHolder::AuditedRevocation { .. } => "revocation record in the audit log",
+        }
+    }
+}
+
+/// The directory of the audit log that the proxy serving the control
+/// socket at `control` writes: `audit` beside the socket. For the home
+/// socket ([`home_proxy_control`]) that is `~/.minimal/bep/audit`, the
+/// directory `bep serve` writes (`bep::audit::default_dir`).
+fn proxy_audit_dir(control: &std::path::Path) -> std::path::PathBuf {
+    control
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .join("audit")
+}
+
+/// The revocation record of `id` in the proxy's audit log in `audit`, when
+/// one is there (BEP-070). These are the records a `bep serve` start puts
+/// back in force ([`bep::revoke::restore`]), read here when no proxy runs.
+/// A missing directory holds none.
+///
+/// # Errors
+///
+/// [`AllocationError::AuditUnread`] when the log is not read, or when a
+/// complete line in it does not parse. That line can be the revocation of
+/// `id`, so the check fails closed, as a `bep serve` start does.
+fn audit_revocation_holding(
+    audit: &std::path::Path,
+    id: BoxId,
+) -> Result<Option<IdHolder>, AllocationError> {
+    let unread = |why: String| {
+        tracing::warn!(
+            box_id = %crate::bep_attach::BoxIdText(&id),
+            audit = %audit.display(),
+            why = %why,
+            "refused a box registration: the Box Egress Proxy's audit log was not read whole, \
+             so the box id check did not finish"
+        );
+        AllocationError::AuditUnread {
+            id,
+            audit: audit.display().to_string(),
+            why,
+        }
+    };
+    let batch = bep::audit::LogReader::new(audit)
+        .read_new()
+        .map_err(|error| unread(error.to_string()))?;
+    let hex = box_id_hex(id);
+    if let Some(entry) = batch.entries.into_iter().find(|entry| {
+        entry.record.kind == bep::audit::Kind::Revocation
+            && entry.record.subject.eq_ignore_ascii_case(&hex)
+    }) {
+        return Ok(Some(IdHolder::AuditedRevocation {
+            record: entry.line,
+            audit: audit.to_path_buf(),
+        }));
+    }
+    if batch.skipped > 0 {
+        let segments: Vec<String> = batch
+            .skipped_in
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let lines = if batch.skipped == 1 {
+            "1 line".to_owned()
+        } else {
+            format!("{} lines", batch.skipped)
+        };
+        // `bep serve --quarantine-unreadable` moves those segments aside and
+        // records again the revocations it reads there (BEP-068), so the
+        // refusal names it as the way out.
+        return Err(unread(format!(
+            "{lines} in {} did not parse, and a line that does not parse can record a destroyed \
+             box. To move those segments into {} and start the proxy, run `bep serve` with \
+             `--quarantine-unreadable`",
+            segments.join(", "),
+            audit.join(bep::audit::QUARANTINE_DIR).display()
+        )));
+    }
+    Ok(None)
+}
+
+/// The box ids the revocations in force at the proxy's control socket at
+/// `path` name, as 32 lowercase hex digits: the ones the proxy restored
+/// from its audit log at start and the ones recorded since (BEP-070).
+///
+/// # Errors
+///
+/// The I/O error of the connect, the write or the read, or a refusal the
+/// proxy replied with.
+fn proxy_revoked_box_ids(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let reply = exchange_control(
+        path,
+        "revoked_box_ids",
+        &serde_json::json!({ "op": "revoked_box_ids" }),
+    )?;
+    let reply: bep::control::RevokedBoxIdsReply =
+        serde_json::from_value(reply).map_err(std::io::Error::other)?;
+    Ok(reply
+        .box_ids
+        .into_iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect())
+}
+
+/// How long [`BoxRegistry::send_live_boxes`] waits for the proxy's control
+/// socket to take connections. `bep serve` binds it just after its
+/// listener, the socket whose appearance starts the send.
+const LIVE_BOXES_WAIT: Duration = Duration::from_secs(10);
+
+impl BoxRegistry {
+    /// The id of every box this registry holds, a live row or a kept
+    /// creation, as 32 lowercase hex digits, each once.
+    pub fn live_box_ids(&self) -> Vec<String> {
+        let mut ids: BTreeSet<String> = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .values()
+            .map(|record| box_id_hex(record.box_id))
+            .collect();
+        ids.extend(
+            self.creations()
+                .values()
+                .map(|creation| box_id_hex(creation.id())),
+        );
+        ids.into_iter().collect()
+    }
+
+    /// Names every box this registry holds to the proxy's control socket,
+    /// in one `live_boxes` request (BEP-063, #2617). The proxy then frees
+    /// the client key of each box it kept from before its start that is not
+    /// in the list: a box that ended with no `forget_box`. It retries the
+    /// connect for [`LIVE_BOXES_WAIT`] while no proxy takes it. With no
+    /// control socket set, it sends nothing.
+    pub fn send_live_boxes(&self) {
+        let Some(path) = self.proxy_control.as_deref() else {
+            return;
+        };
+        let ids = self.live_box_ids();
+        let count = ids.len();
+        let request = serde_json::json!({ "op": "live_boxes", "box_ids": ids });
+        let deadline = Instant::now() + LIVE_BOXES_WAIT;
+        loop {
+            match exchange_control(path, "live_boxes", &request) {
+                Ok(_) => {
+                    tracing::info!(
+                        boxes = count,
+                        "named the live boxes to the Box Egress Proxy"
+                    );
+                    return;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "the Box Egress Proxy did not take the live box list: a client key of \
+                         a box that ended with no forget stays in use until the next start"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Sends one `op` request for the box id `id` to the proxy's control socket
 /// at `path`, and reads its reply. The protocol is one JSON object per line
 /// each way.
@@ -2994,6 +3232,21 @@ fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> Submitted {
 /// The I/O error of the connect, the write or the read, or a refusal the
 /// proxy replied with.
 fn send_control(path: &std::path::Path, op: &str, id: &str) -> std::io::Result<()> {
+    exchange_control(path, op, &serde_json::json!({ "op": op, "box_id": id })).map(|_| ())
+}
+
+/// Sends the `op` request line `request` to the proxy's control socket at
+/// `path`, and reads its reply.
+///
+/// # Errors
+///
+/// The I/O error of the connect, the write or the read, or a refusal the
+/// proxy replied with.
+fn exchange_control(
+    path: &std::path::Path,
+    op: &str,
+    request: &serde_json::Value,
+) -> std::io::Result<serde_json::Value> {
     use std::io::{BufRead as _, Write as _};
 
     let stream = std::os::unix::net::UnixStream::connect(path)?;
@@ -3001,7 +3254,7 @@ fn send_control(path: &std::path::Path, op: &str, id: &str) -> std::io::Result<(
     stream.set_write_timeout(Some(PROXY_CONTROL_TIMEOUT))?;
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    let mut line = serde_json::json!({ "op": op, "box_id": id }).to_string();
+    let mut line = request.to_string();
     line.push('\n');
     writer.write_all(line.as_bytes())?;
     let mut reply = String::new();
@@ -3021,7 +3274,7 @@ fn send_control(path: &std::path::Path, op: &str, id: &str) -> std::io::Result<(
             "the proxy refused {op}: {why}"
         )));
     }
-    Ok(())
+    Ok(reply)
 }
 
 /// A clone shares the live rows, the hand-out book, and the withdrawal
@@ -4096,8 +4349,9 @@ impl BoxRegistry {
     /// ([`crate::bep_attach::mint_box_id`]): a spec carries none, so no
     /// client can present an id, and a re-registration under the same
     /// name and addresses is a new box with a new id. Ids are never reused.
-    /// A mint that collides with an id a live row or attachment already
-    /// holds is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
+    /// A mint that collides with an id a live row, a kept creation, an
+    /// attachment or a revocation record the proxy retains already holds
+    /// is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
     /// never re-minted — before any address is spent, and said as one warn
     /// line naming the id. A name that folds to one a live row already
     /// holds is refused the same way ([`AllocationError::NameAlreadyHeld`]):
@@ -4165,10 +4419,20 @@ impl BoxRegistry {
         // behind — no row, no share, no attachment, no spent address.
         // A colliding mint is refused, never re-minted: a collision means
         // the mint is broken, and a second draw would hide it.
-        if self.holds_box_id(id) {
+        if let Some(holder) = self.holds_box_id(id)? {
+            let (record, audit) = match &holder {
+                IdHolder::AuditedRevocation { record, audit } => {
+                    (record.as_str(), audit.display().to_string())
+                }
+                _ => ("", String::new()),
+            };
             tracing::warn!(
                 box_id = %crate::bep_attach::BoxIdText(&id),
-                "refused a box registration whose id a live row or attachment already holds"
+                held_by = holder.as_str(),
+                record,
+                audit,
+                "refused a box registration whose id is already held: the check reads live \
+                 rows, kept creations, attachments and the proxy's revocation records"
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
@@ -4349,20 +4613,32 @@ impl BoxRegistry {
         )
     }
 
-    /// Whether some live row, attachment or kept creation already holds
-    /// `id` (BEP-070): the collision check every client-driven
+    /// Which record already holds `id`, if any (BEP-070): a live row, a
+    /// kept creation, an attachment, or a revocation record the Box Egress
+    /// Proxy retains. It is the collision check every client-driven
     /// registration runs on the id it minted. A dormant creation
     /// ([`Creation`]) is a retained box record: its id stays its box's
-    /// while its creator may still resume it. An id is never reused
+    /// while its creator may still resume it. A revocation record names
+    /// its id for as long as the proxy keeps it, restored from its audit
+    /// log at each start ([`proxy_revoked_box_ids`]). An id is never reused
     /// because no client can present one and the mint never draws the same
     /// UUIDv7 twice, not because this check remembers spent ids.
-    fn holds_box_id(&self, id: BoxId) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`AllocationError::RevocationsUnread`] when a proxy answers its
+    /// control socket but does not list its revocations. Only a socket
+    /// that is absent or refuses the connect reads as no proxy. With no
+    /// proxy, the check reads the revocation records in the proxy's audit
+    /// log ([`audit_revocation_holding`]), and
+    /// [`AllocationError::AuditUnread`] when that log is not read whole.
+    fn holds_box_id(&self, id: BoxId) -> Result<Option<IdHolder>, AllocationError> {
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         if rows.values().any(|record| record.box_id == id) {
-            return true;
+            return Ok(Some(IdHolder::LiveRow));
         }
         drop(rows);
         if self
@@ -4370,11 +4646,54 @@ impl BoxRegistry {
             .values()
             .any(|creation| creation.id() == id)
         {
-            return true;
+            return Ok(Some(IdHolder::KeptCreation));
         }
-        self.attachments
+        if self
+            .attachments
             .as_ref()
             .is_some_and(|attachments| attachments.holds_id(id))
+        {
+            return Ok(Some(IdHolder::Attachment));
+        }
+        let Some(path) = self.proxy_control.as_deref() else {
+            return Ok(None);
+        };
+        match proxy_revoked_box_ids(path) {
+            Ok(revoked) => Ok(revoked
+                .contains(&box_id_hex(id))
+                .then_some(IdHolder::RevocationRecord)),
+            // No proxy serves the socket, so the check reads the revocation
+            // records the proxy's audit log retains: the ones its next start
+            // puts back in force (BEP-068).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                tracing::debug!(
+                    %error,
+                    "no Box Egress Proxy answers its control socket: the box id check reads the \
+                     revocation records in its audit log"
+                );
+                audit_revocation_holding(&proxy_audit_dir(path), id)
+            }
+            // A proxy is there but its list was not read: a timeout, a
+            // refusal or a malformed reply. The check cannot show that no
+            // record holds the id, so it fails closed.
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %crate::bep_attach::BoxIdText(&id),
+                    %error,
+                    "refused a box registration: the Box Egress Proxy did not list its \
+                     revocation records, so the box id check did not finish"
+                );
+                Err(AllocationError::RevocationsUnread {
+                    id,
+                    why: error.to_string(),
+                })
+            }
+        }
     }
 
     /// The name a live row or a kept creation holds that `name` folds to,
@@ -6563,9 +6882,7 @@ mod tests {
         let logged = log.contents();
         assert_eq!(
             logged
-                .matches(
-                    "refused a box registration whose id a live row or attachment already holds"
-                )
+                .matches("refused a box registration whose id is already held")
                 .count(),
             1,
             "one warn line per refused registration, got: {logged}"
@@ -10259,6 +10576,36 @@ mod tests {
         assert!(absent.revoke.is_err() && absent.forget.is_err());
     }
 
+    // BEP-063 (#2617): the live box list names each box the registry holds,
+    // in 32 hex digits, in one `live_boxes` line. A registry with no control
+    // socket sends nothing.
+    #[test]
+    fn live_boxes_names_every_box_the_registry_holds() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let db = registry
+            .register_client_box(client_spec("db"))
+            .expect("the plan has an address for the box");
+        let mut expected = vec![super::box_id_hex(web.box_id), super::box_id_hex(db.box_id)];
+        expected.sort();
+        assert_eq!(registry.live_box_ids(), expected);
+        registry.send_live_boxes();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(&path, &["{\"ok\":true}\n"]);
+        registry
+            .clone()
+            .with_proxy_control(Some(path))
+            .send_live_boxes();
+        assert_eq!(
+            server.join().unwrap(),
+            [serde_json::json!({"op": "live_boxes", "box_ids": expected})]
+        );
+    }
+
     // T41: a refused `revoke_box` still sends `forget_box`, so the proxy
     // attributes the destroyed box's id to no live box.
     #[test]
@@ -10306,7 +10653,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        // The registration's id check asks the proxy for its revoked ids
+        // (BEP-070) on one connection. That is the only line the stub
+        // answers.
+        let answered = {
+            use std::io::{BufRead as _, Write as _};
+            let listener = listener.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                (&stream)
+                    .write_all(b"{\"ok\":true,\"box_ids\":[]}\n")
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()
+            })
+        };
         let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(path));
         registry.spawn_withdrawal_drainer(|_| {});
         let mut spec = client_spec("web");
@@ -10315,6 +10679,11 @@ mod tests {
             .register_client_box(spec)
             .expect("the plan has an address for the box");
         assert!(web.declares_credentialed_upstream());
+        assert_eq!(
+            answered.join().unwrap(),
+            serde_json::json!({"op": "revoked_box_ids"})
+        );
+        listener.set_nonblocking(true).unwrap();
         relay_carried_and_ended(&registry, &[&web]);
         wait_until(|| web.is_detached(), "the row detaches at its relay's end");
 
@@ -10340,6 +10709,209 @@ mod tests {
                 )
                 .is_ok(),
             "the creator can resume the box under the same id"
+        );
+    }
+
+    // BEP-070: a minted id that only a revocation record holds is refused.
+    // The proxy wrote the record at a destroy, and its next start restored
+    // it from the audit log. No row, creation or attachment holds the id,
+    // so the proxy's control socket is the only source that names it.
+    #[test]
+    fn a_minted_id_a_revocation_holds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        let id = crate::bep_attach::mint_box_id();
+        let hex = super::box_id_hex(id);
+
+        // The proxy's first run revokes the box and records it in the log.
+        {
+            let log = bep::audit::AuditLog::open_dir(&audit_dir, bep::audit::Rotation::default())
+                .unwrap();
+            let records = bep::control::Records {
+                audit: Some(Arc::new(Mutex::new(log))),
+                ..bep::control::Records::default()
+            };
+            let line = serde_json::json!({"op": "revoke_box", "box_id": hex}).to_string();
+            assert!(records.handle(&line).ok);
+        }
+
+        // Its next start restores the record, and serves its control socket.
+        let restored = bep::revoke::restore(&audit_dir).unwrap();
+        assert_eq!(restored.box_ids, vec![hex.clone()]);
+        let socket = dir.path().join("bep").join("control.sock");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let control = runtime.block_on(async {
+            bep::control::Control::bind(&socket, Default::default(), Default::default())
+                .unwrap()
+                .with_revocations(Arc::new(RwLock::new(restored.box_ids)))
+        });
+        let serving = runtime.spawn(control.run());
+
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(socket));
+        assert_eq!(
+            registry.holds_box_id(id),
+            Ok(Some(super::IdHolder::RevocationRecord)),
+            "only the proxy's revocation record holds the id"
+        );
+        let refused = registry
+            .register_client_box_as(client_spec("web"), Ipv4Addr::new(127, 0, 0, 2), 0, id, None)
+            .expect_err("an id a revocation record holds is not a new box's");
+        assert_eq!(refused, AllocationError::CollidingBoxId { id });
+        let text = refused.to_string();
+        assert!(
+            text.contains(&crate::bep_attach::BoxIdText(&id).to_string()),
+            "{text}"
+        );
+        for source in [
+            "running box",
+            "stopped box that can resume",
+            "attachment",
+            "revocation record",
+        ] {
+            assert!(text.contains(source), "the refusal names {source}: {text}");
+        }
+        assert!(
+            registry.table().rows().is_empty(),
+            "a refused registration publishes no row"
+        );
+
+        // A fresh mint that no record holds still registers.
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("an id no record holds registers");
+        assert_ne!(web.box_id(), id);
+        serving.abort();
+    }
+
+    // BEP-070: a proxy that answers its control socket but does not list
+    // its revocations leaves the id check unfinished, so the mint is
+    // refused rather than let through. A missing socket reads as no proxy.
+    #[test]
+    fn a_minted_id_a_revocation_holds_is_refused_when_the_proxy_does_not_list_them() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let answered = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            (&stream)
+                .write_all(b"{\"ok\":false,\"error\":\"unknown op\"}\n")
+                .unwrap();
+        });
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(path));
+        let id = crate::bep_attach::mint_box_id();
+        let refused = registry
+            .register_client_box_as(client_spec("web"), Ipv4Addr::new(127, 0, 0, 2), 0, id, None)
+            .expect_err("an unfinished id check refuses the registration");
+        answered.join().unwrap();
+        assert!(
+            matches!(&refused, AllocationError::RevocationsUnread { id: refused_id, why }
+                if *refused_id == id && why.contains("unknown op")),
+            "got {refused:?}"
+        );
+        assert!(
+            registry.table().rows().is_empty(),
+            "a refused registration publishes no row"
+        );
+
+        // No socket at the path reads as no proxy, and the box registers.
+        let absent =
+            BoxRegistry::new(SUBNET).with_proxy_control(Some(dir.path().join("absent.sock")));
+        absent
+            .register_client_box(client_spec("web"))
+            .expect("with no proxy, no revocation is in force");
+    }
+
+    // BEP-070: with no proxy running, a minted id that a revocation record
+    // in the proxy's audit log holds is refused. The check reads the
+    // records a `bep serve` start puts back in force, and the refusal's
+    // log line names the record that holds the id.
+    #[test]
+    fn a_minted_id_a_revocation_holds_is_refused_with_no_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let bep_dir = dir.path().join("bep");
+        let audit_dir = bep_dir.join("audit");
+        let socket = bep_dir.join("control.sock");
+        let id = crate::bep_attach::mint_box_id();
+        let hex = super::box_id_hex(id);
+
+        // A proxy revoked the box and recorded it in the log, then stopped.
+        {
+            let log = bep::audit::AuditLog::open_dir(&audit_dir, bep::audit::Rotation::default())
+                .unwrap();
+            let records = bep::control::Records {
+                audit: Some(Arc::new(Mutex::new(log))),
+                ..bep::control::Records::default()
+            };
+            let line = serde_json::json!({"op": "revoke_box", "box_id": hex}).to_string();
+            assert!(records.handle(&line).ok);
+        }
+        assert!(!socket.exists(), "no proxy serves the control socket");
+
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(socket.clone()));
+        match registry.holds_box_id(id) {
+            Ok(Some(super::IdHolder::AuditedRevocation { record, audit })) => {
+                assert!(record.contains(&hex), "the record names the id: {record}");
+                assert_eq!(audit, audit_dir);
+            }
+            other => panic!("only the audit log's revocation record holds the id: {other:?}"),
+        }
+        let refused = registry
+            .register_client_box_as(client_spec("web"), Ipv4Addr::new(127, 0, 0, 2), 0, id, None)
+            .expect_err("an id a revocation record holds is not a new box's");
+        assert_eq!(refused, AllocationError::CollidingBoxId { id });
+        assert!(
+            refused.to_string().contains("revocation record"),
+            "{refused}"
+        );
+        assert!(
+            registry.table().rows().is_empty(),
+            "a refused registration publishes no row"
+        );
+
+        // A fresh mint that no record holds still registers.
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("an id no record holds registers");
+        assert_ne!(web.box_id(), id);
+
+        // A complete line that does not parse can be a revocation, so the
+        // check fails closed and names the segment that holds it.
+        let segment = bep::audit::segments(&audit_dir).unwrap().remove(0);
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes.extend_from_slice(b"not a record\n");
+        std::fs::write(&segment, bytes).unwrap();
+        let other = crate::bep_attach::mint_box_id();
+        let refused = registry
+            .register_client_box_as(
+                client_spec("api"),
+                Ipv4Addr::new(127, 0, 0, 3),
+                0,
+                other,
+                None,
+            )
+            .expect_err("an unreadable audit line refuses the registration");
+        assert!(
+            matches!(&refused, AllocationError::AuditUnread { id: refused_id, why, .. }
+                if *refused_id == other && why.contains(&segment.display().to_string())),
+            "got {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("--quarantine-unreadable"),
+            "the refusal names the way out: {refused}"
+        );
+
+        // The id the record holds is still refused: the record still reads.
+        assert_eq!(
+            registry
+                .register_client_box_as(client_spec("db"), Ipv4Addr::new(127, 0, 0, 4), 0, id, None)
+                .expect_err("the record still holds the id"),
+            AllocationError::CollidingBoxId { id }
         );
     }
 }
