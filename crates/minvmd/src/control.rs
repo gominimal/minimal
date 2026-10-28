@@ -2014,7 +2014,7 @@ struct ExposeDecisionAudit {
     /// The port the box asked to publish.
     port: u16,
     /// The decision the box's `dynamic_ingress` setting made.
-    decision: boxes::DynamicIngress,
+    decision: sessions::DynamicIngress,
     /// Who decided it.
     decided_by: minimald_rpc::ExposeDecidedBy,
     /// What became of the request.
@@ -6935,7 +6935,7 @@ mod tests {
                     ingress_ports: vec![],
                     egress: None,
                     credentialed_upstream: None,
-                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
@@ -6946,11 +6946,11 @@ mod tests {
     }
 
     /// The host's audit log beside `sock_path`, parsed one record per line.
-    fn host_audit_records(sock_path: &std::path::Path) -> Vec<serde_json::Value> {
+    fn host_audit_records(sock_path: &std::path::Path) -> Vec<serde_json_lenient::Value> {
         let logged = std::fs::read_to_string(audit_log_path(sock_path)).unwrap_or_default();
         logged
             .lines()
-            .map(|line| serde_json::from_str(line).expect("one audit line is one record"))
+            .map(|line| serde_json_lenient::from_str(line).expect("one audit line is one record"))
             .collect()
     }
 
@@ -6970,12 +6970,12 @@ mod tests {
         for (port, decision, outcome) in [
             (
                 4000,
-                boxes::DynamicIngress::Deny,
+                sessions::DynamicIngress::Deny,
                 minimald_rpc::ExposeDecisionOutcome::Refused,
             ),
             (
                 3000,
-                boxes::DynamicIngress::Allow,
+                sessions::DynamicIngress::Allow,
                 minimald_rpc::ExposeDecisionOutcome::Published,
             ),
         ] {
@@ -6997,7 +6997,7 @@ mod tests {
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
                 switch_address: Ipv4Addr::new(192, 0, 2, 1),
                 port: 3000,
-                decision: boxes::DynamicIngress::Allow,
+                decision: sessions::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Published,
             }),
@@ -7013,7 +7013,7 @@ mod tests {
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
                 switch_address: web.switch_address,
                 port: 3001,
-                decision: boxes::DynamicIngress::Allow,
+                decision: sessions::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Published,
             }),
@@ -7116,7 +7116,7 @@ mod tests {
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
                 switch_address: web.switch_address,
                 port: 4000,
-                decision: boxes::DynamicIngress::Deny,
+                decision: sessions::DynamicIngress::Deny,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
             }),

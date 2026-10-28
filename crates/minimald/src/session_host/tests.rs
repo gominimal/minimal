@@ -5766,14 +5766,14 @@ async fn expose_unenrolled_decision_audited() {
             minimald_rpc::ExposeDecisionReport {
                 switch_address: web_row,
                 port: 3000,
-                decision: boxes::DynamicIngress::Allow,
+                decision: sessions::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Published,
             },
             minimald_rpc::ExposeDecisionReport {
                 switch_address: db_row,
                 port: 3000,
-                decision: boxes::DynamicIngress::Deny,
+                decision: sessions::DynamicIngress::Deny,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
                 outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
             },

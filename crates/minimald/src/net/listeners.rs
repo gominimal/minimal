@@ -761,7 +761,7 @@ fn send_host_audit(channel: BoxReportChannel, request: minimald_rpc::BoxControlR
 pub(crate) fn report_expose_decision(
     box_name: &str,
     port: u16,
-    decision: boxes::DynamicIngress,
+    decision: sessions::DynamicIngress,
     decided_by: minimald_rpc::ExposeDecidedBy,
     outcome: minimald_rpc::ExposeDecisionOutcome,
 ) {
