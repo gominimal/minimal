@@ -1001,7 +1001,16 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            let reply = order.apply(|| withdraw_box(boxes, answerer, request));
+            let reply = order.apply(|| {
+                let (name, switch_address) = (request.name.clone(), request.switch_address);
+                let reply = withdraw_box(boxes, answerer, request);
+                // The box is gone: its audit window ends, and the count of
+                // the records it suppressed lands now.
+                if matches!(reply, BoxControlReply::Addresses(_)) {
+                    flush_guest_audit(audit_path, &name, switch_address);
+                }
+                reply
+            });
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ResumeBox(request), ControlDoor::Host) => {
@@ -2023,15 +2032,18 @@ fn append_audit_copy(
     );
 }
 
-/// How long one box's audit window lasts: the guest's expose decision and
-/// refused egress reports for a box write at most
-/// [`GUEST_AUDIT_RECORDS_PER_WINDOW`] records in it.
+/// How long one box's audit window lasts: the guest's expose decision
+/// reports for a box write at most [`GUEST_AUDIT_RECORDS_PER_WINDOW`]
+/// records in it, and its refused egress reports as many again.
 const GUEST_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The most records the guest's audit reports write for one box in one
-/// [`GUEST_AUDIT_WINDOW`]. Past it a report is counted, not written, and
-/// the next window's first record is preceded by one line with the count,
-/// so a hostile box cannot fill the host's disk through its reports.
+/// The most records each kind of the guest's audit reports (expose
+/// decisions, refused egress) writes for one box in one
+/// [`GUEST_AUDIT_WINDOW`]. Each kind has its own budget, so a flood of
+/// refused flows never hides a later expose decision. Past it a report is
+/// counted, not written, and one line with the count precedes the next
+/// window's first record, or lands when the box is withdrawn. So a hostile
+/// box cannot fill the host's disk through its reports.
 const GUEST_AUDIT_RECORDS_PER_WINDOW: u32 = 30;
 
 /// The most refused flows one box's window remembers to fold repeats.
@@ -2041,12 +2053,14 @@ const GUEST_AUDIT_FLOWS_PER_WINDOW: usize = 256;
 /// process. Past it the windows that ended are pruned.
 const GUEST_AUDIT_TRACKED: usize = 1024;
 
-/// One box's audit window: when it opened, how many records it wrote, how
-/// many it suppressed, and the refused flows it already recorded.
+/// One box's audit window: when it opened, how many records of each kind
+/// it wrote, how many it suppressed, and the refused flows it already
+/// recorded.
 #[derive(Debug)]
 struct GuestAuditWindow {
     opened: std::time::Instant,
-    written: u32,
+    expose_written: u32,
+    egress_written: u32,
     suppressed: u64,
     flows: HashSet<String>,
 }
@@ -2091,7 +2105,8 @@ fn admit_guest_audit(
     }
     let window = windows.entry(key).or_insert_with(|| GuestAuditWindow {
         opened: now,
-        written: 0,
+        expose_written: 0,
+        egress_written: 0,
         suppressed: 0,
         flows: HashSet::new(),
     });
@@ -2100,7 +2115,8 @@ fn admit_guest_audit(
         carried = window.suppressed;
         *window = GuestAuditWindow {
             opened: now,
-            written: 0,
+            expose_written: 0,
+            egress_written: 0,
             suppressed: 0,
             flows: HashSet::new(),
         };
@@ -2110,11 +2126,18 @@ fn admit_guest_audit(
     {
         return GuestAuditAdmission::Repeat;
     }
-    if window.written >= GUEST_AUDIT_RECORDS_PER_WINDOW {
+    // Each kind spends its own budget: refused flows never use up the
+    // records an expose decision needs.
+    let written = if flow.is_some() {
+        &mut window.egress_written
+    } else {
+        &mut window.expose_written
+    };
+    if *written >= GUEST_AUDIT_RECORDS_PER_WINDOW {
         window.suppressed = window.suppressed.saturating_add(1);
         return GuestAuditAdmission::Suppressed;
     }
-    window.written += 1;
+    *written += 1;
     if let Some(flow) = flow
         && window.flows.len() < GUEST_AUDIT_FLOWS_PER_WINDOW
     {
@@ -2187,6 +2210,35 @@ struct SuppressedAudit {
     suppressed: u64,
 }
 
+/// Writes the line that counts `suppressed` records for the box, when
+/// there are any.
+fn append_suppressed_audit(
+    audit_path: &Path,
+    box_name: &str,
+    switch_address: Ipv4Addr,
+    suppressed: u64,
+) {
+    if suppressed == 0 {
+        return;
+    }
+    tracing::warn!(
+        box = %box_name,
+        %switch_address,
+        suppressed,
+        "the box's audit reports passed the host's cap; records were suppressed"
+    );
+    append_audit_line(
+        audit_path,
+        &SuppressedAudit {
+            ts: unix_now_secs(),
+            event: "audit_suppressed",
+            box_name: box_name.to_string(),
+            switch_address,
+            suppressed,
+        },
+    );
+}
+
 /// Writes the suppressed-count line when the admission carries one, and
 /// says whether the record itself is to be written.
 fn take_guest_audit(
@@ -2197,27 +2249,24 @@ fn take_guest_audit(
 ) -> bool {
     match admission {
         GuestAuditAdmission::Write { suppressed } => {
-            if *suppressed > 0 {
-                tracing::warn!(
-                    box = %box_name,
-                    %switch_address,
-                    suppressed,
-                    "the box's audit reports passed the host's cap; records were suppressed"
-                );
-                append_audit_line(
-                    audit_path,
-                    &SuppressedAudit {
-                        ts: unix_now_secs(),
-                        event: "audit_suppressed",
-                        box_name: box_name.to_string(),
-                        switch_address,
-                        suppressed: *suppressed,
-                    },
-                );
-            }
+            append_suppressed_audit(audit_path, box_name, switch_address, *suppressed);
             true
         }
         GuestAuditAdmission::Repeat | GuestAuditAdmission::Suppressed => false,
+    }
+}
+
+/// Ends a withdrawn box's audit window. The window is forgotten, so a later
+/// box at the same address starts a fresh one. The count of the records it
+/// suppressed is written now: a box that stops reporting opens no later
+/// window, so without this flush that count is never written.
+fn flush_guest_audit(audit_path: &Path, box_name: &str, switch_address: Ipv4Addr) {
+    let window = GUEST_AUDIT_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(audit_path.to_path_buf(), switch_address));
+    if let Some(window) = window {
+        append_suppressed_audit(audit_path, box_name, switch_address, window.suppressed);
     }
 }
 
@@ -7378,6 +7427,32 @@ mod tests {
             "a guest's rule text is clamped: {records:?}"
         );
 
+        // The flood used up the egress budget, not the expose one: a denied
+        // `min net expose` after it is still recorded.
+        let expose = control(
+            &guest,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: web.switch_address,
+                port: 4000,
+                decision: boxes::DynamicIngress::Deny,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+            }),
+        )
+        .expect("the report is answered");
+        assert_eq!(
+            expose,
+            BoxControlReply::Audited { audited: true },
+            "a flood of refused flows never hides an expose decision"
+        );
+        assert_eq!(
+            host_audit_records(&guest)
+                .iter()
+                .filter(|record| record["event"] == "expose_decision")
+                .count(),
+            1
+        );
+
         // The window's end: the next record is preceded by the count.
         let audit_path = audit_log_path(&guest);
         let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
@@ -7405,5 +7480,36 @@ mod tests {
         );
         assert_eq!(suppressed[0]["box"], "web");
         assert_eq!(suppressed[0]["suppressed"], 21);
+
+        // A box that floods and then goes quiet: its withdrawal writes the
+        // count, since no later report will.
+        let mut dropped = 0u64;
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16 + 5) {
+            if refused(port, "quiet after") == (BoxControlReply::Audited { audited: false }) {
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0, "the flood passed the cap");
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: None,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the box is withdrawn: {withdrawn:?}"
+        );
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(suppressed.len(), 2, "the withdrawal flushes the count");
+        assert_eq!(suppressed[1]["box"], "web");
+        assert_eq!(suppressed[1]["suppressed"], dropped);
     }
 }
