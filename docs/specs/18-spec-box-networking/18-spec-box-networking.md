@@ -577,7 +577,7 @@ and an activation whose declared port cannot be published is refused
   verify:   cargo nextest run -p minimald proxy_undeclared_port_refused_like_direct
   property: for every target box, every port it has not published, and every proxied request to it, the refusal equals the direct-connection refusal
   harness:  kani_frame_verdict_admits_nothing_undeclared; bound and purity constraint under Tiers in Design reasoning
-  <!-- S8c/AC1; prose 45; unwanted; "published" covers a declared port and a port published while the box runs (NET-016, NET-044), so a port a direct connection reaches is never refused through the proxy (NET-071) -->
+  <!-- S8c/AC1; prose 45; unwanted; "published" covers a declared port and a port published while the box runs (NET-016, NET-044), so a port a direct connection reaches is never refused through the proxy (NET-071); for a host-address box, published means bound: the host-address lane does not filter (design §7.1 parity bullet), so its verdict admits every port and a port nothing listens on is unreachable, not refused -->
 
 - **NET-070** IF a request through the hostname proxy comes from a caller whose egress rules deny the target THEN THE SYSTEM SHALL refuse it.
   tier:     T2
@@ -590,7 +590,7 @@ and an activation whose declared port cannot be published is refused
   tier:     T1
   verify:   cargo nextest run -p minimald proxy_parity_across_network_modes
   property: for every network mode, every rule set, and every request, the hostname proxy's verdict equals the direct connection's verdict
-  <!-- S8c/AC2; prose 45; ubiquitous -->
+  <!-- S8c/AC2; prose 45; ubiquitous; the verdict, not the HTTP status, is what equals the direct connection's: a refused verdict reads 403 Forbidden naming the reason; an admitted request whose upstream refuses the connection or times out reads 502 Bad Gateway, in every network mode -->
 
 - **NET-135** THE SYSTEM SHALL route through the hostname proxy only HTTP/1.1 requests and CONNECT tunnels, and close a connection that opens with the HTTP/2 prior-knowledge preface.
   tier:     T0
