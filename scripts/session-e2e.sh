@@ -13317,9 +13317,10 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #             request is NOT RUN until a box can carry a store handle
 #             (#2525): today no box creation mints one.
 #   key       (BEP-063, BEP-067, BEP-070) runs only with
-#             E2E_BEP_KEY_REPLACE=1: a grant box A answers 'gh api
-#             user'. The case puts a value that is no key in the keychain
-#             item of the client's signing key, so the next creation (box
+#             E2E_BEP_KEY_REPLACE=1. The manual macOS lane runs it
+#             (#2500). A grant box A answers 'gh api user'. The case
+#             puts a value that is no key in the keychain item of the
+#             client's signing key, so the next creation (box
 #             B) replaces the key. The proxy keeps the replaced key, which
 #             it names by its kid, and A still answers. The admit records of
 #             A and B each carry the jti of their own handle. The destroy of
@@ -13432,7 +13433,7 @@ rt_leg_key() {
   local ck_id_a ck_id_b ck_id_a2 ck_jti_a ck_jti_b ck_n
   local ck_v7='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
   if [ "${E2E_BEP_KEY_REPLACE:-}" != 1 ]; then
-    not_run "$ck_leg" "the leg replaces the client signing key in this machine's login keychain: set E2E_BEP_KEY_REPLACE=1 to run it"
+    not_run "$ck_leg" "the leg replaces the client signing key in this machine's login keychain: set E2E_BEP_KEY_REPLACE=1 to run it. The manual macOS lane runs it (#2500)"
     return 0
   fi
   bep_live_gate "$ck_leg" || return 0
