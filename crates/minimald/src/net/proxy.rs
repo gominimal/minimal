@@ -3616,7 +3616,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn proxy_forwards_runtime_published_port() {
-        let backend_port = spawn_backend_on(RUNTIME_LEASE, "runtime").await;
+        let probe = TcpListener::bind((RUNTIME_LEASE, 0)).await.unwrap();
+        let backend_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        spawn_backend_on(
+            SocketAddr::new(IpAddr::V4(RUNTIME_LEASE), backend_port),
+            "runtime",
+        )
+        .await;
         let subnet = SwitchSubnet::default();
 
         // The own-address box on a VM host: its lease reported with an empty
@@ -3628,10 +3635,10 @@ mod tests {
 
         // The box's relay gate, registered under its lease as the relay's
         // spawn registers it: the gate a direct connection meets.
-        let gate = Arc::new(BoxGate::for_session(
+        let gate = Arc::new(SessionGate::for_session(
             "rtweb".to_string(),
             RUNTIME_LEASE,
-            &BoxPolicy::default(),
+            &SessionPolicy::default(),
             subnet,
             None,
         ));
@@ -3639,7 +3646,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
         let authority = format!("rtweb.min.internal:{backend_port}");
 
         let buf = CaptureWriter::default();
@@ -3993,7 +4000,7 @@ mod tests {
             // The target's relay gate, registered under its lease as the
             // relay's spawn registers it, with the runtime publishes made:
             // the gate a direct connection to the target meets.
-            let gate = Arc::new(BoxGate::for_session(
+            let gate = Arc::new(SessionGate::for_session(
                 "web".to_string(),
                 target_lease,
                 &target_policy,

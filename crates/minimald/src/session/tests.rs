@@ -7938,7 +7938,7 @@ async fn expose_allow_publishes_and_lists() {
         "listweb",
         switch,
         loopback,
-        Some(boxes::DynamicIngress::Allow),
+        Some(sessions::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
@@ -7954,10 +7954,10 @@ async fn expose_allow_publishes_and_lists() {
     // The box's relay gate, registered under its switch address as the
     // relay's spawn registers it, and the lease its attach reports to the
     // hostname registry: what a direct connection and the proxy both meet.
-    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
         "listweb".to_string(),
         switch,
-        &boxes::BoxPolicy::default(),
+        &sessions::SessionPolicy::default(),
         crate::net::SwitchSubnet::default(),
         None,
     ));
@@ -8095,7 +8095,7 @@ async fn expose_allow_publishes_and_lists() {
     let backend = tokio::net::TcpListener::bind(local)
         .await
         .expect("the mapping's address is free to stand in for the forward");
-    crate::traced::spawn(async move {
+    tokio::spawn(async move {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         while let Ok((mut sock, _)) = backend.accept().await {
             let mut scratch = [0u8; 1024];
@@ -8109,7 +8109,7 @@ async fn expose_allow_publishes_and_lists() {
         .await
         .expect("the proxy binds");
     let proxy_addr = proxy.local_addr().expect("the proxy has an address");
-    crate::traced::spawn(crate::net::proxy::serve(
+    tokio::spawn(crate::net::proxy::serve(
         proxy,
         crate::net::proxy::Router::new(
             std::sync::Arc::clone(&hostnames),

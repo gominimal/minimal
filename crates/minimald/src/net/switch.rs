@@ -2571,7 +2571,7 @@ pub struct Refusal {
 /// target's ingress gate ever sees it (NET-070). The target's half is the
 /// port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
 /// applies over the target's published set: the declared ports and the ports
-/// it published at runtime ([`BoxGate::runtime_published_tcp`], read into
+/// it published at runtime ([`SessionGate::runtime_published_tcp`], read into
 /// the route when its name resolved). A port in neither routes nowhere, and
 /// is refused with the rule a direct connection's drop carries.
 #[must_use]
