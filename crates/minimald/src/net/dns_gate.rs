@@ -3113,10 +3113,19 @@ pub(crate) mod tests {
             assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         }
         assert_eq!(lines("refused-once.example"), 1, "one line for the burst");
-        let reply = reply_to(&gate, "refused-other.example.", RecordType::A);
+        // The key is a bucket of the name under a hasher random to the
+        // process, so a fixed second name shares the first one's bucket on
+        // one run in 256. Pick a second name the hasher puts in another
+        // bucket, so the leg is about two keys, every run.
+        let first = unmatched_refused_key("refused-once.example");
+        let other = (0..)
+            .map(|n| format!("refused-other{n}.example"))
+            .find(|name| unmatched_refused_key(name) != first)
+            .expect("some name falls in another of the 256 buckets");
+        let reply = reply_to(&gate, &format!("{other}."), RecordType::A);
         assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         assert_eq!(
-            lines("refused-other.example"),
+            lines(&other),
             1,
             "a second name is not silenced by the first"
         );
