@@ -895,7 +895,26 @@ impl BoxActor {
         }
 
         let ctx = self.build_context(scaffold_if_missing).await?;
-        Ok(ctx)
+        // NET-155: every context the box hands out places the package builds
+        // it starts in the box's leaf while the box has one, so a task run,
+        // a check or a launch's builds follow the box's egress verdict. The
+        // lookup does not refuse here: a relaunch asks for this context
+        // before its launch creates the leaf again, and the launch then
+        // places the env's builds in that leaf itself (`Env::build`). The
+        // build and materialize side operations refuse a placed box whose
+        // leaf is gone (`build_placement`).
+        let box_id = record.id.to_string();
+        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
+        let leaf = box_build_leaf(
+            std::path::Path::new(sandbox::classifier::TREE_ROOT),
+            &box_id,
+            &box_name,
+            false,
+        )?;
+        Ok(match leaf {
+            Some(leaf) => ctx.with_classifier_leaf(leaf),
+            None => ctx,
+        })
     }
 
     /// The mctx [`Config`] rooted at this session's workspace, shared by the

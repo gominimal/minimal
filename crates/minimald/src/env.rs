@@ -484,6 +484,14 @@ impl Env {
     /// helper), assembles the rootfs, and spawns the command
     /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
+        // NET-155: the leaf the launcher created for this box places every
+        // package build this env starts — the missing packages below and the
+        // in-box installs later — so the box's egress verdict decides what
+        // they reach. It replaces any leaf the context carried, because the
+        // launch's leaf is the one the box runs in now.
+        if let Some(leaf) = args.classifier_leaf.clone() {
+            ctx = ctx.with_classifier_leaf(leaf);
+        }
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
         graph.top_levels = args
@@ -507,6 +515,17 @@ impl Env {
             .all(|bsr| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
         if !all_built {
             tracing::trace!("missing local packages, building session env");
+            match ctx.classifier_leaf() {
+                Some(leaf) => tracing::info!(
+                    box_name = %args.name,
+                    leaf = %leaf.dir().display(),
+                    "starting the box's missing package builds in the box's classifier leaf",
+                ),
+                None => tracing::info!(
+                    box_name = %args.name,
+                    "starting the box's missing package builds in the daemon's own cgroup",
+                ),
+            }
             ctx.build_graph(&graph, false, None)
                 .await
                 .map_err(err_to_io)?;
@@ -1706,6 +1725,19 @@ impl BoxChannel {
         // fetch is recorded as the daemon's own node-plane fetch, made for
         // the box that asked — so the one walk feeds both.
         let scope = install_scope(&new_graph, pkgs);
+        // NET-155: `Env::build` placed this context in the box's leaf, so
+        // the builds this install starts follow the box's egress verdict.
+        match self.ctx.classifier_leaf() {
+            Some(leaf) => tracing::info!(
+                box_name = %self.name,
+                leaf = %leaf.dir().display(),
+                "starting an in-box install's package builds in the box's classifier leaf",
+            ),
+            None => tracing::info!(
+                box_name = %self.name,
+                "starting an in-box install's package builds in the daemon's own cgroup",
+            ),
+        }
         let progress = crate::sandbox_progress::SandboxProgress::new(
             self.ctx.op_tracker(),
             Some(scope.clone()),
