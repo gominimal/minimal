@@ -810,13 +810,27 @@ pub(super) fn place_box_processes(
 /// A supervisor whose children share the daemon's own PID namespace (the
 /// test launcher's plain process) has no namespace to scan. The box is then
 /// the supervisor and its descendants.
+///
+/// A supervisor whose namespace cannot be read is gone: it exited and was
+/// reaped. Its pid can belong to an unrelated process by now, so the box has
+/// no processes and a stop signals nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BoxProcesses {
     /// The box's container supervisor.
     root: u32,
-    /// The `(device, inode)` of the box's PID namespace, or `None` when it is
-    /// the daemon's own.
-    namespace: Option<(u64, u64)>,
+    /// Where the box's processes are.
+    scope: ProcessScope,
+}
+
+/// Where a box's processes are, as `BoxProcesses::of_container` found them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessScope {
+    /// Every process in the PID namespace with this `(device, inode)`.
+    Namespace((u64, u64)),
+    /// The supervisor and its descendants, in the daemon's own namespace.
+    Tree,
+    /// No process: the supervisor's namespace could not be read.
+    Gone,
 }
 
 impl BoxProcesses {
@@ -826,17 +840,27 @@ impl BoxProcesses {
         let boxed = namespace_id(std::path::Path::new(&format!(
             "/proc/{root}/ns/pid_for_children"
         )));
-        let namespace = match (boxed, own) {
-            (Some(boxed), Some(own)) if boxed != own => Some(boxed),
-            _ => None,
+        let scope = match (boxed, own) {
+            (Some(boxed), Some(own)) if boxed != own => ProcessScope::Namespace(boxed),
+            (Some(_), Some(_)) => ProcessScope::Tree,
+            _ => {
+                // A pid whose namespace is not confirmed is never signalled:
+                // the kernel can reuse a reaped supervisor's pid.
+                tracing::debug!(
+                    container_pid = root,
+                    "stop: the container supervisor was already reaped; no process to signal"
+                );
+                ProcessScope::Gone
+            }
         };
-        Self { root, namespace }
+        Self { root, scope }
     }
 
     /// The box's live processes. A zombie has ended, so it is not one.
     pub(crate) fn pids(&self) -> Vec<i32> {
-        match self.namespace {
-            Some(namespace) => procfs_pids()
+        match self.scope {
+            ProcessScope::Gone => Vec::new(),
+            ProcessScope::Namespace(namespace) => procfs_pids()
                 .into_iter()
                 .filter(|pid| {
                     namespace_id(std::path::Path::new(&format!("/proc/{pid}/ns/pid")))
@@ -844,7 +868,7 @@ impl BoxProcesses {
                 })
                 .filter(|pid| is_live(*pid))
                 .collect(),
-            None => {
+            ProcessScope::Tree => {
                 let mut tree = Vec::new();
                 let mut next = vec![i32::try_from(self.root).unwrap_or(i32::MAX)];
                 while let Some(pid) = next.pop() {

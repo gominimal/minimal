@@ -12521,3 +12521,25 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     assert_eq!(exited["exit_code"], 125);
     assert!(!exited.contains_key("signal"));
 }
+
+/// BOX-013: a container supervisor that already exited and was reaped has
+/// no readable namespace. Its pid can belong to an unrelated process by
+/// then, so the stop finds no process of the box and signals nothing.
+#[test]
+fn of_container_on_a_reaped_supervisor_signals_nothing() {
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn the stand-in supervisor");
+    let pid = child.id();
+    child.wait().expect("reap the stand-in supervisor");
+
+    for root in [pid, u32::try_from(i32::MAX).unwrap()] {
+        let processes = crate::box_runtime::BoxProcesses::of_container(root);
+        assert!(
+            processes.pids().is_empty(),
+            "a supervisor with no readable namespace has no processes"
+        );
+        // Signal 0 checks delivery and sends nothing, so a reused pid is safe.
+        assert_eq!(processes.signal(0), 0, "no process is signalled");
+    }
+}
