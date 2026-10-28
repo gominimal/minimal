@@ -17321,12 +17321,32 @@ proof_proxy_sees_boxes_by_address() {
     cred_case_log | grep -F -- 'connection delivered' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # The gate's own drop line carries `rule_matched`. The relay's refusal
+  # reaches the host as the audit record minvmd::control logs with a `rule`
+  # field, so match only the gate's field here, and expect the audit record
+  # for this box below.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the laneless box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+  psba_nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-psba-nolane"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      psba_nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$psba_nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-psba-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent, and the host audit log holds the relay's refusal"
 
   # The host process's leg: NET-132's IF-clause, end to end. A process
   # outside every box connects straight to the acceptor's own unix socket
