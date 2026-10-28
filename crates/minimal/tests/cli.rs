@@ -3089,7 +3089,7 @@ fn policy_shows_baseline_set() {
     // The rows are the enumeration the helper carries, one per category —
     // the set the host-side gate decides the daemon's own frames by — each
     // named by the host the daemon's own downloads go to (NET-061).
-    let rendered_baseline = "  registry  cache.minimal.dev\n  cache  cache.minimal.dev\n";
+    let rendered_baseline = "  registry  github.com\n  cache  cache.minimal.dev\n";
     assert!(
         text.contains(rendered_baseline),
         "the baseline rows are the enumeration's entries, one per category, \
@@ -3113,15 +3113,14 @@ fn policy_shows_baseline_set() {
         Value::String("in force".to_string()),
         "the JSON view carries the in-force posture:\n{document}"
     );
-    let named = Value::String("cache.minimal.dev".to_string());
     let entries = document["node_plane_baseline"]["entries"]
         .as_array()
         .expect("the JSON view carries the baseline entries");
     assert_eq!(entries.len(), 2, "registry and cache:\n{document}");
-    for entry in entries {
+    for (entry, host) in entries.iter().zip(["github.com", "cache.minimal.dev"]) {
         assert_eq!(
             entry["endpoints"],
-            Value::Array(vec![named.clone()]),
+            Value::Array(vec![Value::String(host.to_string())]),
             "the JSON view names each entry's host:\n{document}"
         );
     }
