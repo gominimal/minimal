@@ -600,13 +600,25 @@ fn node_dns_layer(subnet: SwitchSubnet, lease: Ipv4Addr) -> DnsGate {
         "node",
         None,
         compiled_egress(None, subnet, lease, None),
-        egress::InfrastructureDenySet::new(
-            subnet.dns_server().octets(),
-            subnet.host_alias().octets(),
-        ),
+        infrastructure_deny_set(subnet),
         subnet.host_alias().octets(),
         Arc::new(PolicyWarnLimiter::new()),
     )
+}
+
+/// The rebinding deny set for one switch: its resolver and host alias, and
+/// on a carved switch the documented host literal too. That switch maps the
+/// literal to the host loopback, so the literal is one of its own addresses
+/// and the set always refuses it, like the alias.
+fn infrastructure_deny_set(subnet: SwitchSubnet) -> egress::InfrastructureDenySet {
+    let set = egress::InfrastructureDenySet::new(
+        subnet.dns_server().octets(),
+        subnet.host_alias().octets(),
+    );
+    match subnet.documented_host_literal() {
+        Some(literal) => set.with_host_literal(literal.octets()),
+        None => set,
+    }
 }
 
 /// The daemon's own relay, carrying the node's DNS layer
@@ -1554,10 +1566,7 @@ impl BoxGate {
         // with the DNS gate below — so a name's admission and a frame's
         // verdict can never disagree about what the box declared.
         let rules = compiled_egress(Some(policy), subnet, lease, hostname_proxy_port);
-        let infrastructure = egress::InfrastructureDenySet::new(
-            subnet.dns_server().octets(),
-            subnet.host_alias().octets(),
-        );
+        let infrastructure = infrastructure_deny_set(subnet);
         let limiter = Arc::new(PolicyWarnLimiter::new());
         // One DNS gate per box, sharing the limiter, the resolver address
         // the egress rules already resolved from `subnet` (NET-079's
@@ -6554,6 +6563,30 @@ pub(crate) mod tests {
         assert!(
             notice.emit(),
             "a policy warning must not suppress the deprecation notice"
+        );
+    }
+
+    /// NET-004 with §5.3: on a carved `/24` the documented literal is one of
+    /// the switch's own addresses, so the rebinding deny set refuses it, a
+    /// box-zone answer included. The default subnet's set is unchanged.
+    #[test]
+    fn rebinding_refuses_documented_literal_on_a_carved_switch() {
+        let literal = [100, 64, 255, 254];
+        let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
+        let set = infrastructure_deny_set(carved);
+        assert_eq!(
+            egress::rebinding_admits(literal, true, None, None, &set),
+            Err(egress::RebindingRefusal::Infrastructure),
+            "a box-zone answer of the literal is refused on a carved switch"
+        );
+        // A sibling's lease on the same switch is still admitted.
+        egress::rebinding_admits([100, 64, 3, 9], true, None, None, &set).unwrap();
+        assert_eq!(
+            infrastructure_deny_set(SwitchSubnet::default()),
+            egress::InfrastructureDenySet::new(
+                SwitchSubnet::default().dns_server().octets(),
+                SwitchSubnet::default().host_alias().octets(),
+            ),
         );
     }
 
