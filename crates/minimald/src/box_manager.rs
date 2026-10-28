@@ -1401,6 +1401,19 @@ impl BoxManager {
                             // the record. Evicting here instead makes that
                             // delete bring up a new actor, which runs the
                             // `on_destroy` hooks a second time.
+                            //
+                            // No retry until one of those two comes: the
+                            // run's client may have died with the daemon,
+                            // so no delete may ever arrive. Deliberate
+                            // (review 2026-10-28, minimal#2345): the next
+                            // restart reaps the record through this same
+                            // path, so the leftover is bounded by a
+                            // restart and not retried inside this run.
+                            // Retrying sooner means evicting the closed
+                            // actor or spawning a second teardown, and
+                            // either lets a later delete bring up a fresh
+                            // actor that runs the `on_destroy` hooks a
+                            // second time.
                             Err(error) => tracing::warn!(
                                 %error,
                                 "resume: destroying the run-owned box failed; \
