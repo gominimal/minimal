@@ -1294,6 +1294,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                                 loadouts,
                                                 crate::loadouts::HookPrep::Enforce,
                                                 Some(user_policy),
+                                                // The dashboard owns the screen, so
+                                                // it refuses an undecided item rather
+                                                // than asking.
+                                                crate::loadouts::PromptLane::Dashboard,
                                             )?;
                                         let decision = crate::decide_workspace_upload(
                                             &root,

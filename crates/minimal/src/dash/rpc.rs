@@ -550,7 +550,12 @@ pub async fn activate(
                 contribution: inputs.contribution,
             })
             .await
-            .map_err(|error| session_rpc_failed(SessionRpc::ConfigureLoadout, error))?;
+            .map_err(|error| {
+                minimal_client::explain_configure_loadout_error(session_rpc_failed(
+                    SessionRpc::ConfigureLoadout,
+                    error,
+                ))
+            })?;
         match configured {
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {

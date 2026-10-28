@@ -1261,6 +1261,29 @@ pub fn version_assertion() -> Option<String> {
     (!skew_override_set()).then(|| version::VERSION.to_string())
 }
 
+/// Explain a failed `ConfigureLoadout` that a daemon predating untrusted
+/// loadouts refused because it could not decode one.
+///
+/// `CreateSession`'s version gate refuses a skewed daemon before any
+/// loadout is sent, so this is reachable only under [`SKEW_OVERRIDE_VAR`].
+/// There the daemon's decode error is all the operator would see, and
+/// ``unknown variant `untrusted_loadout` `` does not say what to do. Any
+/// other error passes through unchanged.
+#[must_use]
+pub fn explain_configure_loadout_error(error: anyhow::Error) -> anyhow::Error {
+    let kind = boxes::wire::primitives::UNTRUSTED_LOADOUT_KIND;
+    if !format!("{error:#}").contains(&format!("`{kind}`")) {
+        return error;
+    }
+    error.context(format!(
+        "The running minimald predates untrusted loadouts and cannot accept \
+         one, and this activation applies a loadout from `loadouts-untrusted/`. \
+         {SKEW_OVERRIDE_VAR} let this CLI talk to a daemon of another build. \
+         Restart the daemon on this build (run `min stop`, then re-run this \
+         command), or leave the untrusted loadout out of this activation."
+    ))
+}
+
 /// Refuse to drive a daemon built from a different tree than this CLI, given
 /// the build it just reported on a reply the caller was making anyway.
 ///
@@ -1637,6 +1660,35 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 mod tests {
     use super::{Client, resolve_provider_dir, resolve_socket_path};
     use std::path::Path;
+
+    /// An old daemon's refusal to decode an untrusted loadout is explained,
+    /// with the decode error kept in the chain; any other failure is left
+    /// exactly as it was.
+    #[test]
+    fn configure_loadout_error_explains_an_undecodable_untrusted_loadout() {
+        let refused = anyhow::anyhow!(
+            "unknown variant `untrusted_loadout`, expected one of `user_loadout`, \
+             `project`, `package` at line 1 column 80"
+        )
+        .context("ConfigureLoadout RPC failed");
+        let explained = super::explain_configure_loadout_error(refused);
+        let rendered = format!("{explained:#}");
+        assert!(
+            rendered.starts_with("The running minimald predates untrusted loadouts"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains(super::SKEW_OVERRIDE_VAR),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("unknown variant"), "got: {rendered}");
+
+        let other = anyhow::anyhow!("connection reset").context("ConfigureLoadout RPC failed");
+        assert_eq!(
+            format!("{:#}", super::explain_configure_loadout_error(other)),
+            "ConfigureLoadout RPC failed: connection reset",
+        );
+    }
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
     /// data on stream 1 (during a diagnostic download or a workspace upload)

@@ -706,6 +706,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         selection,
         crate::loadouts::HookPrep::StageOnly,
         Some(amended_policy),
+        crate::loadouts::PromptLane::for_run(global.no_input),
     )?;
     inputs.announce_loadouts();
 
@@ -795,7 +796,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             contribution,
         })
         .await
-        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
+        .map_err(|error| {
+            minimal_client::explain_configure_loadout_error(crate::session_rpc_failed(
+                crate::SessionRpc::ConfigureLoadout,
+                error,
+            ))
+        })?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
         // Same failure, same wording as an activate: the user knows the

@@ -1281,8 +1281,14 @@ pub(crate) async fn activate_box(
             } else {
                 loadouts::HookPrep::Enforce
             };
-            let inputs =
-                loadouts::prepare_activation_inputs(global, &project_root, selection, hooks, None)?;
+            let inputs = loadouts::prepare_activation_inputs(
+                global,
+                &project_root,
+                selection,
+                hooks,
+                None,
+                loadouts::PromptLane::for_run(args.no_prompt || global.no_input),
+            )?;
 
             // Scaffold-offer a missing `minimal.toml` only after the loadouts
             // resolve and compose: a bad `--loadout` must error before anything
@@ -2030,9 +2036,8 @@ pub(crate) async fn activate_box(
                             .and_then(|registration| registration.box_id),
                     )
                     .await;
-                    return Err(session_rpc_failed(
-                        crate::SessionRpc::ConfigureLoadout,
-                        error,
+                    return Err(minimal_client::explain_configure_loadout_error(
+                        session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error),
                     ));
                 }
                 Ok(configured) => configured,

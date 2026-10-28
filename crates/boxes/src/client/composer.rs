@@ -12,13 +12,12 @@ use crate::wire::request::WireContribution;
 /// Accumulator for a user's loadouts, composed into a
 /// [`WireContribution`] by [`Self::compose`].
 ///
-/// User-origin items always reach a `Decided` outcome under
+/// Items from trusted loadouts always reach a `Decided` outcome under
 /// [`UserPolicy`] (the allow step auto-passes for them; `ignore`
-/// and `deny` still apply), so the compose pass needs no
-/// [`PolicyHooks`] — nothing here can land in a "needs approval"
-/// state.
-///
-/// [`PolicyHooks`]: crate::core::hooks::PolicyHooks
+/// and `deny` still apply), so composing only those needs no
+/// [`PolicyHooks`]. Items from an [untrusted](Loadout::untrusted)
+/// loadout are gated like a project's and can need approval, so a
+/// composer holding one is composed via [`Self::compose_with_hooks`].
 pub struct UserComposer {
     contribution: Contribution,
     /// Names of every loadout already accepted via [`Self::add`].
@@ -160,22 +159,49 @@ impl UserComposer {
     /// Compose every accumulated loadout against `policy` and emit
     /// the wire form ready to ship to the daemon.
     ///
-    /// This composer only accepts loadouts via [`Self::add`], so every
-    /// item carries `Source::UserLoadout`: the policy's allow step
-    /// auto-passes, but `deny` and `ignore` still apply (so a user
-    /// loadout entry matching a deny rule is rejected, and a match
-    /// on ignore is silently dropped).
+    /// For trusted loadouts, every item carries `Source::UserLoadout`:
+    /// the policy's allow step auto-passes, but `deny` and `ignore`
+    /// still apply (so a user loadout entry matching a deny rule is
+    /// rejected, and a match on ignore is silently dropped).
     ///
     /// # Errors
     ///
     /// See [`ComposeError`]. The hookless path returns
-    /// [`ComposeError::HookRequired`] if a `Loadout::contribute` impl
-    /// ever produces a non-user-origin item — a contributor bug, since
-    /// loadouts must tag everything `Source::UserLoadout`.
+    /// [`ComposeError::HookRequired`] for any item that needs approval —
+    /// one from an untrusted loadout the policy does not `allow`. Use
+    /// [`Self::compose_with_hooks`] when untrusted loadouts are present.
     pub fn compose(
         self,
         policy: UserPolicy,
         options: ComposeOptions,
+    ) -> Result<(WireContribution, UserPolicy), ComposeError> {
+        self.compose_inner(policy, options, None)
+    }
+
+    /// [`Self::compose`], asking `hooks` about every item the policy
+    /// can't decide — in practice, items from an untrusted loadout that
+    /// no `allow` rule matches. Gated exactly as a project's items are on
+    /// the daemon-response path: vars by name, patches by path, and
+    /// lifecycle hooks once per loadout directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`ComposeError`]; [`ComposeError::Aborted`] when `hooks`
+    /// aborts.
+    pub fn compose_with_hooks(
+        self,
+        policy: UserPolicy,
+        options: ComposeOptions,
+        hooks: &dyn crate::core::hooks::PolicyHooks,
+    ) -> Result<(WireContribution, UserPolicy), ComposeError> {
+        self.compose_inner(policy, options, Some(hooks))
+    }
+
+    fn compose_inner(
+        self,
+        policy: UserPolicy,
+        options: ComposeOptions,
+        hooks: Option<&dyn crate::core::hooks::PolicyHooks>,
     ) -> Result<(WireContribution, UserPolicy), ComposeError> {
         // Tilde fallback comes from the user's env on the client side
         // (this is the user's own process environment, so it's the
@@ -184,7 +210,7 @@ impl UserComposer {
         let anchors = PatchAnchors::home(home_fallback.as_deref())
             .with_loadouts_dir(self.loadouts_dir.as_ref());
         let (composition, final_policy) =
-            compose_contribution(self.contribution, &[], policy, None, options, anchors)?;
+            compose_contribution(self.contribution, &[], policy, hooks, options, anchors)?;
         Ok((
             composition_to_wire(composition, self.orientation),
             final_policy,

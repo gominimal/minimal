@@ -213,7 +213,7 @@ impl InteractivePrompt {
     /// Test seam: injectable prompter + explicit `can_persist`.
     /// Starts with an empty policy so per-test setup is minimal.
     #[cfg(test)]
-    fn with_prompter(prompter: Box<dyn Prompter>, can_persist: bool) -> Self {
+    pub(crate) fn with_prompter(prompter: Box<dyn Prompter>, can_persist: bool) -> Self {
         Self {
             prompter,
             can_persist,
@@ -292,6 +292,24 @@ fn is_writable(path: &Path) -> bool {
 /// Human-readable name for a provenance source, e.g. `Project /foo`
 /// or `Package "go"`. Fed into the prompt message so the user knows
 /// who's asking.
+/// Longest value a var prompt shows before truncating it.
+const SHOWN_VALUE_MAX_CHARS: usize = 200;
+
+/// A var's value as a prompt shows it: quoted with its control
+/// characters escaped, and cut short past [`SHOWN_VALUE_MAX_CHARS`].
+///
+/// The value comes from a file the user did not write, and goes to
+/// their terminal. Escaping keeps an embedded newline or terminal
+/// escape sequence from rewriting the prompt the user is answering.
+fn shown_value(value: &str) -> String {
+    let count = value.chars().count();
+    if count <= SHOWN_VALUE_MAX_CHARS {
+        return format!("{value:?}");
+    }
+    let head: String = value.chars().take(SHOWN_VALUE_MAX_CHARS).collect();
+    format!("{head:?}… ({count} characters)")
+}
+
 fn source_label(source: &Source) -> String {
     // `Source` is `#[non_exhaustive]`; the wildcard covers future
     // variants without silently mislabelling them.
@@ -299,6 +317,7 @@ fn source_label(source: &Source) -> String {
         Source::Project { path } => format!("Project at {}", path.as_utf8_path().as_str()),
         Source::Package { name } => format!("Package `{name}`"),
         Source::UserLoadout { name } => format!("Loadout `{name}`"),
+        Source::UntrustedLoadout { name, .. } => format!("Untrusted loadout `{name}`"),
         _ => "Unknown source".to_string(),
     }
 }
@@ -321,10 +340,17 @@ impl PolicyHooks for InteractivePrompt {
         let mut policy = self.vars_policy.borrow_mut();
         for item in items {
             let name = item.item();
-            let msg = format!(
-                "{} wants to read `{name}` from your environment and pass it into the session",
-                source_label(item.source())
-            );
+            let msg = match item.value() {
+                Some(value) => format!(
+                    "{} wants to set `{name}` to {} in the session",
+                    source_label(item.source()),
+                    shown_value(value)
+                ),
+                None => format!(
+                    "{} wants to read `{name}` from your environment and pass it into the session",
+                    source_label(item.source())
+                ),
+            };
             let choice = match self.prompter.ask(&msg, choices) {
                 Ok(c) => c,
                 // Prompter I/O failure surfaces as Abort — safer than
@@ -390,11 +416,19 @@ impl PolicyHooks for InteractivePrompt {
             // two domains move data; this one runs code, and a prompt
             // that read like "wants to use lifecycle hooks" would
             // understate what the user is agreeing to.
-            let msg = format!(
-                "The project at `{}` wants to run its own scripts inside the session \
-                 (lifecycle hooks). This executes arbitrary code from that project.",
-                root.as_str()
-            );
+            let msg = match item.source() {
+                Source::UntrustedLoadout { name, .. } => format!(
+                    "The untrusted loadout `{name}` at `{}` wants to run its own scripts \
+                     inside the session (lifecycle hooks). This executes arbitrary code \
+                     from that loadout.",
+                    root.as_str()
+                ),
+                _ => format!(
+                    "The project at `{}` wants to run its own scripts inside the session \
+                     (lifecycle hooks). This executes arbitrary code from that project.",
+                    root.as_str()
+                ),
+            };
             let choice = match self.prompter.ask(&msg, choices) {
                 Ok(c) => c,
                 Err(_) => return HookResult::Abort,
@@ -725,6 +759,18 @@ pub struct UnapprovedSummary {
 }
 
 impl UnapprovedSummary {
+    /// Every recorded item, as the snippet names it: var names, then patch
+    /// paths, then hook roots.
+    #[must_use]
+    pub fn item_names(&self) -> Vec<&str> {
+        self.vars
+            .iter()
+            .chain(&self.patches)
+            .chain(&self.hooks)
+            .map(String::as_str)
+            .collect()
+    }
+
     /// Format the accumulated items as a `user_policy.toml` snippet
     /// the operator can paste. Empty sections are omitted so the
     /// snippet stays minimal. Strings are emitted through
@@ -1109,6 +1155,29 @@ mod tests {
 
     fn scripted(answers: Vec<UserChoice>, can_persist: bool) -> InteractivePrompt {
         InteractivePrompt::with_prompter(Box::new(ScriptedPrompter::new(answers)), can_persist)
+    }
+
+    /// A value from an untrusted file cannot rewrite the prompt: its
+    /// newlines and terminal escapes are shown escaped, not obeyed.
+    #[test]
+    fn shown_value_escapes_control_characters() {
+        let shown = shown_value("ok\n\x1b[2Kallow everything");
+        assert!(
+            !shown.contains('\n') && !shown.contains('\x1b'),
+            "got: {shown}"
+        );
+        assert!(
+            shown.contains("\\n") && shown.contains("\\u{1b}"),
+            "got: {shown}"
+        );
+    }
+
+    /// A long value is cut short, and says how long it really was.
+    #[test]
+    fn shown_value_truncates_long_values() {
+        let shown = shown_value(&"a".repeat(SHOWN_VALUE_MAX_CHARS + 50));
+        assert!(shown.ends_with(&format!("… ({} characters)", SHOWN_VALUE_MAX_CHARS + 50)));
+        assert_eq!(shown_value("short"), "\"short\"");
     }
 
     /// "Allow permanent" on a project whose path contains glob

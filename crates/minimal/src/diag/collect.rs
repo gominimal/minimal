@@ -92,11 +92,40 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     )
     .await;
 
+    for subdir in [
+        crate::loadouts::LOADOUTS_DIR_NAME,
+        crate::loadouts::UNTRUSTED_LOADOUTS_DIR_NAME,
+    ] {
+        add_loadouts_dir(w, &paths.config, subdir).await;
+    }
+
+    // The retired reverse proxy's client certificate, key and CA are not
+    // collected, and their absence is not recorded either (NET-109).
+
+    // Mesh enrolment holds only a host:port endpoint. No-follow like every
+    // other content read: it ships verbatim, so a symlink here would
+    // exfiltrate an arbitrary file byte-for-byte.
+    match read_string_nofollow(&paths.mesh_enrolment).await {
+        Ok(content) => {
+            w.add_bytes("config/mesh-enrolment", content.as_bytes(), Redaction::None)
+                .await?
+        }
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => w.skip("config/mesh-enrolment", format!("unreadable: {e:#}")),
+    }
+    Ok(())
+}
+
+/// Collect one loadouts directory, `<config>/<subdir>`, into
+/// `config/<subdir>/` — the trusted `loadouts` and the untrusted
+/// `loadouts-untrusted` alike.
+async fn add_loadouts_dir(w: &mut BundleWriter, config: &Path, subdir: &str) {
+    let dir = config.join(subdir);
     // Both loadout layouts: `<name>.toml` and `<name>/loadout.toml`. Only
     // the definition file either way — the rest of a loadout's directory
     // ($LOADOUT_ROOT assets, hook scripts) is the user's own content and
     // has never been collected.
-    match tokio::fs::read_dir(paths.config.join("loadouts")).await {
+    match tokio::fs::read_dir(dir).await {
         Ok(mut entries) => loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
@@ -116,7 +145,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                         Ok(ft) => ft.is_dir(),
                         Err(e) => {
                             w.skip(
-                                format!("config/loadouts/{name}"),
+                                format!("config/{subdir}/{name}"),
                                 format!("unreadable: {e}"),
                             );
                             continue;
@@ -134,43 +163,30 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                                 w,
                                 &file,
                                 &format!(
-                                    "config/loadouts/{name}/{}.redacted",
+                                    "config/{subdir}/{name}/{}.redacted",
                                     boxes::client::disk::LOADOUT_FILE_NAME
                                 ),
                             )
                             .await;
                         }
                     } else if path.extension().is_some_and(|e| e == "toml") {
-                        add_redacted_toml(w, &path, &format!("config/loadouts/{name}.redacted"))
+                        add_redacted_toml(w, &path, &format!("config/{subdir}/{name}.redacted"))
                             .await;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    w.skip("config/loadouts/", format!("listing interrupted: {e}"));
+                    w.skip(
+                        format!("config/{subdir}/"),
+                        format!("listing interrupted: {e}"),
+                    );
                     break;
                 }
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
+        Err(e) => w.skip(format!("config/{subdir}/"), format!("unreadable: {e}")),
     }
-
-    // The retired reverse proxy's client certificate, key and CA are not
-    // collected, and their absence is not recorded either (NET-109).
-
-    // Mesh enrolment holds only a host:port endpoint. No-follow like every
-    // other content read: it ships verbatim, so a symlink here would
-    // exfiltrate an arbitrary file byte-for-byte.
-    match read_string_nofollow(&paths.mesh_enrolment).await {
-        Ok(content) => {
-            w.add_bytes("config/mesh-enrolment", content.as_bytes(), Redaction::None)
-                .await?
-        }
-        Err(e) if is_not_found(&e) => {}
-        Err(e) => w.skip("config/mesh-enrolment", format!("unreadable: {e:#}")),
-    }
-    Ok(())
 }
 
 /// Adds a TOML file with values redacted; a missing file is silently fine,

@@ -1,0 +1,7 @@
+description = "Untrusted: defines the var a $UT_TRUST_ROOT allow rule names; rule must not expand"
+
+[vars]
+UT_TRUST_ROOT = "@LOADOUTS_UNTRUSTED@/ut-var-attack"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "echo \"ut-var-attack-inline kind=$MINIMAL_HOOK_SOURCE_KIND name=$MINIMAL_HOOK_SOURCE_NAME\" | tee -a \"$HOME/untrusted-loadout-test.log\"" }
