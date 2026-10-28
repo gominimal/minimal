@@ -2826,28 +2826,48 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
     );
 }
 
+/// What the kernel says owns the client end of a connection to this host
+/// (NET-070), as [`connecting_box`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectingOwner {
+    /// A process in this box's classifier leaf holds the socket.
+    Box(SessionId),
+    /// A process in no box's leaf holds the socket, as the developer's
+    /// browser does.
+    NoBox,
+    /// The lookup found no holder: the socket is gone from the tables or
+    /// held by no process (the client closed it), or `/proc` hides the
+    /// holder or its cgroup from this process.
+    Unknown,
+}
+
 /// The box that owns the client end of a TCP connection to this host
 /// (NET-070): `peer` is the client's address and `local` the address it
 /// connected to, as the accepting side sees them. The kernel's socket tables
 /// give the client socket's inode, the process that holds a descriptor for
 /// it, and that process's cgroup. A host-address box's processes run in its
 /// classifier leaf, `boxes/<allow|deny>/<box id>`, and the leaf's name is the
-/// box's id. `None` when any step finds nothing: the client is not on this
-/// host's network namespace, its process is not visible to this one, or it
-/// runs in no box's leaf, as the developer's browser does.
+/// box's id. [`ConnectingOwner::NoBox`] when the holder runs in no box's
+/// leaf, and [`ConnectingOwner::Unknown`] when any step finds nothing, so a
+/// caller can refuse a connection it cannot attribute.
 #[must_use]
-pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> Option<SessionId> {
+pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
     #[cfg(target_os = "linux")]
     {
-        let inode = client_socket_inode(peer, local)?;
-        let pid = socket_holder(inode)?;
-        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        box_in_cgroup(&cgroup)
+        let holder = client_socket_inode(peer, local)
+            .and_then(socket_holder)
+            .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok());
+        match holder {
+            None => ConnectingOwner::Unknown,
+            Some(cgroup) => {
+                box_in_cgroup(&cgroup).map_or(ConnectingOwner::NoBox, ConnectingOwner::Box)
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (peer, local);
-        None
+        ConnectingOwner::Unknown
     }
 }
 
@@ -3093,7 +3113,7 @@ mod tests {
         let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
         assert_eq!(socket_holder(inode), Some(std::process::id()));
         // A test process runs in no box's leaf, so it is no box.
-        assert_eq!(connecting_box(peer, local), None);
+        assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
         drop(client);
     }
 

@@ -184,7 +184,19 @@ pub type SharedVerdict = fn(Option<&super::dns::Caller>, &super::dns::Route, u16
 /// address: `(peer, local)` as the accepting side sees them. The production
 /// lookup is [`super::dns::connecting_box`], which reads the kernel's socket
 /// tables and the holder's cgroup.
-pub type SocketOwner = fn(SocketAddrV4, SocketAddrV4) -> Option<SessionId>;
+pub type SocketOwner = fn(SocketAddrV4, SocketAddrV4) -> super::dns::ConnectingOwner;
+
+/// Who a proxied connection came from, named when the proxy accepts it.
+enum CallerLookup {
+    /// A box, with the egress rules its request is put to.
+    Box(super::dns::Caller),
+    /// No box: a host-side client such as the developer's browser.
+    NoBox,
+    /// A connection from the node's address whose owner the proxy cannot
+    /// name while a host-address box is live. It can be that box's, so the
+    /// proxy refuses it rather than leave it ungated.
+    Unattributed,
+}
 
 /// The shared routing core: maps an HTTP authority (`host` or `host:port`) to
 /// the upstream socket address a request forwards to.
@@ -282,26 +294,36 @@ impl<T: HostRoute> Router<T> {
     /// the node's address, and the caller is the host-address box that owns
     /// the connecting socket, if one does. The socket lookup reads `/proc`,
     /// so it runs off the async workers, and it runs only while some live
-    /// caller holds no switch lease.
-    async fn caller_for(
-        &self,
-        peer: SocketAddrV4,
-        local: Option<SocketAddr>,
-    ) -> Option<super::dns::Caller> {
+    /// caller holds no switch lease. A lookup that cannot name the socket's
+    /// holder then is [`CallerLookup::Unattributed`], never no caller: the
+    /// client can close its socket before the proxy looks, and the gate must
+    /// not open for that.
+    async fn caller_for(&self, peer: SocketAddrV4, local: Option<SocketAddr>) -> CallerLookup {
         if let Some(caller) = self.caller_at(*peer.ip()) {
-            return Some(caller);
+            return CallerLookup::Box(caller);
+        }
+        if !self.table.has_unleased_callers() {
+            return CallerLookup::NoBox;
         }
         let Some(SocketAddr::V4(local)) = local else {
-            return None;
+            return CallerLookup::Unattributed;
         };
-        if !self.table.has_unleased_callers() {
-            return None;
-        }
         let owner = self.owner;
-        let box_id = crate::traced::spawn_blocking(move || owner(peer, local))
+        let found = crate::traced::spawn_blocking(move || owner(peer, local))
             .await
-            .ok()
-            .flatten()?;
+            .unwrap_or(super::dns::ConnectingOwner::Unknown);
+        let box_id = match found {
+            super::dns::ConnectingOwner::Box(box_id) => box_id,
+            super::dns::ConnectingOwner::NoBox => return CallerLookup::NoBox,
+            super::dns::ConnectingOwner::Unknown => {
+                tracing::debug!(
+                    component = "dns-proxy",
+                    %peer,
+                    "found no owner for a proxied connection from the node's address"
+                );
+                return CallerLookup::Unattributed;
+            }
+        };
         let caller = self.table.caller_owning(box_id, *peer.ip());
         tracing::debug!(
             component = "dns-proxy",
@@ -310,7 +332,7 @@ impl<T: HostRoute> Router<T> {
             caller = caller.as_ref().map_or("none", super::dns::Caller::name),
             "named the box that owns a proxied connection from the node's address"
         );
-        caller
+        caller.map_or(CallerLookup::NoBox, CallerLookup::Box)
     }
 }
 
@@ -498,6 +520,19 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     T: HostRoute,
 {
+    // Who the request came from (NET-070), named before the head is read,
+    // while the client still holds its socket: a peer at a live box's switch
+    // lease is that box, with the egress rules its own outbound frames are
+    // decided by. A peer at the node's address is the host-address box that
+    // owns the connecting socket, with that box's egress rules. Any other
+    // peer — a host-side client such as the developer's browser — is no
+    // caller, and its egress is ungated here exactly as a direct connection
+    // from it would be (NET-071).
+    let lookup = match peer {
+        Some(SocketAddr::V4(peer)) => router.caller_for(peer, local).await,
+        _ => CallerLookup::NoBox,
+    };
+
     // Bound the head read so a client that connects but never sends a complete
     // head cannot occupy this task indefinitely.
     let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut client)).await {
@@ -571,16 +606,25 @@ where
     let kind = request.kind;
     let port = port.unwrap_or(DEFAULT_UPSTREAM_PORT);
 
-    // Who the request came from (NET-070): a peer at a live box's switch lease
-    // is that box, with the egress rules its own outbound frames are decided
-    // by. A peer at the node's address is the host-address box that owns the
-    // connecting socket, with that box's egress rules. Any other peer — a
-    // host-side client such as the developer's browser — is no caller, and
-    // its egress is ungated here exactly as a direct connection from it would
-    // be (NET-071).
-    let caller = match peer {
-        Some(SocketAddr::V4(peer)) => router.caller_for(peer, local).await,
-        _ => None,
+    let caller = match lookup {
+        CallerLookup::Box(caller) => Some(caller),
+        CallerLookup::NoBox => None,
+        CallerLookup::Unattributed => {
+            let reason = "the proxy cannot tell which box opened this connection";
+            tracing::warn!(
+                component = "dns-proxy",
+                host,
+                session = route.session(),
+                caller = "unknown",
+                peer = ?peer,
+                port,
+                direction = %Direction::Egress,
+                reason,
+                status = "403 Forbidden",
+                "refused a proxied request"
+            );
+            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
+        }
     };
 
     // The shared verdict, before the proxy dials anything: a request the
@@ -3681,6 +3725,7 @@ mod tests {
     const HOST_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 4);
     const OPEN_HOST_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 5);
     const BROWSER_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 6);
+    const UNATTRIBUTED_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 7);
     const HOST_BOX: &str = "00000000-0000-0000-0000-000000000011";
     const OPEN_HOST_BOX: &str = "00000000-0000-0000-0000-000000000012";
 
@@ -3688,17 +3733,26 @@ mod tests {
     /// the kernel's answer stood in: a test process runs in no box's leaf.
     /// The connection from [`HOST_BOX_ADDR`] is owned by the deny-all box,
     /// the one from [`OPEN_HOST_BOX_ADDR`] by the box with no egress rules,
-    /// and any other connection by no box, as the developer's browser's is.
-    fn stub_socket_owner(peer: SocketAddrV4, local: SocketAddrV4) -> Option<SessionId> {
+    /// The one from [`UNATTRIBUTED_ADDR`] has no owner the kernel can name, as
+    /// a socket the client closed at once has none. Any other connection is
+    /// owned by no box, as the developer's browser's is.
+    fn stub_socket_owner(
+        peer: SocketAddrV4,
+        local: SocketAddrV4,
+    ) -> crate::net::dns::ConnectingOwner {
+        use crate::net::dns::ConnectingOwner;
         assert_eq!(
             *local.ip(),
             Ipv4Addr::LOCALHOST,
             "local is the proxy's address"
         );
         match *peer.ip() {
-            HOST_BOX_ADDR => SessionId::parse_str(HOST_BOX).ok(),
-            OPEN_HOST_BOX_ADDR => SessionId::parse_str(OPEN_HOST_BOX).ok(),
-            _ => None,
+            HOST_BOX_ADDR => ConnectingOwner::Box(SessionId::parse_str(HOST_BOX).unwrap()),
+            OPEN_HOST_BOX_ADDR => {
+                ConnectingOwner::Box(SessionId::parse_str(OPEN_HOST_BOX).unwrap())
+            }
+            UNATTRIBUTED_ADDR => ConnectingOwner::Unknown,
+            _ => ConnectingOwner::NoBox,
         }
     }
 
@@ -3709,7 +3763,8 @@ mod tests {
     /// as it does for a switch-lease caller. A deny-all host-address box's
     /// request to another box is refused, and the refusal line names it. A
     /// host-address box with no egress rules, and a connection no box owns,
-    /// send the same request and it routes.
+    /// send the same request and it routes. A connection whose owner the
+    /// kernel cannot name is refused, not left ungated.
     #[tokio::test]
     async fn proxy_host_address_caller_egress_denied() {
         let backend_port = spawn_backend().await;
@@ -3771,6 +3826,13 @@ mod tests {
             routed.contains("200 OK"),
             "expected a connection no box owns to route, got: {routed}"
         );
+        let unattributed =
+            proxy_get_from(proxy_addr, UNATTRIBUTED_ADDR, "web.min.internal:18080").await;
+        assert!(
+            unattributed.contains("403 Forbidden")
+                && unattributed.contains("the proxy cannot tell which box opened this connection"),
+            "expected a connection with no named owner to be refused, got: {unattributed}"
+        );
 
         drop(guard);
         let logged = buf.contents();
@@ -3781,7 +3843,15 @@ mod tests {
         assert_eq!(
             refusals.len(),
             1,
-            "one refusal, the deny-all box's: {logged}"
+            "one policy refusal, the deny-all box's: {logged}"
+        );
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("refused a proxied request")
+                    && line.contains(r#"caller="unknown""#)
+                    && line.contains(&UNATTRIBUTED_ADDR.to_string())),
+            "expected the unattributed refusal to name the peer, got: {logged}"
         );
         for expected in [
             r#"caller="hostbox""#,
