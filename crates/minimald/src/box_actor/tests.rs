@@ -8057,12 +8057,10 @@ async fn expose_allow_publishes_and_lists() {
     ));
     crate::net::switch::register_live_gate_for_test(switch, &gate);
     let hostnames = manager.hostnames();
-    hostnames.write().expect("registry lock").report_own_address(
-        web,
-        "listweb",
-        switch,
-        std::collections::BTreeMap::new(),
-    );
+    hostnames
+        .write()
+        .expect("registry lock")
+        .report_own_address(web, "listweb", switch, std::collections::BTreeMap::new());
     // Before the expose, the proxy refuses the port with the refusal a
     // direct connection gets: the box published nothing at it.
     let before = {
@@ -8167,7 +8165,10 @@ async fn expose_allow_publishes_and_lists() {
     // NET-069): the box's gate admits the port, so the proxy forwards a
     // request for it to the forward the publish bound — the mapping's own
     // `local` — and a request through the proxy reaches what listens there.
-    assert!(gate.admits_tcp(3000), "the publish admits the port at the gate");
+    assert!(
+        gate.admits_tcp(3000),
+        "the publish admits the port at the gate"
+    );
     let route = hostnames
         .read()
         .expect("registry lock")
