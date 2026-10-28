@@ -4096,7 +4096,7 @@ dependencies = [
  "libc",
  "paths",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "shlex",
  "tempfile",
  "toml",
