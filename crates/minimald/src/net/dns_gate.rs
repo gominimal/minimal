@@ -431,6 +431,27 @@ const STEERED_SERVFAIL_RULE: &str = "bep-steered-servfail";
 /// list does not match (NET-141).
 const UNMATCHED_REFUSED_RULE: &str = "dns-unmatched-refused";
 
+/// How many rate-limit keys the REFUSED warning spreads a box's names over.
+/// The box chooses the names, and the limiter never evicts a key, so the
+/// key holds a bucket of the name, not the name: a box that asks for many
+/// names grows the limiter by this many keys at most.
+const UNMATCHED_REFUSED_BUCKETS: u64 = 256;
+
+/// The rate-limit key of the REFUSED warning for `name`: one of
+/// [`UNMATCHED_REFUSED_BUCKETS`] keys, picked by a hash with a key random to
+/// this daemon, so a box cannot pick names that collide with another name.
+/// Two names that share a bucket share one line a minute.
+fn unmatched_refused_key(name: &str) -> String {
+    use std::hash::BuildHasher;
+    static HASHER: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    let bucket = HASHER
+        .get_or_init(std::collections::hash_map::RandomState::new)
+        .hash_one(name)
+        % UNMATCHED_REFUSED_BUCKETS;
+    format!("{UNMATCHED_REFUSED_RULE}:{bucket}")
+}
+
 /// A DNS wire name in the form the allowlist matches: ASCII-lowercased,
 /// with the root dot stripped — `github.com` for `GitHub.com.`.
 fn normalized(name: &str) -> String {
@@ -758,10 +779,11 @@ impl DnsGate {
     }
 
     /// The refusal's one rate-limited line (NET-141): the box and the name it
-    /// asked for that its allow list does not match. Keyed by the name, so a
-    /// burst for one name cannot silence another's.
+    /// asked for that its allow list does not match. Keyed by a bucket of
+    /// the name ([`unmatched_refused_key`]), so a burst for one name does not
+    /// silence most others, and the limiter's keys stay bounded.
     fn warn_refused(&self, name: &str, rtype: RecordType) {
-        let key = format!("{UNMATCHED_REFUSED_RULE}:{name}");
+        let key = unmatched_refused_key(name);
         if self
             .limiter
             .should_warn_at(&self.label, &key, Instant::now())
@@ -4001,5 +4023,19 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// The REFUSED warning's rate-limit keys stay bounded whatever names a
+    /// box asks for, and one name always maps to one key (NET-141).
+    #[test]
+    fn unmatched_name_refusal_keys_stay_bounded() {
+        let keys: std::collections::HashSet<String> = (0..10_000)
+            .map(|n| unmatched_refused_key(&format!("name-{n}.example.com")))
+            .collect();
+        assert!(keys.len() as u64 <= UNMATCHED_REFUSED_BUCKETS);
+        assert_eq!(
+            unmatched_refused_key("example.com"),
+            unmatched_refused_key("example.com")
+        );
     }
 }
