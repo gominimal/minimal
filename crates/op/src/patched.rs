@@ -34,6 +34,11 @@ pub struct PatchedBuild<'a, SF: crate::SourceFetcher> {
     /// The remote cache to consult before reporting a dependency missing.
     /// When `None`, dependency resolution stays purely local.
     pub remote_cache: Option<&'a RemoteCache<common::fetchers::AnyBackend>>,
+
+    /// The classifier leaf of the box this build runs for, if any (NET-155).
+    /// Carried to the spec build, so the box's egress verdict decides the
+    /// build's connections. `None` keeps the build as the caller's traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
@@ -146,6 +151,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             stderr_writer: self.stderr_writer.take(),
             cancel: tokio_util::sync::CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: self.classifier_leaf.clone(),
         }
         .run(opts)
         .await?;
@@ -226,6 +232,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: None,
+            classifier_leaf: None,
         }
     }
 
@@ -335,6 +342,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -393,6 +401,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -444,6 +453,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -487,6 +497,7 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
         };
         let opts = Options {
             cache: cache.clone(),

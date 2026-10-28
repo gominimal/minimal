@@ -48,6 +48,12 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
+
+    /// The classifier leaf of the box this build runs for, if any (NET-155).
+    /// When set, the build's sandbox runs in that leaf, so the box's egress
+    /// verdict decides every connection the build makes. When `None`, the
+    /// build runs in the cgroup of its caller, as the caller's own traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -281,6 +287,48 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     }
 }
 
+impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
+    /// The sandbox configuration this build runs in. A build placed for a box
+    /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
+    /// box's leaf and not the leaf of the process that starts it.
+    fn sandbox_config(
+        &self,
+        build: &BuildSpec,
+        inputs: Vec<SandboxMapped>,
+        rootfs: HashSet<SandboxMapped>,
+        needs_dns: bool,
+        needs_internet: bool,
+        daemon_id: Option<&String>,
+    ) -> sandbox::config::Config {
+        let mut config = sandbox::config::Config::new(&build.name)
+            .with_isolated_wd(inputs.into_iter())
+            .with_rootfs(rootfs.into_iter())
+            .with_dns(needs_dns)
+            // A build that needs neither DNS nor the internet runs in an empty
+            // network namespace; anything else shares the host's. Said as a plan
+            // rather than as a mode: a build is not a PTask and has never had
+            // one, and the sandbox layer acts on plans.
+            .with_plan(if !needs_dns && !needs_internet {
+                sandbox::NetPlan::isolated()
+            } else {
+                sandbox::NetPlan::host()
+            });
+        if let Some(a) = &build.build_args {
+            config = config.with_build_args(a.iter());
+        }
+        if let Some(w) = self.cpu_weight {
+            config = config.with_cpu_weight(w);
+        }
+        if let Some(id) = daemon_id {
+            config = config.with_daemon_id(id.clone());
+        }
+        if let Some(leaf) = &self.classifier_leaf {
+            config = config.with_classifier_leaf(leaf.clone());
+        }
+        config
+    }
+}
+
 impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
     type Result = SpecBuildResult;
 
@@ -315,28 +363,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let channel = ();
 
-        let mut config = sandbox::config::Config::new(&build.name)
-            .with_isolated_wd(inputs.into_iter())
-            .with_rootfs(rootfs.into_iter())
-            .with_dns(needs_dns)
-            // A build that needs neither DNS nor the internet runs in an empty
-            // network namespace; anything else shares the host's. Said as a plan
-            // rather than as a mode: a build is not a PTask and has never had
-            // one, and the sandbox layer acts on plans.
-            .with_plan(if !needs_dns && !needs_internet {
-                sandbox::NetPlan::isolated()
-            } else {
-                sandbox::NetPlan::host()
-            });
-        if let Some(a) = &build.build_args {
-            config = config.with_build_args(a.iter());
-        }
-        if let Some(w) = self.cpu_weight {
-            config = config.with_cpu_weight(w);
-        }
-        if let Some(id) = &opts.daemon_id {
-            config = config.with_daemon_id(id.clone());
-        }
+        let config = self.sandbox_config(
+            build,
+            inputs,
+            rootfs,
+            needs_dns,
+            needs_internet,
+            opts.daemon_id.as_ref(),
+        );
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
@@ -496,6 +530,7 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
         }
     }
 
@@ -609,6 +644,7 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -621,5 +657,37 @@ mod tests {
         let op = OpTracker::new_root();
         let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
         assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
+    }
+
+    /// NET-155: a spec build placed for a box runs its sandbox in that box's
+    /// classifier leaf. A build with no placement names no leaf, so its
+    /// sandbox stays in the cgroup of the process that starts it.
+    #[test]
+    fn spec_build_runs_in_the_given_classifier_leaf() {
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, ..} = import "minimal.ncl" in
+            {
+                name = "downloads-at-build",
+                build_deps = [],
+                cmd = "curl https://example.invalid/",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let fetcher = UnusedFetcher;
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Deny,
+        );
+
+        let mut placed = spec_build(&bsr, &fetcher);
+        placed.classifier_leaf = Some(leaf.clone());
+        let config = placed.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, Some(leaf));
+
+        let unplaced = spec_build(&bsr, &fetcher);
+        let config = unplaced.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, None);
     }
 }
