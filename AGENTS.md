@@ -308,13 +308,18 @@ that a command prints on stdout for a script to read is output, not a message.
 
 **When you specify or plan work that adds or changes a message:**
 
-- Write the exact text in the spec or the issue, with the condition that
-  prints it and the surface it appears on.
+- In the spec, state what the message must tell the user, the condition
+  that prints it, and the surface it appears on. Do not write the exact
+  text in a spec. A spec binds the behaviour, and the wording can change
+  without it.
+- Write the exact text in the issue or the plan task, and pin it in the
+  test that checks it. A wording change is a code and test change, never a
+  spec change.
 - Say why it is true: name the code path or state that makes it so.
 - List the tests and scripts that pin the text, so the change updates them.
-- If a spec pins the old text, say so. Change the spec in the same piece of
-  work, or record the spec line that must follow in an issue linked from the
-  PR.
+- If a spec still quotes the old text, say so. Replace the quote with what
+  the message must convey in the same piece of work, or in an issue linked
+  from the PR.
 
 **When you review such work**, read each new string as a user who has never
 seen the design. Apply the test above before you approve.
