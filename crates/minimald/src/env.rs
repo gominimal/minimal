@@ -521,9 +521,15 @@ impl Env {
                     leaf = %leaf.dir().display(),
                     "starting the box's missing package builds in the box's classifier leaf",
                 ),
+                None if ctx.box_network().is_some() => tracing::info!(
+                    box_name = %args.name,
+                    "starting the box's missing package builds on the box's own network, \
+                     under the box's egress rules",
+                ),
                 None => tracing::info!(
                     box_name = %args.name,
-                    "starting the box's missing package builds in the daemon's own cgroup",
+                    "starting the box's missing package builds in the daemon's own cgroup, \
+                     with no per-box egress enforcement, because the box has none",
                 ),
             }
             ctx.build_graph(&graph, false, None)
@@ -1741,9 +1747,15 @@ impl BoxChannel {
                 leaf = %leaf.dir().display(),
                 "starting an in-box install's package builds in the box's classifier leaf",
             ),
+            None if self.ctx.box_network().is_some() => tracing::info!(
+                box_name = %self.name,
+                "starting an in-box install's package builds on the box's own network, \
+                 under the box's egress rules",
+            ),
             None => tracing::info!(
                 box_name = %self.name,
-                "starting an in-box install's package builds in the daemon's own cgroup",
+                "starting an in-box install's package builds in the daemon's own cgroup, \
+                 with no per-box egress enforcement, because the box has none",
             ),
         }
         let progress = crate::sandbox_progress::SandboxProgress::new(
@@ -1984,6 +1996,9 @@ impl BoxChannel {
         build_graph.top_levels = vec![bsr];
 
         let tapped = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        // NET-155: an own-address box has no leaf. Its build attaches to the
+        // box's own network, which the box's context carries.
+        let box_network = ctx.box_network().cloned();
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
             let remote_cache = if ctx.use_remote_cache() {
@@ -2001,9 +2016,10 @@ impl BoxChannel {
 
             let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
-            // NET-155: the build runs in the box's own leaf, so the box's
-            // egress verdict decides what it can reach. A box with no leaf
-            // builds in the daemon's own cgroup, as node-plane traffic.
+            // NET-155: the build runs in the box's own leaf, or on the own-
+            // address box's network, so the box's egress verdict decides what
+            // it can reach. A box with neither has no per-box enforcement,
+            // and its build runs in the daemon's own cgroup.
             match &self.classifier_leaf {
                 Some(leaf) => tracing::info!(
                     box_name = %self.name,
@@ -2011,12 +2027,19 @@ impl BoxChannel {
                     leaf = %leaf.dir().display(),
                     "starting a package build for a box in the box's classifier leaf",
                 ),
+                None if box_network.is_some() => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = "none",
+                    "starting a package build for a box on the box's own network, \
+                     under the box's egress rules",
+                ),
                 None => tracing::info!(
                     box_name = %self.name,
                     package = %pkg_name,
                     leaf = "none",
                     "starting a package build for a box in the daemon's own cgroup, \
-                     as node-plane traffic",
+                     with no per-box egress enforcement, because the box has none",
                 ),
             }
             let res = op::PatchedBuild {
@@ -2026,6 +2049,10 @@ impl BoxChannel {
                 stderr_writer: Some(Box::new(LineTap::new(stderr_writer, tapped.clone()))),
                 remote_cache: remote_cache.as_ref(),
                 classifier_leaf: self.classifier_leaf.clone(),
+                box_network: match &self.classifier_leaf {
+                    Some(_) => None,
+                    None => box_network.clone(),
+                },
             }
             .run(&op::Options {
                 cache,
@@ -2051,7 +2078,7 @@ impl BoxChannel {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(refusal) = egress_refusal(
-                self.classifier_leaf.as_ref(),
+                build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
                 pkg_name,
                 &self.name,
                 lines.iter().map(String::as_str),
@@ -2982,19 +3009,33 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
     })
 }
 
-/// The error line for a package build that the egress rules of its box
-/// refused (NET-155), or `None` when the refusal is not the rules'. A box in
-/// the deny subtree of the classifier tree is refused every destination, so
-/// any destination outside the box zone that its build could not reach was
-/// refused by the box's rules. A box in the allow subtree is refused nothing there, so its failures are
-/// left as the build reported them.
-pub(crate) fn egress_refusal<'a>(
+/// Whether the egress rules a box's package build runs under admit no
+/// destination (NET-155): the build runs in the deny subtree of the
+/// classifier tree, or on the network of an own-address box whose rules
+/// admit nothing. A build with neither runs under no rules of the box.
+pub(crate) fn build_denies_all(
     leaf: Option<&ClassifierLeaf>,
+    network: Option<&op::BuildNetwork>,
+) -> bool {
+    match leaf {
+        Some(leaf) => leaf.is_deny(),
+        None => network.is_some_and(op::BuildNetwork::denies_all),
+    }
+}
+
+/// The error line for a package build that the egress rules of its box
+/// refused (NET-155), or `None` when the refusal is not the rules'.
+/// `denies_all` is [`build_denies_all`]'s answer for the build. A box whose
+/// rules admit no destination is refused every one, so any destination
+/// outside the box zone that its build could not reach was refused by the
+/// box's rules. Any other box's failures are left as the build reported them.
+pub(crate) fn egress_refusal<'a>(
+    denies_all: bool,
     package: &str,
     box_name: &str,
     lines: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    if !leaf.is_some_and(ClassifierLeaf::is_deny) {
+    if !denies_all {
         return None;
     }
     let destination = refused_destination(lines)?;

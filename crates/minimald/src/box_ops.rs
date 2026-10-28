@@ -392,15 +392,27 @@ enum Op {
     },
 }
 
-/// Where a box's package builds run (NET-155): the box they run for and
-/// its classifier leaf. The leaf is `None` when the box has none, and the
-/// builds then run in the daemon's own cgroup.
+/// Where a box's package builds run (NET-155): the box they run for, and
+/// its classifier leaf or its own network. A host-address box placed in a
+/// leaf builds in that leaf. An own-address box has no leaf, and its builds
+/// attach to a network of its own. A box with neither has no per-box egress
+/// enforcement, and its builds run in the daemon's own cgroup.
 #[derive(Debug, Clone)]
 pub(crate) struct BuildPlacement {
     /// The box's name, as `min ls` shows it.
     pub box_name: String,
     /// The box's classifier leaf, if its launch placed it in one.
     pub leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The own-address box's network, which its builds attach to.
+    pub network: Option<op::BuildNetwork>,
+}
+
+impl BuildPlacement {
+    /// Whether the box's egress rules admit no destination, so a build
+    /// that could not reach one was refused by the rules.
+    pub(crate) fn denies_all(&self) -> bool {
+        crate::env::build_denies_all(self.leaf.as_ref(), self.network.as_ref())
+    }
 }
 
 /// How many output lines of one package build [`BuildTap`] keeps.
@@ -427,12 +439,19 @@ impl BuildTap {
                         leaf = %leaf.dir().display(),
                         "starting a package build for a box in the box's classifier leaf",
                     ),
+                    None if placement.network.is_some() => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = "none",
+                        "starting a package build for a box on the box's own network, \
+                         under the box's egress rules",
+                    ),
                     None => tracing::info!(
                         box_name = %placement.box_name,
                         package = %name,
                         leaf = "none",
                         "starting a package build for a box in the daemon's own cgroup, \
-                         as node-plane traffic",
+                         with no per-box egress enforcement, because the box has none",
                     ),
                 }
                 self.builds
@@ -466,7 +485,7 @@ impl BuildTap {
         builds.sort_by_key(|(idx, _)| **idx);
         builds.into_iter().find_map(|(_, (package, lines))| {
             crate::env::egress_refusal(
-                placement.leaf.as_ref(),
+                placement.denies_all(),
                 package,
                 &placement.box_name,
                 lines.iter().map(String::as_str),
@@ -557,9 +576,10 @@ impl SideOp {
         sinks: Vec<BuildSink>,
     ) -> Result<Self, std::io::Error> {
         // NET-155: every package build of this op runs in the box's leaf.
-        let ctx = match &placement.leaf {
-            Some(leaf) => ctx.with_classifier_leaf(leaf.clone()),
-            None => ctx,
+        let ctx = match (&placement.leaf, &placement.network) {
+            (Some(leaf), _) => ctx.with_classifier_leaf(leaf.clone()),
+            (None, Some(network)) => ctx.with_box_network(network.clone()),
+            (None, None) => ctx,
         };
         // `graph_from_all_packages` is CPU-heavy, run on blocking pool.
         let (ctx, graph_result) = crate::traced::spawn_blocking(move || {

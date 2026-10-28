@@ -12383,6 +12383,7 @@ fn box_package_build_under_box_egress_verdict() {
         let placement = BuildPlacement {
             box_name: name.to_string(),
             leaf,
+            network: None,
         };
         let mut tap = BuildTap::default();
         for event in build_events("fetcher", &download) {
@@ -12405,6 +12406,7 @@ fn box_package_build_under_box_egress_verdict() {
     let placement = BuildPlacement {
         box_name: "sealed".to_string(),
         leaf: Some(sealed),
+        network: None,
     };
     let mut tap = BuildTap::default();
     let other = build_events("compiler", &["error: cc failed"])
@@ -12427,7 +12429,7 @@ fn box_package_build_under_box_egress_verdict() {
 /// it, for the failure lines of `curl`, `wget` and `git`.
 #[test]
 fn box_package_build_refusal_names_destination_and_box() {
-    use crate::env::{egress_refusal, refused_destination};
+    use crate::env::{build_denies_all, egress_refusal, refused_destination};
     use sandbox::config::{ClassifierLeaf, Verdict};
 
     let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
@@ -12467,7 +12469,12 @@ fn box_package_build_refusal_names_destination_and_box() {
             "{line}"
         );
         assert_eq!(
-            egress_refusal(Some(&deny), "hello", "my-box", [line]),
+            egress_refusal(
+                build_denies_all(Some(&deny), None),
+                "hello",
+                "my-box",
+                [line]
+            ),
             Some(format!(
                 "the build of hello could not reach {destination}: \
                  the egress rules of box my-box do not allow it"
@@ -12475,14 +12482,27 @@ fn box_package_build_refusal_names_destination_and_box() {
         );
         // An allowed box's failure is the destination's, not the rules'.
         assert_eq!(
-            egress_refusal(Some(&allow), "hello", "my-box", [line]),
+            egress_refusal(
+                build_denies_all(Some(&allow), None),
+                "hello",
+                "my-box",
+                [line]
+            ),
             None
         );
-        assert_eq!(egress_refusal(None, "hello", "my-box", [line]), None);
+        assert_eq!(
+            egress_refusal(build_denies_all(None, None), "hello", "my-box", [line]),
+            None
+        );
     }
     // A failure that names no destination is left as the build said it.
     assert_eq!(
-        egress_refusal(Some(&deny), "hello", "my-box", ["error: cc failed"]),
+        egress_refusal(
+            build_denies_all(Some(&deny), None),
+            "hello",
+            "my-box",
+            ["error: cc failed"]
+        ),
         None
     );
     // Box-zone names are not subject to egress rules: a deny box that cannot
@@ -12493,7 +12513,12 @@ fn box_package_build_refusal_names_destination_and_box() {
         "curl: (6) Could not resolve host: min.internal",
     ] {
         assert_eq!(
-            egress_refusal(Some(&deny), "hello", "my-box", [line]),
+            egress_refusal(
+                build_denies_all(Some(&deny), None),
+                "hello",
+                "my-box",
+                [line]
+            ),
             None,
             "{line}"
         );
@@ -12501,7 +12526,7 @@ fn box_package_build_refusal_names_destination_and_box() {
     // A name that only ends in the apex text is not in the zone.
     assert!(
         egress_refusal(
-            Some(&deny),
+            build_denies_all(Some(&deny), None),
             "hello",
             "my-box",
             ["curl: (6) Could not resolve host: evilmin.internal"]
@@ -12547,4 +12572,176 @@ fn box_package_build_under_box_egress_verdict_builds_task_of_box_never_placed() 
         crate::exec::task_build_refusal(enforcement, "plain", false)
             .expect("a box that was never placed builds without a leaf");
     }
+}
+
+/// A box record for the NET-155 tests, in `mode` and under `egress`.
+fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
+    boxes::Record {
+        id: boxes::SessionId::nil(),
+        name: Some("sealed".to_string()),
+        username: None,
+        project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+        network: mode,
+        policy: boxes::BoxPolicy::new(egress, None),
+        task_addresses: Vec::new(),
+        box_addresses: None,
+        status: boxes::BoxState::Active,
+        hooks_enabled: true,
+        host_ip_enforcement: None,
+        box_id: None,
+        host_row_bound: false,
+        bound_ports: std::collections::BTreeSet::new(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
+        box_type: None,
+        parent: None,
+        project_root: None,
+        attrs: Default::default(),
+    }
+}
+
+/// A switch on a VM host, which a test never reaches.
+fn build_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
+            crate::net::SwitchTransport::HostShuttle {
+                cid: crate::net::VSOCK_HOST_CID,
+                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+            },
+        ),
+    ))
+}
+
+/// NET-155: an own-address box has no classifier leaf. Its package build
+/// runs on the box's own network, under the box's egress rules, and never
+/// as the daemon's own traffic. A deny-all box's build that cannot reach its
+/// download is reported as refused by the box's rules. A box allowed the
+/// destination is never reported as refused. Before each build attaches,
+/// the network asks whether the box's host-side row stands, as a task run
+/// does, so a build never attaches under another box's row.
+#[tokio::test]
+async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_network() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    let switch = build_switch();
+
+    let sealed = build_record(
+        boxes::NetworkMode::OwnIp,
+        Some(boxes::EgressPolicy::deny_all()),
+    );
+    let network = super::setup::own_address_build_network(&sealed, &switch, false)
+        .expect("an own-address box builds on its own network");
+    assert!(network.denies_all());
+    assert!(format!("{:?}", network.network()).contains("OwnAddressBuildNetwork"));
+    // With no `egress` section, the deny-all default applies to the build.
+    let defaulted = build_record(boxes::NetworkMode::OwnIp, None);
+    assert!(
+        super::setup::own_address_build_network(&defaulted, &switch, false)
+            .unwrap()
+            .denies_all()
+    );
+
+    let open = build_record(
+        boxes::NetworkMode::OwnIp,
+        Some(boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec!["downloads.example.org".to_string()]),
+            allow_protocols: None,
+            deny_subnets: None,
+        }),
+    );
+    let open_network = super::setup::own_address_build_network(&open, &switch, false)
+        .expect("an allowed own-address box builds on its own network");
+    assert!(!open_network.denies_all());
+
+    let download = [
+        "curl: (6) Could not resolve host: downloads.example.org",
+        "build command failed",
+    ];
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "fetcher".to_string(),
+        op::Error::Other(anyhow::anyhow!("build command failed")),
+    ))
+    .to_string();
+    let run = |network: op::BuildNetwork| {
+        let placement = BuildPlacement {
+            box_name: "sealed".to_string(),
+            leaf: None,
+            network: Some(network),
+        };
+        let mut tap = BuildTap::default();
+        for event in build_events("fetcher", &download) {
+            tap.observe(&event, &placement);
+        }
+        tap.refusal(&placement, &failed)
+    };
+    assert_eq!(
+        run(network.clone()).as_deref(),
+        Some(
+            "the build of fetcher could not reach downloads.example.org: \
+             the egress rules of box sealed do not allow it"
+        )
+    );
+    assert_eq!(run(open_network), None);
+
+    // A box the VM host registered, whose row the host cannot confirm, has
+    // its build's network refused before anything attaches.
+    let mut registered = sealed.clone();
+    registered.box_addresses = Some(boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(192, 168, 127, 10),
+        loopback_address: std::net::Ipv4Addr::new(127, 77, 0, 10),
+    });
+    let network = super::setup::own_address_build_network(&registered, &switch, false).unwrap();
+    let refused = network
+        .network()
+        .plan()
+        .await
+        .expect_err("a build of a box whose row is not confirmed does not attach");
+    assert!(
+        refused.to_string().contains("could not confirm"),
+        "{refused}"
+    );
+}
+
+/// NET-155: a host-address box with no per-box enforcement has no leaf and
+/// no network of its own. Its build runs in the daemon's own cgroup, because
+/// the box has no enforcement, and no failure is reported as the box's rules.
+#[test]
+fn box_package_build_under_box_egress_verdict_builds_unenforced_box_without_rules() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    let switch = build_switch();
+    let mut record = build_record(
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
+    );
+    record.host_ip_enforcement = Some(boxes::HostIpEnforcement::None);
+    assert!(super::setup::own_address_build_network(&record, &switch, false).is_none());
+    assert_eq!(
+        super::setup::box_build_leaf(
+            tempfile::tempdir().unwrap().path(),
+            "sealed",
+            "sealed",
+            false
+        ),
+        Ok(None)
+    );
+    let placement = BuildPlacement {
+        box_name: "sealed".to_string(),
+        leaf: None,
+        network: None,
+    };
+    assert!(!placement.denies_all());
+    let mut tap = BuildTap::default();
+    for event in build_events(
+        "fetcher",
+        &["curl: (6) Could not resolve host: downloads.example.org"],
+    ) {
+        tap.observe(&event, &placement);
+    }
+    assert_eq!(
+        tap.refusal(
+            &placement,
+            "`fetcher` failed to build: build command failed"
+        ),
+        None
+    );
 }

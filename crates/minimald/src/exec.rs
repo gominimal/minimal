@@ -279,7 +279,7 @@ pub(crate) fn task_network(
 /// and a host that cannot be asked, read as no row: fail-closed. A box the
 /// host registered nothing for (a native host, a `host_ip` or `none` box)
 /// asks nothing.
-async fn ensure_task_rows_stand(
+pub(crate) async fn ensure_task_rows_stand(
     record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
