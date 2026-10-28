@@ -605,6 +605,21 @@ fn classify_record_for_reconcile(
     })
 }
 
+/// Logs a loaded record whose `reason` this build does not know (BOX-011).
+/// The record loads with the reason as written, and a save keeps it, so
+/// the log line is the one place the daemon says it cannot read the
+/// ending.
+fn log_unknown_reason(record: &Record) {
+    if let Some(reason @ crate::core::record::StoredReason::Unknown(_)) = &record.reason {
+        tracing::warn!(
+            session_id = %record.id,
+            status = ?record.status,
+            reason = reason.as_str(),
+            "loaded a box record with a reason this build does not know; kept as written",
+        );
+    }
+}
+
 /// Enumerate the immediate session subdirectories under `sessions_dir`.
 /// Missing dir is treated as empty (the parent `DiskLoader::new` has
 /// already ensured the dir exists, but a race during init is harmless).
@@ -1245,6 +1260,7 @@ impl Loader for DiskLoader {
             .join(&short)
             .join("record.json");
         let record: Record = serde_json_lenient::from_reader(std::fs::File::open(record_file)?)?;
+        log_unknown_reason(&record);
         Ok(DiskBox {
             minimal_state_dir: self.minimal_dir.clone(),
             key: key.clone(),
@@ -1512,6 +1528,9 @@ mod tests {
                 None,
             ),
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // Deliberately the non-default shapes: `hooks_enabled: false`
             // and a present `box_addresses` are both serde defaults to
             // `None`/`true`, so a fixture using those would round-trip
@@ -1532,6 +1551,9 @@ mod tests {
             box_id: None,
             host_row_bound: true,
             bound_ports: std::collections::BTreeSet::new(),
+            // Non-default for the same reason: `false` is its serde default, and
+            // a dropped marker would strand a run box on resume (NET-131).
+            ends_with_run: true,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             // Set, so a field dropped on write shows up as a diff: `None` is
@@ -2805,6 +2827,139 @@ mod tests {
         loader.save(&key, &promoted).unwrap();
 
         assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    // BOX-011: a record saved stopped or exited loads in the same state,
+    // with the reason, exit code and signal of how the box ended.
+    #[test]
+    fn record_stores_stopped_and_exited_with_their_ending() {
+        use crate::core::record::{ExitEnding, RecordState, StopEnding};
+
+        let endings = [
+            RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
+            RecordState::Exited(ExitEnding::Timeout),
+            RecordState::Exited(ExitEnding::Oom),
+            RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 0 }),
+            RecordState::Stopped(StopEnding::Signalled { signal: 15 }),
+            RecordState::Stopped(StopEnding::AtDaemonStart),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let mut keys = Vec::new();
+        for (n, ending) in endings.iter().enumerate() {
+            let mut record = sample_record();
+            record.name = Some(format!("ended-{n}"));
+            let key = loader.create(record).unwrap();
+            let mut ended = loader.get(&key).unwrap().record().clone();
+            ended.set_state(*ending);
+            loader.save(&key, &ended).unwrap();
+            keys.push(key);
+        }
+
+        // A fresh loader reads the records from disk, not from memory.
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        for (key, ending) in keys.iter().zip(endings) {
+            let record = loader.get(key).unwrap().record().clone();
+            assert_eq!(record.state(), Ok(ending), "{ending:?}");
+            assert_eq!(record.exit_code, ending.exit_code(), "{ending:?}");
+            assert_eq!(record.signal, ending.signal(), "{ending:?}");
+
+            let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+                &std::fs::read(
+                    loader_dir(&tmp)
+                        .as_utf8_path()
+                        .join("sessions")
+                        .join(loader.live_short(key).unwrap())
+                        .join("record.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(written["status"], ending.name(), "{ending:?}");
+            assert_eq!(
+                written["reason"],
+                ending
+                    .reason()
+                    .map(crate::core::record::EndReason::name)
+                    .unwrap(),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("exit_code")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.exit_code().map(i64::from),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("signal")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.signal().map(i64::from),
+                "{ending:?}"
+            );
+        }
+
+        // Back to running clears the ending from the record.
+        let mut loader = loader;
+        let mut running = loader.get(&keys[0]).unwrap().record().clone();
+        running.set_state(RecordState::Running);
+        loader.save(&keys[0], &running).unwrap();
+        let read = loader.get(&keys[0]).unwrap().record().clone();
+        assert_eq!(read.state(), Ok(RecordState::Running));
+        assert_eq!(
+            (read.reason, read.exit_code, read.signal),
+            (None, None, None)
+        );
+    }
+
+    // BOX-011: a reason this build does not know loads, reads as an
+    // unreadable ending rather than as a guess, and saves as written.
+    #[test]
+    fn unknown_reason_loads_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let id = SessionId::mint();
+        let mut raw = serde_json_lenient::to_value(Record {
+            id,
+            name: Some("evicted".to_string()),
+            ..sample_record()
+        })
+        .unwrap();
+        raw["status"] = serde_json_lenient::json!("exited");
+        raw["reason"] = serde_json_lenient::json!("evicted");
+        raw["exit_code"] = serde_json_lenient::json!(143);
+        write_raw_record(&root, "0e0e0", &raw);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.find_by_id(&id).unwrap().expect("record is indexed");
+        let record = loader.get(&key).unwrap().record().clone();
+        assert_eq!(record.status, BoxState::Exited);
+        assert_eq!(
+            record.reason,
+            Some(crate::core::record::StoredReason::Unknown(
+                "evicted".to_string()
+            ))
+        );
+        assert_eq!(record.exit_code, Some(143));
+        assert_eq!(
+            record.state(),
+            Err(crate::core::record::UnreadableEnding {
+                state: "exited",
+                reason: Some("evicted".to_string()),
+                exit_code: Some(143),
+                signal: None,
+            })
+        );
+
+        loader.save(&key, &record).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0e0e0").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["status"], "exited");
+        assert_eq!(written["reason"], "evicted");
+        assert_eq!(written["exit_code"], 143);
     }
 
     #[test]
