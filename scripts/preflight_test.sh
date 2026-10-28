@@ -127,7 +127,37 @@ expect "arm64 Linux, no x86_64 Linux toolchain" 1 "--force-non-host"
 setup Linux x86_64
 rm "$work/kvm"
 run all
-expect "Linux, no /dev/kvm only warns" 0 "warn  writable $work/kvm (VM recipes only)"
+expect "Linux, no /dev/kvm only warns" 0 "warn  $work/kvm is missing, so this host has no KVM"
+if grep -qF "usermod" <<<"$out"; then
+    bad "Linux, no /dev/kvm: offered the kvm group fix"$'\n'"$out"
+fi
+
+# Root can write any file, so only a non-root run can see an unwritable device.
+if [ "$(id -u)" -ne 0 ]; then
+    setup Linux x86_64
+    chmod a-w "$work/kvm"
+    run all
+    expect "Linux, unwritable /dev/kvm only warns" 0 "sudo usermod -aG kvm"
+    chmod u+w "$work/kvm"
+fi
+
+# Without a native musl toolchain, `just initramfs` falls back to cross.
+setup Linux x86_64
+stub docker 'exit 1'
+run all
+expect "Linux, no native musl, Docker down only warns" 0 "warn  running Docker daemon"
+
+setup Linux x86_64
+stub docker 'exit 1'
+# shellcheck disable=SC2016 # $1 expands inside the stub, not here.
+stub rustup 'case "$1" in target) echo x86_64-unknown-linux-musl ;; *) echo x ;; esac'
+stub x86_64-linux-musl-gcc 'exit 0'
+run all
+if grep -qF "Docker daemon" <<<"$out"; then
+    bad "Linux, native musl: checked cross"$'\n'"$out"
+else
+    expect "Linux, native musl skips the cross checks" 0 "all required checks passed"
+fi
 
 setup Linux x86_64
 stub pkg-config 'exit 1'

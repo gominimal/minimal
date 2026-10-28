@@ -78,7 +78,7 @@ preflight:
 _preflight-cross:
     @scripts/preflight.sh cross
 
-# Linux builds the initramfs natively when it can (scripts/build-initramfs.sh).
+# Linux needs no gate here: `just preflight` warns when cross is missing.
 [linux]
 _preflight-cross:
 
@@ -122,7 +122,7 @@ gvproxy:
     @scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # Cross-compile minimald → initramfs /init.
-initramfs: _preflight-cross
+initramfs:
     scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
 # Compiles the guest minimald here, then hands the binary to

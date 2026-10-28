@@ -3,8 +3,9 @@
 # command that fixes each one that is missing.
 #
 #   scripts/preflight.sh          # everything (`just preflight`)
-#   scripts/preflight.sh cross    # only what `cross` needs (gates `just initramfs`
-#                                 # and `just test-cross` on macOS)
+#   scripts/preflight.sh cross    # only what `cross` needs (gates `just test-cross`
+#                                 # on macOS, and the cross build in
+#                                 # scripts/build-initramfs.sh on macOS)
 #
 # Installs nothing. Exits 1 when a required check fails. A check marked `warn`
 # covers a tool only some recipes need, and never fails the run.
@@ -92,13 +93,19 @@ check_protoc() {
     rm -rf "$tmp"
 }
 
+# check_cross [fail|warn]
 check_cross() {
-    if have cross; then ok "cross"; else fail "cross" "cargo install cross --locked"; fi
+    local level="${1:-fail}"
+    if have cross; then ok "cross"; else "$level" "cross" "cargo install cross --locked"; fi
 
     if have docker && docker info >/dev/null 2>&1; then
         ok "running Docker daemon"
     else
-        fail "running Docker daemon" "start Docker Desktop or OrbStack"
+        if [ "$os" = Darwin ]; then
+            "$level" "running Docker daemon" "start Docker Desktop or OrbStack"
+        else
+            "$level" "running Docker daemon" "install Docker Engine if it is missing, then run: sudo systemctl start docker"
+        fi
     fi
 
     # On x86_64 Linux the host toolchain is the one cross mounts.
@@ -111,9 +118,17 @@ check_cross() {
     if awk -v tc="$tc" 'index($0, tc) == 1 { found = 1 } END { exit !found }' <<<"$list"; then
         ok "x86_64 Linux toolchain for cross ($tc)"
     else
-        fail "x86_64 Linux toolchain for cross ($tc)" \
+        "$level" "x86_64 Linux toolchain for cross ($tc)" \
             "rustup toolchain add $tc --profile minimal --force-non-host"
     fi
+}
+
+# native_musl: true when scripts/build-initramfs.sh can build the guest
+# minimald without `cross`. Keep this in step with the detection there.
+native_musl() {
+    local target="$host_arch-unknown-linux-musl" list=""
+    if have rustup; then list="$(rustup target list --installed 2>/dev/null || true)"; fi
+    grep -qx -- "$target" <<<"$list" && have "$host_arch-linux-musl-gcc"
 }
 
 check_macos() {
@@ -144,7 +159,10 @@ check_linux() {
     fi
     # The VM recipes (up-kvm, test-vm, e2e) need these; the native stack does not.
     local kvm="${PREFLIGHT_KVM_DEV:-/dev/kvm}"
-    if [ -e "$kvm" ] && [ -w "$kvm" ]; then
+    if [ ! -e "$kvm" ]; then
+        warn "$kvm is missing, so this host has no KVM (VM recipes only)" \
+            "enable virtualization in the firmware or hypervisor, then run: sudo modprobe kvm_intel (Intel) or sudo modprobe kvm_amd (AMD)"
+    elif [ -w "$kvm" ]; then
         ok "writable $kvm"
     else
         warn "writable $kvm (VM recipes only)" "sudo usermod -aG kvm \"\$USER\", then log in again"
@@ -152,6 +170,10 @@ check_linux() {
     tool jq jq jq warn
     tool zstd zstd zstd warn
     tool cpio cpio cpio warn
+    # Without a native musl toolchain, `just initramfs` falls back to `cross`.
+    if ! native_musl; then
+        check_cross warn
+    fi
 }
 
 echo "preflight: $os $host_arch, Rust $channel"

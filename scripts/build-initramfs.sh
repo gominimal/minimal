@@ -62,6 +62,12 @@ else
     env "$LINKER_VAR=$MUSL_CC" "$CC_VAR=$MUSL_CC" cargo "$@"
   else
     echo "build-initramfs: cross build ($TARGET)" >&2
+    # On macOS, check what cross needs first, so a missing toolchain or Docker
+    # daemon prints its fix instead of an error from inside cross. Only this
+    # branch calls cross, so the prebuilt and native builds skip the check.
+    if [ "$(uname -s)" = Darwin ]; then
+      "$ROOT/scripts/preflight.sh" cross
+    fi
     command -v cross >/dev/null || cargo install cross --locked
     # The cross-rs images are amd64-only. cross builds its pre-build image
     # without --platform, and Docker Desktop on arm64 then fails with "no match
