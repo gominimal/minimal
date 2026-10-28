@@ -26,6 +26,11 @@ final-status-level = "slow"
 # pass/fail summary to $GITHUB_STEP_SUMMARY.
 path = "junit.xml"
 
+# The arch review reads this leg's steps from the CI log (BEP-018).
+[[profile.ci.overrides]]
+filter = 'test(=a_blocked_cohort_rejects_a_pre_flip_udp_443_socket)'
+success-output = "immediate"
+
 [profile.vm]
 # Prebuilt-harness VM runs (the KVM lane's archived e2e tests). One VM at a
 # time on a 2-vCPU runner; boots are legitimately slow, so the slow period is

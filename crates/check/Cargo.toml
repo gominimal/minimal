@@ -12,6 +12,7 @@ anyhow.workspace = true
 path-absolutize.workspace = true
 futures.workspace = true
 nickel-lang-core.workspace = true
+nix.workspace = true
 object.workspace = true
 regex.workspace = true
 tokio.workspace = true
@@ -27,6 +28,9 @@ graph.workspace = true
 lcache.workspace = true
 op.workspace = true
 ot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

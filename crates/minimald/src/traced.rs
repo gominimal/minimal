@@ -240,6 +240,13 @@ impl<T> Sender<T> {
     pub(crate) fn downgrade(&self) -> WeakSender<T> {
         WeakSender(self.0.downgrade())
     }
+
+    /// Test-only: messages sent and not yet received, so a test can wait
+    /// for a message another task sends to be queued.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.0.max_capacity() - self.0.capacity()
+    }
 }
 
 pub(crate) struct WeakSender<T>(mpsc::WeakSender<(T, Caller)>);

@@ -1406,6 +1406,13 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         return;
     }
     let mngr = state.sessions_manager().await;
+    // Behind a VM host daemon the client's registration lease closed with
+    // its connection, and the host withdrew the box's row on that close. A
+    // session kept here would run with no row: its name would not resolve,
+    // and the host could hand its addresses to another box. Nothing in the
+    // VM can publish the row again, so here a finished session is reaped as
+    // an unfinished one is. A native daemon has no such row, and keeps it.
+    let keep_finished = !state.in_microvm().await;
     for id in ids {
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
@@ -1428,11 +1435,23 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::
         ) {
             continue;
         }
-        match mngr.delete_session(id).await {
-            Ok(_) => tracing::info!(
+        // Only if still unfinished when the session gets to it: a finalize
+        // already in flight ends first, and a session it finished is kept
+        // (inbox#690's reap half) — on a native daemon; see above.
+        let reaped = if keep_finished {
+            mngr.delete_session_if_unfinalized(id).await
+        } else {
+            mngr.delete_session(id).await.map(Some)
+        };
+        match reaped {
+            Ok(Some(_)) => tracing::info!(
                 session_id = %id,
                 ?status,
                 "reaped unfinalized session after its connection closed"
+            ),
+            Ok(None) => tracing::info!(
+                session_id = %id,
+                "kept a session whose connection closed: it finished activating first"
             ),
             Err(e) => tracing::warn!(
                 session_id = %id,

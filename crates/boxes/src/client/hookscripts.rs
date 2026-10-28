@@ -325,11 +325,8 @@ mod tests {
             HookScript::inline("echo hi"),
             loadout_source(),
         )];
-        assert!(
-            stage_external_scripts(&hooks, &anchors(root))
-                .unwrap()
-                .is_empty()
-        );
+        let staged = stage_external_scripts(&hooks, &anchors(root)).unwrap();
+        assert!(staged.is_empty(), "expected empty, got {staged:?}");
     }
 
     #[test]
@@ -526,10 +523,7 @@ mod tests {
                 name: "helix".into(),
             },
         )];
-        assert!(
-            stage_external_scripts(&hooks, &anchors(root))
-                .unwrap()
-                .is_empty()
-        );
+        let staged = stage_external_scripts(&hooks, &anchors(root)).unwrap();
+        assert!(staged.is_empty(), "expected empty, got {staged:?}");
     }
 }

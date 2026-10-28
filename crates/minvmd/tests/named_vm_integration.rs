@@ -1,7 +1,8 @@
-//! Named VMs (NET-052..NET-056): a VM named with `--vm` gets its own state
+//! Named VMs (NET-052..NET-055): a VM named with `--vm` gets its own state
 //! directory, socket, and daemon under a per-name subdirectory of the provider
-//! directory, the default VM's paths are unchanged, stopping one VM leaves the
-//! other running, and reaping is scoped to this checkout's VMs.
+//! directory, the default VM's paths are unchanged, and stopping one VM leaves
+//! the other running. Reaping scoped to this checkout's VMs (NET-056) is a
+//! shell harness, `scripts/reap-vms_test.sh`.
 //!
 //! These tests run on hosts with or without libkrun — every lane. A VM's
 //! *identity* is host-side state `minvmd` resolves before the hypervisor is ever
@@ -14,8 +15,7 @@
 //! Being a `*_integration.rs` harness, the VM lanes replay it from a nextest
 //! archive on a machine that did not build it (`--workspace-remap`, see
 //! ci-macos.yml/ci-linux-kvm.yml), so no path baked at build time exists
-//! there: the binary comes from [`minvmd_bin`]'s `MINVMD_BIN`, and the reap
-//! script travels inside the harness ([`REAP_SCRIPT`]).
+//! there: the binary comes from [`minvmd_bin`]'s `MINVMD_BIN`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -33,12 +33,6 @@ use paths::{DaemonAbsPath, ProviderKind, SSH_SOCK_FILE};
 fn minvmd_bin() -> std::ffi::OsString {
     std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
 }
-
-/// The `scripts/reap-vms.sh` under test, embedded at compile time: the VM lanes
-/// replay this harness from an archive on a machine whose checkout is not at
-/// this build's paths, and the script is what `reap_scoped_per_checkout`
-/// exercises.
-const REAP_SCRIPT: &str = include_str!("../../../scripts/reap-vms.sh");
 
 /// Run the `minvmd` binary under test ([`minvmd_bin`]) against a
 /// `--minimal-state-dir` base. `RUST_LOG` is dropped so the default `info`
@@ -463,164 +457,4 @@ fn stop_one_vm_leaves_other_running() {
         _default.state_dir.daemon_alive().unwrap(),
         "the other VM's daemon must keep running"
     );
-}
-
-// ── NET-056 ───────────────────────────────────────────────────────────────────
-
-#[test]
-fn reap_scoped_per_checkout() {
-    let tmp = tempfile::tempdir().unwrap();
-
-    // A stand-in checkout: its own copy of the reap script, so the ROOT the
-    // script derives is this directory and the recorded patterns prove the
-    // scoping rather than asserting on the real checkout's path. Written from
-    // the embedded copy because the VM lanes replay this harness on a machine
-    // where no path baked at build time exists.
-    let checkout = tmp.path().join("a-checkout");
-    std::fs::create_dir_all(checkout.join("scripts")).unwrap();
-    let script = checkout.join("scripts/reap-vms.sh");
-    std::fs::write(&script, REAP_SCRIPT).unwrap();
-    set_executable(&script);
-
-    // Stub `pkill` and `sudo` on a PATH in front of the real coreutils: they
-    // record the patterns they were asked to match and never signal anything,
-    // so the real pkill is unreachable from this test.
-    let bin = tmp.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let log = tmp.path().join("pkill.log");
-    let stub = |name: &str, recorded: &str| {
-        let path = bin.join(name);
-        std::fs::write(
-            &path,
-            format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"{recorded} $*\" >> \"$PKILL_LOG\"\nexit 0\n"
-            ),
-        )
-        .unwrap();
-        set_executable(&path);
-    };
-    stub("pkill", "pkill");
-    stub("sudo", "sudo");
-
-    let run_reap = |args: &[&str]| {
-        Command::new("bash")
-            .arg(checkout.join("scripts/reap-vms.sh"))
-            .args(args)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("PKILL_LOG", &log)
-            .output()
-            .expect("running the reap script")
-    };
-    let recorded = || std::fs::read_to_string(&log).unwrap_or_default();
-    let root = checkout.display().to_string();
-
-    // Bare invocation: every VM this checkout spawned is in reach — the
-    // default VM's and any named VM's, whose cmdlines carry only an appended
-    // `--vm <name>` — and every pattern is pinned to this checkout's path, so
-    // a parallel checkout's VMs (or the system's gvproxy) are not.
-    let out = run_reap(&[]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let lines = recorded();
-    assert_eq!(
-        lines.lines().count(),
-        4,
-        "two patterns, each user-side and once via sudo: {lines}"
-    );
-    for line in lines.lines() {
-        assert!(
-            line.contains(&root),
-            "every pattern must be pinned to this checkout's path, never a bare name: {line}"
-        );
-    }
-    for expected in [
-        format!("pkill -f {root}/.*minvmd"),
-        format!("pkill -f {root}/.*gvproxy"),
-        format!("sudo -n pkill -f {root}/.*minvmd"),
-        format!("sudo -n pkill -f {root}/.*gvproxy"),
-    ] {
-        assert!(
-            lines.lines().any(|l| l == expected),
-            "missing pattern {expected:?} in:\n{lines}"
-        );
-    }
-    let bare_patterns = lines;
-
-    // `--vm default` is the default VM spelled out — and the default VM's
-    // processes carry no `--vm` flag (minvmd's re-exec and the CLI's autospawn
-    // omit it for the default name) and its switch socket sits in no per-name
-    // subdirectory, so the name-pinned patterns would match nothing and the
-    // script would exit 0 having reaped no VM. It must reap exactly what the
-    // bare invocation reaps.
-    std::fs::remove_file(&log).unwrap();
-    let out = run_reap(&["--vm", "default"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        recorded(),
-        bare_patterns,
-        "`--vm default` must reap the default VM like the bare invocation does"
-    );
-
-    // By name: the patterns pin the same checkout *and* the one named VM —
-    // minvmd processes by their `--vm alpha` argument, the VM's gvproxy
-    // switch by its per-name socket directory — leaving every other VM of
-    // this checkout running.
-    std::fs::remove_file(&log).unwrap();
-    let out = run_reap(&["--vm", "alpha"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let lines = recorded();
-    for expected in [
-        format!("pkill -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
-        format!("sudo -n pkill -f {root}/.*minvmd.*--vm[= ]alpha( |$)"),
-        format!("pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
-        format!("sudo -n pkill -f {root}/.*gvproxy.*local-minvmd[0-9]+/alpha/"),
-    ] {
-        assert!(
-            lines.lines().any(|l| l == expected),
-            "missing pattern {expected:?} in:\n{lines}"
-        );
-    }
-
-    // A name with ERE metacharacters is quoted, not interpreted.
-    std::fs::remove_file(&log).unwrap();
-    let out = run_reap(&["--vm", "a.b+c"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let lines = recorded();
-    assert!(
-        lines.contains("--vm[= ]a\\.b\\+c( |$)"),
-        "a VM name must be matched literally, not as a regex: {lines}"
-    );
-
-    // A `--vm` without a name is a usage error, not a reap of everything.
-    let out = run_reap(&["--vm"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("usage"),
-        "the usage error must say how to call the script: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Mark `path` executable (0700): the stub commands and the copied script must
-/// be runnable by the test.
-fn set_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(path, perms).unwrap();
 }

@@ -15,7 +15,8 @@ const GIVE_UP: Duration = Duration::from_secs(600);
 
 /// A probe of a host that never answers has to end on its own deadline.
 ///
-/// The session actor forwards `GetHostAttrs`/`GetHostScreen` to a spawned
+/// The session actor forwards `GetHostScreen` (and, through the host slot,
+/// the listing's attrs probe takes the same bounded path) to a spawned
 /// task so the actor stays responsive, but nothing cancels that task:
 /// dropping the caller's receiver does not stop a spawned future. Left
 /// unbounded, every poll of a wedged host stranded one task forever — and
@@ -1866,7 +1867,7 @@ async fn missing_sidecar_falls_back_to_baseline() {
 /// session sitting idle with nobody attached must still be able to launch
 /// a host, and a second request must reuse it rather than starting a
 /// second shell in the same session.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -1891,7 +1892,8 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     assert!(host.is_alive());
     assert!(
         handle.get_attrs().await.is_some(),
-        "the session should now be holding the host it launched"
+        "the session should now be holding the host it launched: the slot is \
+         published before `ensure_host` replies, on a multi-thread runtime too"
     );
 
     let again = handle
@@ -2119,7 +2121,10 @@ async fn destroy_session(
 ) -> minimald_rpc::DestroySessionResponse {
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(resp) => resp,
@@ -3338,6 +3343,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                 ..Default::default()
             }),
             credentialed_upstream: None,
+            quic443: None,
         },
     )
 }
@@ -3838,7 +3844,10 @@ async fn destroyed_box_name_is_nxdomain() {
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
-        .call::<DestroySession>(&DestroySessionRequest { id })
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
     {
         Errorable::Ok(_) => {}
@@ -11839,5 +11848,251 @@ async fn a_hook_launched_shell_of_a_registered_box_is_kept_for_a_terminal() {
         published.contains("export TERM='xterm-256color'"),
         "the kept shell takes the terminal's TERM through the republished \
          attach-env; got: {published:?}"
+    );
+}
+
+/// BEP-015: a GitHub grant box carries a git credential helper. With the
+/// launch's command-scope git configuration, `git credential fill` answers
+/// for each grant host with the sealed value as the password, so git sends
+/// it in an `Authorization` header the proxy substitutes. The helper is
+/// git's sole helper for those hosts: a `store` helper in `~/.gitconfig` and
+/// in a repository configuration does not run for them, so `git credential
+/// approve` writes nothing to `~/.git-credentials` (Gatehouse §6.4 line
+/// 718). A host outside the grant gets no answer from the helper. Each
+/// answer is logged by host, never by value. The box's git configuration
+/// files stay as they are. A box with no grant, or with a value that a shell
+/// can read as code, gets no helper and no git configuration.
+#[test]
+fn grant_box_git_credential_helper_answers_for_grant_hosts() {
+    use super::bep_git_helper::{
+        HELPER_CONFIG_REL, HELPER_DIR_REL, HELPER_LOG_MAX_BYTES, HELPER_LOG_REL, HELPER_REL,
+        Installed, grant_hosts, install, launch_git_config_env,
+    };
+    const SEALED: &str = "eyJ0eXAiOiJ4In0..aXY.Y3Q.dGFn";
+    let delivery = |sealed: &str| boxes::SealedDelivery {
+        variable: "GH_TOKEN".to_string(),
+        sealed: sealed.to_string(),
+    };
+    let hosts = grant_hosts();
+    assert_eq!(hosts.len(), bep::module::GITHUB.hosts.len());
+    assert!(hosts.iter().any(|host| host == "github.com"), "{hosts:?}");
+
+    let home = tempfile::tempdir().unwrap();
+    // The box's own configuration: a `store` helper in `~/.gitconfig` and in
+    // a repository, which must not run for a grant host.
+    let gitconfig = home.path().join(".gitconfig");
+    let own_config = "[user]\n\tname = Box User\n[credential]\n\thelper = store\n";
+    std::fs::write(&gitconfig, own_config).unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let repo_config = repo.join(".git/config");
+    let mut config = std::fs::read_to_string(&repo_config).unwrap();
+    config.push_str("[credential]\n\thelper = store\n");
+    std::fs::write(&repo_config, config).unwrap();
+    let credentials = home.path().join(".git-credentials");
+
+    // No helper yet, so the launch sets no git configuration.
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(std::fs::read_to_string(&gitconfig).unwrap(), own_config);
+    assert!(!home.path().join(".config/git/config").exists());
+
+    // The pairs follow the ones the box environment already holds.
+    let shifted = launch_git_config_env(home.path(), 2, [SEALED]);
+    assert!(
+        shifted.contains(&(
+            "GIT_CONFIG_COUNT".to_string(),
+            (2 + hosts.len() * 2).to_string()
+        )),
+        "{shifted:?}"
+    );
+    assert!(
+        shifted.iter().any(|(key, _)| key == "GIT_CONFIG_KEY_2"),
+        "{shifted:?}"
+    );
+    let git_env = launch_git_config_env(home.path(), 0, [SEALED]);
+    assert!(
+        git_env.contains(&(
+            "GIT_CONFIG_COUNT".to_string(),
+            (hosts.len() * 2).to_string()
+        )),
+        "{git_env:?}"
+    );
+    let git = |verb: &str, input: String| {
+        let mut child = std::process::Command::new("git")
+            .args(["credential", verb])
+            .current_dir(&repo)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .envs(git_env.iter().cloned())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let fill = |host: &str| git("fill", format!("protocol=https\nhost={host}\n\n"));
+    let approve = |host: &str| {
+        git(
+            "approve",
+            format!("protocol=https\nhost={host}\nusername=x-access-token\npassword={SEALED}\n\n"),
+        )
+    };
+    for host in &hosts {
+        let output = fill(host);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{host}: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("password={SEALED}\n")),
+            "{host}: {stdout}"
+        );
+        assert!(
+            stdout.contains("username=x-access-token\n"),
+            "{host}: {stdout}"
+        );
+        let output = approve(host);
+        assert!(output.status.success(), "{host}: {output:?}");
+        assert!(
+            !credentials.exists(),
+            "{host}: a store helper ran and wrote {}",
+            std::fs::read_to_string(&credentials).unwrap_or_default()
+        );
+    }
+    let output = fill("example.com");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(SEALED),
+        "a host outside the grant gets the sealed value"
+    );
+    assert!(
+        !output.status.success(),
+        "git found a credential for example.com"
+    );
+    // The box's own `store` helper still runs for a host outside the grant,
+    // so the checks above are not empty.
+    assert!(approve("example.com").status.success());
+    let stored = std::fs::read_to_string(&credentials).unwrap();
+    assert!(stored.contains("example.com"), "{stored}");
+    assert!(!stored.contains("github.com"), "{stored}");
+
+    let log = std::fs::read_to_string(home.path().join(HELPER_LOG_REL)).unwrap();
+    assert_eq!(log.lines().count(), hosts.len(), "{log}");
+    for host in &hosts {
+        assert!(
+            log.contains(&format!("answered for host {host}\n")),
+            "{log}"
+        );
+    }
+    assert!(!log.contains(SEALED), "the log holds the value: {log}");
+
+    // The log does not grow without bound: past its cap it moves to `.1`.
+    let log_path = home.path().join(HELPER_LOG_REL);
+    std::fs::write(&log_path, vec![b'x'; HELPER_LOG_MAX_BYTES as usize + 1]).unwrap();
+    assert!(fill("github.com").status.success());
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("answered for host github.com\n"), "{log}");
+    let rotated = std::fs::metadata(log_path.with_extension("log.1")).unwrap();
+    assert_eq!(rotated.len(), HELPER_LOG_MAX_BYTES + 1);
+
+    // A box with no grant, or a value that is not inert, gets no helper.
+    let plain = tempfile::tempdir().unwrap();
+    assert_eq!(install(plain.path(), &[]).unwrap(), Installed::NoGrant);
+    assert_eq!(
+        install(plain.path(), &[delivery("x'; touch /tmp/owned #")]).unwrap(),
+        Installed::Refused
+    );
+    assert!(!plain.path().join(HELPER_REL).exists());
+    assert!(launch_git_config_env(plain.path(), 0, [SEALED]).is_empty());
+
+    // A start that no longer has a usable grant removes the helper an
+    // earlier start wrote.
+    assert_eq!(
+        install(home.path(), &[delivery("x'; touch /tmp/owned #")]).unwrap(),
+        Installed::Refused
+    );
+    assert!(!home.path().join(HELPER_REL).exists());
+    assert!(!home.path().join(HELPER_CONFIG_REL).exists());
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(install(home.path(), &[]).unwrap(), Installed::NoGrant);
+    assert!(!home.path().join(HELPER_REL).exists());
+
+    // A write that fails removes the helper an earlier start wrote, so the
+    // launch does not name it: here a directory sits at the config's name.
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    std::fs::remove_file(home.path().join(HELPER_CONFIG_REL)).unwrap();
+    std::fs::create_dir_all(home.path().join(HELPER_CONFIG_REL).join("blocker")).unwrap();
+    assert!(install(home.path(), &[delivery(SEALED)]).is_err());
+    assert!(!home.path().join(HELPER_REL).exists());
+    assert!(launch_git_config_env(home.path(), 0, [SEALED]).is_empty());
+    std::fs::remove_dir_all(home.path().join(HELPER_CONFIG_REL)).unwrap();
+
+    // A helper that this start did not write does not count: the launch
+    // names the helper only when it answers with a value this launch
+    // places, as when a removal after a failed write fails too.
+    assert_eq!(
+        install(home.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert!(launch_git_config_env(home.path(), 0, ["eyJuZXcifQ..bmV3.dmFs.dGFn"]).is_empty());
+    assert!(launch_git_config_env(home.path(), 0, std::iter::empty()).is_empty());
+    assert!(!launch_git_config_env(home.path(), 0, ["GH_HOST", SEALED]).is_empty());
+
+    // The box's user owns its home. A symbolic link on a path the helper
+    // writes is refused, and nothing is written through it.
+    let outside = tempfile::tempdir().unwrap();
+    let linked_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(linked_dir.path().join(".local/state")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), linked_dir.path().join(HELPER_DIR_REL)).unwrap();
+    assert!(install(linked_dir.path(), &[delivery(SEALED)]).is_err());
+    assert!(install(linked_dir.path(), &[]).is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert!(launch_git_config_env(linked_dir.path(), 0, [SEALED]).is_empty());
+
+    let linked_helper = tempfile::tempdir().unwrap();
+    let helper_target = outside.path().join("helper");
+    std::fs::write(&helper_target, "keep").unwrap();
+    std::fs::create_dir_all(linked_helper.path().join(HELPER_DIR_REL)).unwrap();
+    std::os::unix::fs::symlink(&helper_target, linked_helper.path().join(HELPER_REL)).unwrap();
+    assert_eq!(
+        install(linked_helper.path(), &[delivery(SEALED)]).unwrap(),
+        Installed::Written
+    );
+    assert_eq!(std::fs::read_to_string(&helper_target).unwrap(), "keep");
+    assert!(
+        !std::fs::symlink_metadata(linked_helper.path().join(HELPER_REL))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }

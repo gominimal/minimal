@@ -9,7 +9,6 @@ impl BoxMessage {
             Self::GetPaths { .. } => "GetPaths",
             Self::MakeContext { .. } => "MakeContext",
             Self::Attach { .. } => "Attach",
-            Self::GetHostAttrs { .. } => "GetHostAttrs",
             Self::EnsureHost { .. } => "EnsureHost",
             Self::GetWorkspaceDelta { .. } => "GetWorkspaceDelta",
             Self::GetHostScreen { .. } => "GetHostScreen",
@@ -22,6 +21,7 @@ impl BoxMessage {
             Self::IsBusy { .. } => "IsBusy",
             Self::Stop { .. } => "Stop",
             Self::Destroy { .. } => "Destroy",
+            Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::GetRecord { .. } => "GetRecord",
             Self::GetNetSwitch { .. } => "GetNetSwitch",
             Self::GetDenyAllOptOut(_) => "GetDenyAllOptOut",
@@ -41,6 +41,8 @@ impl BoxMessage {
             #[cfg(test)]
             Self::PeekPendingAsks(_) => "PeekPendingAsks",
             #[cfg(test)]
+            Self::Park(..) => "Park",
+            #[cfg(test)]
             Self::PeekComposition { .. } => "PeekComposition",
             #[cfg(test)]
             Self::PeekIngressCells(_) => "PeekIngressCells",
@@ -48,6 +50,8 @@ impl BoxMessage {
             Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
             #[cfg(test)]
             Self::ForgetComposedGraphNames(_) => "ForgetComposedGraphNames",
+            #[cfg(test)]
+            Self::HoldUntil(..) => "HoldUntil",
         }
     }
 }

@@ -488,7 +488,11 @@ pub struct BoxConfig {
     /// The box id the same registration handed back
     /// ([`boxes::Record::box_id`]): the id the host's row of the box
     /// holds. `None` for every activation that handed no box addresses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
@@ -509,6 +513,42 @@ pub struct BoxConfig {
     /// state is the host's verdict, never a caller's assertion.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
+    /// The sealed value of each of the box's GitHub grants (BEP-007), as
+    /// the creating client minted them for [`Self::box_id`]. The daemon
+    /// copies them into the box's record, and every launch places each one
+    /// in its grant's environment variable. Empty for a box with no grant.
+    /// A daemon that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_deliveries: Vec<boxes::SealedDelivery>,
+    /// The Box Egress Proxy's root certificate, PEM-encoded, for the box to
+    /// trust. `None` until the proxy publishes the certificate
+    /// (<https://github.com/gominimal/minimal/issues/2437>), and the daemon
+    /// reads nothing from it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_certificate: Option<String>,
+    /// The client verb that asked for the box. The daemon stamps the
+    /// record's Box Type from it. A client that predates the field sends
+    /// none, and the box is a session.
+    #[serde(default)]
+    pub creating_verb: CreatingVerb,
+    /// The root of the project the box comes from: the directory that
+    /// holds the project's `minimal.toml`, which can be a parent of
+    /// [`Self::project_path`]. `None` from a client that predates the
+    /// field. The daemon then records `project_path` as the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
+/// A closed set: a value outside it does not deserialize.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreatingVerb {
+    /// `min session activate`, or the dashboard's create.
+    #[default]
+    Session,
+    /// `min task run`.
+    Task,
 }
 
 /// Serde default for [`BoxConfig::hooks_enabled`]. See
@@ -518,9 +558,13 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
-/// A box's identity on its host ([`boxes::BoxId`]): defined beside the
-/// session record that carries it and re-exported under the path its
-/// clients spell, so no wire form changes.
+/// A box's identity ([`boxes::BoxId`]): the one id type every request and
+/// reply names a box by, the same type as [`SessionId`]. Defined beside the
+/// record that is keyed on it, and re-exported under the path its clients
+/// spell. A session reply spells it in the hyphenated form. The VM host's
+/// box control wire spells it as 32 hex digits, through
+/// [`boxes::box_id_hex`] on each of its fields. Both are the bytes each
+/// reply carried before the two id types merged.
 pub use boxes::BoxId;
 
 /// What a successful registration hands back: the allocated addresses —
@@ -543,6 +587,7 @@ pub struct RegisteredBox {
     pub loopback_address: std::net::Ipv4Addr,
     /// The box id the published row holds: the box's own UUIDv7, handed
     /// back to the registering client.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The task addresses filed with the box ([`RegisterBoxRequest::task_slots`]):
     /// one switch address per task slot, each a row of its own carrying
@@ -715,7 +760,11 @@ pub struct WithdrawBoxRequest {
     /// client that predates the field, or one that no longer holds the id
     /// (a destroy reads the pair from the session record, which carries
     /// none): the pair proof alone decides, as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -746,7 +795,11 @@ pub struct ResumeBoxRequest {
     /// holds it: a registration of the name under another id is a newer
     /// box, and the resume is refused. `None` when the client holds no id
     /// (the session record carries none): the pair proof alone decides.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -763,7 +816,11 @@ pub struct RowStandingRequest {
     /// The box id the same registration handed back: the row is answered
     /// as standing only when it is this box's own row. `None`, from a
     /// record that carries no id, is never answered as standing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "boxes::box_id_hex::option"
+    )]
     pub box_id: Option<BoxId>,
 }
 
@@ -886,6 +943,7 @@ pub struct BoxRow {
     /// (NET-045). Required the same way [`RegisteredBox::box_id`] is: a
     /// row read from a daemon that predates ids fails the whole parse on
     /// a new client rather than silently naming a box no id names.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The box's address on the switch: the row's key.
     pub switch_address: std::net::Ipv4Addr,
@@ -1038,6 +1096,7 @@ pub struct RecordAskAnswerRequest {
 pub struct SubscribeAsksRequest {
     /// The row's box id — the host-minted identity the row read hands the
     /// client.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
 }
 
@@ -1051,6 +1110,7 @@ pub struct PendingAskOffer {
     /// The ask's host-minted id: what the recorded answer carries back.
     pub ask_id: AskId,
     /// The row's box id — the identity the client subscribed by.
+    #[serde(with = "boxes::box_id_hex")]
     pub box_id: BoxId,
     /// The box's name, from the host's own row: the one guest-untouched
     /// field the dialog's text is built from.
@@ -1272,6 +1332,14 @@ pub enum BoxControlRequest {
     /// ([`RowStandingRequest`]): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::RowStanding`].
     RowStanding(RowStandingRequest),
+    /// The in-VM daemon's read of whether the Box Egress Proxy's listener is
+    /// live on the host (BEP-062): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::ProxyListening`]. A read,
+    /// never a report: the proxy runs on the host, outside the VM, so the
+    /// guest can only ask. The DNS gate of a `dns` or `both` box answers a
+    /// steered name with the proxy's address only while the answer is
+    /// `true`, and SERVFAIL otherwise.
+    ProxyListening,
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1521,6 +1589,7 @@ pub enum BoxControlReply {
         /// discriminates this from every other shape.
         subscribed: bool,
         /// The row's box id the subscription is attached to.
+        #[serde(with = "boxes::box_id_hex")]
         box_id: BoxId,
     },
     /// A pending ask, pushed to a subscribed client's connection
@@ -1639,6 +1708,14 @@ pub enum BoxControlReply {
         /// Whether a row stands at it.
         row_standing: bool,
     },
+    /// The proxy-listening read's answer: whether the Box Egress Proxy's
+    /// listener is live on the host. `false` when the host runs no proxy.
+    /// `listening` is required — the marker that keeps this document from
+    /// decoding as any other reply.
+    ProxyListening {
+        /// Whether the proxy's listener is live.
+        listening: bool,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -1665,13 +1742,24 @@ pub struct CreateSessionRequest {
     /// [`CreateSessionResponse::daemon_version`] it fails to echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_match_version: Option<String>,
+    /// The box's spec, as the client built it from the project's entry and
+    /// the command's flags (BOX-068): a JSON object whose `v` names the
+    /// spec's shape. The daemon stores it beside the box's record before the
+    /// box starts, and refuses a create whose spec is not such an object.
+    /// `None` comes from three senders: a client that predates the field,
+    /// the dashboard create (#2635), and `min task run` of an interactive
+    /// task (#2411). The daemon then files a record with no stored spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json_lenient::Value>,
 }
 
 impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
-    /// addresses, hooks on, no attrs, and no version assertion.
+    /// addresses, hooks on, no attrs, no sealed deliveries, no root
+    /// certificate, the session verb, no project root, no version
+    /// assertion, and no spec.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1689,8 +1777,13 @@ impl CreateSessionRequest {
                 box_addresses: None,
                 hooks_enabled: default_hooks_enabled(),
                 attrs: Default::default(),
+                sealed_deliveries: Vec::new(),
+                root_certificate: None,
+                creating_verb: CreatingVerb::default(),
+                project_root: None,
             },
             must_match_version: None,
+            spec: None,
         }
     }
 }
@@ -2037,6 +2130,13 @@ pub struct DestroySession;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestroySessionRequest {
     pub id: SessionId,
+    /// Destroy the session only if it has not finished activating (record
+    /// not yet `Active`), decided by the session itself after any finalize
+    /// already in flight: the destroy a client sends to clean up an
+    /// activation it gave up on (inbox#690). Absent, as from a client that
+    /// predates it, the destroy is unconditional, as it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_if_unfinalized: bool,
 }
 
 /// How a [`DestroySession`] for an id the daemon holds no record of opens:
@@ -2065,6 +2165,10 @@ pub struct DestroySessionResponse {
     /// declared and what happened, followed by its captured output tail
     /// on the lines after, when there is any.
     pub hook_failures: Vec<String>,
+    /// The destroy was `only_if_unfinalized` and the session had finished:
+    /// it was kept, and is live. Only ever set in answer to such a request,
+    /// so a client that predates the flag never sees it.
+    pub kept: bool,
 }
 
 /// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
@@ -2084,6 +2188,8 @@ enum DestroySessionResponseWire {
 struct DestroySessionResponseFields {
     #[serde(default)]
     hook_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    kept: bool,
 }
 
 impl From<DestroySessionResponseWire> for DestroySessionResponse {
@@ -2092,6 +2198,7 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
             DestroySessionResponseWire::Unit(()) => Self::default(),
             DestroySessionResponseWire::Fields(f) => Self {
                 hook_failures: f.hook_failures,
+                kept: f.kept,
             },
         }
     }
@@ -2099,11 +2206,12 @@ impl From<DestroySessionResponseWire> for DestroySessionResponse {
 
 impl From<DestroySessionResponse> for DestroySessionResponseWire {
     fn from(resp: DestroySessionResponse) -> Self {
-        if resp.hook_failures.is_empty() {
+        if resp.hook_failures.is_empty() && !resp.kept {
             Self::Unit(())
         } else {
             Self::Fields(DestroySessionResponseFields {
                 hook_failures: resp.hook_failures,
+                kept: resp.kept,
             })
         }
     }
@@ -2736,6 +2844,103 @@ impl CleanCacheUpdate {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Failed { .. })
+    }
+}
+
+/// Read a box's lifecycle events (BOX-162), streaming.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`ReadEventsRequest`] and half-closes. The daemon then streams back one
+/// JSON-encoded [`ReadEventsUpdate`] per line: an `Event` for each retained
+/// event in the order it was written, then, with `follow`, each new event as
+/// it is written. Exactly one terminal line ends the stream: `Done` after the
+/// retained events of a read that does not follow, `Reaped` when a followed
+/// box is reaped, or `Failed`. A request the daemon refuses before it reads
+/// any event leaves the stream empty and says why on extended data.
+pub const READ_EVENTS_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadEvents");
+
+/// Request body for [`READ_EVENTS_SUBSYSTEM`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadEventsRequest {
+    /// The box whose events to read.
+    pub id: SessionId,
+    /// Keep the stream open after the retained events, and send each new
+    /// event as it is written, until the box is reaped or the client
+    /// closes the channel.
+    #[serde(default)]
+    pub follow: bool,
+}
+
+/// One line of a [`READ_EVENTS_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadEventsUpdate {
+    /// One event of the box, in the order the daemon wrote it.
+    Event { event: boxes::events::BoxEvent },
+    /// Terminal: every retained event was sent, and the read does not
+    /// follow.
+    Done,
+    /// Terminal: the followed box was reaped, so no event follows.
+    Reaped,
+    /// Terminal: the read stopped on an error after it started.
+    Failed { error: String },
+}
+
+impl ReadEventsUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Event { .. })
+    }
+}
+
+#[cfg(test)]
+mod read_events_tests {
+    use super::*;
+    use boxes::events::{BoxEvent, BoxEventType};
+
+    /// BOX-162: the request and every update line survive the wire.
+    #[test]
+    fn read_events_request_round_trips() {
+        let id = SessionId::mint();
+        for follow in [false, true] {
+            let req = ReadEventsRequest { id, follow };
+            let bytes = serde_json_lenient::to_vec(&req).unwrap();
+            let back: ReadEventsRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+        // A client that sends no `follow` reads without following.
+        let bare = format!(r#"{{"id":"{id}"}}"#);
+        let back: ReadEventsRequest = serde_json_lenient::from_str(&bare).unwrap();
+        assert!(!back.follow);
+
+        let updates = [
+            ReadEventsUpdate::Event {
+                event: BoxEvent {
+                    box_id: id,
+                    parent: Some(SessionId::mint()),
+                    ts: 1_700_000_000_000,
+                    kind: BoxEventType::Exited,
+                    data: [("reason".to_string(), "stopped".into())]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+            ReadEventsUpdate::Done,
+            ReadEventsUpdate::Reaped,
+            ReadEventsUpdate::Failed {
+                error: "the events file cannot be read".to_string(),
+            },
+        ];
+        for update in updates {
+            let bytes = serde_json_lenient::to_vec(&update).unwrap();
+            let back: ReadEventsUpdate = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(
+                back.is_terminal(),
+                !matches!(update, ReadEventsUpdate::Event { .. })
+            );
+            assert_eq!(back, update);
+        }
     }
 }
 

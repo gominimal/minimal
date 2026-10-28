@@ -503,7 +503,7 @@ mod vars_gating {
     fn ignore_drops_silently() {
         let policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
         let (out, _) = gate_vars(vec![pv("_TMP")], policy, Some(&PanicHook)).unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "expected empty, got {out:?}");
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod vars_gating {
             Some(&PanicHook),
         )
         .unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "expected empty, got {out:?}");
     }
 
     #[test]
@@ -748,7 +748,7 @@ mod patches_gating {
             PatchAnchors::default(),
         )
         .unwrap();
-        assert!(resolved.is_empty());
+        assert!(resolved.is_empty(), "expected empty, got {resolved:?}");
     }
 
     /// Build a [`SessionVar`] for tests where the gating step expects
@@ -1652,7 +1652,7 @@ mod conflict_helpers {
     fn dedupe_empty_is_noop() {
         let mut items: Vec<&str> = vec![];
         dedupe_by_name(&mut items, |s| s);
-        assert!(items.is_empty());
+        assert!(items.is_empty(), "expected empty, got {items:?}");
     }
 
     #[test]
@@ -1723,10 +1723,22 @@ mod merge {
     fn empty_merge_is_identity() {
         let mut left = Contribution::new();
         left.merge(Contribution::new()).unwrap();
-        assert!(left.vars.is_empty());
-        assert!(left.patches.is_empty());
-        assert!(left.packages.is_empty());
-        assert!(left.lifecycle_hooks.is_empty());
+        assert!(left.vars.is_empty(), "expected empty, got {:?}", left.vars);
+        assert!(
+            left.patches.is_empty(),
+            "expected empty, got {:?}",
+            left.patches
+        );
+        assert!(
+            left.packages.is_empty(),
+            "expected empty, got {:?}",
+            left.packages
+        );
+        assert!(
+            left.lifecycle_hooks.is_empty(),
+            "expected empty, got {:?}",
+            left.lifecycle_hooks
+        );
     }
 
     // ---------------- vars ----------------
