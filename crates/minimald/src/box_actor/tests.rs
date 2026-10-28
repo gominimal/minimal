@@ -12315,7 +12315,7 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
         .spawn()
         .expect("spawn the stand-in box");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
-    let entrypoint = tokio::task::spawn_blocking(move || {
+    let entrypoint = crate::traced::spawn_blocking(move || {
         let mut child = child;
         child.wait().map(|status| status.code().unwrap_or(-1))
     });
@@ -12412,7 +12412,7 @@ async fn stop_force_kills_at_once() {
         .spawn()
         .expect("spawn the stand-in box");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
-    let entrypoint = tokio::task::spawn_blocking(move || {
+    let entrypoint = crate::traced::spawn_blocking(move || {
         let mut child = child;
         child.wait().map(|status| status.code().unwrap_or(-1))
     });

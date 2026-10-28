@@ -1207,6 +1207,35 @@ async fn serve_rename_session(
         .await
 }
 
+/// `StopBox`: stops the running box and keeps its record (BOX-013,
+/// BOX-018). Answers how the box ended, as the record now stores it.
+async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::StopBox
+        .handle_channel(c, async |req: minimald_rpc::StopBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.stop_box(req.id, req.force).await {
+                Ok(ending) => {
+                    let state = boxes::core::record::RecordState::Stopped(ending);
+                    tracing::info!(
+                        session_id = %req.id,
+                        force = req.force,
+                        exit_code = state.exit_code(),
+                        signal = state.signal(),
+                        "session stopped"
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::StopBoxResponse {
+                        exit_code: state.exit_code(),
+                        signal: state.signal(),
+                    }))
+                }
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
 async fn serve_destroy_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -2861,6 +2890,7 @@ pub async fn handle_ssh_rpc(
         | FinalizeSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | minimald_rpc::StopBox::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -2940,6 +2970,7 @@ pub async fn handle_ssh_rpc(
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
