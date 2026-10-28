@@ -62,13 +62,6 @@ pub struct TelemetryConfig {
     /// default until 1.0; `false` makes no request and prints no notice.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Reserved for the opt-in export (spec 25): accepted, not yet read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-    /// Reserved for the opt-in export (spec 25): `[telemetry.export.<name>]`
-    /// tables of string settings, accepted, not yet read.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub export: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 fn default_true() -> bool {
@@ -77,11 +70,7 @@ fn default_true() -> bool {
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            mode: None,
-            export: std::collections::BTreeMap::new(),
-        }
+        Self { enabled: true }
     }
 }
 
@@ -435,29 +424,16 @@ mod tests {
         path
     }
 
-    /// `[telemetry]` is on by default, switches off with `enabled = false`,
-    /// and accepts the export keys spec 25 reserves.
+    /// `[telemetry]` is on by default and switches off with `enabled = false`;
+    /// a key it does not know is refused like any other (the export settings
+    /// of spec 25 get their typed section when gominimal/arch#101 defines them).
     #[test]
-    fn telemetry_section_defaults_on_and_accepts_the_reserved_keys() {
+    fn telemetry_section_defaults_on_and_switches_off() {
         let dir = TempDir::new().unwrap();
         let path = write_file(dir.path(), "config.toml", "[loadouts]\n");
         assert!(read_config_file(&path).unwrap().telemetry.enabled);
-        let path = write_file(
-            dir.path(),
-            "off.toml",
-            indoc::indoc! {r#"
-                [telemetry]
-                enabled = false
-                mode = "spool"
-
-                [telemetry.export.lab]
-                endpoint = "http://localhost:4318"
-            "#},
-        );
-        let cfg = read_config_file(&path).unwrap();
-        assert!(!cfg.telemetry.enabled);
-        assert_eq!(cfg.telemetry.mode.as_deref(), Some("spool"));
-        assert!(cfg.telemetry.export.contains_key("lab"));
+        let path = write_file(dir.path(), "off.toml", "[telemetry]\nenabled = false\n");
+        assert!(!read_config_file(&path).unwrap().telemetry.enabled);
         let path = write_file(dir.path(), "bad.toml", "[telemetry]\nenabld = false\n");
         assert!(
             read_config_file(&path).is_err(),
