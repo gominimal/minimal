@@ -579,9 +579,10 @@ Review, audit and revocation
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
   property: for every two requests identical in every BEP-039 field, the handle's `jti` included, and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
-- **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record only by removing a whole segment that BEP-068 retention no longer retains.
+- **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record from the retained set only by removing a whole segment that BEP-068 retention no longer retains, or by moving a whole segment that holds an unreadable line into the `quarantine` directory under BEP-068.
   tier:     T0
   verify:   cargo nextest run -p bep audit_log_is_opened_append_only
+  <!-- the quarantine move (`bep serve --quarantine-unreadable`, #2613) moves a segment and edits none: it appends the `quarantine` record and re-records the segment's readable revocations before the move, so the moved bytes stay intact under `quarantine/` and the chain still verifies across the gap -->
 
 - **BEP-068** WHEN the active audit segment reaches its size bound THE SYSTEM SHALL open a new segment whose first record carries the previous segment's final hash.
   tier:     T0
@@ -597,6 +598,18 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p bep segment_with_live_revocation_is_retained
     <!-- ubiquitous; Gatehouse §6.10 v1.24: a revocation record is compactable once no value naming its box can be unexpired, and the credentialed-lane ceiling bounds that; pruning earlier would lose the revocation at the next start -->
+  - WHEN the proxy starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL refuse the start and name `bep serve --quarantine-unreadable`.
+    tier:   T0
+    verify: cargo nextest run -p bep serve_refuses_start_on_unreadable_audit_line
+    <!-- an unreadable line can be a revocation, and a start without it redeems a value for a destroyed box; the partial last line of a torn write is cut at open and does not count -->
+  - WHEN `bep serve --quarantine-unreadable` starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL append one record of kind `quarantine` for that segment, then append again each revocation it reads in that segment with the marker `quarantine_restated`, then move the segment into the `quarantine` directory beside the log, and log one warn line for the move.
+    tier:   T0
+    verify: cargo nextest run -p bep quarantine_of_the_active_segment_opens_the_next
+    <!-- the `quarantine` record carries `segment` (the moved file's name), `from_hash` (the hash the moved segment's first record chains to), `final_hash` (the hash the record after it chains to), `unreadable` (its complete lines that did not parse) and BEP-048's `previous_hash`; the records go to the log before the move, so a crash between the two leaves the segment in place for the next quarantine and never leaves a moved segment unrecorded; a quarantine of the active segment first opens the next segment; the `quarantine_restated` marker tells the copy from the revocation a destroy wrote, so a reader does not count one destroy twice; the warn line names the segment, where it moved, the unreadable count, the count of records of a kind this bep does not know, and the final hash, and says that a revocation on such a line is no longer in force -->
+  - WHEN the chain is verified THE SYSTEM SHALL bridge a gap before the first record of a segment only through a `quarantine` record whose moved segment is present under `quarantine/`, agrees with the record's `from_hash` and `final_hash`, and sits between the two segments the gap separates.
+    tier:   T0
+    verify: cargo nextest run -p bep forged_quarantine_record_bridges_no_gap
+    <!-- a forged `quarantine` record, or one whose moved segment is absent or altered, bridges nothing, so the break still reports (BEP-049) -->
 
 - **BEP-042** WHEN `min box audit <id> [-o jsonl]` is run with a box id THE SYSTEM SHALL output the retained audit records whose subject is that box and no other, a reaped box included.
   tier:     T0
