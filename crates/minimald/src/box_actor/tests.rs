@@ -8020,14 +8020,18 @@ async fn expose_allow_publishes_and_lists() {
     // binds at the address the box's name answers at.
     let manager = server.state.sessions_manager().await;
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // Addresses no other test's box uses: the live-gate table the proxy and
+    // the expose both read is process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 96);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 96);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         // This test's own box name: under the shared capture every test's
         // lines ride one buffer, so each assertion finds its line by the
         // box it names.
         "listweb",
-        std::net::Ipv4Addr::new(100, 64, 128, 21),
-        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        switch,
+        loopback,
         Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
@@ -8041,6 +8045,37 @@ async fn expose_allow_publishes_and_lists() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
+    // The box's relay gate, registered under its switch address as the
+    // relay's spawn registers it, and the lease its attach reports to the
+    // hostname registry: what a direct connection and the proxy both meet.
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
+        "listweb".to_string(),
+        switch,
+        &boxes::BoxPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let hostnames = manager.hostnames();
+    hostnames
+        .write()
+        .expect("registry lock")
+        .report_own_address(web, "listweb", switch, std::collections::BTreeMap::new());
+    // Before the expose, the proxy refuses the port with the refusal a
+    // direct connection gets: the box published nothing at it.
+    let before = {
+        let route = hostnames
+            .read()
+            .expect("registry lock")
+            .resolve("listweb.min.internal")
+            .expect("the box's name resolves");
+        crate::net::switch::proxied_request_verdict(None, &route, 3000)
+    };
+    assert!(
+        matches!(before, crate::net::switch::ProxiedRequest::Refused(_)),
+        "an unpublished port is refused through the proxy: {before:?}"
+    );
+    assert!(!gate.admits_tcp(3000));
     let sock = handle
         .net_switch()
         .await
@@ -8055,7 +8090,7 @@ async fn expose_allow_publishes_and_lists() {
         .await
         .expect("the allowed port publishes");
     let expected = minimald_rpc::LiveMapping {
-        local: "127.0.64.21:3000".to_string(),
+        local: "127.0.64.96:3000".to_string(),
         internal_port: 3000,
         proto: boxes::IpProto::Tcp,
         pending: Some(false),
@@ -8122,9 +8157,64 @@ async fn expose_allow_publishes_and_lists() {
     assert!(
         line.contains("port=3000")
             && line.contains("decision=allow")
-            && line.contains("local=127.0.64.21:3000"),
+            && line.contains("local=127.0.64.96:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+    // The publish is reachable through the hostname proxy at once (NET-044,
+    // NET-069): the box's gate admits the port, so the proxy forwards a
+    // request for it to the forward the publish bound — the mapping's own
+    // `local` — and a request through the proxy reaches what listens there.
+    assert!(
+        gate.admits_tcp(3000),
+        "the publish admits the port at the gate"
+    );
+    let route = hostnames
+        .read()
+        .expect("registry lock")
+        .resolve("listweb.min.internal")
+        .expect("the box's name resolves");
+    assert_eq!(
+        route.source(3000),
+        Some(crate::net::dns::RouteSource::Runtime),
+        "the route carries the exposed port as a runtime publish"
+    );
+    let local: std::net::SocketAddr = mapping.local.parse().expect("the mapping names a socket");
+    assert_eq!(
+        crate::net::switch::proxied_request_verdict(None, &route, 3000),
+        crate::net::switch::ProxiedRequest::Forward(local),
+        "the proxy forwards the exposed port to the forward the publish bound"
+    );
+    // The fake forwarder bound nothing, so this test stands in for the box
+    // behind the forward, at the mapping's own address.
+    let backend = tokio::net::TcpListener::bind(local)
+        .await
+        .expect("the mapping's address is free to stand in for the forward");
+    crate::traced::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        while let Ok((mut sock, _)) = backend.accept().await {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("the proxy binds");
+    let proxy_addr = proxy.local_addr().expect("the proxy has an address");
+    crate::traced::spawn(crate::net::proxy::serve(
+        proxy,
+        crate::net::proxy::Router::new(
+            std::sync::Arc::clone(&hostnames),
+            crate::net::switch::proxied_request_verdict,
+        ),
+    ));
+    let reached = crate::net::proxy::proxy_get(proxy_addr, "listweb.min.internal:3000").await;
+    assert!(
+        reached.contains("200 OK"),
+        "the exposed port opens through the hostname proxy: {reached}"
     );
 }
 
@@ -8471,7 +8561,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
             assert!(
                 source
                     .to_string()
-                    .contains("the VM host daemon refused to open the port"),
+                    .contains("the request to open the port was refused"),
                 "the refused publish says who refused it: {source}"
             );
         }
@@ -9064,13 +9154,12 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         .lines()
         .find(|line| {
             line.contains("dynamic ingress expose")
-                && line.contains("outcome=\"refused\"")
+                && line.contains("outcome=\"refused: out of range\"")
                 && line.contains("port=4500")
         })
         .unwrap_or_else(|| panic!("the out-of-range refusal must be logged, got: {logged}"));
     assert!(
-        refused_line
-            .contains("reason=port 4500 is outside this box's declared dynamic range 3000-3999"),
+        refused_line.contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
         "the refusal names the port and the declared range: {refused_line}"
     );
     let failed_line = logged
@@ -9085,6 +9174,89 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         failed_line.contains("returned HTTP 500"),
         "the failed publish names the switch's refusal: {failed_line}"
     );
+}
+
+/// NET-047: a port outside the box's `--dynamic-range` is refused with the
+/// range named, for an `allow` box and an `ask` box alike. The `ask` box
+/// refuses it before any prompt is routed: the same box's in-range request
+/// is routed, and with nobody attached it ends as the nobody-to-answer
+/// refusal, which an out-of-range request never reaches. Neither box keeps a
+/// mapping, and the request's info line says `refused: out of range`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_out_of_range_refusal_names_range() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    for (name, stance, octet) in [
+        ("rangeallow", boxes::DynamicIngress::Allow, 41),
+        ("rangeask", boxes::DynamicIngress::Ask, 42),
+    ] {
+        let id = finalize_dynamic_ingress_session(
+            &mut client,
+            name,
+            std::net::Ipv4Addr::new(100, 64, 128, octet),
+            std::net::Ipv4Addr::new(127, 0, 64, octet),
+            Some(stance),
+            Some((3000, 3999)),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        let refusal = match handle.expose_dynamic(4500).await {
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::OutOfRange {
+                    requested: 4500,
+                    range: (3000, 3999),
+                },
+            )) => refusal,
+            other => panic!("{name}: a port outside the range is refused by range: {other:?}"),
+        };
+        assert_eq!(
+            refusal.for_caller(name, boxes::NetworkMode::OwnIp, 4500),
+            "port 4500 is outside this box's --dynamic-range 3000-3999. Nothing was published.",
+            "{name}: the refusal names the port and the range"
+        );
+        if stance == boxes::DynamicIngress::Ask {
+            // The in-range ask is routed, and nobody is attached to answer:
+            // the out-of-range one above never got that far.
+            match handle.expose_dynamic(3000).await {
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                )) => {}
+                other => panic!("an in-range ask is routed to a prompt: {other:?}"),
+            }
+        }
+        let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+            .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(id))
+            .await;
+        assert_eq!(
+            live,
+            minimald_rpc::Errorable::Ok(vec![]),
+            "{name}: a refused request leaves no mapping"
+        );
+    }
+    let logged = capture.contents();
+    for (name, decision) in [("rangeallow", "allow"), ("rangeask", "ask")] {
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains(&format!("name={name}"))
+                    && line.contains("port=4500")
+            })
+            .unwrap_or_else(|| panic!("{name}: the refusal must be logged, got: {logged}"));
+        assert!(
+            line.contains("outcome=\"refused: out of range\"")
+                && line.contains(&format!("decision={decision}"))
+                && line
+                    .contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
+            "{name}: the line names the outcome, the port and the range: {line}"
+        );
+    }
 }
 
 /// NET-044 on the shared-address interim: under an absent range verdict every

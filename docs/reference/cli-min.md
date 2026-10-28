@@ -659,6 +659,21 @@ daemon running).
 `stop` stays bare at the top level — a deliberate exception to the
 `min <noun> <verb>` convention: it acts on the daemon, not on any session.
 
+### `auth login` (alias: `min login`)
+
+```
+min auth login [--device]
+min login [--device]
+```
+
+Signs in to GitHub and keeps the sign-in in the host keychain. It opens
+GitHub in your browser. With `--device`, or in a build with no browser
+sign-in, it prints a code to enter at github.com. The token stays in the host
+keychain and is never written to a file.
+
+`min login` is the same command as `min auth login`. It takes the same flags
+and prints the same prompts.
+
 ### `loadout list` (alias: `ls`)
 
 ```
