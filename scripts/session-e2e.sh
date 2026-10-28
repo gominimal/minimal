@@ -22112,9 +22112,9 @@ exit" E2E_PTY_ANSWER=keep \
 # registration named (`minvmd status --row`), and the admission's own copy
 # lands in the VM host daemon's owner-only host audit (T84) — printed,
 # like every record this case asserts. The deny stance is decided inside
-# the box, so nothing crosses and nothing may exist on the host: no live
-# row, an empty runtime set, and no audit line at all, asserted all three
-# ways. The host's own probe at the published address must reach the
+# the box, so nothing is admitted on the host: no live row and an empty
+# runtime set. The decision still crosses the report door (NET-046), so the
+# host audit holds exactly one deny line for it. The host's own probe at the published address must reach the
 # in-box server and get its response (NET-044). The ask legs
 # (`eib_vm_ask_legs` above) are the host-attached human's. And the expose half of T61 lands on this lane: a
 # box created on the non-default VM (`min --vm alpha session activate`,
@@ -22160,8 +22160,8 @@ proof_expose_from_inside_box() {
   # the report door T94 opened: the guest daemon reports it, the host admits
   # the runtime port into the row, and the admission's own copy lands in the
   # host audit. The ask stays with `eib_vm_ask_legs` — the human attached on
-  # the host answers. The deny is decided inside the box, so nothing crosses
-  # and nothing may exist on the host. The two-VM leg at the end is the
+  # the host answers. The deny is decided inside the box, so nothing is
+  # admitted on the host, and its one audit line is reported there. The two-VM leg at the end is the
   # expose half of T61: a box on the non-default VM publishes there.
   if [ -n "${E2E_VM:-}" ]; then
     local eib_vm_sids=""
@@ -22404,9 +22404,10 @@ proof_expose_from_inside_box() {
       *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; fail ;;
     esac
     echo "deny box: refused with the deny the stance spells (NET-043)"
-    # Nothing crosses the report door — the guest decided deny — so nothing
-    # may exist on the host: no live row in the box's own listing, an empty
-    # runtime set in the host-held row, and no line at all in the host audit.
+    # The guest decided deny, so nothing is admitted on the host: no live row
+    # in the box's own listing and an empty runtime set in the host-held row.
+    # The decision itself still crosses the report door (NET-046), so the host
+    # audit holds exactly one expose_decision line for it.
     eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
       || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
     case "$eib_policy" in
@@ -22432,12 +22433,31 @@ proof_expose_from_inside_box() {
         fail
         ;;
     esac
-    if grep -qF "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null; then
-      echo "::error::the VM host daemon's host audit carries a line for $eib_deny_name — a deny decided in the box never crosses the report door, so the host must record nothing (T84)"
+    # The report is sent after the refusal, so poll briefly for its line.
+    eib_deny_lines=""
+    eib_deny_count=0
+    for _ in $(seq 1 20); do
+      eib_deny_lines="$(grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null \
+        | grep -F '"event":"expose_decision"' || true)"
+      eib_deny_count="$(printf '%s' "$eib_deny_lines" | grep -c . || true)"
+      [ "$eib_deny_count" -ge 1 ] && break
+      sleep 0.25
+    done
+    if [ "$eib_deny_count" -ne 1 ]; then
+      echo "::error::the VM host daemon's host audit carries $eib_deny_count expose_decision lines for $eib_deny_name — the deny decided in the box must reach the host as exactly one line (NET-046)"
       grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
       fail
     fi
-    echo "the deny recorded nothing: no live row, an empty runtime set in the host row, and no line in the host audit (NET-044, NET-046)"
+    case "$eib_deny_lines" in
+      *'"decision":"deny"'*'"decided_by":"box-policy"'*'"outcome":"refused"'*) ;;
+      *)
+        echo "::error::the host audit's expose_decision line for $eib_deny_name is not a deny decided by box-policy and refused (NET-046)"
+        echo "  $eib_deny_lines"
+        fail
+        ;;
+    esac
+    echo "host audit: $eib_deny_lines (the deny decided in the box, reported to the host, NET-046)"
+    echo "the deny admitted nothing: no live row and an empty runtime set in the host row, and the host audit holds the one deny line (NET-044, NET-046)"
 
     while IFS= read -r eib_vm_sid; do
       [ -n "$eib_vm_sid" ] && { mnl session destroy --force "$eib_vm_sid" >/dev/null 2>&1 || true; }
@@ -22640,7 +22660,7 @@ exit" E2E_PTY_ANSWER=keep \
       echo "two named VMs: the expose inside the box on $eib_two_vm published on $eib_two_vm, and the named VM is stopped again (NET-055, NET-058)"
     fi
 
-    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing recorded on the host, and every decision is a line in the VM host daemon's own audit"
+    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing admitted on the host and its deny recorded in the host audit, and every decision is a line in the VM host daemon's own audit"
     if [ -n "$eib_two_skip" ]; then
       echo "$eib_vm_ok; the two named VMs leg SKIPPED: $eib_two_skip)"
     else
