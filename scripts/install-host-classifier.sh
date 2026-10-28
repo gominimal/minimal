@@ -77,7 +77,9 @@
 # components commonly class with; --ct-mark-mask overrides them (it
 # must name exactly two contiguous bits), the ruleset this host already
 # carries is scanned for a ct-mark user of those bits and the install
-# refuses over one, and the chosen mask is recorded beside the marker
+# refuses over one (a rule that writes the mark with no mask uses every
+# bit, so no mask avoids it), a mask in a range Tailscale or kube-proxy
+# classes with is refused, and the chosen mask is recorded beside the marker
 # minimald probes, so the daemon and this step read one value. That
 # marker is removed before the transaction and written only after it
 # succeeds, so a re-install that fails leaves the host honestly
@@ -136,6 +138,18 @@ readonly MASK_RECORD_PREFIX=ct-mark-mask-
 # refuse a deny-all box whose carve-out no longer names its live answerer.
 readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
+# The mark ranges well-known components of a host class connections with,
+# one "<component> <range>" per line. --ct-mark-mask refuses a mask that
+# touches one of them even when this host's ruleset shows no user of it
+# yet: the component can start after the install, and the scan below sees
+# only the rules loaded now. Tailscale classes with 0x00ff0000, kube-proxy
+# with 0x4000 (masquerade) and 0x8000 (drop).
+readonly WELL_KNOWN_MARK_RANGES='Tailscale 0x00ff0000
+kube-proxy 0x0000c000'
+# The named counter every refusal of this table counts in: the deny-all
+# chain's and the IPv6 chain's alike, so one listing reads both
+# (`nft list counter inet minimal_class refused`).
+readonly REFUSED_COUNTER=refused
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
@@ -253,7 +267,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,85p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,87p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -897,6 +911,15 @@ install_quic443_helper() {
 # un-enrolled host's two identities are the classify chain's matches and
 # nothing is translated, and the chain stands so an association can add
 # the reserved addresses to the same two marks without a reinstall.
+#
+# The ipv6_out chain refuses every IPv6 connection a box in the boxes
+# subtree opens to anything but loopback, whatever the box declares. A
+# host-address box's allow list is decided by IPv4 address rules only, and
+# this table has no IPv6 path to decide one on, so IPv6 would be a way
+# around every box's verdict, the allow subtree's included. Its refusal is
+# the deny chain's: replies admitted, then the same named counter, log
+# prefix and active reject, so one counter reads every refusal this table
+# makes, IPv4 and IPv6 alike.
 render_ruleset() {
     leaf_elements=
     if [ -n "${quic443_kept_leaves:-}" ]; then
@@ -925,6 +948,9 @@ add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
 
 table inet $TABLE_NAME {
+    counter $REFUSED_COUNTER {
+        packets 0 bytes 0
+    }
     set $QUIC443_LEAF_SET {
         typeof socket cgroupv2 level $(box_leaf_level)$leaf_elements
     }
@@ -936,6 +962,17 @@ table inet $TABLE_NAME {
     }
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
+        counter name "$REFUSED_COUNTER"
+        limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
+        reject with icmpx admin-prohibited
+    }
+    chain ipv6_out {
+        type filter hook output priority filter; policy accept;
+        meta nfproto ipv6 oifname != "lo" socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" jump ipv6_refuse
+    }
+    chain ipv6_refuse {
+        ct state established,related ct direction reply accept
+        counter name "$REFUSED_COUNTER"
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
     }$dstnat_chain
@@ -1065,6 +1102,46 @@ require_mask() {
     cohort_hex=0x$(printf '%08x' "$cohort_bit")
     node_hex=0x$(printf '%08x' "$node_bit")
     clear_hex=0x$(printf '%08x' "$clear_mask")
+    refuse_well_known_mark_ranges
+}
+
+# mask_rerun_hint — this step's own invocation with its --ct-mark-mask, if
+# any, replaced by a placeholder: the command a person runs to choose two
+# other bits. It is the step's own command because the step is the one
+# that takes the flag.
+mask_rerun_hint() {
+    local kept=() skip= a
+    for a in "${original_args[@]}"; do
+        if [ -n "$skip" ]; then
+            skip=
+            continue
+        fi
+        if [ "$a" = --ct-mark-mask ]; then
+            skip=1
+            continue
+        fi
+        kept+=("$a")
+    done
+    printf 'sudo %s%s%s --ct-mark-mask <mask>' "$0" "${kept[0]+ }" "${kept[*]-}"
+}
+
+# refuse_well_known_mark_ranges — a mask that touches a range in
+# WELL_KNOWN_MARK_RANGES is refused, with the range and the component that
+# classes with it named. The scan reads only the rules loaded now, and a
+# component that starts after the install would share bits with this
+# table, each side overwriting the other's marks.
+refuse_well_known_mark_ranges() {
+    local component range
+    while read -r component range; do
+        [ -n "$component" ] || continue
+        if [ $((mask_value & range)) -ne 0 ]; then
+            printf 'error: --ct-mark-mask %s uses bits in %s, the range %s marks connections with. The two would overwrite each other'"'"'s marks.\n' \
+                "$mask_hex" "$range" "$component" >&2
+            die "refusing to install with that mask. Run this step again with two contiguous bits outside $range: $(mask_rerun_hint)"
+        fi
+    done <<EOF
+$WELL_KNOWN_MARK_RANGES
+EOF
 }
 
 # ct_mark_conflicts_in — the lines of an nftables or iptables-save listing,
@@ -1093,11 +1170,39 @@ ct_mark_conflicts_in() {
         # A table header names whose rules follow: everything until the next
         # header belongs to it, and this step replacing its own table is not
         # a host it must refuse to install over.
-        $1 == "table" { own_table = ($3 == own); next }
+        $1 == "table" { own_table = ($3 == own); where = "table " $2 " " $3; chain = ""; next }
         own_table { next }
+        $1 == "chain" { chain = $2; next }
+        # iptables-save: "*mangle" opens a table, "-A CHAIN" names a rule.
+        /^\*/ { where = "iptables table " substr($1, 2); chain = ""; next }
         /ct mark|CONNMARK|connmark/ {
             line = $0
+            sub(/^[ \t]+/, "", line)
             hit = 0
+            whole = 0
+            if ($1 == "-A") chain = $2
+            # A write with no explicit mask sets every bit of the connection
+            # mark, whatever value it writes, so it overlaps every mask: an
+            # nft `ct mark set` whose value is not a read of the ct mark
+            # itself (`ct mark set meta mark`, `ct mark set 0x1`), a CONNMARK
+            # --set-mark or --set-xmark with no "/mask", and a CONNMARK
+            # --save-mark with no --mask or --ctmask.
+            if (match(line, /ct mark set /)) {
+                if (substr(line, RSTART + RLENGTH) !~ /^ct mark( |$)/) whole = 1
+            }
+            if (line ~ /CONNMARK/) {
+                for (i = 1; i < NF; i++) {
+                    if ($i == "--set-mark" || $i == "--set-xmark") {
+                        if ($(i + 1) !~ /\// || tolower($(i + 1)) ~ /\/0xffffffff$/) whole = 1
+                    }
+                }
+                # iptables-save spells a save with no mask as an all-ones one.
+                if (line ~ /--save-mark/) {
+                    if (line !~ /--(mask|ctmask) /) whole = 1
+                    if (tolower(line) ~ /--(mask|ctmask) 0xffffffff/) whole = 1
+                }
+            }
+            if (whole) hit = 1
             rest = line
             while (match(rest, /0[xX][0-9a-fA-F]+/)) {
                 v = hex(substr(rest, RSTART + 2, RLENGTH - 2))
@@ -1113,7 +1218,11 @@ ct_mark_conflicts_in() {
                     }
                 }
             }
-            if (hit) print line
+            if (hit) {
+                comp = where == "" ? "the host ruleset" : where
+                if (chain != "") comp = comp ", chain " chain
+                printf "  %s: %s%s\n", comp, line, whole ? " (writes every bit of the connection mark)" : ""
+            }
         }
     '
 }
@@ -1145,7 +1254,13 @@ scan_ct_mark_conflicts() {
     fi
     if [ -n "$conflicting" ]; then
         printf 'error: this host already uses the ct-mark bits %s this install classifies with:\n%s\n' "$mask_hex" "$conflicting" >&2
-        die "refusing to install over another ct-mark user: pass --ct-mark-mask <two contiguous bits nothing else classes with> and this step classifies with those instead"
+        # A rule that writes every bit overlaps every mask, so no other
+        # mask avoids it: the remedy is the rule, not the flag.
+        case "$conflicting" in
+            *"(writes every bit of the connection mark)"*)
+                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run this step again." ;;
+        esac
+        die "refusing to install over another ct-mark user. Run this step again with two contiguous bits that no rule above uses: $(mask_rerun_hint)"
     fi
 }
 
