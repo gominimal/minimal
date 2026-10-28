@@ -156,20 +156,16 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
     }
 
-    // mTLS material: cert/CA metadata only, private key never touched.
+    // CA metadata only, and the private key is never touched. The retired
+    // reverse proxy's client certificate is not collected (NET-109).
     w.skip(
         "config/client.key",
         "private key material — never collected",
     );
-    let certs: std::collections::BTreeMap<&str, Option<FileMeta>> = [
-        (
-            "client.pem",
-            file_meta(&paths.config.join("client.pem")).await,
-        ),
-        ("ca.pem", file_meta(&paths.config.join("ca.pem")).await),
-    ]
-    .into_iter()
-    .collect();
+    let certs: std::collections::BTreeMap<&str, Option<FileMeta>> =
+        [("ca.pem", file_meta(&paths.config.join("ca.pem")).await)]
+            .into_iter()
+            .collect();
     let json = serde_json_lenient::to_vec_pretty(&certs).context("serializing cert metadata")?;
     w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
         .await?;
@@ -1210,6 +1206,41 @@ mod tests {
             );
         }
         files
+    }
+
+    /// The retired reverse proxy's client certificate is not collected: a
+    /// bundle has no `client.pem` entry, even when the file is still on disk
+    /// from an older install (NET-109).
+    #[tokio::test]
+    async fn diag_collects_no_client_certificate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = paths(dir.path());
+        tokio::fs::create_dir_all(&diag.config).await.unwrap();
+        tokio::fs::write(diag.config.join("client.pem"), b"leftover")
+            .await
+            .unwrap();
+        let out = dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        config(&mut w, &diag).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        for (path, contents) in &files {
+            assert!(
+                !path.contains("client.pem"),
+                "the bundle carries a client.pem entry: {path}"
+            );
+            assert!(
+                !String::from_utf8_lossy(contents).contains("client.pem"),
+                "{path} names client.pem"
+            );
+        }
+        assert!(
+            files.contains_key("config/client-cert.json"),
+            "the CA metadata is still collected: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
     }
 
     fn paths(state: &Path) -> DiagPaths {
