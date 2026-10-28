@@ -157,13 +157,16 @@ impl NodeBaselinePhase {
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::InForce;
 
 /// The registry the daemon's own fetches resolve packages against: the host
-/// its default remote cache reads from (`mctx`'s `DEFAULT_REMOTE_CACHE_READ_URL`,
-/// `https://cache.minimal.dev/`), because the package index the daemon
-/// resolves is an object in that cache. Nothing on a VM host configures
-/// another location for the guest daemon, so the daemon's configured
-/// registry is this default. A deployment re-points the category with
-/// [`NodePlaneBaseline::with_registry`].
-pub const DAEMON_REGISTRY_ENDPOINT: &str = "cache.minimal.dev";
+/// of the package source repository a project's `[upstream]` names (`op`'s
+/// default, `https://github.com/gominimal/pkgs`). Before a box launches, the
+/// in-VM daemon git-fetches that repository at its locked commit to build
+/// the package graph, so the fetch is node-plane traffic and the host must
+/// be a member. The package index and the package content the daemon reads
+/// next are objects in the cache ([`DAEMON_CACHE_ENDPOINT`]). Nothing on a
+/// VM host configures another location for the guest daemon, so the
+/// daemon's configured registry is this default. A deployment re-points the
+/// category with [`NodePlaneBaseline::with_registry`].
+pub const DAEMON_REGISTRY_ENDPOINT: &str = "github.com";
 
 /// The cache the daemon's own fetches read package content from: the host of
 /// its default remote cache read location (`mctx`'s
@@ -276,10 +279,10 @@ impl NodePlaneBaseline {
     /// the design's, in the order the display spells them, and each names
     /// the host the daemon's own fetches go to:
     ///
-    /// - `registry`: [`DAEMON_REGISTRY_ENDPOINT`], where the daemon resolves
-    ///   its package index.
-    /// - `cache`: [`DAEMON_CACHE_ENDPOINT`], where the daemon reads package
-    ///   content.
+    /// - `registry`: [`DAEMON_REGISTRY_ENDPOINT`], where the daemon fetches
+    ///   the package source repository its package graph is built from.
+    /// - `cache`: [`DAEMON_CACHE_ENDPOINT`], where the daemon reads the
+    ///   package index and package content.
     ///
     /// Which registry and which cache the node plane uses is the
     /// deployment's to say: [`with_registry`](Self::with_registry) and
@@ -608,13 +611,17 @@ mod tests {
             &[DAEMON_CACHE_ENDPOINT.to_string()]
         );
         // Both names are the ones the node plane's own lookups pin against,
-        // one name serving both categories.
+        // each against its own category: the package source repository's
+        // host for the registry, the cache's host for the cache.
         assert_eq!(
             baseline.named_endpoints(),
-            vec![(
-                "cache.minimal.dev".to_string(),
-                vec![BaselineCategory::Registry, BaselineCategory::Cache]
-            )]
+            vec![
+                ("github.com".to_string(), vec![BaselineCategory::Registry]),
+                (
+                    "cache.minimal.dev".to_string(),
+                    vec![BaselineCategory::Cache]
+                ),
+            ]
         );
         // And it carries the in-VM daemon's own address, the one source
         // identity the set's verdict accepts.
@@ -659,7 +666,7 @@ mod tests {
         // and after.
         let logged = log.contents();
         for line in [
-            "entry=\"registry\" previous=cache.minimal.dev endpoints=10.9.0.0/16",
+            "entry=\"registry\" previous=github.com endpoints=10.9.0.0/16",
             "entry=\"cache\" previous=cache.minimal.dev endpoints=10.8.0.0/16",
         ] {
             assert!(
@@ -812,7 +819,7 @@ mod tests {
             NodePlaneBaseline::built_in(SUBNET).with_cache(vec!["198.51.100.0/24".to_owned()]);
         assert_eq!(
             baseline.display_endpoints(entry(&baseline, BaselineCategory::Registry)),
-            vec!["cache.minimal.dev".to_owned()]
+            vec!["github.com".to_owned()]
         );
         assert_eq!(
             baseline.display_endpoints(entry(&baseline, BaselineCategory::Cache)),

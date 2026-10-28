@@ -15385,7 +15385,7 @@ mod tests {
         wait_for_log(&h.log, "node-plane baseline set").await;
         let logged = h.log.contents();
         for term in [
-            "registry=cache.minimal.dev",
+            "registry=github.com",
             "cache=cache.minimal.dev",
             "node_baseline_phase=\"in force\"",
             "node_addr=100.64.255.253",
@@ -15455,7 +15455,7 @@ mod tests {
         wait_for_log(&h.log, "pinned a node-plane baseline entry's addresses").await;
         let logged = h.log.contents();
         assert!(
-            logged.contains("entry=registry,cache")
+            logged.contains("entry=cache")
                 && logged.contains("addresses=[203.0.113.10]")
                 && logged.contains("lookup_source=100.64.255.253"),
             "the pin line names the entry, the addresses and the lookup's source, got: {logged}"
@@ -15469,6 +15469,48 @@ mod tests {
             expect_frame(&mut h.switch).await,
             fetch,
             "the daemon's own fetch reaches the switch as it was sent"
+        );
+
+        // The registry's leg: the package source repository a box launch
+        // git-fetches before its package graph exists. The daemon's own
+        // lookup of the registry's name pins its answer against the registry
+        // entry, and the fetch to it is admitted — the fetch whose drop hung
+        // a box launch inside the VM.
+        let registry_name = crate::net::baseline::DAEMON_REGISTRY_ENDPOINT;
+        let registry_addr = Ipv4Addr::new(203, 0, 113, 20);
+        let registry_query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(node_addr),
+            40001,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query(registry_name),
+        );
+        send_frame(&mut h.guest, &registry_query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            registry_query,
+            "the daemon's own query for the registry's name reaches the switch"
+        );
+        let registry_reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(node_addr),
+            40001,
+            &dns_pins::tests::dns_response(registry_name, &[registry_addr]),
+        );
+        send_frame(&mut h.switch, &registry_reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            registry_reply,
+            "the registry's reply reaches the daemon in full"
+        );
+        wait_for_log(&h.log, "entry=registry").await;
+        let registry_fetch = ipv4_frame(node_addr, 6, registry_addr.octets(), 443);
+        send_frame(&mut h.guest, &registry_fetch).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            registry_fetch,
+            "the daemon's own fetch from the registry reaches the switch as it was sent"
         );
 
         // To an address no lookup pinned, the set says no.

@@ -1948,7 +1948,7 @@ pub(crate) mod tests {
         wait_for_line(&log, "pinned a node-plane baseline entry's addresses");
         let logged = log.contents();
         assert!(
-            logged.contains("entry=registry,cache")
+            logged.contains("entry=cache")
                 && logged.contains("addresses=[203.0.113.10]")
                 && logged.contains("lookup_source=100.64.255.253")
                 && logged.contains(&format!("resolver={}", SUBNET.dns_server())),
