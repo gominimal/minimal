@@ -722,15 +722,20 @@ and an activation whose declared port cannot be published is refused
       verify: cargo nextest run -p minvmd retract_of_declared_port_refused
       <!-- S10a/AC1; prose 51; unwanted; design §7.1 bind discipline (sockets held for the session's lifetime, unbound only by host-side ingress revocation) and NET-121; the runtime-published set is NET-016/NET-017's listen-published ports; until listen-publishing lands the set is empty and every withdrawal of a declared port is refused -->
 
-- **NET-156** WHILE the box host is VM-backed, IF a flow from the node or from a box targets the host-gateway alias at a destination that is neither a configured host exposure nor in the node-plane baseline set THEN THE SYSTEM SHALL refuse the flow.
+- **NET-156** WHILE the box host is VM-backed, IF a flow from a box or from the host-address cohort targets the host-gateway alias at a destination that is not a configured host exposure, not the gateway resolver's port, and not a credentialed-lane box's steered flow to the node-local Box Egress Proxy THEN THE SYSTEM SHALL refuse the flow.
   tier:     T0
-  verify:   cargo nextest run -p minvmd host_alias_refused_outside_exposures_and_baseline
-  <!-- S10a; design §7.1 ("box→host reach over that alias is default-deny except explicitly configured host exposures"); state+unwanted; decided outside the VM, so a root escapee cannot widen it; covers the node's own row, which carries the host-address cohort, as well as each box row; the node-plane baseline set (NET-130) keeps the daemon's registry and cache fetches working; what configures a host exposure is an open question (below), and until it closes no exposure exists, so every other port is refused -->
+  verify:   cargo nextest run -p minvmd host_alias_refused_outside_exposures_for_boxes
+  <!-- S10a; design §7.1 ("box→host reach over that alias is default-deny except explicitly configured host exposures"; the resolver port, the steered Box Egress Proxy and configured exposures are the only machine-internal reach); state+unwanted; decided outside the VM, so a root escapee cannot widen it; box-plane rules never grant the baseline set (design §5.1), and the cohort does not inherit it (§4.3 rule 2), so a box or cohort flow to a baseline destination at the alias is refused; what configures a host exposure is an open question (below), and until it closes no exposure exists -->
+
+- **NET-158** WHILE the box host is VM-backed, IF a flow with the node-plane identity targets the host-gateway alias at a destination that is not a configured host exposure, not the gateway resolver's port, not the node-local Box Egress Proxy, and not in the node-plane baseline set THEN THE SYSTEM SHALL refuse the flow.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_alias_admits_baseline_for_node_plane_only
+  <!-- S10a; design §7.1 and §5.1; state+unwanted; the node-plane baseline set (NET-130) keeps the daemon's registry and cache fetches working, and only the node-plane identity carries it; the test sends one flow to a baseline destination at the alias from the node-plane identity, admitted, and the same flow from the host-address cohort, refused (NET-156) -->
 
 - **NET-157** WHILE the box host is VM-backed, WHEN the system refuses an own-address box's egress THE SYSTEM SHALL record the refusal in a log on the host, outside the VM.
   tier:     T0
   verify:   cargo nextest run -p minvmd egress_refusal_logged_on_host
-  <!-- S8a/AC2 ("a disallowed connection drops and is logged"); state+event; the guest keeps its own record too; the host record is the one a root escapee in the VM cannot edit, and the one a person debugging a refused connection reads without entering the VM; a log record, not a message for the user -->
+  <!-- S8a/AC2 ("a disallowed connection drops and is logged"); state+event; the guest keeps its own record too; the host record is the one a root escapee in the VM cannot edit, and the one a person debugging a refused connection reads without entering the VM; one record per refused flow, never per frame, rate-capped with a line counting the records suppressed (design §9); a log record, not a message for the user -->
 
 - **NET-138** WHERE the host is VM-backed THE SYSTEM SHALL hold, outside the VM, one table of every published namespace on the node — each live box, the node itself and the host-address cohort — with its switch address, its host loopback address, its name, its admitted port set and its egress rules, filled from the host-side creator's expanded spec and the host-side helper's own allocation.
   tier:     T0
@@ -1439,8 +1444,9 @@ refusal holds only inside the VM, below the escape boundary.
   also declare its reach to one? The design admits box-to-host reach over the
   host-gateway alias only for explicitly configured host exposures, and names
   no surface that configures one. Until one exists, no box reaches a host
-  service at `host.min.internal`, and NET-156 refuses every port outside the
-  node-plane baseline set. One option is an exposure the host's operator
+  service at `host.min.internal`: NET-156 refuses every port outside the
+  design's openings for a box, and NET-158 adds the node-plane baseline set for
+  the node alone. One option is an exposure the host's operator
   names, reachable from every box on the host whatever its egress rules, with
   Minimal's own listeners excluded by rule. A second adds a box-side
   declaration, so reach needs both the host's exposure and the box's egress
