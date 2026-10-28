@@ -83,6 +83,19 @@ const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// the client would wait out the kernel's SYN retries (about two minutes).
 const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many socket owner lookups (each a walk of `/proc`) run at once across
+/// the daemon, for connections to the proxy from the node's address (NET-070).
+const OWNER_LOOKUPS: usize = 4;
+
+/// The slots [`OWNER_LOOKUPS`] counts, shared by every listener the daemon
+/// runs, so the blocking pool never holds more than that many walks.
+static OWNER_LOOKUP_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(OWNER_LOOKUPS);
+
+/// How long a connection waits for an owner lookup slot before the proxy
+/// stops waiting and refuses it as a caller it cannot name.
+const OWNER_LOOKUP_WAIT: Duration = Duration::from_secs(5);
+
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
 /// host (with any `:port` already stripped) to the route its requests forward
 /// on, or `None` if no live PTask owns it. The host resolver is never consulted.
@@ -311,6 +324,21 @@ impl<T: HostRoute> Router<T> {
             return CallerLookup::NoBox;
         }
         let Some(SocketAddr::V4(local)) = local else {
+            return CallerLookup::Unattributed;
+        };
+        // Each lookup walks `/proc` on the blocking pool, so at most
+        // OWNER_LOOKUPS of them run at once, daemon-wide. A connection that
+        // waits past OWNER_LOOKUP_WAIT for a slot is not attributed, and its
+        // request is refused: a burst of connections cannot fill the pool,
+        // and it cannot open the gate either.
+        let Ok(Ok(_slot)) =
+            tokio::time::timeout(OWNER_LOOKUP_WAIT, OWNER_LOOKUP_SLOTS.acquire()).await
+        else {
+            tracing::debug!(
+                component = "dns-proxy",
+                %peer,
+                "no owner lookup slot came free for a proxied connection from the node's address"
+            );
             return CallerLookup::Unattributed;
         };
         let owner = self.owner;
