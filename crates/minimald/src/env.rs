@@ -28,7 +28,7 @@ use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -258,6 +258,11 @@ pub struct EnvArgs {
     /// installs is absent — whose environments launch exactly as they did
     /// before the classifier existed, never refused on that ground.
     classifier_leaf: Option<ClassifierLeaf>,
+
+    /// The proxy's root certificate, PEM-encoded, that [`Env::build`] adds
+    /// to the box's own trust store (BEP-011). `None` for a box that gets
+    /// no root: its trust store is the packages' own.
+    root_certificate: Option<String>,
 }
 
 impl EnvArgs {
@@ -286,6 +291,7 @@ impl EnvArgs {
             session_id: None,
             include_package_attr_wiring: true,
             classifier_leaf: None,
+            root_certificate: None,
         }
     }
 
@@ -377,6 +383,15 @@ impl EnvArgs {
     #[must_use]
     pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
         self.classifier_leaf = Some(leaf);
+        self
+    }
+
+    /// Adds the proxy's root certificate, PEM-encoded, to the box's trust
+    /// store (BEP-011): appended to the box's own copy of the CA bundle and
+    /// linked in the hashed certificate directory under its subject hash.
+    #[must_use]
+    pub fn with_root_certificate(mut self, pem: String) -> Self {
+        self.root_certificate = Some(pem);
         self
     }
 }
@@ -550,6 +565,17 @@ impl Env {
             .map(|bsr| cache.read_dir(&graph.spec_hash(bsr)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| std::io::Error::other(format!("loading dependency: {e}")))?;
+        // BEP-011: the trust variables of a box with the proxy's root, below
+        // every variable the caller set, so a box spec keeps its own value.
+        // The bundle variables follow whether the packages ship a bundle,
+        // because the box's variables are fixed before its rootfs exists.
+        let ships_bundle = args.root_certificate.is_some()
+            && layers_ship_ca_bundle(rootfs_dirs.iter().map(|ce| ce.path()));
+        crate::box_runtime::layer_trust_env(
+            &mut pkg_env_vars,
+            args.root_certificate.is_some(),
+            ships_bundle,
+        );
 
         let config = Config::new(args.name.clone())
             .with_session_dirs(
@@ -604,6 +630,37 @@ impl Env {
                 .map_err(std::io::Error::other)?;
         }
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
+        // BEP-011: the root goes into this box's own trust store, or the box
+        // keeps the packages' store unchanged.
+        match &args.root_certificate {
+            Some(pem) => {
+                let installed = install_root_certificate(&sandbox.rootfs(), pem)?;
+                if installed.bundle {
+                    tracing::debug!(
+                        session_id = ?args.session_id,
+                        box_name = %args.name,
+                        link = %installed.link,
+                        bundle_variables = ships_bundle,
+                        "injected the proxy's root certificate into the box's trust store"
+                    );
+                } else {
+                    tracing::debug!(
+                        session_id = ?args.session_id,
+                        box_name = %args.name,
+                        link = %installed.link,
+                        bundle_variables = ships_bundle,
+                        "injected the proxy's root certificate into the box's trust store; \
+                         the packages ship no CA bundle, so the box has no bundle and \
+                         only NODE_EXTRA_CA_CERTS names the root"
+                    );
+                }
+            }
+            None => tracing::debug!(
+                session_id = ?args.session_id,
+                box_name = %args.name,
+                "injected no proxy root certificate into the box's trust store"
+            ),
+        }
         sandbox.keep_dir(false);
         let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
@@ -838,6 +895,489 @@ fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
         std::fs::write(&path, format!("{existing}{body}"))?;
     }
     Ok(())
+}
+
+/// Adds the proxy's root certificate `pem` to the trust store of the box
+/// whose rootfs is `rootfs` (BEP-011), in both standard forms, beside the
+/// system roots the box's packages ship:
+///
+/// - the root alone, at [`BOX_ROOT_CERTIFICATE`];
+/// - the box's own copy of the CA bundle at [`BOX_CA_BUNDLE`]: the bundle
+///   the packages ship, with the root appended. When the packages ship no
+///   bundle, no bundle is written: a bundle with the root alone would
+///   replace the public roots for a tool that reads it;
+/// - a link `<subject hash>.<n>` to the root in [`BOX_CA_DIR`], the name
+///   OpenSSL looks a certificate up by in a hashed directory.
+///
+/// The rootfs is hardlinked from the package store, so a file it holds can
+/// be the store's own. Each file is written as a new file in place of the
+/// one it replaces, and never through it, so no other box built from the
+/// same packages sees the root. A link in the rootfs resolves inside the
+/// rootfs, never on the daemon's side. Returns the link's name, and
+/// whether the box has a bundle.
+///
+/// [`BOX_ROOT_CERTIFICATE`]: crate::box_runtime::BOX_ROOT_CERTIFICATE
+/// [`BOX_CA_BUNDLE`]: crate::box_runtime::BOX_CA_BUNDLE
+/// [`BOX_CA_DIR`]: crate::box_runtime::BOX_CA_DIR
+pub(crate) fn install_root_certificate(rootfs: &Path, pem: &str) -> std::io::Result<RootInstall> {
+    use crate::box_runtime::{BOX_CA_BUNDLE, BOX_CA_DIR, BOX_ROOT_CERTIFICATE};
+    let unusable = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the Box Egress Proxy's root certificate is not a valid certificate",
+        )
+    };
+    // Only the one certificate block reaches the store: text around it,
+    // or a second block, would add trust the checks below never read.
+    let block = certificate_block(pem).ok_or_else(unusable)?;
+    let der = certificate_der(block).ok_or_else(unusable)?;
+    let hash = trust_store::subject_hash(&der).ok_or_else(unusable)?;
+    let mut text = block.to_string();
+    text.push('\n');
+
+    let dir = resolve_in_rootfs(rootfs, Path::new(BOX_CA_DIR), true)?
+        .expect("a created directory resolves");
+    let file_name = |box_path: &str| {
+        Path::new(box_path)
+            .file_name()
+            .expect("a trust-store path names a file")
+            .to_owned()
+    };
+    let root_name = file_name(BOX_ROOT_CERTIFICATE);
+    replace_file(&dir.join(&root_name), text.as_bytes())?;
+
+    let bundle_name = file_name(BOX_CA_BUNDLE);
+    let bundle = match resolve_in_rootfs(rootfs, Path::new(BOX_CA_BUNDLE), false)? {
+        Some(path) if path.is_file() => {
+            let mut bundle = std::fs::read(path)?;
+            if !bundle.is_empty() && !bundle.ends_with(b"\n") {
+                bundle.push(b'\n');
+            }
+            bundle.extend_from_slice(text.as_bytes());
+            replace_file(&dir.join(&bundle_name), &bundle)?;
+            true
+        }
+        _ => false,
+    };
+
+    // A system root can hold the same subject hash: the first free suffix
+    // is the root's, as `c_rehash` numbers a collision.
+    for n in 0u32.. {
+        let name = format!("{hash:08x}.{n}");
+        let link = dir.join(&name);
+        match std::fs::symlink_metadata(&link) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(&root_name, &link)?;
+                return Ok(RootInstall { link: name, bundle });
+            }
+            Err(e) => return Err(e),
+            Ok(_) if std::fs::read_link(&link).is_ok_and(|to| to == Path::new(&root_name)) => {
+                return Ok(RootInstall { link: name, bundle });
+            }
+            Ok(_) => {}
+        }
+    }
+    unreachable!("a directory cannot hold a link for every suffix")
+}
+
+/// What [`install_root_certificate`] wrote into a box's trust store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RootInstall {
+    /// The name of the root's link in the hashed directory.
+    pub(crate) link: String,
+    /// Whether the box has its own CA bundle with the root appended. False
+    /// when the packages ship no bundle, so the box has none.
+    pub(crate) bundle: bool,
+}
+
+/// Whether the packages in `layers`, the directories a box's rootfs is
+/// built from, ship a CA bundle at [`BOX_CA_BUNDLE`]. Read before the
+/// rootfs exists, because the box's variables are fixed when it is built.
+/// A link resolves inside the layer that holds it.
+///
+/// [`BOX_CA_BUNDLE`]: crate::box_runtime::BOX_CA_BUNDLE
+fn layers_ship_ca_bundle<'a>(layers: impl IntoIterator<Item = &'a Path>) -> bool {
+    let bundle = Path::new(crate::box_runtime::BOX_CA_BUNDLE);
+    layers.into_iter().any(|layer| {
+        resolve_in_rootfs(layer, bundle, false)
+            .ok()
+            .flatten()
+            .is_some_and(|path| path.is_file())
+    })
+}
+
+/// Writes `bytes` to `path` as a new file, after it removes what `path`
+/// held. A hardlink to the package store, or a link to another file, loses
+/// only its name in this rootfs, and its target stays unchanged.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::write(path, bytes)
+}
+
+/// Resolves the box path `box_path` to its file on the daemon's side of
+/// `rootfs`, as the box sees it: every link resolves inside `rootfs`, and a
+/// `..` stops at its root. A missing component is created as a directory
+/// when `create` is true. Otherwise the path resolves to `None`.
+fn resolve_in_rootfs(
+    rootfs: &Path,
+    box_path: &Path,
+    create: bool,
+) -> std::io::Result<Option<PathBuf>> {
+    use std::path::Component;
+    fn push_components(stack: &mut Vec<std::ffi::OsString>, path: &Path) {
+        for component in path.components().rev() {
+            match component {
+                Component::Normal(name) => stack.push(name.to_owned()),
+                Component::ParentDir => stack.push("..".into()),
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+    }
+    let mut stack = Vec::new();
+    push_components(&mut stack, box_path);
+    let mut current = rootfs.to_path_buf();
+    let mut hops = 0u32;
+    while let Some(name) = stack.pop() {
+        if name == ".." {
+            if current != rootfs {
+                current.pop();
+            }
+            continue;
+        }
+        let next = current.join(&name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > 40 {
+                    return Err(std::io::Error::other(format!(
+                        "too many links in {} inside the box",
+                        box_path.display()
+                    )));
+                }
+                let target = std::fs::read_link(&next)?;
+                if target.is_absolute() {
+                    current = rootfs.to_path_buf();
+                }
+                push_components(&mut stack, &target);
+            }
+            Ok(_) => current = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                std::fs::create_dir(&next)?;
+                current = next;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(current))
+}
+
+/// The text of the one certificate block in `pem`, from its `BEGIN` line
+/// through its `END` line, or `None` when `pem` holds no block or more
+/// than one.
+fn certificate_block(pem: &str) -> Option<&str> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if pem.matches(BEGIN).count() != 1 {
+        return None;
+    }
+    let start = pem.find(BEGIN)?;
+    let end = start + pem[start..].find(END)? + END.len();
+    Some(&pem[start..end])
+}
+
+/// The DER bytes of the first certificate in `pem`, or `None` when `pem`
+/// holds no certificate block or its body is not base64.
+fn certificate_der(pem: &str) -> Option<Vec<u8>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let body = pem.split_once(BEGIN)?.1.split_once(END)?.0;
+    trust_store::base64_decode(body)
+}
+
+/// The pieces of OpenSSL's hashed-directory lookup that [`install_root_certificate`]
+/// needs: the subject hash of a certificate, as `openssl x509 -subject_hash`
+/// prints it. `minimald` holds no X.509 or SHA-1 library, and a hashed
+/// directory needs only this one value, so the reading is local and small.
+mod trust_store {
+    /// One DER element: its tag, its content, and the bytes after it.
+    fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = input.split_first()?;
+        if tag & 0x1f == 0x1f {
+            return None;
+        }
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (usize::from(first), rest)
+        } else {
+            let count = usize::from(first & 0x7f);
+            if count == 0 || count > 4 || rest.len() < count {
+                return None;
+            }
+            let (bytes, rest) = rest.split_at(count);
+            (
+                bytes
+                    .iter()
+                    .fold(0usize, |len, &b| (len << 8) | usize::from(b)),
+                rest,
+            )
+        };
+        if rest.len() < len {
+            return None;
+        }
+        let (content, rest) = rest.split_at(len);
+        Some((tag, content, rest))
+    }
+
+    /// The DER encoding of one element with `tag` and `content`.
+    fn encode(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(u8::try_from(len).expect("checked above"));
+        } else {
+            let bytes: Vec<u8> = len
+                .to_be_bytes()
+                .into_iter()
+                .skip_while(|&b| b == 0)
+                .collect();
+            out.push(0x80 | u8::try_from(bytes.len()).expect("a length has at most 8 bytes"));
+            out.extend(bytes);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// The content of the certificate's subject `Name`.
+    fn subject(der: &[u8]) -> Option<&[u8]> {
+        const SEQUENCE: u8 = 0x30;
+        let (SEQUENCE, certificate, _) = element(der)? else {
+            return None;
+        };
+        let (SEQUENCE, tbs, _) = element(certificate)? else {
+            return None;
+        };
+        let mut rest = tbs;
+        // The explicit version is optional; then the serial, the signature
+        // algorithm, the issuer and the validity come before the subject.
+        if rest.first() == Some(&0xa0) {
+            rest = element(rest)?.2;
+        }
+        for _ in 0..4 {
+            rest = element(rest)?.2;
+        }
+        let (SEQUENCE, subject, _) = element(rest)? else {
+            return None;
+        };
+        Some(subject)
+    }
+
+    /// An attribute value in OpenSSL's canonical form: a string type is
+    /// re-encoded as a `UTF8String` with ASCII letters lowercased, leading
+    /// and trailing whitespace removed and each inner run of whitespace
+    /// made one space. Any other type keeps its encoding.
+    fn canonical_value(tag: u8, content: &[u8], whole: &[u8]) -> Option<Vec<u8>> {
+        let text: String = match tag {
+            // UTF8String
+            0x0c => std::str::from_utf8(content).ok()?.to_string(),
+            // BMPString
+            0x1e => content
+                .chunks(2)
+                .map(|c| match c {
+                    [hi, lo] => char::from_u32(u32::from(u16::from_be_bytes([*hi, *lo]))),
+                    _ => None,
+                })
+                .collect::<Option<String>>()?,
+            // UniversalString
+            0x1c => content
+                .chunks(4)
+                .map(|c| {
+                    <[u8; 4]>::try_from(c)
+                        .ok()
+                        .and_then(|b| char::from_u32(u32::from_be_bytes(b)))
+                })
+                .collect::<Option<String>>()?,
+            // PrintableString, T61String, IA5String, VisibleString: one
+            // byte for one character.
+            0x13 | 0x14 | 0x16 | 0x1a => content.iter().map(|&b| char::from(b)).collect(),
+            _ => return Some(whole.to_vec()),
+        };
+        let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+        let bytes = text.as_bytes();
+        let start = bytes.iter().position(|b| !space(b)).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !space(b))
+            .map_or(start, |i| i + 1);
+        let mut out = Vec::with_capacity(end - start);
+        let mut in_space = false;
+        for b in &bytes[start..end] {
+            if space(b) {
+                if !in_space {
+                    out.push(b' ');
+                }
+                in_space = true;
+            } else {
+                out.push(b.to_ascii_lowercase());
+                in_space = false;
+            }
+        }
+        Some(encode(0x0c, &out))
+    }
+
+    /// The canonical encoding of a subject's content, as OpenSSL hashes it:
+    /// each relative distinguished name as a DER `SET` of canonical
+    /// attributes, in order, with no outer `SEQUENCE`.
+    fn canonical_name(mut name: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        while !name.is_empty() {
+            let (0x31, mut set, rest) = element(name)? else {
+                return None;
+            };
+            name = rest;
+            let mut attributes = Vec::new();
+            while !set.is_empty() {
+                let (0x30, attribute, rest) = element(set)? else {
+                    return None;
+                };
+                set = rest;
+                let (0x06, _, value) = element(attribute)? else {
+                    return None;
+                };
+                let oid = &attribute[..attribute.len() - value.len()];
+                let (tag, content, tail) = element(value)?;
+                if !tail.is_empty() {
+                    return None;
+                }
+                let mut encoded = oid.to_vec();
+                encoded.extend(canonical_value(tag, content, value)?);
+                attributes.push(encode(0x30, &encoded));
+            }
+            // DER orders a SET OF by its members' encodings.
+            attributes.sort();
+            out.extend(encode(0x31, &attributes.concat()));
+        }
+        Some(out)
+    }
+
+    /// The subject hash of the DER certificate `der`: the first four bytes
+    /// of the SHA-1 of its canonical subject, read little-endian. `None`
+    /// when `der` is not a certificate this can read.
+    pub(super) fn subject_hash(der: &[u8]) -> Option<u32> {
+        let digest = sha1(&canonical_name(subject(der)?)?);
+        Some(u32::from_le_bytes([
+            digest[0], digest[1], digest[2], digest[3],
+        ]))
+    }
+
+    /// SHA-1 (FIPS 180-4). Used only to name a link, never to check one.
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [
+            0x6745_2301,
+            0xefcd_ab89,
+            0x98ba_dcfe,
+            0x1032_5476,
+            0xc3d2_e1f0,
+        ];
+        let mut message = data.to_vec();
+        let bits = u64::try_from(data.len()).expect("a length fits in 64 bits") * 8;
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend(bits.to_be_bytes());
+        for block in message.chunks(64) {
+            let mut w = [0u32; 80];
+            for (i, word) in block.chunks(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, word) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | (!b & d), 0x5a82_7999),
+                    20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                    _ => (b ^ c ^ d, 0xca62_c1d6),
+                };
+                let t = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(*word);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = t;
+            }
+            for (state, value) in h.iter_mut().zip([a, b, c, d, e]) {
+                *state = state.wrapping_add(value);
+            }
+        }
+        let mut out = [0u8; 20];
+        for (chunk, word) in out.chunks_mut(4).zip(h) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// Standard base64, padding optional, whitespace ignored. `None` for
+    /// any other character.
+    pub(super) fn base64_decode(text: &str) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for b in text.bytes() {
+            let value = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => break,
+                b' ' | b'\t' | b'\r' | b'\n' => continue,
+                _ => return None,
+            };
+            acc = (acc << 6) | u32::from(value);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(u8::try_from((acc >> bits) & 0xff).expect("masked to a byte"));
+            }
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sha1_matches_the_standard_vectors() {
+            assert_eq!(
+                hex::encode(sha1(b"abc")),
+                "a9993e364706816aba3e25717850c26c9cd0d89d"
+            );
+            assert_eq!(
+                hex::encode(sha1(b"")),
+                "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+            );
+            assert_eq!(
+                hex::encode(sha1(
+                    b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+                )),
+                "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+            );
+        }
+    }
 }
 
 /// A request forwarded from the synchronous listener to the async actor.
@@ -4258,5 +4798,163 @@ exit $rc
     fn state_dirs_from_env_vars_silently_drops_multi_component() {
         let env = BTreeMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    // BEP-011: two roots `openssl req` issued, with the subject hash
+    // `openssl x509 -subject_hash` prints for each. The first has the
+    // proxy's subject with a doubled space and capitals. The second has a
+    // PrintableString, padding whitespace and a two-valued name.
+    const ROOT_FIXTURE: &str = "-----BEGIN CERTIFICATE-----
+MIIB6TCCAY+gAwIBAgIUKEyk5XE1f8EVhMjyqFOVAARndXswCgYIKoZIzj0EAwIw
+OzEQMA4GA1UECgwHTWluaW1hbDEnMCUGA1UEAwweTWluaW1hbCBCb3ggRWdyZXNz
+IFByb3h5ICBSb290MB4XDTI2MTAyMjIzNDU1NFoXDTM2MTAxOTIzNDU1NFowOzEQ
+MA4GA1UECgwHTWluaW1hbDEnMCUGA1UEAwweTWluaW1hbCBCb3ggRWdyZXNzIFBy
+b3h5ICBSb290MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExUC2b3xiCEX0LCqy
+sX0SMiHE0w+BRLrWRcgXH3TYrLnnvIODSgyYXivXAf938svi3if2u9dz4vLa2xFe
+7A9aLKNxMG8wHQYDVR0OBBYEFIgMZA34w+lLInVQsCRYuhrFh28UMB8GA1UdIwQY
+MBaAFIgMZA34w+lLInVQsCRYuhrFh28UMA8GA1UdEwEB/wQFMAMBAf8wHAYDVR0e
+AQH/BBIwEKAOMAyCCmdpdGh1Yi5jb20wCgYIKoZIzj0EAwIDSAAwRQIgHh0/64gR
+ThgYRM6y+810FiKt1tE5xHpfzExZsodENtECIQD0rmeyrbOA0ieA96kOppfKC0hK
+HXlvsoVB14bgb2892g==
+-----END CERTIFICATE-----\n";
+    const ROOT_FIXTURE_HASH: u32 = 0x75ba_e43c;
+    const ROOT_FIXTURE_MIXED: &str = "-----BEGIN CERTIFICATE-----
+MIIB3jCCAYWgAwIBAgIUJTs63lHvmaKP6+0zeiJcEqmcMEcwCgYIKoZIzj0EAwIw
+RTELMAkGA1UEBhMCVVMxGDAWBgNVBAoMDyAgTWluaW1hbHRDb3JwIDEcMAsGA1UE
+AwwEUm9vdDANBgNVBAsMBkVncmVzczAeFw0yNjEwMjIyMzQ2MDFaFw0zNjEwMTky
+MzQ2MDFaMEUxCzAJBgNVBAYTAlVTMRgwFgYDVQQKDA8gIE1pbmltYWx0Q29ycCAx
+HDALBgNVBAMMBFJvb3QwDQYDVQQLDAZFZ3Jlc3MwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAT2BZlyD4iot8ZEN8nWDeFUrSTPNjWVnwvTKXVQ9pSNBooOKADDTelx
+i3DPaOjeBqN4rbdyBsezCfBTN0Zbq7Vno1MwUTAdBgNVHQ4EFgQU1qntUuFHdvTi
+EaXbONzaxV3n8VQwHwYDVR0jBBgwFoAU1qntUuFHdvTiEaXbONzaxV3n8VQwDwYD
+VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAdxfdz9bZjCvywfPZdGrNy
+5AtB0aBLEzU4X+WJQNBCOQIgHA2qJyucOi4ZJc3KkPluYSaqzqvgMfalICgLj9mo
+06M=
+-----END CERTIFICATE-----\n";
+    const ROOT_FIXTURE_MIXED_HASH: u32 = 0x1313_be68;
+
+    #[test]
+    fn subject_hash_matches_openssl() {
+        for (pem, hash) in [
+            (ROOT_FIXTURE, ROOT_FIXTURE_HASH),
+            (ROOT_FIXTURE_MIXED, ROOT_FIXTURE_MIXED_HASH),
+        ] {
+            let der = certificate_der(pem).expect("a PEM certificate");
+            assert_eq!(trust_store::subject_hash(&der), Some(hash), "{pem}");
+        }
+        assert_eq!(certificate_der("not a certificate"), None);
+    }
+
+    /// BEP-011: the root lands in the box's own bundle copy and hashed
+    /// directory, and the package store's bundle keeps its bytes.
+    #[test]
+    fn root_certificate_goes_into_the_box_copy_never_the_store() {
+        let store = tempfile::tempdir().unwrap();
+        let store_bundle = store.path().join("ca-certificates.crt");
+        let system_roots = "-----BEGIN CERTIFICATE-----\nU1lTVEVN\n-----END CERTIFICATE-----";
+        std::fs::write(&store_bundle, system_roots).unwrap();
+        let rootfs = tempfile::tempdir().unwrap();
+        let certs = rootfs.path().join("etc/ssl/certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::hard_link(&store_bundle, certs.join("ca-certificates.crt")).unwrap();
+        // A system root that holds the same subject hash keeps its link.
+        std::fs::write(certs.join("other.pem"), "other").unwrap();
+        std::os::unix::fs::symlink("other.pem", certs.join("75bae43c.0")).unwrap();
+
+        let installed = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
+
+        assert_eq!(
+            installed,
+            RootInstall {
+                link: "75bae43c.1".to_string(),
+                bundle: true
+            }
+        );
+        assert!(layers_ship_ca_bundle([store.path(), rootfs.path()]));
+        assert_eq!(
+            std::fs::read_to_string(&store_bundle).unwrap(),
+            system_roots
+        );
+        let bundle = std::fs::read_to_string(certs.join("ca-certificates.crt")).unwrap();
+        assert_eq!(bundle, format!("{system_roots}\n{ROOT_FIXTURE}"));
+        assert_eq!(
+            std::fs::read_to_string(certs.join("minimal-box-egress-proxy-root.pem")).unwrap(),
+            ROOT_FIXTURE
+        );
+        assert_eq!(
+            std::fs::read_link(certs.join("75bae43c.1")).unwrap(),
+            Path::new("minimal-box-egress-proxy-root.pem")
+        );
+        assert_eq!(
+            std::fs::read_link(certs.join("75bae43c.0")).unwrap(),
+            Path::new("other.pem")
+        );
+    }
+
+    /// BEP-011: a link in the rootfs resolves inside the rootfs, so an
+    /// absolute link never sends a write to the daemon's own `/etc`.
+    #[test]
+    fn root_certificate_follows_links_inside_the_rootfs() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let real = rootfs.path().join("etc/pki/tls/certs");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink("/etc/pki/tls", rootfs.path().join("etc/ssl")).unwrap();
+
+        assert!(!layers_ship_ca_bundle([rootfs.path()]));
+
+        let installed = install_root_certificate(rootfs.path(), ROOT_FIXTURE).unwrap();
+
+        assert_eq!(
+            installed,
+            RootInstall {
+                link: "75bae43c.0".to_string(),
+                bundle: false
+            }
+        );
+        assert!(
+            !real.join("ca-certificates.crt").exists(),
+            "with no system bundle the box gets no bundle"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("minimal-box-egress-proxy-root.pem")).unwrap(),
+            ROOT_FIXTURE
+        );
+        assert!(real.join("75bae43c.0").is_symlink());
+    }
+
+    #[test]
+    fn root_certificate_that_is_not_a_certificate_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let error = install_root_certificate(rootfs.path(), "garbage").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!rootfs.path().join("etc/ssl/certs").exists());
+    }
+
+    /// BEP-011: a PEM with a second certificate block is refused, so no
+    /// trust anchor beyond the proxy's root reaches the box.
+    #[test]
+    fn root_certificate_with_two_blocks_is_refused() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let two = format!("{ROOT_FIXTURE}{ROOT_FIXTURE_MIXED}");
+        let error = install_root_certificate(rootfs.path(), &two).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!rootfs.path().join("etc/ssl/certs").exists());
+    }
+
+    /// BEP-011: text around the one block never reaches the store.
+    #[test]
+    fn root_certificate_text_outside_the_block_is_dropped() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let pem = format!("note before\n{ROOT_FIXTURE}trailing text\n");
+        install_root_certificate(rootfs.path(), &pem).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                rootfs
+                    .path()
+                    .join("etc/ssl/certs/minimal-box-egress-proxy-root.pem")
+            )
+            .unwrap(),
+            ROOT_FIXTURE
+        );
     }
 }

@@ -259,6 +259,10 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Not a daemon connection: `min` registers a GitHub grant box
+            // with the Box Egress Proxy over its control socket. The proxy is
+            // not the daemon, and the daemon's build is not in question here.
+            "cmd/boxes/create.rs::mint_grants = ungated",
             // Not a product path: the destroy-race test's own connection to
             // the harness daemon. The destroy it drives sends no gated RPC —
             // the race's loser just reports what the daemon said — so the
@@ -294,13 +298,42 @@ fn every_daemon_connection_is_classified() {
             "dash/rpc.rs::connect_missing = gated",
             "dash/rpc.rs::discover = gated",
             "diag/net.rs::probe_socket = ungated",
+            // Test-only: the BEP-063 mint tests register keys with a proxy
+            // control socket they serve themselves, so no daemon is involved.
+            "mint.rs::a_refused_client_key_is_replaced_and_registered_before_the_mint = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replacement_past_a_bound_of_keys_in_use_fails_the_creation = ungated",
+            "mint.rs::a_replacement_the_store_does_not_keep_revokes_no_key = ungated",
+            "mint.rs::create = ungated",
+            // The proxy's control socket, not the daemon: a replaced client
+            // key is revoked there, and no daemon version applies to it.
+            "mint.rs::local_client_key_at = ungated",
+            "mint.rs::revoke_others = ungated",
+            "mint.rs::store_handle_signed_and_key_registered = ungated",
+            "mint.rs::store_handle_signed_and_key_registered = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
             // the selected daemon — but connections all the same, and the
             // paths they drive are the gated ones above, so the label records
             // what the tests assert rather than a decision they make.
+            // Not a product path, and not the daemon: the mint tests' own
+            // connections to a test Box Egress Proxy's control socket.
+            "tests.rs::a_failed_box_reply_forgets_the_box_again = ungated",
+            "tests.rs::a_refused_client_key_forgets_the_box_again = ungated",
+            "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
+            "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
+            "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
+            // Not a product path, and not the daemon: the audit test submits
+            // a revocation to a test Box Egress Proxy's control socket.
+            "tests.rs::mint_and_destroy_append_audit_records = ungated",
         ]
     );
 }
@@ -319,8 +352,14 @@ fn every_create_session_asserts_the_daemon_build() {
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
             "cmd/boxes/create.rs::activate_box = asserts",
+            // A unit test's request, never sent: it checks the box spec.
+            "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
+            // A unit test's request, never sent: it checks the project root.
+            "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // A unit test's request, never sent: it checks the project root.
+            "dash/rpc.rs::dashboard_create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
@@ -328,6 +367,8 @@ fn every_create_session_asserts_the_daemon_build() {
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
             "tests.rs::create_box_on = asserts",
+            // Not a client path: the mint unit tests' create-request fixture.
+            "tests.rs::create_request = asserts",
         ]
     );
 }
@@ -1774,6 +1815,269 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
     std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(resolve_upload_root(path).is_err());
+}
+
+/// The pure upload decision over its whole domain: the empty/`$HOME`
+/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// headless gate, with no TTY and no daemon in sight.
+#[test]
+fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
+    // An empty directory skips silently — unless the caller passed an
+    // explicit `--sync tarball`, which uploads it anyway.
+    let empty = tempfile::tempdir().unwrap();
+    let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(empty, false, false, None),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(
+        decide_workspace_upload(empty, true, false, None),
+        UploadDecision::Upload
+    );
+
+    // A non-empty, undeclared, non-VCS root: a headless caller skips with
+    // the shared warning, an interactive one is asked first.
+    let plain = tempfile::tempdir().unwrap();
+    std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
+    let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(plain, false, true, None),
+        UploadDecision::SkipUndeclared
+    );
+    assert_eq!(
+        decide_workspace_upload(plain, false, false, None),
+        UploadDecision::Confirm
+    );
+
+    // A VCS root or a declared project uploads unconditionally.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("notes.txt"), "x").unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(repo, false, true, None),
+        UploadDecision::Upload
+    );
+
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(declared.path().join("notes.txt"), "x").unwrap();
+    std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
+    let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(declared, false, true, None),
+        UploadDecision::Upload
+    );
+
+    // A declared project that is `$HOME` keeps the carve-out — home is never
+    // bulk-uploaded on a stray activation — so its hooks are the count the
+    // gate below refuses over. This is the one state a skip can drop hooks
+    // from: an undeclared root has no `minimal.toml` to lose (the case above).
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(home, false, false, Some(home.as_std_path())),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(project_lifecycle_hook_count(home), 1);
+    assert!(
+        refuse_dropped_hooks(
+            &WorkspaceUpload::SkippedEmptyOrHome {
+                dropped_hooks: project_lifecycle_hook_count(home),
+            },
+            home,
+            CLI_DROPPED_HOOKS_REMEDY,
+        )
+        .is_err(),
+        "a skipped home that declares hooks must be refused, not created silently"
+    );
+}
+
+/// The refusal a hook-dropping skip raises names the root, the count, and the
+/// `--sync` escape hatch. It is shared by both CLI callers and by the
+/// dashboard's own gate, so the wording cannot drift between them; the remedy
+/// clause is the caller's, and each caller's names what it can do.
+#[test]
+fn dropped_hooks_error_names_root_count_and_escape_hatch() {
+    let err = dropped_hooks_error(
+        camino::Utf8Path::new("/srv/data/run42"),
+        3,
+        CLI_DROPPED_HOOKS_REMEDY,
+    );
+    let text = err.to_string();
+    assert!(text.contains("/srv/data/run42"), "{text}");
+    assert!(text.contains("is your home directory"), "{text}");
+    assert!(text.contains("3 lifecycle hook(s)"), "{text}");
+    assert!(text.contains("--sync tarball"), "{text}");
+    assert!(text.contains("--sync none"), "{text}");
+
+    // The dashboard owns neither flag, so its refusal names the command that
+    // does rather than advice no key on the screen can follow.
+    let dashboard = dropped_hooks_error(
+        camino::Utf8Path::new("/home/dev"),
+        2,
+        DASH_DROPPED_HOOKS_REMEDY,
+    )
+    .to_string();
+    assert!(
+        dashboard.contains("min session activate --sync tarball"),
+        "{dashboard}"
+    );
+    assert!(
+        !dashboard.contains("`--sync none`"),
+        "the dashboard cannot pass --sync none, so it must not be told to: {dashboard}"
+    );
+}
+
+/// The resolved-root notice appears only when the upload walked above the
+/// invocation directory, so `min activate` from inside a project says which
+/// root it used while a root at the invocation directory stays quiet.
+#[test]
+fn resolved_upload_root_notice_only_when_they_differ() {
+    let root = camino::Utf8Path::new("/proj");
+    let subdir = camino::Utf8Path::new("/proj/sub");
+    assert!(resolved_upload_root_notice(root, root).is_none());
+    let notice = resolved_upload_root_notice(subdir, root).expect("a notice when they differ");
+    assert!(
+        notice.contains("/proj (resolved from /proj/sub)"),
+        "{notice}"
+    );
+}
+
+/// A skip that would drop lifecycle hooks is the caller's call: the refusing
+/// caller gets an error, and one with no hooks dropped never does. The skip
+/// that costs them is the `$HOME` that is itself a declared project — an
+/// undeclared root has no `minimal.toml` to lose — and the user's own decline
+/// is never refused, whatever it costs: it is an answer, not an accident.
+#[test]
+fn report_upload_outcome_refuses_dropped_hooks_only() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    assert!(
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+            root,
+            DroppedHooksPolicy::Refuse,
+            &mut Vec::new(),
+        )
+        .is_err(),
+        "a skipped home that declares hooks is refused"
+    );
+    for kept in [
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(
+            report_upload_outcome(Ok(kept), root, DroppedHooksPolicy::Refuse, &mut Vec::new())
+                .is_ok(),
+            "{kept:?}"
+        );
+    }
+}
+
+/// The non-refusing caller (`min task run`) proceeds, but its warning names
+/// the hooks the skipped upload loses: the empty-box line alone would read as
+/// a healthy start.
+#[test]
+fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Warn,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
+    assert!(
+        err.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
+        "{err:?}"
+    );
+}
+
+/// `--no-hooks` already disabled the project's hooks, so the activation
+/// proceeds without a hook warning: only the empty-box line remains.
+#[test]
+fn report_upload_outcome_ignores_hooks_the_caller_disabled() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Ignore,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
+    assert!(!err.contains("lifecycle hook"), "{err:?}");
+}
+
+/// The rule `min dash` applies in place of the stderr wording refuses exactly
+/// the skip that would drop hooks: the skips that cost nothing, and the user's
+/// own decline, still create their box.
+#[test]
+fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    for allowed in [
+        WorkspaceUpload::Uploaded,
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(
+            refuse_dropped_hooks(&allowed, root, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
+    }
+    let err = refuse_dropped_hooks(
+        &WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 },
+        root,
+        CLI_DROPPED_HOOKS_REMEDY,
+    )
+    .expect_err("a home skip that drops lifecycle hooks is refused");
+    assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
+}
+
+/// A create that plans its upload refuses the hook-dropping `$HOME` skip
+/// from the decision alone, before the daemon holds a session or a row: only
+/// the empty/`$HOME` skip can cost hooks, and only when the root declares
+/// some.
+#[test]
+fn refuse_dropped_hooks_before_create_refuses_the_home_skip() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    for allowed in [
+        UploadDecision::Upload,
+        UploadDecision::SkipUndeclared,
+        UploadDecision::Confirm,
+        UploadDecision::Declined,
+    ] {
+        assert!(
+            refuse_dropped_hooks_before_create(allowed, home, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
+    }
+    let err = refuse_dropped_hooks_before_create(
+        UploadDecision::SkipEmptyOrHome,
+        home,
+        CLI_DROPPED_HOOKS_REMEDY,
+    )
+    .expect_err("the home skip that drops hooks is refused before the create");
+    assert!(err.to_string().contains("1 lifecycle hook(s)"), "{err}");
 }
 
 /// A refused composition is reported in the user's terms — the
@@ -3734,5 +4038,1125 @@ fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
     assert_eq!(
         match_id_prefix(&entries, "beefcafe").unwrap(),
         Some(entries[2].id)
+    );
+}
+
+/// The GitHub grant mint and the box's registration with the proxy
+/// (BEP-003, BEP-005).
+mod mint_tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bep::boxes::{BoxRegistry, Stance};
+    use bep::control::{Control, Registry};
+    use bep::module::GITHUB;
+    use bep::publish::{Identity, PublishedKey};
+    use bep::seal::{Binding, Breadth, MemberKind, Mode, ProxyKey, ProxyPublicKey};
+    use bep::signin::{Completed, Flow, Keychain as _, Material, MemoryKeychain, store_sign_in};
+    use minimald_rpc::CreateSessionRequest;
+
+    use crate::mint::{ClientKey, ControlClient, GrantBox, MintError, mint_and_register};
+
+    const BOX_ID: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f5";
+    const BOX_HEX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+    const NOW: u64 = 1_800_000_000;
+    const ROOT_END: u64 = 2_000_000_000;
+
+    fn published(key: &ProxyPublicKey) -> PublishedKey {
+        PublishedKey {
+            public: URL_SAFE_NO_PAD.encode(key.to_sec1_bytes()),
+            kid: key.kid(),
+        }
+    }
+
+    /// A proxy's sealing key and the identity it publishes.
+    fn proxy() -> (ProxyKey, Identity) {
+        let sealing = ProxyKey::generate().unwrap();
+        let root = ProxyKey::generate().unwrap();
+        let identity = Identity {
+            sealing: Some(published(&sealing.public())),
+            root: Some(published(&root.public())),
+            signing: Some(published(&ProxyKey::generate().unwrap().public())),
+            root_not_after: Some(ROOT_END),
+            root_certificate: None,
+        };
+        (sealing, identity)
+    }
+
+    fn signed_in() -> MemoryKeychain {
+        let keychain = MemoryKeychain::default();
+        store_sign_in(
+            &keychain,
+            &Completed {
+                account: "octocat".into(),
+                flow: Flow::Device,
+                material: Material {
+                    instance: String::new(),
+                    access_token: "ghu_secret_token_value".into(),
+                    refresh_token: "ghr_secret_refresh_value".into(),
+                },
+                token_expires_at: NOW + 3_600,
+                refresh_expires_at: NOW + 86_400,
+            },
+        )
+        .unwrap();
+        keychain
+    }
+
+    fn grant_box(stance: Stance) -> GrantBox {
+        GrantBox {
+            box_id: BOX_ID.into(),
+            grants: vec!["GH_TOKEN".into()],
+            egress: vec![
+                "github.com".into(),
+                "api.github.com".into(),
+                "uploads.github.com".into(),
+                "codeload.github.com".into(),
+            ],
+            stance,
+        }
+    }
+
+    /// A control socket served on its own runtime, with its registries.
+    struct Served {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        clients: Registry,
+        boxes: BoxRegistry,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    fn serve() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let clients = Registry::default();
+        let boxes = BoxRegistry::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async { Control::bind(&path, Arc::clone(&clients), Arc::clone(&boxes)) })
+            .unwrap();
+        runtime.spawn(control.run());
+        Served {
+            _dir: dir,
+            path,
+            clients,
+            boxes,
+            _runtime: runtime,
+        }
+    }
+
+    // BEP-072, BEP-011: a grant box's create request carries the root
+    // certificate the proxy published, beside each grant's sealed value. A
+    // grant box whose proxy publishes none is refused with a message that
+    // names `bep`, and a box with no grant carries no root.
+    #[test]
+    fn grant_box_create_request_carries_the_published_root_certificate() {
+        use crate::cmd::{grant_root_certificate, hand_grants};
+
+        let (_, identity) = proxy();
+        let root_key = identity.key(bep::keys::Role::Root).unwrap();
+        let pem = bep::publish::certificate_pem(&certificate_der(&root_key.to_sec1_bytes()));
+        let identity = Identity {
+            root_certificate: Some(pem.clone()),
+            ..identity
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        identity.publish(&path).unwrap();
+        let published = Identity::read(&path).unwrap();
+
+        let root = grant_root_certificate(&published).unwrap();
+        assert_eq!(root, pem);
+        let grants = vec!["GH_TOKEN".to_string()];
+        let minted = vec![crate::mint::Minted {
+            grant: "GH_TOKEN".into(),
+            sealed: zeroize::Zeroizing::new("sealed-value".into()),
+            expiry: ROOT_END,
+        }];
+        let mut request = create_request();
+        hand_grants(&mut request, &grants, &minted, Some(root)).unwrap();
+        assert_eq!(
+            request.config.root_certificate.as_deref(),
+            Some(pem.as_str())
+        );
+        assert_eq!(request.config.sealed_deliveries.len(), 1);
+        assert_eq!(request.config.sealed_deliveries[0].variable, "GH_TOKEN");
+
+        // An identity that an older `bep` published has no certificate, one
+        // with a broken certificate has none that the box can trust, and a
+        // certificate under another key is not the published root's.
+        let foreign = ProxyKey::generate().unwrap().public().to_sec1_bytes();
+        let foreign = bep::publish::certificate_pem(&certificate_der(&foreign));
+        for root_certificate in [None, Some("not a certificate".to_string()), Some(foreign)] {
+            let identity = Identity {
+                root_certificate,
+                ..published.clone()
+            };
+            let error = grant_root_certificate(&identity).unwrap_err().to_string();
+            assert!(error.contains("no root certificate"), "{error}");
+            assert!(error.contains("Run `bep`"), "{error}");
+        }
+        let mut refused = create_request();
+        let error = hand_grants(&mut refused, &grants, &minted, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Run `bep`"), "{error}");
+        assert_eq!(refused.config.root_certificate, None);
+        assert!(refused.config.sealed_deliveries.is_empty());
+
+        // A box with no GitHub grant carries no root.
+        let mut plain = create_request();
+        hand_grants(&mut plain, &[], &[], None).unwrap();
+        assert_eq!(plain.config.root_certificate, None);
+    }
+
+    /// A certificate's DER, in the shape of the one `bep` issues, whose
+    /// subject public key is `point`, an uncompressed P-256 point. Only the
+    /// structure up to the subject key is real.
+    fn certificate_der(point: &[u8]) -> Vec<u8> {
+        fn element(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+            let content = parts.concat();
+            let mut out = vec![tag];
+            match u16::try_from(content.len()).unwrap() {
+                len @ 0..0x80 => out.push(u8::try_from(len).unwrap()),
+                len @ 0x80..0x100 => out.extend([0x81, u8::try_from(len).unwrap()]),
+                len => {
+                    out.push(0x82);
+                    out.extend(len.to_be_bytes());
+                }
+            }
+            out.extend(content);
+            out
+        }
+        const P256: &[u8] = &[
+            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+            0xce, 0x3d, 0x03, 0x01, 0x07,
+        ];
+        let algorithm = element(0x30, &[P256]);
+        let key = element(0x03, &[&[0], point]);
+        let spki = element(0x30, &[&algorithm, &key]);
+        let name = element(0x30, &[&element(0x31, &[])]);
+        let tbs = element(
+            0x30,
+            &[
+                &element(0xa0, &[&element(0x02, &[&[2]])]),
+                &element(0x02, &[&[1]]),
+                &element(0x30, &[]),
+                &name,
+                &element(0x30, &[]),
+                &name,
+                &spki,
+                &element(0xa3, &[&[0; 200]]),
+            ],
+        );
+        element(0x30, &[&tbs, &element(0x30, &[]), &element(0x03, &[&[0]])])
+    }
+
+    fn create_request() -> CreateSessionRequest {
+        let mut request = CreateSessionRequest::new(
+            "grant-box",
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+            boxes::NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        );
+        request.must_match_version = minimal_client::version_assertion();
+        request
+    }
+
+    // BEP-005: the member is a sign-in reference under the client's key,
+    // with no token, the module's authorities, no injection form, and the
+    // root's validity end as its expiry.
+    #[test]
+    fn local_member_is_a_sign_in_reference_expiring_with_the_root() {
+        let (sealing, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let key = ClientKey::generate().unwrap();
+
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &key,
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].grant, "GH_TOKEN");
+        assert_eq!(minted[0].expiry, ROOT_END);
+        // The sealed value carries no token, in any part.
+        assert!(!minted[0].sealed.contains("ghu_"));
+        assert!(!minted[0].sealed.contains("ghr_"));
+
+        // The value opens for this box on the proxy that publishes the key.
+        let node = sealing.public().kid();
+        let opened = bep::seal::open(
+            &sealing,
+            &minted[0].sealed,
+            &Binding {
+                box_id: BOX_HEX.into(),
+                host: node.clone(),
+                module: GITHUB.id.into(),
+                now: NOW + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.context.box_id, BOX_HEX);
+        assert_eq!(opened.context.host, node);
+        assert_eq!(opened.context.module, "github");
+        assert_eq!(opened.context.host_set_version, GITHUB.host_set_version);
+        assert_eq!(opened.context.mode, Mode::User);
+        assert_eq!(opened.context.iat, NOW);
+        assert_eq!(opened.context.expiry, ROOT_END);
+        assert_eq!(opened.member.kind, MemberKind::SignIn);
+        assert_eq!(opened.member.breadth, Breadth::Full);
+        assert_eq!(opened.member.exp, Some(ROOT_END));
+
+        // The handle verifies under the client key the mint registered.
+        let registered = served.clients.read().unwrap().clone();
+        assert!(registered.contains(&key.kid()));
+        let claims = bep::handle::verify(&opened.member.jws, &registered).unwrap();
+        assert_eq!(claims.sub, BOX_HEX);
+        assert_eq!(claims.node_id, node);
+        assert_eq!(claims.store, "github");
+        assert_eq!(claims.id, instance);
+        let upstream: Vec<String> = GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect();
+        assert_eq!(claims.upstream, upstream);
+        assert_eq!(claims.inject, None);
+        assert_eq!(claims.iat, NOW);
+        assert_eq!(claims.exp, ROOT_END);
+        assert_eq!(claims.jti.len(), 32);
+        assert!(!opened.member.jws.contains("ghu_"));
+
+        // A handle signed under a key the proxy never registered does not
+        // verify.
+        let other = bep::handle::ClientKeys::new();
+        assert!(bep::handle::verify(&opened.member.jws, &other).is_err());
+    }
+
+    // BEP-005: an identity with no root validity end mints nothing, and
+    // registers nothing.
+    #[test]
+    fn an_identity_with_no_root_validity_mints_nothing() {
+        let (_, identity) = proxy();
+        let identity = Identity {
+            root_not_after: None,
+            ..identity
+        };
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Identity { .. }), "{err}");
+        assert!(served.boxes.get(BOX_HEX).is_none());
+    }
+
+    // BEP-003: the proxy holds the box's declared egress and its stance
+    // after the mint. With no sign-in held, nothing is registered.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy() {
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+
+        mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::HostIp),
+            NOW,
+        )
+        .unwrap();
+        let held = served.boxes.get(BOX_HEX).expect("the proxy holds the box");
+        let egress: Vec<(String, u16)> = held
+            .egress
+            .iter()
+            .map(|authority| (authority.host.clone(), authority.port))
+            .collect();
+        assert_eq!(
+            egress,
+            [
+                ("github.com".to_owned(), 443),
+                ("api.github.com".to_owned(), 443),
+                ("uploads.github.com".to_owned(), 443),
+                ("codeload.github.com".to_owned(), 443),
+            ]
+        );
+        assert_eq!(held.stance, Stance::HostIp);
+
+        // With no sign-in held the creation fails with the defined error's
+        // text, and the proxy gets no registration.
+        let other = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        let err = mint_and_register(
+            &MemoryKeychain::default(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &GrantBox {
+                box_id: other.into(),
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::NoSignIn));
+        assert!(err.to_string().contains("Run `min auth login`"), "{err}");
+        assert!(served.boxes.get(other).is_none());
+
+        // A box registration the proxy refuses leaves no client key
+        // registered.
+        let refused_key = ClientKey::generate().unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &refused_key,
+            &GrantBox {
+                box_id: other.into(),
+                egress: vec![".".into()],
+                ..grant_box(Stance::OwnIp)
+            },
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert!(served.boxes.get(other).is_none());
+        assert!(!served.clients.read().unwrap().contains(&refused_key.kid()));
+
+        // Nothing answers on a socket no proxy serves.
+        let gone = served.path.with_file_name("none.sock");
+        let err = ControlClient::connect(&gone).err().unwrap();
+        assert!(matches!(err, MintError::NotRunning { .. }), "{err}");
+    }
+
+    // BEP-003: a creation that fails after the mint leaves no declared
+    // egress at the proxy. A creation that finishes keeps it.
+    #[test]
+    fn grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails() {
+        use crate::mint::ProxyRegistration;
+        let (_, identity) = proxy();
+        let served = serve();
+        let mut control = ControlClient::connect(&served.path).unwrap();
+        let mut mint = |box_id: &str| {
+            mint_and_register(
+                &signed_in(),
+                &identity,
+                std::path::Path::new("identity.json"),
+                &mut control,
+                &ClientKey::generate().unwrap(),
+                &GrantBox {
+                    box_id: box_id.into(),
+                    ..grant_box(Stance::OwnIp)
+                },
+                NOW,
+            )
+            .unwrap();
+        };
+
+        // A failed creation drops its registration, and the proxy forgets
+        // the box.
+        mint(BOX_HEX);
+        assert!(served.boxes.get(BOX_HEX).is_some());
+        drop(ProxyRegistration::new(served.path.clone(), BOX_HEX).unwrap());
+        assert!(served.boxes.get(BOX_HEX).is_none());
+
+        // A finished creation keeps its registration.
+        let kept = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f7";
+        mint(kept);
+        ProxyRegistration::new(served.path.clone(), kept)
+            .unwrap()
+            .keep();
+        assert!(served.boxes.get(kept).is_some());
+
+        // A drop inside a runtime forgets the box on a blocking thread, and
+        // the runtime waits for it before it shuts down.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            drop(ProxyRegistration::new(served.path.clone(), kept).unwrap());
+        });
+        drop(runtime);
+        assert!(served.boxes.get(kept).is_none());
+
+        // A drop with no proxy to tell does not panic.
+        let gone = served.path.with_file_name("none.sock");
+        drop(ProxyRegistration::new(gone, kept).unwrap());
+    }
+
+    // BEP-067, BEP-043: a mint appends one `mint` record per member, and a
+    // live box's destroy appends one `revocation` record, to the one audit
+    // log, through the proxy's control socket. The records chain, and the
+    // revocation is in force for the box id alone.
+    #[test]
+    fn mint_and_destroy_append_audit_records() {
+        use bep::audit::{AuditLog, Kind, LogReader, Outcome, line_hash, segment_name};
+        use bep::redeemer::Revocations;
+
+        let (_, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let logs = dir.path().join("audit");
+        let log = AuditLog::open(logs.join(segment_name(0))).unwrap();
+        let revocations = Revocations::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_revocations(Arc::clone(&revocations))
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        let mut client = ControlClient::connect(&path).unwrap();
+        let two_grants = GrantBox {
+            grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+            ..grant_box(Stance::OwnIp)
+        };
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut client,
+            &ClientKey::generate().unwrap(),
+            &two_grants,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+
+        let mut reader = LogReader::new(&logs);
+        let mints = reader.read_new().unwrap().entries;
+        assert_eq!(mints.len(), 2, "one mint record per member: {mints:?}");
+        for entry in &mints {
+            assert_eq!(entry.record.kind, Kind::Mint);
+            assert_eq!(entry.record.subject, BOX_HEX);
+            assert_eq!(entry.record.identifier, format!("github:{instance}"));
+            assert_eq!(entry.record.decision, Outcome::Admit);
+            assert!(!entry.line.contains("ghu_") && !entry.line.contains("ghr_"));
+        }
+        assert!(revocations.read().unwrap().is_empty());
+
+        // The destroy of the live box, as `minvmd` sends it: the revocation,
+        // then the forget. The hyphenated id names the same box.
+        client.revoke_box(BOX_ID).unwrap();
+        client.forget_box(BOX_ID).unwrap();
+        // A second revocation of the box records nothing new.
+        client.revoke_box(BOX_HEX).unwrap();
+        let revoked = reader.read_new().unwrap().entries;
+        assert_eq!(revoked.len(), 1, "one revocation record: {revoked:?}");
+        assert_eq!(revoked[0].record.kind, Kind::Revocation);
+        assert_eq!(revoked[0].record.subject, BOX_HEX);
+        assert_eq!(revoked[0].record.identifier, bep::audit::NONE);
+        // One chain: the revocation follows the client's mints.
+        assert_eq!(revoked[0].record.previous_hash, line_hash(&mints[1].line));
+        assert_eq!(mints[1].record.previous_hash, line_hash(&mints[0].line));
+        assert_eq!(revocations.read().unwrap().as_slice(), [BOX_HEX.to_owned()]);
+
+        // A request with no box id is refused, and records nothing.
+        assert!(client.revoke_box("web").is_err());
+        assert!(client.record_mint(BOX_HEX, " ").is_err());
+        assert!(reader.read_new().unwrap().entries.is_empty());
+    }
+
+    /// A control socket that registers and forgets boxes as the proxy does,
+    /// and refuses every client key. Gives the socket and its boxes.
+    fn serve_refusing_keys() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = Arc::new(std::sync::RwLock::new(bep::handle::ClientKeys::new()));
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                served_ops.lock().unwrap().push("connect".to_owned());
+                // The proxy serves each connection on its own task.
+                let (clients, served_boxes, served_ops) = (
+                    Arc::clone(&clients),
+                    Arc::clone(&served_boxes),
+                    Arc::clone(&served_ops),
+                );
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        let request: bep::control::Request =
+                            serde_json_lenient::from_str(&line).unwrap();
+                        let op = match request {
+                            bep::control::Request::RegisterClientKey { .. } => {
+                                "register_client_key"
+                            }
+                            bep::control::Request::RegisterBox { .. } => "register_box",
+                            bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                            bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
+                            bep::control::Request::RecordMint { .. } => "record_mint",
+                            bep::control::Request::RevokeBox { .. } => "revoke_box",
+                        };
+                        served_ops.lock().unwrap().push(op.to_owned());
+                        let reply = if op == "register_client_key" {
+                            bep::control::Reply {
+                                ok: false,
+                                kid: None,
+                                revoked: Vec::new(),
+                                error: Some("the key is not a P-256 public key".into()),
+                            }
+                        } else if op == "record_mint" || op == "revoke_box" {
+                            // `handle_line` keeps no record, so the stub
+                            // answers these two itself.
+                            bep::control::Reply {
+                                ok: true,
+                                kid: None,
+                                revoked: Vec::new(),
+                                error: None,
+                            }
+                        } else {
+                            bep::control::handle_line(&line, &clients, &served_boxes)
+                        };
+                        let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                        answer.push('\n');
+                        writer.write_all(answer.as_bytes()).unwrap();
+                        line.clear();
+                    }
+                });
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-063: a client key the proxy refuses leaves no box registered
+    // either. The box is registered first and forgotten again, over a new
+    // connection.
+    #[test]
+    fn a_refused_client_key_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_refusing_keys();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert_eq!(
+            *ops.lock().unwrap(),
+            [
+                "connect",
+                "register_box",
+                "register_client_key",
+                "connect",
+                "forget_box"
+            ]
+        );
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    /// A control socket that stores each box it is asked to register and
+    /// then closes the connection with no reply. Every other request gets
+    /// the proxy's answer. Gives the socket, its boxes and the requests.
+    fn serve_dropping_box_replies() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BoxRegistry,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let boxes = BoxRegistry::default();
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (served_boxes, served_ops) = (Arc::clone(&boxes), Arc::clone(&ops));
+        std::thread::spawn(move || {
+            let clients = std::sync::RwLock::new(bep::handle::ClientKeys::new());
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let request: bep::control::Request =
+                        serde_json_lenient::from_str(&line).unwrap();
+                    let op = match request {
+                        bep::control::Request::RegisterClientKey { .. } => "register_client_key",
+                        bep::control::Request::RegisterBox { .. } => "register_box",
+                        bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                        bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
+                        bep::control::Request::RecordMint { .. } => "record_mint",
+                        bep::control::Request::RevokeBox { .. } => "revoke_box",
+                    };
+                    served_ops.lock().unwrap().push(op.to_owned());
+                    let reply = if op == "record_mint" || op == "revoke_box" {
+                        // `handle_line` keeps no record, so the stub
+                        // answers these two itself.
+                        bep::control::Reply {
+                            ok: true,
+                            kid: None,
+                            revoked: Vec::new(),
+                            error: None,
+                        }
+                    } else {
+                        bep::control::handle_line(&line, &clients, &served_boxes)
+                    };
+                    if op == "register_box" {
+                        // The box is stored, and the reply never comes.
+                        break;
+                    }
+                    let mut answer = serde_json_lenient::to_string(&reply).unwrap();
+                    answer.push('\n');
+                    writer.write_all(answer.as_bytes()).unwrap();
+                    line.clear();
+                }
+            }
+        });
+        (dir, path, boxes, ops)
+    }
+
+    // BEP-003: a registration whose reply fails can still leave the box
+    // stored at the proxy. The mint forgets it again over a new connection,
+    // and registers no client key.
+    #[test]
+    fn a_failed_box_reply_forgets_the_box_again() {
+        let (_, identity) = proxy();
+        let (_dir, path, boxes, ops) = serve_dropping_box_replies();
+        let mut control = ControlClient::connect(&path).unwrap();
+        let err = mint_and_register(
+            &signed_in(),
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut control,
+            &ClientKey::generate().unwrap(),
+            &grant_box(Stance::OwnIp),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MintError::Control(_)), "{err}");
+        assert_eq!(*ops.lock().unwrap(), ["register_box", "forget_box"]);
+        assert!(boxes.get(BOX_HEX).is_none());
+    }
+
+    fn github_secrets() -> boxes::core::bep::SecretGrants {
+        std::collections::BTreeMap::from([(
+            "GH_TOKEN".to_owned(),
+            boxes::core::bep::SecretGrant {
+                source: boxes::core::bep::GrantSource::Broker,
+                scopes: vec!["github:user-token".into()],
+                mode: None,
+            },
+        )])
+    }
+
+    fn refusal(err: &anyhow::Error) -> &boxes::core::bep::ActivationRefused {
+        err.downcast_ref::<boxes::core::bep::ActivationRefused>()
+            .unwrap_or_else(|| panic!("not a refused box spec: {err}"))
+    }
+
+    // Gatehouse §6.2: where no node-local proxy exists, a GitHub grant is
+    // refused with `gatehouse_unenrolled_node` and exit 5, even with a
+    // sign-in held. `github_sign_in_required` is only for a host that has a
+    // proxy.
+    #[test]
+    fn a_grant_box_with_no_proxy_is_refused_as_an_unenrolled_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let control = dir.path().join("control.sock");
+        assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        assert!(!crate::cmd::proxy_present(None, None));
+
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(
+            boxes::core::bep::GATEHOUSE_UNENROLLED_NODE,
+            "gatehouse_unenrolled_node"
+        );
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and no Box Egress \
+             Proxy serves boxes on this machine. Remove the grant from the [secrets] table in \
+             minimal.toml, then create the box again."
+        );
+        // With no sign-in held either, the missing proxy is what is refused.
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), false, &MemoryKeychain::default())
+                .unwrap_err();
+        assert_eq!(
+            refusal(&err).refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+
+        // With a proxy, no sign-in held is refused with its own error.
+        std::fs::write(&identity, "{}").unwrap();
+        std::fs::write(&control, "").unwrap();
+        assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), true, &MemoryKeychain::default())
+                .unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GITHUB_SIGN_IN_REQUIRED)
+        );
+        assert_eq!(refused.exit_code(), 3);
+        // With a proxy and a sign-in, the grants pass. A box with no GitHub
+        // grant is never refused.
+        assert_eq!(
+            crate::cmd::check_github_grants(&github_secrets(), true, &signed_in()).unwrap(),
+            ["GH_TOKEN"]
+        );
+        assert!(
+            crate::cmd::check_github_grants(&Default::default(), false, &MemoryKeychain::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Gatehouse §6.2: a grant box with no box id or no stance is refused
+    // with `gatehouse_unenrolled_node`, and does not start with a grant that
+    // resolves to nothing.
+    #[test]
+    fn a_grant_box_with_no_box_id_or_stance_is_refused_as_an_unenrolled_node() {
+        let grants = vec!["GH_TOKEN".to_owned()];
+        let refused =
+            crate::cmd::grant_box_facts(&grants, None, boxes::NetworkMode::OwnIp).unwrap_err();
+        assert_eq!(
+            refused.refusals[0].code(),
+            Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
+        );
+        assert_eq!(refused.exit_code(), 5);
+        let refused =
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::NoNet)
+                .unwrap_err();
+        assert_eq!(refused.exit_code(), 5);
+
+        assert_eq!(
+            crate::cmd::grant_box_facts(&grants, Some(BOX_ID.into()), boxes::NetworkMode::HostNet)
+                .unwrap(),
+            Some((BOX_ID.to_owned(), Stance::HostIp))
+        );
+        // A box with no GitHub grant needs neither.
+        assert_eq!(
+            crate::cmd::grant_box_facts(&[], None, boxes::NetworkMode::NoNet).unwrap(),
+            None
+        );
+    }
+}
+
+/// BEP-070: on a host that is not enrolled, each box creation gets a box id
+/// that the host-side creator mints outside the VM: a UUIDv7 whose timestamp
+/// comes from the clock and whose random fields come from the OS CSPRNG.
+/// The test drives the CLI's own registration against the real VM host
+/// tables and control server, and creates the box again and again under one
+/// name. Each creation gets a new id. The CLI presents no id, so the id the
+/// reply returns is the one the host's row holds. A friendly name is an
+/// alias, so a re-created box never inherits the id of its predecessor.
+#[tokio::test]
+async fn box_id_is_a_csprng_uuidv7_per_creation() {
+    use minimal_client::box_registration::{register_box_for_activation, withdraw_box_row};
+
+    const CREATIONS: usize = 8;
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_millis(),
+        )
+        .expect("the time in milliseconds fits in 64 bits")
+    }
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let sock_path = provider_dir.join("control.sock");
+    let attachments = minvmd::bep_attach::Attachments::new();
+    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+        .feeding_proxy_attachments(attachments.clone());
+    let _server = minvmd::control::spawn(
+        sock_path.clone(),
+        registry.clone(),
+        minvmd::net::answerer::AnswererStatus::allocating_for_tests("box-id-test-node"),
+        minvmd::control::ProxyPublishStatus::default(),
+    )
+    .expect("the control server binds its socket");
+
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(CREATIONS);
+    for creation in 0..CREATIONS {
+        let before = now_ms();
+        let mut registered = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "creation {creation}: the real control server answers the registration, \
+                 after ids {ids:02x?}: {error:#}"
+            )
+        })
+        .expect("an own-address box on a VM-backed host registers");
+        let after = now_ms();
+        // Commit the lease, as an activation does once its session is
+        // active. A lease dropped uncommitted makes the host withdraw the
+        // row on its own thread, later. That late withdrawal can land
+        // while the next creation of "web" is being assigned its address,
+        // and the host then refuses that creation as withdrawn.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
+        let id = registered
+            .box_id
+            .expect("the reply returns the id the host minted for this creation");
+        let bytes = id.to_bytes();
+
+        // The host minted it: the row and the attachment that the
+        // registration published hold the id that the reply returned.
+        let row = registry
+            .table()
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration published the box's row");
+        assert_eq!(
+            row.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's row holds"
+        );
+        let attachment = attachments
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            attachment.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's attachment holds"
+        );
+
+        // A UUIDv7: version 7 and the RFC 9562 variant.
+        assert_eq!(
+            bytes[6] >> 4,
+            7,
+            "creation {creation}: the id is a UUIDv7, got {id}"
+        );
+        assert_eq!(
+            bytes[8] >> 6,
+            0b10,
+            "creation {creation}: the id carries the RFC 9562 variant, got {id}"
+        );
+        // Its 48-bit timestamp is the clock at the mint, not a counter.
+        // The mint can take the millisecond after the process's last mint
+        // when that is ahead of the clock, so the upper bound allows one
+        // second of lead over the clock after the registration.
+        let mut stamp = [0u8; 8];
+        stamp[2..].copy_from_slice(&bytes[..6]);
+        let stamp = u64::from_be_bytes(stamp);
+        let latest = after + 1_000;
+        assert!(
+            (before..=latest).contains(&stamp),
+            "creation {creation}: the timestamp {stamp} of id {id} is the clock at the \
+             mint, between {before} and {latest}"
+        );
+
+        ids.push(bytes);
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(registered.addresses),
+            Some(id),
+        )
+        .await;
+        assert!(
+            !attachments.holds_id(bytes),
+            "creation {creation}: the destroyed box's id is held by no attachment"
+        );
+    }
+
+    // One id per creation: no id returns under the name it was minted for.
+    let distinct: std::collections::BTreeSet<[u8; 16]> = ids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        CREATIONS,
+        "each creation under one name gets an id of its own, got {ids:02x?}"
+    );
+    // The ids sort in creation order: each mint takes a later millisecond
+    // than the one before it.
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "the ids sort in creation order, got {ids:02x?}"
+    );
+    // The random fields are random fills, never a counter: all 74 bits
+    // after the version and the variant. `rand_a` is the 12 bits after the
+    // version, and `rand_b` is the 62 bits after the variant. Eight draws of
+    // 62 random bits are all distinct, and no two consecutive draws differ
+    // by one: either chance is below 2^-55. `rand_a` holds 12 bits only, so
+    // two of eight draws match about once in 150 runs. The test asserts
+    // only that `rand_a` does not step by one on every creation, the shape
+    // a counter gives it: a chance of 2^-84 for random fills.
+    let rand_a: Vec<u16> = ids
+        .iter()
+        .map(|bytes| u16::from_be_bytes([bytes[6] & 0x0f, bytes[7]]))
+        .collect();
+    let rand_b: Vec<u64> = ids
+        .iter()
+        .map(|bytes| {
+            let mut field = [0u8; 8];
+            field.copy_from_slice(&bytes[8..16]);
+            field[0] &= 0x3f;
+            u64::from_be_bytes(field)
+        })
+        .collect();
+    let distinct_b: std::collections::BTreeSet<u64> = rand_b.iter().copied().collect();
+    assert_eq!(
+        distinct_b.len(),
+        CREATIONS,
+        "rand_b differs on every creation, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        rand_b
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
+        "rand_b is not a counter, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        !rand_a
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff == 1),
+        "rand_a is not a counter, got {rand_a:03x?} from ids {ids:02x?}"
+    );
+}
+
+/// BEP-070: a minted box id that a retained record already names refuses
+/// the creation. This test proves the CLI half only: when the host refuses
+/// a registration for a colliding id, the CLI refuses the creation. It does
+/// not prove that the host detects a collision. The host half — the
+/// registry refuses the colliding mint before it spends an address — is
+/// `minvmd`'s `colliding_box_id_refused`, which the spec names as a second
+/// verify line. A real mint does not collide, and no public door fixes the
+/// id the host mints. So this test stands in for the host on the control
+/// socket and answers the CLI's registration with the exact refusal the
+/// host sends for a collision. The activation fails with the refusal, which
+/// names the colliding id, and no box id comes back.
+#[tokio::test]
+async fn colliding_box_id_refuses_creation() {
+    use minimal_client::box_registration::register_box_for_activation;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+
+    // The id a retained record already holds, and the refusal the host's
+    // control server replies with when a mint lands on it.
+    let held = minvmd::bep_attach::mint_box_id();
+    let refusal = minvmd::box_registry::AllocationError::CollidingBoxId { id: held }.to_string();
+    let held_text = minimald_rpc::BoxId::from_bytes(held).to_string();
+    assert!(
+        refusal.contains(&held_text),
+        "the host's refusal names the colliding id {held_text}, got {refusal:?}"
+    );
+
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the CLI connects");
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the CLI sends a control request");
+        assert!(
+            matches!(request, minimald_rpc::BoxControlRequest::Register(_)),
+            "the CLI asks the host to register the box, got {request:?}"
+        );
+        let mut reply =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error { error: refusal })
+                .unwrap();
+        reply.push('\n');
+        stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+    });
+
+    let err = register_box_for_activation(
+        paths::ProviderKind::Minvmd,
+        Some(dir.path()),
+        boxes::NetworkMode::OwnIp,
+        "web",
+        &policy,
+    )
+    .await
+    .expect_err("a colliding box id refuses the creation; the box gets no id");
+    host.await.expect("the stand-in host answered");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains(&held_text),
+        "the refusal names the colliding id {held_text}, got {chain:?}"
+    );
+    assert!(
+        chain.contains("does not start"),
+        "the activation ends on the refusal, so no box is created, got {chain:?}"
     );
 }

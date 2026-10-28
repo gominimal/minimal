@@ -119,6 +119,8 @@ pub enum Command {
     Proxy(ProxyArgs),
     /// Sign in to GitHub, and show the sign-in that boxes use
     Auth(AuthArgs),
+    /// Store, list and remove the secrets that boxes reference by name
+    Secret(SecretArgs),
     /// Print that there is nothing to mint
     ///
     /// The HTTPS reverse proxy this verb once served is retired, so it
@@ -586,7 +588,7 @@ pub struct MeshJoinArgs {
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about, which would replace the
 // top-level `min --help` description with this text.
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Default, Clone, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
@@ -1173,6 +1175,16 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+    /// The `min` process this proxy serves (ssh's parent): the proxy exits,
+    /// closing the daemon connection, once that process is gone.
+    #[arg(long, hide = true)]
+    pub owner: Option<u32>,
+    /// A file the owner holds an exclusive `flock` on for its lifetime: the
+    /// proxy exits the moment it can take that lock, which the kernel
+    /// releases on any end of the owner, a SIGKILL included. The pid above
+    /// is the fallback where no lock was handed.
+    #[arg(long, hide = true)]
+    pub owner_lock: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1193,6 +1205,13 @@ pub enum AuthCommand {
     ///
     /// Never prints the token.
     Status,
+    /// Sign out of GitHub and remove the sign-in from the host keychain
+    ///
+    /// Boxes created before the sign-out lose GitHub access at their next
+    /// request, and their processes keep running. Also asks GitHub to revoke
+    /// the sign-in. A later `min auth login` gives those boxes no access
+    /// back.
+    Logout,
 }
 
 #[derive(Debug, Args)]
@@ -1200,6 +1219,86 @@ pub struct AuthLoginArgs {
     /// Sign in with a code entered at github.com, not in this browser
     #[arg(long)]
     pub device: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Store a secret in the host keychain under a name
+    ///
+    /// Reads the value from the terminal, or from standard input when it is
+    /// not a terminal. Prints only the name. Only the Box Egress Proxy reads
+    /// the stored value without a prompt.
+    Set(SecretSetArgs),
+    /// List the stored secrets and the rules that use them
+    ///
+    /// Never prints a value.
+    #[command(alias = "ls")]
+    List(SecretListArgs),
+    /// Remove a stored secret
+    Rm(SecretRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretSetArgs {
+    /// The name that box specs use for the secret
+    pub id: String,
+    /// The store to keep the secret in (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+    // Neither of these fields carries a value into the store: each one is
+    // here so that `set` refuses a value given on the command line with its
+    // own message (BEP-050), not with a generic usage error.
+    #[arg(hide = true)]
+    pub value: Option<String>,
+    #[arg(long = "env", alias = "from-env", value_name = "VAR", hide = true)]
+    pub env: Option<String>,
+    /// The host or host:port the secret is sent to; repeat for more than one.
+    /// Writes the secret's rule to your config.toml
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        conflicts_with = "preset",
+        requires = "form"
+    )]
+    pub upstream: Vec<String>,
+    /// The HTTP header that carries the secret
+    #[arg(long, value_name = "NAME", group = "form", requires = "upstream")]
+    pub header: Option<String>,
+    /// Text sent before the secret in the header, such as "Bearer "
+    #[arg(long, value_name = "TEXT", requires = "header")]
+    pub prefix: Option<String>,
+    /// Send the secret as this basic authentication field: user or password
+    #[arg(long, value_name = "FIELD", group = "form", requires = "upstream")]
+    pub basic_auth: Option<String>,
+    /// Use the upstream and header of a known service: anthropic,
+    /// anthropic-api-key, cloudflare, linear or sentry
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["header", "prefix", "basic_auth"])]
+    pub preset: Option<String>,
+    /// Replace a different rule for this secret without asking
+    #[arg(long, short)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretListArgs {
+    /// The store to list (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretRmArgs {
+    /// The name of the secret to remove
+    pub id: String,
+    /// The store that holds the secret (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
 }
 
 /// Arguments for `min login`.
