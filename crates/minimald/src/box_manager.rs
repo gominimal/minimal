@@ -2587,6 +2587,7 @@ mod create_stamp_tests {
             box_id: None,
             box_addresses: None,
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: [
                 ("parent".to_string(), SessionId::mint().to_string()),
                 ("box_type".to_string(), "task".to_string()),
