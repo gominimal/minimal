@@ -1058,9 +1058,13 @@ fn serve_request(
             // reached one, the cause that names why the hostname proxy
             // is not serving. Two facts, one reply: the answerer's state
             // decides the zone-answerer row and the native-DNS probe,
-            // the sibling cause the proxy's own line.
+            // the sibling cause the proxy's own line. The answerer's state
+            // reads `starting` until this node's first publish is
+            // acknowledged (or the node gives up on it past its bound), so
+            // an activation never reads a registration in flight as a
+            // failure.
             let reply = BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
-                answerer: answerer.get(),
+                answerer: answerer.reported(),
                 proxy_down: proxy_publish
                     .down()
                     .map(|(port, cause)| minimald_rpc::ProxyDown { port, cause }),
