@@ -526,8 +526,9 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// the deployment configured, empty unless it named ports, matched against
 /// `transport_port`, the TCP or UDP destination port, `None` for any other
 /// frame. Box rows stay refused at a configured exposure too: the design
-/// holds an exposure as local reach under the box's egress rules, and that
-/// reach is not built yet. The fabric plane outside `own_block`, the subnet the gate's rows live in — a frame to a
+/// holds an exposure as local reach under the box's egress rules (§7.1),
+/// and that reach is not built yet; the refusal fails closed, and
+/// gominimal/inbox#1144 owns the gap. The fabric plane outside `own_block`, the subnet the gate's rows live in — a frame to a
 /// sibling or to the daemon inside the node's own block is local reach,
 /// decided by the row's CIDR rules and the target's ingress, never by this
 /// rule, and the gateway inside it is the control-surface rule's; or RFC
@@ -5412,9 +5413,9 @@ fn gate_verdict(
     // below reads for every row: the box rows' refusal stands at every
     // port, and the node row's outside the exposures. The scoping holds only
     // while the baseline is announced: in force, the arm above returns first
-    // and the baseline's registry and cache entries admit the alias at every
-    // port, a gap the in-force phase still has to close
-    // (gominimal/inbox#1147).
+    // and admits the alias only at TCP on `REGISTRY_CACHE_FETCH_PORTS` (443),
+    // with no host exposures, a gap gominimal/inbox#1144 and
+    // gominimal/inbox#1147 own.
     let box_row = src != table.subnet().daemon_ip().octets();
     // A non-first IPv4 fragment carries no readable L4 port — `summarize`
     // reports destination port 0 for it — so it fails the exposure match
@@ -5426,8 +5427,9 @@ fn gate_verdict(
     // design — every input comes from the one frame being judged — and
     // fragment association would add per-flow state here (or reassembly
     // elsewhere) to recover a packet whose failure mode is a drop, not an
-    // exposure: deny-by-default keeps the safe direction. Tracked as
-    // follow-up work with the in-force scoping (gominimal/inbox#1147).
+    // exposure: deny-by-default keeps the safe direction. In force, the arm
+    // above admits no host exposure at all, so the fragment case arises only
+    // while the baseline is announced.
     let transport_port = matches!(
         summary.protocol(),
         Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
