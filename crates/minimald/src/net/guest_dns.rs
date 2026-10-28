@@ -111,7 +111,7 @@ pub async fn start(subnet: SwitchSubnet) {
     // socket is shared with the forward tasks, each of which sends its
     // reply from the listener's own address, so the loop's socket is an
     // `Arc` the spawned sends borrow.
-    drop(crate::traced::spawn(async move {
+    drop(tokio::spawn(async move {
         if let Err(error) = serve(Arc::new(socket), gateway).await {
             tracing::error!(
                 component = COMPONENT,
@@ -168,7 +168,7 @@ async fn serve_bounded(
                 };
                 let listener = socket.clone();
                 let datagram = datagram.to_vec();
-                drop(crate::traced::spawn(async move {
+                drop(tokio::spawn(async move {
                     forward(listener, gateway, datagram, peer).await;
                     drop(permit);
                 }));
@@ -508,7 +508,7 @@ mod tests {
         .await
         .expect("the test listener binds a loopback port");
         let relay = listener.local_addr().expect("the listener names its port");
-        let served = crate::traced::spawn(super::serve(listener.into(), gateway));
+        let served = tokio::spawn(super::serve(listener.into(), gateway));
 
         // One in-zone A query, sent as a datagram from a stand-in box.
         let query = query_of(&[("host.min.internal.".to_string(), RecordType::A)]);
@@ -573,7 +573,7 @@ mod tests {
         let gateway = standin.local_addr().expect("the stand-in names its port");
         let listener = loopback_socket("the test listener").await;
         let relay = listener.local_addr().expect("the listener names its port");
-        let served = crate::traced::spawn(super::serve(listener.into(), gateway));
+        let served = tokio::spawn(super::serve(listener.into(), gateway));
 
         let query = query_of(&[("host.min.internal.".to_string(), RecordType::A)]);
         let datagram = query.to_vec().expect("the query encodes");
@@ -630,7 +630,7 @@ mod tests {
         let gateway = standin.local_addr().expect("the stand-in names its port");
         let listener = loopback_socket("the test listener").await;
         let relay = listener.local_addr().expect("the listener names its port");
-        let served = crate::traced::spawn(super::serve_bounded(listener.into(), gateway, 1));
+        let served = tokio::spawn(super::serve_bounded(listener.into(), gateway, 1));
 
         let box_socket = loopback_socket("a stand-in box").await;
         let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -681,7 +681,7 @@ mod tests {
         .expect("the test listener binds a loopback port");
         let relay = listener.local_addr().expect("the listener names its port");
         let gateway = gateway();
-        let served = crate::traced::spawn(super::serve(listener.into(), gateway));
+        let served = tokio::spawn(super::serve(listener.into(), gateway));
 
         let box_socket = UdpSocket::bind(std::net::SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
