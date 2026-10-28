@@ -950,7 +950,7 @@ impl ServerStateHandle {
         self.0.lock().await.config.minimal_state_dir.clone()
     }
 
-    /// The daemon's identity dir — the provider instance dir it runs under,
+    /// The daemon's identity dir — the host dir it runs under,
     /// whose canonical path is the node id its channel client publishes
     /// under (`main`'s `client_instance_dir`). `None` for a daemon with no
     /// identity dir configured (a harness server): its node id falls back

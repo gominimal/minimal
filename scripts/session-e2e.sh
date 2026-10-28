@@ -707,7 +707,7 @@ fi
 # (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
 # the cause. The proxy-source case below is where that stops being a
 # silent posture difference and becomes a failed proof. macOS resolves
-# the minvmd backend either way (`client_provider_kind` gates on the OS,
+# the minvmd backend either way (`client_host_kind` gates on the OS,
 # crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
 # without the flag — and both of its lanes arrive here with no
 # E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's

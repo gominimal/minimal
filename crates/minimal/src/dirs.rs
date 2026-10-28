@@ -45,7 +45,7 @@ pub(crate) fn report(global: &GlobalArgs) -> String {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
-        provider: crate::client::client_provider_kind(global.use_minvmd()),
+        host_kind: crate::client::client_host_kind(global.use_minvmd()),
     };
     format_dir_rows(&build_dir_rows(&dirs))
 }
@@ -71,9 +71,9 @@ struct DirsLookup {
     state: PathBuf,
     /// `<cache>/minimal`.
     cache: PathBuf,
-    /// The backend whose provider dir the CLI would connect to, so the SSH
+    /// The backend whose host dir the CLI would connect to, so the SSH
     /// socket row names the right `providers/local-<kind>0` path.
-    provider: paths::ProviderKind,
+    host_kind: paths::HostKind,
 }
 
 /// Which top-level group the mesh-enrolment row prints under. Values
@@ -139,15 +139,15 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
     rows.extend([("State", "State dir", Some(dirs.state.clone()), None).into_row()]);
     // The session store lives inside the VM on minvmd-backed hosts, so the
     // host sessions path is never created there; show the in-VM note instead.
-    rows.push(match dirs.provider {
-        paths::ProviderKind::Minvmd => (
+    rows.push(match dirs.host_kind {
+        paths::HostKind::Minvmd => (
             "State",
             "Sessions",
             None,
             Some("inside the VM; not on this host".to_string()),
         )
             .into_row(),
-        paths::ProviderKind::Minimald => {
+        paths::HostKind::Minimald => {
             ("State", "Sessions", Some(dirs.state.join("sessions")), None).into_row()
         }
     });
@@ -164,7 +164,7 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             "SSH socket",
             Some(dirs.state.join(format!(
                 "providers/{}/ssh.sock",
-                paths::provider_instance_name(dirs.provider, 0)
+                paths::host_name(dirs.host_kind, 0)
             ))),
             None,
         )
@@ -299,7 +299,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
-            provider: paths::ProviderKind::Minimald,
+            host_kind: paths::HostKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let shape: Vec<(&str, &str, String)> = rows
@@ -376,7 +376,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
-            provider: paths::ProviderKind::Minimald,
+            host_kind: paths::HostKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
@@ -388,9 +388,9 @@ mod tests {
 
     /// On a minvmd-backed host the session store lives inside the VM, so the
     /// Sessions row must carry no host path and the in-VM note; the native
-    /// provider keeps the host sessions path.
+    /// minimald keeps the host sessions path.
     #[test]
-    fn build_dir_rows_sessions_row_depends_on_provider() {
+    fn build_dir_rows_sessions_row_depends_on_host_kind() {
         let native = DirsLookup {
             config: PathBuf::from("/c"),
             #[cfg(feature = "remote-access")]
@@ -399,7 +399,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
-            provider: paths::ProviderKind::Minimald,
+            host_kind: paths::HostKind::Minimald,
         };
         let native_sessions = build_dir_rows(&native)
             .into_iter()
@@ -416,7 +416,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
-            provider: paths::ProviderKind::Minvmd,
+            host_kind: paths::HostKind::Minvmd,
         };
         let vm_sessions = build_dir_rows(&vm)
             .into_iter()
@@ -460,7 +460,7 @@ mod tests {
             mesh_group: MeshGroup::State,
             state: PathBuf::from("/override"),
             cache: PathBuf::from("/x"),
-            provider: paths::ProviderKind::Minimald,
+            host_kind: paths::HostKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let mesh = rows.iter().find(|r| r.name == "Mesh enrolment").unwrap();

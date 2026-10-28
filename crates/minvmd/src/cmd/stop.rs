@@ -79,7 +79,7 @@ pub enum HostStop {
 /// the guest itself, then falls back to [`stop_at`], gives it no less.
 pub const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Stop the VM whose provider dir is `provider_dir`, exactly as `minvmd stop`
+/// Stop the VM whose host dir is `host_dir`, exactly as `minvmd stop`
 /// would: best-effort guest Shutdown over the bridge socket in that dir, then
 /// SIGTERM (SIGKILL after 5 s) to the VMM, then `Stopped`. The returned
 /// [`HostStop`] says whether the guest acknowledged that Shutdown.
@@ -87,12 +87,12 @@ pub const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// `quiesce_guest` false skips the guest Shutdown, for a caller whose own
 /// Shutdown RPC to that guest has just failed.
 ///
-/// For the minvmd binary `provider_dir` is the process-global default
-/// ([`StateDir::default_path`]); the `minimal` CLI passes the provider dir it
+/// For the minvmd binary `host_dir` is the process-global default
+/// ([`StateDir::default_path`]); the `minimal` CLI passes the host dir it
 /// resolved for *its* VM, so `min stop --force` can stop a wedged VM from the
 /// host when the in-guest daemon cannot answer.
-pub fn stop_at(provider_dir: std::path::PathBuf, quiesce_guest: bool) -> Result<HostStop> {
-    run_with_state_dir(provider_dir, quiesce_guest)
+pub fn stop_at(host_dir: std::path::PathBuf, quiesce_guest: bool) -> Result<HostStop> {
+    run_with_state_dir(host_dir, quiesce_guest)
 }
 
 /// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
@@ -133,7 +133,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<Ho
     let acknowledged = match vmm_pid {
         Some(pid) => {
             // The bridge socket is resolved from THIS state dir, never
-            // minvmd's process-global provider dir: in the CLI process that
+            // minvmd's process-global host dir: in the CLI process that
             // global is unset (the CLI sets the client crate's globals
             // instead), and a wrong-VM resolution could shut a healthy
             // sibling VM's guest down from under this stop.
@@ -422,7 +422,7 @@ pub(crate) fn graceful_stop_from_signal(
     // Same best-effort quiesce as `stop`: a failure here logs and falls
     // through to the signal, so a wedged guest cannot stall termination.
     // The UDS is the same `<state dir>/ssh.sock` the CLI resolves for the
-    // default provider dir (R3.2), computed from the passed state dir. The
+    // default host dir (R3.2), computed from the passed state dir. The
     // RPC runs until the quiesce deadline, whatever the connect leaves of
     // the budget, so a guest still draining sessions gets all of it.
     let now = Instant::now();
@@ -636,7 +636,7 @@ mod tests {
         assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
     }
 
-    /// `stop_at` is the CLI's host-side recovery entry point: given a provider
+    /// `stop_at` is the CLI's host-side recovery entry point: given a host
     /// dir whose state says Running under a live alive-lock, with the VMM a
     /// spawned process and no bridge socket to answer the guest RPC, it must
     /// quiesce (missing socket fails fast), signal the process, and leave the
@@ -680,7 +680,7 @@ mod tests {
         );
     }
 
-    /// The guest Shutdown goes to the bridge socket in the provider dir
+    /// The guest Shutdown goes to the bridge socket in the host dir
     /// `stop_at` was given, never to minvmd's process-global one: resolving
     /// through that global from the CLI process could shut a healthy sibling
     /// VM's guest down. A listener at `<passed dir>/ssh.sock` must therefore

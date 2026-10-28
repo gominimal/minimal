@@ -33,8 +33,8 @@ mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
-// the session commands, as does the provider-kind rule its gate keys on.
-pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+// the session commands, as does the host-kind rule its gate keys on.
+pub(crate) use box_verbs::{daemon_host_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
@@ -209,9 +209,9 @@ fn root_context(
 
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
-    // once per invocation, before any command resolves a provider dir, so an
+    // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
-    client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
+    client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
@@ -1086,14 +1086,14 @@ pub(crate) fn arm_activation_interrupt(
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
-    // same provider dir's, and the borrow must not cross the spawn. Keyed
-    // on the provider kind — the rule the socket resolution itself and the
+    // same host dir's, and the borrow must not cross the spawn. Keyed
+    // on the host kind — the rule the socket resolution itself and the
     // fabric display turn on — not on `use_minvmd()`, which is true only
     // under an explicit `--provider local-minvmd`: on macOS every invocation
     // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
     // flag would leave exactly that host's box row published.
     let control_sock =
-        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
+        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.

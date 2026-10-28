@@ -290,7 +290,7 @@ pub struct ResourcePool {
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
-    /// Provider capacity shared by all sessions. Optional for compatibility
+    /// Host capacity shared by all sessions. Optional for compatibility
     /// with minimald versions that predate resource-pool reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_pool: Option<ResourcePool>,
@@ -618,7 +618,7 @@ pub const TASK_SLOTS_PER_BOX: u8 = 4;
 /// one door a client has to the host-side box table (NET-138).
 ///
 /// On a minvmd-backed host, `min session activate` opens this socket — a
-/// UDS beside the daemon's ssh socket in the provider's state dir — writes
+/// UDS beside the daemon's ssh socket in the host's state dir — writes
 /// one [`BoxControlRequest`] line of JSON — a registration when the box is
 /// created, a withdrawal when the session that registered it is destroyed
 /// or its activation fails — and reads one [`BoxControlReply`] line back.
