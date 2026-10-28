@@ -3026,10 +3026,10 @@ async fn policy_shows_unset_egress_as_named_default() {
 /// rules (NET-130): the helper's built-in enumeration of the categories the
 /// in-VM daemon's own traffic may reach, one row per category, on an
 /// own-address box, headed by the posture the host-side gate decides the
-/// daemon's own fetches under — announced, the shipped posture, the run
-/// path's allow-all interim node row still decides those fetches, so the
-/// rows are what the set will bound, not what bounds them today; in force,
-/// it decides them whatever the box's own declaration resolves to. The set
+/// daemon's own fetches under — in force, the shipped posture: the set is
+/// what bounds Minimal's own downloads in the VM, whatever the box's own
+/// declaration resolves to, and each entry names the host those downloads
+/// go to. The set
 /// is shown where the fabric the helper gates is named — the microVM
 /// backend's plan — and nowhere it is not: a host-address box shares its
 /// host's namespace and has no switch fabric, and a backend with no
@@ -3070,34 +3070,33 @@ fn policy_shows_baseline_set() {
         "the box's own rules are shown:\n{text}"
     );
     // The posture is spelled beside the set, the way the daemon's start-up
-    // line spells it. The shipped posture is announced — the run path's
-    // allow-all interim node row still decides the daemon's own fetches — so
-    // the display must not present the rows as what bounds them. The flip of
-    // `NODE_BASELINE_PHASE` updates this assertion with the rest of the
-    // cutover.
+    // line spells it. The shipped posture is in force: the set is what
+    // bounds Minimal's own downloads in the VM, and the line carries no
+    // interim wording.
     assert!(
         text.contains(
             "destinations for Minimal's own downloads in this VM (not this box's rules): \
-             announced (node row's allow-all interim)"
+             in force\n"
         ),
         "the helper's baseline set is shown beside the box's rules, headed by the \
-         gate's announced posture:\n{text}"
+         gate's in-force posture:\n{text}"
+    );
+    assert!(
+        !text.contains("interim"),
+        "the in-force posture drops the interim wording:\n{text}"
     );
 
     // The rows are the enumeration the helper carries, one per category —
-    // the set the host-side gate decides the daemon's own frames by once the
-    // baseline is in force — each alias endpoint with the in-force arm's
-    // protocol and port bound beside it (NET-061).
-    let alias = fabric.host_alias();
-    let rendered_baseline =
-        format!("  registry  {alias}/32 tcp/443\n  cache  {alias}/32 tcp/443\n");
+    // the set the host-side gate decides the daemon's own frames by — each
+    // named by the host the daemon's own downloads go to (NET-061).
+    let rendered_baseline = "  registry  cache.minimal.dev\n  cache  cache.minimal.dev\n";
     assert!(
-        text.contains(&rendered_baseline),
+        text.contains(rendered_baseline),
         "the baseline rows are the enumeration's entries, one per category, \
-         with the alias bound:\n{text}"
+         each naming its host:\n{text}"
     );
 
-    // The JSON view carries the same bounded endpoints.
+    // The JSON view carries the same posture and endpoints.
     let mut out = Vec::new();
     write_policy_json(
         &mut out,
@@ -3109,7 +3108,12 @@ fn policy_shows_baseline_set() {
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
-    let bounded = Value::String(format!("{alias}/32 tcp/443"));
+    assert_eq!(
+        document["node_plane_baseline"]["phase"],
+        Value::String("in force".to_string()),
+        "the JSON view carries the in-force posture:\n{document}"
+    );
+    let named = Value::String("cache.minimal.dev".to_string());
     let entries = document["node_plane_baseline"]["entries"]
         .as_array()
         .expect("the JSON view carries the baseline entries");
@@ -3117,8 +3121,8 @@ fn policy_shows_baseline_set() {
     for entry in entries {
         assert_eq!(
             entry["endpoints"],
-            Value::Array(vec![bounded.clone()]),
-            "the JSON view spells the alias bound:\n{document}"
+            Value::Array(vec![named.clone()]),
+            "the JSON view names each entry's host:\n{document}"
         );
     }
     // Beside, not instead: the egress block comes first, the baseline set
