@@ -1076,6 +1076,30 @@ const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3
 /// connection's accept, channel bindings, and close correlate across the log.
 static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a connection that ended with `e` was hung up by its peer rather
+/// than broken by a fault on this side.
+///
+/// A peer that closes its socket with bytes still unread in its receive queue
+/// makes the kernel answer the next read here with `ECONNRESET` instead of an
+/// end of file (Linux `AF_UNIX`, and TCP's RST). That is the same abrupt
+/// hangup as an end of file: which one arrives depends on whether the client
+/// had drained the daemon's last output when it went away. The rendered
+/// message is still matched for the cases russh reports as its own errors
+/// rather than as an io error.
+fn closed_by_peer(e: &crate::connection::ConnectionError) -> bool {
+    use std::io::ErrorKind;
+    if let crate::connection::ConnectionError::Protocol(russh::Error::IO(io)) = e
+        && matches!(
+            io.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        )
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("early eof") || msg.contains("Broken pipe") || msg.contains("Disconnected")
+}
+
 /// A listening minimald server.
 #[derive(Debug)]
 pub struct Server;
@@ -1225,14 +1249,9 @@ impl Server {
                             // connections and Ctrl-C'd attaches normally end;
                             // framing them as errors makes routine traffic
                             // read like a transport incident during field
-                            // analysis. Match on the rendered message: russh
-                            // wraps the underlying io error, and this is log
-                            // framing only.
+                            // analysis. This is log framing only.
                             let msg = e.to_string();
-                            if msg.contains("early eof")
-                                || msg.contains("Broken pipe")
-                                || msg.contains("Disconnected")
-                            {
+                            if closed_by_peer(&e) {
                                 tracing::info!(reason = %msg, "connection closed by peer");
                             } else {
                                 tracing::warn!(error = %msg, "session ended with error");
