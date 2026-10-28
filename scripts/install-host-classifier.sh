@@ -920,6 +920,12 @@ install_quic443_helper() {
 # the deny chain's: replies admitted, then the same named counter, log
 # prefix and active reject, so one counter reads every refusal this table
 # makes, IPv4 and IPv6 alike.
+#
+# This refusal is the v1 posture, not the end state. It stays until the
+# IPv6 admission path of design section 12 item 5 (gominimal/arch#43)
+# lands. That path decides a box's IPv6 egress the way the IPv4 rules
+# decide it, and replaces this blanket refusal. Until then, IPv6 is a way
+# around the allow list, and this chain closes it.
 render_ruleset() {
     leaf_elements=
     if [ -n "${quic443_kept_leaves:-}" ]; then
@@ -1110,7 +1116,7 @@ require_mask() {
 # other bits. It is the step's own command because the step is the one
 # that takes the flag.
 mask_rerun_hint() {
-    local kept=() skip= a
+    local kept=() skip='' a
     for a in "${original_args[@]}"; do
         if [ -n "$skip" ]; then
             skip=

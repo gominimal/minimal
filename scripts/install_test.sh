@@ -3134,24 +3134,38 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "the refusal names the conflicting rule itself" \
         grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
     want_ok "the refusal names the override it would take instead" \
-        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+        grep -q -- "Run this step again with two contiguous bits that no rule above uses: sudo .* --ct-mark-mask <mask>$" "$OUT"
     want_ok "the refusal dies before touching anything: the previous marker \
 still vouches for the table it loaded" \
         test -d "$tree/classifier-table"
     run_hc conflict_escaped "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x0000c000
+        --ct-mark-mask 0x03000000
     check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
     want_ok "the escape renders its own bits, both identities on them" \
-        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
     want_ok "the escape records the bits it chose" \
-        test -d "$tree/ct-mark-mask-0x0000c000"
+        test -d "$tree/ct-mark-mask-0x03000000"
     want_err "the escape left no record of the refused mask" \
         test -e "$tree/ct-mark-mask-0x30000000"
     run_hc conflict_back "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 1 "$rc" "the next default-mask install refuses again"
     NFT_RULESET=
+
+    # --- A mask in a range a well-known component classes with is refused
+    # even when no loaded rule uses it yet: the component can start after
+    # the install. The refusal names the range and the component.
+    run_hc well_known_range "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 1 "$rc" "an install with a mask in kube-proxy's range exits 1"
+    want_ok "the refusal names the range and the component" \
+        grep -q "uses bits in 0x0000c000, the range kube-proxy marks connections with" "$OUT"
+    want_ok "the refusal says to run the step again with another mask" \
+        grep -q -- "two contiguous bits outside 0x0000c000: sudo .* --ct-mark-mask <mask>$" "$OUT"
+    want_err "the refused mask is not recorded" \
+        test -e "$tree/ct-mark-mask-0x0000c000"
 
     # --- --ct-mark-mask is validated before anything is made: exactly two
     # contiguous set bits inside the 32 a connection mark holds, nothing
