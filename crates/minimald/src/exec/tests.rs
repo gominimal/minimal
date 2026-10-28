@@ -122,6 +122,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // No launch ever minted these records, so none has recorded its
         // outcome on one.
@@ -129,6 +132,8 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // No run ever minted these records, so none ends with one.
+        ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
         box_type: None,

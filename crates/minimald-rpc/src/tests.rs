@@ -512,6 +512,7 @@ fn create_session_request_round_trips() {
             // default, so a fixture using it would round-trip green
             // even if the field never reached the wire.
             hooks_enabled: false,
+            ends_with_run: false,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -556,6 +557,7 @@ fn create_request_constructor_round_trips() {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
