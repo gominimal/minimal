@@ -2405,18 +2405,53 @@ fn audit_refused_egress(
     BoxControlReply::Audited { audited }
 }
 
+/// The size the host-side audit log may reach before it rotates (NET-046).
+/// The per-box caps bound the rate a guest can report at, not the total, so
+/// the file itself is bounded too: the append that would carry it past this
+/// size first renames it to `box-admissions.log.1`, replacing the generation
+/// rotated before it, and starts a fresh file. One kept generation bounds
+/// the log at about twice this size. The same bound and shape as the in-VM
+/// daemon's own audit log (`minimald`'s `audit::MAX_LOG_BYTES`).
+const MAX_AUDIT_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Serialises every append to the host-side audit log. The ask threads and
+/// the doors append concurrently, and a rotation is a size read, a rename
+/// and a reopen: two writers deciding it at once could each rotate, and the
+/// second rename would replace the full generation the first one kept.
+static AUDIT_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// Append one JSON line to the daemon's owner-only audit log: the shared
 /// half of the admission copy and the ask records.
 fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
+    append_audit_line_capped(path, line, MAX_AUDIT_LOG_BYTES);
+}
+
+/// [`append_audit_line`] with the rotation size passed in, so a test can
+/// rotate the log without writing a mebibyte.
+fn append_audit_line_capped(path: &Path, line: &impl serde::Serialize, cap: u64) {
     let Ok(json) = serde_json_lenient::to_string(line) else {
         // A plain struct of primitives serializes; this arm is unreachable
         // in practice and costs nothing to keep honest.
         tracing::warn!("an audit line did not serialize");
         return;
     };
+    let bytes = format!("{json}\n");
+    // A poisoned lock guards no data: the append it serialised failed or
+    // panicked, and the next append is still safe to make.
+    let _guard = AUDIT_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let written = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let len = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if audit_log_rotates(len, bytes.len() as u64, cap) {
+            std::fs::rename(path, audit_log_rotated_path(path))?;
         }
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2425,9 +2460,9 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             .append(true)
             .mode(0o600)
             .open(path)?;
-        // One write per line: the ask threads append concurrently, and a
-        // line written in two pieces could interleave with another's.
-        file.write_all(format!("{json}\n").as_bytes())
+        // One write per line: a line written in two pieces could interleave
+        // with another writer's outside this process.
+        file.write_all(bytes.as_bytes())
     })();
     if let Err(error) = written {
         tracing::warn!(
@@ -2436,6 +2471,22 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             "an audit line could not be appended to the host-side audit log"
         );
     }
+}
+
+/// Whether a log already holding `len` bytes rotates before an `incoming`
+/// line lands: only when the line would carry it past `cap`, and never when
+/// it is empty, so a single line longer than the cap goes into a fresh file
+/// rather than rotating on every append.
+fn audit_log_rotates(len: u64, incoming: u64, cap: u64) -> bool {
+    len > 0 && len.saturating_add(incoming) > cap
+}
+
+/// The one rotated generation's path beside the live log:
+/// `box-admissions.log.1`.
+fn audit_log_rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
 }
 
 /// Run one ask verb's connection on a thread of its own (NET-045): the ask
@@ -3393,6 +3444,77 @@ mod tests {
     /// The default switch subnet, the plan the registries below are built
     /// for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// NET-046: the host-side audit log is bounded. Past its cap it rotates
+    /// to one kept generation, so neither file grows past the cap however
+    /// many records a guest reports, and the newest records are the ones
+    /// kept.
+    #[test]
+    fn host_audit_log_rotates_within_its_bound_and_keeps_the_newest_records() {
+        #[derive(serde::Serialize)]
+        struct Line {
+            seq: u64,
+        }
+        fn seqs(path: &Path) -> Vec<u64> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    serde_json_lenient::from_str::<serde_json_lenient::Value>(line)
+                        .expect("each kept line is whole JSON")["seq"]
+                        .as_u64()
+                        .expect("seq")
+                })
+                .collect()
+        }
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(AUDIT_LOG_RELATIVE_PATH);
+        let rotated = audit_log_rotated_path(&path);
+        let cap = 512;
+        let total = 1000;
+        for seq in 0..total {
+            append_audit_line_capped(&path, &Line { seq }, cap);
+            assert!(
+                std::fs::metadata(&path).unwrap().len() <= cap,
+                "the live log stays within its cap"
+            );
+            if let Ok(meta) = std::fs::metadata(&rotated) {
+                assert!(
+                    meta.len() <= cap,
+                    "the kept generation stays within its cap"
+                );
+            }
+        }
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "one rotated generation is kept, never more: {files:?}"
+        );
+        let kept: Vec<u64> = seqs(&rotated).into_iter().chain(seqs(&path)).collect();
+        assert_eq!(
+            kept.last().copied(),
+            Some(total - 1),
+            "the newest record is kept"
+        );
+        let first = kept[0];
+        assert_eq!(
+            kept,
+            (first..total).collect::<Vec<_>>(),
+            "the kept records are the newest, contiguous and in order"
+        );
+        assert!(
+            kept.len() as u64 * 12 > cap,
+            "a rotation keeps at least a full generation: {}",
+            kept.len()
+        );
+        // The host's own records still land after rotation.
+        append_audit_line_capped(&path, &Line { seq: total }, cap);
+        assert_eq!(seqs(&path).last().copied(), Some(total));
+    }
 
     /// A process-global log capture. The server serves on its own OS
     /// thread, so the thread-local captures the crate's other tests install
