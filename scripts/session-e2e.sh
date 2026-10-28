@@ -4528,10 +4528,11 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 # record in the daemon's log per exposed mapping (host, port, session).
 #
 # Gating, decided by where the proof's pieces actually run:
-#   * Native Linux only. A VM lane's daemon runs in the guest while the pair
-#     this proof installs lives host-side (macOS is always VM-backed), so
-#     there is no fresh-install story to drive there — those lanes'
-#     own-address boxes are the proxy proof's own-address half.
+#   * The install half is native Linux only. A VM lane's daemon runs in the
+#     guest while the pair this proof installs lives host-side. On the macOS
+#     lane the case runs fresh_install_range_lands_on_macos instead: the
+#     range that `min finalize-install` applies lands on the running VM. A
+#     Linux VM lane skips.
 #   * The box needs a TUN device: its session program opens /dev/net/tun for
 #     its in-namespace tap, and a host that is itself a sandbox (the
 #     agent-runtime boxes this harness runs on) has none and cannot mknod one,
@@ -4571,6 +4572,11 @@ local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
 local fi_host fi_host2 fi_pkg_log
 local fi_lane_minimald fi_restore_profile
+if [ -n "$E2E_VM" ] && [ "$(uname -s)" = Darwin ]; then
+  # The macOS lane's half: the range lands on a running VM (NET-010/NET-123).
+  fresh_install_range_lands_on_macos
+  return $?
+fi
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
   return 0
@@ -4983,6 +4989,181 @@ else
 fi
 echo "fresh-install loopback publish OK (installed pair, shipped switch, host-loopback answer, logged expose)"
 echo "::endgroup::"
+}
+
+# The fresh-install case on the macOS lane (NET-010, NET-040, NET-123): the
+# VM is already up, and its daemon walked the host's loopback at its start.
+# The case runs the script `min finalize-install` runs, which applies the
+# reserved local range to lo0. Then, WITHOUT a VM restart, a new own-IP box
+# with `--ingress 8080:8080` must publish at its own 127.0.64.N address: the
+# session start walks the range again, finds it present, and the box's name
+# answers there. Three facts are asserted:
+#   * `http://<name>.min.internal:8080` returns the in-box server's response,
+#     through the resolver file the same script wrote;
+#   * the box's own range address (the zone answerer's A record for its name)
+#     returns the same response at port 8080;
+#   * `min ls` names that address.
+# The host is restored on every exit: the range unit, its aliases, the
+# resolver file and the answerer service go (range_teardown_unit,
+# answerer_service_teardown — the teardown repeats both if the case dies).
+fresh_install_range_lands_on_macos() {
+  local frm_name="e2e-fi-range" frm_port=8080 frm_marker="FRESH_INSTALL_RANGE_OK"
+  local frm_seed="" frm_sid="" frm_setup="" frm_cmd="" frm_ready="" frm_aliases=0
+  local frm_ans_port="" frm_addr="" frm_status="" frm_body="" frm_rc=0 frm_url=""
+  echo "::group::fresh install publishes an own-IP ingress at the box's range address on macOS"
+  if ! command -v launchctl >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+    echo "fresh-install range publish on macOS SKIPPED (needs launchctl and passwordless sudo to run the script min finalize-install runs)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "fresh-install range publish on macOS SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box publishes a port)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 0 ]; then
+    echo "::error::lo0 already carries addresses of 127.0.64.0/24 before the case ran min finalize-install; the case proves the range landing on a running VM, so it needs a host without the range"
+    fail
+  fi
+
+  # A box before the range: the VM's daemon read the range absent, so the
+  # walk this case proves is the one a later session start makes.
+  frm_setup="$WORK/fi-range-finalize-install.out"
+  mnl finalize-install --show --script >"$frm_setup" 2>"$frm_setup.note" || true
+  frm_cmd="$(setup_script_from "$frm_setup")"
+  case "$frm_cmd" in
+    '#!/bin/sh'*) ;;
+    *)
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$frm_cmd')"
+      cat "$frm_setup" "$frm_setup.note" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  if [ -f /etc/resolver/min.internal ]; then
+    RANGE_RESOLVER_BEFORE="$WORK/fi-range-resolver.before"
+    cp /etc/resolver/min.internal "$RANGE_RESOLVER_BEFORE"
+  fi
+  # Record every undo before the run, so a half-failed script still leaves
+  # the teardown its targets.
+  RANGE_INSTALLED=yes
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$frm_cmd")"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$frm_setup" >"$WORK/fi-range-cmd.out" 2>"$WORK/fi-range-cmd.err"; then
+    echo "::error::the script min finalize-install runs did not run"
+    cat "$WORK/fi-range-cmd.out" "$WORK/fi-range-cmd.err" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 40); do
+    frm_aliases="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+    [ "$frm_aliases" = 254 ] && break
+    sleep 0.25
+  done
+  if [ "$frm_aliases" != 254 ]; then
+    echo "::error::the script applied $frm_aliases of 254 range addresses to lo0"
+    fail
+  fi
+  echo "min finalize-install applied the range: 254 of 254 addresses on lo0; the VM keeps running"
+
+  # The new box, on the VM that read the range absent at its start.
+  frm_seed="$(hook_mktemp /tmp/mnlfr.XXXXXX)"
+  hook_seed_preamble > "$frm_seed/minimal.toml"
+  mkdir "$frm_seed/.git"
+  frm_sid="$(cd "$frm_seed" && mnl session activate . --no-prompt \
+    --name "$frm_name" --network own_ip --ingress "$frm_port:$frm_port" \
+    2>"$WORK/fi-range-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $frm_port:$frm_port' failed after min finalize-install"
+    cat "$WORK/fi-range-activate.err" 2>/dev/null || true
+    fail
+  }
+  frm_sid="$(printf '%s\n' "$frm_sid" | tail -n1 | tr -d '\r')"
+  mnl session exec "$frm_sid" \
+    "body=$frm_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/fr200" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not write the box's responder response"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  mnl session exec "$frm_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$frm_port,reuseaddr,fork SYSTEM:\"cat /home/fr200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not start the box's responder"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$frm_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$frm_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      frm_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$frm_ready" ] || {
+    echo "::error::the box's responder never answered inside its own box"
+    fail
+  }
+
+  # The box's own address: the zone answerer's A record for its name.
+  for _ in $(seq 1 40); do
+    frm_ans_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$frm_ans_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$frm_ans_port" ]; then
+    echo "::error::'min ls' carries no DNS SERVICE line after min finalize-install, so the box's address cannot be asked for"
+    mnl ls 2>&1 | head -40 || true
+    fail
+  fi
+  frm_addr="$(zone_answerer_a "$frm_ans_port" "$frm_name.min.internal" 2>"$WORK/fi-range-ans.err")" || true
+  case "$frm_addr" in
+    127.0.64.*) ;;
+    *)
+      echo "::error::$frm_name.min.internal answers ${frm_addr:-nothing}, not an address of 127.0.64.0/24: the session start did not land the range on the running VM (NET-123's re-walk), so the box stands at the 127.0.0.1 interim"
+      cat "$WORK/fi-range-ans.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  echo "the zone answers $frm_name.min.internal with $frm_addr, an address of the range"
+
+  # Both URLs, with every proxy variable stripped: no client needs setup.
+  for frm_url in "http://$frm_name.min.internal:$frm_port/" "http://$frm_addr:$frm_port/"; do
+    frm_status=""; frm_body=""
+    for _ in $(seq 1 20); do
+      env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+        curl -sS --max-time 8 -o "$WORK/fi-range.body" -w 'HTTP:%{http_code}' \
+        "$frm_url" >"$WORK/fi-range.out" 2>"$WORK/fi-range.err"
+      frm_rc=$?
+      frm_status="$(cat "$WORK/fi-range.out" 2>/dev/null)"
+      frm_body="$(cat "$WORK/fi-range.body" 2>/dev/null || true)"
+      [ "$frm_rc" -eq 0 ] && [ "$frm_status" = "HTTP:200" ] \
+        && [[ "$frm_body" == *"$frm_marker"* ]] && break
+      sleep 0.5
+    done
+    echo "GET $frm_url -> ${frm_status:-<none>} ${frm_body:-<no body>} (curl exit $frm_rc)"
+    if [ "$frm_rc" -ne 0 ] || [ "$frm_status" != "HTTP:200" ] \
+       || [[ "$frm_body" != *"$frm_marker"* ]]; then
+      echo "::error::GET $frm_url did not return the in-box server's response"
+      cat "$WORK/fi-range.err" 2>/dev/null || true
+      fail
+    fi
+  done
+
+  # `min ls` names the address the box answers at.
+  if ! mnl ls 2>/dev/null | grep -qF -- "$frm_addr"; then
+    echo "::error::'min ls' does not name $frm_addr, the address $frm_name.min.internal answers at"
+    mnl ls 2>&1 | head -40 || true
+    fail
+  fi
+  echo "'min ls' names $frm_addr"
+
+  mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
+  range_teardown_unit
+  answerer_service_teardown
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls names the address, host restored)"
+  echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
