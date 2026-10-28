@@ -506,6 +506,11 @@ where
                 session = route.session(),
                 caller = caller.as_ref().map_or("none", super::dns::Caller::name),
                 port,
+                // Whether the target published the port, and how: `none`
+                // for an ingress refusal, the source for an egress one.
+                route_source = route
+                    .source(port)
+                    .map_or("none", super::dns::RouteSource::as_str),
                 direction = %refusal.direction,
                 remote_addr = refusal
                     .other
@@ -520,6 +525,21 @@ where
             return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     };
+    // One line per admitted request, naming why the target's route carries
+    // the port: its declaration, a runtime publish, or a host-address box
+    // that gates nothing. At `info`, so the daemon's default filter keeps
+    // it in the log a `min bug` bundle carries.
+    tracing::info!(
+        component = "dns-proxy",
+        host,
+        session = route.session(),
+        port,
+        upstream = %upstream_addr,
+        route_source = route
+            .source(port)
+            .map_or("none", super::dns::RouteSource::as_str),
+        "forwarding a proxied request"
+    );
 
     let mut upstream = match tokio::time::timeout(
         UPSTREAM_DIAL_TIMEOUT,
@@ -3572,6 +3592,135 @@ mod tests {
             logged.contains(r#"status="403 Forbidden""#),
             "expected the refusal to name the status it sent, got: {logged}"
         );
+        // The diagnostics bundle reads, from the refusal line alone, that the
+        // port was neither declared nor published at runtime.
+        assert!(
+            logged.contains(r#"route_source="none""#),
+            "expected the refusal to say the port has no route source, got: {logged}"
+        );
+    }
+
+    /// The target lease [`proxy_forwards_runtime_published_port`] registers
+    /// its box's live gate under. The live-gate table is process-wide, so the
+    /// address is this test's alone.
+    #[cfg(target_os = "linux")]
+    const RUNTIME_LEASE: Ipv4Addr = Ipv4Addr::new(127, 0, 71, 1);
+
+    /// NET-044, NET-016 and NET-069 through the proxy: a port the box
+    /// published at runtime — an expose decided `allow`, or a listener —
+    /// opens through the hostname proxy exactly while the box's own gate
+    /// admits a direct connection to it, and the proxy refuses it with the
+    /// direct connection's refusal before the publish and after the
+    /// withdrawal. The box declares no ingress, so every forward here is a
+    /// runtime one, and the per-request line names it so.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_forwards_runtime_published_port() {
+        let backend_port = spawn_backend_on(RUNTIME_LEASE, "runtime").await;
+        let subnet = SwitchSubnet::default();
+
+        // The own-address box on a VM host: its lease reported with an empty
+        // applied map, because it declares no ingress.
+        let target = SessionId::parse_str("00000000-0000-0000-0000-000000000071").unwrap();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(target, "rtweb", RUNTIME_LEASE, BTreeMap::new());
+        let router = Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict);
+
+        // The box's relay gate, registered under its lease as the relay's
+        // spawn registers it: the gate a direct connection meets.
+        let gate = Arc::new(BoxGate::for_session(
+            "rtweb".to_string(),
+            RUNTIME_LEASE,
+            &BoxPolicy::default(),
+            subnet,
+            None,
+        ));
+        crate::net::switch::register_live_gate_for_test(RUNTIME_LEASE, &gate);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+        let authority = format!("rtweb.min.internal:{backend_port}");
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // Before any publish: a direct connection is refused, and so is the
+        // proxied request.
+        assert!(!gate.admits_tcp(backend_port));
+        let before = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            before.contains("403 Forbidden"),
+            "an unpublished port is refused before the publish, got: {before}"
+        );
+
+        // An expose decided `allow` admits the port at the gate: the direct
+        // connection reaches it, and the proxied request does at once.
+        gate.admit_exposed(backend_port);
+        assert!(gate.admits_tcp(backend_port));
+        let exposed = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            exposed.contains("200 OK") && exposed.ends_with("runtime"),
+            "an exposed port opens through the proxy, got: {exposed}"
+        );
+
+        // The expose's revocation drops the admission, and the proxy refuses
+        // the port again with the direct connection's refusal.
+        gate.withdraw_exposed(backend_port);
+        assert!(!gate.admits_tcp(backend_port));
+        let revoked = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            revoked.contains("403 Forbidden"),
+            "a withdrawn expose is refused, got: {revoked}"
+        );
+
+        // A listener's publication is the other runtime surface: published,
+        // the port opens; withdrawn, it is refused.
+        gate.admit_published(backend_port);
+        let listened = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            listened.contains("200 OK") && listened.ends_with("runtime"),
+            "a listen-published port opens through the proxy, got: {listened}"
+        );
+        gate.withdraw_published(backend_port);
+        let closed = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            closed.contains("403 Forbidden"),
+            "a closed listener's port is refused, got: {closed}"
+        );
+
+        drop(guard);
+        let logged = buf.contents();
+        let forwarded: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("forwarding a proxied request"))
+            .collect();
+        assert_eq!(
+            forwarded.len(),
+            2,
+            "one line per admitted request, got: {logged}"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .all(|line| line.contains(r#"route_source="runtime""#)
+                    && line.contains(r#"session="rtweb""#)),
+            "each admitted line names the runtime route source, got: {logged}"
+        );
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|line| line.contains("network policy violation")
+                    && line.contains(r#"route_source="none""#))
+                .count(),
+            3,
+            "each refusal says the port had no route source, got: {logged}"
+        );
     }
 
     /// NET-070's verify line: a request through the hostname proxy from a
@@ -3802,10 +3951,15 @@ mod tests {
             // request is put to — or from a host-side peer, whose egress is
             // ungated here exactly as its direct connections are.
             from_a_box in prop::bool::ANY,
+            // The ports the target published at runtime: bit 0 exposes port
+            // 3000 (`min net expose` decided `allow`), bit 1 publishes port
+            // 3001 for a listener. Only an own-address box has a gate to
+            // admit them on.
+            runtime in 0u8..=3,
             // The requested port: one of the publishable externals, one of the
-            // internal ports behind them, or an unrelated one.
+            // internal ports behind them, a runtime one, or an unrelated one.
             request_port in prop::sample::select(vec![
-                1024u16, 1025, 1026, 1027, 8000, 8001, 8002, 8003, 9000,
+                1024u16, 1025, 1026, 1027, 8000, 8001, 8002, 8003, 3000, 3001, 9000,
             ]),
         ) {
             let subnet = SwitchSubnet::default();
@@ -3832,8 +3986,32 @@ mod tests {
                 credentialed_upstream: None,
             };
             // The registry, as the session actor and the attach path fill it
-            // for each mode. Loopback stands in for the target's lease.
+            // for each mode. Loopback stands in for the target's lease; no
+            // other test registers a live gate under it, so the gate below
+            // is the only one the process-wide table holds for it.
             let target_lease = Ipv4Addr::LOCALHOST;
+            // The target's relay gate, registered under its lease as the
+            // relay's spawn registers it, with the runtime publishes made:
+            // the gate a direct connection to the target meets.
+            let gate = Arc::new(BoxGate::for_session(
+                "web".to_string(),
+                target_lease,
+                &target_policy,
+                subnet,
+                None,
+            ));
+            if runtime & 1 != 0 {
+                gate.admit_exposed(3000);
+            }
+            if runtime & 2 != 0 {
+                gate.admit_published(3001);
+            }
+            crate::net::switch::register_live_gate_for_test(target_lease, &gate);
+            let runtime_ports: BTreeSet<u16> = [(1u8, 3000u16), (2, 3001)]
+                .into_iter()
+                .filter(|(bit, _)| runtime & bit != 0)
+                .map(|(_, port)| port)
+                .collect();
             // The applied external→internal map the attach path reports: the
             // declaration's own mappings, so a box with no ingress section
             // reports an empty map, exactly as the attach path derives it.
@@ -3937,6 +4115,31 @@ mod tests {
                 "the proxy's verdict must equal the direct connection's"
             );
 
+            // The runtime half, held to the gate itself rather than to the
+            // route: an own-address target's runtime port is forwarded, at
+            // the same number, exactly when its gate admits a direct
+            // connection to it and the caller's egress lets the frame out.
+            if mode != TargetMode::HostAddress
+                && (3000..=3001).contains(&request_port)
+                && !matches!(
+                    &observed,
+                    ProxiedRequest::Refused(Refusal { direction: Direction::Egress, .. })
+                )
+            {
+                let reached = matches!(
+                    &observed,
+                    ProxiedRequest::Forward(SocketAddr::V4(up))
+                        if *up == SocketAddrV4::new(target_lease, request_port)
+                );
+                prop_assert_eq!(
+                    reached,
+                    gate.admits_tcp(request_port),
+                    "a runtime port is reached through the proxy exactly when \
+                     the gate admits a direct connection to it"
+                );
+                prop_assert_eq!(reached, runtime_ports.contains(&request_port));
+            }
+
             // No reach a direct connection would not have: where the target
             // has a gate, the port the forwarded connection terminates on is
             // one its own declaration admits. A host-address target has no
@@ -3951,24 +4154,19 @@ mod tests {
                     TargetMode::OwnAddressOnSwitch => Some(up.port()),
                     TargetMode::OwnAddressNative => Some(
                         // The forwarder carries the published external port;
-                        // the connection terminates on the internal one.
+                        // the connection terminates on the internal one. A
+                        // runtime port is the same number on both sides.
                         mappings
                             .iter()
                             .find(|m| m.external_port == up.port())
                             .map(|m| m.internal_port)
+                            .or_else(|| runtime_ports.contains(&up.port()).then_some(up.port()))
                             .expect("a forwarded request names a published port"),
                     ),
                 };
                 if let Some(internal) = terminated_on {
-                    let gate = SessionGate::for_session(
-                        "web".to_string(),
-                        target_lease,
-                        &target_policy,
-                        subnet,
-                        None,
-                    );
                     prop_assert!(
-                        gate.admits_direct_tcp(internal),
+                        gate.admits_tcp(internal),
                         "the proxy forwarded to port {internal}, which the target's gate refuses"
                     );
                 }
