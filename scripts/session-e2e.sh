@@ -13818,18 +13818,25 @@ proof_bep_r3_finalize_install_names_quic_helper() {
   mnl finalize-install --show --json </dev/null >"$WORK/$fq_case.json" 2>"$WORK/$fq_case.json.err" || true
   if ! fq_out="$(python3 - "$WORK/$fq_case.json" <<'PY'
 import json, sys
+# The shell captures stdout only, so the reason goes to stdout before exit 1.
+def die(msg):
+    print(msg)
+    sys.exit(1)
 path = "/usr/local/lib/minimal/quic443-leaf"
-with open(sys.argv[1]) as f:
-    report = json.load(f)
+try:
+    with open(sys.argv[1]) as f:
+        report = json.load(f)
+except (OSError, ValueError) as e:
+    die("the report is not valid JSON: %s" % e)
 items = [i for i in report.get("items", []) if i.get("id") == "quic443-helper"]
 if len(items) != 1:
-    sys.exit("the report holds %d quic443-helper items, not 1" % len(items))
+    die("the report holds %d quic443-helper items, not 1" % len(items))
 item = items[0]
 if item.get("label") != "QUIC block helper":
-    sys.exit("the quic443-helper item is labelled %r" % item.get("label"))
+    die("the quic443-helper item is labelled %r" % item.get("label"))
 state = item.get("state")
 if state == "missing" and path not in (item.get("today") or ""):
-    sys.exit("the missing helper's item does not name %s: %r" % (path, item.get("today")))
+    die("the missing helper's item does not name %s: %r" % (path, item.get("today")))
 print(state)
 PY
 )"; then
