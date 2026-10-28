@@ -777,6 +777,21 @@ pub(crate) struct RangeWalkAnswer {
     /// How many boxes the landing moved off the `127.0.0.1` interim onto
     /// their range addresses.
     pub(crate) moved: usize,
+    /// Whether this walk was a fault of the channel over a landed present
+    /// verdict, so the verdict stayed present and `probe` is the failed
+    /// walk's, not the verdict's.
+    pub(crate) kept_present: bool,
+}
+
+/// Whether a probe that did not bind the whole range rests on a refusal
+/// the forwarder answered, recorded as `AddrNotAvailable`, rather than on
+/// a fault of the channel.
+#[cfg(target_os = "linux")]
+fn range_probe_refused(probe: &crate::net::loopback::RangeProbe) -> bool {
+    matches!(
+        probe.first_failure,
+        Some((_, std::io::ErrorKind::AddrNotAvailable))
+    )
 }
 
 /// The forwarder-conducted walk of the reserved local range (NET-123) and
@@ -843,8 +858,27 @@ impl RangeWalk {
     }
 
     /// Walks the range and lands the verdict. The caller holds the turn.
-    async fn walk_and_land(&self) -> (crate::net::loopback::RangeProbe, usize) {
+    ///
+    /// A walk that neither bound the whole range nor got a refusal from the
+    /// forwarder (a timeout, a missing socket, a malformed reply) is a fault
+    /// of the channel, not a fact about the host's loopback. Over a landed
+    /// present verdict such a walk lands nothing: the verdict stays present
+    /// and every box keeps its range address. The returned flag says so.
+    /// Over a pending or absent verdict the walk lands absent as before,
+    /// because the interim is what the surface can promise without an answer.
+    async fn walk_and_land(&self) -> (crate::net::loopback::RangeProbe, usize, bool) {
         let probe = self.probe().await;
+        if !probe.present() && !range_probe_refused(&probe) && self.present_landed() {
+            tracing::warn!(
+                probe = %probe.summary(),
+                first_failure = ?probe.first_failure,
+                action = "loopback-range-walk-inconclusive",
+                "the range walk got no answer from the forwarder; \
+                 the present verdict stays and every box keeps its address",
+            );
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return (probe, 0, true);
+        }
         let moved = land_range_verdict(
             &self.book,
             &self.registry,
@@ -858,7 +892,15 @@ impl RangeWalk {
             self.grant_node_address();
         }
         self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        (probe, moved)
+        (probe, moved, false)
+    }
+
+    /// Whether the book holds a landed present verdict: it vouches for an
+    /// address inside the reserved range only then.
+    fn present_landed(&self) -> bool {
+        ::switch::loopback::range_hosts()
+            .next()
+            .is_some_and(|host| self.book.vouches_for(host))
     }
 
     /// Hands the node its own loopback address once the range is present
@@ -902,7 +944,7 @@ impl RangeWalk {
     /// path, it lands the first verdict the book opened pending on.
     pub(crate) async fn daemon_start(&self) {
         let mut last = self.last.lock().await;
-        let (probe, _) = self.walk_and_land().await;
+        let (probe, _, _) = self.walk_and_land().await;
         tracing::info!(
             via = "forwarder",
             surface = probe.surface(),
@@ -926,7 +968,9 @@ impl RangeWalk {
     /// range can go away under a running VM, so a present verdict is
     /// bind-probed again too: a present-to-absent walk lands the absent
     /// arm, which moves every box in the range onto the `127.0.0.1`
-    /// interim. A walk that ended while this call waited for its turn gives
+    /// interim. Only a refusal the forwarder answered lands that arm over a
+    /// present verdict. A walk that got no answer keeps the verdict
+    /// ([`Self::walk_and_land`]). A walk that ended while this call waited for its turn gives
     /// this call its answer.
     pub(crate) async fn session_start(&self) -> RangeWalkAnswer {
         let seen = self.walks.load(std::sync::atomic::Ordering::Acquire);
@@ -937,14 +981,26 @@ impl RangeWalk {
                 probe: probe.clone(),
                 walked: false,
                 moved: 0,
+                kept_present: false,
             };
         }
-        let (probe, moved) = self.walk_and_land().await;
+        let (probe, moved, kept_present) = self.walk_and_land().await;
+        if kept_present {
+            // The verdict did not move, so the last walk's probe stays the
+            // one a waiting session start takes as its answer.
+            return RangeWalkAnswer {
+                probe,
+                walked: true,
+                moved,
+                kept_present,
+            };
+        }
         *last = Some(probe.clone());
         RangeWalkAnswer {
             probe,
             walked: true,
             moved,
+            kept_present,
         }
     }
 }
@@ -985,7 +1041,9 @@ pub(crate) struct InterimUpgrade {
 /// destroy. The landing is the one moment the daemon holds both facts — the
 /// verdict and every publish it contradicts — so it re-publishes each such
 /// box at the interim, name and route with it, and the box's attach binds
-/// where the surface listens instead of failing until destroy. The arm is
+/// where the surface listens instead of failing until destroy. The node's
+/// own address moves to the interim too when it stands in the range, so
+/// the names of host-address boxes stop answering at it. The arm is
 /// a belt behind the pending window's gate: no production path publishes a
 /// reserved-range address under anything but a landed present verdict — a
 /// hand waits for one or stands at the interim, and a resumed box the
@@ -1054,6 +1112,22 @@ fn land_range_verdict(
                 );
                 reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
                 reg.register_own_ip(session, &name, ports);
+            }
+            // The node's own address a present landing granted: host-address
+            // boxes route at it, and the surface cannot bind it now. The
+            // node's lease stays in the book, so the next present landing
+            // grants the same address back.
+            let node = reg.node_address();
+            if ::switch::loopback::range_hosts().any(|host| host == node) {
+                tracing::warn!(
+                    from = %node,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-node",
+                    "the node's own loopback address stood inside the reserved \
+                     local range; the range is absent on the publish surface, \
+                     so the node's names move to the 127.0.0.1 interim",
+                );
+                reg.set_node_address(Ipv4Addr::LOCALHOST);
             }
             0
         }

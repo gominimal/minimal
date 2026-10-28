@@ -3170,6 +3170,9 @@ async fn session_start_rewalks_range_after_finalize_install() {
     let server = TestServer::new().await;
     let mngr = server.state.sessions_manager().await;
     let installed = Arc::new(AtomicBool::new(false));
+    // When set, the stand-in walk times out at its first round: the
+    // forwarder never answered.
+    let stalled = Arc::new(AtomicBool::new(false));
     let walks = Arc::new(AtomicUsize::new(0));
     // When set, the stand-in runs the real forwarder walk against this
     // control socket, in place of a fixed verdict.
@@ -3177,12 +3180,22 @@ async fn session_start_rewalks_range_after_finalize_install() {
         Arc::new(std::sync::Mutex::new(None));
     {
         let installed = Arc::clone(&installed);
+        let stalled = Arc::clone(&stalled);
         let walks = Arc::clone(&walks);
         let forwarder = Arc::clone(&forwarder);
         mngr.install_range_walk_standin(move || {
             walks.fetch_add(1, Ordering::SeqCst);
             let sock = forwarder.lock().expect("forwarder lock").clone();
-            if let Some(sock) = sock {
+            if stalled.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: ::switch::loopback::range_hosts().count(),
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::TimedOut,
+                    )),
+                }
+            } else if let Some(sock) = sock {
                 let control = crate::net::policy::ControlChannel::Unix(sock);
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
@@ -3363,6 +3376,51 @@ async fn session_start_rewalks_range_after_finalize_install() {
         "the walk never releases the forward the box holds: {unexposed:?}"
     );
 
+    // The forwarder stalls: the walk times out and gets no answer. That is
+    // a fault of the channel, not an absent range, so the present verdict
+    // stays and every box keeps its range address.
+    stalled.store(true, Ordering::SeqCst);
+    let stalled_start = client
+        .call::<CreateSession>(&req("forwarder-stalled", "/uwu"))
+        .await
+        .ok()
+        .expect("a stalled walk must not refuse the session");
+    stalled.store(false, Ordering::SeqCst);
+    assert!(
+        !stalled_start.interim_loopback,
+        "a walk with no answer keeps the present verdict, so the reply stays off the interim"
+    );
+    assert_eq!(walks.load(Ordering::SeqCst), 5);
+    let line = probe_line(&log.contents(), &stalled_start.id);
+    assert!(
+        line.contains("walked=true")
+            && line.contains("verdict_kept=true")
+            && line.contains("surface=reserved-range"),
+        "the line says the walk kept the present verdict: {line}"
+    );
+    assert!(
+        mngr.loopback_book()
+            .vouches_for(::switch::loopback::range_hosts().next().unwrap()),
+        "the book still holds the present verdict"
+    );
+    assert_eq!(
+        mngr.hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(before.id),
+        Some(moved),
+        "a stalled walk moves no box off its range address"
+    );
+    let node = mngr
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    assert!(
+        ::switch::loopback::range_hosts().any(|host| host == node),
+        "the present landing granted the node a range address, got {node}"
+    );
+
     // The range goes away under the running VM.
     installed.store(false, Ordering::SeqCst);
     let gone = client
@@ -3375,7 +3433,7 @@ async fn session_start_rewalks_range_after_finalize_install() {
         "the walk found the range absent after a present landing, so the \
          reply carries the interim"
     );
-    assert_eq!(walks.load(Ordering::SeqCst), 5);
+    assert_eq!(walks.load(Ordering::SeqCst), 6);
     let line = probe_line(&log.contents(), &gone.id);
     assert!(
         line.contains("walked=true") && line.contains("surface=127.0.0.1-interim"),
@@ -3396,6 +3454,22 @@ async fn session_start_rewalks_range_after_finalize_install() {
                 && line.contains(&format!("from={moved}"))
         }),
         "the move back to the interim is logged with the session id and both addresses"
+    );
+    assert_eq!(
+        mngr.hostnames()
+            .read()
+            .expect("registry lock")
+            .node_address(),
+        std::net::Ipv4Addr::LOCALHOST,
+        "the absent landing moves the node's address off the range onto the interim"
+    );
+    assert!(
+        log.contents().lines().any(|line| {
+            line.contains("loopback-range-absent-node")
+                && line.contains(&format!("from={node}"))
+                && line.contains("to=127.0.0.1")
+        }),
+        "the node's move to the interim is logged with both addresses"
     );
 }
 

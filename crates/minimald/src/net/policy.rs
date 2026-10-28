@@ -1022,7 +1022,10 @@ pub async fn expose_dynamic(
 /// local probe classifies its binds — every address bound reads the range
 /// present; the first refusal names the first missing alias; anything that
 /// is not a bind — a refused request, a stall, an unreachable control
-/// channel — reads absent, never present.
+/// channel — reads absent, never present. The first failure's kind tells
+/// the two apart: `AddrNotAvailable` is a refusal the forwarder answered,
+/// and any other kind is a fault of the channel. The session-start walk
+/// keeps a present verdict over a fault (`RangeWalk` in `box_manager`).
 ///
 /// Why a second probe beside the local one: an own-address box's declared
 /// ports are bound by the **forwarder**, not by the daemon. On a native host
@@ -1112,7 +1115,18 @@ async fn probe_publish_surface_within(
                     );
                 }
                 Err(error) => {
-                    probe.first_failure.get_or_insert((*address, error.kind()));
+                    // A refusal the forwarder answered is recorded as the
+                    // bind refusal the local probe records, `AddrNotAvailable`:
+                    // the host said this address does not bind. Every other
+                    // error keeps its own kind (a timeout, a missing socket,
+                    // a malformed reply), so a session-start walk can tell a
+                    // fault of the channel from an answer about the range.
+                    let kind = if is_forwarder_refusal(&error) {
+                        io::ErrorKind::AddrNotAvailable
+                    } else {
+                        error.kind()
+                    };
+                    probe.first_failure.get_or_insert((*address, kind));
                     if error.kind() == io::ErrorKind::TimedOut {
                         // A control channel that does not answer is not a
                         // fact about the host's loopback at all, so the walk
@@ -1302,9 +1316,33 @@ pub(crate) async fn post_json_within<T: Serialize>(
         };
         Err(io::Error::new(
             kind,
-            format!("gvproxy {path} returned HTTP {status}: {said}"),
+            ForwarderRefusal(format!("gvproxy {path} returned HTTP {status}: {said}")),
         ))
     }
+}
+
+/// The error a control request carries when the forwarder answered with a
+/// non-2xx status: the forwarder was reached and said no. The range walk
+/// reads it apart from a fault of the channel itself (a timeout, a missing
+/// socket, a malformed reply), because only an answer is a fact about the
+/// host's loopback (NET-123).
+#[derive(Debug)]
+struct ForwarderRefusal(String);
+
+impl std::fmt::Display for ForwarderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ForwarderRefusal {}
+
+/// Whether `error` is a [`ForwarderRefusal`]: the forwarder answered the
+/// request and refused it.
+fn is_forwarder_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ForwarderRefusal>())
 }
 
 /// Writes `request` to a freshly-connected control stream and reads the response
@@ -2462,11 +2500,16 @@ mod tests {
             assert!(!probe.present());
             assert!(probe.interim());
             assert_eq!(probe.surface(), "127.0.0.1-interim");
-            // The refused request comes back as gvproxy's folded error, whose
-            // kind is `Other` — the address is the record's, never guessed.
+            // The forwarder answered and refused, so the walk records the
+            // bind refusal's kind, `AddrNotAvailable` — the answer a
+            // session-start walk lands absent on. The address is the
+            // record's, never guessed.
             assert_eq!(
                 probe.first_failure,
-                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::Other))
+                Some((
+                    Ipv4Addr::new(127, 0, 64, 1),
+                    io::ErrorKind::AddrNotAvailable
+                ))
             );
         }
 

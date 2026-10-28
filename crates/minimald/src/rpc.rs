@@ -697,18 +697,27 @@ fn session_start_range_walk_line(
     answer: &crate::box_manager::RangeWalkAnswer,
 ) -> bool {
     let probe = &answer.probe;
+    // A walk that got no answer over a present verdict keeps that verdict,
+    // so the box publishes in the range and the surface is the range's.
+    let interim = probe.interim() && !answer.kept_present;
+    let surface = if answer.kept_present {
+        "reserved-range"
+    } else {
+        probe.surface()
+    };
     tracing::info!(
         session_id = %session_id,
         via = "forwarder",
         walked = answer.walked,
         moved_off_interim = answer.moved,
+        verdict_kept = answer.kept_present,
         probe = %probe.summary(),
-        surface = %probe.surface(),
+        surface = %surface,
         first_failure = ?probe.first_failure,
-        interim_loopback = probe.interim(),
+        interim_loopback = interim,
         "session-start loopback probe picked the publish surface"
     );
-    probe.interim()
+    interim
 }
 
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
