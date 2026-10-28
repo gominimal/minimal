@@ -249,6 +249,17 @@ impl HostHandle {
         (Self { sender }, WedgedMailbox(receiver))
     }
 
+    /// Resolves once the host's runtime loop has dropped its mailbox, so a
+    /// send from here on finds the channel closed.
+    ///
+    /// Awaiting an aborted loop task is not always enough for that: the
+    /// task a caller holds can be a watcher that stands in for the loop
+    /// (`box_actor`'s `watch_quic443_exit`), and aborting the watcher only
+    /// asks the loop to abort.
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
     /// A handle to a host that answers every attrs probe at once (with
     /// default attrs) and ignores everything else: a live host, as far as a
     /// listing can tell.
