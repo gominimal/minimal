@@ -13,7 +13,8 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;
@@ -943,8 +944,10 @@ pub enum BoxState {
     Materializing,
     /// Composition complete and every side-channel upload is on
     /// disk; the record is ready to apply and the session is
-    /// attachable.
+    /// attachable. This is the stored spelling of the `running` state
+    /// (BOX-011), and a record that spells it `running` loads as it.
     #[default]
+    #[serde(alias = "running")]
     Active,
 }
 
@@ -1003,7 +1006,9 @@ where
 /// the two id types merged reads back as the same id.
 ///
 /// Ordered by its bytes, which for a `UUIDv7` is the order of its mint
-/// time: a map keyed by box id holds its boxes in creation order.
+/// millisecond: a map keyed by box id holds its boxes sorted by the
+/// millisecond each id was minted in. One process mints no two ids in the
+/// same millisecond, so its ids sort in creation order.
 ///
 /// [`Display`]: std::fmt::Display
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1024,11 +1029,48 @@ impl BoxId {
     }
 
     /// Mints a fresh box id: one `UUIDv7`, its timestamp from the clock
-    /// and its random fields from the OS CSPRNG. Ids minted in one process
-    /// sort in mint order.
+    /// and all 74 of its random bits from the OS CSPRNG, with no counter.
+    /// No two ids minted in one process share a mint millisecond, and each
+    /// takes a later one than the id before it. A mint whose clock reading
+    /// is not after the last mint millisecond takes the millisecond after
+    /// the last one: see [`next_mint_ms`]. So the last mint millisecond
+    /// never goes back, nothing waits for the clock, and ids minted in one
+    /// process sort in mint order, which is creation order (NET-129).
     #[must_use]
     pub fn mint() -> Self {
-        Self(Uuid::now_v7())
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // The mint millisecond of the last id this process minted.
+        static LAST_MINT_MS: AtomicU64 = AtomicU64::new(0);
+
+        loop {
+            let last = LAST_MINT_MS.load(Ordering::Acquire);
+            let now = uuid::Timestamp::now(uuid::NoContext);
+            let (secs, nanos) = now.to_unix();
+            let clock_ms = secs * 1000 + u64::from(nanos) / 1_000_000;
+            let ms = next_mint_ms(last, clock_ms);
+            // A CAS that another mint overtook fails, and the loop reads
+            // the new `last`. So `LAST_MINT_MS` only moves forward.
+            if LAST_MINT_MS
+                .compare_exchange(last, ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let stamp = if ms == clock_ms {
+                    now
+                } else {
+                    uuid::Timestamp::from_unix(
+                        uuid::NoContext,
+                        ms / 1000,
+                        // A remainder below 1000 always fits in a `u32`.
+                        u32::try_from(ms % 1000).unwrap_or(0) * 1_000_000,
+                    )
+                };
+                // `NoContext` gives the timestamp no counter bits, so
+                // `new_v7` fills `rand_a` and `rand_b` with fresh random
+                // bits.
+                return Self(Uuid::new_v7(stamp));
+            }
+        }
     }
 
     /// The all-zero id: what a record read without an id carries until it
@@ -1060,6 +1102,16 @@ impl BoxId {
     pub fn simple(&self) -> String {
         self.0.simple().to_string()
     }
+}
+
+/// The mint millisecond for a box id, given the `last` one this process
+/// minted and the clock's reading `clock_ms`. It is the clock's reading
+/// when that is after `last`. Otherwise it is `last + 1`: the clock read
+/// in the same millisecond as the last mint, read before a mint that
+/// overtook this one, or stepped back. The result is always after `last`.
+#[must_use]
+fn next_mint_ms(last: u64, clock_ms: u64) -> u64 {
+    clock_ms.max(last.saturating_add(1))
 }
 
 impl From<Uuid> for BoxId {
@@ -1423,11 +1475,51 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_certificate: Option<String>,
 
+    /// The Box Type this box was created as (BOX-001): the type the
+    /// creating verb names: [`SESSION_BOX_TYPE`] for every box
+    /// `min session activate` creates, and [`TASK_BOX_TYPE`] for every box
+    /// `min task run` creates. Daemon-owned: the create stamps it from
+    /// the request's creating verb, and no client field names the type.
+    /// `None` for a record that predates the field.
+    #[serde(default)]
+    pub box_type: Option<String>,
+
+    /// The box whose workload created this one (BOX-001), stamped by the
+    /// creating daemon from the caller's per-box identity and never from
+    /// the request. `None` when the caller runs outside any box, which is
+    /// every caller on a host with no nesting, and for a record that
+    /// predates the field. Written as `null` when there is no parent, so
+    /// a record that carries the key reads apart from one that predates it.
+    #[serde(default)]
+    pub parent: Option<BoxId>,
+
+    /// The root of the project whose `minimal.toml` this box's entry came
+    /// from (BOX-001): the resolved project directory the creating client
+    /// named, as the daemon stamped it at creation. `None` for a record
+    /// that predates the field.
+    #[serde(default)]
+    pub project_root: Option<HostAbsPath>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
 
+/// The Box Type of a box `min session activate` creates (BOX-001).
+pub const SESSION_BOX_TYPE: &str = "session";
+
+/// The Box Type of a box `min task run` creates (BOX-001).
+pub const TASK_BOX_TYPE: &str = "task";
+
 impl Record {
+    /// The one state the record is in (BOX-011). A stored record is
+    /// `pending`, `materializing` or `running`: the store does not yet
+    /// hold an ending, so no stored record reads as `stopped` or `exited`.
+    /// Issue #2634 owns storing `reason`, `exit_code` and `signal`.
+    #[must_use]
+    pub fn state(&self) -> crate::core::record::RecordState {
+        crate::core::record::RecordState::from(self.status)
+    }
+
     /// [`Record::validate_policy`] plus the checks a record must pass only
     /// when it is created: added after records were already stored, they
     /// would strand an existing session if they ran on every launch.
@@ -1564,6 +1656,40 @@ impl Record {
 mod tests {
     use super::*;
 
+    /// A clock reading at or behind the last mint millisecond never moves
+    /// the mint back: a stale reading, a same-millisecond reading and a
+    /// backward clock step each take the millisecond after the last mint.
+    #[test]
+    fn next_mint_ms_never_goes_back() {
+        // A clock ahead of the last mint is taken as read.
+        assert_eq!(next_mint_ms(1_000, 1_005), 1_005);
+        // The same millisecond as the last mint takes the next one.
+        assert_eq!(next_mint_ms(1_000, 1_000), 1_001);
+        // A stale reading behind the last mint, as a mint overtaken by
+        // another reads, takes the millisecond after the last mint.
+        assert_eq!(next_mint_ms(1_000, 990), 1_001);
+        // A clock stepped far back does the same.
+        assert_eq!(next_mint_ms(1_000, 0), 1_001);
+        // The first mint of a process takes the clock.
+        assert_eq!(next_mint_ms(0, 1_700_000_000_000), 1_700_000_000_000);
+    }
+
+    /// Ids minted back to back sort in mint order, each in a later
+    /// millisecond than the one before it.
+    #[test]
+    fn minted_ids_take_strictly_later_milliseconds() {
+        let ids: Vec<BoxId> = (0..64).map(|_| BoxId::mint()).collect();
+        let ms = |id: &BoxId| {
+            let mut stamp = [0u8; 8];
+            stamp[2..].copy_from_slice(&id.to_bytes()[..6]);
+            u64::from_be_bytes(stamp)
+        };
+        for pair in ids.windows(2) {
+            assert!(ms(&pair[0]) < ms(&pair[1]), "{} then {}", pair[0], pair[1]);
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
     /// A box id reads back from a reader, which lends no borrowed string —
     /// the path a record on disk and a request off a socket both take.
     #[test]
@@ -1654,6 +1780,9 @@ mod tests {
             ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: BTreeMap::new(),
         }
     }

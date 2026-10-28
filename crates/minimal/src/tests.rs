@@ -301,7 +301,18 @@ fn every_daemon_connection_is_classified() {
             // Test-only: the BEP-063 mint tests register keys with a proxy
             // control socket they serve themselves, so no daemon is involved.
             "mint.rs::a_refused_client_key_is_replaced_and_registered_before_the_mint = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke = ungated",
+            "mint.rs::a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replaced_client_key_keeps_verifying_until_its_boxes_end = ungated",
+            "mint.rs::a_replacement_past_a_bound_of_keys_in_use_fails_the_creation = ungated",
+            "mint.rs::a_replacement_the_store_does_not_keep_revokes_no_key = ungated",
             "mint.rs::create = ungated",
+            // The proxy's control socket, not the daemon: a replaced client
+            // key is revoked there, and no daemon version applies to it.
+            "mint.rs::local_client_key_at = ungated",
+            "mint.rs::revoke_others = ungated",
             "mint.rs::store_handle_signed_and_key_registered = ungated",
             "mint.rs::store_handle_signed_and_key_registered = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
@@ -320,6 +331,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
+            // Not a product path, and not the daemon: the audit test submits
+            // a revocation to a test Box Egress Proxy's control socket.
+            "tests.rs::mint_and_destroy_append_audit_records = ungated",
         ]
     );
 }
@@ -338,8 +352,14 @@ fn every_create_session_asserts_the_daemon_build() {
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
             "cmd/boxes/create.rs::activate_box = asserts",
+            // A unit test's request, never sent: it checks the box spec.
+            "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
+            // A unit test's request, never sent: it checks the project root.
+            "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
+            // A unit test's request, never sent: it checks the project root.
+            "dash/rpc.rs::dashboard_create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
@@ -1795,6 +1815,269 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
     std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(resolve_upload_root(path).is_err());
+}
+
+/// The pure upload decision over its whole domain: the empty/`$HOME`
+/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// headless gate, with no TTY and no daemon in sight.
+#[test]
+fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
+    // An empty directory skips silently — unless the caller passed an
+    // explicit `--sync tarball`, which uploads it anyway.
+    let empty = tempfile::tempdir().unwrap();
+    let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(empty, false, false, None),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(
+        decide_workspace_upload(empty, true, false, None),
+        UploadDecision::Upload
+    );
+
+    // A non-empty, undeclared, non-VCS root: a headless caller skips with
+    // the shared warning, an interactive one is asked first.
+    let plain = tempfile::tempdir().unwrap();
+    std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
+    let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(plain, false, true, None),
+        UploadDecision::SkipUndeclared
+    );
+    assert_eq!(
+        decide_workspace_upload(plain, false, false, None),
+        UploadDecision::Confirm
+    );
+
+    // A VCS root or a declared project uploads unconditionally.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("notes.txt"), "x").unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(repo, false, true, None),
+        UploadDecision::Upload
+    );
+
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(declared.path().join("notes.txt"), "x").unwrap();
+    std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
+    let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(declared, false, true, None),
+        UploadDecision::Upload
+    );
+
+    // A declared project that is `$HOME` keeps the carve-out — home is never
+    // bulk-uploaded on a stray activation — so its hooks are the count the
+    // gate below refuses over. This is the one state a skip can drop hooks
+    // from: an undeclared root has no `minimal.toml` to lose (the case above).
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(home, false, false, Some(home.as_std_path())),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(project_lifecycle_hook_count(home), 1);
+    assert!(
+        refuse_dropped_hooks(
+            &WorkspaceUpload::SkippedEmptyOrHome {
+                dropped_hooks: project_lifecycle_hook_count(home),
+            },
+            home,
+            CLI_DROPPED_HOOKS_REMEDY,
+        )
+        .is_err(),
+        "a skipped home that declares hooks must be refused, not created silently"
+    );
+}
+
+/// The refusal a hook-dropping skip raises names the root, the count, and the
+/// `--sync` escape hatch. It is shared by both CLI callers and by the
+/// dashboard's own gate, so the wording cannot drift between them; the remedy
+/// clause is the caller's, and each caller's names what it can do.
+#[test]
+fn dropped_hooks_error_names_root_count_and_escape_hatch() {
+    let err = dropped_hooks_error(
+        camino::Utf8Path::new("/srv/data/run42"),
+        3,
+        CLI_DROPPED_HOOKS_REMEDY,
+    );
+    let text = err.to_string();
+    assert!(text.contains("/srv/data/run42"), "{text}");
+    assert!(text.contains("is your home directory"), "{text}");
+    assert!(text.contains("3 lifecycle hook(s)"), "{text}");
+    assert!(text.contains("--sync tarball"), "{text}");
+    assert!(text.contains("--sync none"), "{text}");
+
+    // The dashboard owns neither flag, so its refusal names the command that
+    // does rather than advice no key on the screen can follow.
+    let dashboard = dropped_hooks_error(
+        camino::Utf8Path::new("/home/dev"),
+        2,
+        DASH_DROPPED_HOOKS_REMEDY,
+    )
+    .to_string();
+    assert!(
+        dashboard.contains("min session activate --sync tarball"),
+        "{dashboard}"
+    );
+    assert!(
+        !dashboard.contains("`--sync none`"),
+        "the dashboard cannot pass --sync none, so it must not be told to: {dashboard}"
+    );
+}
+
+/// The resolved-root notice appears only when the upload walked above the
+/// invocation directory, so `min activate` from inside a project says which
+/// root it used while a root at the invocation directory stays quiet.
+#[test]
+fn resolved_upload_root_notice_only_when_they_differ() {
+    let root = camino::Utf8Path::new("/proj");
+    let subdir = camino::Utf8Path::new("/proj/sub");
+    assert!(resolved_upload_root_notice(root, root).is_none());
+    let notice = resolved_upload_root_notice(subdir, root).expect("a notice when they differ");
+    assert!(
+        notice.contains("/proj (resolved from /proj/sub)"),
+        "{notice}"
+    );
+}
+
+/// A skip that would drop lifecycle hooks is the caller's call: the refusing
+/// caller gets an error, and one with no hooks dropped never does. The skip
+/// that costs them is the `$HOME` that is itself a declared project — an
+/// undeclared root has no `minimal.toml` to lose — and the user's own decline
+/// is never refused, whatever it costs: it is an answer, not an accident.
+#[test]
+fn report_upload_outcome_refuses_dropped_hooks_only() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    assert!(
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+            root,
+            DroppedHooksPolicy::Refuse,
+            &mut Vec::new(),
+        )
+        .is_err(),
+        "a skipped home that declares hooks is refused"
+    );
+    for kept in [
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(
+            report_upload_outcome(Ok(kept), root, DroppedHooksPolicy::Refuse, &mut Vec::new())
+                .is_ok(),
+            "{kept:?}"
+        );
+    }
+}
+
+/// The non-refusing caller (`min task run`) proceeds, but its warning names
+/// the hooks the skipped upload loses: the empty-box line alone would read as
+/// a healthy start.
+#[test]
+fn report_upload_outcome_warns_when_a_home_skip_drops_hooks() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Warn,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
+    assert!(
+        err.contains("2 lifecycle hook(s) declared in /srv/data/run42/minimal.toml"),
+        "{err:?}"
+    );
+}
+
+/// `--no-hooks` already disabled the project's hooks, so the activation
+/// proceeds without a hook warning: only the empty-box line remains.
+#[test]
+fn report_upload_outcome_ignores_hooks_the_caller_disabled() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    let mut err = Vec::new();
+    let result = report_upload_outcome(
+        Ok(WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 }),
+        root,
+        DroppedHooksPolicy::Ignore,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("the sink holds UTF-8");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(err.contains("Starting with an empty box"), "{err:?}");
+    assert!(!err.contains("lifecycle hook"), "{err:?}");
+}
+
+/// The rule `min dash` applies in place of the stderr wording refuses exactly
+/// the skip that would drop hooks: the skips that cost nothing, and the user's
+/// own decline, still create their box.
+#[test]
+fn refuse_dropped_hooks_gates_only_the_hook_dropping_skip() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    for allowed in [
+        WorkspaceUpload::Uploaded,
+        WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 },
+        WorkspaceUpload::SkippedUndeclared,
+        WorkspaceUpload::Declined,
+    ] {
+        assert!(
+            refuse_dropped_hooks(&allowed, root, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
+    }
+    let err = refuse_dropped_hooks(
+        &WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 2 },
+        root,
+        CLI_DROPPED_HOOKS_REMEDY,
+    )
+    .expect_err("a home skip that drops lifecycle hooks is refused");
+    assert!(err.to_string().contains("2 lifecycle hook(s)"), "{err}");
+}
+
+/// A create that plans its upload refuses the hook-dropping `$HOME` skip
+/// from the decision alone, before the daemon holds a session or a row: only
+/// the empty/`$HOME` skip can cost hooks, and only when the root declares
+/// some.
+#[test]
+fn refuse_dropped_hooks_before_create_refuses_the_home_skip() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(mfile::MFILE_NAME),
+        "[[session.lifecycle_hooks]]\n\
+         on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+    )
+    .unwrap();
+    let home = camino::Utf8Path::from_path(home.path()).expect("temp path is UTF-8");
+    for allowed in [
+        UploadDecision::Upload,
+        UploadDecision::SkipUndeclared,
+        UploadDecision::Confirm,
+        UploadDecision::Declined,
+    ] {
+        assert!(
+            refuse_dropped_hooks_before_create(allowed, home, CLI_DROPPED_HOOKS_REMEDY).is_ok(),
+            "{allowed:?}"
+        );
+    }
+    let err = refuse_dropped_hooks_before_create(
+        UploadDecision::SkipEmptyOrHome,
+        home,
+        CLI_DROPPED_HOOKS_REMEDY,
+    )
+    .expect_err("the home skip that drops hooks is refused before the create");
+    assert!(err.to_string().contains("1 lifecycle hook(s)"), "{err}");
 }
 
 /// A refused composition is reported in the user's terms — the
@@ -4220,6 +4503,90 @@ mod mint_tests {
         drop(ProxyRegistration::new(gone, kept).unwrap());
     }
 
+    // BEP-067, BEP-043: a mint appends one `mint` record per member, and a
+    // live box's destroy appends one `revocation` record, to the one audit
+    // log, through the proxy's control socket. The records chain, and the
+    // revocation is in force for the box id alone.
+    #[test]
+    fn mint_and_destroy_append_audit_records() {
+        use bep::audit::{AuditLog, Kind, LogReader, Outcome, line_hash, segment_name};
+        use bep::redeemer::Revocations;
+
+        let (_, identity) = proxy();
+        let keychain = signed_in();
+        let instance = keychain.metadata().unwrap().unwrap().instance;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let logs = dir.path().join("audit");
+        let log = AuditLog::open(logs.join(segment_name(0))).unwrap();
+        let revocations = Revocations::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = runtime
+            .block_on(async {
+                Control::bind(&path, Registry::default(), BoxRegistry::default()).map(|control| {
+                    control
+                        .with_revocations(Arc::clone(&revocations))
+                        .with_audit(Arc::new(std::sync::Mutex::new(log)))
+                })
+            })
+            .unwrap();
+        runtime.spawn(control.run());
+
+        let mut client = ControlClient::connect(&path).unwrap();
+        let two_grants = GrantBox {
+            grants: vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+            ..grant_box(Stance::OwnIp)
+        };
+        let minted = mint_and_register(
+            &keychain,
+            &identity,
+            std::path::Path::new("identity.json"),
+            &mut client,
+            &ClientKey::generate().unwrap(),
+            &two_grants,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(minted.len(), 2);
+
+        let mut reader = LogReader::new(&logs);
+        let mints = reader.read_new().unwrap().entries;
+        assert_eq!(mints.len(), 2, "one mint record per member: {mints:?}");
+        for entry in &mints {
+            assert_eq!(entry.record.kind, Kind::Mint);
+            assert_eq!(entry.record.subject, BOX_HEX);
+            assert_eq!(entry.record.identifier, format!("github:{instance}"));
+            assert_eq!(entry.record.decision, Outcome::Admit);
+            assert!(!entry.line.contains("ghu_") && !entry.line.contains("ghr_"));
+        }
+        assert!(revocations.read().unwrap().is_empty());
+
+        // The destroy of the live box, as `minvmd` sends it: the revocation,
+        // then the forget. The hyphenated id names the same box.
+        client.revoke_box(BOX_ID).unwrap();
+        client.forget_box(BOX_ID).unwrap();
+        // A second revocation of the box records nothing new.
+        client.revoke_box(BOX_HEX).unwrap();
+        let revoked = reader.read_new().unwrap().entries;
+        assert_eq!(revoked.len(), 1, "one revocation record: {revoked:?}");
+        assert_eq!(revoked[0].record.kind, Kind::Revocation);
+        assert_eq!(revoked[0].record.subject, BOX_HEX);
+        assert_eq!(revoked[0].record.identifier, bep::audit::NONE);
+        // One chain: the revocation follows the client's mints.
+        assert_eq!(revoked[0].record.previous_hash, line_hash(&mints[1].line));
+        assert_eq!(mints[1].record.previous_hash, line_hash(&mints[0].line));
+        assert_eq!(revocations.read().unwrap().as_slice(), [BOX_HEX.to_owned()]);
+
+        // A request with no box id is refused, and records nothing.
+        assert!(client.revoke_box("web").is_err());
+        assert!(client.record_mint(BOX_HEX, " ").is_err());
+        assert!(reader.read_new().unwrap().entries.is_empty());
+    }
+
     /// A control socket that registers and forgets boxes as the proxy does,
     /// and refuses every client key. Gives the socket and its boxes.
     fn serve_refusing_keys() -> (
@@ -4261,13 +4628,27 @@ mod mint_tests {
                             }
                             bep::control::Request::RegisterBox { .. } => "register_box",
                             bep::control::Request::ForgetBox { .. } => "forget_box",
+                            bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                            bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
+                            bep::control::Request::RecordMint { .. } => "record_mint",
+                            bep::control::Request::RevokeBox { .. } => "revoke_box",
                         };
                         served_ops.lock().unwrap().push(op.to_owned());
                         let reply = if op == "register_client_key" {
                             bep::control::Reply {
                                 ok: false,
                                 kid: None,
+                                revoked: Vec::new(),
                                 error: Some("the key is not a P-256 public key".into()),
+                            }
+                        } else if op == "record_mint" || op == "revoke_box" {
+                            // `handle_line` keeps no record, so the stub
+                            // answers these two itself.
+                            bep::control::Reply {
+                                ok: true,
+                                kid: None,
+                                revoked: Vec::new(),
+                                error: None,
                             }
                         } else {
                             bep::control::handle_line(&line, &clients, &served_boxes)
@@ -4347,9 +4728,24 @@ mod mint_tests {
                         bep::control::Request::RegisterClientKey { .. } => "register_client_key",
                         bep::control::Request::RegisterBox { .. } => "register_box",
                         bep::control::Request::ForgetBox { .. } => "forget_box",
+                        bep::control::Request::RevokeClientKey { .. } => "revoke_client_key",
+                        bep::control::Request::ReplaceClientKey { .. } => "replace_client_key",
+                        bep::control::Request::RecordMint { .. } => "record_mint",
+                        bep::control::Request::RevokeBox { .. } => "revoke_box",
                     };
                     served_ops.lock().unwrap().push(op.to_owned());
-                    let reply = bep::control::handle_line(&line, &clients, &served_boxes);
+                    let reply = if op == "record_mint" || op == "revoke_box" {
+                        // `handle_line` keeps no record, so the stub
+                        // answers these two itself.
+                        bep::control::Reply {
+                            ok: true,
+                            kid: None,
+                            revoked: Vec::new(),
+                            error: None,
+                        }
+                    } else {
+                        bep::control::handle_line(&line, &clients, &served_boxes)
+                    };
                     if op == "register_box" {
                         // The box is stored, and the reply never comes.
                         break;
@@ -4497,4 +4893,270 @@ mod mint_tests {
             None
         );
     }
+}
+
+/// BEP-070: on a host that is not enrolled, each box creation gets a box id
+/// that the host-side creator mints outside the VM: a UUIDv7 whose timestamp
+/// comes from the clock and whose random fields come from the OS CSPRNG.
+/// The test drives the CLI's own registration against the real VM host
+/// tables and control server, and creates the box again and again under one
+/// name. Each creation gets a new id. The CLI presents no id, so the id the
+/// reply returns is the one the host's row holds. A friendly name is an
+/// alias, so a re-created box never inherits the id of its predecessor.
+#[tokio::test]
+async fn box_id_is_a_csprng_uuidv7_per_creation() {
+    use minimal_client::box_registration::{register_box_for_activation, withdraw_box_row};
+
+    const CREATIONS: usize = 8;
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is past the epoch")
+                .as_millis(),
+        )
+        .expect("the time in milliseconds fits in 64 bits")
+    }
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let sock_path = provider_dir.join("control.sock");
+    let attachments = minvmd::bep_attach::Attachments::new();
+    let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+        .feeding_proxy_attachments(attachments.clone());
+    let _server = minvmd::control::spawn(
+        sock_path.clone(),
+        registry.clone(),
+        minvmd::net::answerer::AnswererStatus::allocating_for_tests("box-id-test-node"),
+        minvmd::control::ProxyPublishStatus::default(),
+    )
+    .expect("the control server binds its socket");
+
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(CREATIONS);
+    for creation in 0..CREATIONS {
+        let before = now_ms();
+        let mut registered = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "creation {creation}: the real control server answers the registration, \
+                 after ids {ids:02x?}: {error:#}"
+            )
+        })
+        .expect("an own-address box on a VM-backed host registers");
+        let after = now_ms();
+        // Commit the lease, as an activation does once its session is
+        // active. A lease dropped uncommitted makes the host withdraw the
+        // row on its own thread, later. That late withdrawal can land
+        // while the next creation of "web" is being assigned its address,
+        // and the host then refuses that creation as withdrawn.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
+        let id = registered
+            .box_id
+            .expect("the reply returns the id the host minted for this creation");
+        let bytes = id.to_bytes();
+
+        // The host minted it: the row and the attachment that the
+        // registration published hold the id that the reply returned.
+        let row = registry
+            .table()
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration published the box's row");
+        assert_eq!(
+            row.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's row holds"
+        );
+        let attachment = attachments
+            .by_source(registered.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            attachment.box_id(),
+            bytes,
+            "creation {creation}: the CLI holds the id the host's attachment holds"
+        );
+
+        // A UUIDv7: version 7 and the RFC 9562 variant.
+        assert_eq!(
+            bytes[6] >> 4,
+            7,
+            "creation {creation}: the id is a UUIDv7, got {id}"
+        );
+        assert_eq!(
+            bytes[8] >> 6,
+            0b10,
+            "creation {creation}: the id carries the RFC 9562 variant, got {id}"
+        );
+        // Its 48-bit timestamp is the clock at the mint, not a counter.
+        // The mint can take the millisecond after the process's last mint
+        // when that is ahead of the clock, so the upper bound allows one
+        // second of lead over the clock after the registration.
+        let mut stamp = [0u8; 8];
+        stamp[2..].copy_from_slice(&bytes[..6]);
+        let stamp = u64::from_be_bytes(stamp);
+        let latest = after + 1_000;
+        assert!(
+            (before..=latest).contains(&stamp),
+            "creation {creation}: the timestamp {stamp} of id {id} is the clock at the \
+             mint, between {before} and {latest}"
+        );
+
+        ids.push(bytes);
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(registered.addresses),
+            Some(id),
+        )
+        .await;
+        assert!(
+            !attachments.holds_id(bytes),
+            "creation {creation}: the destroyed box's id is held by no attachment"
+        );
+    }
+
+    // One id per creation: no id returns under the name it was minted for.
+    let distinct: std::collections::BTreeSet<[u8; 16]> = ids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        CREATIONS,
+        "each creation under one name gets an id of its own, got {ids:02x?}"
+    );
+    // The ids sort in creation order: each mint takes a later millisecond
+    // than the one before it.
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "the ids sort in creation order, got {ids:02x?}"
+    );
+    // The random fields are random fills, never a counter: all 74 bits
+    // after the version and the variant. `rand_a` is the 12 bits after the
+    // version, and `rand_b` is the 62 bits after the variant. Eight draws of
+    // 62 random bits are all distinct, and no two consecutive draws differ
+    // by one: either chance is below 2^-55. `rand_a` holds 12 bits only, so
+    // two of eight draws match about once in 150 runs. The test asserts
+    // only that `rand_a` does not step by one on every creation, the shape
+    // a counter gives it: a chance of 2^-84 for random fills.
+    let rand_a: Vec<u16> = ids
+        .iter()
+        .map(|bytes| u16::from_be_bytes([bytes[6] & 0x0f, bytes[7]]))
+        .collect();
+    let rand_b: Vec<u64> = ids
+        .iter()
+        .map(|bytes| {
+            let mut field = [0u8; 8];
+            field.copy_from_slice(&bytes[8..16]);
+            field[0] &= 0x3f;
+            u64::from_be_bytes(field)
+        })
+        .collect();
+    let distinct_b: std::collections::BTreeSet<u64> = rand_b.iter().copied().collect();
+    assert_eq!(
+        distinct_b.len(),
+        CREATIONS,
+        "rand_b differs on every creation, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        rand_b
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x3fff_ffff_ffff_ffff != 1),
+        "rand_b is not a counter, got {rand_b:016x?} from ids {ids:02x?}"
+    );
+    assert!(
+        !rand_a
+            .windows(2)
+            .all(|pair| pair[1].wrapping_sub(pair[0]) & 0x0fff == 1),
+        "rand_a is not a counter, got {rand_a:03x?} from ids {ids:02x?}"
+    );
+}
+
+/// BEP-070: a minted box id that a retained record already names refuses
+/// the creation. This test proves the CLI half only: when the host refuses
+/// a registration for a colliding id, the CLI refuses the creation. It does
+/// not prove that the host detects a collision. The host half — the
+/// registry refuses the colliding mint before it spends an address — is
+/// `minvmd`'s `colliding_box_id_refused`, which the spec names as a second
+/// verify line. A real mint does not collide, and no public door fixes the
+/// id the host mints. So this test stands in for the host on the control
+/// socket and answers the CLI's registration with the exact refusal the
+/// host sends for a collision. The activation fails with the refusal, which
+/// names the colliding id, and no box id comes back.
+#[tokio::test]
+async fn colliding_box_id_refuses_creation() {
+    use minimal_client::box_registration::register_box_for_activation;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    let policy = boxes::BoxPolicy {
+        egress: None,
+        ingress: None,
+        credentialed_upstream: None,
+        quic443: None,
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+
+    // The id a retained record already holds, and the refusal the host's
+    // control server replies with when a mint lands on it.
+    let held = minvmd::bep_attach::mint_box_id();
+    let refusal = minvmd::box_registry::AllocationError::CollidingBoxId { id: held }.to_string();
+    let held_text = minimald_rpc::BoxId::from_bytes(held).to_string();
+    assert!(
+        refusal.contains(&held_text),
+        "the host's refusal names the colliding id {held_text}, got {refusal:?}"
+    );
+
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the CLI connects");
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the CLI sends a control request");
+        assert!(
+            matches!(request, minimald_rpc::BoxControlRequest::Register(_)),
+            "the CLI asks the host to register the box, got {request:?}"
+        );
+        let mut reply =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error { error: refusal })
+                .unwrap();
+        reply.push('\n');
+        stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+    });
+
+    let err = register_box_for_activation(
+        paths::ProviderKind::Minvmd,
+        Some(dir.path()),
+        boxes::NetworkMode::OwnIp,
+        "web",
+        &policy,
+    )
+    .await
+    .expect_err("a colliding box id refuses the creation; the box gets no id");
+    host.await.expect("the stand-in host answered");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains(&held_text),
+        "the refusal names the colliding id {held_text}, got {chain:?}"
+    );
+    assert!(
+        chain.contains("does not start"),
+        "the activation ends on the refusal, so no box is created, got {chain:?}"
+    );
 }

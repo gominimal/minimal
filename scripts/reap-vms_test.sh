@@ -95,8 +95,10 @@ run_reap
 expect_lines "bare reap sends -9, pinned to the quoted checkout" \
     "pkill -9 -f $root/.*minvmd" \
     "pkill -9 -f ^$root/[^ ]*gvproxy" \
+    "pkill -9 -f $root/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock" \
     "sudo -n pkill -9 -f $root/.*minvmd" \
-    "sudo -n pkill -9 -f ^$root/[^ ]*gvproxy"
+    "sudo -n pkill -9 -f ^$root/[^ ]*gvproxy" \
+    "sudo -n pkill -9 -f $root/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
 bare="$(sort "$log")"
 expect_matching "checkout's own minvmd is matched" 1 \
     "$checkout/target/debug/minvmd run"
@@ -112,6 +114,14 @@ expect_matching "checkout's own proxy, whose listener names gvproxy, is not take
     "$checkout/target/debug/bep serve --listener /tmp/gvproxy-bep.sock"
 expect_matching "a proxy listening under the checkout is not taken for a switch either" 0 \
     "$checkout/target/debug/bep serve --listener $checkout/.scratch/gvproxy-bep.sock"
+# #2501: this checkout's `bep serve` of every VM, and nothing else.
+provider="/home/u/.minimal/providers/local-minvmd0"
+expect_matching "checkout's own default-VM proxy is matched" 1 \
+    "$checkout/target/debug/bep serve --listener $provider/gvproxy-bep.sock --exit-on-stdin-close"
+expect_matching "checkout's own named-VM proxy is matched" 1 \
+    "$checkout/target/debug/bep serve --listener $provider/alpha/gvproxy-bep.sock --exit-on-stdin-close"
+expect_matching "another checkout's proxy is not matched" 0 \
+    "/elsewhere/target/debug/bep serve --listener $provider/gvproxy-bep.sock"
 
 # `--vm default` is the bare invocation: the default VM's processes carry no
 # `--vm` flag, so name-pinned patterns would reap nothing.
@@ -128,13 +138,26 @@ expect_lines "--vm alpha pins the checkout and the VM name" \
     "pkill -9 -f $root/.*minvmd.*--vm[= ]alpha( |\$)" \
     "sudo -n pkill -9 -f $root/.*minvmd.*--vm[= ]alpha( |\$)" \
     "pkill -9 -f ^$root/[^ ]*gvproxy.*local-minvmd[0-9]+/alpha/" \
-    "sudo -n pkill -9 -f ^$root/[^ ]*gvproxy.*local-minvmd[0-9]+/alpha/"
+    "sudo -n pkill -9 -f ^$root/[^ ]*gvproxy.*local-minvmd[0-9]+/alpha/" \
+    "pkill -9 -f $root/.*/bep serve .*local-minvmd[0-9]+/alpha/gvproxy-bep\\.sock" \
+    "sudo -n pkill -9 -f $root/.*/bep serve .*local-minvmd[0-9]+/alpha/gvproxy-bep\\.sock"
 expect_matching "--vm alpha leaves another VM of this checkout alone" 0 \
     "$checkout/target/debug/minvmd run --vm beta"
 expect_matching "--vm alpha does not take a proxy that names gvproxy for alpha's switch" 0 \
     "$checkout/target/debug/bep serve --listener /x/gvproxy-bep.sock /x/local-minvmd0/alpha/"
-expect_matching "--vm alpha does not take a proxy listening under the checkout for alpha's switch" 0 \
-    "$checkout/target/debug/bep serve --listener $checkout/.scratch/local-minvmd0/alpha/gvproxy-bep.sock"
+# A proxy listening in an alpha directory under the checkout is alpha's
+# proxy, so the proxy pattern takes it. Ask the switch pattern alone.
+under="$checkout/target/debug/bep serve --listener $checkout/.scratch/local-minvmd0/alpha/gvproxy-bep.sock"
+switch_alpha="$(grep -F 'gvproxy.*local-minvmd' "$log" | grep -v '^sudo ' | sed -e 's/^.*pkill -9 -f //')"
+if printf '%s\n' "$under" | grep -Eq -- "$switch_alpha"; then
+    bad "--vm alpha does not take a proxy listening under the checkout for alpha's switch (pattern: $switch_alpha)"
+else
+    ok "--vm alpha does not take a proxy listening under the checkout for alpha's switch"
+fi
+expect_matching "--vm alpha matches alpha's proxy" 1 \
+    "$checkout/target/debug/bep serve --listener $provider/alpha/gvproxy-bep.sock --exit-on-stdin-close"
+expect_matching "--vm alpha leaves another VM's proxy alone" 0 \
+    "$checkout/target/debug/bep serve --listener $provider/beta/gvproxy-bep.sock --exit-on-stdin-close"
 
 # A name with ERE metacharacters is quoted, not interpreted.
 run_reap --vm a.b+c
@@ -162,8 +185,10 @@ run_reap --root "$elsewhere/"
 expect_lines "--root DIR/ pins the quoted DIR in place of the checkout" \
     "pkill -9 -f $other/.*minvmd" \
     "pkill -9 -f ^$other/[^ ]*gvproxy" \
+    "pkill -9 -f $other/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock" \
     "sudo -n pkill -9 -f $other/.*minvmd" \
-    "sudo -n pkill -9 -f ^$other/[^ ]*gvproxy"
+    "sudo -n pkill -9 -f ^$other/[^ ]*gvproxy" \
+    "sudo -n pkill -9 -f $other/.*/bep serve .*local-minvmd[0-9]+/([^/]+/)?gvproxy-bep\\.sock"
 expect_matching "--root matches DIR's testbed minvmd" 1 \
     "$elsewhere/testbed/bin/minvmd run"
 expect_matching "--root matches DIR's fetched gvproxy" 1 \

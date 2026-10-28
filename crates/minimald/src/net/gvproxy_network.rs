@@ -302,14 +302,20 @@ pub(crate) async fn complete_own_ip_attach(
     // forwarders this attach goes on to build (NET-121) share one gate: a
     // revoked port's refusal on the legs is the same gate state the
     // forwarder's revocation sets.
+    // The switch's one state of the Box Egress Proxy's listener, asked over
+    // this box's control channel: a `dns` or `both` box's steered names
+    // resolve to the proxy only while the host says it listens, and fail
+    // closed otherwise (BEP-062). A native host has no one to ask, so its
+    // steered names always fail closed.
     let gate = policy
         .map(|policy| {
-            BoxGate::for_session(
+            BoxGate::for_session_steered(
                 lease_ip.to_string(),
                 lease_ip,
                 policy,
                 subnet,
                 hostname_proxy_port,
+                dns::ProxyListenerState::for_switch(&control),
             )
         })
         .map(Arc::new);

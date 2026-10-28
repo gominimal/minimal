@@ -662,7 +662,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // of a row: the hold moves with the name, so the old name no box
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
-            if record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none() {
+            if holds_name(&record) {
                 let control_sock = vm_host_control_sock(
                     daemon_provider_kind(global),
                     global.minimal_dir.as_deref(),

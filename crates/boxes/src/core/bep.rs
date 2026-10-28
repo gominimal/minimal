@@ -23,6 +23,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use client_config::store_rules::normalize_host;
+// The store rules live in `client-config` so `bep` reads them without
+// linking this crate. These paths stay for every caller.
+pub use client_config::store_rules::{
+    DENIED_HEADERS, StoreAction, StoreConsent, StoreDenySet, StoreRuleConfig, StoreRuleRefusal,
+    StoreRuleRefused, StoreRules, check_store_rules, store_consent,
+};
+
 use crate::{EgressPolicy, NetworkMode};
 
 /// The exit code of a box spec that the activation refuses.
@@ -846,301 +854,6 @@ pub fn warn_project_store_rules<'a>(keys: impl IntoIterator<Item = &'a str>) -> 
     found
 }
 
-/// The injection headers no rule can name (BEP-034), lower case. A header
-/// that starts with `proxy-` is refused too.
-pub const DENIED_HEADERS: [&str; 6] = [
-    "host",
-    ":authority",
-    "cookie",
-    "transfer-encoding",
-    "connection",
-    "upgrade",
-];
-
-/// The consent a store rule asks for before a reference is redeemed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StoreAction {
-    /// The reference is redeemed with no question.
-    Allow,
-    /// The client asks the person at the terminal.
-    Ask,
-    /// The reference is never redeemed.
-    Deny,
-}
-
-/// One `[secret-store-rules.<id>]` rule. The table key is the item's
-/// identifier in its store, and it is the name a message uses for the rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoreRuleConfig {
-    /// The store that holds the item. `None` is the host's native store.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store: Option<String>,
-    /// The upstream authorities the rule registers, each `host` or
-    /// `host:port`.
-    pub upstream: Vec<String>,
-    /// The header the value goes in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header: Option<String>,
-    /// The text before the value in [`Self::header`], such as `Bearer `.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    /// The basic authentication field the value fills: `user` or
-    /// `password`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub basic_auth: Option<String>,
-    /// The consent the rule asks for. `None` asks for none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<StoreAction>,
-}
-
-impl StoreRuleConfig {
-    /// The host part of each upstream authority, normalised.
-    fn upstream_hosts(&self) -> impl Iterator<Item = String> + '_ {
-        self.upstream
-            .iter()
-            .map(|authority| authority_host(authority))
-    }
-}
-
-/// The `[secret-store-rules]` table: rules by item identifier.
-pub type StoreRules = BTreeMap<String, StoreRuleConfig>;
-
-/// What a store rule can never name. The caller supplies the parts this
-/// crate does not own.
-#[derive(Debug, Clone, Copy)]
-pub struct StoreDenySet<'a> {
-    /// The hosts of every configured deep module, such as the GitHub set.
-    pub module_hosts: &'a [&'a str],
-    /// The domains of Minimal's own infrastructure, such as the box-internal
-    /// names and `minimal.dev`. A rule's upstream can name neither a domain
-    /// here nor a name under it. The caller passes the root's deny set, so
-    /// one list feeds the root's name constraints and this check.
-    pub infrastructure: &'a [&'a str],
-    /// The identifiers of the GitHub sign-in item, which only the GitHub
-    /// module can use.
-    pub sign_in_items: &'a [&'a str],
-}
-
-impl StoreDenySet<'_> {
-    fn is_sign_in_item(&self, id: &str) -> bool {
-        self.sign_in_items
-            .iter()
-            .any(|item| item.eq_ignore_ascii_case(id))
-    }
-}
-
-/// Why a store rule was refused when the configuration was read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StoreRuleRefusal {
-    /// BEP-034: an upstream is a deep module's host or a name under it.
-    ModuleHost {
-        /// The host, as the rule writes it.
-        host: String,
-    },
-    /// BEP-034: an upstream is Minimal's own infrastructure.
-    MinimalInfrastructure {
-        /// The host, as the rule writes it.
-        host: String,
-    },
-    /// BEP-034: the injection header is in the deny set.
-    DeniedHeader {
-        /// The header, as the rule writes it.
-        header: String,
-    },
-    /// BEP-034: the rule names the GitHub sign-in item.
-    SignInItem,
-    /// BEP-034: a field is not in the shape the deny set can judge: an
-    /// upstream that is not a plain `host` or `host:port`, a header that is
-    /// not an HTTP token, a prefix with a control character, or a
-    /// `basic_auth` other than `user` or `password`.
-    Malformed {
-        /// The field: `upstream`, `header`, `prefix` or `basic_auth`.
-        field: &'static str,
-        /// The value, as the rule writes it.
-        value: String,
-    },
-    /// The rule registers no upstream, or not exactly one injection form.
-    Incomplete,
-}
-
-/// A store rule refused when the configuration was read. The rule is left
-/// out of the rules the caller uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreRuleRefused {
-    /// The rule's name: its item identifier.
-    pub rule: String,
-    /// The configuration file that holds the rule.
-    pub file: String,
-    /// Why it was refused.
-    pub reason: StoreRuleRefusal,
-}
-
-impl StoreRuleRefused {
-    /// The requirement the refusal enforces, for the log line only.
-    #[must_use]
-    pub fn requirement(&self) -> &'static str {
-        match self.reason {
-            StoreRuleRefusal::Incomplete => "BEP-079",
-            _ => "BEP-034",
-        }
-    }
-}
-
-impl fmt::Display for StoreRuleRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { rule, file, reason } = self;
-        let named = match reason {
-            StoreRuleRefusal::ModuleHost { host }
-            | StoreRuleRefusal::MinimalInfrastructure { host } => host.clone(),
-            StoreRuleRefusal::DeniedHeader { header } => format!("the header {header}"),
-            StoreRuleRefusal::SignInItem => {
-                return write!(
-                    f,
-                    "The secret-store rule {rule} in {file} names the item that holds your \
-                     GitHub sign-in. Only GitHub grants can use that item. Remove or rename \
-                     the rule."
-                );
-            }
-            StoreRuleRefusal::Malformed { field, value } => {
-                let shape = match *field {
-                    "upstream" => "a host name or host:port",
-                    "header" => "an HTTP header name",
-                    "basic_auth" => "user or password",
-                    _ => "text without control characters",
-                };
-                return write!(
-                    f,
-                    "The secret-store rule {rule} in {file} has the {field} {value:?}, which is \
-                     not {shape}. Change the rule."
-                );
-            }
-            StoreRuleRefusal::Incomplete => {
-                return write!(
-                    f,
-                    "The secret-store rule {rule} in {file} needs at least one upstream, and \
-                     either a header or basic_auth, but not both. Change the rule."
-                );
-            }
-        };
-        // The task fixes this wording.
-        write!(
-            f,
-            "The secret-store rule {rule} in {file} names {named}, which a secret can never \
-             be sent to. Remove or change the rule."
-        )
-    }
-}
-
-/// The first reason to refuse `rule`, or `None` when it passes.
-fn store_rule_refusal(
-    id: &str,
-    rule: &StoreRuleConfig,
-    deny: StoreDenySet<'_>,
-) -> Option<StoreRuleRefusal> {
-    if deny.is_sign_in_item(id) {
-        return Some(StoreRuleRefusal::SignInItem);
-    }
-    for (written, host) in rule.upstream.iter().zip(rule.upstream_hosts()) {
-        if !is_plain_authority(written) {
-            return Some(StoreRuleRefusal::Malformed {
-                field: "upstream",
-                value: written.clone(),
-            });
-        }
-        if deny.module_hosts.iter().any(|m| is_within(&host, m)) {
-            return Some(StoreRuleRefusal::ModuleHost {
-                host: written.clone(),
-            });
-        }
-        if deny
-            .infrastructure
-            .iter()
-            .any(|domain| is_within(&host, domain))
-        {
-            return Some(StoreRuleRefusal::MinimalInfrastructure {
-                host: written.clone(),
-            });
-        }
-    }
-    if let Some(header) = &rule.header {
-        let lower = header.trim().to_ascii_lowercase();
-        if DENIED_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") {
-            return Some(StoreRuleRefusal::DeniedHeader {
-                header: header.clone(),
-            });
-        }
-        if !is_http_token(header) {
-            return Some(StoreRuleRefusal::Malformed {
-                field: "header",
-                value: header.clone(),
-            });
-        }
-    }
-    if let Some(prefix) = &rule.prefix {
-        // A header value is visible characters, spaces and tabs only.
-        if !prefix
-            .chars()
-            .all(|c| c == ' ' || c == '\t' || c.is_ascii_graphic())
-        {
-            return Some(StoreRuleRefusal::Malformed {
-                field: "prefix",
-                value: prefix.clone(),
-            });
-        }
-    }
-    if let Some(field) = &rule.basic_auth
-        && !matches!(field.as_str(), "user" | "password")
-    {
-        return Some(StoreRuleRefusal::Malformed {
-            field: "basic_auth",
-            value: field.clone(),
-        });
-    }
-    let forms = usize::from(rule.header.is_some()) + usize::from(rule.basic_auth.is_some());
-    if rule.upstream.is_empty() || forms != 1 || (rule.prefix.is_some() && rule.header.is_none()) {
-        return Some(StoreRuleRefusal::Incomplete);
-    }
-    None
-}
-
-/// Splits `rules`, read from `file`, into the rules that pass and the rules
-/// refused (BEP-034). Logs one debug line per refused rule, naming the rule
-/// and why. The caller prints each refusal for the person.
-#[must_use]
-pub fn check_store_rules(
-    rules: StoreRules,
-    file: &str,
-    deny: StoreDenySet<'_>,
-) -> (StoreRules, Vec<StoreRuleRefused>) {
-    let mut accepted = StoreRules::new();
-    let mut refused = Vec::new();
-    for (id, rule) in rules {
-        match store_rule_refusal(&id, &rule, deny) {
-            None => {
-                accepted.insert(id, rule);
-            }
-            Some(reason) => {
-                let refusal = StoreRuleRefused {
-                    rule: id,
-                    file: file.to_string(),
-                    reason,
-                };
-                tracing::debug!(
-                    rule = %refusal.rule,
-                    file,
-                    requirement = refusal.requirement(),
-                    reason = ?refusal.reason,
-                    "secret-store rule refused while reading the configuration"
-                );
-                refused.push(refusal);
-            }
-        }
-    }
-    (accepted, refused)
-}
-
 /// One store reference a box spec declares: a broker grant scope that is not
 /// a `github:` scope, written `<store>:<id>` or `<id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1193,35 +906,6 @@ pub fn store_references(secrets: &SecretGrants) -> impl Iterator<Item = StoreRef
                 .filter(|scope| !scope.starts_with("github:"))
                 .map(move |scope| StoreReference::parse(name, scope))
         })
-}
-
-/// What happens to a store reference under its rule's consent action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreConsent {
-    /// The reference is redeemed.
-    Allow,
-    /// The client asks the person at the terminal first.
-    Ask,
-    /// The reference is denied.
-    Deny,
-}
-
-/// The consent for a reference that matches `rule`. `tty` says whether the
-/// client has a terminal. With no terminal, an `ask` rule denies (BEP-035).
-#[must_use]
-pub fn store_consent(rule: &StoreRuleConfig, tty: bool) -> StoreConsent {
-    match rule.action {
-        None | Some(StoreAction::Allow) => StoreConsent::Allow,
-        Some(StoreAction::Deny) => StoreConsent::Deny,
-        Some(StoreAction::Ask) if tty => StoreConsent::Ask,
-        Some(StoreAction::Ask) => {
-            tracing::debug!(
-                rule = "BEP-035",
-                "store reference denied: its rule asks for consent and the client has no terminal"
-            );
-            StoreConsent::Deny
-        }
-    }
 }
 
 /// Every reason to refuse the store references in `secrets`, in grant name
@@ -1292,65 +976,6 @@ pub fn check_store_references(
         );
     }
     Err(ActivationRefused { refusals })
-}
-
-/// The normalised host part of an authority, `host` or `host:port`.
-fn authority_host(authority: &str) -> String {
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => authority,
-    };
-    normalize_host(host)
-}
-
-/// Whether `authority` is a plain `host` or `host:port`: a DNS name of
-/// non-empty labels of letters, digits and hyphens, and a port from 1 to
-/// 65535. Anything else (userinfo, a path, brackets, a wildcard, whitespace,
-/// an IP address) can name a host the deny set does not see, so the rule is
-/// refused. The deny set compares names, so an IP address is refused too.
-fn is_plain_authority(authority: &str) -> bool {
-    let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
-    };
-    let labels: Vec<&str> = host.strip_suffix('.').unwrap_or(host).split('.').collect();
-    let host_ok = labels.iter().all(|label| {
-        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    }) && !labels.last().is_some_and(|last| is_numeric_label(last));
-    let port_ok = port.is_none_or(|p| {
-        (1..=5).contains(&p.len())
-            && p.chars().all(|c| c.is_ascii_digit())
-            && p.parse::<u16>().is_ok_and(|n| n != 0)
-    });
-    host_ok && port_ok
-}
-
-/// Whether `label`, the last label of a host, makes the host an IPv4
-/// address as a URL parser reads it: decimal digits, or `0x` and hex digits.
-fn is_numeric_label(label: &str) -> bool {
-    let lower = label.to_ascii_lowercase();
-    match lower.strip_prefix("0x") {
-        Some(hex) => hex.chars().all(|c| c.is_ascii_hexdigit()),
-        None => lower.chars().all(|c| c.is_ascii_digit()),
-    }
-}
-
-/// Whether `name` is an HTTP header name: one or more `tchar` (RFC 9110).
-fn is_http_token(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
-}
-
-/// Whether the normalised `host` is `domain` or a name under it.
-fn is_within(host: &str, domain: &str) -> bool {
-    let domain = normalize_host(domain);
-    host == domain || host.ends_with(&format!(".{domain}"))
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -1889,7 +1514,11 @@ mod tests {
         let spec = ActivationSpec { bep: &bep, ..spec };
         let plan = check_activation(&spec, HostFacts::LOCAL, GITHUB_HOSTS).expect("accepted");
         assert!(plan.inject_ca);
-        assert!(plan.warnings.is_empty());
+        assert!(
+            plan.warnings.is_empty(),
+            "expected empty, got {:?}",
+            plan.warnings
+        );
     }
 
     /// BEP-011: a box spec that sets a trust variable keeps its value, and
@@ -2022,9 +1651,33 @@ mod tests {
         StoreDenySet {
             module_hosts: GITHUB_HOSTS,
             // The names of `bep::ca::DENY_SET`, which the client passes.
-            infrastructure: &["min.internal", "minimal.dev"],
+            infrastructure: infrastructure_deny_set(),
             sign_in_items: SIGN_IN_ITEMS,
         }
+    }
+
+    /// The names of `bep::ca::DENY_SET`, read from its source text. This
+    /// crate does not depend on `bep`, so the tests read the one definition
+    /// of the set where it lives, and a change to it reaches them.
+    fn infrastructure_deny_set() -> &'static [&'static str] {
+        static SET: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            let source = include_str!("../../../bep/src/ca.rs");
+            let start = source
+                .find("pub const DENY_SET: &[&str] = &[")
+                .expect("bep::ca defines DENY_SET");
+            let body = &source[start..];
+            let body = &body[..body.find("\n];").expect("DENY_SET ends")];
+            let names: Vec<&'static str> = body
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .filter(|line| !line.starts_with("//"))
+                .filter_map(|line| line.strip_prefix('"')?.strip_suffix("\","))
+                .collect();
+            assert!(!names.is_empty(), "DENY_SET holds no name");
+            names
+        })
     }
 
     fn rules_from(text: &str) -> StoreRules {
@@ -2107,7 +1760,8 @@ mod tests {
         assert_eq!(
             reasons["cache"],
             &StoreRuleRefusal::MinimalInfrastructure {
-                host: "cache.minimal.dev".into()
+                host: "cache.minimal.dev".into(),
+                entry: "minimal.dev".into(),
             }
         );
         for (name, header) in [
@@ -2132,7 +1786,8 @@ mod tests {
         assert_eq!(
             internal.first().map(|r| &r.reason),
             Some(&StoreRuleRefusal::MinimalInfrastructure {
-                host: "host.min.internal".into()
+                host: "host.min.internal".into(),
+                entry: "min.internal".into(),
             })
         );
         let gh = refused.iter().find(|r| r.rule == "gh").expect("gh refused");
@@ -2160,6 +1815,73 @@ mod tests {
             r.header = Some(header.into());
             let (_, refused) = check_store_rules(StoreRules::from([("x".into(), r)]), "c", deny());
             assert_eq!(refused.len(), 1, "{header} must be refused");
+        }
+    }
+
+    /// BEP-034 (#2441): a store rule that names any entry of the decided
+    /// deny set, or a name under one, is refused, and the refusal names the
+    /// entry. The names the ruling leaves allowed pass.
+    #[test]
+    fn every_deny_set_name_is_refused_as_a_store_rule() {
+        let set = infrastructure_deny_set();
+        assert_eq!(
+            set,
+            [
+                "min.internal",
+                "minimal.dev",
+                "cache.gominimal.dev",
+                "minimal.farm"
+            ]
+        );
+        for entry in set {
+            let upper = entry.to_ascii_uppercase();
+            for host in [
+                (*entry).to_owned(),
+                format!("{entry}:443"),
+                format!("{upper}."),
+                format!("api.{entry}"),
+                format!("x.y.{entry}:8443"),
+            ] {
+                let (accepted, refused) = check_store_rules(
+                    StoreRules::from([("x".into(), rule(&["example.com", &host]))]),
+                    "c",
+                    deny(),
+                );
+                assert!(accepted.is_empty(), "{host} was accepted");
+                assert_eq!(
+                    refused.first().map(|r| &r.reason),
+                    Some(&StoreRuleRefusal::MinimalInfrastructure {
+                        host: host.clone(),
+                        entry: (*entry).to_owned(),
+                    }),
+                    "{host}"
+                );
+                let text = refused[0].to_string();
+                assert!(text.to_ascii_lowercase().contains(entry), "{text}");
+            }
+        }
+        let (_, refused) = check_store_rules(
+            StoreRules::from([("cache".into(), rule(&["cache.minimal.farm"]))]),
+            "c",
+            deny(),
+        );
+        assert_eq!(
+            refused[0].to_string(),
+            "The secret-store rule cache in c names cache.minimal.farm, which is under \
+             minimal.farm. A secret can never be sent to minimal.farm or a name under it. \
+             Remove or change the rule."
+        );
+        for host in [
+            "localhost:8080",
+            "printer.local",
+            "nas.home.arpa",
+            "svc.corp.internal",
+            "notminimal.dev",
+        ] {
+            let (accepted, refused) =
+                check_store_rules(StoreRules::from([("x".into(), rule(&[host]))]), "c", deny());
+            assert!(refused.is_empty(), "{host} was refused: {refused:?}");
+            assert_eq!(accepted.len(), 1, "{host}");
         }
     }
 

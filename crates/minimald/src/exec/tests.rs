@@ -133,6 +133,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
+        box_type: None,
+        parent: None,
+        project_root: None,
         attrs: Default::default(),
     }
 }

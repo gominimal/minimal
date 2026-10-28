@@ -66,6 +66,7 @@ use crate::http::{self, CloseReason, Parse};
 use crate::listener::Delivery;
 use crate::module::Module;
 use crate::redeem;
+use crate::store::HostStore;
 
 /// The one ALPN protocol both TLS legs offer.
 pub const ALPN_HTTP11: &[u8] = b"http/1.1";
@@ -91,11 +92,44 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// days, so a reissue after one day keeps every served leaf well inside it.
 const LEAF_REUSE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The source of the store authorities that [`Admission`] asks at each
+/// CONNECT, so a changed rule decides the next tunnel without a restart.
+pub trait StoreAuthorities: Send + Sync {
+    /// The `host:port` authorities that the store rules register now.
+    fn authorities(&self) -> Vec<(String, u16)>;
+}
+
+/// The store authorities of an [`Admission`]: a fixed list, or a source.
+#[derive(Clone)]
+enum Store {
+    Fixed(Vec<(String, u16)>),
+    Source(Arc<dyn StoreAuthorities>),
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::Fixed(Vec::new())
+    }
+}
+
 /// The authorities the proxy carries requests to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct Admission {
     modules: Vec<Module>,
-    store: Vec<(String, u16)>,
+    store: Store,
+}
+
+impl fmt::Debug for Admission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let store = match &self.store {
+            Store::Fixed(store) => format!("{store:?}"),
+            Store::Source(_) => "source".to_owned(),
+        };
+        f.debug_struct("Admission")
+            .field("modules", &self.modules)
+            .field("store", &store)
+            .finish()
+    }
 }
 
 impl Admission {
@@ -109,9 +143,33 @@ impl Admission {
     {
         Self {
             modules: modules.to_vec(),
-            store: store
+            store: Store::Fixed(
+                store
+                    .into_iter()
+                    .map(|(host, port)| (normal_host(host.as_ref()), port))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The host sets of `modules`, and the store authorities that `source`
+    /// gives at each CONNECT (BEP-032).
+    #[must_use]
+    pub fn with_source(modules: &[Module], source: Arc<dyn StoreAuthorities>) -> Self {
+        Self {
+            modules: modules.to_vec(),
+            store: Store::Source(source),
+        }
+    }
+
+    /// The store authorities now, with normal hosts.
+    fn store(&self) -> Vec<(String, u16)> {
+        match &self.store {
+            Store::Fixed(store) => store.clone(),
+            Store::Source(source) => source
+                .authorities()
                 .into_iter()
-                .map(|(host, port)| (normal_host(host.as_ref()), port))
+                .map(|(host, port)| (normal_host(&host), port))
                 .collect(),
         }
     }
@@ -124,7 +182,7 @@ impl Admission {
             .iter()
             .flat_map(|module| module.hosts)
             .any(|a| a.host == host && a.port == port)
-            || self.store.iter().any(|(h, p)| *h == host && *p == port)
+            || self.store().iter().any(|(h, p)| *h == host && *p == port)
     }
 
     /// Whether `host` is a credentialed host, on any port.
@@ -135,7 +193,7 @@ impl Admission {
             .iter()
             .flat_map(|module| module.hosts)
             .any(|a| a.host == host)
-            || self.store.iter().any(|(h, _)| *h == host)
+            || self.store().iter().any(|(h, _)| *h == host)
     }
 }
 
@@ -200,9 +258,23 @@ impl Resolve for SystemResolver {
 pub trait AuditWriter: Send + Sync {
     /// Appends one record. A failure is the writer's to log.
     fn write(&self, decision: &Decision);
+
+    /// Appends one record and reports a failure to the caller, which logs
+    /// it. A writer that cannot fail keeps this default.
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.write(decision);
+        Ok(())
+    }
 }
 
 impl AuditWriter for Mutex<AuditLog> {
+    fn try_write(&self, decision: &Decision) -> io::Result<()> {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(decision)
+            .map(drop)
+    }
+
     fn write(&self, decision: &Decision) {
         let mut log = self.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(err) = log.append(decision) {
@@ -449,6 +521,8 @@ impl Proxy {
             box_id: box_id.to_owned(),
             authority: authority.to_owned(),
             identifier: None,
+            // Refused before any sealed value is read.
+            jti: String::new(),
             mapping: Mapping::ModuleUnmapped,
             outcome: Outcome::Refuse,
             marker: Some(marker.to_owned()),
@@ -631,7 +705,10 @@ impl Proxy {
             Arc::clone(&self.audit),
             Arc::clone(&self.redeemer),
             upstream.proof(),
-        );
+        )
+        // An admitted store reference reads its value from this host's
+        // store, per request (BEP-032, BEP-033).
+        .with_store(Arc::new(HostStore));
         relay(flow, boxed, upstream, IDLE_TIMEOUT).await;
         Ended::Relayed
     }

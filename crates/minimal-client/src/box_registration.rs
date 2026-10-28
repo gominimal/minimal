@@ -320,6 +320,12 @@ pub async fn register_box_with_vm_host(
                  read for {switch_address}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::ProxyListening { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the proxy-listening \
+                 read; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the name-hold \
@@ -862,6 +868,9 @@ mod tests {
             ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         }
     }

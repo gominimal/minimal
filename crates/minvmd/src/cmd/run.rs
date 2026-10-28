@@ -392,6 +392,23 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// The supervisor's box registry: it feeds the proxy attachments, compiles
+/// under the operator's deny-all opt-out, persists to `registry_file`, and
+/// sends a live box's revocation to the Box Egress Proxy control socket under
+/// the home directory (BEP-043). Only this start path sets that socket.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn supervisor_registry(
+    proxy_attachments: crate::bep_attach::Attachments,
+    egress_deny_all_opt_out: bool,
+    registry_file: std::path::PathBuf,
+) -> crate::box_registry::BoxRegistry {
+    crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
+        .feeding_proxy_attachments(proxy_attachments)
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
+        .with_proxy_control(crate::box_registry::home_proxy_control())
+        .persisting_to(registry_file)
+}
+
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
 ///
@@ -565,10 +582,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // (NET-138): a supervisor restarted under a session's live box reloads
     // its row detached, for the box to attach again or its creator to
     // resume inside the grace — never from anything the guest reports.
-    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone())
-        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
-        .persisting_to(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
+    let boxes = supervisor_registry(
+        proxy_attachments.clone(),
+        egress_deny_all_opt_out,
+        state_dir.dir().join(crate::box_registry::REGISTRY_FILE),
+    );
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -672,6 +690,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // from the host side — the same host-side argument the answerer's read
     // already makes.
     let proxy_publish = crate::control::ProxyPublishStatus::new();
+    // Whether the Box Egress Proxy listens (BEP-062): the cell the guest
+    // report door answers the in-VM daemon's proxy-listening read from.
+    // Empty until the proxy below starts, so a boot without one answers
+    // `false` and the guest's DNS gate fails steered names closed.
+    let bep_listening = crate::control::BepListening::new();
 
     // The host-side door to the box table (T66): the control socket the
     // activating client registers an own-address box on, reads its
@@ -691,6 +714,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         &boxes,
         &answerer_status,
         &proxy_publish,
+        &bep_listening,
     )?;
 
     // The guest telemetry door (TEL-034): bound only with telemetry on,
@@ -868,7 +892,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // nothing. Best-effort, like a missing gvproxy: a boot without
             // the proxy still runs boxes, without a credentialed lane.
             if !stub_enabled && cfg!(target_os = "macos") {
-                _bep_proxy = start_bep_proxy(&proxy_sock, &token);
+                _bep_proxy = start_bep_proxy(&proxy_sock, &token, &boxes);
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
@@ -876,26 +900,28 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // value (spec NET-132), named here so the two cannot drift.
             let wire = switch::bep_host::BepWire::new(proxy_sock, token)
                 .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+            // The stand-in binds before it returns, so it listens for the
+            // boot's life. The proxy listens only once its watcher sees its
+            // socket, and stops with its exit.
+            let proxy_listening = if _bep_stub.is_some() {
+                Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    true,
+                )))
+            } else {
+                _bep_proxy.as_ref().map(BepProxy::listening)
+            };
+            // The guest door answers the in-VM daemon's proxy-listening
+            // read from the same flag the delivery wiring reads (BEP-062).
+            if let Some(listening) = &proxy_listening {
+                bep_listening.attach(std::sync::Arc::clone(listening));
+            }
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
                 wire,
-                bep_box_source(
-                    // The stand-in binds before it returns, so it listens
-                    // for the boot's life. The proxy listens only once its
-                    // watcher sees its socket, and stops with its exit.
-                    if _bep_stub.is_some() {
-                        Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                            true,
-                        )))
-                    } else {
-                        _bep_proxy.as_ref().map(BepProxy::listening)
-                    },
-                    boxes.table(),
-                    proxy_attachments.clone(),
-                ),
+                bep_box_source(proxy_listening, boxes.table(), proxy_attachments.clone()),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -1400,7 +1426,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 /// the release workflow build only `minvmd`, so an installed `minvmd`
 /// finds no proxy and boots without a credentialed lane. #2498
 /// (https://github.com/gominimal/minimal/issues/2498) owns that release gap.
-const BEP_BIN_ENV: &str = "MINVMD_BEP_BIN";
+const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
 /// `min bug` collects it from the provider dir by the same name.
@@ -1430,18 +1456,39 @@ fn cap_bep_log(log: &std::path::Path, cap: u64) -> std::io::Result<()> {
     }
 }
 
+/// The flag that tells `bep serve` to stop when its standard input closes.
+/// The supervisor holds the pipe's write end, and the kernel closes it when
+/// the supervisor exits, even by SIGKILL, so a supervisor that dies without
+/// unwinding still stops its proxy. It is the one mechanism on macOS, which
+/// has no parent-death signal. On Linux it backs up `PR_SET_PDEATHSIG`
+/// ([`tie_to_parent`]). #2501
+/// (https://github.com/gominimal/minimal/issues/2501).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const BEP_LIFELINE_FLAG: &str = "--exit-on-stdin-close";
+
 /// How often the proxy's watcher looks for an exit or a stop.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The `bep` binary to start: [`BEP_BIN_ENV`] verbatim, else `bep` beside
-/// this process's own binary. `None` when no such file exists.
+/// The `bep` binary to start, by the rule that `min secret` also names in
+/// an item's access control (`bep::store::proxy_binary_path`): [`BEP_BIN_ENV`]
+/// verbatim, else `bep` beside this process's own binary. `None` when no
+/// such file exists.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn resolve_bep_binary() -> Option<std::path::PathBuf> {
-    let path = match std::env::var_os(BEP_BIN_ENV).filter(|v| !v.is_empty()) {
-        Some(path) => std::path::PathBuf::from(path),
-        None => std::env::current_exe().ok()?.with_file_name("bep"),
-    };
+    bep_binary_at(std::env::var_os(BEP_BIN_ENV).as_deref(), || {
+        std::env::current_exe().ok()
+    })
+}
+
+/// [`resolve_bep_binary`] with the variable and this process's binary
+/// given, so a test can pass both.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn bep_binary_at(
+    env: Option<&std::ffi::OsStr>,
+    exe: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let path = bep::store::proxy_binary_path(env, exe)?;
     path.is_file().then_some(path)
 }
 
@@ -1467,13 +1514,18 @@ struct BepProxy {
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl BepProxy {
-    /// Starts `binary serve --listener <listener>`, with `token` as 64 hex
-    /// digits on its standard input and its output appended to `log`.
+    /// Starts `binary serve --listener <listener> --exit-on-stdin-close`,
+    /// with `token` as 64 hex digits on its standard input and its output
+    /// appended to `log`. The standard input stays open after the token for
+    /// as long as the child is owned here: it is the supervisor's lifeline
+    /// ([`BEP_LIFELINE_FLAG`]). The watcher runs `on_listening` each time
+    /// the proxy starts to listen.
     fn spawn(
         binary: &std::path::Path,
         listener: &std::path::Path,
         token: &[u8; switch::bep_host::TOKEN_LEN],
         log: &std::path::Path,
+        on_listening: Option<OnListening>,
     ) -> std::io::Result<Self> {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
@@ -1495,6 +1547,7 @@ impl BepProxy {
             .arg("serve")
             .arg("--listener")
             .arg(listener)
+            .arg(BEP_LIFELINE_FLAG)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
@@ -1505,13 +1558,18 @@ impl BepProxy {
             line.push_str(&format!("{byte:02x}"));
         }
         line.push('\n');
-        // The proxy reads one line and closes its end. Dropping ours after
-        // the write is the end of input either way.
-        let written = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("the proxy's standard input was not piped"))
-            .and_then(|mut stdin| stdin.write_all(line.as_bytes()));
+        // The proxy reads one line, then waits for the end of its input.
+        // Our end goes back into the child, so it closes when the watcher
+        // drops the child or this process exits for any reason: a crash or
+        // SIGKILL closes it too, and the proxy stops (#2501).
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush()),
+            None => Err(std::io::Error::other(
+                "the proxy's standard input was not piped",
+            )),
+        };
         if let Err(error) = written {
             let _ = child.kill();
             let _ = child.wait();
@@ -1527,6 +1585,7 @@ impl BepProxy {
                 listener: listener.to_path_buf(),
                 stale,
                 log: log.to_path_buf(),
+                on_listening,
             };
             hand_to_watcher(child, watch, |body| {
                 std::thread::Builder::new()
@@ -1558,8 +1617,8 @@ impl BepProxy {
 /// `PR_SET_PDEATHSIG(SIGTERM)` in the child. The signal follows the thread
 /// that forks, and the supervisor's boot thread lives as long as the VM.
 /// The child exits at once when the supervisor is already gone at the
-/// `prctl`. macOS has no parent-death signal: #2501
-/// (https://github.com/gominimal/minimal/issues/2501) owns that half.
+/// `prctl`. macOS has no parent-death signal, so there the proxy's standard
+/// input is the tie: [`BEP_LIFELINE_FLAG`].
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn tie_to_parent(command: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
@@ -1609,6 +1668,30 @@ struct BepWatch {
     /// The socket at `listener` before the start, which is not the proxy's.
     stale: Option<SocketIdentity>,
     log: std::path::PathBuf,
+    /// Runs each time the proxy starts to listen.
+    on_listening: Option<OnListening>,
+}
+
+/// What the watcher runs when the proxy starts to listen.
+type OnListening = Box<dyn Fn() + Send + 'static>;
+
+/// The hook that names the boxes of `boxes` to the proxy each time it starts
+/// to listen (BEP-063, #2617), on a thread of its own so the watcher does
+/// not wait for it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn send_live_boxes_on_listening(boxes: crate::box_registry::BoxRegistry) -> OnListening {
+    Box::new(move || {
+        let boxes = boxes.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bep-live-boxes".into())
+            .spawn(move || boxes.send_live_boxes());
+        if let Err(error) = spawned {
+            tracing::warn!(
+                %error,
+                "the Box Egress Proxy did not get the live box list: its thread did not start"
+            );
+        }
+    })
 }
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
@@ -1695,6 +1778,9 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
                     .is_some_and(|identity| Some(identity) != watch.stale);
                 if bound != watch.listening.swap(bound, Ordering::SeqCst) {
                     tracing::debug!(pid, listening = bound, "box egress proxy listener");
+                    if bound && let Some(on_listening) = &watch.on_listening {
+                        on_listening();
+                    }
                 }
             }
             Err(error) => {
@@ -1719,11 +1805,13 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
 
 /// Starts this boot's proxy on `listener`, its log beside it. Logs one
 /// info line naming the socket and the pid, or one warn line naming why
-/// the boot goes on without the proxy.
+/// the boot goes on without the proxy. Once the proxy listens, it gets the
+/// box ids `boxes` holds ([`send_live_boxes_on_listening`]).
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn start_bep_proxy(
     listener: &std::path::Path,
     token: &[u8; switch::bep_host::TOKEN_LEN],
+    boxes: &crate::box_registry::BoxRegistry,
 ) -> Option<BepProxy> {
     let Some(binary) = resolve_bep_binary() else {
         tracing::warn!(
@@ -1733,7 +1821,8 @@ fn start_bep_proxy(
         return None;
     };
     let log = listener.with_file_name(BEP_LOG_FILE);
-    match BepProxy::spawn(&binary, listener, token, &log) {
+    let on_listening = send_live_boxes_on_listening(boxes.clone());
+    match BepProxy::spawn(&binary, listener, token, &log, Some(on_listening)) {
         Ok(proxy) => {
             tracing::info!(
                 pid = proxy.pid(),
@@ -2771,6 +2860,7 @@ fn bind_box_doors(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
+    bep_listening: &crate::control::BepListening,
 ) -> Result<(
     std::thread::JoinHandle<()>,
     (&'static str, std::path::PathBuf),
@@ -2789,17 +2879,21 @@ fn bind_box_doors(
             control_sock_path.display()
         )
     })?;
-    let guest_report_door =
-        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish).with_context(
-            || {
-                format!(
-                    "binding the guest report door at {}",
-                    control_sock_path
-                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
-                        .display()
-                )
-            },
-        )?;
+    let guest_report_door = guest_report_door_env(
+        control_sock_path,
+        boxes,
+        answerer,
+        proxy_publish,
+        bep_listening,
+    )
+    .with_context(|| {
+        format!(
+            "binding the guest report door at {}",
+            control_sock_path
+                .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                .display()
+        )
+    })?;
     Ok((control, guest_report_door))
 }
 
@@ -2823,12 +2917,14 @@ fn guest_report_door_env(
     boxes: &crate::box_registry::BoxRegistry,
     answerer: &crate::net::answerer::AnswererStatus,
     proxy_publish: &crate::control::ProxyPublishStatus,
+    bep_listening: &crate::control::BepListening,
 ) -> std::io::Result<(&'static str, std::path::PathBuf)> {
-    let door = crate::control::spawn_guest_reports_door(
+    let door = crate::control::spawn_guest_reports_door_with_proxy(
         control_sock_path,
         boxes.clone(),
         answerer.clone(),
         proxy_publish.clone(),
+        bep_listening.clone(),
     )?;
     Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
 }
@@ -3209,8 +3305,94 @@ fn await_publish_report(
 
 #[cfg(test)]
 mod tests {
+    // BEP-043: the daemon's start path sends a live box's revocation to the
+    // proxy's control socket under the home directory.
+    #[test]
+    fn supervisor_registry_sends_revocations_to_the_home_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = super::supervisor_registry(
+            crate::bep_attach::Attachments::new(),
+            false,
+            dir.path().join("registry.json"),
+        );
+        assert_eq!(
+            registry.proxy_control(),
+            crate::box_registry::home_proxy_control().as_deref()
+        );
+        assert!(registry.proxy_control().is_some());
+    }
+
     #[cfg(not(minvmd_libkrun))]
     use super::*;
+
+    /// BEP-051: `minvmd` starts the proxy that `min secret set` names in an
+    /// item's access control, for one `PATH` and one `MINVMD_BEP_BIN`.
+    /// `min secret` resolves through `bep::store::proxy_binary_on_path`,
+    /// which `resolve_proxy` in `crates/minimal/src/cmd/secret.rs` calls with
+    /// the process's `PATH`. `minvmd` resolves from its own `current_exe()`.
+    #[test]
+    fn minvmd_and_min_secret_resolve_the_same_proxy_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let minvmd = dir.path().join("minvmd");
+        let bep = dir.path().join("bep");
+        let other = dir.path().join("other-bep");
+        for file in [&minvmd, &bep, &other] {
+            std::fs::write(file, b"").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&minvmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bep = std::fs::canonicalize(&bep).unwrap();
+        let other = std::fs::canonicalize(&other).unwrap();
+        // The `minvmd` that autospawn starts from this PATH, with the path
+        // its own `current_exe()` gives.
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path(), dir.path()]).unwrap();
+        let started = std::fs::canonicalize(&minvmd).unwrap();
+        let exe = || Some(started.clone());
+        for env in [None, Some(""), Some(other.to_str().unwrap())] {
+            let env = env.map(std::ffi::OsStr::new);
+            let min_secret = ::bep::store::proxy_binary_on_path(env, Some(&path)).unwrap();
+            assert_eq!(super::bep_binary_at(env, exe), Some(min_secret), "{env:?}");
+        }
+        assert_eq!(super::bep_binary_at(None, exe), Some(bep.clone()));
+        assert_eq!(
+            super::bep_binary_at(Some(other.as_os_str()), exe),
+            Some(other.clone())
+        );
+
+        // PATH that reaches `minvmd` through a link: on Linux both take the
+        // `bep` beside the real `minvmd`.
+        #[cfg(target_os = "linux")]
+        {
+            let links = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&minvmd, links.path().join("minvmd")).unwrap();
+            std::fs::write(links.path().join("bep"), b"").unwrap();
+            let linked = std::env::join_paths([links.path()]).unwrap();
+            assert_eq!(
+                super::bep_binary_at(None, exe),
+                Some(::bep::store::proxy_binary_on_path(None, Some(&linked)).unwrap())
+            );
+        }
+
+        // A relative variable or a relative PATH entry names no proxy for
+        // `min secret`, so it never trusts a program the daemon cannot find.
+        assert_eq!(
+            ::bep::store::proxy_binary_on_path(Some(std::ffi::OsStr::new("bep")), Some(&path)),
+            Err(::bep::store::ProxyLookupError::RelativeEnv("bep".into()))
+        );
+        assert_eq!(
+            ::bep::store::proxy_binary_on_path(None, Some(std::ffi::OsStr::new("bin"))),
+            Err(::bep::store::ProxyLookupError::NoMinvmd)
+        );
+
+        // A path that names no file starts no proxy.
+        std::fs::remove_file(&bep).unwrap();
+        assert_eq!(super::bep_binary_at(None, exe), None);
+        assert_eq!(super::bep_binary_at(None, || None), None);
+    }
 
     #[cfg(not(minvmd_libkrun))]
     #[test]
@@ -3715,6 +3897,10 @@ mod tests {
         assert_eq!(drawn, 1, "one candidate drawn, no TCP probe applied to it");
     }
 
+    /// How many times a step that releases a port asks for it again when
+    /// another test in the process took it first (#2653).
+    const NODE_PORT_RACE_ATTEMPTS: usize = 16;
+
     #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
         // Its own reservation dir: no test takes a flock in the real one.
@@ -3737,16 +3923,24 @@ mod tests {
         // probe assigns it as asked — the case the session e2e's hardcoded
         // default proxy port depends on. Released on the wildcard the probe
         // addresses, like the hold above.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
-        assert_eq!(
-            super::assign_node_port(ports.path(), free, false)
-                .unwrap()
-                .port,
-            free,
-            "a free port is assigned as asked"
-        );
+        // Another test in the process can take the released port before the
+        // probe runs (#2653): that is a lost race, not a wrong answer, so a
+        // skipped preferred port releases a fresh one and asks again. A probe
+        // that refuses every free port still fails after the last attempt.
+        let mut handed_as_asked = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free {
+                handed_as_asked = Some(assigned);
+                break;
+            }
+        }
+        let handed_as_asked = handed_as_asked.expect("a free port is assigned as asked");
+        assert!(handed_as_asked.skipped.is_none(), "nothing skipped");
+        drop(handed_as_asked);
 
         // The supervisor assigns the proxy port and hands it to the guest:
         // whatever the host picked, it is a real port the guest can bind as
@@ -3772,11 +3966,26 @@ mod tests {
         // (T93), so pin a port this test knows is free — and the one
         // resolved port is what both the handoff and the row carry.
         let previous = std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok();
-        let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let pin = freed_pin.local_addr().unwrap().port();
-        drop(freed_pin);
-        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
-        let pinned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // The released pin has the same race as the free port above (#2653):
+        // a pin another test took fails the start, so release a fresh one and
+        // pin again.
+        let mut last_refusal = None;
+        let mut resolved = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let pin = freed_pin.local_addr().unwrap().port();
+            drop(freed_pin);
+            unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
+            match super::assign_node_proxy_port(ports.path()) {
+                Ok(pinned) => {
+                    resolved = Some((pin, pinned));
+                    break;
+                }
+                Err(error) => last_refusal = Some(error.to_string()),
+            }
+        }
+        let (pin, pinned) = resolved
+            .unwrap_or_else(|| panic!("a free pin resolves, last refusal: {last_refusal:?}"));
         assert_eq!(pinned.port, pin, "the override is the resolution");
         assert!(
             pinned.configured,
@@ -4361,9 +4570,14 @@ mod tests {
         let proxy_publish = crate::control::ProxyPublishStatus::new();
 
         // The bound half: the pair names the door's path under its env.
-        let (name, door) =
-            super::guest_report_door_env(&control_sock, &boxes, &answerer, &proxy_publish)
-                .expect("the guest report door binds beside the control socket");
+        let (name, door) = super::guest_report_door_env(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect("the guest report door binds beside the control socket");
         assert_eq!(
             name,
             crate::control::GUEST_REPORT_SOCK_ENV,
@@ -4392,7 +4606,14 @@ mod tests {
         )
         .expect("seeding the blocking file");
         assert!(
-            super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish).is_err(),
+            super::guest_report_door_env(
+                &blocked_sock,
+                &boxes,
+                &answerer,
+                &proxy_publish,
+                &Default::default()
+            )
+            .is_err(),
             "a guest-door path held by a non-socket file refuses the bind, and \
              the env the child would register it from"
         );
@@ -4412,8 +4633,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
         std::fs::write(&control_sock, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-            .expect_err("a control socket path held by a non-socket file fails the startup");
+        let error = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect_err("a control socket path held by a non-socket file fails the startup");
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!(
@@ -4427,8 +4654,14 @@ mod tests {
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
         let door = control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE);
         std::fs::write(&door, "not a socket").expect("seeding the blocking file");
-        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-            .expect_err("a guest door path held by a non-socket file fails the startup");
+        let error = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect_err("a guest door path held by a non-socket file fails the startup");
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!(
@@ -4440,9 +4673,14 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
-        let (_control, (name, door)) =
-            super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
-                .expect("both doors bind on a clear path");
+        let (_control, (name, door)) = super::bind_box_doors(
+            &control_sock,
+            &boxes,
+            &answerer,
+            &proxy_publish,
+            &Default::default(),
+        )
+        .expect("both doors bind on a clear path");
         assert_eq!(name, crate::control::GUEST_REPORT_SOCK_ENV);
         assert!(
             std::os::unix::net::UnixStream::connect(&control_sock).is_ok()
@@ -4485,7 +4723,7 @@ mod tests {
         for (i, byte) in token.iter_mut().enumerate() {
             *byte = u8::try_from(i * 7 + 1).unwrap();
         }
-        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         assert_ne!(proxy.pid(), 0);
 
         let token_file = seen.with_extension("token");
@@ -4506,7 +4744,11 @@ mod tests {
         let args = std::fs::read_to_string(seen.with_extension("args")).unwrap();
         assert_eq!(
             args.trim_end(),
-            format!("serve --listener {}", listener.display())
+            format!(
+                "serve --listener {} {}",
+                listener.display(),
+                super::BEP_LIFELINE_FLAG
+            )
         );
         assert!(!args.contains(&hex), "the token never rides in argv");
         assert!(
@@ -4572,7 +4814,7 @@ mod tests {
 
         let proxy = std::thread::spawn({
             let (bin, listener, log) = (bin.clone(), listener.clone(), log.clone());
-            move || super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn")
+            move || super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn")
         })
         .join()
         .expect("the starting thread");
@@ -4588,6 +4830,56 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         drop(proxy);
+    }
+
+    /// #2501: the proxy's standard input stays open after the token for as
+    /// long as the supervisor owns the child, and closes when it lets go.
+    /// The kernel closes the same end when the supervisor dies without
+    /// unwinding (`bep::supervisor` proves that half with a SIGKILL'd
+    /// writer), so `bep serve --exit-on-stdin-close` stops on any host.
+    #[test]
+    fn proxy_is_started_with_the_per_boot_token_and_a_lifeline_on_its_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let eof = dir.path().join("eof");
+        let bin = dir.path().join("bep");
+        // A reader in the background holds the input past the token, as
+        // `bep serve` does, and records the end of input. An asynchronous
+        // list's input is /dev/null unless redirected, hence fd 3.
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r token\n\
+                 exec 3<&0\n\
+                 ( cat <&3 >/dev/null; echo closed > '{eof}' ) &\n\
+                 exec sleep 30\n",
+                eof = eof.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let log = listener.with_file_name(super::BEP_LOG_FILE);
+        let token = [9u8; switch::bep_host::TOKEN_LEN];
+
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
+        std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
+        assert!(
+            !eof.exists(),
+            "the input stays open after the token while the supervisor lives"
+        );
+
+        drop(proxy);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !eof.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the input never closed when the supervisor let go"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// The proxy's log, appended across boots, moves aside to `bep.log.old`
@@ -4637,6 +4929,7 @@ mod tests {
             listener: dir.path().join("gvproxy-bep.sock"),
             stale: None,
             log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: None,
         };
         let error = super::hand_to_watcher(child, watch, |_body| {
             Err(std::io::Error::other("no thread for the watcher"))
@@ -4649,5 +4942,68 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "the proxy does not outlive a failed watcher start");
+    }
+
+    /// BEP-063 (#2617): when `bep serve` starts to listen, the watcher sends
+    /// the proxy's control socket one `live_boxes` line with every box id
+    /// the registry holds, so the proxy frees the keys of the boxes that
+    /// ended with no forget.
+    #[test]
+    fn proxy_gets_the_live_box_ids_when_it_starts_to_listen() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.sock");
+        let registry = crate::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        for name in ["box-a", "box-b"] {
+            registry
+                .register_client_box(crate::box_registry::ClientBoxSpec {
+                    name: name.to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the plan has a switch address to hand out");
+        }
+        let expected = registry.live_box_ids();
+        assert_eq!(expected.len(), 2);
+        let registry = registry.with_proxy_control(Some(control.clone()));
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let watch = super::BepWatch {
+            stop: std::sync::Arc::default(),
+            listening: std::sync::Arc::default(),
+            listener: listener.clone(),
+            stale: None,
+            log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: Some(super::send_live_boxes_on_listening(registry)),
+        };
+        let stop = std::sync::Arc::clone(&watch.stop);
+        let watcher =
+            super::hand_to_watcher(child, watch, |body| std::thread::Builder::new().spawn(body))
+                .expect("the watcher starts");
+
+        // The proxy binds its listener, then its control socket.
+        let _listening = std::os::unix::net::UnixListener::bind(&listener).unwrap();
+        let control = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let (stream, _) = control.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (&stream).write_all(b"{\"ok\":true}\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"op": "live_boxes", "box_ids": expected})
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.join().unwrap();
     }
 }

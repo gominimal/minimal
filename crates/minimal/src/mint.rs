@@ -19,8 +19,10 @@
 //! socket before any handle signed under it leaves this process (BEP-063).
 //! The proxy keeps the registration across its restarts. The target is one
 //! local key that a [`ClientKeyStore`] keeps. When the store refuses this
-//! program that key, [`local_client_key`] replaces it, and the mint registers
-//! the replacement before it delivers a handle.
+//! program that key, [`local_client_key`] replaces it. The proxy registers
+//! the replacement first. After the store keeps the replacement, the proxy
+//! revokes every other client key, so no handle signed under the refused
+//! key verifies again. A revoke that fails is retried at the next creation.
 //!
 //! Box creation reads that key from the host keychain
 //! ([`HostClientKeyStore`]), so every creation signs under one key and the
@@ -41,7 +43,8 @@
 //!
 //! The same control socket then registers the box with its declared egress
 //! and its address stance, so the proxy admits the box's requests to those
-//! authorities.
+//! authorities. Last, it records one `mint` record per member in the
+//! proxy's audit log, the log the proxy's decisions go to (BEP-067).
 
 use std::fmt;
 use std::io::{self, BufRead as _, BufReader, Write as _};
@@ -121,6 +124,56 @@ pub enum MintError {
     RootExpired,
     /// The client key store failed for a reason other than a refusal.
     KeyStore(String),
+    /// The proxy holds its bound of client keys, and running boxes use each
+    /// one, so it refused this client's key.
+    KeysInUse {
+        /// The proxy's bound.
+        max: usize,
+    },
+    /// The rule is read from a `min --config-dir` override, and the files
+    /// that `bep serve` reads hold no rule for the item, so it would not
+    /// redeem the handle.
+    RuleNotRead {
+        /// The rule's item identifier.
+        id: String,
+        /// The client configuration that `bep serve` reads.
+        bep_config: PathBuf,
+        /// The `--config-dir` override.
+        config_dir: PathBuf,
+    },
+    /// A configuration file that `bep serve` reads store rules from does
+    /// not read, so `bep serve` holds no store rules at all.
+    BepConfigUnread {
+        /// The rule's item identifier.
+        id: String,
+        /// The file that does not read.
+        file: PathBuf,
+        /// Why it does not read.
+        error: String,
+    },
+    /// `bep serve` refuses its own rule for the item when it reads it.
+    BepRuleRefused {
+        /// The rule's item identifier.
+        id: String,
+        /// The refusal, which names its file.
+        refusal: String,
+    },
+    /// The rules that `bep serve` reads give the item a `deny` action.
+    BepRuleDenied {
+        /// The rule's item identifier.
+        id: String,
+        /// The files that `bep serve` reads store rules from.
+        files: String,
+    },
+    /// `bep serve` holds a rule for the item in another form.
+    BepRuleDiffers {
+        /// The rule's item identifier.
+        id: String,
+        /// The files that `bep serve` reads store rules from.
+        files: String,
+        /// The rule fields that differ, as the configuration names them.
+        fields: Vec<&'static str>,
+    },
 }
 
 impl fmt::Display for MintError {
@@ -187,6 +240,49 @@ impl fmt::Display for MintError {
             Self::KeyStore(detail) => write!(
                 f,
                 "Cannot start the box: the host keychain did not give this client's signing key: {detail}."
+            ),
+            // The exact text the task fixes for a registration that the
+            // bound refuses (BEP-063).
+            Self::KeysInUse { max } => write!(
+                f,
+                "min did not create the box: the Box Egress Proxy already holds {max} client keys, \
+                 and running boxes use each one. A key is freed when the last box created under it ends."
+            ),
+            // The exact text the task fixes for a rule that `bep serve`
+            // does not read (BEP-032).
+            Self::RuleNotRead {
+                id,
+                bep_config,
+                config_dir,
+            } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                config_dir.display()
+            ),
+            Self::BepConfigUnread { id, file, error } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve cannot read {}, \
+                 so it holds no store rules. {error}",
+                file.display()
+            ),
+            Self::BepRuleRefused { id, refusal } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve refuses its rule for {id}. \
+                 {refusal}"
+            ),
+            Self::BepRuleDenied { id, files } => write!(
+                f,
+                "min did not mint a store handle for {id}: the store rules that bep serve reads \
+                 from {files} set action = \"deny\" for {id}."
+            ),
+            Self::BepRuleDiffers { id, files, fields } => write!(
+                f,
+                "min did not mint a store handle for {id}: the rule for {id} that bep serve reads \
+                 from {files} has a different {}. Give both rules the same {}.",
+                fields.join(" and "),
+                fields.join(" and ")
             ),
         }
     }
@@ -282,30 +378,173 @@ pub trait ClientKeyStore {
 /// The client's local key from `store`. A store that keeps no key gets a
 /// new one. A store that refuses this program its key gets a replacement
 /// (BEP-063): the key signs handles only, and every mint registers the key
-/// it signs under, so the replacement needs no step from the operator.
+/// it signs under, so the replacement needs no step from the operator. The
+/// proxy at [`control_path`] registers the replacement before the store
+/// keeps it, and revokes the key it replaces after the store keeps it.
 ///
 /// # Errors
 ///
 /// [`MintError::Random`] when the host gives no random bytes, and
-/// [`MintError::KeyStore`] when the store fails for another reason.
+/// [`MintError::KeyStore`] when the store fails for another reason. A
+/// replacement also fails with the control socket's errors.
 pub fn local_client_key(store: &dyn ClientKeyStore) -> Result<ClientKey, MintError> {
+    let control = control_path().unwrap_or_else(|| PathBuf::from("~/.minimal/bep/control.sock"));
+    local_client_key_at(store, &control)
+}
+
+/// [`local_client_key`], with the proxy's control socket at `control`.
+///
+/// The client cannot read the key that the store refused, so it cannot name
+/// that key to the proxy. The replacement goes to the proxy with
+/// `replace_client_key`, which revokes every other registered key. The
+/// steps go in this order:
+///
+/// 1. `register_client_key` registers the replacement and revokes nothing.
+///    A proxy that is down or refuses leaves the refused key in the store,
+///    and the next creation tries again.
+/// 2. The store keeps the replacement. A store that fails leaves every old
+///    key registered, so running boxes keep their store handles.
+/// 3. `replace_client_key` revokes every other key that no running box
+///    uses. A key that a running box uses keeps verifying until the last
+///    such box is forgotten, and then the proxy revokes it. Before this
+///    step, a pending-revoke file next to the control socket records the
+///    replacement's identifier, and the client removes the file when the
+///    revoke succeeds.
+///    A failure here leaves the replacement registered and in the store,
+///    and is logged at warn. The next creation finds the replacement in the
+///    store and the pending file under its identifier, and revokes again.
+///
+/// A lock file next to the control socket serialises the replacement and
+/// the retry across `min` processes. A creation that waited on the lock
+/// reads the store again, and uses a key that another creation kept.
+///
+/// # Errors
+///
+/// As [`local_client_key`].
+pub fn local_client_key_at(
+    store: &dyn ClientKeyStore,
+    control: &Path,
+) -> Result<ClientKey, MintError> {
     let store_error = |error| match error {
         ClientKeyError::Refused(detail) | ClientKeyError::Store(detail) => {
             MintError::KeyStore(detail)
         }
     };
-    match store.find() {
-        Ok(Some(key)) => return Ok(key),
-        Ok(None) => {}
+    let pending = pending_revoke_path(control);
+    let replacing = match store.find() {
+        Ok(Some(key)) => {
+            if !pending.exists() {
+                return Ok(key);
+            }
+            // A pending revoke is retried under the lock, against the key
+            // that the store holds then.
+            let _lock = ReplaceLock::acquire(control);
+            return match store.find() {
+                Ok(Some(key)) => {
+                    retry_pending_revoke(&key, control, &pending);
+                    Ok(key)
+                }
+                Ok(None) => Ok(key),
+                Err(error) => Err(store_error(error)),
+            };
+        }
+        Ok(None) => false,
         Err(ClientKeyError::Refused(detail)) => {
             tracing::warn!(%detail, "the keychain refused the client's signing key; replacing it");
+            true
         }
         Err(error) => return Err(store_error(error)),
+    };
+    // Two creations that both get a refusal replace the key one after the
+    // other. The second one finds the first one's replacement in the store
+    // and uses it, so the revoke never removes the key that the store keeps.
+    let _lock = replacing.then(|| ReplaceLock::acquire(control));
+    if replacing && let Ok(Some(key)) = store.find() {
+        retry_pending_revoke(&key, control, &pending);
+        return Ok(key);
     }
     let key = ClientKey::generate()?;
+    if replacing {
+        ControlClient::connect(control)?.register_client_key(&key, None)?;
+    }
+    if replacing && let Err(error) = std::fs::write(&pending, key.kid()) {
+        // Without the file, a failed revoke below is not retried.
+        tracing::warn!(path = %pending.display(), %error, "did not record the pending client key revoke");
+    }
     store.replace(&key).map_err(store_error)?;
+    if replacing {
+        revoke_others(&key, control, &pending);
+    }
     tracing::info!(kid = %key.kid(), "made a new client signing key");
     Ok(key)
+}
+
+/// An exclusive lock on the file next to the control socket at `control`.
+/// It serialises the replacement of the client's key, and the retry of a
+/// pending revoke, across `min` processes. The lock ends when it is dropped.
+struct ReplaceLock {
+    _file: Option<std::fs::File>,
+}
+
+impl ReplaceLock {
+    /// Waits for the lock. A lock file that does not open, or a lock that
+    /// fails, is logged at warn, and the caller goes on without the lock.
+    fn acquire(control: &Path) -> Self {
+        let mut name = control.as_os_str().to_owned();
+        name.push(".replace-lock");
+        let path = PathBuf::from(name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.lock().map(|()| file));
+        match file {
+            Ok(file) => Self { _file: Some(file) },
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "did not lock the client key replacement");
+                Self { _file: None }
+            }
+        }
+    }
+}
+
+/// The file next to the control socket at `control` that names a kept
+/// replacement key whose revoke of the other keys did not finish.
+fn pending_revoke_path(control: &Path) -> PathBuf {
+    let mut name = control.as_os_str().to_owned();
+    name.push(".revoke-pending");
+    PathBuf::from(name)
+}
+
+/// Revokes every client key but `key` at the proxy at `control`, when the
+/// file at `pending` names `key`. A file that names another key is stale:
+/// that key is not in the store, so the file is removed.
+fn retry_pending_revoke(key: &ClientKey, control: &Path, pending: &Path) {
+    let Ok(named) = std::fs::read_to_string(pending) else {
+        return;
+    };
+    if named.trim() == key.kid() {
+        tracing::info!(kid = %key.kid(), "retrying the revoke of the replaced client signing keys");
+        revoke_others(key, control, pending);
+    } else {
+        let _ = std::fs::remove_file(pending);
+    }
+}
+
+/// Revokes every client key but `key` at the proxy at `control`, and
+/// removes the file at `pending` when the proxy records the revoke.
+fn revoke_others(key: &ClientKey, control: &Path, pending: &Path) {
+    match ControlClient::connect(control).and_then(|mut client| client.replace_client_key(key)) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(pending);
+        }
+        Err(error) => tracing::warn!(
+            kid = %key.kid(),
+            %error,
+            "did not revoke the replaced client signing keys at the proxy; the next creation tries again"
+        ),
+    }
 }
 
 /// The keychain item that keeps the client's key: its service.
@@ -721,16 +960,26 @@ impl ControlClient {
     }
 
     /// Registers `key` with the proxy, so it verifies handles signed under
-    /// it (BEP-063).
+    /// it (BEP-063). With `box_id`, the proxy records that the box uses the
+    /// key, and keeps the key until the box is forgotten.
     ///
     /// # Errors
     ///
-    /// [`MintError::Control`] when the connection fails, and
-    /// [`MintError::Refused`] when the proxy refuses the key.
-    pub fn register_client_key(&mut self, key: &ClientKey) -> Result<(), MintError> {
+    /// [`MintError::Control`] when the connection fails,
+    /// [`MintError::KeysInUse`] when the proxy's bound is full of keys that
+    /// running boxes use, and [`MintError::Refused`] when the proxy refuses
+    /// the key for another reason.
+    pub fn register_client_key(
+        &mut self,
+        key: &ClientKey,
+        box_id: Option<&str>,
+    ) -> Result<(), MintError> {
         let kid = key.kid();
         match self.ask(
-            &Request::RegisterClientKey { key: key.public() },
+            &Request::RegisterClientKey {
+                key: key.public(),
+                box_id: box_id.map(str::to_owned),
+            },
             CLIENT_KEY,
         ) {
             Ok(_) => {
@@ -742,6 +991,39 @@ impl ControlClient {
             Err(error) => {
                 if let MintError::Refused { error: reason, .. } = &error {
                     tracing::warn!(kid, reason, "the proxy refused the client signing key");
+                    if let Some(max) = bep::control::keys_in_use_bound(reason) {
+                        return Err(MintError::KeysInUse { max });
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Registers `key` with the proxy in place of every other client key,
+    /// which the proxy revokes (BEP-063).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the key or does not
+    /// record the revocation.
+    pub fn replace_client_key(&mut self, key: &ClientKey) -> Result<(), MintError> {
+        let kid = key.kid();
+        match self.ask(&Request::ReplaceClientKey { key: key.public() }, CLIENT_KEY) {
+            Ok(reply) => {
+                for revoked in &reply.revoked {
+                    tracing::info!(kid = %revoked, replacement = %kid, "revoked the replaced client signing key at the proxy");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let MintError::Refused { error: reason, .. } = &error {
+                    tracing::warn!(
+                        kid,
+                        reason,
+                        "the proxy refused the replacement client signing key"
+                    );
                 }
                 Err(error)
             }
@@ -762,6 +1044,46 @@ impl ControlClient {
             "the box's removal",
         )?;
         tracing::debug!(box_id, "withdrew the box's declared egress from the proxy");
+        Ok(())
+    }
+
+    /// Records the mint of the member `identifier` for the box `box_id` in
+    /// the proxy's audit log (BEP-067).
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the record.
+    pub fn record_mint(&mut self, box_id: &str, identifier: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RecordMint {
+                box_id: box_id.to_owned(),
+                identifier: identifier.to_owned(),
+            },
+            "the mint record",
+        )?;
+        tracing::debug!(box_id, identifier, "recorded the mint with the proxy");
+        Ok(())
+    }
+
+    /// Revokes every sealed value that names the box `box_id`, and records
+    /// the revocation in the proxy's audit log (BEP-043, BEP-067). `minvmd`
+    /// sends this request when a live box is destroyed, and `min` never
+    /// does, so only the tests use it here.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy refuses the revocation.
+    #[cfg(test)]
+    pub(crate) fn revoke_box(&mut self, box_id: &str) -> Result<(), MintError> {
+        self.ask(
+            &Request::RevokeBox {
+                box_id: box_id.to_owned(),
+            },
+            "the box's revocation",
+        )?;
+        tracing::debug!(box_id, "revoked the box's sealed values at the proxy");
         Ok(())
     }
 
@@ -901,7 +1223,10 @@ pub struct GrantBox {
 /// since the Unix epoch.
 ///
 /// The client's key is registered last, after every other step succeeded,
-/// so a failed mint leaves no key the proxy trusts and no box uses. When
+/// so a failed mint leaves no key the proxy trusts and no box uses. After
+/// it, one `mint` record per member goes to the proxy's audit log
+/// (BEP-067). A record the proxy does not take is a warn line, and the
+/// mint stands: the box and its key are registered by then. When
 /// the key's registration fails, the box is forgotten again, so a failed
 /// mint leaves neither a key nor a box behind. The
 /// sealed values leave this process only after this function returns, so
@@ -942,6 +1267,7 @@ pub fn mint_and_register(
     let node = sealing.kid();
 
     let mut minted = Vec::with_capacity(grant_box.grants.len());
+    let mut identifiers = Vec::with_capacity(grant_box.grants.len());
     for grant in &grant_box.grants {
         let claims = sign_in_claims(
             &box_id,
@@ -952,6 +1278,7 @@ pub fn mint_and_register(
             expiry,
             handle_id()?,
         );
+        identifiers.push(claims.identifier());
         let jws = Zeroizing::new(handle::sign(&key.0, &claims));
         let context = Context {
             box_id: box_id.clone(),
@@ -999,9 +1326,21 @@ pub fn mint_and_register(
     // delivered. It goes last, so no failed step leaves it registered.
     // A failed key reply, a read timeout for one, can leave the late reply
     // on this connection, so the forget goes over a new one here too.
-    if let Err(error) = control.register_client_key(key) {
+    if let Err(error) = control.register_client_key(key, Some(&box_id)) {
         forget_on_a_new_connection(&control.path, &box_id, "its key was refused");
         return Err(error);
+    }
+    // BEP-067: one `mint` record per member, through the proxy, the log's
+    // only writer.
+    for identifier in &identifiers {
+        if let Err(error) = control.record_mint(&box_id, identifier) {
+            tracing::warn!(
+                box_id = %box_id,
+                identifier = %identifier,
+                error = %error,
+                "the proxy did not record the mint"
+            );
+        }
     }
     Ok(minted)
 }
@@ -1081,12 +1420,20 @@ impl fmt::Debug for StoreHandle {
 /// [`MintError::Identity`] when the identity has no usable sealing key or
 /// root validity, [`MintError::RootExpired`] when that validity ended, and
 /// the control socket's errors. A refused key is [`MintError::Refused`].
+/// [`MintError::RuleNotRead`], [`MintError::BepConfigUnread`],
+/// [`MintError::BepRuleRefused`], [`MintError::BepRuleDenied`] and
+/// [`MintError::BepRuleDiffers`] when `config_dir`, the `min --config-dir`
+/// override, gives a rule that `bep serve` does not hold as given.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
         reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
     )
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint, and the caller holds each one"
 )]
 pub fn mint_store_handle(
     identity: &Identity,
@@ -1095,8 +1442,18 @@ pub fn mint_store_handle(
     key: &ClientKey,
     box_id: &str,
     rule: &StoreRule,
+    config_dir: Option<&Path>,
     now: u64,
 ) -> Result<StoreHandle, MintError> {
+    if let Some(dir) = config_dir {
+        let bep_config = paths::minimal_config_dir_with_override(None).join("config.toml");
+        bep_reads_store_rule(
+            rule,
+            dir,
+            &bep_config,
+            Path::new(crate::config::ORGANIZATION_CONFIG_PATH),
+        )?;
+    }
     let box_id = box_id_hex(box_id)?;
     let node = identity
         .key(bep::keys::Role::Sealing)
@@ -1110,7 +1467,7 @@ pub fn mint_store_handle(
     let claims = store_claims(&box_id, &node, rule, now, expiry, jti.clone());
     let jws = Zeroizing::new(handle::sign(&key.0, &claims));
     // BEP-063: the key is registered before the handle leaves this process.
-    control.register_client_key(key)?;
+    control.register_client_key(key, Some(&box_id))?;
     tracing::info!(
         box_id = %box_id,
         store = %rule.store,
@@ -1121,6 +1478,108 @@ pub fn mint_store_handle(
         "minted a store handle"
     );
     Ok(StoreHandle { jws, jti, expiry })
+}
+
+/// Refuses `rule`, read under the `min --config-dir` override `config_dir`,
+/// unless `bep serve` holds the same rule (BEP-032). `bep serve` reads
+/// `bep_config` merged over `organization` and never the override, because
+/// `minvmd` starts it with no `--config-dir`. A handle under a rule that it
+/// does not hold, or holds in another form, is not redeemed as minted. Each
+/// cause has its own error, so the person edits the right file.
+fn bep_reads_store_rule(
+    rule: &StoreRule,
+    config_dir: &Path,
+    bep_config: &Path,
+    organization: &Path,
+) -> Result<(), MintError> {
+    let user = paths::minimal_config_dir_with_override(Some(config_dir)).join("config.toml");
+    if user == bep_config {
+        return Ok(());
+    }
+    let id = rule.id.clone();
+    let module_hosts = crate::config::store_module_hosts();
+    // A file that does not read gives `bep serve` no rules at all.
+    let read = boxes::client::config::read_client_store_rules(
+        bep_config,
+        organization,
+        crate::config::store_deny_set(&module_hosts),
+    )
+    .map_err(|err| MintError::BepConfigUnread {
+        id: id.clone(),
+        file: bep_config.to_owned(),
+        error: err.to_string(),
+    })?;
+    if let Some(err) = &read.organization_error {
+        return Err(MintError::BepConfigUnread {
+            id,
+            file: organization.to_owned(),
+            error: err.to_string(),
+        });
+    }
+    if let Some(refusal) = read.refused.iter().find(|r| r.rule == rule.id) {
+        return Err(MintError::BepRuleRefused {
+            id,
+            refusal: refusal.to_string(),
+        });
+    }
+    let files = if organization.exists() {
+        format!("{} and {}", bep_config.display(), organization.display())
+    } else {
+        bep_config.display().to_string()
+    };
+    let Some(held) = read.rules.get(&rule.id) else {
+        return Err(MintError::RuleNotRead {
+            id,
+            bep_config: bep_config.to_owned(),
+            config_dir: config_dir.to_owned(),
+        });
+    };
+    if held.action == Some(boxes::core::bep::StoreAction::Deny) {
+        return Err(MintError::BepRuleDenied { id, files });
+    }
+    let fields = StoreRule::from_config(&rule.id, held).map_or_else(
+        || vec!["header and basic_auth"],
+        |held| differing_fields(&held, rule),
+    );
+    if fields.is_empty() {
+        return Ok(());
+    }
+    Err(MintError::BepRuleDiffers { id, files, fields })
+}
+
+/// The configuration fields in which `held`, the rule `bep serve` holds,
+/// differs from `rule`, the rule `min` mints under.
+fn differing_fields(held: &StoreRule, rule: &StoreRule) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if held.store != rule.store {
+        fields.push("store");
+    }
+    if held.upstream != rule.upstream {
+        fields.push("upstream");
+    }
+    match (&held.inject, &rule.inject) {
+        (
+            handle::Inject::Header { name, prefix },
+            handle::Inject::Header {
+                name: other_name,
+                prefix: other_prefix,
+            },
+        ) => {
+            if name != other_name {
+                fields.push("header");
+            }
+            if prefix != other_prefix {
+                fields.push("prefix");
+            }
+        }
+        (handle::Inject::BasicAuth { field }, handle::Inject::BasicAuth { field: other }) => {
+            if field != other {
+                fields.push("basic_auth");
+            }
+        }
+        _ => fields.push("header and basic_auth"),
+    }
+    fields
 }
 
 /// Tells the proxy at `path` to forget `box_id` over a new connection, so
@@ -1144,12 +1603,13 @@ fn forget_on_a_new_connection(path: &Path, box_id: &str, after: &str) {
 /// behind (BEP-003).
 ///
 /// The client's key stays registered: the control socket has no request
-/// that withdraws a key. The client keeps that key for its next mint.
+/// that withdraws a key. The forget ends the box's use of the key, and the
+/// client keeps that key for its next mint.
 ///
 /// The forget runs only on a failed creation. A Ctrl-C ends the process
 /// in `std::process::exit`, which runs no destructor, so it leaves the box
-/// at the proxy until the box's destroy forgets it
-/// (https://github.com/gominimal/minimal/issues/2277). Inside a
+/// at the proxy until the box's destroy forgets it: `minvmd` revokes and
+/// forgets a live box when it withdraws the box's row. Inside a
 /// tokio runtime it runs on a blocking thread, so it never holds up a
 /// runtime worker. It waits at most [`FORGET_TIMEOUT`] for each read and
 /// write.
@@ -1200,8 +1660,8 @@ impl Drop for ProxyRegistration {
         match tokio::runtime::Handle::try_current() {
             // The runtime waits for its blocking threads before it shuts
             // down, so a runtime shutdown does not lose the forget. A
-            // Ctrl-C exits the process with no drop, and #2277 forgets
-            // that box at its destroy.
+            // Ctrl-C exits the process with no drop, and the box's
+            // destroy forgets that box.
             Ok(runtime) => drop(runtime.spawn_blocking(forget)),
             Err(_) => forget(),
         }
@@ -1257,17 +1717,17 @@ mod tests {
         }
     }
 
-    /// A key store that refuses its key once, as a keychain does to a
-    /// rebuilt program, and keeps the replacement.
+    /// A key store that refuses its key until it keeps a replacement, as a
+    /// keychain does to a rebuilt program.
     #[derive(Default)]
     struct RefusingOnce {
-        refused: RefCell<bool>,
+        replaced: RefCell<bool>,
         kept: RefCell<Option<[u8; 32]>>,
     }
 
     impl ClientKeyStore for RefusingOnce {
         fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
-            if !self.refused.replace(true) {
+            if !*self.replaced.borrow() {
                 return Err(ClientKeyError::Refused("not this program".into()));
             }
             Ok(self.kept.borrow().and_then(|b| ClientKey::from_secret(&b)))
@@ -1275,6 +1735,7 @@ mod tests {
 
         fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
             *self.kept.borrow_mut() = Some(*key.secret());
+            *self.replaced.borrow_mut() = true;
             Ok(())
         }
     }
@@ -1327,14 +1788,14 @@ mod tests {
             .unwrap();
         runtime.spawn(control.run());
 
-        // A keychain that refuses the key gets a replacement, kept for the
-        // next mint.
+        // A keychain that refuses the key gets a replacement, registered at
+        // the proxy and kept for the next mint.
         let store = RefusingOnce::default();
-        let key = local_client_key(&store).unwrap();
-        assert_eq!(local_client_key(&store).unwrap().kid(), key.kid());
-        assert!(!clients.read().unwrap().contains(&key.kid()));
+        let key = local_client_key_at(&store, &path).unwrap();
+        assert_eq!(local_client_key_at(&store, &path).unwrap().kid(), key.kid());
+        assert!(clients.read().unwrap().contains(&key.kid()));
         // A locked keychain is not a refusal: no key is replaced.
-        let err = local_client_key(&Locked).unwrap_err();
+        let err = local_client_key_at(&Locked, &path).unwrap_err();
         assert!(matches!(err, MintError::KeyStore(_)), "{err}");
 
         let (sealing, identity) = proxy_identity(ROOT_END);
@@ -1347,6 +1808,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1380,6 +1842,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1395,6 +1858,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1416,6 +1880,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1493,6 +1958,7 @@ mod tests {
             .unwrap()
             .lines()
             .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_whitespace().next())
             .map(str::to_owned)
             .collect()
     }
@@ -1505,7 +1971,7 @@ mod tests {
         path: &Path,
         box_id: &str,
     ) -> Result<(ClientKey, Vec<Minted>), MintError> {
-        let key = local_client_key(store)?;
+        let key = local_client_key_at(store, path)?;
         let mut control = ControlClient::connect(path)?;
         let minted = mint_and_register(
             &signed_in(),
@@ -1596,10 +2062,10 @@ mod tests {
         let old = ClientKey::generate().unwrap();
         ControlClient::connect(&path)
             .unwrap()
-            .register_client_key(&old)
+            .register_client_key(&old, None)
             .unwrap();
         let store = RefusingOnce {
-            refused: RefCell::new(false),
+            replaced: RefCell::new(false),
             kept: RefCell::new(Some(*old.secret())),
         };
 
@@ -1607,13 +2073,10 @@ mod tests {
         assert_eq!(minted.len(), 1);
         assert_ne!(replacement.kid(), old.kid());
         // The replacement is registered by the time the sealed value leaves
-        // the mint, and the old key still verifies the handles under it.
+        // the mint, and the proxy revoked the old key.
         assert!(clients.read().unwrap().contains(&replacement.kid()));
-        assert!(clients.read().unwrap().contains(&old.kid()));
-        assert_eq!(
-            kept_registrations(&path),
-            vec![old.public(), replacement.public()]
-        );
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert_eq!(kept_registrations(&path), vec![replacement.public()]);
         // The keychain keeps the replacement for the next creation.
         assert_eq!(local_client_key(&store).unwrap().kid(), replacement.kid());
 
@@ -1622,5 +2085,447 @@ mod tests {
         serve_refusing(&refusing);
         let err = create(&store, &identity, &refusing, BOX_ID).unwrap_err();
         assert!(matches!(err, MintError::Refused { .. }), "{err}");
+    }
+
+    // BEP-063: a key the keychain refuses is replaced, and the proxy keeps
+    // the old key verifying the store handles and sign-in references of the
+    // boxes created under it until those boxes end, after a restart too
+    // (the ruling on gominimal/arch#144). The forget of the last such box
+    // revokes the old key. A proxy that refuses the replacement leaves the
+    // store as it was, so the next creation tries again.
+    #[test]
+    fn a_replaced_client_key_keeps_verifying_until_its_boxes_end() {
+        const SIGNED_IN_BOX: &str = "0192f0c1-7a2b-7c3d-8e4f-a0b1c2d3e4f6";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_, identity) = proxy_identity(ROOT_END);
+        let identity_path = Path::new("identity.json");
+        let old = ClientKey::generate().unwrap();
+        let mint = |key: &ClientKey| {
+            let mut control = ControlClient::connect(&path).unwrap();
+            let minted = mint_store_handle(
+                &identity,
+                identity_path,
+                &mut control,
+                key,
+                BOX_ID,
+                &rule(),
+                None,
+                NOW,
+            )
+            .unwrap();
+            minted.jws.to_string()
+        };
+        let verifies = |clients: &Registry, jws: &str| {
+            bep::handle::verify(jws, &clients.read().unwrap()).is_ok()
+        };
+        let holds =
+            |clients: &Registry, key: &ClientKey| clients.read().unwrap().contains(&key.kid());
+
+        let (runtime, clients) = serve_control(&path);
+        // One box holds a store handle under the old key, and another a
+        // sign-in reference.
+        let before = mint(&old);
+        assert!(verifies(&clients, &before));
+        let kept = Kept::default();
+        kept.replace(&old).unwrap();
+        let (signed, _) = create(&kept, &identity, &path, SIGNED_IN_BOX).unwrap();
+        assert_eq!(signed.kid(), old.kid());
+
+        let store = RefusingOnce {
+            replaced: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let replacement = local_client_key_at(&store, &path).unwrap();
+        assert_ne!(replacement.kid(), old.kid());
+        assert!(holds(&clients, &replacement));
+        // The replacement finished, and the old key still verifies.
+        assert!(!pending_revoke_path(&path).exists());
+        assert!(verifies(&clients, &before));
+        assert!(holds(&clients, &old));
+        drop(runtime);
+
+        let (runtime, clients) = serve_control(&path);
+        assert!(verifies(&clients, &before));
+        assert!(holds(&clients, &replacement));
+
+        // The store handle's box ends. The sign-in reference's box runs on,
+        // so the old key stays.
+        ControlClient::connect(&path)
+            .unwrap()
+            .forget_box(BOX_HEX)
+            .unwrap();
+        assert!(verifies(&clients, &before));
+        // The last box ends, and the old key no longer verifies.
+        ControlClient::connect(&path)
+            .unwrap()
+            .forget_box(&box_id_hex(SIGNED_IN_BOX).unwrap())
+            .unwrap();
+        assert!(!verifies(&clients, &before));
+        assert!(!holds(&clients, &old));
+        assert!(holds(&clients, &replacement));
+        assert_eq!(kept_registrations(&path), vec![replacement.public()]);
+        drop(runtime);
+
+        let (_restarted, clients) = serve_control(&path);
+        assert!(!verifies(&clients, &before));
+        assert!(holds(&clients, &replacement));
+
+        let refusing = dir.path().join("refusing.sock");
+        serve_refusing(&refusing);
+        let store = RefusingOnce {
+            replaced: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let err = local_client_key_at(&store, &refusing).unwrap_err();
+        assert!(matches!(err, MintError::Refused { .. }), "{err}");
+        assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+    }
+
+    // BEP-063: when running boxes use every key the proxy holds, a
+    // replacement is refused, the creation fails with text that says why,
+    // and the store keeps the key it had.
+    #[test]
+    fn a_replacement_past_a_bound_of_keys_in_use_fails_the_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let mut control = ControlClient::connect(&path).unwrap();
+        for n in 0..bep::control::KeyBound::DEFAULT_MAX_KEYS {
+            let key = ClientKey::generate().unwrap();
+            control
+                .register_client_key(&key, Some(&format!("{n:032x}")))
+                .unwrap();
+        }
+        let old = ClientKey::generate().unwrap();
+        let store = RefusingOnce {
+            replaced: RefCell::new(false),
+            kept: RefCell::new(Some(*old.secret())),
+        };
+        let err = local_client_key_at(&store, &path).unwrap_err();
+        assert!(matches!(err, MintError::KeysInUse { max: 16 }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "min did not create the box: the Box Egress Proxy already holds 16 client keys, \
+             and running boxes use each one. A key is freed when the last box created under it ends."
+        );
+        assert_eq!(*store.kept.borrow(), Some(*old.secret()));
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert_eq!(
+            kept_registrations(&path).len(),
+            bep::control::KeyBound::DEFAULT_MAX_KEYS
+        );
+    }
+
+    /// A key store that refuses its key once, and that removes the proxy's
+    /// control socket when it keeps the replacement, so the revoke after
+    /// it does not reach the proxy.
+    struct RefusingThenUnlinking {
+        inner: RefusingOnce,
+        socket: PathBuf,
+    }
+
+    impl ClientKeyStore for RefusingThenUnlinking {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            self.inner.find()
+        }
+
+        fn replace(&self, key: &ClientKey) -> Result<(), ClientKeyError> {
+            std::fs::remove_file(&self.socket).unwrap();
+            self.inner.replace(key)
+        }
+    }
+
+    // BEP-063: a revoke that fails after the store keeps the replacement is
+    // retried at the next creation, so the replaced key does not stay
+    // registered.
+    #[test]
+    fn a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (runtime, _) = serve_control(&path);
+        let old = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&old, None)
+            .unwrap();
+        let store = RefusingThenUnlinking {
+            inner: RefusingOnce {
+                replaced: RefCell::new(false),
+                kept: RefCell::new(Some(*old.secret())),
+            },
+            socket: path.clone(),
+        };
+
+        let replacement = local_client_key_at(&store, &path).unwrap();
+        drop(runtime);
+        let pending = pending_revoke_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&pending).unwrap(),
+            replacement.kid()
+        );
+
+        let (_restarted, clients) = serve_control(&path);
+        assert!(clients.read().unwrap().contains(&old.kid()));
+        let found = local_client_key_at(&store.inner, &path).unwrap();
+        assert_eq!(found.kid(), replacement.kid());
+        assert!(!clients.read().unwrap().contains(&old.kid()));
+        assert!(clients.read().unwrap().contains(&replacement.kid()));
+        assert!(!pending.exists());
+    }
+
+    /// A key store that refuses its key once. Then it gives `other`, as a
+    /// keychain does after another creation kept its replacement.
+    struct ReplacedMeanwhile {
+        found: RefCell<bool>,
+        other: [u8; 32],
+    }
+
+    impl ClientKeyStore for ReplacedMeanwhile {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            if !self.found.replace(true) {
+                return Err(ClientKeyError::Refused("not this program".into()));
+            }
+            Ok(ClientKey::from_secret(&self.other))
+        }
+
+        fn replace(&self, _: &ClientKey) -> Result<(), ClientKeyError> {
+            panic!("a creation replaced a key that another creation kept");
+        }
+    }
+
+    // BEP-063: a creation that gets a refusal after another creation kept a
+    // replacement uses that replacement, and revokes no key the store keeps.
+    #[test]
+    fn a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let other = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&other, None)
+            .unwrap();
+        let store = ReplacedMeanwhile {
+            found: RefCell::new(false),
+            other: *other.secret(),
+        };
+
+        let key = local_client_key_at(&store, &path).unwrap();
+        assert_eq!(key.kid(), other.kid());
+        assert!(clients.read().unwrap().contains(&other.kid()));
+        assert_eq!(kept_registrations(&path), vec![other.public()]);
+    }
+
+    /// A key store that refuses its key, and then fails to keep the
+    /// replacement, as a keychain that locks between the two steps does.
+    struct RefusingThenFailing;
+
+    impl ClientKeyStore for RefusingThenFailing {
+        fn find(&self) -> Result<Option<ClientKey>, ClientKeyError> {
+            Err(ClientKeyError::Refused("not this program".into()))
+        }
+
+        fn replace(&self, _: &ClientKey) -> Result<(), ClientKeyError> {
+            Err(ClientKeyError::Store("locked".into()))
+        }
+    }
+
+    // BEP-063: a replacement that the store does not keep revokes no key at
+    // the proxy, so running boxes keep their store handles.
+    #[test]
+    fn a_replacement_the_store_does_not_keep_revokes_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/control.sock");
+        let (_runtime, clients) = serve_control(&path);
+        let old = ClientKey::generate().unwrap();
+        ControlClient::connect(&path)
+            .unwrap()
+            .register_client_key(&old, None)
+            .unwrap();
+
+        let err = local_client_key_at(&RefusingThenFailing, &path).unwrap_err();
+        assert!(matches!(err, MintError::KeyStore(_)), "{err}");
+        assert!(clients.read().unwrap().contains(&old.kid()));
+    }
+
+    // BEP-032: `bep serve` reads the default config dir only, so a store
+    // handle under a rule from a `--config-dir` override is minted only when
+    // `bep serve` holds the same rule, and refused with the reason otherwise.
+    #[test]
+    fn a_store_rule_under_config_dir_is_minted_only_when_bep_reads_it() {
+        const NPM: &str = "[secret-store-rules.npm-token]\n\
+                           upstream = [\"registry.npmjs.org\"]\n\
+                           header = \"Authorization\"\n\
+                           prefix = \"Bearer \"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let bep_config = dir.path().join("default/minimal/config.toml");
+        let organization = dir.path().join("etc/config.toml");
+        let over = dir.path().join("over");
+        std::fs::create_dir_all(over.join("minimal")).unwrap();
+        std::fs::write(over.join("minimal/config.toml"), NPM).unwrap();
+        let check = || bep_reads_store_rule(&rule(), &over, &bep_config, &organization);
+
+        // The rule exists only below the override: refused, with the reason.
+        let err = check().unwrap_err();
+        assert!(matches!(err, MintError::RuleNotRead { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                over.display()
+            )
+        );
+
+        // `bep serve` holds the rule in another form: refused.
+        std::fs::create_dir_all(bep_config.parent().unwrap()).unwrap();
+        std::fs::write(&bep_config, NPM.replace("Bearer ", "Token ")).unwrap();
+        assert!(matches!(check(), Err(MintError::BepRuleDiffers { .. })));
+
+        // `bep serve` holds the same rule: minted.
+        std::fs::write(&bep_config, NPM).unwrap();
+        check().unwrap();
+
+        // An override that names the default config dir is what `bep serve`
+        // reads, whatever the file holds.
+        std::fs::write(&bep_config, "").unwrap();
+        bep_reads_store_rule(
+            &rule(),
+            &dir.path().join("default"),
+            &bep_config,
+            &organization,
+        )
+        .unwrap();
+    }
+
+    /// The checked rule `npm-token` under an override, and the paths of the
+    /// files that `bep serve` reads, all below `dir`.
+    fn bep_files(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        const NPM: &str = "[secret-store-rules.npm-token]\n\
+                           upstream = [\"registry.npmjs.org\"]\n\
+                           header = \"Authorization\"\n\
+                           prefix = \"Bearer \"\n";
+        let bep_config = dir.join("default/minimal/config.toml");
+        let organization = dir.join("etc/config.toml");
+        let over = dir.join("over");
+        std::fs::create_dir_all(over.join("minimal")).unwrap();
+        std::fs::write(over.join("minimal/config.toml"), NPM).unwrap();
+        std::fs::create_dir_all(bep_config.parent().unwrap()).unwrap();
+        (bep_config, organization, over)
+    }
+
+    // BEP-032: a rule that differs in `bep serve`'s file names that file and
+    // each field that differs, not the override.
+    #[test]
+    fn a_rule_that_differs_for_bep_names_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"npm.example.com\"]\n\
+             header = \"Authorization\"\n\
+             prefix = \"Token \"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: the rule for npm-token that bep \
+                 serve reads from {} has a different upstream and prefix. Give both rules the \
+                 same upstream and prefix.",
+                bep_config.display()
+            )
+        );
+    }
+
+    // BEP-032: a `deny` rule in `bep serve`'s file is named as a deny.
+    #[test]
+    fn a_rule_that_bep_denies_says_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"registry.npmjs.org\"]\n\
+             header = \"Authorization\"\n\
+             prefix = \"Bearer \"\n\
+             action = \"deny\"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        assert!(matches!(err, MintError::BepRuleDenied { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: the store rules that bep serve \
+                 reads from {} set action = \"deny\" for npm-token.",
+                bep_config.display()
+            )
+        );
+    }
+
+    // BEP-032: a file that `bep serve` cannot read is named, with why.
+    #[test]
+    fn a_bep_config_that_does_not_read_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(&bep_config, "not toml [").unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepConfigUnread { file, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(file, &bep_config);
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "min did not mint a store handle for npm-token: bep serve cannot read {}, \
+                 so it holds no store rules. ",
+                bep_config.display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("--config-dir"), "{text}");
+
+        // An organization file that does not read is named in its place.
+        std::fs::write(&bep_config, "").unwrap();
+        std::fs::create_dir_all(organization.parent().unwrap()).unwrap();
+        std::fs::write(&organization, "not toml [").unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepConfigUnread { file, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(file, &organization);
+    }
+
+    // BEP-032: a rule that `bep serve` refuses when it reads it gives the
+    // refusal, which names the file.
+    #[test]
+    fn a_rule_that_bep_refuses_gives_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"github.com\"]\n\
+             header = \"Authorization\"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepRuleRefused { refusal, .. } = &err else {
+            panic!("{err}");
+        };
+        assert!(
+            refusal.contains(&bep_config.display().to_string()),
+            "{refusal}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("min did not mint a store handle for npm-token: bep serve refuses its rule for npm-token. "),
+            "{err}"
+        );
     }
 }

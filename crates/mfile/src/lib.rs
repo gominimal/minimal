@@ -14,6 +14,7 @@ mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
 pub use project_composable::ProjectComposable;
+pub mod spec;
 mod tasks;
 use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};
@@ -672,12 +673,11 @@ impl TryFrom<OutputRaw> for Output {
         let ty = raw.ty.as_deref().unwrap_or("oci-image");
         let kind = match ty {
             "oci-image" => {
-                for (field, set) in [("path", !raw.path.is_empty())] {
-                    if set {
-                        return Err(format!(
-                            "field `{field}` is not valid for outputs with type = \"oci-image\""
-                        ));
-                    }
+                if !raw.path.is_empty() {
+                    return Err(
+                        "field `path` is not valid for outputs with type = \"oci-image\""
+                            .to_string(),
+                    );
                 }
 
                 OutputKind::OciImage {
