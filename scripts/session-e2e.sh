@@ -16871,16 +16871,36 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   else
     echo "relay-side warn line skipped (guest-side daemon log on VM lane — its count and fields are pinned by the native switch test)"
   fi
-  # What this host CAN observe is the consequence of a first-gate refusal:
-  # the frame never crossed the switch, so the VM host's gate never saw it
-  # and minvmd's log says nothing about it. That silence is the pin — a
-  # proxy-lane line in the host gate's log would mean the frame reached the
-  # host, the exception the relay no longer makes. The control above was
-  # reset through the same fabric, so the box and its path are live, and
-  # the absence below is the drop, not a dead fabric.
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # What this host CAN observe is the consequence of a first-gate refusal.
+  # The frame never crossed the switch, so the VM host's gate never saw it
+  # and minvmd never logs the gate's own drop line (its `rule_matched` field)
+  # for it. That silence is the pin: a gate drop line would mean the frame
+  # reached the host, the exception the relay no longer makes. The relay now
+  # reports its refusal over the guest door, so the host does see the relay's
+  # audit record, which minvmd::control logs with a `rule` field, never
+  # `rule_matched`. Its presence proves the relay refused and reported the
+  # frame. The control above was reset through the same fabric, so the box
+  # and its path are live, and the gate's silence is the drop, not a dead
+  # fabric.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the no-lane box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-cred-nolane"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-cred-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
 
