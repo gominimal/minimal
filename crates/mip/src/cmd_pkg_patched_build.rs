@@ -40,6 +40,9 @@ pub async fn cmd_pkg_patched_build(
         stdout_writer: Some(Box::new(common::TracingWriter::stdout())),
         stderr_writer: Some(Box::new(common::TracingWriter::stderr())),
         remote_cache: remote_cache.as_ref(),
+        // NET-155: a command-line patched build runs for no box, so it
+        // stays the caller's own traffic.
+        classifier_leaf: None,
     }
     .run(&op::Options {
         cache,
