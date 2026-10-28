@@ -3145,12 +3145,15 @@ async fn absent_range_publishes_interim_and_readvises() {
 
 /// NET-123 on a VM-backed daemon, after `min finalize-install`: the
 /// create handler asks the forwarder's walk of the host's loopback, not the
-/// guest's own `lo`. While the landed verdict is absent each session start
-/// walks again. The walk after the host gains the range lands present: the
+/// guest's own `lo`. Each session start walks again, whatever verdict
+/// landed last. The walk after the host gains the range lands present: the
 /// box standing at the `127.0.0.1` interim moves onto a range address, the
 /// new box's grant comes from the range, and its reply clears the interim
-/// flag. A present verdict is not walked again. The stand-in walk stands in
-/// for the host forwarder, which a harness daemon does not have.
+/// flag. A present verdict is walked again too. When the range goes away
+/// under the running VM, the next walk lands absent: the reply carries the
+/// interim flag and the earlier box moves back to `127.0.0.1`. The stand-in
+/// walk stands in for the host forwarder, which a harness daemon does not
+/// have.
 #[allow(clippy::await_holding_lock)]
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -3275,7 +3278,8 @@ async fn session_start_rewalks_range_after_finalize_install() {
         "the move is logged with the session id and both addresses"
     );
 
-    // A present verdict is not walked again.
+    // A present verdict is walked again: the range can go away under a
+    // running VM, so every session start bind-probes it.
     let later = client
         .call::<CreateSession>(&req("later", "/uwu"))
         .await
@@ -3284,10 +3288,49 @@ async fn session_start_rewalks_range_after_finalize_install() {
     assert!(!later.interim_loopback);
     assert_eq!(
         walks.load(Ordering::SeqCst),
-        2,
-        "a present verdict needs no walk"
+        3,
+        "a present verdict is walked again at the next session start"
     );
-    assert!(probe_line(&log.contents(), &later.id).contains("walked=false"));
+    let line = probe_line(&log.contents(), &later.id);
+    assert!(
+        line.contains("walked=true") && line.contains("surface=reserved-range"),
+        "the session start walked the range and found it present: {line}"
+    );
+
+    // The range goes away under the running VM.
+    installed.store(false, Ordering::SeqCst);
+    let gone = client
+        .call::<CreateSession>(&req("range-gone", "/uwu"))
+        .await
+        .ok()
+        .expect("an absent range must not refuse the session");
+    assert!(
+        gone.interim_loopback,
+        "the walk found the range absent after a present landing, so the \
+         reply carries the interim"
+    );
+    assert_eq!(walks.load(Ordering::SeqCst), 4);
+    let line = probe_line(&log.contents(), &gone.id);
+    assert!(
+        line.contains("walked=true") && line.contains("surface=127.0.0.1-interim"),
+        "the line names the interim as the surface picked: {line}"
+    );
+    assert_eq!(
+        mngr.hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(before.id),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the absent landing moves the earlier box off its range address onto the interim"
+    );
+    assert!(
+        log.contents().lines().any(|line| {
+            line.contains("loopback-range-absent-box")
+                && line.contains(&format!("session_id={}", before.id))
+                && line.contains(&format!("from={moved}"))
+        }),
+        "the move back to the interim is logged with the session id and both addresses"
+    );
 }
 
 /// NET-018: once the answerer is serving beside the proxy, the replies

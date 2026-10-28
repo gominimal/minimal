@@ -650,10 +650,11 @@ impl BoxManager {
                 // publishes, and releases a grant drawn for a box whose
                 // publish is gone.
                 //
-                // The same walk runs again at each session start while the
-                // landed verdict is not present ([`RangeWalk::session_start`]),
-                // so a host that gains the range after this daemon started
-                // publishes its next box in the range. The walk lets one walk
+                // The same walk runs again at each session start
+                // ([`RangeWalk::session_start`]), so a host that gains the
+                // range after this daemon started publishes its next box in
+                // the range, and a host that loses it moves its boxes to the
+                // interim. The walk lets one walk
                 // run at a time, so the session-start walk never overlaps
                 // this one on the forwarder.
                 let walk = Arc::new(RangeWalk::new(
@@ -767,12 +768,11 @@ pub(crate) enum RangeWalkSource {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub(crate) struct RangeWalkAnswer {
-    /// The probe the verdict rests on: this walk's, or the last walk's when
-    /// no new walk ran.
+    /// The probe the verdict rests on: this walk's, or the concurrent
+    /// walk's when this call took that walk's answer.
     pub(crate) probe: crate::net::loopback::RangeProbe,
-    /// Whether this session start walked the range. `false` when the
-    /// verdict was already present, or when a walk that ended while this
-    /// one waited for its turn gave the answer.
+    /// Whether this session start walked the range. `false` only when a
+    /// walk that ended while this one waited for its turn gave the answer.
     pub(crate) walked: bool,
     /// How many boxes the landing moved off the `127.0.0.1` interim onto
     /// their range addresses.
@@ -829,14 +829,6 @@ impl RangeWalk {
             walks: std::sync::atomic::AtomicU64::new(0),
             last: Mutex::new(None),
         }
-    }
-
-    /// Whether the landed verdict is present: the book vouches for an
-    /// address of the range only under a present verdict.
-    fn range_present(&self) -> bool {
-        ::switch::loopback::range_hosts()
-            .next()
-            .is_some_and(|address| self.book.vouches_for(address))
     }
 
     /// Asks the source to bind the whole range once.
@@ -929,11 +921,13 @@ impl RangeWalk {
         *last = Some(probe);
     }
 
-    /// The session-start walk: walks the range again while the landed
-    /// verdict is not present, and lands what it finds. A present verdict
-    /// is never walked again, because the boot step that applies the range
-    /// keeps it present. A walk that ended while this call waited for its
-    /// turn gives this call its answer.
+    /// The session-start walk: walks the range again at every session
+    /// start, whatever verdict landed last, and lands what it finds. The
+    /// range can go away under a running VM, so a present verdict is
+    /// bind-probed again too: a present-to-absent walk lands the absent
+    /// arm, which moves every box in the range onto the `127.0.0.1`
+    /// interim. A walk that ended while this call waited for its turn gives
+    /// this call its answer.
     pub(crate) async fn session_start(&self) -> RangeWalkAnswer {
         let seen = self.walks.load(std::sync::atomic::Ordering::Acquire);
         let mut last = self.last.lock().await;
@@ -941,26 +935,6 @@ impl RangeWalk {
         if let Some(probe) = last.as_ref().filter(|_| ended_while_waiting) {
             return RangeWalkAnswer {
                 probe: probe.clone(),
-                walked: false,
-                moved: 0,
-            };
-        }
-        if self.range_present() {
-            // The last walk's probe, or, where no walk vouched for the
-            // range (a verdict a test landed), the whole range bound.
-            let probe = last
-                .clone()
-                .filter(|probe| probe.present())
-                .unwrap_or_else(|| {
-                    let hosts = ::switch::loopback::range_hosts().count();
-                    crate::net::loopback::RangeProbe {
-                        bound: hosts,
-                        probed: hosts,
-                        first_failure: None,
-                    }
-                });
-            return RangeWalkAnswer {
-                probe,
                 walked: false,
                 moved: 0,
             };

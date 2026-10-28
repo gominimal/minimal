@@ -190,12 +190,14 @@ impl BoxManagerHandle {
 
     /// The session-start range walk (NET-123) of a daemon that publishes
     /// through the host's forwarder: the forwarder walks the reserved local
-    /// range again while the landed verdict is not present, and lands what
-    /// it finds. A present landing moves every box that stands at the
-    /// `127.0.0.1` interim onto its range address, the same present arm
-    /// [`Self::land_range_verdict`] runs. So a host that gained the range
-    /// after the daemon started (`min finalize-install`) publishes the next
-    /// box in the range, without a VM restart.
+    /// range again at every session start, whatever verdict landed last,
+    /// and lands what it finds. A present landing moves every box that
+    /// stands at the `127.0.0.1` interim onto its range address, the same
+    /// present arm [`Self::land_range_verdict`] runs. So a host that gained
+    /// the range after the daemon started (`min finalize-install`)
+    /// publishes the next box in the range, without a VM restart. An absent
+    /// landing after a present one moves every box in the range onto the
+    /// interim, because the range can go away under a running VM.
     ///
     /// `None` on a native daemon: its own loopback is the publish surface,
     /// and the create handler's local bind probe is the honest one there.
