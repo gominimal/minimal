@@ -758,8 +758,9 @@ impl BoxActor {
                 ));
             }
             // BOX-011: an ended box has no process to host. No path writes
-            // these states yet; until one does and the actor learns to
-            // hold an ended box, refuse it as for `Materializing`.
+            // these states yet, so refuse it as for `Materializing`. #2393
+            // (T6, BOX-025) makes resume bring a stopped PTY box back up
+            // from its record, and there the actor learns to host an ended box.
             BoxState::Stopped | BoxState::Exited => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
