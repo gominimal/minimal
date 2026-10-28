@@ -1644,6 +1644,10 @@ fn native_ruleset_digest() -> String {
     // fails this digest, not a guest's table).
     let listener_addr = "127.0.0.1";
     let listener_port = "7656";
+    // The guest's render also names the box mark its table writes into a
+    // box's packets, so the VM host's gate can tell a box's frame from the
+    // daemon's own at the one address both leave from.
+    let cohort_dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
     let out = Command::new("bash")
         .arg(&script)
         .args([
@@ -1660,6 +1664,8 @@ fn native_ruleset_digest() -> String {
             &identity.to_string(),
             "--ct-mark-mask",
             GUEST_CT_MARK_MASK_ARG,
+            "--cohort-dscp",
+            &cohort_dscp,
         ])
         .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
         .output()
