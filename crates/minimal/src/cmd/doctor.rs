@@ -16,9 +16,10 @@ use crate::task::TaskExit;
 // The two outcome lines are fixed by the plan's diagnostics for BEP-049.
 // A log with missing files (the BEP-049 residual) has its own first line, so
 // a script that reads the first line never sees "chain verified." for it.
-// Missing files exit 2: a prune and a deletion look the same on disk, so
-// the check cannot tell them apart. The own code lets a script tell this
-// case from both a verified chain (0) and a broken chain (1).
+// Missing files exit 0: a prune and a deletion look the same on disk, and
+// a prune leaves a restart on every healthy host, so a non-zero code fails
+// a healthy host. The first line and the `files_missing` log field tell
+// this case apart. A broken chain exits 6 and a verified chain exits 0.
 fn audit_lines(check: &LogCheck) -> Vec<String> {
     match &check.broken {
         Some((segment, record)) => vec![format!(
@@ -100,8 +101,8 @@ pub(crate) fn run(dir: &Path, out: &mut impl Write) -> anyhow::Result<Outcome> {
     Ok(result)
 }
 
-/// `min doctor`. Exits 0 when the audit chain verifies, 1 when the chain
-/// breaks, and 2 when audit files are missing and the chain in the files
+/// `min doctor`. Exits 0 when the audit chain verifies, 6 when the chain
+/// breaks, and 0 when audit files are missing and the chain in the files
 /// that remain verifies. A non-zero exit prints no further message.
 pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
     // Interim (BEP-042), as for `min box audit`: the client reads the
@@ -115,8 +116,8 @@ pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
         .context("cannot find the home directory, so the audit log cannot be found")?;
     match run(&dir, &mut std::io::stdout().lock())? {
         Outcome::Verified => Ok(()),
-        Outcome::Broken => Err(TaskExit(1).into()),
-        Outcome::FilesMissing => Err(TaskExit(2).into()),
+        Outcome::Broken => Err(TaskExit(6).into()),
+        Outcome::FilesMissing => Ok(()),
     }
 }
 
@@ -262,8 +263,8 @@ mod tests {
         segments
     }
 
-    // A missing middle segment gives the missing-files outcome (exit 2), and
-    // an edited record gives the broken outcome (exit 1).
+    // A missing middle segment gives the missing-files outcome (exit 0), and
+    // an edited record gives the broken outcome (exit 6).
     #[test]
     fn doctor_outcome_for_a_missing_segment_and_an_edited_record() {
         let tmp = tempfile::tempdir().expect("a temp dir");
