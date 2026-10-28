@@ -88,6 +88,16 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
+/// Run the GitHub sign-in inside its `auth.login` span. `verb` is what the
+/// user typed (`login` or `auth login`), so a trace tells the alias from the
+/// long form.
+async fn sign_in(global: &GlobalArgs, args: AuthLoginArgs, verb: &str) -> anyhow::Result<()> {
+    use tracing::Instrument as _;
+    cmd_auth_login(global, args)
+        .instrument(tracing::info_span!("auth.login", verb))
+        .await
+}
+
 /// What a command leaves for the process to do after its `cmd` span has
 /// ended: exit with ssh's status, or die of the signal that stopped it.
 ///
@@ -254,7 +264,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
         Some(Command::Auth(AuthArgs { command })) => match command {
-            AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
+            AuthCommand::Login(args) => sign_in(&cli.global_args, args, "auth login").await,
             AuthCommand::Status => cmd_auth_status(&cli.global_args),
             AuthCommand::Logout => cmd_auth_logout(&cli.global_args).await,
         },
@@ -263,9 +273,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SecretCommand::List(args) => cmd_secret_list(&cli.global_args, args),
             SecretCommand::Rm(args) => cmd_secret_rm(&cli.global_args, args),
         },
-        Some(Command::Login(args)) => {
-            cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
-        }
+        // NET-109: `min login` is the alias for `min auth login`.
+        Some(Command::Login(args)) => sign_in(&cli.global_args, args, "login").await,
         // Unlocked handle: `Stdout` takes its lock per write, so the lock is
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
