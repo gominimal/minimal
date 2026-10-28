@@ -2108,13 +2108,8 @@ proof_own_ip_egress_declared_and_enforced() {
 
     # ---- the disallowed NAME, its own assertion ----------------------------
     # example.org is outside `allow_dns_hosts`, so its connection must not
-    # complete. Whether it is refused FAST at resolution (the design outcome:
-    # the resolver refuses a non-matching name) or TIMES OUT with no reset
-    # (the current relay leaves the name unpinned and drops the SYN) is NOT
-    # asserted either way — reconciling those two is the dns_gate work's, not
-    # this proof's — but the observed outcome is printed, with the curl error
-    # and the elapsed time, so the transcript names which behaviour this
-    # build has.
+    # complete. Its relay answers the name REFUSED (NET-141), so curl must
+    # fail at resolution, inside 5000 ms, before any connection is tried.
     name_deny_start_ms="$(now_ms)"
     mnl session exec "$declare_sid" \
       "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.org" \
@@ -2128,13 +2123,16 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-name.err" 2>/dev/null || true
       fail
     fi
-    name_outcome="fast refusal"
+    name_outcome="not a resolver refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-name.err" 2>/dev/null; then
-      name_outcome="fast resolver refusal"
-    elif [ "$name_elapsed_ms" -ge 6000 ]; then
-      name_outcome="timeout with no reset"
+      name_outcome="resolver refusal"
     fi
     echo "disallowed-name GET https://example.org -> rc=$name_rc status=${name_status:-<none>} elapsed=${name_elapsed_ms}ms ($name_outcome) curl: ${name_err:-<none>}"
+    if [ "$name_outcome" != "resolver refusal" ] || [ "$name_elapsed_ms" -ge 5000 ]; then
+      echo "::error::NET-141: the partial-allow-list box's GET https://example.org did not fail fast at resolution (want 'could not resolve' inside 5000 ms, got $name_outcome in ${name_elapsed_ms}ms) — its relay refuses every name the list does not match"
+      cat "$WORK/egress-deny-name.err" 2>/dev/null || true
+      fail
+    fi
   else
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
