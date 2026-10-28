@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [dependencies]
@@ -17,6 +16,9 @@ args.workspace = true
 common.workspace = true
 paths.workspace = true
 boxes.workspace = true
+libc.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 
 serde.workspace = true
 toml.workspace = true
