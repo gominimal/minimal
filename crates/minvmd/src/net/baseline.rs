@@ -32,7 +32,7 @@
 //! deployment's to say, and neither category is ever dropped from the
 //! enumeration by saying it.
 
-use boxes::core::egress::{EgressRules, Ipv4Cidr};
+use boxes::core::egress::{EgressRules, IPPROTO_TCP, Ipv4Cidr};
 use switch::SwitchSubnet;
 
 /// A category of the node-plane baseline enumeration: one of the design's
@@ -150,8 +150,32 @@ impl NodeBaselinePhase {
 /// point them — is the change that flips this constant, and the constant is
 /// the whole cutover: the gate's decision reads it off the baseline it was
 /// built with ([`NodePlaneBaseline::phase`]), the start-up line logs it, and
-/// the tests pin both of its arms, so the flip is one line and nothing else.
+/// the tests pin both of its arms, so the flip is one line here, beside the
+/// listener that feeds [`REGISTRY_CACHE_FETCH_PORTS`].
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
+
+/// The IP protocol the in-force arm opens on the switch's host alias: TCP
+/// alone, because the store surface the built-in endpoints name is HTTPS.
+/// QUIC is not admitted; carrying it would be a stated choice that adds UDP
+/// here. Every other protocol to the alias, ICMP and GRE among them, is the
+/// infrastructure drop, whatever its bytes read as a port.
+pub(crate) const REGISTRY_CACHE_FETCH_PROTOCOL: u8 = IPPROTO_TCP;
+
+/// The ports the in-force arm opens on the switch's host alias, over
+/// [`REGISTRY_CACHE_FETCH_PROTOCOL`]. The compiled set has no port
+/// dimension, so without this bound the alias would be admitted at every
+/// port.
+///
+/// 443 is the planned port of the helper's store surface on the alias. No
+/// listener serves a registry or a cache there yet, and the daemon's own
+/// fetches go to `cache.minimal.dev`, not to the alias. When that listener
+/// lands, this list must be read from the listener's stack, the way
+/// `switch::bep_host::PROXY_PORT` is. `[443]` is the planned port, and no
+/// listener serves it. While [`NODE_BASELINE_PHASE`] is
+/// [`NodeBaselinePhase::Announced`], only the in-force tests exercise this
+/// list. The endpoint-configuration change (#1786) replaces it with the
+/// listener's port, or with an empty list if no listener exists.
+pub(crate) const REGISTRY_CACHE_FETCH_PORTS: [u16; 1] = [443];
 
 /// The node-plane baseline set: the categories in force, each with the
 /// subnets it admits, and the compiled rules the host-side gate decides
@@ -165,6 +189,10 @@ pub struct NodePlaneBaseline {
     /// The switch's resolver, carried into every recompilation so the
     /// resolver carve-out survives a re-pointed category.
     resolver: [u8; 4],
+    /// The switch's host alias: the address the in-force arm bounds to
+    /// [`REGISTRY_CACHE_FETCH_PROTOCOL`] at [`REGISTRY_CACHE_FETCH_PORTS`],
+    /// carried so the policy display spells that bound beside the endpoint.
+    host_alias: [u8; 4],
     /// The categories in force, in the order the display spells them.
     entries: Vec<BaselineEntry>,
     /// The compiled allow list the gate decides node-plane frames by: every
@@ -198,7 +226,9 @@ impl NodePlaneBaseline {
     /// the enumerated set.
     ///
     /// The compiled set allows every IP protocol within the admitted
-    /// subnets — the categories bound destinations, not protocols — and is
+    /// subnets — the categories bound destinations, not protocols; the
+    /// gate's in-force arm bounds the host alias to TCP at
+    /// [`REGISTRY_CACHE_FETCH_PORTS`] before the set is consulted — and is
     /// keyed to the in-VM daemon's own address as its lease: the verdict
     /// rejects any frame wearing another source, so the set decides
     /// node-plane frames and only those. The resolver's carve-out keeps the
@@ -210,6 +240,7 @@ impl NodePlaneBaseline {
         Self::from_entries(
             subnet.daemon_ip().octets(),
             subnet.dns_server().octets(),
+            host_alias.octets(),
             vec![
                 BaselineEntry {
                     category: BaselineCategory::Registry,
@@ -249,6 +280,32 @@ impl NodePlaneBaseline {
     #[must_use]
     pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
+    }
+
+    /// One entry's endpoints as the policy display spells them (NET-061): an
+    /// endpoint naming the host alias carries the in-force arm's bound
+    /// beside it (`100.64.255.254/32 tcp/443`), because the set has no port
+    /// dimension and the bound is what in force admits there. Any other
+    /// endpoint is spelled as the set holds it.
+    #[must_use]
+    pub fn display_endpoints(&self, entry: &BaselineEntry) -> Vec<String> {
+        let alias = format!("{}/32", std::net::Ipv4Addr::from(self.host_alias));
+        let ports = REGISTRY_CACHE_FETCH_PORTS
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        entry
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                if *endpoint == alias {
+                    format!("{endpoint} tcp/{ports}")
+                } else {
+                    endpoint.clone()
+                }
+            })
+            .collect()
     }
 
     /// The set as the daemon's start-up line spells it: one
@@ -315,10 +372,16 @@ impl NodePlaneBaseline {
 
     /// Assembles the set from its parts: the categories carried, and the
     /// addresses the compiled rules are keyed to.
-    fn from_entries(node_addr: [u8; 4], resolver: [u8; 4], entries: Vec<BaselineEntry>) -> Self {
+    fn from_entries(
+        node_addr: [u8; 4],
+        resolver: [u8; 4],
+        host_alias: [u8; 4],
+        entries: Vec<BaselineEntry>,
+    ) -> Self {
         Self {
             node_addr,
             resolver,
+            host_alias,
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
@@ -522,5 +585,23 @@ mod tests {
             FrameVerdict::Drop(reason) => assert_eq!(reason.rule(), "egress-foreign-source"),
             FrameVerdict::Admit => panic!("a foreign source is not admitted by the set"),
         }
+    }
+
+    /// NET-061: the policy display spells the in-force arm's bound beside
+    /// an endpoint naming the host alias, and a re-pointed endpoint as the
+    /// set holds it.
+    #[test]
+    fn display_endpoints_spell_the_alias_bound() {
+        let baseline =
+            NodePlaneBaseline::built_in(SUBNET).with_cache(vec!["198.51.100.0/24".to_owned()]);
+        let alias = format!("{}/32 tcp/443", SUBNET.host_alias());
+        assert_eq!(
+            baseline.display_endpoints(entry(&baseline, BaselineCategory::Registry)),
+            vec![alias]
+        );
+        assert_eq!(
+            baseline.display_endpoints(entry(&baseline, BaselineCategory::Cache)),
+            vec!["198.51.100.0/24".to_owned()]
+        );
     }
 }
