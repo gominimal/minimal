@@ -60,6 +60,10 @@ pub const REQUEST_BUDGET: Duration = Duration::from_secs(2);
 pub const DOCS_URL: &str = "https://docs.minimal.dev/reference/telemetry#update-check";
 /// The channel of a build nobody installed from a channel: never notified.
 pub const SOURCE_CHANNEL: &str = "source";
+/// The channel the installer records for a `--version` install: it is
+/// counted, and never told about another pointer (there is no
+/// `go.minimal.dev/pinned` to run).
+pub const PINNED_CHANNEL: &str = "pinned";
 
 /// What turned the check off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,7 +364,7 @@ pub fn disclosure_due(state: &State, tty: bool) -> bool {
 /// Whether a notice is owed: a channel install, an answer for that channel,
 /// a pointer that is not the installed key, not yet told.
 pub fn notice_due<'a>(state: &'a State, install: &Install) -> Option<&'a str> {
-    if install.channel == SOURCE_CHANNEL {
+    if install.channel == SOURCE_CHANNEL || install.channel == PINNED_CHANNEL {
         return None;
     }
     let latest = state.latest.as_deref()?;
@@ -385,6 +389,34 @@ pub fn skip_for(command: &Option<crate::cli::Command>) -> bool {
                 | Command::Completions(_)
                 | Command::CompleteSessionStr(_)
                 | Command::Version
+        )
+    )
+}
+
+/// The commands that leave the terminal to the notice: short ones whose
+/// output scrolls past. A command that takes the terminal (a session
+/// attach, `run`, a task, the dashboard) paints over a line written before
+/// it, so the notice waits for the next command of this kind, and is only
+/// recorded as shown once it was printed before one.
+pub fn leaves_the_notice_visible(command: &Option<crate::cli::Command>) -> bool {
+    use crate::cli::Command;
+    matches!(
+        command,
+        None | Some(
+            Command::Ls(_)
+                | Command::Stop(_)
+                | Command::Loadout(_)
+                | Command::Net(_)
+                | Command::Dirs
+                | Command::Init(_)
+                | Command::Add(_)
+                | Command::Update(_)
+                | Command::Login(_)
+                | Command::Proxy(_)
+                | Command::Auth(_)
+                | Command::Secret(_)
+                | Command::Bug(_)
+                | Command::Diag(_)
         )
     )
 }
@@ -437,7 +469,10 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
         }
     }
 
-    if tty && let Some(latest) = notice_due(&state, &install) {
+    if tty
+        && leaves_the_notice_visible(command)
+        && let Some(latest) = notice_due(&state, &install)
+    {
         let text = notice(&install, latest);
         let _ = writeln!(std::io::stderr(), "{text}");
         record_notified(&state_path, latest);
@@ -972,6 +1007,29 @@ mod tests {
             None,
             "a source build is never notified"
         );
+    }
+
+    /// A `--version` install (`channel = "pinned"`) is counted and never told: there is no channel to
+    /// upgrade along. A command that takes the terminal does not get the notice; a plain one does.
+    #[test]
+    fn a_pinned_install_is_never_told_and_the_notice_waits_for_a_plain_command() {
+        let state = State {
+            latest: Some("0.9.0".into()),
+            latest_channel: Some(PINNED_CHANNEL.into()),
+            ..Default::default()
+        };
+        let pinned = Install {
+            channel: PINNED_CHANNEL.into(),
+            method: "installer".into(),
+            key: "0.8.0".into(),
+        };
+        assert_eq!(notice_due(&state, &pinned), None);
+        assert!(leaves_the_notice_visible(&None));
+        assert!(leaves_the_notice_visible(&Some(crate::cli::Command::Dirs)));
+        assert!(!leaves_the_notice_visible(&Some(crate::cli::Command::Dash)));
+        assert!(!leaves_the_notice_visible(&Some(
+            crate::cli::Command::DebugAnswererCommand
+        )));
     }
 
     #[test]
