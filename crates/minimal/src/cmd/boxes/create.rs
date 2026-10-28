@@ -1417,7 +1417,7 @@ pub(crate) async fn activate_box(
     // here, the row exists and every later failure owes it its creator's
     // withdrawal (T66): the sites below send it. The control socket is
     // resolved once, here, and the withdrawals ride on it.
-    let kind = daemon_provider_kind(global);
+    let kind = daemon_host_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
     // An autogen name can collide with a live box's row the same way it
     // can with a session (the row stays live until its session's destroy):
@@ -1637,7 +1637,7 @@ pub(crate) async fn activate_box(
             // half) otherwise answers nowhere in its own output. A box that registered
             // nothing — a native host, a host-ip box sharing the node's own row, a
             // `none` box with no switch address — prints nothing: it has no row to
-            // name. Keyed on the provider kind the registration itself keyed on, never
+            // name. Keyed on the host kind the registration itself keyed on, never
             // on `use_minvmd()`, so the flagless VM-backed host prints it too.
             if let Some(addresses) = request.config.box_addresses.as_ref() {
                 eprintln!(
@@ -2265,7 +2265,7 @@ pub(crate) async fn activate_box(
                 // A kept session is active: it gets the `host_ip` name hold
                 // an activation that succeeded makes below.
                 if outcome == CleanupOutcome::Kept
-                    && kind == paths::ProviderKind::Minvmd
+                    && kind == paths::HostKind::Minvmd
                     && request.config.network == boxes::NetworkMode::HostNet
                     && let Some(name) = request.config.name.as_deref()
                 {
@@ -2318,7 +2318,7 @@ pub(crate) async fn activate_box(
     // next attach or exec.
     ActivationStep::HoldName
         .run(async {
-            if kind == paths::ProviderKind::Minvmd
+            if kind == paths::HostKind::Minvmd
                 && request.config.network == boxes::NetworkMode::HostNet
                 && let Some(name) = request.config.name.as_deref()
             {

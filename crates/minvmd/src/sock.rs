@@ -2,7 +2,7 @@
 //! minimald bridge (R3.2).
 //!
 //! The bridge socket lives beside the minvmd state files in the minvmd
-//! provider-instance dir:
+//! host dir:
 //! `<minimal_state_dir>/providers/local-minvmd0/ssh.sock`. It mirrors the
 //! `ssh.sock` name native minimald binds under its own `local-minimald<N>`
 //! dir; the client selects the dir matching the requested backend.
@@ -28,9 +28,9 @@ use std::path::PathBuf;
 pub const VSOCK_BRIDGE_PORT: u32 = 2222;
 
 /// Resolve the host UDS path for the minimald bridge (R3.2):
-/// `<provider dir>/ssh.sock`.
+/// `<host dir>/ssh.sock`.
 pub fn resolve_uds_path() -> io::Result<PathBuf> {
-    Ok(crate::state::provider_dir().join(paths::SSH_SOCK_FILE))
+    Ok(crate::state::host_dir().join(paths::SSH_SOCK_FILE))
 }
 
 /// Usable bytes in `sockaddr_un.sun_path` (excluding the NUL terminator).
@@ -59,12 +59,12 @@ pub fn check_uds_path_len(path: &std::path::Path) -> io::Result<()> {
 }
 
 /// The user the VMM child runs as (BEP-047), and its primary group. The
-/// provider dir and the sockets the VMM child opens carry this group.
+/// host dir and the sockets the VMM child opens carry this group.
 pub const VMM_USER: &str = "minimal-vmm";
 /// The user gvproxy runs as, and its primary group.
 pub const GVPROXY_USER: &str = "minimal-gvproxy";
 
-/// The name of the provider dir's subdirectory that the VM user owns.
+/// The name of the host dir's subdirectory that the VM user owns.
 pub const VMM_DIR: &str = "vmm";
 
 /// The gid of `group`, when this host has the group.
@@ -322,24 +322,21 @@ pub fn enforce_socket_access(
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(mode))
 }
 
-/// Whether a provider dir with this group and mode is one the VM host
+/// Whether a host dir with this group and mode is one the VM host
 /// daemon puts its sockets in: 0700, or 0710 with group `minimal-vmm`
 /// (`vmm_gid`), so the VM user can search it and do nothing else.
-fn provider_dir_mode_ok(gid: u32, mode: u32, vmm_gid: Option<u32>) -> bool {
+fn host_dir_mode_ok(gid: u32, mode: u32, vmm_gid: Option<u32>) -> bool {
     mode == 0o700 || (mode == 0o710 && vmm_gid == Some(gid))
 }
 
 /// Verify that `dir` is owned by the calling process's uid and has mode
 /// 0700, or 0710 with group `minimal-vmm`. Return `PermissionDenied`
 /// otherwise, naming the directory and its actual owner and mode.
-pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
-    verify_provider_dir_ownership_with(dir, group_gid(VMM_USER))
+pub fn verify_host_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
+    verify_host_dir_ownership_with(dir, group_gid(VMM_USER))
 }
 
-fn verify_provider_dir_ownership_with(
-    dir: &std::path::Path,
-    vmm_gid: Option<u32>,
-) -> io::Result<()> {
+fn verify_host_dir_ownership_with(dir: &std::path::Path, vmm_gid: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let meta = std::fs::metadata(dir)?;
@@ -366,7 +363,7 @@ fn verify_provider_dir_ownership_with(
     }
 
     let mode = meta.permissions().mode() & 0o7777;
-    if !provider_dir_mode_ok(meta.gid(), mode, vmm_gid) {
+    if !host_dir_mode_ok(meta.gid(), mode, vmm_gid) {
         let allowed = if vmm_gid.is_some() {
             format!("0700, or 0710 with group {VMM_USER}")
         } else {
@@ -386,10 +383,10 @@ fn verify_provider_dir_ownership_with(
 }
 
 /// Tighten `dir` when it is a directory the calling uid owns with a mode
-/// [`verify_provider_dir_ownership`] refuses: to 0710 when its group is
+/// [`verify_host_dir_ownership`] refuses: to 0710 when its group is
 /// `minimal-vmm`, else to 0700.
 ///
-/// The provider dir is first created by `StateDir::new`, which creates it
+/// The host dir is first created by `StateDir::new`, which creates it
 /// under the process umask (typically 0755), before any socket is bound;
 /// [`prepare_socket_dir`] leaves a pre-existing dir untouched. Refusing
 /// such a dir outright would refuse every existing install. Only the
@@ -407,7 +404,7 @@ fn restrict_owned_dir_with(dir: &std::path::Path, vmm_gid: Option<u32>) -> io::R
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
     let mode = meta.permissions().mode() & 0o7777;
-    if meta.is_dir() && meta.uid() == my_uid && !provider_dir_mode_ok(meta.gid(), mode, vmm_gid) {
+    if meta.is_dir() && meta.uid() == my_uid && !host_dir_mode_ok(meta.gid(), mode, vmm_gid) {
         let target = if vmm_gid == Some(meta.gid()) {
             0o710
         } else {
@@ -484,7 +481,7 @@ mod tests {
     static UDS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn resolve_uds_path_lives_in_provider_dir() {
+    fn resolve_uds_path_lives_in_host_dir() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", "/state") };
@@ -579,30 +576,30 @@ mod tests {
     }
 
     #[test]
-    fn verify_provider_dir_ownership_passes_owned_0700() {
+    fn verify_host_dir_ownership_passes_owned_0700() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("provider");
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        verify_provider_dir_ownership(&dir).unwrap();
+        verify_host_dir_ownership(&dir).unwrap();
     }
 
     #[test]
-    fn verify_provider_dir_ownership_rejects_wrong_mode() {
+    fn verify_host_dir_ownership_rejects_wrong_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("provider");
         std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
-        let err = verify_provider_dir_ownership(&dir).unwrap_err();
+        let err = verify_host_dir_ownership(&dir).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("0755"), "{err}");
         assert!(err.to_string().contains("but it must be 0700"), "{err}");
     }
 
     #[test]
-    fn verify_provider_dir_ownership_rejects_non_directory() {
+    fn verify_host_dir_ownership_rejects_non_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("regular");
         std::fs::File::create(&path).unwrap();
-        let err = verify_provider_dir_ownership(&path).unwrap_err();
+        let err = verify_host_dir_ownership(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
     }
 
@@ -612,14 +609,14 @@ mod tests {
         let dir = tmp.path().join("provider");
         std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
         restrict_owned_dir(&dir).unwrap();
-        verify_provider_dir_ownership(&dir).unwrap();
+        verify_host_dir_ownership(&dir).unwrap();
     }
 
-    /// BEP-047: the provider dir is 0700, or 0710 with group `minimal-vmm`;
+    /// BEP-047: the host dir is 0700, or 0710 with group `minimal-vmm`;
     /// `vmm/` is verified, never created; each socket gets the mode and the
     /// group of the design's table, and 0600 while the group is not held.
     #[test]
-    fn split_user_provider_dir_modes_are_enforced() {
+    fn split_user_host_dir_modes_are_enforced() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         // The test stands in this process's own group for `minimal-vmm`:
         // it is the one group a test can give its own entries.
@@ -628,14 +625,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mode_of = |p: &std::path::Path| std::fs::metadata(p).unwrap().mode() & 0o7777;
 
-        // A new provider dir: 0710 with the group when it is held, else 0700.
+        // A new host dir: 0710 with the group when it is held, else 0700.
         let grouped = tmp.path().join("grouped/ssh.sock");
         prepare_socket_dir_with(&grouped, Some(my_gid), || unreachable!()).unwrap();
         let dir = grouped.parent().unwrap();
         assert_eq!(mode_of(dir), 0o710);
         assert_eq!(std::fs::metadata(dir).unwrap().gid(), my_gid);
-        verify_provider_dir_ownership_with(dir, Some(my_gid)).unwrap();
-        let err = verify_provider_dir_ownership_with(dir, None).unwrap_err();
+        verify_host_dir_ownership_with(dir, Some(my_gid)).unwrap();
+        let err = verify_host_dir_ownership_with(dir, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         let plain = tmp.path().join("plain/ssh.sock");
         prepare_socket_dir_with(&plain, None, || unreachable!()).unwrap();
@@ -652,11 +649,11 @@ mod tests {
         assert!(verified);
         assert!(!in_vmm.parent().unwrap().exists());
 
-        // A group-writable or other-readable provider dir is refused, and an
+        // A group-writable or other-readable host dir is refused, and an
         // owned one is tightened to 0710 when its group is `minimal-vmm`.
         for mode in [0o750, 0o770, 0o711, 0o755] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(verify_provider_dir_ownership_with(dir, Some(my_gid)).is_err());
+            assert!(verify_host_dir_ownership_with(dir, Some(my_gid)).is_err());
             restrict_owned_dir_with(dir, Some(my_gid)).unwrap();
             assert_eq!(mode_of(dir), 0o710, "from {mode:04o}");
         }
@@ -742,14 +739,14 @@ mod tests {
 
     /// The split-user design (T57) names each socket and file in the list
     /// below with an owner, a mode and the users that open it. The list
-    /// covers the provider dir, its `vmm/` subdirectory, the gvproxy dir,
+    /// covers the host dir, its `vmm/` subdirectory, the gvproxy dir,
     /// gvproxy config dir and gate dir that `minimal-gvproxy` uses outside
-    /// the provider dir, and the supervisor channel to the EGW process. The
+    /// the host dir, and the supervisor channel to the EGW process. The
     /// list is written by hand. A new socket that nobody adds to it does not
     /// fail this test. A rename fails it only for a name that the list takes
     /// from the code.
     #[test]
-    fn split_user_provider_dir_design_names_every_socket_owner_of_fixed_list() {
+    fn split_user_host_dir_design_names_every_socket_owner_of_fixed_list() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/design/2026-10-25-split-user-vmm-provider-dir.md");
@@ -771,7 +768,7 @@ mod tests {
             .config_path()
             .to_path_buf(),
         );
-        // The entries in the provider dir and in its `vmm/` subdirectory,
+        // The entries in the host dir and in its `vmm/` subdirectory,
         // the entries the VMM child or `prepare_socket_dir` creates, and
         // the sockets the VMM child opens, each with the user that must
         // create it. A name comes from the code where this
@@ -779,11 +776,11 @@ mod tests {
         // that name fails this test. `boot.log`, `data-vol.raw` and
         // `gvproxy-bep.sock` are literals, because no reachable item names
         // them. The entries `minimal-vmm` creates sit in `vmm/`, because
-        // `minimal-vmm` cannot write the provider dir. gvproxy runs as a
+        // `minimal-vmm` cannot write the host dir. gvproxy runs as a
         // third user, `minimal-gvproxy`, so it shares no writable state
         // with `bep serve` and only the egress gate reaches it. Its switch
         // socket sits in the gvproxy dir, and `gvproxy.yaml` in the gvproxy
-        // config dir, both outside the provider dir. The egress gate and
+        // config dir, both outside the host dir. The egress gate and
         // `switch::bep_host` run in an EGW process as `minimal-gvproxy`
         // (Gatehouse 6.10 line 831). So the EGW process creates the gate
         // socket in the gate dir, and dials `gvproxy-bep.sock` in the
@@ -835,7 +832,7 @@ mod tests {
         // The fallback changes only the gvproxy rows. There gvproxy runs
         // as `minimal-vmm`, so its switch socket sits in `vmm/`. The gate
         // socket and `gvproxy-bep.sock` are named beside the switch socket
-        // today, so the fallback names them in the provider dir, where
+        // today, so the fallback names them in the host dir, where
         // `<login>` still creates them.
         check_table(
             &doc,

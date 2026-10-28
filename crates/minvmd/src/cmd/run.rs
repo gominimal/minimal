@@ -69,7 +69,7 @@ pub fn run(
         match crate::image::resolve_boot_images() {
             Ok((kernel, rootfs, initramfs)) => tracing::info!(
                 vm = %crate::state::vm_name(),
-                state_dir = %crate::state::provider_dir().display(),
+                state_dir = %crate::state::host_dir().display(),
                 kernel = %kernel.display(),
                 rootfs = %rootfs.display(),
                 initramfs = %initramfs.display(),
@@ -78,7 +78,7 @@ pub fn run(
             ),
             Err(e) => tracing::warn!(
                 vm = %crate::state::vm_name(),
-                state_dir = %crate::state::provider_dir().display(),
+                state_dir = %crate::state::host_dir().display(),
                 switch = %switch_str,
                 error = %e,
                 "starting VM with unresolved boot images"
@@ -134,7 +134,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
     // its existing VM state (data volume, boot log) instead of orphaning it.
-    paths::migrate_legacy_provider_dirs(&crate::state::state_base_dir());
+    paths::migrate_legacy_host_dirs(&crate::state::state_base_dir());
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
     // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
@@ -1346,7 +1346,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     tracing::info!(pid = child_pid, "VM is up; supervisor is running");
 
     // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
-    // it with default perms, and the shared provider dir is not 0700.
+    // it with default perms, and the shared host dir is not 0700.
     match crate::sock::resolve_uds_path() {
         Ok(uds_path) => {
             if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
@@ -1429,7 +1429,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
-/// `min bug` collects it from the provider dir by the same name.
+/// `min bug` collects it from the host dir by the same name.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_LOG_FILE: &str = "bep.log";
 

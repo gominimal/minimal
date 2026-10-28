@@ -255,7 +255,7 @@ enum Locality {
     Host,
     /// Not necessarily a host process at all: on macOS minimald runs *inside*
     /// the microVM and logs to the guest data volume, so its records reach the
-    /// bundle through the per-provider guest fetch and never through this
+    /// bundle through the per-host guest fetch and never through this
     /// directory. "Not here" is then a fact about this directory only.
     HostOrGuest,
 }
@@ -281,7 +281,7 @@ const LOG_PREFIXES: [LogPrefix; 2] = [
     },
 ];
 
-/// What the provider loop established about the daemon's own logs reaching
+/// What the host loop established about the daemon's own logs reaching
 /// the bundle by another route — the fact a host-side absence has to be read
 /// against.
 ///
@@ -292,17 +292,17 @@ const LOG_PREFIXES: [LogPrefix; 2] = [
 /// asserting something the archive does not back.
 #[derive(Debug, Clone, Copy)]
 pub enum DaemonLogSources<'a> {
-    /// The provider directory could not be listed, so whether any daemon
+    /// The host directory could not be listed, so whether any daemon
     /// logged elsewhere is *unknown*. Absence may not be claimed.
-    ProvidersUnknown,
-    /// No provider instance exists, so no daemon could have logged elsewhere.
-    NoProviders,
-    /// Providers exist, but none yielded a daemon bundle this run.
+    HostsUnknown,
+    /// No host exists, so no daemon could have logged elsewhere.
+    NoHosts,
+    /// Hosts exist, but none yielded a daemon bundle this run.
     NoneFetched,
-    /// These providers' nested bundles verified and were observed to hold
+    /// These hosts' nested bundles verified and were observed to hold
     /// `logs/minimald.log*`. Non-empty by construction.
     Nested(&'a [&'a str]),
-    /// A nested bundle arrived from these providers, but this run could not
+    /// A nested bundle arrived from these hosts, but this run could not
     /// confirm it holds the daemon's logs — truncated, failed verification,
     /// or verified with no such entry. Non-empty by construction.
     NestedUnconfirmed(&'a [&'a str]),
@@ -312,7 +312,7 @@ pub enum DaemonLogSources<'a> {
 ///
 /// Prefixes that matched no file are *reported back* through `absent` rather
 /// than skipped on the spot: whether "nothing under `<state>/logs`" also means
-/// "nothing in this bundle" depends on what the provider loop finds
+/// "nothing in this bundle" depends on what the host loop finds
 /// afterwards, and the shared collector contract (`collect_step!`) fixes this
 /// signature's return type at `Result<(), _>`.
 /// [`explain_absent_log_prefixes`] records those skips once the answer is in.
@@ -367,7 +367,7 @@ async fn logs_with_audit(
         }
     }
 
-    // Provider-scoped files. run.log: the detached supervisor's stderr
+    // Host-scoped files. run.log: the detached supervisor's stderr
     // redirect (panics, the final error print of a failed boot). boot.log:
     // the VMM's hvc0 console capture — kernel prints and the guest pid-1's
     // stdout, the only evidence when the guest wedges before (or its
@@ -377,10 +377,10 @@ async fn logs_with_audit(
     // holds the table the answers were given by, not only its name in the
     // dir listing. bep.log: the Box Egress Proxy's stdout and stderr, which
     // the VM host daemon starts beside gvproxy and writes here (BEP-015).
-    // Absent the same way a log that never appeared is: a provider dir with
+    // Absent the same way a log that never appeared is: a host dir with
     // no daemon (or a daemon predating the dump, or a host the proxy does
     // not run on) records absence, not an error.
-    for (name, dir) in provider_dirs(&paths.state).await? {
+    for (name, dir) in host_dirs(&paths.state).await? {
         for file_name in [
             "run.log",
             "boot.log",
@@ -414,7 +414,7 @@ async fn logs_with_audit(
     .await
 }
 
-/// The file in a provider dir that holds the Box Egress Proxy's output. The
+/// The file in a host dir that holds the Box Egress Proxy's output. The
 /// VM host daemon names the same file beside the proxy's socket.
 const BEP_LOG_FILE: &str = "bep.log";
 
@@ -744,7 +744,7 @@ fn newest_cmd_trace_id_in(text: &str) -> Option<String> {
     best.map(|(_, id)| id)
 }
 
-/// Records the skips [`logs`] held back, now that the provider loop has said
+/// Records the skips [`logs`] held back, now that the host loop has said
 /// whether the daemon's own logs reached the bundle another way.
 ///
 /// The plain absence claim ([`NO_SUCH_FILES`]) is made only where it is true
@@ -762,9 +762,9 @@ pub fn explain_absent_log_prefixes(
 ) {
     let log_dir = paths.state.join("logs");
     let log_dir = log_dir.display();
-    // Where in the bundle a named provider's nested daemon bundle sits.
-    let carriers = |providers: &[&str]| {
-        providers
+    // Where in the bundle a named host's nested daemon bundle sits.
+    let carriers = |hosts: &[&str]| {
+        hosts
             .iter()
             .map(|p| format!("providers/{p}/guest/daemon-diag.tar.zst"))
             .collect::<Vec<_>>()
@@ -773,36 +773,36 @@ pub fn explain_absent_log_prefixes(
     for prefix in absent {
         let reason = match (prefix.locality, sources) {
             // A host process that wrote nothing here wrote nothing anywhere —
-            // including when the provider listing failed, which says nothing
-            // about a host writer. And with no provider instance there is no
+            // including when the host listing failed, which says nothing
+            // about a host writer. And with no host there is no
             // guest to have logged in either. Both are genuine absence.
-            (Locality::Host, _) | (Locality::HostOrGuest, DaemonLogSources::NoProviders) => {
+            (Locality::Host, _) | (Locality::HostOrGuest, DaemonLogSources::NoHosts) => {
                 format!("{NO_SUCH_FILES} in {log_dir}")
             }
             // The listing failed, so whether a guest daemon logged elsewhere
             // was never established. Saying "absent" here would be asserting
             // the one thing this run did not find out.
-            (Locality::HostOrGuest, DaemonLogSources::ProvidersUnknown) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::HostsUnknown) => format!(
                 "none in {log_dir}, and whether any exist elsewhere is unknown — the \
                  provider directory could not be listed this run (see the `providers` \
                  error in this manifest). Where minimald runs inside the microVM it \
                  logs to the guest data volume, not to this host"
             ),
-            (Locality::HostOrGuest, DaemonLogSources::Nested(providers)) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::Nested(hosts)) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs \
                  to the guest data volume, not to this host. Its own logs are in \
                  this bundle, nested in {} (see logs/PROVENANCE.txt)",
-                carriers(providers)
+                carriers(hosts)
             ),
             // A bundle came back, so "no daemon bundle was fetched" would be
             // false; but it was truncated, failed its checks, or held no such
             // entry, so naming it as the carrier would be false too.
-            (Locality::HostOrGuest, DaemonLogSources::NestedUnconfirmed(providers)) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::NestedUnconfirmed(hosts)) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs \
                  to the guest data volume, not to this host. A daemon bundle was \
                  collected at {}, but this run could not confirm it carries them; \
                  see the guest.* entries in this manifest (see logs/PROVENANCE.txt)",
-                carriers(providers)
+                carriers(hosts)
             ),
             (Locality::HostOrGuest, DaemonLogSources::NoneFetched) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs to \
@@ -887,14 +887,14 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 
 // ── providers/local-<kind><n>/ discovery ───────────────────────────────────────────
 
-/// Provider instance dirs under `<state>/providers`, sorted, plus every named
+/// Host dirs under `<state>/providers`, sorted, plus every named
 /// VM nested in a minvmd instance dir as its own `local-minvmd0/<vm>` entry
 /// (NET-052) — so the bundle lists every VM by name. The default VM keeps the
-/// bare provider entry; a named VM's state dir is the per-name subdirectory
+/// bare host entry; a named VM's state dir is the per-name subdirectory
 /// (NET-054). Empty when the providers dir doesn't exist (nothing was ever
 /// spawned); any other filesystem error is an `Err` — "no daemon was ever
 /// spawned here" must never be claimed on the strength of an EACCES.
-pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+pub async fn host_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
     let mut entries = match tokio::fs::read_dir(state.join("providers")).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -921,14 +921,14 @@ pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::
     Ok(dirs)
 }
 
-/// The named VMs under one minvmd provider dir, as
-/// (`<provider>/<vm>`, state dir) entries. A subdirectory is a VM only when
+/// The named VMs under one minvmd host dir, as
+/// (`<host>/<vm>`, state dir) entries. A subdirectory is a VM only when
 /// its name is a valid VM name — an unnamed directory a tool left behind must
 /// not be reported as a VM, and the in-guest diagnostic bundle's `guest/`
 /// directory is among the names the validator reserves, so it never reads as
-/// a VM either. An unreadable provider dir yields no VMs rather than failing
-/// the whole listing: the provider entry above still says what it holds.
-async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
+/// a VM either. An unreadable host dir yields no VMs rather than failing
+/// the whole listing: the host entry above still says what it holds.
+async fn named_vms(host: &str, dir: &Path) -> Vec<(String, PathBuf)> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -944,22 +944,18 @@ async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
         if paths::validate_vm_name(&vm).is_err() {
             continue;
         }
-        vms.push((format!("{provider}/{vm}"), entry.path()));
+        vms.push((format!("{host}/{vm}"), entry.path()));
     }
     vms
 }
 
-/// Non-log per-provider evidence: what the instance dir holds, its raw
+/// Non-log per-host evidence: what the instance dir holds, its raw
 /// lifecycle state, and whether anything is still alive behind it (R7.6).
 ///
 /// `run.log`/`boot.log` are deliberately *not* collected here — [`logs`]
-/// already tail-caps them for every discovered provider, and a second copy
+/// already tail-caps them for every discovered host, and a second copy
 /// would be a duplicate archive entry.
-pub async fn provider_files(
-    w: &mut BundleWriter,
-    name: &str,
-    dir: &Path,
-) -> Result<(), anyhow::Error> {
+pub async fn host_files(w: &mut BundleWriter, name: &str, dir: &Path) -> Result<(), anyhow::Error> {
     // Shallow inventory of the instance dir: which sockets, locks, keys and
     // images exist. Metadata only — the walk is synchronous, so it runs on a
     // blocking thread like every other listing.
@@ -1009,7 +1005,7 @@ pub async fn provider_files(
     // every VM in the bundle is identifiable at a glance (NET-052).
     let status_vm = vm_of_entry(name);
     let status =
-        tokio::task::spawn_blocking(move || provider_status(status_vm.as_deref(), &status_dir))
+        tokio::task::spawn_blocking(move || host_status(status_vm.as_deref(), &status_dir))
             .await
             .context("provider status worker")?;
     let json = serde_json_lenient::to_vec_pretty(&status).context("serializing provider status")?;
@@ -1073,8 +1069,8 @@ fn volume_info(dir: &Path) -> VolumeInfo {
 }
 
 #[derive(Serialize)]
-struct ProviderStatus {
-    /// The VM this entry serves: `default` for a bare minvmd provider dir,
+struct HostStatus {
+    /// The VM this entry serves: `default` for a bare minvmd host dir,
     /// the per-name subdirectory for a named VM (`local-minvmd0/alpha`), and
     /// `None` for the native minimald backend, which hosts no VMs.
     vm: Option<String>,
@@ -1091,9 +1087,9 @@ struct ProviderStatus {
     minimald_alive: Option<bool>,
 }
 
-/// The VM a provider entry names: the per-name subdirectory of a nested entry
+/// The VM a host entry names: the per-name subdirectory of a nested entry
 /// (`local-minvmd0/alpha` → `alpha`), the default VM for a bare minvmd
-/// provider dir, and `None` for the native minimald backend, which hosts no
+/// host dir, and `None` for the native minimald backend, which hosts no
 /// VMs.
 fn vm_of_entry(name: &str) -> Option<String> {
     if let Some((_, vm)) = name.rsplit_once('/') {
@@ -1103,13 +1099,13 @@ fn vm_of_entry(name: &str) -> Option<String> {
         .then(|| paths::DEFAULT_VM_NAME.to_owned())
 }
 
-/// Reads the provider's lifecycle state and probes the advisory locks.
+/// Reads the host's lifecycle state and probes the advisory locks.
 ///
 /// Deliberately *not* `StateDir::effective_state()`, which repairs stale state
 /// by writing `Stopped` back — a diagnostic must never mutate what it reads.
 /// Synchronous (file locks and `std::fs`); callers run it on a blocking thread.
-fn provider_status(vm: Option<&str>, dir: &Path) -> ProviderStatus {
-    // `StateDir::new` runs `create_dir_all`, so probing a provider whose
+fn host_status(vm: Option<&str>, dir: &Path) -> HostStatus {
+    // `StateDir::new` runs `create_dir_all`, so probing a host whose
     // directory had been deleted would recreate it — leaving ghost state
     // behind and making this collector a mutation, which the paragraph above
     // says it must never be.
@@ -1122,7 +1118,7 @@ fn provider_status(vm: Option<&str>, dir: &Path) -> ProviderStatus {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(e) => (None, Some(e.to_string())),
     };
-    ProviderStatus {
+    HostStatus {
         vm: vm.map(str::to_owned),
         state_dir: dir.to_path_buf(),
         socket: dir.join(paths::SSH_SOCK_FILE),
@@ -1254,21 +1250,21 @@ mod tests {
     }
 
     /// The strong claim ([`NO_SUCH_FILES`]) is licensed by only some of the
-    /// states a run can end in. A run that could not list the provider
+    /// states a run can end in. A run that could not list the host
     /// directory has not established absence, it has established nothing —
     /// and "I did not find out" recorded as "it is not there" is the same
     /// defect as the one this whole path exists to correct.
     #[tokio::test]
     async fn plain_absence_is_claimed_only_where_the_run_established_it() {
         let all = [
-            DaemonLogSources::ProvidersUnknown,
-            DaemonLogSources::NoProviders,
+            DaemonLogSources::HostsUnknown,
+            DaemonLogSources::NoHosts,
             DaemonLogSources::NoneFetched,
             DaemonLogSources::Nested(&["local-minvmd0"]),
             DaemonLogSources::NestedUnconfirmed(&["local-minvmd0"]),
         ];
 
-        // minvmd is a host process wherever the providers are: nothing under
+        // minvmd runs on the machine wherever the hosts are: nothing under
         // <state>/logs is the whole story in every state.
         for sources in all {
             let reasons = reasons_for(sources).await;
@@ -1279,11 +1275,11 @@ mod tests {
         }
 
         // minimald may be inside the microVM, so only a *settled* empty
-        // provider list rules out its logs having gone elsewhere.
+        // host list rules out its logs having gone elsewhere.
         for sources in all {
             let reasons = reasons_for(sources).await;
             let claims_absence = reasons["logs/minimald.log*"].starts_with(NO_SUCH_FILES);
-            let established = matches!(sources, DaemonLogSources::NoProviders);
+            let established = matches!(sources, DaemonLogSources::NoHosts);
             assert_eq!(
                 claims_absence,
                 established,
@@ -1430,10 +1426,10 @@ mod tests {
     #[tokio::test]
     async fn bundle_collects_the_proxy_log_and_audit_segments() {
         let state = tempfile::TempDir::new().unwrap();
-        let provider = state.path().join("providers/local-minvmd0");
-        std::fs::create_dir_all(&provider).unwrap();
-        std::fs::write(provider.join("run.log"), b"minvmd run\n").unwrap();
-        std::fs::write(provider.join(BEP_LOG_FILE), b"bep serving\n").unwrap();
+        let host_dir = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("run.log"), b"minvmd run\n").unwrap();
+        std::fs::write(host_dir.join(BEP_LOG_FILE), b"bep serving\n").unwrap();
 
         let home = tempfile::TempDir::new().unwrap();
         let audit = home.path().join("audit");
@@ -1549,12 +1545,12 @@ mod tests {
         }
     }
 
-    /// One provider dir with two named VMs beside the guest payload and the
-    /// default VM, plus a native instance dir: `provider_dirs` must list every
+    /// One host dir with two named VMs beside the guest payload and the
+    /// default VM, plus a native instance dir: `host_dirs` must list every
     /// VM as its own entry (`local-minvmd0/<vm>`), keep the default VM as the
-    /// bare provider entry, and never report the guest payload as a VM.
+    /// bare host entry, and never report the guest payload as a VM.
     #[tokio::test]
-    async fn provider_dirs_lists_named_vms() {
+    async fn host_dirs_lists_named_vms() {
         let state = tempfile::TempDir::new().unwrap();
         let providers = state.path().join("providers");
         let minvmd = providers.join("local-minvmd0");
@@ -1563,7 +1559,7 @@ mod tests {
         }
         std::fs::create_dir_all(providers.join("local-minimald0")).unwrap();
 
-        let listed = provider_dirs(state.path()).await.unwrap();
+        let listed = host_dirs(state.path()).await.unwrap();
         let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -1593,18 +1589,18 @@ mod tests {
         let out = out_dir.path().join("diag.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
 
-        // A default VM's bare provider dir and a named VM's per-name subdir.
+        // A default VM's bare host dir and a named VM's per-name subdir.
         let alpha = state.path().join("providers/local-minvmd0/alpha");
         std::fs::create_dir_all(&alpha).unwrap();
         std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).unwrap();
-        provider_files(
+        host_files(
             &mut w,
             "local-minvmd0",
             &state.path().join("providers/local-minvmd0"),
         )
         .await
         .unwrap();
-        provider_files(&mut w, "local-minvmd0/alpha", &alpha)
+        host_files(&mut w, "local-minvmd0/alpha", &alpha)
             .await
             .unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
@@ -1647,11 +1643,11 @@ mod tests {
         let out = out_dir.path().join("diag.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
 
-        let provider = state.path().join("providers/local-minvmd0");
-        std::fs::create_dir_all(&provider).unwrap();
+        let host_dir = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         // A sparse file: 1 MiB apparent, one 4 KiB block allocated. Write
         // without truncation so the apparent size stays 1 MiB.
-        let image = provider.join("data-vol.raw");
+        let image = host_dir.join("data-vol.raw");
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -1662,7 +1658,7 @@ mod tests {
         f.set_len(1024 * 1024).unwrap();
         f.write_all(&[0u8; 4096]).unwrap();
 
-        provider_files(&mut w, "local-minvmd0", &provider)
+        host_files(&mut w, "local-minvmd0", &host_dir)
             .await
             .unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
