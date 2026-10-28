@@ -831,14 +831,30 @@ where
                     gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
                 });
             if !pinned {
-                gate.limiter.warn(
+                let remote = drop_remote(&summary);
+                let transport = drop_transport(&reason);
+                // The VM host daemon keeps its own record of the refused
+                // flow, outside the VM: reported only when the drop line
+                // fires, so under the same rate limit, never per frame.
+                if gate.limiter.warn(
                     &gate.label,
                     Direction::Egress,
-                    drop_remote(&summary),
-                    drop_transport(&reason),
+                    remote,
+                    transport,
                     None,
                     reason.rule(),
-                );
+                ) {
+                    let destination = match remote {
+                        Some(SocketAddr::V4(destination)) => Some(destination),
+                        _ => None,
+                    };
+                    crate::net::listeners::report_refused_egress(
+                        reject.lease,
+                        destination,
+                        &transport.to_string(),
+                        reason.rule(),
+                    );
+                }
                 continue;
             }
         }
