@@ -1404,11 +1404,11 @@ impl BoxManager {
                             //
                             // No retry until one of those two comes: the
                             // run's client may have died with the daemon,
-                            // so no delete may ever arrive. Deliberate
-                            // (review 2026-10-28, minimal#2345): the next
-                            // restart reaps the record through this same
-                            // path, so the leftover is bounded by a
-                            // restart and not retried inside this run.
+                            // so no delete may ever arrive. That is
+                            // deliberate: the next restart reaps the record
+                            // through this same path, so the leftover is
+                            // bounded by a restart and not retried inside
+                            // this run.
                             // Retrying sooner means evicting the closed
                             // actor or spawning a second teardown, and
                             // either lets a later delete bring up a fresh
