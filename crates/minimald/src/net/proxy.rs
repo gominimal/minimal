@@ -108,7 +108,9 @@ pub trait HostRoute: Send + Sync + 'static {
     /// The caller a connection from the node's address stands for (NET-070):
     /// the live host-address box `owner`, which owns the connecting socket,
     /// with its egress rules compiled with `from` as their source. `None`
-    /// when `owner` is no live host-address box.
+    /// when `owner` is no live host-address box with caller facts. The proxy
+    /// refuses such a connection as unattributed: the kernel named a box the
+    /// registry cannot describe, so the request stays gated.
     fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<super::dns::Caller>;
 
     /// Whether any live caller holds no switch lease. While none does, a
@@ -297,7 +299,10 @@ impl<T: HostRoute> Router<T> {
     /// caller holds no switch lease. A lookup that cannot name the socket's
     /// holder then is [`CallerLookup::Unattributed`], never no caller: the
     /// client can close its socket before the proxy looks, and the gate must
-    /// not open for that.
+    /// not open for that. A socket owned by a box the registry holds no
+    /// caller facts for is [`CallerLookup::Unattributed`] too: an unknown box
+    /// is denied by default (design §7.1). Only a socket that no box owns is
+    /// [`CallerLookup::NoBox`].
     async fn caller_for(&self, peer: SocketAddrV4, local: Option<SocketAddr>) -> CallerLookup {
         if let Some(caller) = self.caller_at(*peer.ip()) {
             return CallerLookup::Box(caller);
@@ -332,7 +337,7 @@ impl<T: HostRoute> Router<T> {
             caller = caller.as_ref().map_or("none", super::dns::Caller::name),
             "named the box that owns a proxied connection from the node's address"
         );
-        caller.map_or(CallerLookup::NoBox, CallerLookup::Box)
+        caller.map_or(CallerLookup::Unattributed, CallerLookup::Box)
     }
 }
 
@@ -3726,16 +3731,20 @@ mod tests {
     const OPEN_HOST_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 5);
     const BROWSER_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 6);
     const UNATTRIBUTED_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 7);
+    const UNREGISTERED_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 8);
     const HOST_BOX: &str = "00000000-0000-0000-0000-000000000011";
     const OPEN_HOST_BOX: &str = "00000000-0000-0000-0000-000000000012";
+    const UNREGISTERED_BOX: &str = "00000000-0000-0000-0000-000000000013";
 
     /// The socket-owner lookup a host-address box's connection meets, with
     /// the kernel's answer stood in: a test process runs in no box's leaf.
     /// The connection from [`HOST_BOX_ADDR`] is owned by the deny-all box,
     /// the one from [`OPEN_HOST_BOX_ADDR`] by the box with no egress rules,
     /// The one from [`UNATTRIBUTED_ADDR`] has no owner the kernel can name, as
-    /// a socket the client closed at once has none. Any other connection is
-    /// owned by no box, as the developer's browser's is.
+    /// a socket the client closed at once has none. The one from
+    /// [`UNREGISTERED_BOX_ADDR`] is owned by a box with no caller facts in
+    /// the registry. Any other connection is owned by no box, as the
+    /// developer's browser's is.
     fn stub_socket_owner(
         peer: SocketAddrV4,
         local: SocketAddrV4,
@@ -3752,6 +3761,9 @@ mod tests {
                 ConnectingOwner::Box(SessionId::parse_str(OPEN_HOST_BOX).unwrap())
             }
             UNATTRIBUTED_ADDR => ConnectingOwner::Unknown,
+            UNREGISTERED_BOX_ADDR => {
+                ConnectingOwner::Box(SessionId::parse_str(UNREGISTERED_BOX).unwrap())
+            }
             _ => ConnectingOwner::NoBox,
         }
     }
@@ -3764,7 +3776,8 @@ mod tests {
     /// request to another box is refused, and the refusal line names it. A
     /// host-address box with no egress rules, and a connection no box owns,
     /// send the same request and it routes. A connection whose owner the
-    /// kernel cannot name is refused, not left ungated.
+    /// kernel cannot name is refused, not left ungated. So is a connection
+    /// the kernel names a box for that has no caller facts.
     #[tokio::test]
     async fn proxy_host_address_caller_egress_denied() {
         let backend_port = spawn_backend().await;
@@ -3781,8 +3794,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        // The callers: host-address boxes, as the session actor records them.
-        // Neither ever reports a switch lease.
+        // The callers: host-address boxes, as the session actor records them
+        // (`host_address_box_registers_its_caller_facts` in the box actor's
+        // tests proves that production registration). Neither ever reports a
+        // switch lease.
         let deny_all = BoxPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
@@ -3833,6 +3848,12 @@ mod tests {
                 && unattributed.contains("the proxy cannot tell which box opened this connection"),
             "expected a connection with no named owner to be refused, got: {unattributed}"
         );
+        let unregistered =
+            proxy_get_from(proxy_addr, UNREGISTERED_BOX_ADDR, "web.min.internal:18080").await;
+        assert!(
+            unregistered.contains("403 Forbidden"),
+            "expected a connection owned by a box with no caller facts to be refused, got: {unregistered}"
+        );
 
         drop(guard);
         let logged = buf.contents();
@@ -3852,6 +3873,13 @@ mod tests {
                     && line.contains(r#"caller="unknown""#)
                     && line.contains(&UNATTRIBUTED_ADDR.to_string())),
             "expected the unattributed refusal to name the peer, got: {logged}"
+        );
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("refused a proxied request")
+                    && line.contains(&UNREGISTERED_BOX_ADDR.to_string())),
+            "expected the unregistered box's refusal to name the peer, got: {logged}"
         );
         for expected in [
             r#"caller="hostbox""#,

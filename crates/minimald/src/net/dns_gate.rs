@@ -58,9 +58,9 @@
 //!   IPv6 has no admission path, NET-082) and nothing upstream can answer
 //!   them differently.
 //! * **REFUSED for names the allow list does not match** (NET-141) — when
-//!   the box declared `egress.allow_dns_hosts` (a partial list, or the empty
-//!   list of the deny-all shape `boxes::EgressPolicy::deny_all`
-//!   materializes), a query toward this box's resolver that asks for a name
+//!   the box declared a non-empty `egress.allow_dns_hosts` (a partial
+//!   list), or is of the deny-all shape `boxes::EgressPolicy::deny_all`
+//!   materializes (the empty list with nothing else admitted), a query toward this box's resolver that asks for a name
 //!   the list does not match and that is outside the box zone, of any
 //!   record type, is answered REFUSED (rcode 5) by the relay itself and
 //!   never written on to the switch. The match is the one the ingress leg
@@ -81,7 +81,9 @@
 //!   A box with a partial list reads the zone in any case, and the
 //!   NXDOMAIN rule below answers those names. A box that declared no names
 //!   is not refused here: its queries keep the forwarding above, under the
-//!   zone rules below.
+//!   zone rules below. Neither is a box whose list is empty but that admits
+//!   subnets (`--allow-subnets 0.0.0.0/0` alone): `boxes::effective_egress`
+//!   gives it `allow_dns_hosts = Some([])`, and its names still forward.
 //! * **NODATA for non-A queries on box-zone names** (NET-006) — a TXT, MX,
 //!   CNAME, SRV or NS query for a `*.min.internal` name is answered empty by
 //!   the relay itself and never written on to the switch, so the box's
@@ -594,9 +596,17 @@ impl DnsGate {
     /// match ([`answered_on_the_switch`]), so the apex and a zone suffix not
     /// in exact lowercase are refused too. Any other box reads the wider
     /// match ([`in_zone`]) and leaves those names to the NXDOMAIN rule. A box
-    /// that declared no names is refused nothing here.
+    /// that declared no names, or declared the empty list without the
+    /// deny-all shape, is refused nothing here.
     fn refuses(&self, question: &Query) -> bool {
-        let Some(names) = self.names.as_ref() else {
+        // An empty list refuses only in the deny-all shape. A box that
+        // declared no names but admits subnets (`--allow-subnets 0.0.0.0/0`
+        // alone) keeps its forwarding.
+        let Some(names) = self
+            .names
+            .as_ref()
+            .filter(|names| self.deny_all || !names.is_empty())
+        else {
             return false;
         };
         if names.contains(&normalized(&question.name().to_lowercase().to_string())) {
@@ -3192,6 +3202,32 @@ pub(crate) mod tests {
                 proptest::prop_assert_eq!(rcode, Some(ResponseCode::Refused));
             }
         }
+    }
+
+    /// An empty name list that is not the deny-all shape refuses nothing: a
+    /// box created with only `--allow-subnets 0.0.0.0/0` gets
+    /// `allow_dns_hosts = Some([])`, and its query for an outside name is
+    /// forwarded, not answered by the gate (NET-141).
+    #[test]
+    fn empty_name_list_with_subnets_forwards_outside_names() {
+        let policy = boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(vec!["0.0.0.0/0".into()]),
+                allow_dns_hosts: Some(Vec::new()),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        let gate = gate_for(&policy);
+        let query = dns_query("example.com.", RecordType::A);
+        assert!(
+            gate.intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query)
+                .is_none(),
+            "the A query for example.com is forwarded"
+        );
     }
 
     /// The deny-all refusal at the gate itself: REFUSED for a name outside

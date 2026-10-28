@@ -1074,7 +1074,10 @@ impl HostnameRegistry {
     /// with `from`, the address the connection came from, as their source.
     /// A host-address box holds no switch lease, so [`Self::caller_at`]
     /// cannot name it. `None` when `owner` has no caller facts, or when it is
-    /// an own-address box, whose connections come from its lease.
+    /// an own-address box, whose connections come from its lease. The proxy
+    /// refuses a connection that this returns `None` for: the kernel named a
+    /// box, so the connection is not a host-side client's, and an unknown box
+    /// is denied by default.
     #[must_use]
     pub fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<Caller> {
         if self.own.contains_key(&owner) || self.by_lease.values().any(|id| *id == owner) {

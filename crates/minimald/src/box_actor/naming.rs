@@ -339,6 +339,17 @@ impl BoxActor {
                     .write()
                     .expect("hostname registry lock poisoned");
                 reg.register_host_net(record.id, &name);
+                // NET-070: the hostname proxy decides a host-address box's
+                // request by its own egress rules. The box holds no switch
+                // lease, so the proxy finds these facts by the box that owns
+                // the connecting socket (`caller_owning`).
+                reg.register_caller(
+                    record.id,
+                    &name,
+                    &record.policy,
+                    subnet,
+                    hostname_proxy_port,
+                );
             }
             _ => {}
         }
