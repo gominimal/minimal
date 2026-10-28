@@ -27,6 +27,25 @@ pub(crate) fn effective_egress_section(
     }
 }
 
+/// The classifier leaf a package build for the box `box_id` runs in
+/// (NET-155): the leaf the box's launch placed it in, under `root`. The
+/// launch places a box in exactly one subtree, so the leaf is the one of the
+/// two that exists. `None` when the box has no leaf: a box that is not
+/// host-address, a host with no classifier tree, or a box not running.
+/// The build then runs in the daemon's own cgroup, as it did before.
+pub(crate) fn box_build_leaf(
+    root: &std::path::Path,
+    box_id: &str,
+) -> Option<sandbox::config::ClassifierLeaf> {
+    [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ]
+    .into_iter()
+    .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
+    .find(|leaf| leaf.dir().is_dir())
+}
+
 /// The policy the gate enforces for a session: its declared ingress, and its
 /// egress resolved to the section [`effective_egress_section`] names — the
 /// deny-all section for an own-address box with no `egress` section once the
@@ -655,7 +674,19 @@ impl BoxActor {
         pkgs: Vec<String>,
     ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
-        let (sop, rx) = SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, 64).await?;
+        // NET-155: the box's builds run in the box's own classifier leaf, so
+        // its egress verdict decides what the builds can reach.
+        let record = self.record.record().await?;
+        let box_id = record.id.to_string();
+        let placement = crate::box_ops::BuildPlacement {
+            box_name: record.name.clone().unwrap_or_else(|| box_id.clone()),
+            leaf: box_build_leaf(
+                std::path::Path::new(sandbox::classifier::TREE_ROOT),
+                &box_id,
+            ),
+        };
+        let (sop, rx) =
+            SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, placement, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
             BoxInner::Draft { .. } => {

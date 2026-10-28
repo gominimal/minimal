@@ -12127,3 +12127,143 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
             .is_symlink()
     );
 }
+
+/// The events of one package build named `package`, whose output ends in
+/// `lines`, as the build side-op's pump sees them (NET-155).
+fn build_events(package: &str, lines: &[&str]) -> Vec<orchestrator::BuildEvent> {
+    let start = orchestrator::BuildEvent {
+        idx: 7,
+        inner: orchestrator::BuildEventInner::Start {
+            name: package.to_string(),
+            full_build: true,
+            spec_hash: "0".repeat(64),
+        },
+    };
+    std::iter::once(start)
+        .chain(lines.iter().map(|line| orchestrator::BuildEvent {
+            idx: 7,
+            inner: orchestrator::BuildEventInner::Log {
+                is_stderr: true,
+                line: (*line).to_string(),
+            },
+        }))
+        .collect()
+}
+
+/// NET-155: a box's package build runs in the box's own classifier leaf,
+/// so the box's egress verdict decides it. A deny-all box's build that
+/// cannot reach its download is reported as refused by the box's rules. A
+/// box allowed the destination is placed in its allow leaf, and its build
+/// is never reported as refused. A box with no leaf builds in the daemon's
+/// own cgroup, as before.
+#[test]
+fn box_package_build_under_box_egress_verdict() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    use sandbox::config::Verdict;
+
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path();
+    assert_eq!(super::setup::box_build_leaf(root, "sealed"), None);
+
+    let deny_dir = sandbox::classifier::box_leaf(root, "sealed", Verdict::Deny);
+    std::fs::create_dir_all(&deny_dir).unwrap();
+    let allow_dir = sandbox::classifier::box_leaf(root, "open", Verdict::Allow);
+    std::fs::create_dir_all(&allow_dir).unwrap();
+
+    let sealed = super::setup::box_build_leaf(root, "sealed").expect("the deny-all box's leaf");
+    assert_eq!(sealed.dir(), deny_dir);
+    assert!(sealed.is_deny());
+    let open = super::setup::box_build_leaf(root, "open").expect("the allowed box's leaf");
+    assert_eq!(open.dir(), allow_dir);
+    assert!(!open.is_deny());
+
+    let download = [
+        "curl: (6) Could not resolve host: downloads.example.org",
+        "build command failed",
+    ];
+    let run = |name: &str, leaf| {
+        let placement = BuildPlacement {
+            box_name: name.to_string(),
+            leaf,
+        };
+        let mut tap = BuildTap::default();
+        for event in build_events("fetcher", &download) {
+            tap.observe(&event, &placement);
+        }
+        tap.refusal(&placement)
+    };
+    assert_eq!(
+        run("sealed", Some(sealed)).as_deref(),
+        Some(
+            "the build of fetcher could not reach downloads.example.org: \
+             the egress rules of box sealed do not allow it"
+        )
+    );
+    assert_eq!(run("open", Some(open)), None);
+    assert_eq!(run("unplaced", None), None);
+}
+
+/// NET-155: the error of a build the box's egress rules refused names the
+/// destination the build could not reach and the box whose rules refused
+/// it, for the failure lines of `curl`, `wget` and `git`.
+#[test]
+fn box_package_build_refusal_names_destination_and_box() {
+    use crate::env::{egress_refusal, refused_destination};
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let deny = ClassifierLeaf::under(root, "b1", Verdict::Deny);
+    let allow = ClassifierLeaf::under(root, "b1", Verdict::Allow);
+
+    let cases: [(&str, &str); 6] = [
+        (
+            "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server",
+            "example.com:443",
+        ),
+        (
+            "curl: (6) Could not resolve host: example.com",
+            "example.com",
+        ),
+        (
+            "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com",
+            "github.com",
+        ),
+        (
+            "Resolving example.com (example.com)... failed: Temporary failure in name resolution.",
+            "example.com",
+        ),
+        (
+            "Connecting to example.com (example.com)|93.184.215.14|:443... failed: No route to host.",
+            "example.com:443",
+        ),
+        (
+            "Connecting to 93.184.215.14:80... failed: No route to host.",
+            "93.184.215.14:80",
+        ),
+    ];
+    for (line, destination) in cases {
+        assert_eq!(
+            refused_destination(["make: entering", line]).as_deref(),
+            Some(destination),
+            "{line}"
+        );
+        assert_eq!(
+            egress_refusal(Some(&deny), "hello", "my-box", [line]),
+            Some(format!(
+                "the build of hello could not reach {destination}: \
+                 the egress rules of box my-box do not allow it"
+            )),
+        );
+        // An allowed box's failure is the destination's, not the rules'.
+        assert_eq!(
+            egress_refusal(Some(&allow), "hello", "my-box", [line]),
+            None
+        );
+        assert_eq!(egress_refusal(None, "hello", "my-box", [line]), None);
+    }
+    // A failure that names no destination is left as the build said it.
+    assert_eq!(
+        egress_refusal(Some(&deny), "hello", "my-box", ["error: cc failed"]),
+        None
+    );
+}

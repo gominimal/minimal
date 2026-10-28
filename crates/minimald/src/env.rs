@@ -612,6 +612,7 @@ impl Env {
         // names the leaf it entered on its launch log line. `None` on a host
         // that places no box: the config above is the whole story, exactly as
         // it was before the classifier existed.
+        let classifier_leaf = args.classifier_leaf.clone();
         let config = match args.classifier_leaf {
             Some(leaf) => config.with_classifier_leaf(leaf),
             None => config,
@@ -677,6 +678,7 @@ impl Env {
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
             box_id,
+            classifier_leaf,
             session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
@@ -1447,6 +1449,10 @@ struct BoxChannel {
     /// in one, else the session's name — so the daemon's own fetches are
     /// recorded with the box that asked for them.
     box_id: String,
+    /// The box's classifier leaf (NET-155): the in-box patched build runs in
+    /// it, so the box's egress verdict decides what the build can reach.
+    /// `None` on a host that places no box.
+    classifier_leaf: Option<ClassifierLeaf>,
     /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
     /// an env built without one (tests).
     session_id: Option<boxes::SessionId>,
@@ -1937,6 +1943,7 @@ impl BoxChannel {
         let mut build_graph = graph.clone();
         build_graph.top_levels = vec![bsr];
 
+        let tapped = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
             let remote_cache = if ctx.use_remote_cache() {
@@ -1954,12 +1961,24 @@ impl BoxChannel {
 
             let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
+            // NET-155: the build runs in the box's own leaf, so the box's
+            // egress verdict decides what it can reach.
+            tracing::info!(
+                box_name = %self.name,
+                package = %pkg_name,
+                leaf = %self
+                    .classifier_leaf
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), |leaf| leaf.dir().display().to_string()),
+                "starting a package build for a box in the box's classifier leaf",
+            );
             let res = op::PatchedBuild {
                 spec: &bsr,
                 remote_fetcher: &remote_storage,
-                stdout_writer: Some(Box::new(stdout_writer)),
-                stderr_writer: Some(Box::new(stderr_writer)),
+                stdout_writer: Some(Box::new(LineTap::new(stdout_writer, tapped.clone()))),
+                stderr_writer: Some(Box::new(LineTap::new(stderr_writer, tapped.clone()))),
                 remote_cache: remote_cache.as_ref(),
+                classifier_leaf: self.classifier_leaf.clone(),
             }
             .run(&op::Options {
                 cache,
@@ -1979,6 +1998,19 @@ impl BoxChannel {
         .await;
 
         if let Err(e) = result {
+            // NET-155: a build the box's rules refused names the destination
+            // and the box before the build's own error.
+            let lines = tapped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(refusal) = egress_refusal(
+                self.classifier_leaf.as_ref(),
+                pkg_name,
+                &self.name,
+                lines.iter().map(String::as_str),
+            ) {
+                let _ = writeln!(stream, "error: {refusal}");
+            }
             let _ = writeln!(stream, "error: {e}");
             return;
         }
@@ -2750,6 +2782,155 @@ impl tokio::io::AsyncWrite for StreamWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
     }
+}
+
+/// How many output lines of one build [`LineTap`] keeps.
+const TAPPED_LINES: usize = 64;
+
+/// A writer that passes every byte to `inner` and keeps the last
+/// [`TAPPED_LINES`] complete lines in `lines` (NET-155), so a build that
+/// fails can say what it could not reach.
+struct LineTap<W> {
+    inner: W,
+    buf: Vec<u8>,
+    lines: Arc<Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl<W> LineTap<W> {
+    fn new(inner: W, lines: Arc<Mutex<std::collections::VecDeque<String>>>) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            lines,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = &mut *self;
+        let written = match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => n,
+            other => return other,
+        };
+        this.buf.extend_from_slice(&buf[..written]);
+        while let Some(pos) = this.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&this.buf[..pos]).into_owned();
+            this.buf.drain(..=pos);
+            let mut lines = this
+                .lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lines.len() == TAPPED_LINES {
+                lines.pop_front();
+            }
+            lines.push_back(line);
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// The destination a failed build's output says it could not reach
+/// (NET-155), read from the last lines the build printed. It knows the
+/// failure lines of `curl` and `wget`, which also cover `git` over HTTPS:
+/// a host it could not resolve, or a host and port it could not connect to.
+/// `None` when no line names a destination.
+pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let word = |rest: &str| -> Option<String> {
+        let host: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+            .collect();
+        let host = host.trim_end_matches(['.', ':']);
+        (!host.is_empty()).then(|| host.to_string())
+    };
+    lines.into_iter().find_map(|line| {
+        // curl: `Could not resolve host: example.com`
+        if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
+            return word(rest);
+        }
+        // curl: `Failed to connect to example.com port 443 after 3 ms: ...`
+        if let Some((_, rest)) = line.split_once("Failed to connect to ") {
+            let host = word(rest)?;
+            let port = rest
+                .split_once(" port ")
+                .map(|(_, p)| {
+                    p.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .filter(|p| !p.is_empty());
+            return Some(match port {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            });
+        }
+        // wget: `Resolving example.com (example.com)... failed: ...`
+        if let Some(rest) = line.strip_prefix("Resolving ")
+            && line.contains("... failed")
+        {
+            return word(rest);
+        }
+        // wget: `Connecting to example.com (example.com)|1.2.3.4|:443... failed: ...`
+        if let Some(rest) = line.strip_prefix("Connecting to ")
+            && line.contains("... failed")
+        {
+            let host = word(rest)?;
+            let port = rest
+                .rsplit_once("|:")
+                .map(|(_, p)| {
+                    p.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .filter(|p| !p.is_empty());
+            return Some(match port {
+                Some(port) if !host.ends_with(&format!(":{port}")) => format!("{host}:{port}"),
+                _ => host,
+            });
+        }
+        None
+    })
+}
+
+/// The error line for a package build that the egress rules of its box
+/// refused (NET-155), or `None` when the refusal is not the rules'. A box in
+/// the deny subtree of the classifier tree is refused every destination, so
+/// any destination its build could not reach was refused by the box's rules.
+/// A box in the allow subtree is refused nothing there, so its failures are
+/// left as the build reported them.
+pub(crate) fn egress_refusal<'a>(
+    leaf: Option<&ClassifierLeaf>,
+    package: &str,
+    box_name: &str,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if !leaf.is_some_and(ClassifierLeaf::is_deny) {
+        return None;
+    }
+    let destination = refused_destination(lines)?;
+    Some(format!(
+        "the build of {package} could not reach {destination}: \
+         the egress rules of box {box_name} do not allow it"
+    ))
 }
 
 #[cfg(test)]
@@ -3540,6 +3721,7 @@ exit $rc
                 .unwrap(),
             has_packages: HashSet::new(),
             box_id: "a session in a test".to_string(),
+            classifier_leaf: None,
             session_id: None,
             ot: None,
             session,

@@ -392,6 +392,74 @@ enum Op {
     },
 }
 
+/// Where a box's package builds run (NET-155): the box they run for and
+/// its classifier leaf. The leaf is `None` when the box has none, and the
+/// builds then run in the daemon's own cgroup.
+#[derive(Debug, Clone)]
+pub(crate) struct BuildPlacement {
+    /// The box's name, as `min ls` shows it.
+    pub box_name: String,
+    /// The box's classifier leaf, if its launch placed it in one.
+    pub leaf: Option<sandbox::config::ClassifierLeaf>,
+}
+
+/// How many output lines of one package build [`BuildTap`] keeps.
+const TAP_LINES: usize = 64;
+
+/// Watches the events of a box's build side-op (NET-155). It logs each
+/// package build as it starts, and it keeps the last lines of each build's
+/// output, so a build the box's egress rules refused can name what it could
+/// not reach.
+#[derive(Debug, Default)]
+pub(crate) struct BuildTap {
+    builds: std::collections::HashMap<usize, (String, std::collections::VecDeque<String>)>,
+}
+
+impl BuildTap {
+    /// Records one build event.
+    pub(crate) fn observe(&mut self, event: &BuildEvent, placement: &BuildPlacement) {
+        match &event.inner {
+            orchestrator::BuildEventInner::Start { name, .. } => {
+                tracing::info!(
+                    box_name = %placement.box_name,
+                    package = %name,
+                    leaf = %placement
+                        .leaf
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), |leaf| leaf.dir().display().to_string()),
+                    "starting a package build for a box in the box's classifier leaf",
+                );
+                self.builds
+                    .insert(event.idx, (name.clone(), Default::default()));
+            }
+            orchestrator::BuildEventInner::Log { line, .. } => {
+                if let Some((_, lines)) = self.builds.get_mut(&event.idx) {
+                    if lines.len() == TAP_LINES {
+                        lines.pop_front();
+                    }
+                    lines.push_back(line.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The refusal to report, if the box's egress rules refused a
+    /// destination one of its package builds tried to reach.
+    pub(crate) fn refusal(&self, placement: &BuildPlacement) -> Option<String> {
+        let mut builds: Vec<_> = self.builds.iter().collect();
+        builds.sort_by_key(|(idx, _)| **idx);
+        builds.into_iter().find_map(|(_, (package, lines))| {
+            crate::env::egress_refusal(
+                placement.leaf.as_ref(),
+                package,
+                &placement.box_name,
+                lines.iter().map(String::as_str),
+            )
+        })
+    }
+}
+
 /// Session side-operation.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -448,11 +516,19 @@ impl SideOp {
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
+        placement: BuildPlacement,
         buffer: usize,
     ) -> Result<(Self, mpsc::Receiver<BuildUpdate>), std::io::Error> {
         let (tx, rx) = mpsc::channel(buffer);
-        let sop =
-            Self::new_build(session, rebuild, pkgs, ctx, vec![BuildSink::Structured(tx)]).await?;
+        let sop = Self::new_build(
+            session,
+            rebuild,
+            pkgs,
+            ctx,
+            placement,
+            vec![BuildSink::Structured(tx)],
+        )
+        .await?;
         Ok((sop, rx))
     }
 
@@ -462,8 +538,14 @@ impl SideOp {
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
+        placement: BuildPlacement,
         sinks: Vec<BuildSink>,
     ) -> Result<Self, std::io::Error> {
+        // NET-155: every package build of this op runs in the box's leaf.
+        let ctx = match &placement.leaf {
+            Some(leaf) => ctx.with_classifier_leaf(leaf.clone()),
+            None => ctx,
+        };
         // `graph_from_all_packages` is CPU-heavy, run on blocking pool.
         let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
@@ -493,12 +575,15 @@ impl SideOp {
                 // Pump task: drain the log channel until the build drops its
                 // sender (on completion or cancellation).
                 let pump = crate::traced::spawn(async move {
+                    let mut tap = BuildTap::default();
                     while let Some(event) = log_rx.next().await {
+                        tap.observe(&event, &placement);
                         let inner = pump_inner.lock().await;
                         for sink in &inner.sinks {
                             let _ = sink.try_send(BuildUpdate::Event(event.clone()));
                         }
                     }
+                    tap.refusal(&placement)
                 });
 
                 // Do the build. Reduce its `!Send` error (`mctx::Error` holds
@@ -514,7 +599,7 @@ impl SideOp {
                         Some(e.to_string())
                     }
                 };
-                let _ = pump.await;
+                let refusal = pump.await.ok().flatten();
 
                 // Classify the terminal outcome. A build that returned `Ok` is
                 // a success even if the token was cancelled afterwards (e.g. a
@@ -524,7 +609,12 @@ impl SideOp {
                 let outcome = match build_err {
                     None => BuildOutcome::Success,
                     Some(_) if cancel_flag.is_cancelled() => BuildOutcome::Cancelled,
-                    Some(msg) => BuildOutcome::Failed(msg),
+                    // NET-155: a build the box's rules refused names the
+                    // destination and the box before the build's own error.
+                    Some(msg) => BuildOutcome::Failed(match refusal {
+                        Some(refusal) => format!("{refusal}\n{msg}"),
+                        None => msg,
+                    }),
                 };
 
                 finish(&build_inner, BuildUpdate::Finished(outcome)).await;
