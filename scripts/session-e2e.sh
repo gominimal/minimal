@@ -16892,6 +16892,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     if cred_case_log \
       | grep -F -- "recorded the box's refused egress in the host audit log" \
       | grep -F -- '"box":"e2e-cred-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
       | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
       nolane_audit_found=1
       break
@@ -17335,6 +17336,7 @@ proof_proxy_sees_boxes_by_address() {
     if cred_case_log \
       | grep -F -- "recorded the box's refused egress in the host audit log" \
       | grep -F -- '"box":"e2e-psba-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
       | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
       psba_nolane_audit_found=1
       break
@@ -22489,9 +22491,9 @@ proof_expose_from_inside_box() {
       fail
     fi
     case "$eib_deny_lines" in
-      *'"decision":"deny"'*'"decided_by":"box-policy"'*'"outcome":"refused"'*) ;;
+      *'"reported_by":"guest"'*'"decision":"deny"'*'"decided_by":"box-policy"'*'"outcome":"refused"'*) ;;
       *)
-        echo "::error::the host audit's expose_decision line for $eib_deny_name is not a deny decided by box-policy and refused (NET-046)"
+        echo "::error::the host audit's expose_decision line for $eib_deny_name is not a deny reported by the guest, decided by box-policy and refused (NET-046)"
         echo "  $eib_deny_lines"
         fail
         ;;

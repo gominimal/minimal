@@ -2157,6 +2157,9 @@ struct ExposeDecisionAudit {
     ts: u64,
     /// Always `expose_decision`.
     event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
     /// The box the decision was about, from the row.
     #[serde(rename = "box")]
     box_name: String,
@@ -2180,6 +2183,9 @@ struct RefusedEgressAudit {
     ts: u64,
     /// Always `egress_refused`.
     event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
     /// The box whose flow was refused, from the row.
     #[serde(rename = "box")]
     box_name: String,
@@ -2316,6 +2322,7 @@ fn audit_expose_decision(
             decision = ?request.decision,
             decided_by = ?request.decided_by,
             outcome = ?request.outcome,
+            reported_by = "guest",
             "recorded the box's expose decision in the host audit log"
         );
         append_audit_line(
@@ -2323,6 +2330,7 @@ fn audit_expose_decision(
             &ExposeDecisionAudit {
                 ts: unix_now_secs(),
                 event: "expose_decision",
+                reported_by: "guest",
                 box_name: record.name().to_string(),
                 switch_address: request.switch_address,
                 port: request.port,
@@ -2377,6 +2385,7 @@ fn audit_refused_egress(
             %destination,
             %proto,
             %rule,
+            reported_by = "guest",
             "recorded the box's refused egress in the host audit log"
         );
         append_audit_line(
@@ -2384,6 +2393,7 @@ fn audit_refused_egress(
             &RefusedEgressAudit {
                 ts: unix_now_secs(),
                 event: "egress_refused",
+                reported_by: "guest",
                 box_name: record.name().to_string(),
                 switch_address: request.switch_address,
                 destination: request.destination,
@@ -7352,7 +7362,9 @@ mod tests {
         assert_eq!(records[0]["decision"], "deny");
         assert_eq!(records[0]["decided_by"], "box-policy");
         assert_eq!(records[0]["outcome"], "refused");
+        assert_eq!(records[0]["reported_by"], "guest");
         assert_eq!(records[1]["port"], 3000);
+        assert_eq!(records[1]["reported_by"], "guest");
         assert_eq!(records[1]["decision"], "allow");
         assert_eq!(records[1]["outcome"], "published");
     }
@@ -7404,6 +7416,7 @@ mod tests {
         assert_eq!(records[0]["destination"], "203.0.113.9:443");
         assert_eq!(records[0]["proto"], "tcp");
         assert_eq!(records[0]["rule"], "undeclared subnet");
+        assert_eq!(records[0]["reported_by"], "guest");
 
         // A flood of distinct flows writes up to the cap, and the rest are
         // counted, not written.
