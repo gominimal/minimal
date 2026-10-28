@@ -612,13 +612,14 @@ pub struct InterimPublish {
 /// egress rules its own outbound frames are decided by — the same rules a
 /// request from it is put to, exactly as a direct connection from it would be
 /// ([`super::switch::proxied_request_verdict`]). Named by the
-/// lease-to-session map ([`HostnameRegistry::by_lease`]), so only a box on the
-/// switch is ever a caller: a host-side client has no declaration to honour
-/// and no gate of its own on a direct connection either.
+/// lease-to-session map ([`HostnameRegistry::by_lease`]) for a box on the
+/// switch, and by the box that owns the connecting socket for a host-address
+/// box ([`HostnameRegistry::caller_owning`]). A host-side client is no
+/// caller: it has no declaration to honour.
 #[derive(Debug, Clone)]
 pub struct Caller {
-    /// The switch lease the caller's box holds: the address its proxied
-    /// connections come from, and the address a refusal log names it by.
+    /// The address the caller's proxied connections come from: the switch
+    /// lease its box holds, or the node's address for a host-address box.
     lease: Ipv4Addr,
     /// The caller's session name, for the refusal log.
     name: String,
@@ -1048,8 +1049,9 @@ impl HostnameRegistry {
     /// carry (NET-084) and the two surfaces decide by one rule set (NET-071).
     /// `None` when the lease names no session — which is what a host-side
     /// caller (the developer's browser, the daemon's own lanes) is, and what a
-    /// host-address session is too: neither has a box on the switch, and
-    /// neither's egress is gated on a direct connection either.
+    /// host-address session is too: neither has a box on the switch. A
+    /// host-address box is named by the socket it connects from instead
+    /// ([`Self::caller_owning`]).
     #[must_use]
     pub fn caller_at(&self, lease: Ipv4Addr) -> Option<Caller> {
         let id = self.by_lease.get(&lease)?;
@@ -1064,6 +1066,42 @@ impl HostnameRegistry {
                 facts.hostname_proxy_port,
             ),
         })
+    }
+
+    /// The caller a connection from the node's address stands for
+    /// (NET-070): the live host-address box `owner`, which owns the
+    /// connecting socket ([`connecting_box`]), with its egress rules compiled
+    /// with `from`, the address the connection came from, as their source.
+    /// A host-address box holds no switch lease, so [`Self::caller_at`]
+    /// cannot name it. `None` when `owner` has no caller facts, or when it is
+    /// an own-address box, whose connections come from its lease.
+    #[must_use]
+    pub fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<Caller> {
+        if self.own.contains_key(&owner) || self.by_lease.values().any(|id| *id == owner) {
+            return None;
+        }
+        let facts = self.callers.get(&owner)?;
+        Some(Caller {
+            lease: from,
+            name: facts.name.clone(),
+            egress: super::switch::compiled_egress(
+                Some(&facts.policy),
+                facts.subnet,
+                from,
+                facts.hostname_proxy_port,
+            ),
+        })
+    }
+
+    /// Whether any live session with caller facts holds no switch lease: a
+    /// host-address box, or a box whose lease is not reported yet. While
+    /// none does, no connection from the node's address can be a box's, so
+    /// the proxy does not look up who owns the connecting socket.
+    #[must_use]
+    pub fn has_unleased_callers(&self) -> bool {
+        self.callers
+            .keys()
+            .any(|id| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id))
     }
 
     /// The own-address publishes standing inside the reserved local range, as
@@ -2788,6 +2826,116 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
     );
 }
 
+/// The box that owns the client end of a TCP connection to this host
+/// (NET-070): `peer` is the client's address and `local` the address it
+/// connected to, as the accepting side sees them. The kernel's socket tables
+/// give the client socket's inode, the process that holds a descriptor for
+/// it, and that process's cgroup. A host-address box's processes run in its
+/// classifier leaf, `boxes/<allow|deny>/<box id>`, and the leaf's name is the
+/// box's id. `None` when any step finds nothing: the client is not on this
+/// host's network namespace, its process is not visible to this one, or it
+/// runs in no box's leaf, as the developer's browser does.
+#[must_use]
+pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> Option<SessionId> {
+    #[cfg(target_os = "linux")]
+    {
+        let inode = client_socket_inode(peer, local)?;
+        let pid = socket_holder(inode)?;
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        box_in_cgroup(&cgroup)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (peer, local);
+        None
+    }
+}
+
+/// The kernel's socket-table spelling of an IPv4 socket address: the
+/// address as one little-endian word, then the port, both in upper-case hex
+/// (`0100007F:1F90` for `127.0.0.1:8080`), and the v4-mapped IPv6 spelling
+/// the `tcp6` table prints for the same address.
+fn socket_table_keys(addr: SocketAddrV4) -> [String; 2] {
+    let word = u32::from(*addr.ip()).swap_bytes();
+    let port = addr.port();
+    [
+        format!("{word:08X}:{port:04X}"),
+        format!("0000000000000000FFFF0000{word:08X}:{port:04X}"),
+    ]
+}
+
+/// The inode of the socket whose local end is `peer` and whose remote end is
+/// `local`: the client end of a connection the accepting side sees from
+/// `peer` to `local`.
+#[cfg(target_os = "linux")]
+fn client_socket_inode(peer: SocketAddrV4, local: SocketAddrV4) -> Option<u64> {
+    let ours = socket_table_keys(peer);
+    let theirs = socket_table_keys(local);
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        if let Some(inode) = socket_row_inode(&text, &ours, &theirs) {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+/// The inode of the first row of one socket table whose local address is
+/// one of `ours` and whose remote address is one of `theirs`. Inode `0` is
+/// a socket no process holds (a time-wait row), so it is skipped.
+fn socket_row_inode(table: &str, ours: &[String; 2], theirs: &[String; 2]) -> Option<u64> {
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (local, remote, inode) = (fields.get(1)?, fields.get(2)?, fields.get(9)?);
+        if !ours.iter().any(|key| key == local) || !theirs.iter().any(|key| key == remote) {
+            return None;
+        }
+        inode.parse().ok().filter(|inode| *inode != 0)
+    })
+}
+
+/// The first process that holds a descriptor for the socket `inode`.
+#[cfg(target_os = "linux")]
+fn socket_holder(inode: u64) -> Option<u32> {
+    let target = format!("socket:[{inode}]");
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let fds = std::fs::read_dir(entry.path().join("fd")).ok()?;
+            fds.flatten()
+                .any(|fd| {
+                    std::fs::read_link(fd.path())
+                        .is_ok_and(|link| link.as_os_str() == target.as_str())
+                })
+                .then_some(pid)
+        })
+}
+
+/// The box whose classifier leaf a process's `/proc/<pid>/cgroup` names:
+/// the path component after `boxes/allow` or `boxes/deny`, read as a box id.
+/// `None` for a process in no box's leaf.
+fn box_in_cgroup(cgroup: &str) -> Option<SessionId> {
+    use sandbox::classifier::BOXES_DIR;
+    let subtrees = [
+        sandbox::config::Verdict::Allow.dir_name(),
+        sandbox::config::Verdict::Deny.dir_name(),
+    ];
+    cgroup.lines().find_map(|line| {
+        // cgroup2's line is `0::<path>`; a v1 line names a controller.
+        let path = line.strip_prefix("0::")?;
+        let parts: Vec<&str> = path.split('/').collect();
+        parts.windows(3).find_map(|window| {
+            (window[0] == BOXES_DIR && subtrees.contains(&window[1]))
+                .then(|| SessionId::parse_str(window[2]).ok())
+                .flatten()
+        })
+    })
+}
+
 /// The wall clock the record stamps grants with, in Unix seconds — the same
 /// clock a daemon stamps its own start with (the stamp the manager passes
 /// to [`LoopbackLeaseBook::release_dead_boxes`]), so the sweep's
@@ -2881,6 +3029,73 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-070's socket-owner lookup, step by step. The cgroup a process
+    /// reports names its box when it runs in a classifier leaf, in either
+    /// subtree, and names no box otherwise.
+    #[test]
+    fn box_in_cgroup_reads_the_classifier_leaf() {
+        let id = "00000000-0000-0000-0000-0000000000aa";
+        let want = SessionId::parse_str(id).ok();
+        for subtree in ["allow", "deny"] {
+            let cgroup = format!("0::/minimald.slice/boxes/{subtree}/{id}\n");
+            assert_eq!(box_in_cgroup(&cgroup), want, "{subtree}");
+        }
+        for cgroup in [
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+            "0::/minimald.slice/boxes/other/00000000-0000-0000-0000-0000000000aa\n",
+            "0::/minimald.slice/boxes/allow/not-a-box-id\n",
+            "4:cpu:/minimald.slice/boxes/allow/00000000-0000-0000-0000-0000000000aa\n",
+        ] {
+            assert_eq!(box_in_cgroup(cgroup), None, "{cgroup}");
+        }
+    }
+
+    /// The socket table row of a connection's client end is the one whose
+    /// local address is the peer and whose remote address is the proxy's,
+    /// in the v4 table and in the v4-mapped spelling of the v6 table alike.
+    #[test]
+    fn socket_row_inode_finds_the_client_end() {
+        let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), 40000);
+        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+        let ours = socket_table_keys(peer);
+        let theirs = socket_table_keys(local);
+        assert_eq!(ours[0], "0400007F:9C40");
+        assert_eq!(theirs[0], "0100007F:1F90");
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+        let v4 = format!(
+            "{header}\n   0: 0100007F:1F90 0400007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 111 1\n   1: 0400007F:9C40 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 222 1\n"
+        );
+        assert_eq!(socket_row_inode(&v4, &ours, &theirs), Some(222));
+        let v6 = format!(
+            "{header}\n   0: 0000000000000000FFFF00000400007F:9C40 0000000000000000FFFF00000100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 333 1\n"
+        );
+        assert_eq!(socket_row_inode(&v6, &ours, &theirs), Some(333));
+        let time_wait = format!(
+            "{header}\n   0: 0400007F:9C40 0100007F:1F90 06 00000000:00000000 00:00000000 00000000     0        0 0 1\n"
+        );
+        assert_eq!(socket_row_inode(&time_wait, &ours, &theirs), None);
+    }
+
+    /// The kernel half of the lookup, against a real connection: the client
+    /// socket's inode is found from the accepting side's view, and the
+    /// process that holds it is this one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connecting_socket_holder_is_found() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, listener.local_addr().unwrap())
+        else {
+            panic!("an IPv4 connection");
+        };
+        let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
+        assert_eq!(socket_holder(inode), Some(std::process::id()));
+        // A test process runs in no box's leaf, so it is no box.
+        assert_eq!(connecting_box(peer, local), None);
+        drop(client);
+    }
 
     /// A lease an attach path would report, with an `18080:8080` ingress
     /// declaration behind it.

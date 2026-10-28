@@ -35,7 +35,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,8 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
 };
 use tokio::net::{TcpListener, TcpStream};
+
+use boxes::SessionId;
 
 use super::dns::HostnameRegistry;
 use super::policy::Direction;
@@ -102,6 +104,17 @@ pub trait HostRoute: Send + Sync + 'static {
     /// box holds the lease, which is what a host-side peer is (the developer's
     /// browser, the daemon's own lanes).
     fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller>;
+
+    /// The caller a connection from the node's address stands for (NET-070):
+    /// the live host-address box `owner`, which owns the connecting socket,
+    /// with its egress rules compiled with `from` as their source. `None`
+    /// when `owner` is no live host-address box.
+    fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<super::dns::Caller>;
+
+    /// Whether any live caller holds no switch lease. While none does, a
+    /// connection from the node's address cannot be a box's, and the proxy
+    /// does not look up who owns the connecting socket.
+    fn has_unleased_callers(&self) -> bool;
 }
 
 impl HostRoute for HostnameRegistry {
@@ -111,6 +124,14 @@ impl HostRoute for HostnameRegistry {
 
     fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller> {
         self.caller_at(lease)
+    }
+
+    fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<super::dns::Caller> {
+        self.caller_owning(owner, from)
+    }
+
+    fn has_unleased_callers(&self) -> bool {
+        self.has_unleased_callers()
     }
 }
 
@@ -136,6 +157,20 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
             Err(poisoned) => poisoned.into_inner().caller_at(lease),
         }
     }
+
+    fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<super::dns::Caller> {
+        match self.read() {
+            Ok(guard) => guard.caller_owning(owner, from),
+            Err(poisoned) => poisoned.into_inner().caller_owning(owner, from),
+        }
+    }
+
+    fn has_unleased_callers(&self) -> bool {
+        match self.read() {
+            Ok(guard) => guard.has_unleased_callers(),
+            Err(poisoned) => poisoned.into_inner().has_unleased_callers(),
+        }
+    }
 }
 
 /// The admit-or-drop decision every proxied request is put to before the
@@ -145,6 +180,12 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
 /// the router stays a small `Clone` value handed to every connection task.
 pub type SharedVerdict = fn(Option<&super::dns::Caller>, &super::dns::Route, u16) -> ProxiedRequest;
 
+/// Names the box that owns the client end of a connection from the node's
+/// address: `(peer, local)` as the accepting side sees them. The production
+/// lookup is [`super::dns::connecting_box`], which reads the kernel's socket
+/// tables and the holder's cgroup.
+pub type SocketOwner = fn(SocketAddrV4, SocketAddrV4) -> Option<SessionId>;
+
 /// The shared routing core: maps an HTTP authority (`host` or `host:port`) to
 /// the upstream socket address a request forwards to.
 pub struct Router<T> {
@@ -152,6 +193,9 @@ pub struct Router<T> {
     /// The verdict each request is put to (see [`SharedVerdict`]), applied
     /// before the proxy dials the upstream.
     verdict: SharedVerdict,
+    /// Names the box that owns a connection from the node's address (see
+    /// [`SocketOwner`]).
+    owner: SocketOwner,
 }
 
 // Manual `Clone` so a `Router` is cheap to hand to each connection task without
@@ -161,6 +205,7 @@ impl<T> Clone for Router<T> {
         Self {
             table: Arc::clone(&self.table),
             verdict: self.verdict,
+            owner: self.owner,
         }
     }
 }
@@ -171,7 +216,21 @@ impl<T: HostRoute> Router<T> {
     /// [`super::switch::proxied_request_verdict`] in every production caller.
     #[must_use]
     pub fn new(table: Arc<T>, verdict: SharedVerdict) -> Self {
-        Self { table, verdict }
+        Self {
+            table,
+            verdict,
+            owner: super::dns::connecting_box,
+        }
+    }
+
+    /// Replaces the socket-owner lookup. A test hook: a test process runs in
+    /// no box's classifier leaf, so the kernel lookup can never name a box
+    /// for it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_socket_owner(mut self, owner: SocketOwner) -> Self {
+        self.owner = owner;
+        self
     }
 
     /// Routes an HTTP authority to its upstream socket address, or `None` if no
@@ -216,6 +275,42 @@ impl<T: HostRoute> Router<T> {
     /// to (NET-070).
     fn caller_at(&self, lease: Ipv4Addr) -> Option<super::dns::Caller> {
         self.table.caller_at(lease)
+    }
+
+    /// The caller a connection from `peer` to `local` stands for (NET-070).
+    /// A peer at a live box's switch lease is that box. Any other peer is
+    /// the node's address, and the caller is the host-address box that owns
+    /// the connecting socket, if one does. The socket lookup reads `/proc`,
+    /// so it runs off the async workers, and it runs only while some live
+    /// caller holds no switch lease.
+    async fn caller_for(
+        &self,
+        peer: SocketAddrV4,
+        local: Option<SocketAddr>,
+    ) -> Option<super::dns::Caller> {
+        if let Some(caller) = self.caller_at(*peer.ip()) {
+            return Some(caller);
+        }
+        let Some(SocketAddr::V4(local)) = local else {
+            return None;
+        };
+        if !self.table.has_unleased_callers() {
+            return None;
+        }
+        let owner = self.owner;
+        let box_id = crate::traced::spawn_blocking(move || owner(peer, local))
+            .await
+            .ok()
+            .flatten()?;
+        let caller = self.table.caller_owning(box_id, *peer.ip());
+        tracing::debug!(
+            component = "dns-proxy",
+            %peer,
+            %box_id,
+            caller = caller.as_ref().map_or("none", super::dns::Caller::name),
+            "named the box that owns a proxied connection from the node's address"
+        );
+        caller
     }
 }
 
@@ -352,7 +447,8 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
         let (client, peer) = listener.accept().await?;
         let router = router.clone();
         crate::traced::spawn(async move {
-            if let Err(error) = handle_connection_io(client, Some(peer), &router).await {
+            let local = client.local_addr().ok();
+            if let Err(error) = handle_connection_io(client, Some(peer), local, &router).await {
                 tracing::debug!(
                     component = "dns-proxy",
                     %peer,
@@ -384,6 +480,8 @@ struct ParsedRequest<'a> {
 /// core serves the egress proxy's `TcpStream` and any other byte stream a
 /// caller hands it. `peer` is the client's address when the transport has one
 /// — what names the caller whose egress rules the request is put to (NET-070).
+/// `local` is the address the client connected to: with `peer`, it finds the
+/// connecting socket a host-address box owns.
 ///
 /// Every refusal — a head that never arrives, an unparseable head, a host no
 /// live PTask owns, an upstream that will not accept the connection, a request
@@ -393,6 +491,7 @@ struct ParsedRequest<'a> {
 async fn handle_connection_io<C, T>(
     mut client: C,
     peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
     router: &Router<T>,
 ) -> io::Result<()>
 where
@@ -474,13 +573,15 @@ where
 
     // Who the request came from (NET-070): a peer at a live box's switch lease
     // is that box, with the egress rules its own outbound frames are decided
-    // by; any other peer — a host-side client, a box with no lease on the
-    // switch — is no caller, and its egress is ungated here exactly as a
-    // direct connection from it would be (NET-071).
-    let caller = peer.and_then(|peer| match peer {
-        SocketAddr::V4(v4) => router.caller_at(*v4.ip()),
-        SocketAddr::V6(_) => None,
-    });
+    // by. A peer at the node's address is the host-address box that owns the
+    // connecting socket, with that box's egress rules. Any other peer — a
+    // host-side client such as the developer's browser — is no caller, and
+    // its egress is ungated here exactly as a direct connection from it would
+    // be (NET-071).
+    let caller = match peer {
+        Some(SocketAddr::V4(peer)) => router.caller_for(peer, local).await,
+        _ => None,
+    };
 
     // The shared verdict, before the proxy dials anything: a request the
     // switch's own gates would refuse is refused here, where the host, the
@@ -1934,7 +2035,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(60),
-            handle_connection_io(proxy_side, None, &router),
+            handle_connection_io(proxy_side, None, None, &router),
         )
         .await
         .expect("the proxy must bound the upstream dial, not wait out the SYN retries")
@@ -3246,7 +3347,7 @@ mod tests {
         let (buf, guard) = capture_logs();
         let (mut client, proxy_side) = tokio::io::duplex(1024);
         client.write_all(head(port).as_bytes()).await.unwrap();
-        handle_connection_io(proxy_side, None, &router)
+        handle_connection_io(proxy_side, None, None, &router)
             .await
             .unwrap();
         drop(guard);
@@ -3573,6 +3674,127 @@ mod tests {
             logged.contains(r#"status="403 Forbidden""#),
             "expected the refusal to name the status it sent, got: {logged}"
         );
+    }
+
+    /// The node addresses the host-address callers below connect from: one
+    /// per box, so the stub socket-owner lookup can tell them apart.
+    const HOST_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 4);
+    const OPEN_HOST_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 5);
+    const BROWSER_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 6);
+    const HOST_BOX: &str = "00000000-0000-0000-0000-000000000011";
+    const OPEN_HOST_BOX: &str = "00000000-0000-0000-0000-000000000012";
+
+    /// The socket-owner lookup a host-address box's connection meets, with
+    /// the kernel's answer stood in: a test process runs in no box's leaf.
+    /// The connection from [`HOST_BOX_ADDR`] is owned by the deny-all box,
+    /// the one from [`OPEN_HOST_BOX_ADDR`] by the box with no egress rules,
+    /// and any other connection by no box, as the developer's browser's is.
+    fn stub_socket_owner(peer: SocketAddrV4, local: SocketAddrV4) -> Option<SessionId> {
+        assert_eq!(
+            *local.ip(),
+            Ipv4Addr::LOCALHOST,
+            "local is the proxy's address"
+        );
+        match *peer.ip() {
+            HOST_BOX_ADDR => SessionId::parse_str(HOST_BOX).ok(),
+            OPEN_HOST_BOX_ADDR => SessionId::parse_str(OPEN_HOST_BOX).ok(),
+            _ => None,
+        }
+    }
+
+    /// NET-070 for a host-address caller: a host-address box holds no switch
+    /// lease, so its request reaches the hostname proxy from the node's
+    /// address. The proxy names the caller by the box that owns the
+    /// connecting socket, and puts the request to that box's egress rules,
+    /// as it does for a switch-lease caller. A deny-all host-address box's
+    /// request to another box is refused, and the refusal line names it. A
+    /// host-address box with no egress rules, and a connection no box owns,
+    /// send the same request and it routes.
+    #[tokio::test]
+    async fn proxy_host_address_caller_egress_denied() {
+        let backend_port = spawn_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+        let open_box = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        // The target: an own-address box publishing one port.
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        // The callers: host-address boxes, as the session actor records them.
+        // Neither ever reports a switch lease.
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        let no_rules = BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        for (id, name, policy) in [
+            (host_box, "hostbox", deny_all),
+            (open_box, "openbox", no_rules),
+        ] {
+            reg.register_host_net(id, name);
+            reg.register_caller(id, name, &policy, subnet, None);
+        }
+        let router = Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict)
+            .with_socket_owner(stub_socket_owner);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let (buf, guard) = capture_logs();
+
+        let refused = proxy_get_from(proxy_addr, HOST_BOX_ADDR, "web.min.internal:18080").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected the deny-all host-address box's request to be refused, got: {refused}"
+        );
+        let routed = proxy_get_from(proxy_addr, OPEN_HOST_BOX_ADDR, "web.min.internal:18080").await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected the host-address box with no egress rules to route, got: {routed}"
+        );
+        let routed = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected a connection no box owns to route, got: {routed}"
+        );
+
+        drop(guard);
+        let logged = buf.contents();
+        let refusals: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("network policy violation"))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one refusal, the deny-all box's: {logged}"
+        );
+        for expected in [
+            r#"caller="hostbox""#,
+            r#"session="web""#,
+            "direction=egress",
+            "port=18080",
+            "the caller's egress policy denies this target",
+        ] {
+            assert!(
+                refusals[0].contains(expected),
+                "expected the refusal to carry {expected}, got: {logged}"
+            );
+        }
     }
 
     /// NET-070's verify line: a request through the hostname proxy from a
