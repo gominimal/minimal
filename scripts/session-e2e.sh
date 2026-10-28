@@ -20957,7 +20957,7 @@ PY
     fail
   fi
   case "$mnx_ref_err" in
-    *"port $mnx_out_port is outside this box's declared dynamic range $mnx_lo-$mnx_hi"*) ;;
+    *"port $mnx_out_port is outside this box's --dynamic-range $mnx_lo-$mnx_hi. Nothing was published."*) ;;
     *) echo "::error::the out-of-range refusal does not name the port and the declared range (got: '$mnx_ref_err')"; fail ;;
   esac
   echo "out of range: refused with its own typed error — the range the create declared is the whole gate (NET-043)"
