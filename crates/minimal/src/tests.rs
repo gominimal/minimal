@@ -1092,7 +1092,8 @@ fn finalize_install_parses_its_flags() {
             show: false,
             script: false,
             json: false,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
@@ -1102,7 +1103,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: true,
             json: false,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
@@ -1112,7 +1114,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: false,
             json: true,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli =
@@ -1123,7 +1126,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: true,
             json: false,
-            undo: true
+            undo: true,
+            ct_mark_mask: None
         }))
     ));
     // `--script` and `--json` need `--show`; `--json` describes an install,
@@ -1138,6 +1142,58 @@ fn finalize_install_parses_its_flags() {
     ] {
         assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
     }
+}
+
+/// `--ct-mark-mask` takes two contiguous bits in 0x-prefixed hex, the
+/// shape the install step requires, and is refused with `--undo`.
+#[test]
+fn finalize_install_parses_ct_mark_mask() {
+    use clap::Parser as _;
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--ct-mark-mask", "0x0c000000"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            ct_mark_mask: Some(0x0c00_0000),
+            undo: false,
+            ..
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--ct-mark-mask", "0x3"])
+        .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            ct_mark_mask: Some(0x3),
+            show: true,
+            ..
+        }))
+    ));
+    for bad in [
+        "0x10000000",
+        "0x50000000",
+        "0x70000000",
+        "0x0",
+        "0x100000000",
+        "30000000",
+        "0x",
+        "0xzz",
+    ] {
+        assert!(
+            Cli::try_parse_from(["min", "finalize-install", "--ct-mark-mask", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(
+        Cli::try_parse_from([
+            "min",
+            "finalize-install",
+            "--undo",
+            "--ct-mark-mask",
+            "0x0c000000"
+        ])
+        .is_err()
+    );
 }
 
 #[test]
