@@ -420,15 +420,21 @@ impl BuildTap {
     pub(crate) fn observe(&mut self, event: &BuildEvent, placement: &BuildPlacement) {
         match &event.inner {
             orchestrator::BuildEventInner::Start { name, .. } => {
-                tracing::info!(
-                    box_name = %placement.box_name,
-                    package = %name,
-                    leaf = %placement
-                        .leaf
-                        .as_ref()
-                        .map_or_else(|| "none".to_string(), |leaf| leaf.dir().display().to_string()),
-                    "starting a package build for a box in the box's classifier leaf",
-                );
+                match &placement.leaf {
+                    Some(leaf) => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = %leaf.dir().display(),
+                        "starting a package build for a box in the box's classifier leaf",
+                    ),
+                    None => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = "none",
+                        "starting a package build for a box in the daemon's own cgroup, \
+                         as node-plane traffic",
+                    ),
+                }
                 self.builds
                     .insert(event.idx, (name.clone(), Default::default()));
             }

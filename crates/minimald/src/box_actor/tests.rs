@@ -12374,4 +12374,27 @@ fn box_package_build_refusal_names_destination_and_box() {
         egress_refusal(Some(&deny), "hello", "my-box", ["error: cc failed"]),
         None
     );
+    // Box-zone names are not subject to egress rules: a deny box that cannot
+    // resolve or reach one was not refused by its rules.
+    for line in [
+        "curl: (6) Could not resolve host: web.min.internal",
+        "curl: (7) Failed to connect to host.min.internal port 8080 after 1 ms: Couldn't connect to server",
+        "curl: (6) Could not resolve host: min.internal",
+    ] {
+        assert_eq!(
+            egress_refusal(Some(&deny), "hello", "my-box", [line]),
+            None,
+            "{line}"
+        );
+    }
+    // A name that only ends in the apex text is not in the zone.
+    assert!(
+        egress_refusal(
+            Some(&deny),
+            "hello",
+            "my-box",
+            ["curl: (6) Could not resolve host: evilmin.internal"]
+        )
+        .is_some()
+    );
 }

@@ -1962,16 +1962,23 @@ impl BoxChannel {
             let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
             // NET-155: the build runs in the box's own leaf, so the box's
-            // egress verdict decides what it can reach.
-            tracing::info!(
-                box_name = %self.name,
-                package = %pkg_name,
-                leaf = %self
-                    .classifier_leaf
-                    .as_ref()
-                    .map_or_else(|| "none".to_string(), |leaf| leaf.dir().display().to_string()),
-                "starting a package build for a box in the box's classifier leaf",
-            );
+            // egress verdict decides what it can reach. A box with no leaf
+            // builds in the daemon's own cgroup, as node-plane traffic.
+            match &self.classifier_leaf {
+                Some(leaf) => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = %leaf.dir().display(),
+                    "starting a package build for a box in the box's classifier leaf",
+                ),
+                None => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = "none",
+                    "starting a package build for a box in the daemon's own cgroup, \
+                     as node-plane traffic",
+                ),
+            }
             let res = op::PatchedBuild {
                 spec: &bsr,
                 remote_fetcher: &remote_storage,
@@ -2914,8 +2921,8 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
 /// The error line for a package build that the egress rules of its box
 /// refused (NET-155), or `None` when the refusal is not the rules'. A box in
 /// the deny subtree of the classifier tree is refused every destination, so
-/// any destination its build could not reach was refused by the box's rules.
-/// A box in the allow subtree is refused nothing there, so its failures are
+/// any destination outside the box zone that its build could not reach was
+/// refused by the box's rules. A box in the allow subtree is refused nothing there, so its failures are
 /// left as the build reported them.
 pub(crate) fn egress_refusal<'a>(
     leaf: Option<&ClassifierLeaf>,
@@ -2927,6 +2934,17 @@ pub(crate) fn egress_refusal<'a>(
         return None;
     }
     let destination = refused_destination(lines)?;
+    // Box-zone names are not subject to egress rules, so a failure to
+    // resolve or reach one is not a refusal by the box's rules.
+    let host = destination
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let zone_apex = boxes::core::zone_answer::ZONE_APEX;
+    if host == zone_apex || host.ends_with(&format!(".{zone_apex}")) {
+        return None;
+    }
     Some(format!(
         "the build of {package} could not reach {destination}: \
          the egress rules of box {box_name} do not allow it"
