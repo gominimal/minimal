@@ -1503,7 +1503,7 @@ pub(crate) mod linux {
     // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
     // each started by the login through `sudo -n -u` under a drop-in this
     // item installs. The users, the directories and the modes are the ones
-    // `docs/design/2026-10-25-split-user-vmm-host-dir.md` lays out.
+    // `docs/design/2026-10-25-split-user-vmm-provider-dir.md` lays out.
 
     pub(crate) const VM_USERS_ID: &str = "vm-users";
     const VM_USERS_LABEL: &str = "separate users for the VM and its network switch";

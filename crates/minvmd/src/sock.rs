@@ -126,7 +126,7 @@ pub fn held_group_gid(group: &str) -> Option<u32> {
 }
 
 /// The mode and the group one socket gets: a row of the split-user
-/// design's ownership table (`docs/design/2026-10-25-split-user-vmm-host-dir.md`).
+/// design's ownership table (`docs/design/2026-10-25-split-user-vmm-provider-dir.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocketAccess {
     /// The permission bits.
