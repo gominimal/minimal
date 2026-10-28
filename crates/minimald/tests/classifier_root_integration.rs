@@ -1448,7 +1448,11 @@ fn run_probe_build(
     port: u16,
 ) -> (bool, String) {
     let work = tempfile::tempdir_in(base).expect("a temp dir for the build");
-    let cache = lcache::Cache::at_dir(work.path().join("cache")).expect("the build's cache");
+    // The cache opens over a directory that exists: `Cache::at_dir` makes
+    // its subdirectories, not its base.
+    let cache_dir = work.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("the build's cache dir");
+    let cache = lcache::Cache::at_dir(&cache_dir).expect("the build's cache");
     let graph = graph::Graph::new()
         .ingest(
             decode::Layer::new_for_test(format!(
