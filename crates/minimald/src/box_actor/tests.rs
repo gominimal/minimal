@@ -12302,6 +12302,28 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
     );
 }
 
+/// Spawns a stand-in box: `/bin/sh` sets `trap`, then loops on `sleep`.
+/// It answers once the shell set the trap and started its first `sleep`, so
+/// a stop never reaches a shell that still has the default SIGTERM action.
+fn spawn_stand_in_box(trap: &str) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "{trap}; sleep 0.05 & echo ready; wait; while :; do sleep 0.05; done"
+        ))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in box");
+    let stdout = child.stdout.take().expect("the stand-in box's stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read the stand-in box's ready line");
+    assert_eq!(line.trim(), "ready", "the stand-in box set its trap");
+    child
+}
+
 /// A stand-in host loop for `child`: it reaps the child and reports the end
 /// as `hakoniwa` does. A signalled child has no exit status of its own and
 /// carries the container's 125.
@@ -12343,15 +12365,9 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
     use boxes::core::record::{RecordState, StopEnding};
 
     // A box that ignores SIGTERM: the grace runs out and SIGKILL ends it.
-    let child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 0.05; done")
-        .spawn()
-        .expect("spawn the stand-in box");
+    let child = spawn_stand_in_box("trap '' TERM");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
     let entrypoint = stand_in_entrypoint(child);
-    // Let the loop start a child, so the box has more than one process.
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !processes.pids().is_empty(),
         "the stand-in box should be running"
@@ -12437,14 +12453,9 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
 async fn stop_force_kills_at_once() {
     use boxes::core::record::StopEnding;
 
-    let child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 0.05; done")
-        .spawn()
-        .expect("spawn the stand-in box");
+    let child = spawn_stand_in_box("trap '' TERM");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
     let entrypoint = stand_in_entrypoint(child);
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let started = std::time::Instant::now();
     let outcome = super::stop_box_processes(
@@ -12480,14 +12491,9 @@ async fn stop_force_kills_at_once() {
 async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     use boxes::core::record::{RecordState, StopEnding};
 
-    let child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("trap 'exit 125' TERM; while :; do sleep 0.05; done")
-        .spawn()
-        .expect("spawn the stand-in box");
+    let child = spawn_stand_in_box("trap 'exit 125' TERM");
     let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
     let entrypoint = stand_in_entrypoint(child);
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let outcome = super::stop_box_processes(
         SessionId::mint(),
