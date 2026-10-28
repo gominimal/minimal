@@ -249,7 +249,7 @@ pub fn format_policy(
                 out,
                 "  {}  {}",
                 entry.category().as_str(),
-                entry.endpoints().join(", ")
+                baseline.display_endpoints(entry).join(", ")
             )?;
         }
     }
@@ -716,7 +716,7 @@ pub fn write_policy_json_noting(
                     .iter()
                     .map(|entry| PolicyBaselineEntryJson {
                         category: entry.category().as_str(),
-                        endpoints: entry.endpoints().to_vec(),
+                        endpoints: baseline.display_endpoints(entry),
                     })
                     .collect(),
             })
