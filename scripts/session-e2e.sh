@@ -13674,7 +13674,8 @@ proof_bep_conditions_closed_end_to_end() {
 # is runnable alone, and the walk prints PASS or NOT RUN with its gate for
 # each at its end. A failing case ends the run, as every case does.
 #   * bep_r3_spec_names_jti_and_quarantine: the spec's BEP-039 names the
-#     handle's jti, and BEP-041 names the quarantine directory and
+#     handle's jti, BEP-041 names the quarantine directory, and BEP-068
+#     refuses a start over an unreadable line and names
 #     `bep serve --quarantine-unreadable`. Runs on every lane.
 #   * bep_r3_pre_flip_udp_443_refused: a real kernel refuses a UDP 443
 #     socket that a host_ip member opened before its cohort turned blocked,
@@ -13723,11 +13724,12 @@ r3_spec_block() {
 
 proof_bep_r3_spec_names_jti_and_quarantine() {
   echo "::group::BEP spec: the audit record names the handle jti, and an unreadable segment moves to quarantine"
-  local sq_039 sq_041
+  local sq_039 sq_041 sq_068
   sq_039="$(r3_spec_block BEP-039 | head -n1)"
-  sq_041="$(r3_spec_block BEP-041)"
-  if [ -z "$sq_039" ] || [ -z "$sq_041" ]; then
-    echo "::error::$R3_SPEC has no BEP-039 or no BEP-041 requirement"
+  sq_041="$(r3_spec_block BEP-041 | head -n1)"
+  sq_068="$(r3_spec_block BEP-068)"
+  if [ -z "$sq_039" ] || [ -z "$sq_041" ] || [ -z "$sq_068" ]; then
+    echo "::error::$R3_SPEC lacks one of the BEP-039, BEP-041 and BEP-068 requirements"
     fail
   fi
   if [[ "$sq_039" != *"the handle's \`jti\` or empty"* ]]; then
@@ -13736,17 +13738,18 @@ proof_bep_r3_spec_names_jti_and_quarantine() {
     fail
   fi
   echo "BEP-039 names the handle's \`jti\` among the audit record's fields"
-  if [[ "$(printf '%s\n' "$sq_041" | head -n1)" != *"into the \`quarantine\` directory"* ]]; then
+  if [[ "$sq_041" != *"into the \`quarantine\` directory"* ]]; then
     echo "::error::BEP-041 in $R3_SPEC does not name the move of an unreadable segment into the quarantine directory"
-    printf '%s\n' "$sq_041" | head -n1
+    printf '%s\n' "$sq_041"
     fail
   fi
+  echo "BEP-041 names the move of a segment with an unreadable line into the \`quarantine\` directory"
   # shellcheck disable=SC2016 # the backticks are the spec's own text
-  if [[ "$sq_041" != *'name `bep serve --quarantine-unreadable`'* ]]; then
-    echo "::error::BEP-041 in $R3_SPEC does not say that a start over an unreadable line names bep serve --quarantine-unreadable"
+  if [[ "$sq_068" != *'refuse the start and name `bep serve --quarantine-unreadable`'* ]]; then
+    echo "::error::BEP-068 in $R3_SPEC does not say that a start over an unreadable line is refused and names bep serve --quarantine-unreadable"
     fail
   fi
-  echo "BEP-041 names the \`quarantine\` directory, and a refused start names \`bep serve --quarantine-unreadable\`"
+  echo "BEP-068 refuses a start over an unreadable line and names \`bep serve --quarantine-unreadable\`"
   echo "::endgroup::"
 }
 
@@ -13840,7 +13843,7 @@ PY
     fail
   fi
   rm -f "${WORK:?}/${fq_case:?}".*
-  echo "min finalize-install --show --json: the quic443-helper item is $fq_state, and names /usr/local/lib/minimal/quic443-leaf where it is missing"
+  echo "min finalize-install --show --json: the quic443-helper item's state is $fq_state, and the item names /usr/local/lib/minimal/quic443-leaf where it is missing"
   echo "::endgroup::"
 }
 
