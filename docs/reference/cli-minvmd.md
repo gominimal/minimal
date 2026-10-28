@@ -55,6 +55,8 @@ An own-IP box that declares no `egress` section gets the deny-all egress default
 
 `minvmd` reads the variable only when it starts, and hands it to the guest at boot. Set it in the environment of the process that starts `minvmd`: `minvmd run`, or the first `min` command that starts the VM for you. Setting it for a later `min` command against a running VM changes nothing. To apply a change, stop `minvmd` (`minvmd stop`) and start it again with the new environment.
 
+`minvmd` closes `host.min.internal` at every port unless `MINVMD_HOST_EXPOSURE_PORTS` lists ports. Set the variable to a comma-separated list of ports and ranges, such as `8080,3000-3999`. A box in the default host-address network mode then reaches the host at those ports and no other. The box's egress rules still apply inside an exposure. An own-address box gets a refusal at every port, whatever the list says. Leave the variable unset or empty to keep `host.min.internal` closed. Each port must lie between 1 and 65535, and each range must run from low to high. Any other value fails the start with an error that names the bad term. `minvmd` reads the variable from its own environment each time it boots the VM, so to apply a change, stop `minvmd` and start it again.
+
 ### `status`
 
 ```
