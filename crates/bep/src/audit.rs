@@ -1268,16 +1268,61 @@ fn quarantine_bridges(dir: &Path, from: &[(u64, PathBuf, Vec<u8>)]) -> io::Resul
         .iter()
         .map(|(_, path, bytes)| (path.clone(), bytes.clone()))
         .collect();
-    // An error past the gap means the records led the chain across it. An
-    // error at the gap, or before it, bridges nothing.
+    // An error anywhere bridges nothing, unless the quarantine records
+    // provably lead the chain across this gap. Then the error is unrelated
+    // to the gap, and the segments past it report it themselves.
     Ok(match verify_segments(&segments, &moved) {
         Ok(_) => true,
-        Err(at) => match from.iter().position(|(_, path, _)| *path == at.segment) {
-            Some(1) => at.line > 1,
-            Some(k) => k > 1,
-            None => false,
-        },
+        Err(_) => gap_bridged(from, &moved),
     })
+}
+
+/// Whether [`QuarantineRecord`]s lead the chain across the gap between
+/// `from[0]` and `from[1]`, checked on their own: from the hash of the
+/// last line of `from[0]` to the `previous_hash` of the first line of
+/// `from[1]`. Each record on the way must sit in `from[1]` or later, name
+/// a segment numbered between the two, and agree with that segment under
+/// [`QUARANTINE_DIR`] in `moved`. Pure.
+fn gap_bridged(from: &[(u64, PathBuf, Vec<u8>)], moved: &[(String, Vec<u8>)]) -> bool {
+    let [(before, _, before_bytes), (after, _, after_bytes), ..] = from else {
+        return false;
+    };
+    let Some(expected) = complete_lines(before_bytes).last().map(line_hash) else {
+        return false;
+    };
+    let first = complete_lines(after_bytes).next().map(classify);
+    let Some(found) = first.as_ref().and_then(Line::previous_hash) else {
+        return false;
+    };
+    let records: Vec<(u64, QuarantineRecord)> = from[1..]
+        .iter()
+        .flat_map(|(_, _, bytes)| complete_lines(bytes).map(classify))
+        .filter_map(|line| match line {
+            Line::Quarantine(record) => Some(record),
+            _ => None,
+        })
+        .filter_map(|record| {
+            let number = segment_number(&record.segment)?;
+            let agrees = moved.iter().any(|(name, bytes)| {
+                *name == record.segment && moved_segment_matches(&record, bytes)
+            });
+            (agrees && number > *before && number < *after).then_some((number, record))
+        })
+        .collect();
+    let mut at = expected;
+    let mut past = *before;
+    // Each step moves to a higher segment number, so the walk ends.
+    while let Some((number, record)) = records
+        .iter()
+        .find(|(number, record)| *number > past && record.from_hash == at)
+    {
+        at.clone_from(&record.final_hash);
+        past = *number;
+        if at == found {
+            return true;
+        }
+    }
+    false
 }
 
 /// Every segment of the log in `dir` with its number, oldest first.
@@ -2282,6 +2327,57 @@ mod tests {
             ),
         );
         assert!(verify_chain(&audit).unwrap().is_err());
+    }
+
+    // BEP-049, BEP-068: a chain error past line 1 of the segment after a
+    // gap bridges nothing when no quarantine record leads across the gap,
+    // even with files under `quarantine/`.
+    #[test]
+    fn deleted_segment_with_error_past_the_gap_still_breaks() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        fs::remove_file(audit.join(segment_name(1))).unwrap();
+        // The first line past the gap carries the hash before the gap, in
+        // a field order the byte check does not read. So the chain error
+        // sits at line 1 of the next segment, not at the gap.
+        let after = audit.join(segment_name(2));
+        let restated = format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"future\",\"previous_hash\":\"{}\",\"x\":1}}\n",
+            line_hash(first.to_line())
+        );
+        fs::write(&after, &restated).unwrap();
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(9)),
+            "unrelated\n",
+        )
+        .unwrap();
+
+        let from: Vec<(u64, PathBuf, Vec<u8>)> = numbered_segments(&audit)
+            .unwrap()
+            .into_iter()
+            .map(|(n, path)| {
+                let bytes = fs::read(&path).unwrap();
+                (n, path, bytes)
+            })
+            .collect();
+        let segments: Vec<(PathBuf, Vec<u8>)> = from
+            .iter()
+            .map(|(_, path, bytes)| (path.clone(), bytes.clone()))
+            .collect();
+        let err = verify_segments(&segments, &[]).unwrap_err();
+        assert_eq!(err.segment, audit.join(segment_name(3)), "{err:?}");
+        assert!(!quarantine_bridges(&audit, &from).unwrap());
+
+        let check = verify_dir(&audit).unwrap();
+        assert_eq!(check.broken, Some((after, 1)), "{check:?}");
     }
 
     // BEP-068: a quarantine that fails part way moves no segment it did
