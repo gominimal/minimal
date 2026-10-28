@@ -355,10 +355,13 @@ impl SwitchSubnet {
     /// custom plane, which the literal has nothing to do with.
     #[must_use]
     pub fn legacy_host_literal(self) -> Option<Ipv4Addr> {
+        let literal = DEFAULT_SUBNET.host_alias();
         let inside_plane = self.prefix() > DEFAULT_SUBNET.prefix()
             && u32::from(self.network()) & u32::from(DEFAULT_SUBNET.netmask())
                 == u32::from(DEFAULT_SUBNET.network());
-        inside_plane.then(|| DEFAULT_SUBNET.host_alias())
+        // a subnet at the top of the plane (100.64.255.0/24, 100.64.128.0/17) owns the literal
+        // as its alias already: nothing to add, and no duplicate nat entry or carve-out
+        (inside_plane && self.host_alias() != literal).then_some(literal)
     }
 
     /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
@@ -735,6 +738,21 @@ mod tests {
         );
 
         assert_eq!(SwitchSubnet::default().legacy_host_literal(), None);
+        // a subnet inside the plane whose own alias is the literal has nothing to add
+        for top in [
+            SwitchSubnet::new(Ipv4Addr::new(100, 64, 255, 0), 24).unwrap(),
+            SwitchSubnet::new(Ipv4Addr::new(100, 64, 128, 0), 17).unwrap(),
+        ] {
+            assert_eq!(top.host_alias(), Ipv4Addr::new(100, 64, 255, 254), "{top}");
+            assert_eq!(top.legacy_host_literal(), None, "{top}");
+            assert_eq!(
+                render_gvproxy_config(top, &[])
+                    .matches("100.64.255.254")
+                    .count(),
+                3,
+                "{top}: once as nat, once as virtual IP, once in the zone"
+            );
+        }
         assert_eq!(
             render_gvproxy_config(SwitchSubnet::default(), &[])
                 .matches("100.64.255.254")
