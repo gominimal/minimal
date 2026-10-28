@@ -200,6 +200,13 @@ fn a_check_is_due_daily() {
     assert!(!due(&s, 1_000_000 + day - 1));
     assert!(due(&s, 1_000_000 + day));
     assert!(!due(&s, 999_000), "a clock that went backwards is not due");
+    // a stamp a little ahead is skew and not due; one more than a day ahead (a wrong clock
+    // once, a copied state file) is due now rather than holding the check off for weeks
+    assert!(!due(&s, 1_000_000 - 3_600), "an hour of skew is not due");
+    assert!(
+        due(&s, 1_000_000 - day - 1),
+        "more than a day ahead is due now"
+    );
 }
 
 #[test]

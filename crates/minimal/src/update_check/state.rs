@@ -126,11 +126,16 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// A check is due when none completed within [`INTERVAL`].
+/// A check is due when none completed within [`INTERVAL`]. A `checked_at`
+/// ahead of now by less than the interval is a clock that stepped back a
+/// little and is not due (no extra request for skew); one ahead by more than
+/// the interval (a clock set wrong once, a copied state file) is due, rather
+/// than holding the check off until the clock catches up.
 pub fn due(state: &State, now: u64) -> bool {
+    let day = INTERVAL.as_secs();
     state
         .checked_at
-        .is_none_or(|t| now.saturating_sub(t) >= INTERVAL.as_secs())
+        .is_none_or(|t| t > now + day || now.saturating_sub(t) >= day)
 }
 
 /// Takes the lock that keeps two concurrent invocations from both spawning
