@@ -420,6 +420,8 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
+R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1025,6 +1027,10 @@ teardown() {
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
   [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
+  # The round-three walk's planted audit segment: a proxy start refuses a
+  # log that holds it, so a run that died with it in place must not keep it.
+  [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+  [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -13662,6 +13668,546 @@ proof_bep_conditions_closed_end_to_end() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# The BEP round-three conditions closed (T94): one walk over the residuals
+# that the third round of the slice's arch conditions held open. Each case
+# is runnable alone, and the walk prints PASS or NOT RUN with its gate for
+# each at its end. A failing case ends the run, as every case does.
+#   * bep_r3_spec_names_jti_and_quarantine: the spec's BEP-039 names the
+#     handle's jti, BEP-041 names the quarantine directory, and BEP-068
+#     refuses a start over an unreadable line and names
+#     `bep serve --quarantine-unreadable`. Runs on every lane.
+#   * bep_r3_pre_flip_udp_443_refused: a real kernel refuses a UDP 443
+#     socket that a host_ip member opened before its cohort turned blocked,
+#     and the socket sends again after the block lifts (BEP-018). It runs
+#     the root integration leg that proves it, and records the leg's own
+#     NOT RUN gate. Native Linux with passwordless sudo and nft only.
+#   * bep_r3_finalize_install_names_quic_helper: `min finalize-install
+#     --show` lists the QUIC block helper, and the JSON report names its
+#     path while it is missing (BEP-018). Native Linux only.
+#   * bep_r3_uninstall_removes_quic_helper: the installer's uninstall names
+#     the QUIC block helper and its sudoers rule, and its printed remedy
+#     removes both. It runs the installer harness case over a fake root,
+#     so it changes nothing on this host. Runs on every lane.
+#   * bep_r3_minted_id_checked_without_proxy: with no proxy running, a box
+#     creation reads the proxy's audit log for the minted id. An audit
+#     segment with a line that does not parse refuses the creation, and the
+#     same creation succeeds once the segment is gone (BEP-070).
+#   * bep_r3_stranded_box_frees_client_key: a grant box destroyed while the
+#     proxy is down keeps its id in the proxy's client-key registrations.
+#     The next proxy start frees it (BEP-063).
+#   * bep_r3_widened_store_rule_without_restart: a rule added to
+#     [secret-store-rules] while the proxy runs turns the proxy's 403 for its
+#     host into an admitted CONNECT, with the same `bep serve` process
+#     (BEP-032).
+#   * bep_r3_config_dir_rule_reaches_bep_serve: NOT RUN on every lane. Box
+#     creation mints no store handle yet (#2525), so no `min` command reaches
+#     the --config-dir rule check. Its unit tests in crates/minimal/src/mint.rs
+#     pin the check.
+# The four proxy cases need the live proxy gate (bep_live_gate): macOS, the
+# VM host daemon with gvproxy, and a GitHub sign-in.
+R3_SPEC="docs/specs/24-spec-box-egress-proxy/24-spec-box-egress-proxy.md"
+R3_PRE_FLIP_LEG=a_blocked_cohort_rejects_a_pre_flip_udp_443_socket
+R3_STORE_RULE_ID=e2e-round-three
+R3_STORE_HOST=example.com
+
+# Prints the requirement line of $1 (BEP-039, ...) in the spec, and the
+# lines under it up to the next requirement.
+r3_spec_block() {
+  awk -v id="$1" '
+    index($0, "- **" id "**") == 1 { grab = 1; print; next }
+    grab && /^- \*\*[A-Z]+-[0-9]+\*\*/ { exit }
+    grab && /^#/ { exit }
+    grab { print }
+  ' "$ROOT/$R3_SPEC"
+}
+
+proof_bep_r3_spec_names_jti_and_quarantine() {
+  echo "::group::BEP spec: the audit record names the handle jti, and an unreadable segment moves to quarantine"
+  local sq_039 sq_041 sq_068
+  sq_039="$(r3_spec_block BEP-039 | head -n1)"
+  sq_041="$(r3_spec_block BEP-041 | head -n1)"
+  sq_068="$(r3_spec_block BEP-068)"
+  if [ -z "$sq_039" ] || [ -z "$sq_041" ] || [ -z "$sq_068" ]; then
+    echo "::error::$R3_SPEC lacks one of the BEP-039, BEP-041 and BEP-068 requirements"
+    fail
+  fi
+  if [[ "$sq_039" != *"the handle's \`jti\` or empty"* ]]; then
+    echo "::error::BEP-039 in $R3_SPEC does not name the handle's jti among the audit record's fields"
+    printf '%s\n' "$sq_039"
+    fail
+  fi
+  echo "BEP-039 names the handle's \`jti\` among the audit record's fields"
+  if [[ "$sq_041" != *"into the \`quarantine\` directory"* ]]; then
+    echo "::error::BEP-041 in $R3_SPEC does not name the move of an unreadable segment into the quarantine directory"
+    printf '%s\n' "$sq_041"
+    fail
+  fi
+  echo "BEP-041 names the move of a segment with an unreadable line into the \`quarantine\` directory"
+  # shellcheck disable=SC2016 # the backticks are the spec's own text
+  if [[ "$sq_068" != *'refuse the start and name `bep serve --quarantine-unreadable`'* ]]; then
+    echo "::error::BEP-068 in $R3_SPEC does not say that a start over an unreadable line is refused and names bep serve --quarantine-unreadable"
+    fail
+  fi
+  echo "BEP-068 refuses a start over an unreadable line and names \`bep serve --quarantine-unreadable\`"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_pre_flip_udp_443_refused() {
+  echo "::group::host-address cohort: a UDP 443 socket opened before the flip is refused after it (BEP-018)"
+  local pf_case=bep_r3_pre_flip_udp_443_refused pf_why="" pf_rc pf_gate
+  local pf_out="$WORK/bep_r3_pre_flip.out"
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    pf_why="not a native Linux lane: the leg loads the classifier table over this host's own cgroup2"
+  elif ! command -v cargo-nextest >/dev/null 2>&1; then
+    pf_why="no cargo-nextest on PATH: the leg is a test in crates/minimald/tests/netns_root_integration.rs"
+  elif [ "$(id -u)" != 0 ] && ! sudo -n true >/dev/null 2>&1; then
+    pf_why="no passwordless sudo: the classifier install and the QUIC block helper need root"
+  elif [ -e /sys/fs/cgroup/minimald.slice ]; then
+    pf_why="this host already has a classifier tree at /sys/fs/cgroup/minimald.slice, and the leg replaces no host's own"
+  fi
+  if [ -n "$pf_why" ]; then
+    not_run "$pf_case" "$pf_why"
+    echo "::endgroup::"
+    return 0
+  fi
+  echo "running $R3_PRE_FLIP_LEG (cargo nextest run -p minimald --test netns_root_integration)"
+  (cd "$ROOT" && MINIMALD_NETNS_TEST=1 cargo nextest run --locked -p minimald \
+    --test netns_root_integration --run-ignored only --no-capture --no-tests=fail \
+    -E "test(=$R3_PRE_FLIP_LEG)") >"$pf_out" 2>&1
+  pf_rc=$?
+  grep -F -- "$R3_PRE_FLIP_LEG" "$pf_out" || true
+  if [ "$pf_rc" != 0 ]; then
+    echo "::error::$R3_PRE_FLIP_LEG failed (exit $pf_rc)"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  pf_gate="$(sed -n "s/^NOT RUN $R3_PRE_FLIP_LEG: //p" "$pf_out" | head -n1)"
+  if [ -n "$pf_gate" ]; then
+    not_run "$pf_case" "$pf_gate"
+    rm -f "$pf_out"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! grep -qF -- "step 6: after the flip the pre-flip socket is refused with ECONNREFUSED" "$pf_out" \
+    || ! grep -qF -- "step 8: the pre-flip socket sends again after the block lifts" "$pf_out"; then
+    echo "::error::$R3_PRE_FLIP_LEG passed without printing its refusal and its resend steps, so it did not run"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  rm -f "$pf_out"
+  echo "a real kernel refused the pre-flip UDP 443 socket while the cohort was blocked, and it sent again after the block lifted"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_finalize_install_names_quic_helper() {
+  echo "::group::min finalize-install names the QUIC block helper (BEP-018)"
+  local fq_case=bep_r3_finalize_install_names_quic_helper fq_out fq_state
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    not_run "$fq_case" "not a native Linux lane: the QUIC block helper is an item of the native daemon's install"
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl finalize-install --show </dev/null >"$WORK/$fq_case.show" 2>&1 || true
+  if ! grep -qF -- "QUIC block helper" "$WORK/$fq_case.show"; then
+    echo "::error::'min finalize-install --show' does not list the QUIC block helper"
+    cat "$WORK/$fq_case.show"
+    fail
+  fi
+  echo "min finalize-install --show lists the QUIC block helper"
+  mnl finalize-install --show --json </dev/null >"$WORK/$fq_case.json" 2>"$WORK/$fq_case.json.err" || true
+  if ! fq_out="$(python3 - "$WORK/$fq_case.json" <<'PY'
+import json, sys
+# The shell captures stdout only, so the reason goes to stdout before exit 1.
+def die(msg):
+    print(msg)
+    sys.exit(1)
+path = "/usr/local/lib/minimal/quic443-leaf"
+try:
+    with open(sys.argv[1]) as f:
+        report = json.load(f)
+except (OSError, ValueError) as e:
+    die("the report is not valid JSON: %s" % e)
+items = [i for i in report.get("items", []) if i.get("id") == "quic443-helper"]
+if len(items) != 1:
+    die("the report holds %d quic443-helper items, not 1" % len(items))
+item = items[0]
+if item.get("label") != "QUIC block helper":
+    die("the quic443-helper item is labelled %r" % item.get("label"))
+state = item.get("state")
+if state == "missing" and path not in (item.get("today") or ""):
+    die("the missing helper's item does not name %s: %r" % (path, item.get("today")))
+print(state)
+PY
+)"; then
+    echo "::error::'min finalize-install --show --json': $fq_out"
+    cat "$WORK/$fq_case.json" "$WORK/$fq_case.json.err" 2>/dev/null || true
+    fail
+  fi
+  fq_state="$fq_out"
+  if [ "$fq_state" = "done" ] && [ ! -f /usr/local/lib/minimal/quic443-leaf ]; then
+    echo "::error::'min finalize-install --show --json' reports the QUIC block helper done, but /usr/local/lib/minimal/quic443-leaf is absent"
+    fail
+  fi
+  rm -f "${WORK:?}/${fq_case:?}".*
+  echo "min finalize-install --show --json: the quic443-helper item's state is $fq_state, and the item names /usr/local/lib/minimal/quic443-leaf where it is missing"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_uninstall_removes_quic_helper() {
+  echo "::group::uninstall names the QUIC block helper and its sudoers rule, and its remedy removes both"
+  local uq_out="$WORK/bep_r3_uninstall.out" uq_want
+  if ! sh "$ROOT/scripts/install_test.sh" finalize_install_uninstall >"$uq_out" 2>&1; then
+    echo "::error::scripts/install_test.sh finalize_install_uninstall failed"
+    grep -E '^FAIL' "$uq_out" || tail -n 40 "$uq_out"
+    fail
+  fi
+  for uq_want in \
+    "ok   - the uninstall names the QUIC block helper and its sudoers rule" \
+    "ok   - the printed remedy removes usr/local/lib/minimal/quic443-leaf" \
+    "ok   - the printed remedy removes etc/sudoers.d/minimal-quic443-leaf"; do
+    if ! grep -qxF -- "$uq_want" "$uq_out"; then
+      echo "::error::scripts/install_test.sh finalize_install_uninstall does not report: ${uq_want#ok   - }"
+      tail -n 40 "$uq_out"
+      fail
+    fi
+    echo "${uq_want#ok   - }"
+  done
+  rm -f "$uq_out"
+  echo "::endgroup::"
+}
+
+# The pids of this run's `bep serve`, sorted, one per line. minvmd starts it
+# with `--listener` on a socket under this run's $XDG_STATE_HOME, so a proxy
+# from another checkout or a person's own proxy does not match.
+r3_proxy_pids() {
+  pgrep -f -- "serve --listener $XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock" \
+    2>/dev/null | sort || true
+}
+
+# Kills this run's `bep serve` and waits until nothing answers on its control
+# socket $1. Clears BEP_LIVE_DAEMON, so the next bep_live_gate restarts the
+# daemon pair with the proxy. Returns 1 when the proxy still answers.
+r3_proxy_down() {
+  local pd_pids pd_try
+  pd_pids="$(r3_proxy_pids)"
+  if [ -z "$pd_pids" ]; then
+    echo "::error::no 'bep serve' process runs for this VM host, though the proxy answered on $1"
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  kill -KILL $pd_pids 2>/dev/null || true
+  BEP_LIVE_DAEMON=""
+  for pd_try in $(seq 1 20); do
+    bep_control_live "$1" || return 0
+    sleep 0.5
+  done
+  echo "::error::the proxy still answers on $1 after its process was killed"
+  return 1
+}
+
+# Activates a plain own-IP box named $2 for case $1 from R3_SEED_DIR, and
+# prints its id. stderr goes to $WORK/$1.$2.err. Returns the activation's
+# exit status.
+r3_activate_plain() {
+  local ap_out
+  ap_out="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip </dev/null 2>"$WORK/$1.$2.err")" || return 1
+  printf '%s\n' "$ap_out" | tail -n1 | tr -d '\r'
+}
+
+r3_plain_seed() {
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  hook_seed_preamble > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+}
+
+proof_bep_r3_minted_id_checked_without_proxy() {
+  echo "::group::with no proxy running, a box creation checks its minted id against the proxy's audit log (BEP-070)"
+  local mi_case=bep_r3_minted_id_checked_without_proxy
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local mi_control="$HOME/.minimal/bep/control.sock"
+  local mi_audit mi_last mi_n mi_seg mi_sid mi_before mi_after
+  local mi_warn="the Box Egress Proxy's audit log was not read whole"
+  bep_live_gate "$mi_case" || { echo "::endgroup::"; return 0; }
+  mi_audit="$(dirname "$mi_control")/audit"
+
+  MI_SID=""
+  mi_cleanup() {
+    [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+    R3_AUDIT_PLANT=""
+    [ -n "$MI_SID" ] && mnl session destroy --force "$MI_SID" >/dev/null 2>&1
+    MI_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  mi_fail() { mi_cleanup; fail; }
+
+  r3_plain_seed
+  r3_proxy_down "$mi_control" || mi_fail
+  echo "the proxy is down"
+
+  # A new segment after the last one, with one complete line that does not
+  # parse. Removed before the proxy starts again: a start refuses it.
+  mkdir -p "$mi_audit"
+  mi_last="$(find "$mi_audit" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n | tail -n1)"
+  mi_n=$(( ${mi_last:--1} + 1 ))
+  mi_seg="$mi_audit/audit-$mi_n.jsonl"
+  R3_AUDIT_PLANT="$mi_seg"
+  printf 'e2e round three: this line does not parse\n' >"$mi_seg"
+  echo "planted $mi_seg with one line that does not parse"
+
+  mi_before="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if mi_sid="$(r3_activate_plain "$mi_case" e2e-r3-mint-refused)"; then
+    MI_SID="$mi_sid"
+    echo "::error::'min session activate' created a box while the proxy's audit log held a line that does not parse, with no proxy running"
+    mi_fail
+  fi
+  echo "--- min session activate (refused) stderr ---"
+  cat "$WORK/$mi_case.e2e-r3-mint-refused.err" 2>/dev/null || true
+  mi_after="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if [ "$mi_after" -le "$mi_before" ]; then
+    echo "::error::the creation failed, but minvmd logged no refusal for the unread audit log ('$mi_warn')"
+    mi_fail
+  fi
+  if [[ "$(minvmd_log_lines "$mi_warn" | tail -n1)" != *"--quarantine-unreadable"* ]]; then
+    echo "::error::minvmd's refusal does not name bep serve --quarantine-unreadable as the way out"
+    minvmd_log_lines "$mi_warn" | tail -n1
+    mi_fail
+  fi
+  echo "minvmd refused the creation: the audit log was not read whole, and the refusal names --quarantine-unreadable"
+
+  rm -f "$mi_seg"
+  R3_AUDIT_PLANT=""
+  if ! MI_SID="$(r3_activate_plain "$mi_case" e2e-r3-mint-checked)"; then
+    MI_SID=""
+    echo "::error::'min session activate' failed with no proxy running and an audit log that reads whole"
+    cat "$WORK/$mi_case.e2e-r3-mint-checked.err" 2>/dev/null || true
+    mi_fail
+  fi
+  if bep_control_live "$mi_control"; then
+    echo "::error::the proxy answers on $mi_control again, so the second creation was not checked with no proxy"
+    mi_fail
+  fi
+  echo "with the segment gone and the proxy still down, the box $MI_SID was created"
+
+  mi_cleanup
+  rm -f "${WORK:?}/${mi_case:?}".*
+  echo "Minted id checked with no proxy OK (an unread audit log refused the creation, a log read whole let it through)"
+  echo "::endgroup::"
+}
+
+# Prints the box id of box $2 for case $1 as the proxy's control socket
+# spells it: 32 lowercase hex digits.
+r3_box_hex() {
+  local bh_id
+  bh_id="$(bep_recreate_audited_id "$1" "$2")" || return 1
+  printf '%s\n' "$bh_id" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# 0 when the client-key registrations file $1 holds box id $2 in a boxes= set.
+r3_keys_hold_box() {
+  tr 'A-F' 'a-f' <"$1" 2>/dev/null | grep -oE 'boxes=[0-9a-f,]+' | sed 's/^boxes=//' | tr ',' '\n' \
+    | grep -xF -- "$2" >/dev/null
+}
+
+proof_bep_r3_stranded_box_frees_client_key() {
+  echo "::group::a box destroyed while the proxy is down frees its client key at the next proxy start (BEP-063)"
+  local sk_case=bep_r3_stranded_box_frees_client_key sk_name=e2e-r3-stranded
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local sk_control="$HOME/.minimal/bep/control.sock"
+  # shellcheck disable=SC2031
+  local sk_keys="$HOME/.minimal/bep/control.sock.client-keys" sk_hex sk_try sk_freed=""
+  bep_live_gate "$sk_case" || { echo "::endgroup::"; return 0; }
+
+  SK_SID=""
+  sk_cleanup() {
+    [ -n "$SK_SID" ] && mnl session destroy --force "$SK_SID" >/dev/null 2>&1
+    SK_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sk_fail() { sk_cleanup; fail; }
+
+  bep_revoke_seed "$sk_case"
+  SK_SID="$(bep_revoke_activate "$sk_case" "$sk_name")" || { SK_SID=""; sk_fail; }
+  sk_hex="$(r3_box_hex "$sk_case" "$sk_name")" || sk_fail
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys does not hold the grant box $sk_hex in a boxes= set after its creation"
+    sk_fail
+  fi
+  echo "$sk_keys holds the grant box $sk_hex"
+
+  r3_proxy_down "$sk_control" || sk_fail
+  if ! mnl session destroy --force "$SK_SID" </dev/null >/dev/null 2>"$WORK/$sk_case.destroy.err"; then
+    echo "::error::'min session destroy' of $sk_name failed with the proxy down"
+    cat "$WORK/$sk_case.destroy.err" 2>/dev/null || true
+    sk_fail
+  fi
+  SK_SID=""
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys no longer holds $sk_hex with the proxy down, so the box was not stranded"
+    sk_fail
+  fi
+  echo "the box ended with the proxy down, and $sk_keys still holds it"
+
+  bep_live_gate "$sk_case" || sk_fail
+  for sk_try in $(seq 1 60); do
+    [ "$sk_try" -gt 1 ] && sleep 0.5
+    if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+      sk_freed=1
+      break
+    fi
+  done
+  if [ -z "$sk_freed" ]; then
+    echo "::error::$sk_keys still holds the ended box $sk_hex 30 s after the proxy started again"
+    sk_fail
+  fi
+  echo "after the proxy started again, $sk_keys no longer holds $sk_hex"
+
+  sk_cleanup
+  rm -f "${WORK:?}/${sk_case:?}".*
+  echo "Stranded box OK (its id left the client key's boxes at the next proxy start)"
+  echo "::endgroup::"
+}
+
+# One CONNECT to $R3_STORE_HOST:443 through the proxy that box $1's
+# HTTPS_PROXY names. Prints the proxy's answer head.
+r3_connect_probe() {
+  # shellcheck disable=SC2016
+  mnl session exec "$1" sh -c \
+    'p="${HTTPS_PROXY:-${https_proxy:-}}"; p="${p#*://}"; p="${p%%/*}"
+     printf "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n" "$0" "$0" \
+       | /usr/bin/socat -t 10 -T 20 - "TCP:$p" 2>&1 | head -c 400' "$R3_STORE_HOST" \
+    </dev/null 2>&1 | tr -d '\r' || true
+}
+
+# The first HTTP status line in the probe output $1, or nothing.
+r3_status_line() {
+  printf '%s\n' "$1" | sed -n '/^HTTP\/1\.1 [0-9][0-9][0-9]/{p;q;}'
+}
+
+proof_bep_r3_widened_store_rule_without_restart() {
+  echo "::group::a store rule added while the proxy runs is admitted with no restart (BEP-032)"
+  local wr_case=bep_r3_widened_store_rule_without_restart
+  local wr_sid wr_before wr_after wr_pid_before wr_pid_after wr_try
+  local wr_config="$XDG_CONFIG_HOME/minimal/config.toml" wr_saved="$WORK/bep_r3_config.saved"
+  local wr_off="is not one."
+  bep_live_gate "$wr_case" || { echo "::endgroup::"; return 0; }
+
+  WR_SID="" WR_HAD_CONFIG=""
+  [ -f "$wr_config" ] && { cp "$wr_config" "$wr_saved"; WR_HAD_CONFIG=1; }
+  wr_cleanup() {
+    if [ -n "$WR_HAD_CONFIG" ]; then
+      mv -f "$wr_saved" "$wr_config"
+    else
+      rm -f "$wr_config"
+    fi
+    WR_HAD_CONFIG=""
+    [ -n "$WR_SID" ] && mnl session destroy --force "$WR_SID" >/dev/null 2>&1
+    WR_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  wr_fail() { wr_cleanup; fail; }
+
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+  if ! wr_sid="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name e2e-r3-store-rule \
+    --network own_ip --credentialed-upstream </dev/null 2>"$WORK/$wr_case.err")"; then
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    cat "$WORK/$wr_case.err" 2>/dev/null || true
+    wr_fail
+  fi
+  WR_SID="$(printf '%s\n' "$wr_sid" | tail -n1 | tr -d '\r')"
+
+  wr_pid_before="$(r3_proxy_pids | tr '\n' ' ')"
+  wr_before="$(r3_connect_probe "$WR_SID")"
+  echo "before the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_before")"
+  if [[ "$(r3_status_line "$wr_before")" != "HTTP/1.1 403 "* ]] || [[ "$wr_before" != *"$wr_off"* ]]; then
+    echo "::error::before the rule, the proxy did not refuse $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_before"
+    wr_fail
+  fi
+
+  mkdir -p "$(dirname "$wr_config")"
+  printf '\n[secret-store-rules.%s]\nupstream = ["%s"]\nheader = "Authorization"\nprefix = "Bearer "\n' \
+    "$R3_STORE_RULE_ID" "$R3_STORE_HOST" >>"$wr_config"
+  echo "added [secret-store-rules.$R3_STORE_RULE_ID] for $R3_STORE_HOST to $wr_config"
+
+  # The proxy reads the rules again when the file's stamp changes, and a
+  # stamp younger than its settle time is read again at the next CONNECT.
+  for wr_try in $(seq 1 10); do
+    [ "$wr_try" -gt 1 ] && sleep 1
+    wr_after="$(r3_connect_probe "$WR_SID")"
+    [ -n "$(r3_status_line "$wr_after")" ] && [[ "$wr_after" != *"$wr_off"* ]] && break
+  done
+  echo "after the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_after")"
+  if [ -z "$(r3_status_line "$wr_after")" ] || [[ "$wr_after" == *"$wr_off"* ]]; then
+    echo "::error::after the rule was added, the proxy still refuses $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_after"
+    wr_fail
+  fi
+  wr_pid_after="$(r3_proxy_pids | tr '\n' ' ')"
+  if [ -z "$wr_pid_before" ] || [ "$wr_pid_before" != "$wr_pid_after" ]; then
+    echo "::error::the bep serve process changed across the rule change ('$wr_pid_before' -> '$wr_pid_after'), so the proxy restarted"
+    wr_fail
+  fi
+  echo "the same bep serve process (pid $wr_pid_after) admitted $R3_STORE_HOST"
+
+  wr_cleanup
+  rm -f "${WORK:?}/${wr_case:?}".*
+  echo "Widened store rule OK (refused before the rule, admitted after it, no proxy restart)"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_config_dir_rule_reaches_bep_serve() {
+  # Box creation mints no store handle yet: the sealed member list has no
+  # store kind (#2525). So no min command reaches the check that refuses a
+  # --config-dir rule bep serve does not read. Its unit tests in
+  # crates/minimal/src/mint.rs pin it until then.
+  not_run bep_r3_config_dir_rule_reaches_bep_serve \
+    "box creation mints no store handle yet (#2525), so no min command reaches the --config-dir store rule check"
+}
+
+proof_bep_round_three_conditions_closed() {
+  local r3_case r3_before r3_why r3_ran=0 r3_summary=""
+  for r3_case in bep_r3_spec_names_jti_and_quarantine \
+      bep_r3_pre_flip_udp_443_refused \
+      bep_r3_finalize_install_names_quic_helper \
+      bep_r3_uninstall_removes_quic_helper \
+      bep_r3_minted_id_checked_without_proxy \
+      bep_r3_stranded_box_frees_client_key \
+      bep_r3_widened_store_rule_without_restart \
+      bep_r3_config_dir_rule_reaches_bep_serve; do
+    r3_before="$E2E_NOT_RUN"
+    "proof_$r3_case"
+    if [ "$E2E_NOT_RUN" = "$r3_before" ]; then
+      r3_ran=$((r3_ran + 1))
+      r3_summary="$r3_summary$r3_case: PASS"$'\n'
+    else
+      r3_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$r3_case" '$1 == c { w = $2 } END { print w }')"
+      r3_summary="$r3_summary$r3_case: NOT RUN (${r3_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP round-three conditions closed: each case"
+  printf '%s' "$r3_summary"
+  echo "::endgroup::"
+  if [ "$r3_ran" = 0 ]; then
+    not_run bep_round_three_conditions_closed "none of its cases can run on this lane"
+  fi
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -25308,7 +25854,16 @@ case "${1:-}" in
     | bep_revoke_and_sign_out_end_to_end \
     | bep_dns_steering_fails_closed_end_to_end \
     | bep_host_ip_cohort_blocks_udp_443 \
-    | bep_conditions_closed_end_to_end)
+    | bep_conditions_closed_end_to_end \
+    | bep_r3_spec_names_jti_and_quarantine \
+    | bep_r3_pre_flip_udp_443_refused \
+    | bep_r3_finalize_install_names_quic_helper \
+    | bep_r3_uninstall_removes_quic_helper \
+    | bep_r3_minted_id_checked_without_proxy \
+    | bep_r3_stranded_box_frees_client_key \
+    | bep_r3_widened_store_rule_without_restart \
+    | bep_r3_config_dir_rule_reaches_bep_serve \
+    | bep_round_three_conditions_closed)
     "proof_$1"
     ;;
   *)
@@ -25356,6 +25911,11 @@ case "${1:-}" in
     echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
     echo "         bep_dns_steering_fails_closed_end_to_end"
     echo "         bep_host_ip_cohort_blocks_udp_443 bep_conditions_closed_end_to_end"
+    echo "         bep_r3_spec_names_jti_and_quarantine bep_r3_pre_flip_udp_443_refused"
+    echo "         bep_r3_finalize_install_names_quic_helper bep_r3_uninstall_removes_quic_helper"
+    echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
+    echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
+    echo "         bep_round_three_conditions_closed"
     exit 2
     ;;
 esac
