@@ -423,7 +423,6 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
         graph: RwLockReadGuard<'_, Graph>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
-        let check_cache = ctx.check_cache.clone();
         let cache = ctx.cache.clone();
         let result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -451,7 +450,6 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
                 .collect(),
             spec_hash: graph.spec_hash(&bsr),
             cache,
-            check_cache,
             cancel: ctx.cancel.clone(),
         };
         drop(graph);
@@ -476,7 +474,6 @@ struct DetbuildScan {
     globs: Vec<String>,
     spec_hash: common::SpecHash,
     cache: Cache<LocalDir>,
-    check_cache: std::sync::Arc<CheckCache>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -514,28 +511,30 @@ impl DetbuildScan {
     }
 
     /// The output files, under every output glob, that contain the needle:
-    /// each file once, however many globs name it, in path order.
+    /// each file once, however many globs name it, in path order. The walk
+    /// does not follow a symlinked directory: this scan reads whatever the
+    /// build produced, and a loop in it (`a -> .`) must not walk forever.
     fn outputs_naming_detbuild(&self, root: &Path) -> Result<Vec<PathBuf>, Error> {
         let mut files = std::collections::BTreeSet::new();
         for glob in &self.globs {
             crate::bail_if_cancelled(&self.cancel)?;
-            files.extend(
-                self.check_cache
-                    .match_files_for_glob(root, glob)?
-                    .iter()
-                    .filter(|path| path.is_file())
-                    .cloned(),
-            );
+            let matched = common::match_files_for_glob_no_follow(root, glob)
+                .map_err(|e| Error::Other(anyhow!("{e}")))?;
+            files.extend(matched.into_iter().filter(|path| path.is_file()));
         }
         let stop = || self.cancel.is_cancelled();
         files
             .into_iter()
             .map(|path| match file_contains(&path, DETBUILD_NEEDLE, &stop) {
-                Ok(true) => Ok(Some(path)),
-                Ok(false) => Ok(None),
-                // a cancelled read is the check's cancellation, not an I/O error of the file
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    crate::bail_if_cancelled(&self.cancel).map(|()| None)
+                Ok(Some(true)) => Ok(Some(path)),
+                Ok(Some(false)) => Ok(None),
+                // the read stopped because the check was cancelled: report that, never a clean file
+                Ok(None) => {
+                    crate::bail_if_cancelled(&self.cancel)?;
+                    Err(Error::Other(anyhow!(
+                        "the scan of {} stopped without a cancellation",
+                        path.display()
+                    )))
                 }
                 Err(e) => Err(Error::IO("reading output file", path, e)),
             })
@@ -550,8 +549,13 @@ impl DetbuildScan {
 /// a boundary is seen. The standard library has no streaming substring
 /// search; this is the usual chunk-and-overlap over the library's. `stop`
 /// is asked before every chunk: a cancelled check leaves a large file mid-way
-/// with an `Interrupted` error rather than reading it to the end.
-fn file_contains(path: &Path, needle: &[u8], stop: &dyn Fn() -> bool) -> std::io::Result<bool> {
+/// with `None`, distinct from any read error (an `EINTR` from the read is an
+/// error of its own kind, never a cancellation).
+fn file_contains(
+    path: &Path,
+    needle: &[u8],
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Option<bool>> {
     use std::io::Read as _;
     let finder = memchr::memmem::Finder::new(needle);
     let mut file = std::fs::File::open(path)?;
@@ -560,18 +564,15 @@ fn file_contains(path: &Path, needle: &[u8], stop: &dyn Fn() -> bool) -> std::io
     let mut window: Vec<u8> = Vec::with_capacity(keep + chunk.len());
     loop {
         if stop() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "check cancelled",
-            ));
+            return Ok(None);
         }
         let n = file.read(&mut chunk)?;
         if n == 0 {
-            return Ok(false);
+            return Ok(Some(false));
         }
         window.extend_from_slice(&chunk[..n]);
         if finder.find(&window).is_some() {
-            return Ok(true);
+            return Ok(Some(true));
         }
         let start = window.len().saturating_sub(keep);
         window.drain(..start);
