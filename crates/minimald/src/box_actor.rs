@@ -260,7 +260,8 @@ enum BoxMessage {
     /// record.
     Destroy(oneshot::Sender<Result<Vec<String>, std::io::Error>>),
     /// [`Self::Destroy`] for a session that has not finished activating:
-    /// `Ok(None)` and nothing done when the record is `Active`. Decided here,
+    /// `Ok(None)` and nothing done when the record is past activation
+    /// (see [`survives_conditional_destroy`]). Decided here,
     /// in mailbox order, so a finalize ahead of it ends first (inbox#690).
     DestroyIfUnfinalized(oneshot::Sender<Result<Option<Vec<String>>, std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
@@ -1143,12 +1144,12 @@ impl BoxActor {
                 // unconditional destroy would: keeping is the exception.
                 let finished = matches!(
                     self.record.record().await,
-                    Ok(record) if record.status == BoxState::Active
+                    Ok(record) if survives_conditional_destroy(record.status)
                 );
                 if finished {
                     tracing::info!(
                         session_id = %self.record.id(),
-                        "kept a session a cleanup destroy was sent for: it finished activating first"
+                        "kept a session a cleanup destroy was sent for: it is past activation"
                     );
                     let _ = r.send(Ok(None));
                 } else {
@@ -1607,5 +1608,35 @@ pub(crate) mod listen_plan_seam {
 // real session's publish rather than a parallel fixture of it; and the
 // session-host tests, which host the runtime port-publish ask tests (NET-045)
 // and drive them through the session actor's own flow, reuse them too.
+/// Whether a record in `status` is kept by
+/// [`BoxMessage::DestroyIfUnfinalized`]. Only a box that has not finished
+/// activating (`Pending`, `Materializing`) is destroyed. An `Active` box and
+/// an ended one (`Stopped`, `Exited`, whose record BOX-018 retains) are kept.
+/// The match is exhaustive so a new state needs a decision here.
+fn survives_conditional_destroy(status: BoxState) -> bool {
+    match status {
+        BoxState::Pending | BoxState::Materializing => false,
+        BoxState::Active | BoxState::Stopped | BoxState::Exited => true,
+    }
+}
+
+#[cfg(test)]
+mod destroy_if_unfinalized_tests {
+    use super::{survives_conditional_destroy, BoxState};
+
+    #[test]
+    fn destroy_if_unfinalized_keeps_a_stopped_or_exited_record() {
+        assert!(survives_conditional_destroy(BoxState::Stopped));
+        assert!(survives_conditional_destroy(BoxState::Exited));
+        assert!(survives_conditional_destroy(BoxState::Active));
+    }
+
+    #[test]
+    fn destroy_if_unfinalized_destroys_a_pending_or_materializing_record() {
+        assert!(!survives_conditional_destroy(BoxState::Pending));
+        assert!(!survives_conditional_destroy(BoxState::Materializing));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
