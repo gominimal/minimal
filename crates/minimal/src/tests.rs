@@ -818,7 +818,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
     assert_eq!(
         render_bare_status("~/w", &entries, &cwd, true),
         "No terminal: not attaching. State for ~/w:\n\
-             \x20 sessions: 1 (web, active)\n\
+             \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
              \x20 min session run web <task>\n\
