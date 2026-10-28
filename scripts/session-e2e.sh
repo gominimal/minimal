@@ -395,6 +395,7 @@ RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; res
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
+E2E_NOT_RUN_WHY="" # one line per NOT RUN case: the case, a tab, and its gate
 E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
@@ -419,6 +420,8 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
+R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -475,6 +478,11 @@ SETUP_CLASSIFIER_INSTALLED=""
 HIDA_SEED_DIR="" # the decided half's project seed; removed on teardown
 HIDA_UNENFORCED_SEED_DIR="" # the unenforced half's project seed; removed on teardown
 HIDA_CLASSIFIER_INSTALLED=""
+# The host_ip cohort proof's classifier install and its two project seeds;
+# removed on teardown.
+COHORT_CLASSIFIER_INSTALLED=""
+COHORT_SEED_DIR=""
+COHORT_SEED_BLOCK_DIR=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -875,6 +883,7 @@ switch_spawn_fault() {
 not_run() {
   echo "$1: NOT RUN ($2)"
   E2E_NOT_RUN="$E2E_NOT_RUN $1"
+  E2E_NOT_RUN_WHY="$E2E_NOT_RUN_WHY$1"$'\t'"$2"$'\n'
 }
 
 # A check a case carries against a known product gap: one named line citing
@@ -918,6 +927,13 @@ teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
     HIDA_CLASSIFIER_INSTALLED=""
   fi
+  # The host_ip cohort proof's own classifier install, by the same net.
+  if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    COHORT_CLASSIFIER_INSTALLED=""
+  fi
+  [ -n "$COHORT_SEED_DIR" ] && rm -rf "$COHORT_SEED_DIR"
+  [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "$COHORT_SEED_BLOCK_DIR"
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
@@ -1011,6 +1027,10 @@ teardown() {
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
   [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
+  # The round-three walk's planted audit segment: a proxy start refuses a
+  # log that holds it, so a run that died with it in place must not keep it.
+  [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+  [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -13244,6 +13264,950 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# The host_ip cohort's UDP 443 block (BEP-018, T53), end to end on a native
+# host that decides per box. Under this case's own classifier install (the
+# arrangement host_ip_deny_all carries: the privileged step's tree and
+# table, removed before it returns), two host-address boxes share the
+# cohort address:
+#   1. box A declares no quic443 stance and holds no grant, so its own
+#      stance is open, and its UDP to port 443 is not rejected;
+#   2. box B declares quic443 = "block" and joins the cohort; the daemon
+#      log records the cohort's stance flipping to blocked, naming B, and
+#      box A's own leaf added to the set that is refused UDP 443. A's UDP to
+#      port 443 is now rejected at once, and so is B's. A host-address box's
+#      socket is in the host netns, so the reject runs in the local OUTPUT
+#      hook and drops the packet: socat's send fails with "Operation not
+#      permitted". The leaf in the set tells this reject from a silent drop;
+#   3. box B is destroyed; the daemon log records the stance flipping
+#      back, naming B, and A's UDP to port 443 is not rejected again.
+# The daemon log tail of the cohort's stance changes prints at the end.
+# Records NOT RUN on a VM lane (the classifier is a host install and the
+# guest daemon has no cohort leaf), and where the classifier table cannot
+# be loaded: no nft or ip, no passwordless sudo, a classifier install the
+# host already carries, or the installer's own mount check refusing.
+proof_bep_host_ip_cohort_blocks_udp_443() {
+  echo "::group::host-address cohort: one box with quic443 = \"block\" blocks UDP 443 for the cohort, and leaving lifts it (BEP-018)"
+  local cq_case=bep_host_ip_cohort_blocks_udp_443
+  local cq_why="" cq_src="" cq_rust_log cq_sock cq_pid cq_proc cq_comm cq_daemons=""
+  local cq_open_sid="" cq_block_sid="" cq_out cq_launch cq_probe_out cq_flip cq_try cq_members
+  local cq_warm_sid=""
+  local cq_slice=/sys/fs/cgroup/minimald.slice
+  local cq_blocked_leaf=/sys/fs/cgroup/minimald.slice/boxes/quic443-blocked
+  local cq_stance_msg="the host-address cohort's UDP 443 stance changed"
+  local cq_set_add_msg="added a host-address box's own leaf to the set that is refused UDP 443"
+
+  if [ -n "$E2E_VM" ]; then
+    not_run "$cq_case" "a VM lane: the host-address cohort block runs in a native daemon's classifier tree, which a VM guest does not have"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! command -v nft >/dev/null 2>&1; then
+    cq_why="no nft on PATH: the classifier table is loaded with it"
+  elif ! command -v ip >/dev/null 2>&1; then
+    cq_why="no ip on PATH: the install needs the default-route source address"
+  elif ! sudo -n true >/dev/null 2>&1; then
+    cq_why="no passwordless sudo: the classifier install needs root"
+  elif [ -e "$cq_slice" ] || sudo -n nft list table inet minimal_class >/dev/null 2>&1; then
+    cq_why="this host already has a classifier install ($cq_slice or the table inet minimal_class), and this case replaces no host's own"
+  elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+      --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+      >/dev/null 2>"$WORK/$cq_case.mount.err"; then
+    cq_why="the installer's mount check refuses this host: $(head -n1 "$WORK/$cq_case.mount.err" 2>/dev/null || true)"
+  else
+    cq_src="$(ip route get 1.1.1.1 2>/dev/null \
+      | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$cq_src" ] || cq_why="no default-route source address for the install"
+  fi
+  if [ -n "$cq_why" ]; then
+    # A native CI lane carries every gate above, so a missing one there is a
+    # lane fault, as in proof_host_ip_deny_all, never a NOT RUN.
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $cq_why"
+      fail
+    fi
+    not_run "$cq_case" "$cq_why"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The daemon's file log is JSON lines with the event's fields under
+  # "fields" (crates/mlog/src/lib.rs). Prints the lines that hold $1.
+  cq_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -hF -- "$1" {} + 2>/dev/null || true
+  }
+  # One UDP datagram to TEST-NET-1 port 443 from box $1. Prints socat's own
+  # output and a last line "rc=<exit> ms=<elapsed>". Under the block the
+  # table rejects the datagram in the local OUTPUT hook: it sends ICMP port
+  # unreachable and drops the packet, so socat's first send fails at once
+  # with EPERM ("Operation not permitted"). A later send or recv can read
+  # ECONNREFUSED ("Connection refused") instead. Without the block nothing
+  # answers, and socat waits its 3 s.
+  cq_probe() {
+    # shellcheck disable=SC2016
+    mnl session exec "$1" \
+      's=$(date +%s%N); printf q | /usr/bin/socat -t 3 -T 3 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+      2>&1 | tr -d '\r' || true
+  }
+  # 0 when the probe output $1 shows the datagram rejected at once. The
+  # errno alone cannot tell a reject from a drop: the timing tells it from
+  # the 3 s path where nothing answers, and the set check below tells it
+  # from a drop.
+  cq_rejected() {
+    local rc ms
+    rc="$(printf '%s\n' "$1" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+    ms="$(printf '%s\n' "$1" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+    [ -n "$rc" ] && [ "$rc" != 0 ] && [ -n "$ms" ] && [ "$ms" -lt 2000 ] \
+      && printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # 0 when the probe output $1 ran to its end and shows no rejection.
+  cq_not_rejected() {
+    printf '%s\n' "$1" | grep -q '^rc=[0-9]* ms=[0-9]*$' \
+      && ! printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # The case's own teardown, in the order the uninstall needs: the boxes'
+  # leaves empty when they are destroyed, the daemon's when it stops.
+  # Returns the uninstall's exit status.
+  cq_unwind() {
+    [ -n "$cq_warm_sid" ] && mnl session destroy --force "$cq_warm_sid" >/dev/null 2>&1
+    [ -n "$cq_block_sid" ] && mnl session destroy --force "$cq_block_sid" >/dev/null 2>&1
+    [ -n "$cq_open_sid" ] && mnl session destroy --force "$cq_open_sid" >/dev/null 2>&1
+    cq_warm_sid=""; cq_block_sid=""; cq_open_sid=""
+    [ -n "$COHORT_SEED_DIR" ] && rm -rf "${COHORT_SEED_DIR:?}"
+    [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "${COHORT_SEED_BLOCK_DIR:?}"
+    COHORT_SEED_DIR=""; COHORT_SEED_BLOCK_DIR=""
+    mnl stop --force >/dev/null 2>&1 || true
+    if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+      sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || return 1
+      COHORT_CLASSIFIER_INSTALLED=""
+    fi
+    return 0
+  }
+  cq_fail() {
+    local cq_err
+    for cq_err in "$WORK/$cq_case".*.err; do
+      [ -s "$cq_err" ] || continue
+      echo "--- stderr: ${cq_err##*/} ---"
+      cat "$cq_err" 2>/dev/null || true
+    done
+    echo "--- daemon log: the boxes' classifier-leaf launch records (tail) ---"
+    cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
+    echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+    cq_log "$cq_stance_msg" | tail -n 20
+    echo "--- daemon log: the leaves added to the set that is refused UDP 443 (tail) ---"
+    cq_log "$cq_set_add_msg" | tail -n 20
+    cq_unwind
+    fail
+  }
+
+  # ---- the install. The daemon stops first, so the one this case drives
+  # starts under the install.
+  mnl stop --force >/dev/null 2>&1 || true
+  COHORT_CLASSIFIER_INSTALLED=1
+  # The notes are captured as this lane's user: sudo's privilege ends at
+  # the script it runs.
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+      --cohort-address "$cq_src" --node-plane-address "$cq_src" \
+      >"$WORK/$cq_case.install.out" 2>"$WORK/$cq_case.install.err"; then
+    echo "::error::the classifier install failed, so no table rejects the cohort's UDP 443"
+    cat "$WORK/$cq_case.install.err" 2>/dev/null || true
+    cq_fail
+  fi
+  if [ ! -d "$cq_blocked_leaf" ]; then
+    echo "::error::the classifier install laid out no blocked leaf at $cq_blocked_leaf"
+    cq_fail
+  fi
+  echo "install: the classifier tree at $cq_slice with the blocked leaf $cq_blocked_leaf, and the table inet minimal_class, cohort address $cq_src"
+
+  # ---- the daemon, up under a filter that keeps the classifier's and the
+  # launcher's INFO records, then placed in the slice's daemon leaf.
+  cq_rust_log="warn,minimald::net::classifier=info,minimald::box_runtime=info,minimald::box_actor=info"
+  if ! RUST_LOG="$cq_rust_log" mnl ls >/dev/null 2>"$WORK/$cq_case.warm.err"; then
+    echo "::error::the daemon for $cq_case did not come up under its record filter"
+    cat "$WORK/$cq_case.warm.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_proc in /proc/[0-9]*; do
+    [ -r "$cq_proc/comm" ] || continue
+    read -r cq_comm <"$cq_proc/comm" 2>/dev/null || continue
+    [ "$cq_comm" = "$min_daemon" ] || continue
+    [ -O "$cq_proc" ] || continue
+    cq_daemons="$cq_daemons${cq_daemons:+ }${cq_proc#/proc/}"
+  done
+  cq_pid="${cq_daemons%% *}"
+  if [ -z "$cq_pid" ] || [ "${cq_daemons#"$cq_pid"}" != "" ]; then
+    echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${cq_daemons:-none}"
+    cq_fail
+  fi
+  cq_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+      --place-listener "$cq_sock" \
+      >"$WORK/$cq_case.place.out" 2>"$WORK/$cq_case.place.err" \
+    || ! grep -qx "$cq_pid" "$cq_slice/daemon/cgroup.procs" 2>/dev/null; then
+    echo "::error::the installer's --place-listener step did not place $min_daemon $cq_pid in $cq_slice/daemon"
+    cat "$WORK/$cq_case.place.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "place: $min_daemon $cq_pid is in the slice's daemon leaf"
+
+  COHORT_SEED_DIR="$(hook_mktemp /tmp/mnlcohort.XXXXXX)"
+  hook_seed_preamble >"$COHORT_SEED_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_DIR/.git"
+
+  # ---- a throwaway host-address box turns the daemon's classifier fact,
+  # as in proof_host_ip_deny_all. The daemon started outside the slice and
+  # was placed after, so its start-up read still carries that cause. Each
+  # host-address launch re-reads the host, so this box's launch turns the
+  # fact to per_box before box A is created against it.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-warm --network host_ip </dev/null 2>"$WORK/$cq_case.warm-box.err")" || {
+    echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+    cat "$WORK/$cq_case.warm-box.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_warm_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1; }; then
+    echo "::error::the throwaway box $cq_warm_sid did not run a command"
+    cat "$WORK/$cq_case.warm-gate.err" 2>/dev/null || true
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_warm_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the throwaway box $cq_warm_sid was not launched into its own leaf boxes/allow/$cq_warm_sid with per-box enforcement, so the placement did not take effect: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  if ! mnl session destroy --force "$cq_warm_sid" >/dev/null 2>"$WORK/$cq_case.warm-destroy.err"; then
+    echo "::error::the throwaway box $cq_warm_sid would not destroy"
+    cat "$WORK/$cq_case.warm-destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "refresh: the throwaway box's launch (leaf boxes/allow/$cq_warm_sid) says per_box"
+  cq_warm_sid=""
+
+  # ---- box A: open stance, alone in the cohort.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-open --network host_ip </dev/null 2>"$WORK/$cq_case.open.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the open-stance box"
+    cat "$WORK/$cq_case.open.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_open_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # A session's box launches on its first exec, not at the activate, so
+  # the launch record exists only after this exec.
+  if ! mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1; }; then
+    echo "::error::the open-stance box's own exec failed: the box this case is about cannot be driven"
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_open_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the open-stance box $cq_open_sid was not launched into its own leaf boxes/allow/$cq_open_sid with per-box enforcement: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  mnl session exec "$cq_open_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the open-stance box has no /usr/bin/socat (a launcher baseline package)"
+    cq_fail
+  }
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) alone, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from a host-address box with an open stance, alone in the cohort, was rejected or did not run"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B: quic443 = "block" joins, and the whole cohort is blocked.
+  COHORT_SEED_BLOCK_DIR="$(hook_mktemp /tmp/mnlcohortb.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } >"$COHORT_SEED_BLOCK_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_BLOCK_DIR/.git"
+  cq_out="$(cd "$COHORT_SEED_BLOCK_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-block --network host_ip </dev/null 2>"$WORK/$cq_case.block.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the box with quic443 = \"block\""
+    cat "$WORK/$cq_case.block.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_block_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # Box B joins the cohort when it launches, on its first exec.
+  if ! mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1; }; then
+    echo "::error::the exec in box B ($cq_block_sid) failed: the box with quic443 = \"block\" cannot be driven"
+    cq_fail
+  fi
+  cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+    | grep -F -- '"blocked":true' || true)"
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance to blocked when box B ($cq_block_sid) joined"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed to blocked when box B ($cq_block_sid) joined"
+  cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+  echo "blocked leaf: $cq_members process(es) in $cq_blocked_leaf"
+  if [ "$cq_members" = 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf holds no process while the cohort blocks UDP 443"
+    cq_fail
+  fi
+  # An errno cannot tell a reject from a silent drop, so box A's own leaf
+  # must be in the set that the table refuses UDP 443.
+  cq_flip=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_set_add_msg" | grep -F -- "\"box_id\":\"$cq_open_sid\"" || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no add of box A's ($cq_open_sid) own leaf to the set that is refused UDP 443 while box B blocks the cohort"
+    cq_fail
+  fi
+  echo "log: box A's ($cq_open_sid) own leaf was added to the set that is refused UDP 443"
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) beside B, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A was not rejected at once while box B's quic443 = \"block\" blocks the cohort (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_block_sid")"
+  echo "box B ($cq_block_sid), UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box B, which declares quic443 = \"block\", was not rejected at once (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B leaves, and the block lifts for box A.
+  if ! mnl session destroy --force "$cq_block_sid" >/dev/null 2>"$WORK/$cq_case.destroy.err"; then
+    echo "::error::box B ($cq_block_sid) would not destroy"
+    cat "$WORK/$cq_case.destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+      | grep -F -- '"blocked":false' || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance back to open when box B ($cq_block_sid) left"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed back to open when box B ($cq_block_sid) left"
+  local cq_left_sid="$cq_block_sid"
+  cq_block_sid=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+    [ "$cq_members" = 0 ] && break
+  done
+  if [ "$cq_members" != 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf still holds $cq_members process(es) after the last blocking box left"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) after B left, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A is still rejected after the last blocking box left the cohort"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+  cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_left_sid\"" | tail -n 4
+  if ! cq_unwind; then
+    echo "::error::the classifier uninstall failed, so this case left the tree and the table on the host"
+    fail
+  fi
+  rm -f "${WORK:?}/${cq_case:?}".*
+  echo "host-address cohort: UDP 443 open alone, rejected for every member while one blocks, open again after it leaves"
+  echo "::endgroup::"
+}
+
+# The BEP conditions closed, end to end (T56): one walk over the residual
+# cases the slice's arch conditions held open at merge.
+#   * bep_git_credential_helper_sends_header: git in a grant box sends a
+#     header the proxy substitutes (BEP-015).
+#   * bep_signing_rotation_keeps_running_box_working: the signing
+#     certificate rotates under a running proxy, and the box keeps
+#     pushing (BEP-061).
+#   * bep_host_ip_cohort_blocks_udp_443: a blocked host_ip cohort sends no
+#     UDP to port 443 (BEP-018).
+# The first two need the macOS lane with a sign-in and E2E_BEP_PRIVATE_REPO.
+# The third needs a native Linux host that can load the classifier table.
+# Each case records NOT RUN with its gate where it cannot run, and the walk
+# prints PASS or NOT RUN for each at its end. A failing case ends the run,
+# as every case does. The store-reference check at creation (BEP-034) and
+# the CA deny set have their own unit tests in crates/bep.
+proof_bep_conditions_closed_end_to_end() {
+  local cc_case cc_before cc_why cc_ran=0 cc_summary=""
+  for cc_case in bep_git_credential_helper_sends_header \
+      bep_signing_rotation_keeps_running_box_working \
+      bep_host_ip_cohort_blocks_udp_443; do
+    cc_before="$E2E_NOT_RUN"
+    "proof_$cc_case"
+    if [ "$E2E_NOT_RUN" = "$cc_before" ]; then
+      cc_ran=$((cc_ran + 1))
+      cc_summary="$cc_summary$cc_case: PASS"$'\n'
+    else
+      cc_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$cc_case" '$1 == c { w = $2 } END { print w }')"
+      cc_summary="$cc_summary$cc_case: NOT RUN (${cc_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP conditions closed: each case"
+  printf '%s' "$cc_summary"
+  echo "::endgroup::"
+  if [ "$cc_ran" = 0 ]; then
+    not_run bep_conditions_closed_end_to_end "none of its cases can run on this lane"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# The BEP round-three conditions closed (T94): one walk over the residuals
+# that the third round of the slice's arch conditions held open. Each case
+# is runnable alone, and the walk prints PASS or NOT RUN with its gate for
+# each at its end. A failing case ends the run, as every case does.
+#   * bep_r3_spec_names_jti_and_quarantine: the spec's BEP-039 names the
+#     handle's jti, BEP-041 names the quarantine directory, and BEP-068
+#     refuses a start over an unreadable line and names
+#     `bep serve --quarantine-unreadable`. Runs on every lane.
+#   * bep_r3_pre_flip_udp_443_refused: a real kernel refuses a UDP 443
+#     socket that a host_ip member opened before its cohort turned blocked,
+#     and the socket sends again after the block lifts (BEP-018). It runs
+#     the root integration leg that proves it, and records the leg's own
+#     NOT RUN gate. Native Linux with passwordless sudo and nft only.
+#   * bep_r3_finalize_install_names_quic_helper: `min finalize-install
+#     --show` lists the QUIC block helper, and the JSON report names its
+#     path while it is missing (BEP-018). Native Linux only.
+#   * bep_r3_uninstall_removes_quic_helper: the installer's uninstall names
+#     the QUIC block helper and its sudoers rule, and its printed remedy
+#     removes both. It runs the installer harness case over a fake root,
+#     so it changes nothing on this host. Runs on every lane.
+#   * bep_r3_minted_id_checked_without_proxy: with no proxy running, a box
+#     creation reads the proxy's audit log for the minted id. An audit
+#     segment with a line that does not parse refuses the creation, and the
+#     same creation succeeds once the segment is gone (BEP-070).
+#   * bep_r3_stranded_box_frees_client_key: a grant box destroyed while the
+#     proxy is down keeps its id in the proxy's client-key registrations.
+#     The next proxy start frees it (BEP-063).
+#   * bep_r3_widened_store_rule_without_restart: a rule added to
+#     [secret-store-rules] while the proxy runs turns the proxy's 403 for its
+#     host into an admitted CONNECT, with the same `bep serve` process
+#     (BEP-032).
+#   * bep_r3_config_dir_rule_reaches_bep_serve: NOT RUN on every lane. Box
+#     creation mints no store handle yet (#2525), so no `min` command reaches
+#     the --config-dir rule check. Its unit tests in crates/minimal/src/mint.rs
+#     pin the check.
+# The four proxy cases need the live proxy gate (bep_live_gate): macOS, the
+# VM host daemon with gvproxy, and a GitHub sign-in.
+R3_SPEC="docs/specs/24-spec-box-egress-proxy/24-spec-box-egress-proxy.md"
+R3_PRE_FLIP_LEG=a_blocked_cohort_rejects_a_pre_flip_udp_443_socket
+R3_STORE_RULE_ID=e2e-round-three
+R3_STORE_HOST=example.com
+
+# Prints the requirement line of $1 (BEP-039, ...) in the spec, and the
+# lines under it up to the next requirement.
+r3_spec_block() {
+  awk -v id="$1" '
+    index($0, "- **" id "**") == 1 { grab = 1; print; next }
+    grab && /^- \*\*[A-Z]+-[0-9]+\*\*/ { exit }
+    grab && /^#/ { exit }
+    grab { print }
+  ' "$ROOT/$R3_SPEC"
+}
+
+proof_bep_r3_spec_names_jti_and_quarantine() {
+  echo "::group::BEP spec: the audit record names the handle jti, and an unreadable segment moves to quarantine"
+  local sq_039 sq_041 sq_068
+  sq_039="$(r3_spec_block BEP-039 | head -n1)"
+  sq_041="$(r3_spec_block BEP-041 | head -n1)"
+  sq_068="$(r3_spec_block BEP-068)"
+  if [ -z "$sq_039" ] || [ -z "$sq_041" ] || [ -z "$sq_068" ]; then
+    echo "::error::$R3_SPEC lacks one of the BEP-039, BEP-041 and BEP-068 requirements"
+    fail
+  fi
+  if [[ "$sq_039" != *"the handle's \`jti\` or empty"* ]]; then
+    echo "::error::BEP-039 in $R3_SPEC does not name the handle's jti among the audit record's fields"
+    printf '%s\n' "$sq_039"
+    fail
+  fi
+  echo "BEP-039 names the handle's \`jti\` among the audit record's fields"
+  if [[ "$sq_041" != *"into the \`quarantine\` directory"* ]]; then
+    echo "::error::BEP-041 in $R3_SPEC does not name the move of an unreadable segment into the quarantine directory"
+    printf '%s\n' "$sq_041"
+    fail
+  fi
+  echo "BEP-041 names the move of a segment with an unreadable line into the \`quarantine\` directory"
+  # shellcheck disable=SC2016 # the backticks are the spec's own text
+  if [[ "$sq_068" != *'refuse the start and name `bep serve --quarantine-unreadable`'* ]]; then
+    echo "::error::BEP-068 in $R3_SPEC does not say that a start over an unreadable line is refused and names bep serve --quarantine-unreadable"
+    fail
+  fi
+  echo "BEP-068 refuses a start over an unreadable line and names \`bep serve --quarantine-unreadable\`"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_pre_flip_udp_443_refused() {
+  echo "::group::host-address cohort: a UDP 443 socket opened before the flip is refused after it (BEP-018)"
+  local pf_case=bep_r3_pre_flip_udp_443_refused pf_why="" pf_rc pf_gate
+  local pf_out="$WORK/bep_r3_pre_flip.out"
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    pf_why="not a native Linux lane: the leg loads the classifier table over this host's own cgroup2"
+  elif ! command -v cargo-nextest >/dev/null 2>&1; then
+    pf_why="no cargo-nextest on PATH: the leg is a test in crates/minimald/tests/netns_root_integration.rs"
+  elif [ "$(id -u)" != 0 ] && ! sudo -n true >/dev/null 2>&1; then
+    pf_why="no passwordless sudo: the classifier install and the QUIC block helper need root"
+  elif [ -e /sys/fs/cgroup/minimald.slice ]; then
+    pf_why="this host already has a classifier tree at /sys/fs/cgroup/minimald.slice, and the leg replaces no host's own"
+  fi
+  if [ -n "$pf_why" ]; then
+    not_run "$pf_case" "$pf_why"
+    echo "::endgroup::"
+    return 0
+  fi
+  echo "running $R3_PRE_FLIP_LEG (cargo nextest run -p minimald --test netns_root_integration)"
+  (cd "$ROOT" && MINIMALD_NETNS_TEST=1 cargo nextest run --locked -p minimald \
+    --test netns_root_integration --run-ignored only --no-capture --no-tests=fail \
+    -E "test(=$R3_PRE_FLIP_LEG)") >"$pf_out" 2>&1
+  pf_rc=$?
+  grep -F -- "$R3_PRE_FLIP_LEG" "$pf_out" || true
+  if [ "$pf_rc" != 0 ]; then
+    echo "::error::$R3_PRE_FLIP_LEG failed (exit $pf_rc)"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  pf_gate="$(sed -n "s/^NOT RUN $R3_PRE_FLIP_LEG: //p" "$pf_out" | head -n1)"
+  if [ -n "$pf_gate" ]; then
+    not_run "$pf_case" "$pf_gate"
+    rm -f "$pf_out"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! grep -qF -- "step 6: after the flip the pre-flip socket is refused with ECONNREFUSED" "$pf_out" \
+    || ! grep -qF -- "step 8: the pre-flip socket sends again after the block lifts" "$pf_out"; then
+    echo "::error::$R3_PRE_FLIP_LEG passed without printing its refusal and its resend steps, so it did not run"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  rm -f "$pf_out"
+  echo "a real kernel refused the pre-flip UDP 443 socket while the cohort was blocked, and it sent again after the block lifted"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_finalize_install_names_quic_helper() {
+  echo "::group::min finalize-install names the QUIC block helper (BEP-018)"
+  local fq_case=bep_r3_finalize_install_names_quic_helper fq_out fq_state
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    not_run "$fq_case" "not a native Linux lane: the QUIC block helper is an item of the native daemon's install"
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl finalize-install --show </dev/null >"$WORK/$fq_case.show" 2>&1 || true
+  if ! grep -qF -- "QUIC block helper" "$WORK/$fq_case.show"; then
+    echo "::error::'min finalize-install --show' does not list the QUIC block helper"
+    cat "$WORK/$fq_case.show"
+    fail
+  fi
+  echo "min finalize-install --show lists the QUIC block helper"
+  mnl finalize-install --show --json </dev/null >"$WORK/$fq_case.json" 2>"$WORK/$fq_case.json.err" || true
+  if ! fq_out="$(python3 - "$WORK/$fq_case.json" <<'PY'
+import json, sys
+# The shell captures stdout only, so the reason goes to stdout before exit 1.
+def die(msg):
+    print(msg)
+    sys.exit(1)
+path = "/usr/local/lib/minimal/quic443-leaf"
+try:
+    with open(sys.argv[1]) as f:
+        report = json.load(f)
+except (OSError, ValueError) as e:
+    die("the report is not valid JSON: %s" % e)
+items = [i for i in report.get("items", []) if i.get("id") == "quic443-helper"]
+if len(items) != 1:
+    die("the report holds %d quic443-helper items, not 1" % len(items))
+item = items[0]
+if item.get("label") != "QUIC block helper":
+    die("the quic443-helper item is labelled %r" % item.get("label"))
+state = item.get("state")
+if state == "missing" and path not in (item.get("today") or ""):
+    die("the missing helper's item does not name %s: %r" % (path, item.get("today")))
+print(state)
+PY
+)"; then
+    echo "::error::'min finalize-install --show --json': $fq_out"
+    cat "$WORK/$fq_case.json" "$WORK/$fq_case.json.err" 2>/dev/null || true
+    fail
+  fi
+  fq_state="$fq_out"
+  if [ "$fq_state" = "done" ] && [ ! -f /usr/local/lib/minimal/quic443-leaf ]; then
+    echo "::error::'min finalize-install --show --json' reports the QUIC block helper done, but /usr/local/lib/minimal/quic443-leaf is absent"
+    fail
+  fi
+  rm -f "${WORK:?}/${fq_case:?}".*
+  echo "min finalize-install --show --json: the quic443-helper item's state is $fq_state, and the item names /usr/local/lib/minimal/quic443-leaf where it is missing"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_uninstall_removes_quic_helper() {
+  echo "::group::uninstall names the QUIC block helper and its sudoers rule, and its remedy removes both"
+  local uq_out="$WORK/bep_r3_uninstall.out" uq_want
+  if ! sh "$ROOT/scripts/install_test.sh" finalize_install_uninstall >"$uq_out" 2>&1; then
+    echo "::error::scripts/install_test.sh finalize_install_uninstall failed"
+    grep -E '^FAIL' "$uq_out" || tail -n 40 "$uq_out"
+    fail
+  fi
+  for uq_want in \
+    "ok   - the uninstall names the QUIC block helper and its sudoers rule" \
+    "ok   - the printed remedy removes usr/local/lib/minimal/quic443-leaf" \
+    "ok   - the printed remedy removes etc/sudoers.d/minimal-quic443-leaf"; do
+    if ! grep -qxF -- "$uq_want" "$uq_out"; then
+      echo "::error::scripts/install_test.sh finalize_install_uninstall does not report: ${uq_want#ok   - }"
+      tail -n 40 "$uq_out"
+      fail
+    fi
+    echo "${uq_want#ok   - }"
+  done
+  rm -f "$uq_out"
+  echo "::endgroup::"
+}
+
+# The pids of this run's `bep serve`, sorted, one per line. minvmd starts it
+# with `--listener` on a socket under this run's $XDG_STATE_HOME, so a proxy
+# from another checkout or a person's own proxy does not match.
+r3_proxy_pids() {
+  pgrep -f -- "serve --listener $XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock" \
+    2>/dev/null | sort || true
+}
+
+# Kills this run's `bep serve` and waits until nothing answers on its control
+# socket $1. Clears BEP_LIVE_DAEMON, so the next bep_live_gate restarts the
+# daemon pair with the proxy. Returns 1 when the proxy still answers.
+r3_proxy_down() {
+  local pd_pids pd_try
+  pd_pids="$(r3_proxy_pids)"
+  if [ -z "$pd_pids" ]; then
+    echo "::error::no 'bep serve' process runs for this VM host, though the proxy answered on $1"
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  kill -KILL $pd_pids 2>/dev/null || true
+  BEP_LIVE_DAEMON=""
+  for pd_try in $(seq 1 20); do
+    bep_control_live "$1" || return 0
+    sleep 0.5
+  done
+  echo "::error::the proxy still answers on $1 after its process was killed"
+  return 1
+}
+
+# Activates a plain own-IP box named $2 for case $1 from R3_SEED_DIR, and
+# prints its id. stderr goes to $WORK/$1.$2.err. Returns the activation's
+# exit status.
+r3_activate_plain() {
+  local ap_out
+  ap_out="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip </dev/null 2>"$WORK/$1.$2.err")" || return 1
+  printf '%s\n' "$ap_out" | tail -n1 | tr -d '\r'
+}
+
+r3_plain_seed() {
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  hook_seed_preamble > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+}
+
+proof_bep_r3_minted_id_checked_without_proxy() {
+  echo "::group::with no proxy running, a box creation checks its minted id against the proxy's audit log (BEP-070)"
+  local mi_case=bep_r3_minted_id_checked_without_proxy
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local mi_control="$HOME/.minimal/bep/control.sock"
+  local mi_audit mi_last mi_n mi_seg mi_sid mi_before mi_after
+  local mi_warn="the Box Egress Proxy's audit log was not read whole"
+  bep_live_gate "$mi_case" || { echo "::endgroup::"; return 0; }
+  mi_audit="$(dirname "$mi_control")/audit"
+
+  MI_SID=""
+  mi_cleanup() {
+    [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+    R3_AUDIT_PLANT=""
+    [ -n "$MI_SID" ] && mnl session destroy --force "$MI_SID" >/dev/null 2>&1
+    MI_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  mi_fail() { mi_cleanup; fail; }
+
+  r3_plain_seed
+  r3_proxy_down "$mi_control" || mi_fail
+  echo "the proxy is down"
+
+  # A new segment after the last one, with one complete line that does not
+  # parse. Removed before the proxy starts again: a start refuses it.
+  mkdir -p "$mi_audit"
+  mi_last="$(find "$mi_audit" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n | tail -n1)"
+  mi_n=$(( ${mi_last:--1} + 1 ))
+  mi_seg="$mi_audit/audit-$mi_n.jsonl"
+  R3_AUDIT_PLANT="$mi_seg"
+  printf 'e2e round three: this line does not parse\n' >"$mi_seg"
+  echo "planted $mi_seg with one line that does not parse"
+
+  mi_before="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if mi_sid="$(r3_activate_plain "$mi_case" e2e-r3-mint-refused)"; then
+    MI_SID="$mi_sid"
+    echo "::error::'min session activate' created a box while the proxy's audit log held a line that does not parse, with no proxy running"
+    mi_fail
+  fi
+  echo "--- min session activate (refused) stderr ---"
+  cat "$WORK/$mi_case.e2e-r3-mint-refused.err" 2>/dev/null || true
+  mi_after="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if [ "$mi_after" -le "$mi_before" ]; then
+    echo "::error::the creation failed, but minvmd logged no refusal for the unread audit log ('$mi_warn')"
+    mi_fail
+  fi
+  if [[ "$(minvmd_log_lines "$mi_warn" | tail -n1)" != *"--quarantine-unreadable"* ]]; then
+    echo "::error::minvmd's refusal does not name bep serve --quarantine-unreadable as the way out"
+    minvmd_log_lines "$mi_warn" | tail -n1
+    mi_fail
+  fi
+  echo "minvmd refused the creation: the audit log was not read whole, and the refusal names --quarantine-unreadable"
+
+  rm -f "$mi_seg"
+  R3_AUDIT_PLANT=""
+  if ! MI_SID="$(r3_activate_plain "$mi_case" e2e-r3-mint-checked)"; then
+    MI_SID=""
+    echo "::error::'min session activate' failed with no proxy running and an audit log that reads whole"
+    cat "$WORK/$mi_case.e2e-r3-mint-checked.err" 2>/dev/null || true
+    mi_fail
+  fi
+  if bep_control_live "$mi_control"; then
+    echo "::error::the proxy answers on $mi_control again, so the second creation was not checked with no proxy"
+    mi_fail
+  fi
+  echo "with the segment gone and the proxy still down, the box $MI_SID was created"
+
+  mi_cleanup
+  rm -f "${WORK:?}/${mi_case:?}".*
+  echo "Minted id checked with no proxy OK (an unread audit log refused the creation, a log read whole let it through)"
+  echo "::endgroup::"
+}
+
+# Prints the box id of box $2 for case $1 as the proxy's control socket
+# spells it: 32 lowercase hex digits.
+r3_box_hex() {
+  local bh_id
+  bh_id="$(bep_recreate_audited_id "$1" "$2")" || return 1
+  printf '%s\n' "$bh_id" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# 0 when the client-key registrations file $1 holds box id $2 in a boxes= set.
+r3_keys_hold_box() {
+  tr 'A-F' 'a-f' <"$1" 2>/dev/null | grep -oE 'boxes=[0-9a-f,]+' | sed 's/^boxes=//' | tr ',' '\n' \
+    | grep -xF -- "$2" >/dev/null
+}
+
+proof_bep_r3_stranded_box_frees_client_key() {
+  echo "::group::a box destroyed while the proxy is down frees its client key at the next proxy start (BEP-063)"
+  local sk_case=bep_r3_stranded_box_frees_client_key sk_name=e2e-r3-stranded
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local sk_control="$HOME/.minimal/bep/control.sock"
+  # shellcheck disable=SC2031
+  local sk_keys="$HOME/.minimal/bep/control.sock.client-keys" sk_hex sk_try sk_freed=""
+  bep_live_gate "$sk_case" || { echo "::endgroup::"; return 0; }
+
+  SK_SID=""
+  sk_cleanup() {
+    [ -n "$SK_SID" ] && mnl session destroy --force "$SK_SID" >/dev/null 2>&1
+    SK_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sk_fail() { sk_cleanup; fail; }
+
+  bep_revoke_seed "$sk_case"
+  SK_SID="$(bep_revoke_activate "$sk_case" "$sk_name")" || { SK_SID=""; sk_fail; }
+  sk_hex="$(r3_box_hex "$sk_case" "$sk_name")" || sk_fail
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys does not hold the grant box $sk_hex in a boxes= set after its creation"
+    sk_fail
+  fi
+  echo "$sk_keys holds the grant box $sk_hex"
+
+  r3_proxy_down "$sk_control" || sk_fail
+  if ! mnl session destroy --force "$SK_SID" </dev/null >/dev/null 2>"$WORK/$sk_case.destroy.err"; then
+    echo "::error::'min session destroy' of $sk_name failed with the proxy down"
+    cat "$WORK/$sk_case.destroy.err" 2>/dev/null || true
+    sk_fail
+  fi
+  SK_SID=""
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys no longer holds $sk_hex with the proxy down, so the box was not stranded"
+    sk_fail
+  fi
+  echo "the box ended with the proxy down, and $sk_keys still holds it"
+
+  bep_live_gate "$sk_case" || sk_fail
+  for sk_try in $(seq 1 60); do
+    [ "$sk_try" -gt 1 ] && sleep 0.5
+    if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+      sk_freed=1
+      break
+    fi
+  done
+  if [ -z "$sk_freed" ]; then
+    echo "::error::$sk_keys still holds the ended box $sk_hex 30 s after the proxy started again"
+    sk_fail
+  fi
+  echo "after the proxy started again, $sk_keys no longer holds $sk_hex"
+
+  sk_cleanup
+  rm -f "${WORK:?}/${sk_case:?}".*
+  echo "Stranded box OK (its id left the client key's boxes at the next proxy start)"
+  echo "::endgroup::"
+}
+
+# One CONNECT to $R3_STORE_HOST:443 through the proxy that box $1's
+# HTTPS_PROXY names. Prints the proxy's answer head.
+r3_connect_probe() {
+  # shellcheck disable=SC2016
+  mnl session exec "$1" sh -c \
+    'p="${HTTPS_PROXY:-${https_proxy:-}}"; p="${p#*://}"; p="${p%%/*}"
+     printf "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n" "$0" "$0" \
+       | /usr/bin/socat -t 10 -T 20 - "TCP:$p" 2>&1 | head -c 400' "$R3_STORE_HOST" \
+    </dev/null 2>&1 | tr -d '\r' || true
+}
+
+# The first HTTP status line in the probe output $1, or nothing.
+r3_status_line() {
+  printf '%s\n' "$1" | sed -n '/^HTTP\/1\.1 [0-9][0-9][0-9]/{p;q;}'
+}
+
+proof_bep_r3_widened_store_rule_without_restart() {
+  echo "::group::a store rule added while the proxy runs is admitted with no restart (BEP-032)"
+  local wr_case=bep_r3_widened_store_rule_without_restart
+  local wr_sid wr_before wr_after wr_pid_before wr_pid_after wr_try
+  local wr_config="$XDG_CONFIG_HOME/minimal/config.toml" wr_saved="$WORK/bep_r3_config.saved"
+  local wr_off="is not one."
+  bep_live_gate "$wr_case" || { echo "::endgroup::"; return 0; }
+
+  WR_SID="" WR_HAD_CONFIG=""
+  [ -f "$wr_config" ] && { cp "$wr_config" "$wr_saved"; WR_HAD_CONFIG=1; }
+  wr_cleanup() {
+    if [ -n "$WR_HAD_CONFIG" ]; then
+      mv -f "$wr_saved" "$wr_config"
+    else
+      rm -f "$wr_config"
+    fi
+    WR_HAD_CONFIG=""
+    [ -n "$WR_SID" ] && mnl session destroy --force "$WR_SID" >/dev/null 2>&1
+    WR_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  wr_fail() { wr_cleanup; fail; }
+
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+  if ! wr_sid="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name e2e-r3-store-rule \
+    --network own_ip --credentialed-upstream </dev/null 2>"$WORK/$wr_case.err")"; then
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    cat "$WORK/$wr_case.err" 2>/dev/null || true
+    wr_fail
+  fi
+  WR_SID="$(printf '%s\n' "$wr_sid" | tail -n1 | tr -d '\r')"
+
+  wr_pid_before="$(r3_proxy_pids | tr '\n' ' ')"
+  wr_before="$(r3_connect_probe "$WR_SID")"
+  echo "before the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_before")"
+  if [[ "$(r3_status_line "$wr_before")" != "HTTP/1.1 403 "* ]] || [[ "$wr_before" != *"$wr_off"* ]]; then
+    echo "::error::before the rule, the proxy did not refuse $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_before"
+    wr_fail
+  fi
+
+  mkdir -p "$(dirname "$wr_config")"
+  printf '\n[secret-store-rules.%s]\nupstream = ["%s"]\nheader = "Authorization"\nprefix = "Bearer "\n' \
+    "$R3_STORE_RULE_ID" "$R3_STORE_HOST" >>"$wr_config"
+  echo "added [secret-store-rules.$R3_STORE_RULE_ID] for $R3_STORE_HOST to $wr_config"
+
+  # The proxy reads the rules again when the file's stamp changes, and a
+  # stamp younger than its settle time is read again at the next CONNECT.
+  for wr_try in $(seq 1 10); do
+    [ "$wr_try" -gt 1 ] && sleep 1
+    wr_after="$(r3_connect_probe "$WR_SID")"
+    [ -n "$(r3_status_line "$wr_after")" ] && [[ "$wr_after" != *"$wr_off"* ]] && break
+  done
+  echo "after the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_after")"
+  if [ -z "$(r3_status_line "$wr_after")" ] || [[ "$wr_after" == *"$wr_off"* ]]; then
+    echo "::error::after the rule was added, the proxy still refuses $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_after"
+    wr_fail
+  fi
+  wr_pid_after="$(r3_proxy_pids | tr '\n' ' ')"
+  if [ -z "$wr_pid_before" ] || [ "$wr_pid_before" != "$wr_pid_after" ]; then
+    echo "::error::the bep serve process changed across the rule change ('$wr_pid_before' -> '$wr_pid_after'), so the proxy restarted"
+    wr_fail
+  fi
+  echo "the same bep serve process (pid $wr_pid_after) admitted $R3_STORE_HOST"
+
+  wr_cleanup
+  rm -f "${WORK:?}/${wr_case:?}".*
+  echo "Widened store rule OK (refused before the rule, admitted after it, no proxy restart)"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_config_dir_rule_reaches_bep_serve() {
+  # Box creation mints no store handle yet: the sealed member list has no
+  # store kind (#2525). So no min command reaches the check that refuses a
+  # --config-dir rule bep serve does not read. Its unit tests in
+  # crates/minimal/src/mint.rs pin it until then.
+  not_run bep_r3_config_dir_rule_reaches_bep_serve \
+    "box creation mints no store handle yet (#2525), so no min command reaches the --config-dir store rule check"
+}
+
+proof_bep_round_three_conditions_closed() {
+  local r3_case r3_before r3_why r3_ran=0 r3_summary=""
+  for r3_case in bep_r3_spec_names_jti_and_quarantine \
+      bep_r3_pre_flip_udp_443_refused \
+      bep_r3_finalize_install_names_quic_helper \
+      bep_r3_uninstall_removes_quic_helper \
+      bep_r3_minted_id_checked_without_proxy \
+      bep_r3_stranded_box_frees_client_key \
+      bep_r3_widened_store_rule_without_restart \
+      bep_r3_config_dir_rule_reaches_bep_serve; do
+    r3_before="$E2E_NOT_RUN"
+    "proof_$r3_case"
+    if [ "$E2E_NOT_RUN" = "$r3_before" ]; then
+      r3_ran=$((r3_ran + 1))
+      r3_summary="$r3_summary$r3_case: PASS"$'\n'
+    else
+      r3_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$r3_case" '$1 == c { w = $2 } END { print w }')"
+      r3_summary="$r3_summary$r3_case: NOT RUN (${r3_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP round-three conditions closed: each case"
+  printf '%s' "$r3_summary"
+  echo "::endgroup::"
+  if [ "$r3_ran" = 0 ]; then
+    not_run bep_round_three_conditions_closed "none of its cases can run on this lane"
+  fi
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -24833,6 +25797,11 @@ case "${1:-}" in
     # already carries a classifier install, and a residue here would read as
     # one there.
     proof_host_ip_deny_all
+    # After proof_host_ip_deny_all and before the daemon-fetch proof, for the
+    # same reasons: it installs its own host classifier tree and table
+    # (removed before it returns) and respawns the daemon under its own
+    # record filter, and a residue would trip the daemon-fetch proof's gates.
+    proof_bep_host_ip_cohort_blocks_udp_443
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
@@ -24883,7 +25852,18 @@ case "${1:-}" in
     | bep_destroy_with_proxy_down_refuses_by_attachment \
     | bep_logout_refuses_every_reference_at_next_request \
     | bep_revoke_and_sign_out_end_to_end \
-    | bep_dns_steering_fails_closed_end_to_end)
+    | bep_dns_steering_fails_closed_end_to_end \
+    | bep_host_ip_cohort_blocks_udp_443 \
+    | bep_conditions_closed_end_to_end \
+    | bep_r3_spec_names_jti_and_quarantine \
+    | bep_r3_pre_flip_udp_443_refused \
+    | bep_r3_finalize_install_names_quic_helper \
+    | bep_r3_uninstall_removes_quic_helper \
+    | bep_r3_minted_id_checked_without_proxy \
+    | bep_r3_stranded_box_frees_client_key \
+    | bep_r3_widened_store_rule_without_restart \
+    | bep_r3_config_dir_rule_reaches_bep_serve \
+    | bep_round_three_conditions_closed)
     "proof_$1"
     ;;
   *)
@@ -24930,6 +25910,12 @@ case "${1:-}" in
     echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
     echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
     echo "         bep_dns_steering_fails_closed_end_to_end"
+    echo "         bep_host_ip_cohort_blocks_udp_443 bep_conditions_closed_end_to_end"
+    echo "         bep_r3_spec_names_jti_and_quarantine bep_r3_pre_flip_udp_443_refused"
+    echo "         bep_r3_finalize_install_names_quic_helper bep_r3_uninstall_removes_quic_helper"
+    echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
+    echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
+    echo "         bep_round_three_conditions_closed"
     exit 2
     ;;
 esac

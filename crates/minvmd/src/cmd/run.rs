@@ -892,7 +892,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // nothing. Best-effort, like a missing gvproxy: a boot without
             // the proxy still runs boxes, without a credentialed lane.
             if !stub_enabled && cfg!(target_os = "macos") {
-                _bep_proxy = start_bep_proxy(&proxy_sock, &token);
+                _bep_proxy = start_bep_proxy(&proxy_sock, &token, &boxes);
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
@@ -1518,12 +1518,14 @@ impl BepProxy {
     /// with `token` as 64 hex digits on its standard input and its output
     /// appended to `log`. The standard input stays open after the token for
     /// as long as the child is owned here: it is the supervisor's lifeline
-    /// ([`BEP_LIFELINE_FLAG`]).
+    /// ([`BEP_LIFELINE_FLAG`]). The watcher runs `on_listening` each time
+    /// the proxy starts to listen.
     fn spawn(
         binary: &std::path::Path,
         listener: &std::path::Path,
         token: &[u8; switch::bep_host::TOKEN_LEN],
         log: &std::path::Path,
+        on_listening: Option<OnListening>,
     ) -> std::io::Result<Self> {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
@@ -1583,6 +1585,7 @@ impl BepProxy {
                 listener: listener.to_path_buf(),
                 stale,
                 log: log.to_path_buf(),
+                on_listening,
             };
             hand_to_watcher(child, watch, |body| {
                 std::thread::Builder::new()
@@ -1665,6 +1668,30 @@ struct BepWatch {
     /// The socket at `listener` before the start, which is not the proxy's.
     stale: Option<SocketIdentity>,
     log: std::path::PathBuf,
+    /// Runs each time the proxy starts to listen.
+    on_listening: Option<OnListening>,
+}
+
+/// What the watcher runs when the proxy starts to listen.
+type OnListening = Box<dyn Fn() + Send + 'static>;
+
+/// The hook that names the boxes of `boxes` to the proxy each time it starts
+/// to listen (BEP-063, #2617), on a thread of its own so the watcher does
+/// not wait for it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn send_live_boxes_on_listening(boxes: crate::box_registry::BoxRegistry) -> OnListening {
+    Box::new(move || {
+        let boxes = boxes.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bep-live-boxes".into())
+            .spawn(move || boxes.send_live_boxes());
+        if let Err(error) = spawned {
+            tracing::warn!(
+                %error,
+                "the Box Egress Proxy did not get the live box list: its thread did not start"
+            );
+        }
+    })
 }
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
@@ -1751,6 +1778,9 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
                     .is_some_and(|identity| Some(identity) != watch.stale);
                 if bound != watch.listening.swap(bound, Ordering::SeqCst) {
                     tracing::debug!(pid, listening = bound, "box egress proxy listener");
+                    if bound && let Some(on_listening) = &watch.on_listening {
+                        on_listening();
+                    }
                 }
             }
             Err(error) => {
@@ -1775,11 +1805,13 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
 
 /// Starts this boot's proxy on `listener`, its log beside it. Logs one
 /// info line naming the socket and the pid, or one warn line naming why
-/// the boot goes on without the proxy.
+/// the boot goes on without the proxy. Once the proxy listens, it gets the
+/// box ids `boxes` holds ([`send_live_boxes_on_listening`]).
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn start_bep_proxy(
     listener: &std::path::Path,
     token: &[u8; switch::bep_host::TOKEN_LEN],
+    boxes: &crate::box_registry::BoxRegistry,
 ) -> Option<BepProxy> {
     let Some(binary) = resolve_bep_binary() else {
         tracing::warn!(
@@ -1789,7 +1821,8 @@ fn start_bep_proxy(
         return None;
     };
     let log = listener.with_file_name(BEP_LOG_FILE);
-    match BepProxy::spawn(&binary, listener, token, &log) {
+    let on_listening = send_live_boxes_on_listening(boxes.clone());
+    match BepProxy::spawn(&binary, listener, token, &log, Some(on_listening)) {
         Ok(proxy) => {
             tracing::info!(
                 pid = proxy.pid(),
@@ -4690,7 +4723,7 @@ mod tests {
         for (i, byte) in token.iter_mut().enumerate() {
             *byte = u8::try_from(i * 7 + 1).unwrap();
         }
-        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         assert_ne!(proxy.pid(), 0);
 
         let token_file = seen.with_extension("token");
@@ -4781,7 +4814,7 @@ mod tests {
 
         let proxy = std::thread::spawn({
             let (bin, listener, log) = (bin.clone(), listener.clone(), log.clone());
-            move || super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn")
+            move || super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn")
         })
         .join()
         .expect("the starting thread");
@@ -4831,7 +4864,7 @@ mod tests {
         let log = listener.with_file_name(super::BEP_LOG_FILE);
         let token = [9u8; switch::bep_host::TOKEN_LEN];
 
-        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
         assert!(
             !eof.exists(),
@@ -4896,6 +4929,7 @@ mod tests {
             listener: dir.path().join("gvproxy-bep.sock"),
             stale: None,
             log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: None,
         };
         let error = super::hand_to_watcher(child, watch, |_body| {
             Err(std::io::Error::other("no thread for the watcher"))
@@ -4908,5 +4942,68 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "the proxy does not outlive a failed watcher start");
+    }
+
+    /// BEP-063 (#2617): when `bep serve` starts to listen, the watcher sends
+    /// the proxy's control socket one `live_boxes` line with every box id
+    /// the registry holds, so the proxy frees the keys of the boxes that
+    /// ended with no forget.
+    #[test]
+    fn proxy_gets_the_live_box_ids_when_it_starts_to_listen() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.sock");
+        let registry = crate::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        for name in ["box-a", "box-b"] {
+            registry
+                .register_client_box(crate::box_registry::ClientBoxSpec {
+                    name: name.to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the plan has a switch address to hand out");
+        }
+        let expected = registry.live_box_ids();
+        assert_eq!(expected.len(), 2);
+        let registry = registry.with_proxy_control(Some(control.clone()));
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let watch = super::BepWatch {
+            stop: std::sync::Arc::default(),
+            listening: std::sync::Arc::default(),
+            listener: listener.clone(),
+            stale: None,
+            log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: Some(super::send_live_boxes_on_listening(registry)),
+        };
+        let stop = std::sync::Arc::clone(&watch.stop);
+        let watcher =
+            super::hand_to_watcher(child, watch, |body| std::thread::Builder::new().spawn(body))
+                .expect("the watcher starts");
+
+        // The proxy binds its listener, then its control socket.
+        let _listening = std::os::unix::net::UnixListener::bind(&listener).unwrap();
+        let control = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let (stream, _) = control.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (&stream).write_all(b"{\"ok\":true}\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"op": "live_boxes", "box_ids": expected})
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.join().unwrap();
     }
 }

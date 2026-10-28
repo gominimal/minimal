@@ -3478,6 +3478,37 @@ async fn create_handed_own_ip_session(
     id
 }
 
+/// NET-121, design §7.1: a declared TCP host port that another process
+/// already holds at the box's published address fails the finalize. The
+/// error names the port and the next step, and the box never reaches
+/// `Active`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_fails_on_a_taken_declared_host_port() {
+    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    // Another process holds the declared host port at the handed address.
+    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+    let reply = client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        })
+        .await;
+    match reply {
+        Errorable::Err { error } => assert!(
+            error.contains("host port 18080 is already in use")
+                && error.contains("--ingress <other>:<internal>"),
+            "the error must name the port and the next step, got: {error}"
+        ),
+        Errorable::Ok(ok) => panic!("finalize must fail on a taken host port, got {ok:?}"),
+    }
+}
+
 /// Waits until a registration is parked on the range verdict, so the
 /// landing a test makes next provably answers a waiter rather than a
 /// registration that has not yet begun to wait (NET-123 §7.1).
