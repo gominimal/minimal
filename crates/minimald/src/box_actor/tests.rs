@@ -12549,3 +12549,40 @@ fn of_container_on_a_reaped_supervisor_signals_nothing() {
         assert_eq!(processes.signal(0), 0, "no process is signalled");
     }
 }
+
+/// BOX-013: a pid in the daemon's own namespace that is not the daemon's
+/// child is not a supervisor the daemon spawned. A reaped supervisor's pid
+/// can be reused by such a process, so the stop signals nothing.
+#[test]
+fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
+    use std::io::BufRead as _;
+
+    // The shell's background `sleep` is a grandchild: its parent is the shell.
+    let mut shell = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in shell");
+    let mut line = String::new();
+    std::io::BufReader::new(shell.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("read the grandchild's pid");
+    let grandchild: u32 = line.trim().parse().expect("a pid");
+
+    let processes = crate::box_runtime::BoxProcesses::of_container(grandchild);
+    assert!(
+        processes.pids().is_empty(),
+        "a process the daemon did not spawn is not the box's supervisor"
+    );
+    assert_eq!(processes.signal(0), 0, "no process is signalled");
+
+    // The grandchild is still alive: the stop did not reach it.
+    // SAFETY: `kill` reads no memory of ours.
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(grandchild).unwrap(), 0) },
+        0
+    );
+    // SAFETY: as above. This ends the stand-in before the shell is reaped.
+    unsafe { libc::kill(i32::try_from(grandchild).unwrap(), libc::SIGKILL) };
+    shell.wait().expect("reap the stand-in shell");
+}

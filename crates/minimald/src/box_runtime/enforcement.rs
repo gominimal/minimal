@@ -811,9 +811,11 @@ pub(super) fn place_box_processes(
 /// test launcher's plain process) has no namespace to scan. The box is then
 /// the supervisor and its descendants.
 ///
-/// A supervisor whose namespace cannot be read is gone: it exited and was
-/// reaped. Its pid can belong to an unrelated process by now, so the box has
-/// no processes and a stop signals nothing.
+/// A supervisor that is no longer this daemon's child, or whose namespace
+/// cannot be read, is gone: it exited and was reaped. Its pid can belong to
+/// an unrelated process by now, so the box has no processes and a stop
+/// signals nothing. The daemon spawns every supervisor itself, so a process
+/// with another parent is never the box's supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BoxProcesses {
     /// The box's container supervisor.
@@ -829,13 +831,26 @@ enum ProcessScope {
     Namespace((u64, u64)),
     /// The supervisor and its descendants, in the daemon's own namespace.
     Tree,
-    /// No process: the supervisor's namespace could not be read.
+    /// No process: the supervisor is not this daemon's child, or its
+    /// namespace could not be read.
     Gone,
 }
 
 impl BoxProcesses {
     /// The processes of the box whose container supervisor is `root`.
     pub(crate) fn of_container(root: u32) -> Self {
+        // BOX-013: a reaped supervisor's pid can be reused. Only a child of
+        // this daemon can still be the supervisor it spawned.
+        if parent_of(root) != Some(std::process::id()) {
+            tracing::debug!(
+                container_pid = root,
+                "stop: the container supervisor is no longer this daemon's child; no process to signal"
+            );
+            return Self {
+                root,
+                scope: ProcessScope::Gone,
+            };
+        }
         let own = namespace_id(std::path::Path::new("/proc/self/ns/pid"));
         let boxed = namespace_id(std::path::Path::new(&format!(
             "/proc/{root}/ns/pid_for_children"
@@ -902,6 +917,15 @@ impl BoxProcesses {
 fn namespace_id(link: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(link).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// The parent pid of `pid`, as `/proc/<pid>/stat` names it.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The state and then the parent pid follow the last `)`, which closes
+    // the command name.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_ascii_whitespace().nth(1)?.parse().ok()
 }
 
 /// Every pid `/proc` lists.
