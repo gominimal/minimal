@@ -57,6 +57,12 @@
     },
     {
      "kind": null,
+     "name": "client-config",
+     "path": "<root>/crates/client-config",
+     "source": null
+    },
+    {
+     "kind": null,
      "name": "getrandom",
      "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
@@ -678,6 +684,12 @@
      "kind": null,
      "name": "camino",
      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "client-config",
+     "path": "<root>/crates/client-config",
+     "source": null
     },
     {
      "kind": null,
@@ -3249,6 +3261,44 @@
    "id": "path+file:///workbench/minimal/crates/minzoned#0.8.0",
    "manifest_path": "<root>/crates/minzoned/Cargo.toml",
    "name": "minzoned"
+  },
+  {
+   "dependencies": [
+    {
+     "kind": null,
+     "name": "serde",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "thiserror",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "toml",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": null,
+     "name": "tracing",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "indoc",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+     "kind": "dev",
+     "name": "tempfile",
+     "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+   ],
+   "description": "The client's config.toml: its schema, the session keys, and the secret-store rules with their deny checks. Shared by min, boxes and bep, with no build-plane dependencies.",
+   "id": "path+file:///workbench/minimal/crates/client-config#0.0.1",
+   "manifest_path": "<root>/crates/client-config/Cargo.toml",
+   "name": "client-config"
   }
  ],
  "workspace_members": [
@@ -3283,6 +3333,7 @@
   "path+file:///workbench/minimal/crates/minvmd#0.8.0",
   "path+file:///workbench/minimal/crates/switch#0.0.1",
   "path+file:///workbench/minimal/crates/minimald#0.8.0",
-  "path+file:///workbench/minimal/crates/minzoned#0.8.0"
+  "path+file:///workbench/minimal/crates/minzoned#0.8.0",
+  "path+file:///workbench/minimal/crates/client-config#0.0.1"
  ]
 }

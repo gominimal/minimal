@@ -21,6 +21,7 @@ schema = 1
 leaf = [
     "args",
     "async-dialog",
+    "client-config",
     "diagnostics",
     "ot",
     "paths",
