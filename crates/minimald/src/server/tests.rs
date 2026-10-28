@@ -25,6 +25,32 @@ fn inactivity_deadline_spans_the_full_keepalive_budget() {
     assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
 }
 
+/// A client that hangs up with daemon output still unread resets the
+/// connection instead of closing it, and that is the same abrupt client loss
+/// as an end of file: it is logged as a closed connection, not as an error.
+/// A fault on this side still is one.
+#[test]
+fn a_reset_connection_was_closed_by_its_peer() {
+    use crate::connection::ConnectionError;
+    use std::io::{Error, ErrorKind};
+
+    let io = |kind| ConnectionError::Protocol(russh::Error::IO(Error::from(kind)));
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::BrokenPipe,
+    ] {
+        assert!(closed_by_peer(&io(kind)), "{kind:?} is the peer hanging up");
+    }
+    assert!(closed_by_peer(&ConnectionError::Protocol(
+        russh::Error::Disconnect
+    )));
+    assert!(!closed_by_peer(&io(ErrorKind::PermissionDenied)));
+    assert!(!closed_by_peer(&ConnectionError::Internal(
+        "the session store is unreadable".to_string()
+    )));
+}
+
 /// The production config arms the inactivity deadline: with `None` a
 /// wedged transport write parks the session loop forever.
 #[tokio::test]
