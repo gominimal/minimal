@@ -37,7 +37,7 @@ use bep::boxes::BoxRegistry;
 use bep::ca::{Ca, CaError, CaKey, RootCertificate, Union};
 use bep::control::{Control, KeyBound, Registry, RotationReply, RotationRequest};
 use bep::forward::Redeemer;
-use bep::handle::{self as store_handle, Inject, Rules, StoreRule};
+use bep::handle::{self as store_handle, Rules, StoreRule};
 use bep::keys::{self, HeldKey, KeyError, KeyStore, ProxyKeys, ReplaceError, Role};
 use bep::listener::{Listener, PeerAttested, TOKEN_LEN};
 use bep::module::GITHUB;
@@ -46,9 +46,8 @@ use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
-use bep::store::NATIVE_STORE;
 use clap::{Parser, Subcommand};
-use client_config::store_rules::{StoreAction, StoreDenySet, StoreRuleConfig};
+use client_config::store_rules::StoreDenySet;
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// Runs the box egress proxy on this host.
@@ -586,7 +585,8 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
 /// redemption (BEP-032). One limit holds. `bep` reads the default config
 /// dir only, because `minvmd` starts `bep serve` and does not know a
 /// `min --config-dir` override, so rules written under an override are not
-/// read: <https://github.com/gominimal/minimal/issues/2620>. The root's
+/// read. `min` refuses to mint a store handle under such a rule unless this
+/// dir holds the same rule, and the refusal names both dirs. The root's
 /// names and the admitted CONNECT set follow the rules at each
 /// CONNECT ([`StoreAdmission`]). The start log line names the file.
 fn client_store_rules() -> ClientRules {
@@ -804,31 +804,8 @@ fn store_rules_in(user: &Path, organization: &Path) -> Vec<StoreRule> {
     }
     read.rules
         .into_iter()
-        .filter_map(|(id, rule)| store_rule(id, rule))
+        .filter_map(|(id, rule)| StoreRule::from_config(&id, &rule))
         .collect()
-}
-
-/// The proxy's form of one checked rule. A `deny` rule is never redeemed,
-/// so the proxy holds no rule for it, and a handle for its item is refused.
-fn store_rule(id: String, rule: StoreRuleConfig) -> Option<StoreRule> {
-    if rule.action == Some(StoreAction::Deny) {
-        return None;
-    }
-    let inject = match (rule.header, rule.basic_auth) {
-        (Some(name), None) => Inject::Header {
-            name,
-            prefix: rule.prefix,
-        },
-        (None, Some(field)) => Inject::BasicAuth { field },
-        // The check refuses a rule with no form or with both.
-        _ => return None,
-    };
-    Some(StoreRule {
-        store: rule.store.unwrap_or_else(|| NATIVE_STORE.to_owned()),
-        id,
-        upstream: rule.upstream,
-        inject,
-    })
 }
 
 /// The one start line for the root certificate. It names the certificate's
@@ -1723,10 +1700,11 @@ mod tests {
     use bep::boxes::Stance;
     use bep::control::{Reply, Request};
     use bep::forward::Verdict;
-    use bep::handle::{self, Claims};
+    use bep::handle::{self, Claims, Inject};
     use bep::redeem::{Authority, RequestAuthority};
     use bep::seal::{self, Breadth, Context, Member, MemberKind, MemberList, Mode, ProxyPublicKey};
     use bep::signin::{Flow, Material, MemoryKeychain, Metadata};
+    use bep::store::NATIVE_STORE;
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};

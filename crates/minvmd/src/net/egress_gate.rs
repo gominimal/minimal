@@ -175,7 +175,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
+use super::baseline::{
+    NodeBaselinePhase, NodePlaneBaseline, REGISTRY_CACHE_FETCH_PORTS, REGISTRY_CACHE_FETCH_PROTOCOL,
+};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
@@ -5252,8 +5254,29 @@ fn gate_verdict(
     // verdict against the enumeration's compiled set — the lease it is keyed
     // to is the daemon's own address, so the check above and the lease agree
     // on who may wear it. Announced, the interim node row keeps deciding the
-    // node plane, and the fall-through reaches it below.
+    // node plane, and the fall-through reaches it below. The set's verdict
+    // is by subnet alone, so the alias the built-in endpoints name is the
+    // arm's to bound: TCP at a fetch port reaches the shared verdict, and
+    // any other protocol or port is the infrastructure drop, the same
+    // refusal a box row's alias frames take. The protocol is checked
+    // because the summary reads a destination port from every protocol's
+    // bytes. In force, the node plane reaches the alias at TCP 443 only.
+    // Once the host exposures close by default, that is wider than the
+    // announced phase's alias reach, which admits no port. The bound must
+    // also admit the configured host exposures (TCP and UDP) once they
+    // exist. gominimal/inbox#1144 and gominimal/inbox#1147 own that work.
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+        if let Some(dst) = summary.destination()
+            && dst == table.subnet().host_alias().octets()
+            && (summary.protocol() != Some(REGISTRY_CACHE_FETCH_PROTOCOL)
+                || !REGISTRY_CACHE_FETCH_PORTS.contains(&summary.destination_port()))
+        {
+            return Err(GateDrop::Infrastructure {
+                src,
+                dst,
+                dst_port: summary.destination_port(),
+            });
+        }
         return match egress::verdict(summary, baseline.rules()) {
             FrameVerdict::Admit => Ok(GateAdmit::Baseline),
             FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
@@ -15032,6 +15055,90 @@ mod tests {
         );
     }
 
+    /// The in-force arm's own bound on the host alias: the built-in
+    /// registry and cache endpoints name the alias, and the compiled set's
+    /// verdict is by subnet alone — no port dimension — so the arm bounds
+    /// the alias to the ports the daemon's own fetches use. The fetch port
+    /// stays admitted by the set; a wider port on the alias is the
+    /// infrastructure drop, the same refusal a box row's alias frames take
+    /// (design §7.1, NET-062).
+    #[test]
+    fn in_force_baseline_bounds_the_host_alias_to_its_fetch_ports() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = baseline.node_addr();
+        let alias = SUBNET.host_alias().octets();
+
+        let fetch = boxes::core::egress::summarize(&ipv4_frame(node, 6, alias, 443));
+        assert_eq!(
+            gate_verdict(&fetch, None, &table, &baseline, &pins, &ReplyTables::new()),
+            Ok(GateAdmit::Baseline),
+            "the daemon's own fetch port on the alias stays admitted by the set"
+        );
+
+        let wider = boxes::core::egress::summarize(&ipv4_frame(node, 6, alias, 18081));
+        assert!(
+            matches!(
+                gate_verdict(
+                    &wider,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new()
+                ),
+                Err(GateDrop::Infrastructure { dst, dst_port, .. })
+                    if dst == alias && dst_port == 18081
+            ),
+            "a wider port on the alias is the infrastructure drop, in force"
+        );
+    }
+
+    /// The in-force arm bounds the alias by protocol as well as port: the
+    /// summary reads a destination port from every protocol's bytes, so an
+    /// ICMP frame whose checksum reads 443, or a GRE frame (IP protocol 47)
+    /// whose protocol-type field does, must not pass as a fetch. TCP at 443
+    /// is the one admission.
+    #[test]
+    fn in_force_baseline_admits_only_tcp_at_the_alias_fetch_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = baseline.node_addr();
+        let alias = SUBNET.host_alias().octets();
+        let decide = |proto: u8| {
+            let summary = boxes::core::egress::summarize(&ipv4_frame(node, proto, alias, 443));
+            gate_verdict(
+                &summary,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new(),
+            )
+        };
+
+        assert_eq!(
+            decide(6),
+            Ok(GateAdmit::Baseline),
+            "TCP at the fetch port on the alias is admitted, in force"
+        );
+        for (proto, name) in [(1u8, "ICMP"), (47, "GRE")] {
+            assert!(
+                matches!(
+                    decide(proto),
+                    Err(GateDrop::Infrastructure { dst, dst_port: 443, .. }) if dst == alias
+                ),
+                "{name} to alias:443 is the infrastructure drop, in force"
+            );
+        }
+    }
+
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
     /// from the helper's enumeration, and the gate decides the daemon's own
     /// frames by it **beside** the boxes' rows — a deny-all box's row does not
@@ -15117,7 +15224,7 @@ mod tests {
         // daemon's shipped cache URL resolves to, whose serving addresses no
         // subnet list this tree can name — the set says no.
         let out_of_set = ipv4_frame(node_addr, 6, [8, 8, 8, 8], 443);
-        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 444);
+        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 443);
         send_frame(&mut h.guest, &out_of_set).await;
         send_frame(&mut h.guest, &node_marker).await;
         let seen = expect_frame(&mut h.switch).await;

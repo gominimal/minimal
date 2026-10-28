@@ -279,7 +279,7 @@ pub struct Config {
     #[serde(default)]
     pub deny_all_opt_out: bool,
     /// How the create gate learns the host's verdict on the unprivileged
-    /// user namespace every session sandbox starts by unsharing (NET-141).
+    /// user namespace every session sandbox starts by unsharing (NET-143).
     /// Never persisted or handed in: the daemon binary decides it at start
     /// (live, or off under `MINIMALD_USERNS_GATE=off`), and the test harness
     /// fixes it per server.
@@ -304,7 +304,7 @@ pub fn this_daemon_path() -> String {
 /// dependency of their own.
 pub use sandbox::UsernsRestriction;
 
-/// Where the create gate's user-namespace verdict comes from (NET-141).
+/// Where the create gate's user-namespace verdict comes from (NET-143).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsernsGate {
     /// Probe this process on every create — a few `/proc` reads — so a
@@ -802,7 +802,7 @@ impl ServerStateHandle {
     }
 
     /// The host's user-namespace verdict the create gate decides on
-    /// (NET-141), per [`Config::user_namespace_gate`]: probed live from this
+    /// (NET-143), per [`Config::user_namespace_gate`]: probed live from this
     /// process on each call, so nothing is cached across creates; the lock
     /// is held for the copy of the gate alone, never across the probe.
     pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
