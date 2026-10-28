@@ -202,6 +202,9 @@ listener=
 # constants above); require_mask checks the value and derives every
 # spelling the ruleset renders from it.
 ct_mark_mask=$DEFAULT_CT_MARK_MASK
+# Set when --ct-mark-mask names the mask. Without it, an install re-applies
+# the mask a previous install recorded under the tree, if there is one.
+ct_mark_mask_given=
 # The parse loop consumes $@; keep the original invocation for the sudo hint
 # below, or a copy-pasted retry silently drops --user/--uninstall.
 original_args=("$@")
@@ -244,6 +247,7 @@ while [ $# -gt 0 ]; do
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
+            ct_mark_mask_given=1
             shift 2
             ;;
         --uninstall) mode=uninstall; shift ;;
@@ -1111,24 +1115,29 @@ require_mask() {
     refuse_well_known_mark_ranges
 }
 
-# mask_rerun_hint — this step's own invocation with its --ct-mark-mask, if
-# any, replaced by a placeholder: the command a person runs to choose two
-# other bits. It is the step's own command because the step is the one
-# that takes the flag.
+# mask_rerun_hint — the command a person runs to choose two other bits.
+# It is min finalize-install, not this step: that command installs the
+# boot unit too, and the unit carries the mask, so the choice outlives a
+# reboot. A run of this step alone keeps the mask only until the next boot.
 mask_rerun_hint() {
-    local kept=() skip='' a
-    for a in "${original_args[@]}"; do
-        if [ -n "$skip" ]; then
-            skip=
-            continue
-        fi
-        if [ "$a" = --ct-mark-mask ]; then
-            skip=1
-            continue
-        fi
-        kept+=("$a")
-    done
-    printf 'sudo %s%s%s --ct-mark-mask <mask>' "$0" "${kept[0]+ }" "${kept[*]-}"
+    printf 'min finalize-install --ct-mark-mask <mask>'
+}
+
+# adopt_recorded_mask — with no --ct-mark-mask, an install re-applies the
+# mask a previous install recorded under the tree, so a re-run classifies
+# with the bits the operator chose and not the default. Exactly one
+# record is adopted. Two records that disagree are a step that did not
+# finish, and the default stands.
+adopt_recorded_mask() {
+    local recorded
+    [ -z "$ct_mark_mask_given" ] || return 0
+    recorded="$(recorded_ct_mark_masks "$tree_root")"
+    case "$recorded" in
+        ''|*"
+"*) return 0 ;;
+    esac
+    ct_mark_mask=$recorded
+    note "using the ct-mark mask $recorded that the previous install recorded at $tree_root"
 }
 
 # refuse_well_known_mark_ranges — a mask that touches a range in
@@ -1143,7 +1152,7 @@ refuse_well_known_mark_ranges() {
         if [ $((mask_value & range)) -ne 0 ]; then
             printf 'error: --ct-mark-mask %s uses bits in %s, the range %s marks connections with. The two would overwrite each other'"'"'s marks.\n' \
                 "$mask_hex" "$range" "$component" >&2
-            die "refusing to install with that mask. Run this step again with two contiguous bits outside $range: $(mask_rerun_hint)"
+            die "refusing to install with that mask. Choose two contiguous bits outside $range and run: $(mask_rerun_hint)"
         fi
     done <<EOF
 $WELL_KNOWN_MARK_RANGES
@@ -1256,7 +1265,11 @@ scan_ct_mark_conflicts() {
     if command -v iptables-save >/dev/null 2>&1 &&
         legacy="$(iptables-save 2>/dev/null)" && [ -n "$legacy" ]
     then
-        conflicting="$conflicting$(printf '%s\n' "$legacy" | ct_mark_conflicts_in)"
+        legacy_hits="$(printf '%s\n' "$legacy" | ct_mark_conflicts_in)"
+        # Command substitution strips the trailing newline, so the two
+        # listings' hits are joined with one, or two rules print as one line.
+        conflicting="$conflicting${conflicting:+${legacy_hits:+
+}}$legacy_hits"
     fi
     if [ -n "$conflicting" ]; then
         printf 'error: this host already uses the ct-mark bits %s this install classifies with:\n%s\n' "$mask_hex" "$conflicting" >&2
@@ -1264,9 +1277,9 @@ scan_ct_mark_conflicts() {
         # mask avoids it: the remedy is the rule, not the flag.
         case "$conflicting" in
             *"(writes every bit of the connection mark)"*)
-                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run this step again." ;;
+                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again." ;;
         esac
-        die "refusing to install over another ct-mark user. Run this step again with two contiguous bits that no rule above uses: $(mask_rerun_hint)"
+        die "refusing to install over another ct-mark user. Choose two contiguous bits that no rule above uses and run: $(mask_rerun_hint)"
     fi
 }
 
@@ -1356,6 +1369,7 @@ fi
 verify_mount
 resolve_owner
 require_identities
+adopt_recorded_mask
 require_mask
 command -v nft >/dev/null 2>&1 ||
     die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"

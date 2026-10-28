@@ -8360,6 +8360,10 @@ mod tests {
                 "the refusal says why no mask avoids it: {text}"
             );
             assert!(
+                text.contains("then run min finalize-install again."),
+                "the refusal names the command to run once the rule is changed: {text}"
+            );
+            assert!(
                 !text.contains("chain premangle"),
                 "a rule that only reads the ct mark is not a writer: {text}"
             );
@@ -8407,7 +8411,7 @@ mod tests {
 
     /// NET-079: `--ct-mark-mask` refuses a mask in a range a well-known
     /// component classes with, naming the range and the component, and
-    /// says how to run the step again with two other bits.
+    /// names `min finalize-install --ct-mark-mask <mask>` for two other bits.
     #[test]
     fn install_refuses_a_well_known_mark_range() {
         for (mask, component, range) in [
@@ -8428,8 +8432,9 @@ mod tests {
                 "the refusal names the range and its component: {text}"
             );
             assert!(
-                text.contains("--ct-mark-mask <mask>") && !text.contains(&format!("{mask} --")),
-                "the refusal names the rerun with a placeholder for the mask: {text}"
+                text.contains("run: min finalize-install --ct-mark-mask <mask>")
+                    && !text.contains(&format!("{mask} --")),
+                "the refusal names min finalize-install with a placeholder for the mask: {text}"
             );
             assert!(
                 !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),

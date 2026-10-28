@@ -2322,7 +2322,8 @@ fn install_refuses_a_whole_mark_ct_writer() {
 /// `--ct-mark-mask` refuses a mask in a range a well-known component
 /// classes with, on a host that shows no user of it yet: the component
 /// can start after the install. The refusal names the range and the
-/// component, says how to run the step again, and lays out nothing.
+/// component, names `min finalize-install --ct-mark-mask <mask>`, and lays
+/// out nothing.
 ///
 /// `#[ignore]`d like the proofs above, declined the same way on a runner
 /// with no `nft`.
@@ -2363,8 +2364,8 @@ fn install_refuses_a_well_known_mark_range() {
             "the refusal names the range and its component: {refusal}"
         );
         assert!(
-            refusal.contains("--ct-mark-mask <mask>"),
-            "the refusal names the rerun with two other bits: {refusal}"
+            refusal.contains("min finalize-install --ct-mark-mask <mask>"),
+            "the refusal names the command that reruns with two other bits: {refusal}"
         );
         assert!(
             !scratch.exists(),
