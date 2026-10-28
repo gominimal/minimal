@@ -7926,14 +7926,18 @@ async fn expose_allow_publishes_and_lists() {
     // binds at the address the box's name answers at.
     let manager = server.state.sessions_manager().await;
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // Addresses no other test's box uses: the live-gate table the proxy and
+    // the expose both read is process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 96);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 96);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         // This test's own box name: under the shared capture every test's
         // lines ride one buffer, so each assertion finds its line by the
         // box it names.
         "listweb",
-        std::net::Ipv4Addr::new(100, 64, 128, 21),
-        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        switch,
+        loopback,
         Some(sessions::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
@@ -7947,6 +7951,37 @@ async fn expose_allow_publishes_and_lists() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
+    // The box's relay gate, registered under its switch address as the
+    // relay's spawn registers it, and the lease its attach reports to the
+    // hostname registry: what a direct connection and the proxy both meet.
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "listweb".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let hostnames = manager.hostnames();
+    hostnames
+        .write()
+        .expect("registry lock")
+        .report_own_address(web, "listweb", switch, std::collections::BTreeMap::new());
+    // Before the expose, the proxy refuses the port with the refusal a
+    // direct connection gets: the box published nothing at it.
+    let before = {
+        let route = hostnames
+            .read()
+            .expect("registry lock")
+            .resolve("listweb.min.internal")
+            .expect("the box's name resolves");
+        crate::net::switch::proxied_request_verdict(None, &route, 3000)
+    };
+    assert!(
+        matches!(before, crate::net::switch::ProxiedRequest::Refused(_)),
+        "an unpublished port is refused through the proxy: {before:?}"
+    );
+    assert!(!gate.admits_tcp(3000));
     let sock = handle
         .net_switch()
         .await
@@ -7961,7 +7996,7 @@ async fn expose_allow_publishes_and_lists() {
         .await
         .expect("the allowed port publishes");
     let expected = minimald_rpc::LiveMapping {
-        local: "127.0.64.21:3000".to_string(),
+        local: "127.0.64.96:3000".to_string(),
         internal_port: 3000,
         proto: sessions::IpProto::Tcp,
         pending: Some(false),
@@ -8027,9 +8062,64 @@ async fn expose_allow_publishes_and_lists() {
     assert!(
         line.contains("port=3000")
             && line.contains("decision=allow")
-            && line.contains("local=127.0.64.21:3000"),
+            && line.contains("local=127.0.64.96:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+    // The publish is reachable through the hostname proxy at once (NET-044,
+    // NET-069): the box's gate admits the port, so the proxy forwards a
+    // request for it to the forward the publish bound — the mapping's own
+    // `local` — and a request through the proxy reaches what listens there.
+    assert!(
+        gate.admits_tcp(3000),
+        "the publish admits the port at the gate"
+    );
+    let route = hostnames
+        .read()
+        .expect("registry lock")
+        .resolve("listweb.min.internal")
+        .expect("the box's name resolves");
+    assert_eq!(
+        route.source(3000),
+        Some(crate::net::dns::RouteSource::Runtime),
+        "the route carries the exposed port as a runtime publish"
+    );
+    let local: std::net::SocketAddr = mapping.local.parse().expect("the mapping names a socket");
+    assert_eq!(
+        crate::net::switch::proxied_request_verdict(None, &route, 3000),
+        crate::net::switch::ProxiedRequest::Forward(local),
+        "the proxy forwards the exposed port to the forward the publish bound"
+    );
+    // The fake forwarder bound nothing, so this test stands in for the box
+    // behind the forward, at the mapping's own address.
+    let backend = tokio::net::TcpListener::bind(local)
+        .await
+        .expect("the mapping's address is free to stand in for the forward");
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        while let Ok((mut sock, _)) = backend.accept().await {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("the proxy binds");
+    let proxy_addr = proxy.local_addr().expect("the proxy has an address");
+    tokio::spawn(crate::net::proxy::serve(
+        proxy,
+        crate::net::proxy::Router::new(
+            std::sync::Arc::clone(&hostnames),
+            crate::net::switch::proxied_request_verdict,
+        ),
+    ));
+    let reached = crate::net::proxy::proxy_get(proxy_addr, "listweb.min.internal:3000").await;
+    assert!(
+        reached.contains("200 OK"),
+        "the exposed port opens through the hostname proxy: {reached}"
     );
 }
 
