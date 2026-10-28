@@ -527,8 +527,9 @@ where
     };
     // One line per admitted request, naming why the target's route carries
     // the port: its declaration, a runtime publish, or a host-address box
-    // that gates nothing.
-    tracing::debug!(
+    // that gates nothing. At `info`, so the daemon's default filter keeps
+    // it in the log a `min bug` bundle carries.
+    tracing::info!(
         component = "dns-proxy",
         host,
         session = route.session(),
