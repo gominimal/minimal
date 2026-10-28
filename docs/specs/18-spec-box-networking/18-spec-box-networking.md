@@ -575,6 +575,7 @@ and an activation whose declared port cannot be published is refused
 - **NET-069** IF a request through the hostname proxy targets a port the target box has not published THEN THE SYSTEM SHALL refuse it with the same refusal as a direct connection.
   tier:     T2
   verify:   cargo nextest run -p minimald proxy_undeclared_port_refused_like_direct
+  verify:   cargo nextest run -p minimald proxy_refuses_a_withdrawn_port_like_direct
   property: for every target box, every port it has not published, and every proxied request to it, the refusal equals the direct-connection refusal
   harness:  kani_frame_verdict_admits_nothing_undeclared; bound and purity constraint under Tiers in Design reasoning
   <!-- S8c/AC1; prose 45; unwanted; "published" covers a declared port and a port published while the box runs (NET-016, NET-044), so a port a direct connection reaches is never refused through the proxy (NET-071); for a host-address box, published means bound: the host-address lane does not filter (design §7.1 parity bullet), so its verdict admits every port and a port nothing listens on is unreachable, not refused -->
