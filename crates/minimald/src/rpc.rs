@@ -925,7 +925,9 @@ async fn serve_answerer_control(
                 | BoxControlRequest::RecordAskAnswer(_)
                 | BoxControlRequest::SubscribeAsks(_)
                 | BoxControlRequest::ResumeBox(_)
-                | BoxControlRequest::RowStanding(_) => BoxControlReply::Error {
+                | BoxControlRequest::RowStanding(_)
+                | BoxControlRequest::ReportExposeDecision(_)
+                | BoxControlRequest::ReportRefusedEgress(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
