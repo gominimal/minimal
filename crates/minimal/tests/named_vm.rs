@@ -7,6 +7,10 @@
 //! argv, so the proof is the spawn itself, not a VM boot: this runs on every
 //! lane that runs `-p minimal`, with no libkrun required.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

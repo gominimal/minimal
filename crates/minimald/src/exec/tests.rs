@@ -1630,6 +1630,9 @@ fn fresh_daemon() -> &'static std::sync::atomic::AtomicUsize {
 fn fresh_progress() -> &'static tokio::sync::Notify {
     Box::leak(Box::new(tokio::sync::Notify::new()))
 }
+fn fresh_registry() -> &'static super::ExecRegistry {
+    Box::leak(Box::new(std::sync::Mutex::new(Vec::new())))
+}
 fn unlimited() -> super::HeldInputLimits {
     super::HeldInputLimits {
         per_exec: usize::MAX,
@@ -1639,6 +1642,10 @@ fn unlimited() -> super::HeldInputLimits {
         stall: std::time::Duration::from_millis(300),
         starved: std::time::Duration::from_millis(900),
         unstarted: std::time::Duration::from_secs(5),
+        // One byte: the tests above this helper's introduction are about
+        // the bounds, not the drain; the drain tests set their own.
+        quantum: 1,
+        registry: fresh_registry(),
     }
 }
 fn held_with(
@@ -1976,10 +1983,11 @@ async fn an_end_while_the_command_is_starting_ends_the_exec_at_once() {
 }
 
 /// An exec holding nothing at the daemon bound waits for the others, but
-/// not past `starved`: when the budget stays full (its holders read just
-/// enough never to stall, or, here, never at all while not at a bound
-/// themselves), the waiting exec ends with the daemon-bound reason
-/// instead of parking its connection for good. The holder is untouched.
+/// not past `starved`: when the budget stays full of a holder that *is*
+/// draining (it reads a quantum per window while its client keeps it
+/// topped up: a busy daemon, not a hoarder), the waiting exec ends with the
+/// daemon-bound reason instead of parking its connection for good. The
+/// holder is untouched: it is doing nothing wrong.
 #[tokio::test]
 async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
     use std::time::Duration;
@@ -1994,11 +2002,293 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         stall: Duration::from_millis(300),
         starved: Duration::from_millis(1500),
         unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
         let (msg_tx, msgs) = msg_stream();
         let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    for p in &pumps {
+        p.3.command_started();
+    }
+    // 250 held, so the holder's reads never make room for the waiter's
+    // 150: the budget stays full.
+    pumps[0].0.send(data(250, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 250)
+        .await
+    );
+    // The holder drains 60 bytes every 100 ms (a quantum and more per
+    // window) and its client sends 60 more each time: the budget stays
+    // full of input that is being read.
+    let (holder_tx, mut holder_stdin) = (
+        pumps[0].0.clone(),
+        std::mem::replace(&mut pumps[0].1, {
+            let (_, r) = held_with(limits);
+            r
+        }),
+    );
+    let churn = tokio::spawn(async move {
+        let mut buf = [0u8; 60];
+        loop {
+            let _ = holder_stdin.read_exact(&mut buf).await;
+            holder_tx.send(data(60, 1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
+    tokio::time::sleep(limits.stall * 3).await;
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "past the stall, but inside the ceiling: still waiting"
+    );
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("a starved exec is ended at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    churn.abort();
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "a draining holder is untouched"
+    );
+    assert!(
+        pumps[0].3.held_bytes() >= 190,
+        "it still holds what it was reading"
+    );
+}
+
+/// #2238: a command at its cap that reads one byte per window is not
+/// reading; the window restarts on a quantum, so it is ended within one
+/// window like a command that reads nothing.
+#[tokio::test]
+async fn a_trickle_reader_at_its_cap_is_ended_within_a_window() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap(); // the third waits at the cap
+    }
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    ended
+        .expect("a trickle reader is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// #2238's trickle again, in small chunks: a client that feeds one byte per
+/// channel message while the command reads one byte per window gets each
+/// chunk in after one read. The wait at the bound must span chunks, or the
+/// exec at its cap is never ended.
+#[tokio::test]
+async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..200 {
+        msg_tx.send(data(1, 7)).unwrap(); // to the cap, one byte at a time
+    }
+    let feeder = tokio::spawn(async move {
+        loop {
+            // One more byte each time the reader has made room for it.
+            if msg_tx.send(data(1, 7)).is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    feeder.abort();
+    ended
+        .expect("a trickle reader fed in one-byte chunks is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// The other side of the quantum: a command at its cap that reads a
+/// quantum or more per window is reading, and is never ended; it works
+/// through everything held.
+#[tokio::test]
+async fn a_reader_draining_a_quantum_per_window_is_never_ended() {
+    use std::time::Duration;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap();
+    }
+    let mut got = 0usize;
+    let mut buf = [0u8; 25];
+    while got < 300 {
+        got += stdin_r.read(&mut buf).await.unwrap(); // 25 bytes per 100 ms: 75 a window
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        end_rx.borrow().is_none(),
+        "a reader draining a quantum per window is never ended"
+    );
+    assert_eq!(held.held_bytes(), 0);
+}
+
+/// A holder whose command has not started is under its own `unstarted`
+/// grace and is never another exec's victim: the starved exec waits its
+/// ceiling out and ends itself, as before.
+#[tokio::test]
+async fn an_unstarted_holder_is_not_a_victim() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(30),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    // Only the waiter's command runs; the holder's is still starting.
+    pumps[1].3.command_started();
+    pumps[0].0.send(data(200, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 200)
+        .await
+    );
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved by an unstarted holder
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("the starved exec ends itself at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "the unstarted holder is untouched"
+    );
+    assert_eq!(pumps[0].3.held_bytes(), 200);
+}
+
+/// #2238's daemon half: the exec that would cross the daemon's budget
+/// while holding nothing is not the one at fault. After its wait, the
+/// largest holder that read none of what it owed over the window is the
+/// one ended, and the waiting exec gets its input.
+#[tokio::test]
+async fn a_starved_exec_ends_the_holder_that_is_not_draining() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits); // nobody reads
         let (end_tx, end_rx) = tokio::sync::watch::channel(None);
         tokio::spawn(super::pump_channel_input(
             msgs,
@@ -2017,21 +2307,23 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         .await
     );
     pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
-    tokio::time::sleep(limits.stall * 3).await;
-    assert!(
-        pumps[1].2.borrow().is_none(),
-        "past the stall, but inside the ceiling: still waiting"
-    );
-    timeout(Duration::from_secs(10), pumps[1].2.changed())
+    timeout(Duration::from_secs(10), pumps[0].2.changed())
         .await
-        .expect("a starved exec is ended at the ceiling")
+        .expect("the holder that is not draining is the one ended")
         .unwrap();
     assert_eq!(
-        *pumps[1].2.borrow(),
+        *pumps[0].2.borrow(),
         Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
     );
-    assert!(pumps[0].2.borrow().is_none(), "the holder is untouched");
-    assert_eq!(pumps[0].3.held_bytes(), 200);
+    assert!(
+        until(5, || pumps[1].3.held_bytes() == 150).await,
+        "the waiting exec gets its input once the holder is ended"
+    );
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "the waiting exec is not ended"
+    );
+    assert_eq!(daemon_held.load(std::sync::atomic::Ordering::Acquire), 150);
 }
 
 /// The per-exec stall counts this exec's own reads only. Another exec
@@ -2100,6 +2392,8 @@ async fn the_daemon_budget_makes_an_exec_holding_nothing_wait_for_the_others() {
         // longer than this test's waits: it is about the wait, not its end
         starved: Duration::from_secs(60),
         unstarted: Duration::from_secs(5),
+        quantum: 1,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
