@@ -15,21 +15,28 @@ Users install whatever their channel points at.
 
 ## Cut a stable release
 
-Follow these steps in order. The examples use version `X.Y.Z` and commit
-`<commit>`. Replace both with your values.
+Follow these steps in order. The examples use version `X.Y.Z`, commit
+`<commit>`, and branch `release/<branch>`. Replace them with your values. For
+a new release, `<branch>` is the version, as in `release/0.7.0`. A hotfix uses
+the branch of the release that it fixes. See
+[Release a hotfix](#release-a-hotfix).
 
 ### Before you start
 
-- You start the promotion run in step 6, and a second member of the
+- You start the promotion run in step 7, and a second member of the
   `@gominimal/minimalists` team approves it. The workflow does not let you
   approve your own run.
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
 - A release runs on a branch that outlives one build. Fixes land on
-  `release/X.Y.Z` while `main` keeps moving, and each release candidate burns
-  its own version number, because a staged number is permanent. 0.7.0 went
-  out as `0.7.0-rc1`, then `0.7.0-rc2`, then `0.7.0`.
+  `release/<branch>` by PR while `main` keeps moving. Each release candidate
+  uses up its own version number, such as `X.Y.Z-rc1`, because a staged
+  number is permanent.
+- A release candidate stops after step 6. Only the final version goes on to
+  step 7. The promotion does not refuse a candidate version: it moves
+  `stable` to it for every user of the install script, and it creates its
+  tag.
 
 ### 1. Choose the commit and check the version
 
@@ -47,7 +54,7 @@ git switch --detach <commit>
 just check-version
 ```
 
-Do not push a `v*` tag. The promotion in step 6 creates the tag.
+Do not push a `v*` tag. The promotion in step 7 creates the tag.
 
 ### 2. Give the commit a branch
 
@@ -57,36 +64,50 @@ tip of `main`. A run on `main` builds the commit that `main` points at when
 the run starts, and `main` can move between steps 3 and 4.
 
 ```sh
-git push origin <commit>:refs/heads/release/X.Y.Z
+git push origin <commit>:refs/heads/release/<branch>
 ```
 
-Nothing in the pipeline reads the branch name. The draft release and the tag
-point at the commit.
+The branch name must start with `release/`. CI runs the required checks on
+pushes and PRs to `main` and `release/**` only. Without those checks, step 4
+refuses each fix that lands on the branch.
 
-Keep the branch. It carries the fixes that go into the release while `main`
-moves on, and a hotfix cuts the next version from it. Step 8 says what to do
-with it after the release.
+Keep the branch after the release. It carries the fixes that go into the
+release while `main` moves on, and each hotfix for the release goes out from
+it. Step 8 brings its fixes back to `main`.
 
 ### 3. Rehearse the release run
 
 ```sh
-gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=true
+gh workflow run release.yml --ref release/<branch> -f versioned=true -f dry_run=true
 ```
 
 A dry run builds, signs, and smoke-tests everything. It uploads
-nothing and does not use up the version number. Wait for it to pass.
+nothing and does not use up the version number. Wait for it to pass. The run
+page shows the commit that it built.
+
+Do not merge into the branch from now until step 4 stages the release. A fix
+that merges after the dry run gets staged without a rehearsal.
 
 ### 4. Stage the release
 
+Make sure that the branch still points at the commit that the dry run built:
+
 ```sh
-gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=false
+git fetch origin release/<branch>
+git rev-parse FETCH_HEAD
+```
+
+If the branch moved, run step 3 again. Then stage:
+
+```sh
+gh workflow run release.yml --ref release/<branch> -f versioned=true -f dry_run=false
 ```
 
 When the run passes, it did these things:
 
 - It staged `gs://minimal-one/versions/X.Y.Z/`. The folder is write-once.
 - It smoke-tested the artifacts and wrote `versions/X.Y.Z/smoked`, the record
-  that step 6 checks.
+  that step 7 checks.
 - It created a draft GitHub Release `vX.Y.Z` with the notes and every
   artifact attached. A draft has no tag.
 - It did not move any channel. `unstable` follows `main`, and only a
@@ -115,7 +136,19 @@ curl -fsSL https://storage.googleapis.com/minimal-one/versions/X.Y.Z/install.sh 
 gcloud storage rm gs://minimal-one/rc
 ```
 
-### 6. Promote to stable
+### 6. Check minimal-skills against the staged build
+
+[`gominimal/minimal-skills`](https://github.com/gominimal/minimal-skills)
+describes the behaviour of the released build, so it follows the release.
+Check its claims against the staged version `X.Y.Z`, before the promotion,
+so that a fix can still go in before users get the build. Run its evals, and
+file each place where minimal-skills and the running build disagree in
+[`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
+its own `release/vX.Y.Z` branch.
+
+A release candidate stops here.
+
+### 7. Promote to stable
 
 Rehearse first. A dry-run promotion runs the approval step and the smoke
 check, and changes nothing:
@@ -144,51 +177,40 @@ on it. Then the workflow does these things, in this order:
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
 on the same run.
 
-### 7. Update minimal-skills
-
-[`gominimal/minimal-skills`](https://github.com/gominimal/minimal-skills)
-describes the behaviour of the released build, so it follows the release.
-Check its claims against the version you just released, run its evals, and
-file each place where the published docs and the running build disagree in
-[`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
-its own `release/vX.Y.Z` branch. The 0.7.0 pass ran on 2026-10-14 against
-`0.7.0-rc2`.
-
 ### 8. Forward port the release branch
 
-Bring the fixes that landed on `release/X.Y.Z` back to `main`. `main` moves
-while a release is out, so a port that waits costs more than one that does
-not.
+Bring the fixes that landed on `release/<branch>` back to `main`. `main`
+moves while a release is out, so a port that waits costs more than one that
+does not. Compare the branch, not the tag. A fix can land on the branch after
+the tag, and the tag does not contain it.
 
-In this step, `release/X.Y.Z` is the branch from step 2. A hotfix keeps
-the branch of the release that it fixes: 0.7.1 went out from
-`release/0.7.0`, so its port reads `release/0.7.0`. Compare the branch, not
-the tag. A fix can land on the branch after the tag, and the tag does not
-contain it.
-
-The promotion created the tag on GitHub, so fetch it with the branch.
-`--force` replaces a stale local tag of the same name. If the branch is
-already on `main`, there is nothing to port:
+The promotion created the tag on GitHub, so fetch it with the branch. The
+explicit refspecs write `origin/main` and `origin/release/<branch>` in any
+clone. `--force` replaces a stale local tag of the same name. If the branch
+is already on `main`, there is nothing to port and nothing to merge:
 
 ```sh
-git fetch --force origin main release/X.Y.Z tag vX.Y.Z
-git merge-base --is-ancestor origin/release/X.Y.Z origin/main && echo "already on main"
+git fetch --force origin main:refs/remotes/origin/main release/<branch>:refs/remotes/origin/release/<branch> tag vX.Y.Z
+git merge-base --is-ancestor origin/release/<branch> origin/main && echo "branch already on main"
 ```
 
 List the branch commits that have no identical patch on `main`:
 
 ```sh
-git cherry -v origin/main origin/release/X.Y.Z | grep '^+'
+git cherry -v origin/main origin/release/<branch> | grep '^+'
 ```
 
 The list holds the version bumps, and also each cherry-pick whose conflicts
 someone resolved by hand. Find the `main` PR for each fix in the list. If a
 fix has no PR on `main`, open a PR that brings it to `main` and land it.
 
-Then merge the tag back into `main`. The version of every `main` build comes
-from `git describe`, which finds only tags that the commit descends from. The
-release notes and `just check-version` find the previous release the same
-way. Without the merge, they all keep counting from the previous release.
+Then merge the branch tip back into `main`. The tag is on the branch, so the
+merge brings the tag into the history of `main`. The version of every `main`
+build comes from `git describe`, which finds only tags that the commit
+descends from. The release notes and `just check-version` find the previous
+release the same way. Without the merge, they all keep counting from the
+previous release. The merge also records the commits after the tag, so the
+next `git cherry` does not list a fix that is already ported.
 
 The merge uses the `ours` strategy, which keeps the tree of `main` and
 records only the history. It drops any change on the branch that `main`
@@ -196,14 +218,39 @@ lacks, so merge only after `main` has every fix in the list:
 
 ```sh
 git switch -c chore/merge-back-X.Y.Z origin/main
-git merge -s ours vX.Y.Z -m "Merge tag 'vX.Y.Z' into main"
+git merge -s ours origin/release/<branch> -m "Merge branch 'release/<branch>' into main"
 ```
 
-Push the branch, open a PR, and merge it with **Create a merge commit**. The
-other merge buttons drop the link to the tag.
+Push the branch and open a PR. The PR must go in as a merge commit, because
+the other merge buttons drop the link to the branch and its tag. This
+repository turns off **Create a merge commit**. An admin turns it on in the
+repository settings, merges the PR with it, and turns it off again. Then
+check that the tag is on `main`:
 
-Keep the branch from step 2. A hotfix lands on it, bumps `package.version`,
-and goes out through steps 3 to 8 as the next version.
+```sh
+git fetch origin main:refs/remotes/origin/main
+git merge-base --is-ancestor vX.Y.Z origin/main && echo "tag on main"
+```
+
+### Release a hotfix
+
+A hotfix is the next version of a release, cut from the branch of that
+release. `<branch>` stays the version of the first release on the branch: a
+fix for 0.7.0 goes out from `release/0.7.0`. It does not use step 1 or step
+2. A second release candidate, and the final version after the candidates,
+go out from the branch in the same way. Do these steps:
+
+1. Land the fix and the `package.version` bump on `release/<branch>` by PR.
+2. Check that the five required checks from step 1 are green on the branch
+   tip, and check the version there:
+
+   ```sh
+   git fetch origin release/<branch>
+   git switch --detach FETCH_HEAD
+   just check-version
+   ```
+
+3. Follow steps 3 to 8 with `--ref release/<branch>`.
 
 ### Roll back
 
@@ -258,8 +305,8 @@ A release run makes a nightly build or a versioned release:
 | Folder name | Short commit hash, such as `versions/9b763dd5/` | Version number, such as `versions/0.6.0/` |
 | Started by | `nightly.yml` every day, or a manual run without `versioned` | A manual run with `versioned: true` |
 | Version the binaries report | `0.6.0-dev.70.g9b763dd5` | `0.6.0` |
-| GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 6 |
-| Git tag | None | `vX.Y.Z`, created in step 6 |
+| GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 7 |
+| Git tag | None | `vX.Y.Z`, created in step 7 |
 | Stable promotion publishes | Nothing | GitHub Release |
 
 ### release.yml: build, test, stage
