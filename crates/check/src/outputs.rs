@@ -513,24 +513,34 @@ impl DetbuildScan {
         Ok(result)
     }
 
-    /// The output files, under every output glob, that contain the needle.
+    /// The output files, under every output glob, that contain the needle:
+    /// each file once, however many globs name it, in path order.
     fn outputs_naming_detbuild(&self, root: &Path) -> Result<Vec<PathBuf>, Error> {
-        let mut found = Vec::new();
+        let mut files = std::collections::BTreeSet::new();
         for glob in &self.globs {
             crate::bail_if_cancelled(&self.cancel)?;
-            let files = self.check_cache.match_files_for_glob(root, glob)?;
-            let hits = files
-                .iter()
-                .filter(|path| path.is_file())
-                .map(|path| match file_contains(path, DETBUILD_NEEDLE) {
-                    Ok(true) => Ok(Some(path.clone())),
-                    Ok(false) => Ok(None),
-                    Err(e) => Err(Error::IO("reading output file", path.clone(), e)),
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            found.extend(hits.into_iter().flatten());
+            files.extend(
+                self.check_cache
+                    .match_files_for_glob(root, glob)?
+                    .iter()
+                    .filter(|path| path.is_file())
+                    .cloned(),
+            );
         }
-        Ok(found)
+        let stop = || self.cancel.is_cancelled();
+        files
+            .into_iter()
+            .map(|path| match file_contains(&path, DETBUILD_NEEDLE, &stop) {
+                Ok(true) => Ok(Some(path)),
+                Ok(false) => Ok(None),
+                // a cancelled read is the check's cancellation, not an I/O error of the file
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    crate::bail_if_cancelled(&self.cancel).map(|()| None)
+                }
+                Err(e) => Err(Error::IO("reading output file", path, e)),
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 }
 
@@ -538,8 +548,10 @@ impl DetbuildScan {
 /// can be large and are not read whole), each searched with `memmem`, with
 /// `needle.len() - 1` bytes carried between chunks so a match that straddles
 /// a boundary is seen. The standard library has no streaming substring
-/// search; this is the usual chunk-and-overlap over the library's.
-fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
+/// search; this is the usual chunk-and-overlap over the library's. `stop`
+/// is asked before every chunk: a cancelled check leaves a large file mid-way
+/// with an `Interrupted` error rather than reading it to the end.
+fn file_contains(path: &Path, needle: &[u8], stop: &dyn Fn() -> bool) -> std::io::Result<bool> {
     use std::io::Read as _;
     let finder = memchr::memmem::Finder::new(needle);
     let mut file = std::fs::File::open(path)?;
@@ -547,6 +559,12 @@ fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     let mut chunk = vec![0u8; 1 << 16];
     let mut window: Vec<u8> = Vec::with_capacity(keep + chunk.len());
     loop {
+        if stop() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "check cancelled",
+            ));
+        }
         let n = file.read(&mut chunk)?;
         if n == 0 {
             return Ok(false);
