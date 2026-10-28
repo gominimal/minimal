@@ -198,7 +198,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// (exec ssh, or exit with the attach's status) that [`run`] finishes once
 /// the command's `cmd` span has ended, so callers return it untouched.
 pub(crate) async fn box_via_ssh(
-    kind: paths::ProviderKind,
+    kind: paths::HostKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     wire: Option<String>,
@@ -393,7 +393,7 @@ fn subscribe_host_asks(
 /// VM-backed host only. Whether the attach subscribes for it is decided
 /// from its record ([`host_asks_target`]).
 pub(crate) fn host_asks_box(global: &GlobalArgs, name: Option<&str>) -> Option<String> {
-    (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+    (daemon_host_kind(global) == paths::HostKind::Minvmd)
         .then_some(name)
         .flatten()
         .map(str::to_string)
@@ -511,7 +511,7 @@ mod tests {
     }
 
     /// A host-side ask stand: the real VM host daemon's control server and
-    /// guest door over a real registry, in a provider dir the CLI resolves
+    /// guest door over a real registry, in a host dir the CLI resolves
     /// the control socket in (NET-045).
     struct AskStand {
         _dir: tempfile::TempDir,
@@ -524,9 +524,9 @@ mod tests {
     impl AskStand {
         fn start() -> Self {
             let dir = tempfile::TempDir::new().unwrap();
-            let provider_dir = dir.path().join("providers").join("local-minvmd0");
-            std::fs::create_dir_all(&provider_dir).unwrap();
-            let control = provider_dir.join("control.sock");
+            let host_dir = dir.path().join("providers").join("local-minvmd0");
+            std::fs::create_dir_all(&host_dir).unwrap();
+            let control = host_dir.join("control.sock");
             let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
             let answerer =
                 minvmd::net::answerer::AnswererStatus::allocating_for_tests("ask-test-node");
@@ -572,7 +572,7 @@ mod tests {
                 quic443: None,
             };
             register_box_for_activation(
-                paths::ProviderKind::Minvmd,
+                paths::HostKind::Minvmd,
                 self.global.minimal_dir.as_deref(),
                 NetworkMode::OwnIp,
                 name,

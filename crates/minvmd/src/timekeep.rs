@@ -25,7 +25,7 @@
 //! fd-passing variant and no API to reach a guest vsock port from the host once
 //! the VM is up, so a host→guest channel *must* be a UDS on disk. It lands
 //! beside the two that already exist for the same reason (`ssh.sock`,
-//! `gvproxy-switch.sock`) in the minvmd provider dir.
+//! `gvproxy-switch.sock`) in the minvmd host dir.
 //!
 //! The registration is `listen = true` — libkrun binds the host UDS and bridges
 //! each accepted connection to the guest process listening on the vsock port —

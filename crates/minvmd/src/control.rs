@@ -59,7 +59,7 @@
 //! own, so a door's other connections never wait behind a human. Every ask
 //! event appends one line to the same audit log.
 //!
-//! The socket lives beside the daemon's ssh socket in the provider-instance
+//! The socket lives beside the daemon's ssh socket in the host
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
 //! box table. The serving shape mirrors [`crate::net::HostGvproxy::spawn`]
@@ -71,7 +71,7 @@
 //! egress gate dropping its frames under the unregistered rule (NET-085).
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
-//! provider dir to 0700 when the daemon owns it, refuses one it does not
+//! host dir to 0700 when the daemon owns it, refuses one it does not
 //! own, and sets the socket to 0600; every connection's peer uid is then
 //! checked against the daemon's own (`SO_PEERCRED` on Linux, `getpeereid`
 //! on macOS) and a foreign uid is dropped unanswered. Within the
@@ -110,14 +110,14 @@ use minimald_rpc::{
 use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
-/// The control socket's file name inside the provider-instance dir, beside
+/// The control socket's file name inside the host dir, beside
 /// `paths::SSH_SOCK_FILE`. Deliberately not in the `paths` crate: that crate
 /// is shared with consumers that have no box table, and this name only
 /// means something where `minvmd` supervises one.
 pub const CONTROL_SOCK_FILE: &str = "control.sock";
 
 /// The in-VM daemon's control channel's file name, beside the control
-/// socket in the same provider-instance dir: the door the port reports
+/// socket in the same host dir: the door the port reports
 /// (NET-138) arrive on, bridged to the guest over vsock at
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the one channel from inside
 /// the microVM that answers, because a report the grant refused must be
@@ -133,7 +133,7 @@ pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 pub const GUEST_REPORT_SOCK_ENV: &str = "MINVMD_GUEST_REPORT_SOCK";
 
 /// The audit log the daemon appends its host-side copy of each recorded
-/// admission to, relative to the provider dir the sockets live in — the
+/// admission to, relative to the host dir the sockets live in — the
 /// daemon's own audit log, beside the state it keeps for the VM it
 /// serves.
 const AUDIT_LOG_RELATIVE_PATH: &str = "audit/box-admissions.log";
@@ -160,7 +160,7 @@ fn unix_now_secs() -> u64 {
 /// decides what a report may record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlDoor {
-    /// The host's control socket, in the provider dir beside the ssh
+    /// The host's control socket, in the host dir beside the ssh
     /// socket: registrations, withdrawals, and both read-only verbs.
     Host,
     /// The in-VM daemon's control channel: the port reports alone. Bound
@@ -500,11 +500,11 @@ impl BepListening {
     }
 }
 
-/// Resolve the control socket's path: `<provider dir>/control.sock`, the
+/// Resolve the control socket's path: `<host dir>/control.sock`, the
 /// dir the CLI resolves the ssh socket under, so the client finds both by
 /// the same rule.
 pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
-    Ok(crate::state::provider_dir().join(CONTROL_SOCK_FILE))
+    Ok(crate::state::host_dir().join(CONTROL_SOCK_FILE))
 }
 
 /// Bind the control socket at `sock_path` and serve box control requests
@@ -535,7 +535,7 @@ pub fn spawn(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -614,7 +614,7 @@ pub fn spawn_guest_reports_door_with_proxy(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -752,7 +752,7 @@ fn serve_connection(
     // Check the peer's credentials: only the daemon's own uid may reach
     // the box table. The 0600 socket mode is the primary gate; this is
     // defense in depth against a mis-moded file or a group- or
-    // world-writable provider directory. The kernel captures the peer's
+    // world-writable host directory. The kernel captures the peer's
     // credentials at connect time, so a descriptor a same-uid connector
     // passes on still carries that connector's uid.
     //
@@ -1953,7 +1953,7 @@ fn source_text(source: PortReportSource) -> &'static str {
 }
 
 /// The audit copy's path, derived from the control socket's own dir: the
-/// provider-instance dir is this daemon's state for the VM it serves, so
+/// host dir is this daemon's state for the VM it serves, so
 /// the log lives beside the sockets and the persisted state it speaks for.
 fn audit_log_path(sock_path: &Path) -> PathBuf {
     match sock_path.parent() {
@@ -4488,11 +4488,11 @@ mod tests {
         assert!(!is_root_peer(me.wrapping_add(1).max(1)));
     }
 
-    /// The bind tightens a provider dir the daemon owns but `StateDir::new`
+    /// The bind tightens a host dir the daemon owns but `StateDir::new`
     /// created under the umask (0755), rather than refusing every existing
     /// install, and then serves on it.
     #[test]
-    fn bind_tightens_an_owned_provider_dir_to_0700() {
+    fn bind_tightens_an_owned_host_dir_to_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("local-minvmd0");

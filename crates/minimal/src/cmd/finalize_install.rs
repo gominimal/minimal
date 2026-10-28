@@ -1503,7 +1503,7 @@ pub(crate) mod linux {
     // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
     // each started by the login through `sudo -n -u` under a drop-in this
     // item installs. The users, the directories and the modes are the ones
-    // `docs/design/2026-10-25-split-user-vmm-provider-dir.md` lays out.
+    // `docs/design/2026-10-25-split-user-vmm-host-dir.md` lays out.
 
     pub(crate) const VM_USERS_ID: &str = "vm-users";
     const VM_USERS_LABEL: &str = "separate users for the VM and its network switch";
@@ -1545,7 +1545,7 @@ pub(crate) mod linux {
     /// The paths the item works on, for one login and one VM.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct VmUsersLayout {
-        pub provider_dir: std::path::PathBuf,
+        pub host_dir: std::path::PathBuf,
         pub vm_dir: std::path::PathBuf,
         pub gvproxy_dir: std::path::PathBuf,
         pub gvproxy_config_dir: std::path::PathBuf,
@@ -1553,12 +1553,12 @@ pub(crate) mod linux {
     }
 
     impl VmUsersLayout {
-        /// The layout for `operator`'s `vm` with its provider dir at
-        /// `provider_dir`, under [`VM_USERS_BASE`].
-        pub(crate) fn new(provider_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
+        /// The layout for `operator`'s `vm` with its host dir at
+        /// `host_dir`, under [`VM_USERS_BASE`].
+        pub(crate) fn new(host_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
             let vm_dir = std::path::Path::new(VM_USERS_BASE).join(operator).join(vm);
             VmUsersLayout {
-                provider_dir,
+                host_dir,
                 gvproxy_dir: vm_dir.join("gvproxy"),
                 gvproxy_config_dir: vm_dir.join("gvproxy-config"),
                 gate_dir: vm_dir.join("gate"),
@@ -1567,7 +1567,7 @@ pub(crate) mod linux {
         }
 
         pub(crate) fn vmm_dir(&self) -> std::path::PathBuf {
-            self.provider_dir.join("vmm")
+            self.host_dir.join("vmm")
         }
     }
 
@@ -1583,7 +1583,7 @@ pub(crate) mod linux {
         /// The VM name the rules name.
         pub vm: String,
         pub layout: VmUsersLayout,
-        pub provider: Option<DirFact>,
+        pub host_dir: Option<DirFact>,
         pub vmm: Option<DirFact>,
         pub gvproxy_dir: Option<DirFact>,
         pub gvproxy_config_dir: Option<DirFact>,
@@ -1693,16 +1693,16 @@ pub(crate) mod linux {
     }
 
     /// The script block that creates the users, the directories and the
-    /// drop-in. The provider dir and `vmm/` sit in the login's state dir,
+    /// drop-in. The host dir and `vmm/` sit in the login's state dir,
     /// which the login can change while root works there. So root reaches
     /// them by `cd -P`, checks that `pwd -P` is the path it means and
     /// checks the owner of `.`, and changes only `.`.
     fn vm_users_script(facts: &VmUsersFacts, drop_in: &str) -> String {
         let op = &facts.operator;
         let layout = &facts.layout;
-        let provider = layout.provider_dir.display().to_string();
+        let host_dir = layout.host_dir.display().to_string();
         let components: Vec<String> = layout
-            .provider_dir
+            .host_dir
             .components()
             .filter_map(|c| match c {
                 std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
@@ -1726,13 +1726,13 @@ pub(crate) mod linux {
             // went one level down from where the walk was. The physical
             // path is checked too.
             walk.push_str(&format!(
-                "  [ ! -L '{name}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                "  [ ! -L '{name}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 here=$(stat -c %d:%i .)\n\
                  \x20 cd -P -- '{name}'\n\
-                 \x20 {CD_PARENT_CHECK}{provider}: a component moved\" >&2; exit 1; }}\n\
-                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                 \x20 {CD_PARENT_CHECK}{host_dir}: a component moved\" >&2; exit 1; }}\n\
+                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 owner=$(stat -c %u .)\n\
-                 \x20 {want} || {{ echo \"{provider}: a component has another owner\" >&2; exit 1; }}\n"
+                 \x20 {want} || {{ echo \"{host_dir}: a component has another owner\" >&2; exit 1; }}\n"
             ));
         }
         let base = VM_USERS_BASE;
@@ -1764,15 +1764,15 @@ pub(crate) mod linux {
              \x20 chgrp {VMM_USER} .\n\
              \x20 chmod 0710 .\n\
              \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
-             \x20 [ ! -L vmm ] || {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             \x20 [ ! -L vmm ] || {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 here=$(stat -c %d:%i .)\n\
              \x20 cd -P vmm\n\
-             \x20 {CD_PARENT_CHECK}{provider}/vmm moved\" >&2; exit 1; }}\n\
+             \x20 {CD_PARENT_CHECK}{host_dir}/vmm moved\" >&2; exit 1; }}\n\
              \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
-             {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 owner=$(stat -c %u .)\n\
              \x20 [ \"$owner\" = 0 ] || [ \"$owner\" = \"$(id -u {VMM_USER})\" ] || \
-             {{ echo \"{provider}/vmm has another owner\" >&2; exit 1; }}\n\
+             {{ echo \"{host_dir}/vmm has another owner\" >&2; exit 1; }}\n\
              \x20 chown root:root .\n\
              \x20 chmod 0700 .\n\
              \x20 chown {VMM_USER}:{VMM_USER} .\n\
@@ -1835,10 +1835,10 @@ pub(crate) mod linux {
             Ok(path) => path,
             Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
         };
-        // The script prints the provider path inside double quotes, where
+        // The script prints the host dir path inside double quotes, where
         // `$`, a backtick and `\` keep a meaning to the shell. So those
         // characters are refused too.
-        let paths_quotable = [&facts.layout.provider_dir, &facts.layout.vm_dir]
+        let paths_quotable = [&facts.layout.host_dir, &facts.layout.vm_dir]
             .iter()
             .all(|p| {
                 p.to_str()
@@ -1856,15 +1856,15 @@ pub(crate) mod linux {
             );
         };
 
-        // The script walks into the provider dir and does not create it.
-        if !facts.provider.is_some_and(|f| f.is_dir) {
+        // The script walks into the host dir and does not create it.
+        if !facts.host_dir.is_some_and(|f| f.is_dir) {
             return Item::cannot(
                 VM_USERS_ID,
                 VM_USERS_LABEL,
                 format!(
                     "{} does not exist yet, so there is no VM directory to set up. minvmd \
                      creates it the first time the VM starts",
-                    facts.layout.provider_dir.display()
+                    facts.layout.host_dir.display()
                 ),
             );
         }
@@ -1909,7 +1909,7 @@ pub(crate) mod linux {
                 let (vmm_gid, gvp_gid) = (*vmm_gid, *gvp_gid);
                 one_member(&vmm_group)
                     && one_member(&gvp_group)
-                    && facts.provider.is_some_and(|f| {
+                    && facts.host_dir.is_some_and(|f| {
                         f.is_dir
                             && f.uid == facts.operator_uid
                             && f.gid == vmm_gid
@@ -1990,25 +1990,21 @@ pub(crate) mod linux {
     #[allow(dead_code)]
     pub(crate) fn vm_users_item_on_this_host() -> Item {
         let operator = crate::resolver::operator_name();
-        let provider_dir = paths::provider_instance_dir(
-            &paths::minimal_state_dir(),
-            paths::ProviderKind::Minvmd,
-            0,
-        )
-        .as_utf8_path()
-        .as_std_path()
-        .to_path_buf();
+        let host_dir = paths::host_dir(&paths::minimal_state_dir(), paths::HostKind::Minvmd, 0)
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf();
         // The script refuses a symlink in the path, and `/home` is a
         // symlink on some hosts. So the item works on the real path.
-        let provider_dir = std::fs::canonicalize(&provider_dir).unwrap_or(provider_dir);
-        let vm = paths::provider_instance_name(paths::ProviderKind::Minvmd, 0);
-        let layout = VmUsersLayout::new(provider_dir, &operator, &vm);
+        let host_dir = std::fs::canonicalize(&host_dir).unwrap_or(host_dir);
+        let vm = paths::host_name(paths::HostKind::Minvmd, 0);
+        let layout = VmUsersLayout::new(host_dir, &operator, &vm);
         let facts = VmUsersFacts {
             operator_uid: nix::unistd::getuid().as_raw(),
             passwd: std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
             group: std::fs::read_to_string("/etc/group").unwrap_or_default(),
             vm,
-            provider: dir_fact(&layout.provider_dir),
+            host_dir: dir_fact(&layout.host_dir),
             vmm: dir_fact(&layout.vmm_dir()),
             gvproxy_dir: dir_fact(&layout.gvproxy_dir),
             gvproxy_config_dir: dir_fact(&layout.gvproxy_config_dir),
@@ -3179,7 +3175,7 @@ mod tests {
     }
 
     /// BEP-047: the VM users item creates `minimal-vmm` and
-    /// `minimal-gvproxy`, the provider dir at 0710 group `minimal-vmm`,
+    /// `minimal-gvproxy`, the host dir at 0710 group `minimal-vmm`,
     /// `vmm/`, the gvproxy, gvproxy config and gate dirs, and the sudoers
     /// drop-in, and reads as done once all of them hold.
     #[test]
@@ -3199,7 +3195,7 @@ mod tests {
             group: "root:x:0:\nalice:x:1000:\n".to_string(),
             vm: "local-minvmd0".to_string(),
             layout: layout.clone(),
-            provider: Some(DirFact {
+            host_dir: Some(DirFact {
                 uid: 1000,
                 gid: 1000,
                 mode: 0o700,
@@ -3324,7 +3320,7 @@ mod tests {
                 "{}minimal-vmm:x:990:alice\nminimal-gvproxy:x:991:alice\n",
                 fresh.group
             ),
-            provider: dir(1000, 990, 0o710),
+            host_dir: dir(1000, 990, 0o710),
             vmm: dir(990, 990, 0o750),
             gvproxy_dir: dir(991, 991, 0o750),
             gvproxy_config_dir: dir(1000, 991, 0o750),
@@ -3333,7 +3329,7 @@ mod tests {
             ..fresh.clone()
         };
         assert_eq!(vm_users_item_over(&finished).state, ItemState::Done);
-        // A gate dir without setgid, a provider dir at the wrong mode, or a
+        // A gate dir without setgid, a host dir at the wrong mode, or a
         // stale drop-in each make the step run again.
         for broken in [
             VmUsersFacts {
@@ -3341,7 +3337,7 @@ mod tests {
                 ..finished.clone()
             },
             VmUsersFacts {
-                provider: dir(1000, 1000, 0o700),
+                host_dir: dir(1000, 1000, 0o700),
                 ..finished.clone()
             },
             VmUsersFacts {
@@ -3380,16 +3376,16 @@ mod tests {
             cause.contains("`sudo gpasswd -d bob minimal-vmm`"),
             "{cause}"
         );
-        // No provider dir yet: the script has nothing to walk into, so the
+        // No host dir yet: the script has nothing to walk into, so the
         // item refuses, and the rest of the plan still runs.
-        let no_provider = VmUsersFacts {
-            provider: None,
+        let no_host_dir = VmUsersFacts {
+            host_dir: None,
             ..fresh.clone()
         };
-        let not_yet = vm_users_item_over(&no_provider);
+        let not_yet = vm_users_item_over(&no_host_dir);
         assert_eq!(not_yet.state, ItemState::Cannot);
         assert!(not_yet.script.is_none());
-        // The script prints the provider path in double quotes, so a path
+        // The script prints the host dir path in double quotes, so a path
         // the shell expands there is refused, and root runs nothing.
         for active in ["/home/$(id)/p", "/home/`id`/p", "/home/a\\b/p"] {
             let unsafe_path = VmUsersFacts {

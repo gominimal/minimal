@@ -124,7 +124,7 @@ async fn bug_without_daemon_still_produces_a_bundle() {
     assert!(find(&files, "host/dirs.txt").is_some());
     assert!(find(&files, "state/listing.txt").is_some());
 
-    // Nothing was ever spawned: the provider and log absences are recorded
+    // Nothing was ever spawned: the host and log absences are recorded
     // as skips, not silently missing and not errors.
     let skipped_whats: Vec<&str> = manifest["skipped"]
         .as_array()
@@ -455,7 +455,7 @@ async fn planted_secrets_never_reach_the_bundle() {
 }
 
 #[tokio::test]
-async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
+async fn logs_collects_newest_five_per_prefix_and_host_logs() {
     let state = tempfile::TempDir::new().unwrap();
     let config = tempfile::TempDir::new().unwrap();
 
@@ -474,21 +474,21 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
             .unwrap();
     }
 
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(&provider).unwrap();
-    std::fs::write(provider.join("run.log"), "supervisor stderr\n").unwrap();
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    std::fs::write(host_dir.join("run.log"), "supervisor stderr\n").unwrap();
     // The zone-table dump (NET-138): the table the VM host daemon's
     // answerer answered from, under the name the daemon writes — the
     // bundle carries the table itself, not just its name in the dir
     // listing.
     let zone_table = "[\n  {\n    \"name\": \"web.min.internal\",\n    \"address\": \"127.0.64.9\",\n    \"live\": true\n  }\n]";
-    std::fs::write(provider.join(minvmd::diag::ZONE_TABLE_FILE), zone_table).unwrap();
+    std::fs::write(host_dir.join(minvmd::diag::ZONE_TABLE_FILE), zone_table).unwrap();
     // boot.log deliberately absent — recorded as a skip, not an error.
-    // A native provider instance carries no zone dump either: same skip.
+    // A native host carries no zone dump either: same skip.
     let native = state.path().join("providers/local-minimald0");
     std::fs::create_dir_all(&native).unwrap();
     std::fs::write(native.join("run.log"), "native daemon stderr\n").unwrap();
-    // Non-`local-` entries are not provider instances and must be ignored.
+    // Non-`local-` entries are not hosts and must be ignored.
     let stray = state.path().join("providers/remote-x");
     std::fs::create_dir_all(&stray).unwrap();
     std::fs::write(stray.join("run.log"), "not a local provider\n").unwrap();
@@ -553,7 +553,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
 }
 
 /// The `--log-tail-bytes` cap reaches every log the collector bundles — the
-/// rotated host logs and the provider-scoped ones — and the manifest labels
+/// rotated host logs and the host-scoped ones — and the manifest labels
 /// each capped file so a reader can tell a truncated log from a short one.
 #[tokio::test]
 async fn a_custom_tail_cap_applies_to_every_log() {
@@ -563,9 +563,9 @@ async fn a_custom_tail_cap_applies_to_every_log() {
     let log_dir = state.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     std::fs::write(log_dir.join("minimald.log.2026-07-21"), "x".repeat(500)).unwrap();
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(&provider).unwrap();
-    std::fs::write(provider.join("run.log"), "y".repeat(500)).unwrap();
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    std::fs::write(host_dir.join("run.log"), "y".repeat(500)).unwrap();
 
     let out_dir = tempfile::TempDir::new().unwrap();
     let out = out_dir.path().join("diag.tar.zst");
@@ -686,7 +686,7 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
     }
     assert!(probe["version"]["long_version"].is_string());
 
-    // R7.6: liveness status for the discovered provider.
+    // R7.6: liveness status for the discovered host.
     assert!(find(&files, "local-minimald0/status.json").is_some());
     assert!(find(&files, "local-minimald0/dir-listing.txt").is_some());
 
@@ -744,11 +744,11 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
 async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
     let state = tempfile::TempDir::new().unwrap();
     let config = tempfile::TempDir::new().unwrap();
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(&provider).unwrap();
-    drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(host_dir.join("ssh.sock")).unwrap());
     // A data volume the fallback can date, standing in for a real image.
-    std::fs::write(provider.join("data-vol.raw"), [0u8; 4096]).unwrap();
+    std::fs::write(host_dir.join("data-vol.raw"), [0u8; 4096]).unwrap();
 
     let out_dir = tempfile::TempDir::new().unwrap();
     let out = out_dir.path().join("diag.tar.zst");
@@ -817,7 +817,7 @@ async fn bug_no_guest_makes_no_daemon_contact() {
     // nothing touched the daemon.
     assert!(find(&files, "socket-probe.json").is_none());
     assert!(find(&files, "daemon-diag.tar.zst").is_none());
-    // Host-side per-provider collection still ran.
+    // Host-side per-host collection still ran.
     assert!(find(&files, "local-minimald0/status.json").is_some());
 }
 
