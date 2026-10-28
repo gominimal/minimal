@@ -2493,6 +2493,24 @@ impl LoopbackLeaseBook {
         self.verdict_landing.send_replace(verdict);
     }
 
+    /// Waits, without a bound, for the verdict to land, and returns it. A
+    /// verdict already landed returns at once. When the book is dropped
+    /// before a landing, this returns [`RangeVerdict::Pending`]. The watcher
+    /// of a box finalized at the `127.0.0.1` fallback under a pending verdict
+    /// waits here (NET-144).
+    pub async fn await_landing(&self) -> RangeVerdict {
+        let mut landing = self.verdict_landing.subscribe();
+        loop {
+            let verdict = *landing.borrow_and_update();
+            if verdict != RangeVerdict::Pending {
+                return verdict;
+            }
+            if landing.changed().await.is_err() {
+                return RangeVerdict::Pending;
+            }
+        }
+    }
+
     /// The daemon's one verdict deadline, as an instant: the moment the book
     /// opened plus [`HAND_VERDICT_WAIT`] (or the instant a test moved it to).
     fn hand_verdict_deadline(&self) -> std::time::Instant {

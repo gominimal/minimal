@@ -3633,6 +3633,88 @@ async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fal
     );
 }
 
+/// NET-144, under a pending range verdict: a second box at the `127.0.0.1`
+/// interim yields the declared port the first box holds there, because a
+/// present landing moves both to their own addresses. When the verdict
+/// lands absent, the second box stays at the fallback with the port unbound,
+/// and the daemon log reports it with the port and the holder. The first
+/// box, which holds the port, is not reported.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict_lands_absent() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    // The bound is shrunk so both finalizes publish at the interim.
+    manager.reset_hand_verdict_deadline(100);
+    let mut client = server.connect().await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 81),
+        std::net::Ipv4Addr::new(127, 0, 64, 81),
+    )
+    .await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 82),
+        std::net::Ipv4Addr::new(127, 0, 64, 82),
+    )
+    .await;
+    let finalized = finalize_session(&mut client, second).await;
+    assert!(
+        finalized
+            .shared_port_collisions
+            .iter()
+            .any(|collision| collision.port == 18080 && collision.held_by.starts_with("first")),
+        "under the pending verdict the second box yields the port: {finalized:?}"
+    );
+    let registry = manager.hostnames();
+    for id in [first, second] {
+        assert_eq!(
+            registry
+                .read()
+                .expect("registry lock")
+                .published_own_address(id),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "both boxes stand at the interim while the verdict walks"
+        );
+    }
+    let reported = |logged: &str, id: SessionId| {
+        logged.lines().any(|line| {
+            line.contains("host-port-in-use")
+                && line.contains("127.0.0.1 fallback")
+                && line.contains(&format!("session={id}"))
+        })
+    };
+    assert!(
+        !reported(&capture.contents(), second),
+        "nothing is reported while the verdict is pending"
+    );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reported(&capture.contents(), second) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains("127.0.0.1 fallback")
+            && line.contains(&format!("session={second}"))
+            && line.contains("port=18080")
+            && line.contains("address=127.0.0.1")
+            && line.contains("holder=box:first")),
+        "the absent landing reports the held port, the address and the holder, got: {logged}"
+    );
+    assert!(
+        !reported(&logged, first),
+        "the box that holds the port is not reported: {logged}"
+    );
+}
+
 /// Waits until a registration is parked on the range verdict, so the
 /// landing a test makes next provably answers a waiter rather than a
 /// registration that has not yet begun to wait (NET-123 §7.1).

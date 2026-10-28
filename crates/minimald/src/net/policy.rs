@@ -388,6 +388,79 @@ pub async fn apply_ingress_naming_holders(
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
+    apply_declared(
+        control,
+        control.host_unbinds_declared_forwards(),
+        published,
+        ptask_ip,
+        ingress,
+        gate,
+        yielded,
+        holder_of,
+    )
+    .await
+}
+
+/// Binds the declared forwards of a box on a VM-backed host when finalize
+/// publishes it, before the record goes `Active` (NET-121, NET-144, design
+/// §7.1: the bind succeeds before the name is published). On a VM-backed
+/// host the forwarder binds on the host OS, so the daemon cannot probe the
+/// ports itself ([`host_ports_in_use`]). It binds them, toward the
+/// `switch_address` the VM host handed the box, and a held port fails with
+/// the same typed refusal the native probe gives. A failure rolls back as
+/// [`apply_ingress`] does.
+///
+/// The bound forwards stay on the host. The box's first attach posts the
+/// same exposes again, and the host's switch answers each one that the
+/// listener is already bound, which the attach takes as bound. The host
+/// unbinds the forwards when it withdraws the box's row, as it does for
+/// every declared forward ([`release_declared_ingress`]).
+///
+/// # Errors
+///
+/// As [`apply_ingress`].
+pub async fn bind_declared_at_publish(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    switch_address: Ipv4Addr,
+    ingress: &IngressPolicy,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
+    apply_declared(
+        control,
+        control.host_unbinds_declared_forwards(),
+        published,
+        switch_address,
+        ingress,
+        None,
+        yielded,
+        holder_of,
+    )
+    .await
+}
+
+/// [`apply_ingress_naming_holders`], with `host_holds_listeners` read off the
+/// control channel ([`ControlChannel::host_unbinds_declared_forwards`]) by
+/// the caller, so a test can drive the VM-backed answers over a unix socket.
+/// Behind a VM host's gate a listener the switch already holds is the
+/// box's own forward, bound at publish ([`bind_declared_at_publish`]), or
+/// a publish the host keeps for the box until the holder's row is withdrawn
+/// ([`HandedBind::HeldByHost`]). Either way the forward is tracked as bound.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the public wrappers above fix the flag; a struct would be single-use ceremony"
+)]
+async fn apply_declared(
+    control: &ControlChannel,
+    host_holds_listeners: bool,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    ingress: &IngressPolicy,
+    gate: Option<&Arc<super::switch::BoxGate>>,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
         if let Some(collision) = yielded
@@ -405,7 +478,18 @@ pub async fn apply_ingress_naming_holders(
             continue;
         }
         let req = expose_request(mapping, published, ptask_ip);
-        match post_json(control, "/services/forwarder/expose", &req).await {
+        let answer = match post_json(control, "/services/forwarder/expose", &req).await {
+            Err(e) if host_holds_listeners && is_already_running(&e) => {
+                tracing::debug!(
+                    port = mapping.external_port,
+                    local = %req.local,
+                    "the host already holds this declared forward for the box"
+                );
+                Ok(())
+            }
+            answer => answer,
+        };
+        match answer {
             Ok(()) => bound.push(PortForwarder {
                 mapping: ExposedMapping {
                     local: req.local,
@@ -429,7 +513,7 @@ pub async fn apply_ingress_naming_holders(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                release_declared_ingress(control, &bound).await;
+                release_declared(control, host_holds_listeners, &bound).await;
                 // A taken host port fails the apply like any other refusal:
                 // NET-121 (docs/specs/18-spec-box-networking, design §7.1)
                 // makes a failed bind a surfaced error, never a silent
@@ -691,7 +775,13 @@ pub async fn unexpose_forwarder(
 ///   their connections when it withdraws the box's row. Each forward still
 ///   gets one info line, so the log keeps NET-121's bind/unbind pair.
 pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
-    if !control.host_unbinds_declared_forwards() {
+    release_declared(control, control.host_unbinds_declared_forwards(), bound).await;
+}
+
+/// [`release_declared_ingress`], with `host_unbinds` read off the control
+/// channel by the caller.
+async fn release_declared(control: &ControlChannel, host_unbinds: bool, bound: &[PortForwarder]) {
+    if !host_unbinds {
         remove_ingress(control, bound).await;
         return;
     }
@@ -2842,8 +2932,8 @@ mod tests {
         use tokio::net::UnixListener;
 
         use super::super::{
-            ControlChannel, IngressPolicy, PortMapping, apply_ingress, host_ports_in_use,
-            is_address_in_use, port_in_use_refusal,
+            ControlChannel, IngressPolicy, PortMapping, apply_declared, apply_ingress,
+            host_ports_in_use, is_address_in_use, port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -2961,6 +3051,90 @@ mod tests {
                 asked[2].contains("127.0.64.9:18080"),
                 "the rollback releases the forward that bound: {asked:?}"
             );
+        }
+
+        /// NET-144 on a VM-backed host, where the daemon cannot probe the
+        /// host's ports: finalize binds the declared forwards at publish, and
+        /// a port a program on the host holds fails that bind with the same
+        /// refusal text as the native probe. On a VM-backed host the host
+        /// unbinds the declared forwards, so the rollback asks the switch
+        /// for nothing: the forwarder sees exactly the one expose.
+        #[tokio::test]
+        async fn activation_refused_when_declared_port_is_held_on_a_vm_host_at_publish() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_in_turn(sock.clone(), vec![IN_USE]);
+            let err = match apply_declared(
+                &ControlChannel::Unix(sock),
+                true,
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18999]),
+                None,
+                &[],
+                &|_| minimald_rpc::PortHolder::Host,
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a held host port must fail the bind at publish"),
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            assert_eq!(
+                err.to_string(),
+                "Port 18999 is already in use on this machine by another \
+                 program on this machine.\nChoose another host port in --ingress (for \
+                 example --ingress 19000:80) or in [network] ingress in \
+                 minimal.toml.",
+                "the VM-backed refusal is the native refusal's text"
+            );
+            let asked = forwarder.await.expect("the fake forwarder ran");
+            assert_eq!(asked.len(), 1, "one expose and no rollback: {asked:?}");
+            assert!(
+                asked[0].contains("\"local\":\"127.0.64.9:18999\"")
+                    && asked[0].contains("\"remote\":\"100.64.128.10:80\""),
+                "the bind names the published address and the handed switch address: {asked:?}"
+            );
+        }
+
+        /// After the bind at publish, the box's first attach posts the same
+        /// expose, and the VM host's switch answers that the listener is
+        /// already bound. Behind a VM host's gate that answer is the box's
+        /// own forward, so the attach tracks it as bound. On a native host
+        /// the same answer still fails the apply.
+        #[tokio::test]
+        async fn activation_refused_when_declared_port_is_held_not_by_the_forward_bound_at_publish()
+        {
+            for host_holds_listeners in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let sock = dir.path().join("gvproxy.sock");
+                let forwarder = forwarder_answering_in_turn(
+                    sock.clone(),
+                    vec![(500, "proxy already running\n"), (200, "")],
+                );
+                let applied = apply_declared(
+                    &ControlChannel::Unix(sock),
+                    host_holds_listeners,
+                    PUBLISHED,
+                    LEASE,
+                    &ingress(&[18080]),
+                    None,
+                    &[],
+                    &|_| minimald_rpc::PortHolder::Host,
+                )
+                .await;
+                if host_holds_listeners {
+                    let bound = applied.expect("the forward bound at publish is the box's own");
+                    assert_eq!(bound.len(), 1);
+                    assert_eq!(bound[0].local(), "127.0.64.9:18080");
+                } else {
+                    let Err(err) = applied else {
+                        panic!("on a native host a bound listener fails");
+                    };
+                    assert!(port_in_use_refusal(&err).is_none(), "got: {err}");
+                }
+                forwarder.abort();
+            }
         }
 
         /// The activation probe names exactly the TCP ports another process

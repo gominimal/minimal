@@ -129,6 +129,57 @@ impl fmt::Debug for WorkspaceBaseline {
 }
 
 impl BoxActor {
+    /// Watches for the range verdict to land, for a box that finalized at
+    /// the shared `127.0.0.1` fallback under a pending verdict while another
+    /// box there held one of its declared ports (NET-144). Under a pending
+    /// verdict the box yields the port, because a present landing moves it
+    /// to its own address. When the verdict lands absent, the box stays at
+    /// the fallback with the port unbound. The box is `Active` by then, so
+    /// the watcher reports the held port in one warn line with the same
+    /// fields as a refused activation, and does not destroy the box. A box
+    /// that moved off the fallback, or no longer publishes, is not reported.
+    #[cfg(target_os = "linux")]
+    fn watch_fallback_landing(&self, record: &Record, ingress: &boxes::IngressPolicy) {
+        let book = Arc::clone(&self.loopback);
+        let hostnames = Arc::clone(&self.hostnames);
+        let session = record.id;
+        let mappings = ingress.port_mappings.clone();
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "session.fallback_port_watch", session = %session),
+            async move {
+                if book.await_landing().await != crate::net::dns::RangeVerdict::Absent {
+                    return;
+                }
+                let held = hostnames
+                    .read()
+                    .expect("hostname registry lock poisoned")
+                    .fallback_port_refusal(session);
+                let Some((port, holder)) = held else {
+                    return;
+                };
+                let box_port = mappings
+                    .iter()
+                    .find(|mapping| mapping.external_port == port)
+                    .map_or(port, |mapping| mapping.internal_port);
+                let refusal = minimald_rpc::PortInUseRefusal {
+                    port,
+                    box_port,
+                    holder: minimald_rpc::PortHolder::Box(holder),
+                };
+                tracing::warn!(
+                    session = %session,
+                    port = refusal.port,
+                    address = %std::net::Ipv4Addr::LOCALHOST,
+                    holder = %refusal.holder.log_label(),
+                    action = "host-port-in-use",
+                    "the range verdict landed absent, so this active box stays at the \
+                     127.0.0.1 fallback, where another box holds its declared ingress \
+                     port; the port is not bound for this box"
+                );
+            },
+        );
+    }
+
     /// Compose this session's loadout from its project config and the
     /// client's wire contribution, then either finalize it (`Ok(None)`, the
     /// session is now `Active`) or park it in `Draft` holding the resume
@@ -545,13 +596,13 @@ impl BoxActor {
                 // ([`Self::deregister_hostname`]). A retried finalize
                 // registers again, which is idempotent for one session id.
                 #[cfg(target_os = "linux")]
-                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = self
-                    .register_hostname(&record, true)
-                    .await
-                    .into_iter()
+                let yielded_ports = self.register_hostname(&record, true).await;
+                #[cfg(target_os = "linux")]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = yielded_ports
+                    .iter()
                     .map(|c| minimald_rpc::SharedPortCollision {
                         port: c.port,
-                        held_by: c.other,
+                        held_by: c.other.clone(),
                     })
                     .collect();
                 #[cfg(not(target_os = "linux"))]
@@ -571,15 +622,20 @@ impl BoxActor {
                 // address. Only a landed range verdict keeps a box there.
                 // Under a pending verdict the interim is a waypoint, the box
                 // moves to its hand when the verdict lands present, and the
-                // port is yielded as before. At a node's shared address the
-                // port is yielded too (NET-129). Then the daemon probes the ports that
-                // something outside the registry holds. On a native host the
-                // forwarder binds in the daemon's own network namespace, so
-                // the daemon probes. On a VM-backed host the forwarder binds
-                // on the host OS, so the probe finds nothing and the spawn's
-                // apply reports the port. The probe is skipped when activate
-                // hooks run: their launch binds the forwards, and a taken
-                // port fails that apply with the same refusal.
+                // port is yielded as before. If the verdict then lands absent,
+                // the box stays at the fallback, and a watcher reports the
+                // held port in the daemon log ([`Self::watch_fallback_landing`]).
+                // At a node's shared address the port is yielded too
+                // (NET-129). Then the daemon checks the ports that something
+                // outside the registry holds. On a native host the forwarder
+                // binds in the daemon's own network namespace, so the daemon
+                // probes. On a VM-backed host the forwarder binds on the host
+                // OS, so a probe here proves nothing: the daemon binds the
+                // forwards at publish instead, toward the switch address the
+                // host handed the box, and a held port fails that bind with
+                // the same refusal. The check is skipped when activate hooks
+                // run: their launch binds the forwards, and a taken port
+                // fails that apply with the same refusal.
                 #[cfg(target_os = "linux")]
                 if let (boxes::NetworkMode::OwnIp, Some(ingress)) =
                     (&record.network, record.policy.ingress.as_ref())
@@ -591,11 +647,16 @@ impl BoxActor {
                             .expect("hostname registry lock poisoned");
                         (
                             hostnames.published_own_address(record.id),
-                            hostnames.fallback_port_refusal(record.id).filter(|_| {
-                                self.loopback.range_verdict()
-                                    != crate::net::dns::RangeVerdict::Pending
-                            }),
+                            hostnames.fallback_port_refusal(record.id),
                         )
+                    };
+                    let fallback_refusal = if fallback_refusal.is_some()
+                        && self.loopback.range_verdict() == crate::net::dns::RangeVerdict::Pending
+                    {
+                        self.watch_fallback_landing(&record, ingress);
+                        None
+                    } else {
+                        fallback_refusal
                     };
                     let box_port = |port: u16| {
                         ingress
@@ -615,23 +676,58 @@ impl BoxActor {
                         && let Some(published) = published
                     {
                         let control = self.switch_control().await;
-                        let yielded: Vec<u16> =
-                            shared_port_collisions.iter().map(|c| c.port).collect();
-                        if let Some(&port) = crate::net::policy::host_ports_in_use(
-                            &control, published, ingress, &yielded,
-                        )
-                        .first()
-                        {
-                            refusal = Some(minimald_rpc::PortInUseRefusal {
+                        let own_name = super::helpers::registry_name(&record);
+                        let holder_of = |port: u16| {
+                            crate::net::policy::port_holder(
+                                &self.hostnames,
+                                &own_name,
+                                published,
                                 port,
-                                box_port: box_port(port),
-                                holder: crate::net::policy::port_holder(
-                                    &self.hostnames,
-                                    &super::helpers::registry_name(&record),
+                            )
+                        };
+                        let switch_address = record
+                            .box_addresses
+                            .map(|addresses| addresses.switch_address);
+                        match (control.host_unbinds_declared_forwards(), switch_address) {
+                            // A VM-backed host: bind at publish.
+                            (true, Some(switch_address)) => {
+                                if let Err(e) = crate::net::policy::bind_declared_at_publish(
+                                    &control,
                                     published,
-                                    port,
-                                ),
-                            });
+                                    switch_address,
+                                    ingress,
+                                    &yielded_ports,
+                                    &holder_of,
+                                )
+                                .await
+                                {
+                                    match crate::net::policy::port_in_use_refusal(&e) {
+                                        Some(held) => refusal = Some(held),
+                                        // Any other failed bind fails the
+                                        // finalize as it is (NET-121).
+                                        None => return Err(e),
+                                    }
+                                }
+                            }
+                            // A VM-backed box the host handed no switch
+                            // address has no forward to bind yet. Its
+                            // first attach binds the forwards.
+                            (true, None) => {}
+                            (false, _) => {
+                                let yielded: Vec<u16> =
+                                    yielded_ports.iter().map(|c| c.port).collect();
+                                if let Some(&port) = crate::net::policy::host_ports_in_use(
+                                    &control, published, ingress, &yielded,
+                                )
+                                .first()
+                                {
+                                    refusal = Some(minimald_rpc::PortInUseRefusal {
+                                        port,
+                                        box_port: box_port(port),
+                                        holder: holder_of(port),
+                                    });
+                                }
+                            }
                         }
                     }
                     if let Some(refusal) = refusal {
