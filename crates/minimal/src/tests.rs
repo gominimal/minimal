@@ -736,7 +736,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
     assert_eq!(
         render_bare_status("~/w", &entries, &cwd, true),
         "No terminal: not attaching. State for ~/w:\n\
-             \x20 sessions: 1 (web, active)\n\
+             \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
              \x20 min session run web <task>\n\
@@ -813,7 +813,7 @@ fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        warning.contains("run `min ls` until its status is active"),
+        warning.contains("run `min ls` until its status is running"),
         "the wait guidance names the command to watch, got: {warning}"
     );
     assert!(

@@ -651,7 +651,14 @@ impl BoxActor {
             .hostnames
             .write()
             .expect("hostname registry lock poisoned");
-        reg.deregister(&registry_name(&record));
+        // The registry keys its rows by name alone, so withdraw only a row
+        // registered to this box. Another box can hold the same name: one
+        // whose name is derived from the same project basename, or one a
+        // restart resumed while this box came up only to be destroyed.
+        let name = registry_name(&record);
+        if reg.name_held_by(record.id, &name) {
+            reg.deregister(&name);
+        }
     }
 
     /// Renames the session: persists the new name through the record handle
