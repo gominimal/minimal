@@ -212,7 +212,10 @@ pub(crate) async fn destroy_box(
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+            id,
+            only_if_unfinalized: false,
+        })
         .await
         .context("DestroySession RPC failed")?;
 

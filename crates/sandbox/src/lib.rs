@@ -316,8 +316,15 @@ impl<C: Channel> Sandbox<C> {
                         }
                         config::SandboxMapped::FileCopy(p) => {
                             let dest = b.join(p.file_name().unwrap());
-                            fs::copy(p, &dest)
-                                .map_err(|e| Error::IO("copying input file", dest, e))?;
+                            if !copy_input_file(p, &dest)
+                                .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
+                            {
+                                tracing::warn!(
+                                    "Not copying {} => {}, already exists",
+                                    p.display(),
+                                    dest.display()
+                                );
+                            }
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
@@ -2737,6 +2744,28 @@ fn booted_with_systemd() -> bool {
         .unwrap_or_default()
 }
 
+/// Copy `src` to `dest` as a new file with `src`'s permission bits. Returns
+/// `false`, touching nothing, when `dest` already exists: two inputs with one
+/// basename keep the first, as a hardlinked `File` input does. `fs::copy`
+/// would truncate an existing `dest`, and a `dest` hardlinked in from a mapped
+/// directory shares its inode with that directory's source, so the copy would
+/// have rewritten the source in place.
+fn copy_input_file(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    let mut out = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut input = fs::File::open(src)?;
+    std::io::copy(&mut input, &mut out)?;
+    out.set_permissions(input.metadata()?.permissions())?;
+    Ok(true)
+}
+
 fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
     common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
 }
@@ -2931,7 +2960,7 @@ fn shell_word(path: &str) -> String {
 /// a loss of isolation.
 ///
 /// A `Some` is not advisory: `minimald` gates every session create on it
-/// (NET-141), refusing the create with this cause and its remedy, so a false
+/// (NET-143), refusing the create with this cause and its remedy, so a false
 /// `Some` — a host whose kernel would in fact allow the unshare — refuses
 /// every session on that host. Three facts are read, each live from `/proc`
 /// on every call, so a remedy applied to a running host takes effect at the
@@ -3735,12 +3764,44 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copied input is a new file with the source's bytes and mode.
+    #[test]
+    fn copy_input_file_copies_bytes_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.tar.gz");
+        fs::write(&src, b"payload").unwrap();
+        fs::set_permissions(&src, Permissions::from_mode(0o640)).unwrap();
+        let dest = tmp.path().join("dest.tar.gz");
+        assert!(copy_input_file(&src, &dest).unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    /// An existing destination is left alone, even one that is a hardlink to
+    /// another file: `fs::copy` would truncate it and so rewrite that file.
+    #[test]
+    fn copy_input_file_never_writes_through_an_existing_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("cached-from-a-dep");
+        fs::write(&shared, b"shared bytes").unwrap();
+        let dest = tmp.path().join("build-dest");
+        fs::hard_link(&shared, &dest).unwrap();
+        let src = tmp.path().join("other-source");
+        fs::write(&src, b"other").unwrap();
+        assert!(!copy_input_file(&src, &dest).unwrap());
+        assert_eq!(fs::read(&shared).unwrap(), b"shared bytes");
+        assert_eq!(fs::read(&dest).unwrap(), b"shared bytes");
+    }
     use config::{Config, SandboxMapped};
 
     /// The daemon's AppArmor remedy names the install step for the
     /// installed daemon and, on its own line, the loader with `--path` for
     /// this daemon's own path, so a source-built daemon is covered too
-    /// (NET-141).
+    /// (NET-143).
     #[test]
     fn daemon_apparmor_remedy_names_finalize_install_and_this_binary() {
         let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
@@ -3766,7 +3827,7 @@ mod tests {
 
     /// The mip AppArmor remedy is a command the operator pastes, so a data
     /// dir or binary path with a space stays one shell word, while a plain
-    /// path is shown bare (NET-141).
+    /// path is shown bare (NET-143).
     #[test]
     fn mip_apparmor_remedy_quotes_paths_with_spaces() {
         let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
@@ -4373,6 +4434,23 @@ ff02::2\tip6-allrouters
             matches!(result, Err(Error::MappedFile(_))),
             "expected MappedFile error, got {result:?}"
         );
+    }
+
+    /// A build that fails after its directory was created leaves nothing
+    /// behind: `Sandbox::new` rejecting a file in the rootfs comes after
+    /// `Config::build` made the directory and its synth config.
+    #[tokio::test]
+    async fn a_failed_build_removes_its_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("sandboxes");
+        std::fs::create_dir(&base).unwrap();
+        let result = Config::new("test-cleanup")
+            .with_add_rootfs(SandboxMapped::File(tmp.path().join("phantom.txt")))
+            .build(&base, ())
+            .await;
+        assert!(matches!(result, Err(Error::MappedFile(_))), "{result:?}");
+        let left: Vec<_> = std::fs::read_dir(&base).unwrap().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
     }
 
     /// When no explicit `state_dir` is configured, `Sandbox::new` derives it

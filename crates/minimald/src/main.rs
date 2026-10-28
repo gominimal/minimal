@@ -1223,7 +1223,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
         // Live: the create gate probes this process on every create
-        // (NET-141). The preflight below switches it off under
+        // (NET-143). The preflight below switches it off under
         // `MINIMALD_USERNS_GATE=off`.
         user_namespace_gate: minimald::server::UsernsGate::Live,
     };
@@ -1254,7 +1254,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // this process's own privileges and AppArmor label are what the kernel
     // will check. On a restricted host (stock Ubuntu 24.04+ with an
     // unconfined daemon) that denial otherwise surfaces only when the first
-    // attach dies writing /proc/self/uid_map. The create gate (NET-141)
+    // attach dies writing /proc/self/uid_map. The create gate (NET-143)
     // refuses every session with the cause and the remedy before allocating
     // anything, re-probing on each create so a remedy applied to the running
     // host takes effect without a restart; this start-up read only warns

@@ -3,8 +3,9 @@
 # crates: rcache (index_file untrusted-bytes parse path) and boxes
 # (PathDecision combination lattice, the egress frame verdict's
 # admit-iff-declared property, and the publish-verb decision's
-# applied-iff-table-admits property), mlog (the telemetry switches and
-# the spool's clean-up plan), and minvmd (the guest boot line: the token
+# applied-iff-table-admits property, a box record held in exactly one of
+# five states, and a restart that reaps only unfinished records), mlog
+# (the telemetry switches and the spool's clean-up plan), and minvmd (the guest boot line: the token
 # alphabet both its readers agree on and the budget that leaves libkrun
 # its reserve), and bep (the redemption decision: a value that does not
 # decrypt, a misattributed source, a member without bounds, an authority
@@ -274,7 +275,7 @@ expect() { # crate expected_count
         exit 1
     }
 }
-expect boxes 10
+expect boxes 12
 expect rcache 3
 expect mlog 9
 expect minvmd 5

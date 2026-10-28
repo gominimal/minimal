@@ -65,7 +65,7 @@ pub async fn cmd_pkg_upload_cache(
         });
 
         s.spawn(move || {
-            let mut writer = handle.block_on(ctx.remote_cache_writer()).unwrap();
+            let writer = handle.block_on(ctx.remote_cache_writer()).unwrap();
             for (bsr, (tar_file, sha256)) in rx {
                 let build = graph.get(&bsr).unwrap();
                 let bsh = graph.spec_hash(&bsr);

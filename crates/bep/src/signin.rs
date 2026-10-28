@@ -35,9 +35,9 @@
 use std::fmt;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// The keychain service name of the sign-in item.
 pub const SERVICE: &str = "dev.minimal.github-sign-in";
@@ -216,7 +216,19 @@ pub enum Standing {
     Lapsed,
 }
 
+/// How long before the token expires the proxy renews it, in seconds
+/// (BEP-069).
+pub const RENEW_WITHIN_SECS: u64 = 5 * 60;
+
 impl Metadata {
+    /// True when the token has expired at `now`, or expires within
+    /// [`RENEW_WITHIN_SECS`] of it, so the proxy renews it before use
+    /// (BEP-069).
+    #[must_use]
+    pub fn needs_renewal(&self, now: u64) -> bool {
+        self.token_expires_at <= now.saturating_add(RENEW_WITHIN_SECS)
+    }
+
     /// The sign-in's standing at `now`, in Unix seconds.
     #[must_use]
     pub fn standing(&self, now: u64) -> Standing {
@@ -315,6 +327,264 @@ pub trait Keychain {
     ///
     /// When the keychain refuses the write.
     fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError>;
+
+    /// Replace both parts of the held item in place, and create no item
+    /// (BEP-069). The write happens only while the held item is the
+    /// instance that `metadata` names. A logout that removed the item, or a
+    /// sign-in that replaced it with a new instance, gives
+    /// [`Updated::Gone`].
+    ///
+    /// The default checks the held metadata, then writes, with nothing
+    /// between them. [`MemoryKeychain`] checks and writes under one lock.
+    /// [`HostKeychain`] checks and writes under the item lock
+    /// ([`lock_item`]), which `min auth logout` holds for its delete. The
+    /// host keychain tools have no update-only write of their own.
+    ///
+    /// # Errors
+    ///
+    /// When the keychain refuses the read or the write.
+    fn update(&self, metadata: &Metadata, material: &Material) -> Result<Updated, SignInError> {
+        match self.metadata()? {
+            Some(held) if held.instance == metadata.instance => {
+                self.write(metadata, material)?;
+                Ok(Updated::Written)
+            }
+            _ => Ok(Updated::Gone),
+        }
+    }
+}
+
+impl<T: Keychain + ?Sized> Keychain for Arc<T> {
+    fn metadata(&self) -> Result<Option<Metadata>, SignInError> {
+        (**self).metadata()
+    }
+
+    fn material(&self) -> Result<Option<Material>, SignInError> {
+        (**self).material()
+    }
+
+    fn write(&self, metadata: &Metadata, material: &Material) -> Result<(), SignInError> {
+        (**self).write(metadata, material)
+    }
+
+    fn update(&self, metadata: &Metadata, material: &Material) -> Result<Updated, SignInError> {
+        (**self).update(metadata, material)
+    }
+}
+
+/// What [`Keychain::update`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Updated {
+    /// The held item now holds the new parts.
+    Written,
+    /// No item of that instance is held. Nothing was written.
+    Gone,
+}
+
+/// The token and refresh material GitHub gave for a renewal. Debug output
+/// redacts the tokens.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Refreshed {
+    /// The new GitHub user token.
+    pub access_token: String,
+    /// The new refresh token. GitHub revokes the old one.
+    pub refresh_token: String,
+    /// Seconds until the new token expires.
+    pub expires_in: u64,
+    /// Seconds until the new refresh token expires.
+    pub refresh_token_expires_in: u64,
+}
+
+impl fmt::Debug for Refreshed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refreshed")
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token_expires_in", &self.refresh_token_expires_in)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Refreshed {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
+/// Why GitHub gave no renewed token.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RefreshError {
+    /// GitHub answered and refused the refresh token, with this error code.
+    #[error("GitHub refused the refresh token: {0}")]
+    Refused(String),
+    /// The renewal did not complete: GitHub was not reached, its answer did
+    /// not parse, or the proxy cannot send the request.
+    #[error("the renewal did not complete: {0}")]
+    Failed(String),
+}
+
+/// GitHub's token endpoint, as the proxy's renewal uses it (BEP-069).
+pub trait TokenEndpoint: Send + Sync {
+    /// Exchange `refresh_token` for a new token and refresh token. `flow`
+    /// is the flow that produced the sign-in: a browser-flow sign-in renews
+    /// under the App's client secret, a device-flow one without it.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub refuses the refresh token or is not reached.
+    fn refresh(&self, flow: Flow, refresh_token: &str) -> Result<Refreshed, RefreshError>;
+}
+
+/// The token endpoint of a proxy that has none. Every renewal fails, so an
+/// expired token is refused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTokenEndpoint;
+
+impl TokenEndpoint for NoTokenEndpoint {
+    fn refresh(&self, _flow: Flow, _refresh_token: &str) -> Result<Refreshed, RefreshError> {
+        Err(RefreshError::Failed(
+            "this proxy has no GitHub token endpoint".into(),
+        ))
+    }
+}
+
+/// The token a renewal gave for substitution.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// The token to substitute.
+    pub token: Zeroizing<String>,
+    /// True when this renewal got the token from GitHub and wrote it to the
+    /// item. False when the held token was still good to use.
+    pub renewed: bool,
+    /// True when this renewal asked GitHub, or meant to, and got no new
+    /// token, and the held token is given until it expires.
+    pub failed: bool,
+}
+
+/// Why a renewal gave no token. Each one refuses the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RenewError {
+    /// The token has expired and GitHub refused the renewal, or the refresh
+    /// material expired too, or the item was not read.
+    #[error("the GitHub sign-in needs a new sign-in")]
+    SignInRequired,
+    /// GitHub renewed the sign-in, but the item was not written. The renewed
+    /// token is discarded.
+    #[error("the renewed GitHub sign-in was not saved")]
+    NotSaved,
+    /// The item is gone, or holds another sign-in. The renewed token, if
+    /// any, is discarded.
+    #[error("the GitHub sign-in was removed")]
+    Gone,
+}
+
+/// Renew the sign-in `instance` from its refresh material, when its token
+/// has expired or expires within [`RENEW_WITHIN_SECS`] of `now` (BEP-069).
+///
+/// The function reads the item again first. When another renewal already
+/// wrote a token with time to live, it gives that token and does not renew.
+/// A renewed token is written to the item, update-only, before it is given
+/// for first use. When the renewal fails and the held token has not expired
+/// yet, the held token is given.
+///
+/// # Errors
+///
+/// [`RenewError`] when no token can be substituted.
+pub fn renew(
+    keychain: &dyn Keychain,
+    endpoint: &dyn TokenEndpoint,
+    instance: &str,
+    now: u64,
+) -> Result<Resolved, RenewError> {
+    let metadata = match keychain.metadata() {
+        Ok(Some(metadata)) if metadata.instance == instance => metadata,
+        Ok(_) => return Err(RenewError::Gone),
+        Err(error) => {
+            tracing::warn!(%error, "the sign-in item was not read for its renewal");
+            return Err(RenewError::SignInRequired);
+        }
+    };
+    let material = match keychain.material() {
+        Ok(Some(material)) if material.instance == instance => material,
+        Ok(_) => return Err(RenewError::Gone),
+        Err(error) => {
+            tracing::warn!(%error, "the sign-in item was not read for its renewal");
+            return Err(RenewError::SignInRequired);
+        }
+    };
+    let held = |failed| Resolved {
+        token: Zeroizing::new(material.access_token.clone()),
+        renewed: false,
+        failed,
+    };
+    let keep = || {
+        if now < metadata.token_expires_at {
+            Ok(held(true))
+        } else {
+            Err(RenewError::SignInRequired)
+        }
+    };
+    if !metadata.needs_renewal(now) {
+        return Ok(held(false));
+    }
+    if now >= metadata.refresh_expires_at {
+        tracing::warn!(
+            account = %metadata.account,
+            refresh_expires_at = metadata.refresh_expires_at,
+            "the GitHub sign-in was not renewed: its refresh material expired"
+        );
+        return keep();
+    }
+    let refreshed = match endpoint.refresh(metadata.flow, &material.refresh_token) {
+        Ok(refreshed) => refreshed,
+        Err(error) => {
+            tracing::warn!(
+                account = %metadata.account,
+                %error,
+                "GitHub did not renew the sign-in"
+            );
+            return keep();
+        }
+    };
+    let renewed_metadata = Metadata {
+        token_expires_at: now.saturating_add(refreshed.expires_in),
+        refresh_expires_at: now.saturating_add(refreshed.refresh_token_expires_in),
+        ..metadata.clone()
+    };
+    let renewed_material = Material {
+        instance: instance.to_owned(),
+        access_token: refreshed.access_token.clone(),
+        refresh_token: refreshed.refresh_token.clone(),
+    };
+    match keychain.update(&renewed_metadata, &renewed_material) {
+        Ok(Updated::Written) => {
+            tracing::info!(
+                account = %renewed_metadata.account,
+                token_expires_at = renewed_metadata.token_expires_at,
+                "renewed the GitHub sign-in at the proxy"
+            );
+            Ok(Resolved {
+                token: Zeroizing::new(renewed_material.access_token.clone()),
+                renewed: true,
+                failed: false,
+            })
+        }
+        Ok(Updated::Gone) => {
+            tracing::warn!(
+                account = %metadata.account,
+                "the GitHub sign-in was removed during its renewal; the renewed token was discarded"
+            );
+            Err(RenewError::Gone)
+        }
+        Err(error) => {
+            tracing::warn!(
+                account = %metadata.account,
+                %error,
+                "the renewed GitHub sign-in was not saved; the renewed token was discarded"
+            );
+            Err(RenewError::NotSaved)
+        }
+    }
 }
 
 /// Store a completed sign-in in the one sign-in item (BEP-002).
@@ -432,6 +702,31 @@ impl Keychain for MemoryKeychain {
         self.store(SERVICE, secret)?;
         self.store(META_SERVICE, metadata.encode())
     }
+
+    fn update(&self, metadata: &Metadata, material: &Material) -> Result<Updated, SignInError> {
+        let secret = encode_secret(metadata, material)?;
+        let mut g = self.items.lock().map_err(|_| SignInError::Keychain {
+            action: "write the sign-in",
+            detail: "poisoned".into(),
+        })?;
+        // The check and the write hold one lock, so a `clear` either runs
+        // before the check or after the write.
+        let held = g
+            .iter()
+            .find(|(s, _)| *s == META_SERVICE)
+            .map(|(_, m)| Metadata::decode(m))
+            .transpose()?;
+        let has_secret = g.iter().any(|(s, _)| *s == SERVICE);
+        match held {
+            Some(held) if has_secret && held.instance == metadata.instance => {
+                g.retain(|(s, _)| *s != SERVICE && *s != META_SERVICE);
+                g.push((SERVICE, secret));
+                g.push((META_SERVICE, metadata.encode()));
+                Ok(Updated::Written)
+            }
+            _ => Ok(Updated::Gone),
+        }
+    }
 }
 
 /// A token in characters every keychain command line carries unquoted.
@@ -519,6 +814,75 @@ impl Keychain for HostKeychain {
         }
         Ok(())
     }
+
+    fn update(&self, metadata: &Metadata, material: &Material) -> Result<Updated, SignInError> {
+        // BEP-069: the check and the write happen under the item lock, so a
+        // logout that holds it for its delete cannot fall between them.
+        let _lock = lock_item()?;
+        match self.metadata()? {
+            Some(held) if held.instance == metadata.instance => {
+                self.write(metadata, material)?;
+                Ok(Updated::Written)
+            }
+            _ => Ok(Updated::Gone),
+        }
+    }
+}
+
+/// The file the item lock is held on: `~/.minimal/bep/sign-in.lock`. `None`
+/// when no home directory is known.
+#[must_use]
+pub fn item_lock_path() -> Option<std::path::PathBuf> {
+    std::env::home_dir().map(|home| home.join(".minimal/bep/sign-in.lock"))
+}
+
+/// The item lock, held until drop. It is an exclusive lock on a file, so it
+/// holds across processes: the proxy's renewal and `min auth logout`.
+#[derive(Debug)]
+pub struct ItemLock {
+    _file: std::fs::File,
+}
+
+/// Take the item lock at [`item_lock_path`], and wait while another process
+/// holds it. The renewal holds it from its check to its write, and a logout
+/// holds it for its delete, so a renewal never writes an item back after a
+/// logout deleted it.
+///
+/// # Errors
+///
+/// When no home directory is known, or the lock file is not opened or not
+/// locked.
+pub fn lock_item() -> Result<ItemLock, SignInError> {
+    let path = item_lock_path().ok_or_else(|| SignInError::Keychain {
+        action: "lock the sign-in",
+        detail: "no home directory is known".into(),
+    })?;
+    lock_item_at(&path)
+}
+
+/// Take the item lock on the file at `path`, created when missing.
+///
+/// # Errors
+///
+/// When the lock file is not opened or not locked.
+pub fn lock_item_at(path: &std::path::Path) -> Result<ItemLock, SignInError> {
+    let refused = |e: std::io::Error| SignInError::Keychain {
+        action: "lock the sign-in",
+        detail: format!("{}: {e}", path.display()),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(refused)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(refused)?;
+    file.lock().map_err(refused)?;
+    Ok(ItemLock { _file: file })
 }
 
 fn run(
@@ -714,5 +1078,26 @@ mod host {
             action,
             detail: String::from_utf8_lossy(stderr).trim().to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BEP-069: the item lock excludes a second holder until the first drops
+    // it, so a renewal's check and write never straddle a logout's delete.
+    #[test]
+    fn the_item_lock_excludes_a_second_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/sign-in.lock");
+        let held = lock_item_at(&path).unwrap();
+        let other = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a second holder takes the lock while the first holds it"
+        );
+        drop(held);
+        other.try_lock().expect("the lock is free once dropped");
     }
 }

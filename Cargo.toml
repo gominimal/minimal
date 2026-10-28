@@ -6,6 +6,7 @@ members = [
     "crates/lcache",
     "crates/rcache",
     "crates/check",
+    "crates/client-config",
     "crates/checkouts",
     "crates/common",
     "crates/decode",
@@ -140,6 +141,7 @@ codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep i
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
+crc32c = "0.6"
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "7"
 fd-lock = "4"
@@ -208,7 +210,7 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
-russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.64", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 serde_json = { version = "1" }
 serde_json_lenient = { version = "0.2" }
@@ -267,6 +269,7 @@ lcache = { path = "crates/lcache" }
 rcache = { path = "crates/rcache" }
 check = { path = "crates/check" }
 checkouts = { path = "crates/checkouts" }
+client-config = { path = "crates/client-config" }
 common = { path = "crates/common" }
 decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }

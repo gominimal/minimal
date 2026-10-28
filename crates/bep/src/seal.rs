@@ -13,8 +13,9 @@
 //! associated data, so a change to any byte of the context makes the value
 //! fail to open. The plaintext is the member list, as JSON:
 //! `{"members": [{"kind": "signin", "breadth": "full", "jws": ..., "exp"?: ...}],
-//! "default_owner"?: ...}`. A v1 value carries exactly one member, and
-//! [`open`] refuses a member of unknown `kind`.
+//! "default_owner"?: ...}`. A member's `kind` is `signin` for a sign-in
+//! reference or `store` for a store handle. A v1 value carries exactly one
+//! member, and [`open`] refuses a member of unknown `kind`.
 //!
 //! [`open`] refuses a value sealed to another key, a value that does not
 //! decrypt, a value bound to another box, host or module, and a value past
@@ -91,6 +92,9 @@ pub enum Mode {
 pub enum MemberKind {
     /// A reference to the host's GitHub sign-in (BEP-005).
     SignIn,
+    /// A store handle: a reference to an item in a host store, under a
+    /// `[secret-store-rules]` rule (BEP-032, BEP-063).
+    Store,
 }
 
 /// How much of the module's authority a member carries.
@@ -711,12 +715,14 @@ impl MemberKind {
     fn as_wire(self) -> &'static str {
         match self {
             Self::SignIn => "signin",
+            Self::Store => "store",
         }
     }
 
     fn from_wire(wire: Option<&str>) -> Option<Self> {
         match wire? {
             "signin" => Some(Self::SignIn),
+            "store" => Some(Self::Store),
             _ => None,
         }
     }
