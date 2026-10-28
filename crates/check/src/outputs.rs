@@ -8,7 +8,7 @@ use crate::{CheckCache, CheckCtx, CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use common::target::Arch;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
-use lcache::{CacheErr, DirCacheEntry, LocalDir};
+use lcache::{Cache, CacheErr, DirCacheEntry, LocalDir};
 use object::Object;
 use ot::OpTracker;
 use tokio::sync::RwLockReadGuard;
@@ -425,7 +425,7 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
     ) -> Result<CheckResult, Error> {
         let check_cache = ctx.check_cache.clone();
         let cache = ctx.cache.clone();
-        let mut result = CheckResult {
+        let result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: NO_DETBUILD_CHECK.into(),
             err: vec![],
@@ -437,65 +437,30 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
             Some(b) => *b,
             None => return Ok(result), // skip: nothing to check against
         };
-        // Only what the scan needs leaves the guard: the hash that names
-        // the cached build, the package's name and its output globs. The
-        // graph itself stays where it is (cloning it per package would
-        // scale with packages times graph size).
-        let spec_hash = graph.spec_hash(&bsr);
-        let build = graph.get(&bsr).unwrap();
-        let name = build.name.clone();
-        let globs: Vec<String> = build.outputs.values().map(|o| o.glob().clone()).collect();
+        // Only what the scan needs leaves the guard (the graph itself stays
+        // where it is: cloning it per package would scale with packages times
+        // graph size).
+        let scan = DetbuildScan {
+            name: graph.get(&bsr).unwrap().name.clone(),
+            globs: graph
+                .get(&bsr)
+                .unwrap()
+                .outputs
+                .values()
+                .map(|o| o.glob().clone())
+                .collect(),
+            spec_hash: graph.spec_hash(&bsr),
+            cache,
+            check_cache,
+            cancel: ctx.cancel.clone(),
+        };
         drop(graph);
-        let cancel = ctx.cancel.clone();
         let span = tracing::Span::current();
-
         // The closure's error is a `String`: `Error` is not `Send`, and a
         // blocking task's result must be, as `MissingRuntimeDeps` does it.
         tokio::task::spawn_blocking(move || {
             let _enter = span.enter();
-            (move || -> Result<CheckResult, Error> {
-            crate::bail_if_cancelled(&cancel)?;
-            // No cached build is a skip; a cache that cannot be read is an
-            // error, never a silent pass over an output that exists.
-            let cached_build = match cache.read_dir(&spec_hash) {
-                Ok(c) => c,
-                Err(lcache::CacheErr::NotFound) => return Ok(result),
-                Err(e) => {
-                    return Err(Error::Other(
-                        anyhow::Error::from(e)
-                            .context(format!("reading the cached build of {name}")),
-                    ));
-                }
-            };
-            result.verdict = CheckVerdict::Pass;
-            if name == DETBUILD_PACKAGE {
-                return Ok(result);
-            }
-            for glob in &globs {
-                for path in check_cache
-                    .match_files_for_glob(cached_build.path(), glob)?
-                    .iter()
-                {
-                    crate::bail_if_cancelled(&cancel)?;
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let found = file_contains(path, DETBUILD_NEEDLE)
-                        .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
-                    if found {
-                        result.verdict = CheckVerdict::Fail;
-                        result.err.push(format!(
-                            "{}: contains `libdetbuild`: the build's LD_PRELOAD shim leaked into what ships; \
-                             nothing in an output may name it (gominimal/minimal#2489)",
-                            path.strip_prefix(cached_build.path())
-                                .unwrap_or(path)
-                                .display()
-                        ));
-                    }
-                }
-            }
-            Ok(result)
-            })().map_err(|e| format!("{e}"))
+            scan.verdict(result).map_err(|e| format!("{e}"))
         })
         .await
         .map_err(|e| Error::Other(anyhow!(e)))?
@@ -503,11 +468,80 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
     }
 }
 
-/// Whether `path` contains `needle`, read in 64 KiB chunks with an overlap of
-/// `needle.len() - 1` bytes carried between them, so a match that straddles a
-/// chunk boundary is seen; outputs can be large and are not read whole.
+/// One package's scan: what names its cached build, its name and output
+/// globs, the caches, and the cancel token. Built under the graph's guard,
+/// run on the blocking pool without it.
+struct DetbuildScan {
+    name: String,
+    globs: Vec<String>,
+    spec_hash: common::SpecHash,
+    cache: Cache<LocalDir>,
+    check_cache: std::sync::Arc<CheckCache>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl DetbuildScan {
+    /// Skip without a cached build (and for the exempt package); otherwise
+    /// pass, or fail naming every output that contains the needle.
+    fn verdict(&self, mut result: CheckResult) -> Result<CheckResult, Error> {
+        crate::bail_if_cancelled(&self.cancel)?;
+        // No cached build is a skip; a cache that cannot be read is an
+        // error, never a silent pass over an output that exists.
+        let cached_build = match self.cache.read_dir(&self.spec_hash) {
+            Ok(c) => c,
+            Err(lcache::CacheErr::NotFound) => return Ok(result),
+            Err(e) => {
+                return Err(Error::Other(
+                    anyhow::Error::from(e)
+                        .context(format!("reading the cached build of {}", self.name)),
+                ));
+            }
+        };
+        result.verdict = CheckVerdict::Pass;
+        if self.name == DETBUILD_PACKAGE {
+            return Ok(result);
+        }
+        let root = cached_build.path();
+        for path in self.outputs_naming_detbuild(root)? {
+            result.verdict = CheckVerdict::Fail;
+            result.err.push(format!(
+                "{}: contains `libdetbuild`: the build's LD_PRELOAD shim leaked into what ships; \
+                 nothing in an output may name it (gominimal/minimal#2489)",
+                path.strip_prefix(root).unwrap_or(&path).display()
+            ));
+        }
+        Ok(result)
+    }
+
+    /// The output files, under every output glob, that contain the needle.
+    fn outputs_naming_detbuild(&self, root: &Path) -> Result<Vec<PathBuf>, Error> {
+        let mut found = Vec::new();
+        for glob in &self.globs {
+            crate::bail_if_cancelled(&self.cancel)?;
+            let files = self.check_cache.match_files_for_glob(root, glob)?;
+            let hits = files
+                .iter()
+                .filter(|path| path.is_file())
+                .map(|path| match file_contains(path, DETBUILD_NEEDLE) {
+                    Ok(true) => Ok(Some(path.clone())),
+                    Ok(false) => Ok(None),
+                    Err(e) => Err(Error::IO("reading output file", path.clone(), e)),
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            found.extend(hits.into_iter().flatten());
+        }
+        Ok(found)
+    }
+}
+
+/// Whether `path` contains `needle`: the file read in 64 KiB chunks (outputs
+/// can be large and are not read whole), each searched with `memmem`, with
+/// `needle.len() - 1` bytes carried between chunks so a match that straddles
+/// a boundary is seen. The standard library has no streaming substring
+/// search; this is the usual chunk-and-overlap over the library's.
 fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     use std::io::Read as _;
+    let finder = memchr::memmem::Finder::new(needle);
     let mut file = std::fs::File::open(path)?;
     let keep = needle.len().saturating_sub(1);
     let mut chunk = vec![0u8; 1 << 16];
@@ -518,7 +552,7 @@ fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
             return Ok(false);
         }
         window.extend_from_slice(&chunk[..n]);
-        if window.windows(needle.len()).any(|w| w == needle) {
+        if finder.find(&window).is_some() {
             return Ok(true);
         }
         let start = window.len().saturating_sub(keep);
