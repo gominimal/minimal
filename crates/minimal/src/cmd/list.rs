@@ -257,11 +257,13 @@ pub(crate) fn duplicate_session_warning(
                 "{lead} To reuse it instead: min session attach {key}"
             ))
         }
-        _ => Some(format!(
+        boxes::BoxState::Pending | boxes::BoxState::Materializing => Some(format!(
             "{lead} The existing session is still being created; run `min ls` \
-             until its status is active, then attach to it with `min session \
+             until its status is running, then attach to it with `min session \
              attach <session>` instead of creating a second."
         )),
+        // An ended session is not one attach accepts, so no reuse command.
+        boxes::BoxState::Stopped | boxes::BoxState::Exited => Some(lead),
     }
 }
 
@@ -1272,13 +1274,18 @@ pub fn format_ls_across_vms_on(
     Ok(())
 }
 
-/// Human-readable lifecycle status for the `ls` table, using the same
-/// snake_case tokens the `--json` surface emits so the two agree.
+/// Human-readable lifecycle status for the `ls` table: the state names
+/// BOX-011 gives, which the `--json` surface also emits, except that it
+/// still spells `running` as `active`.
 pub(crate) fn status_label(status: boxes::BoxState) -> &'static str {
     match status {
         boxes::BoxState::Pending => "pending",
         boxes::BoxState::Materializing => "materializing",
-        boxes::BoxState::Active => "active",
+        // BOX-011 names the state `running`. The record still stores it as
+        // `active`, so `--json` prints that word.
+        boxes::BoxState::Active => "running",
+        boxes::BoxState::Stopped => "stopped",
+        boxes::BoxState::Exited => "exited",
     }
 }
 
@@ -1295,5 +1302,23 @@ pub(crate) fn format_memory(bytes: u64) -> String {
         }
     } else {
         format!("{} MiB", bytes / MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_label;
+
+    // BOX-011: `min ls` labels each state with its BOX-011 name.
+    #[test]
+    fn list_labels_a_running_box_running() {
+        assert_eq!(status_label(boxes::BoxState::Active), "running");
+        assert_eq!(status_label(boxes::BoxState::Pending), "pending");
+        assert_eq!(
+            status_label(boxes::BoxState::Materializing),
+            "materializing"
+        );
+        assert_eq!(status_label(boxes::BoxState::Stopped), "stopped");
+        assert_eq!(status_label(boxes::BoxState::Exited), "exited");
     }
 }

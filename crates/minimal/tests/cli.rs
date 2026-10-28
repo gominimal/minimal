@@ -5,6 +5,10 @@
 //! invoked the CLI. The daemon's state is inspected directly (via
 //! `TestClient`) to verify side-effects.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 mod common;
 
 use boxes::SessionId;
@@ -295,7 +299,7 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("PROJECT PATH"),
         "header should list PROJECT PATH: {text}"
     );
-    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(text.contains("running"), "row should show status: {text}");
     assert!(
         text.contains("/work/proj"),
         "row should show project path: {text}"

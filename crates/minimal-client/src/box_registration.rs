@@ -326,6 +326,12 @@ pub async fn register_box_with_vm_host(
                  read; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::Audited { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an audit report's \
+                 answer; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the name-hold \
@@ -858,6 +864,9 @@ mod tests {
             network: boxes::NetworkMode::OwnIp,
             policy: boxes::BoxPolicy::default(),
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
@@ -865,6 +874,7 @@ mod tests {
             host_ip_enforcement: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,

@@ -6,6 +6,10 @@
 //! records for everything that's missing, and how the command degrades when
 //! the daemon is unreachable.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 mod common;
 
 use std::collections::BTreeMap;

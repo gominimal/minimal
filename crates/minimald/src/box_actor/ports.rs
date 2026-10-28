@@ -127,14 +127,12 @@ pub(super) fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'stati
             "too many port prompts from this box are already waiting for an answer"
         }
         minimald_rpc::AskRefused::NoRow => {
-            "this box's network addresses are not registered with the VM host daemon"
+            "this box's network addresses are not registered on the host"
         }
         minimald_rpc::AskRefused::StanceNotAsk => {
-            "the VM host daemon does not have this box's --dynamic-ingress set to ask"
+            "the host does not have this box's --dynamic-ingress set to ask"
         }
-        minimald_rpc::AskRefused::OutsideGrant => {
-            "the port is outside the --dynamic-range the VM host daemon holds for this box"
-        }
+        minimald_rpc::AskRefused::OutsideGrant => "the port is outside this box's --dynamic-range",
         minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
         minimald_rpc::AskRefused::Denied => "the person attached answered no",
         minimald_rpc::AskRefused::NoTty => "the attached terminal could not show the prompt",
@@ -263,7 +261,9 @@ impl BoxActor {
             .unwrap_or(boxes::DynamicIngress::Deny);
         // The box's own setting decides first (NET-043), whatever asked: the
         // deny-all default when nothing was declared, the range gate under an
-        // `allow`, and an `ask` handed to whoever is attached (NET-045).
+        // `allow` or an `ask`, and an in-range `ask` handed to whoever is
+        // attached (NET-045). A port outside an `ask` box's range is refused
+        // here, so no prompt is routed for it (NET-047).
         match crate::net::policy::dynamic_ingress_decision(record.policy.ingress.as_ref(), port) {
             Err(crate::net::policy::ExposeRefusal::AskNeedsAnswer) => {
                 self.route_ask(record, box_name, port, reply).await;
@@ -537,7 +537,7 @@ impl BoxActor {
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
-                    "the VM host daemon refused the port prompt: {}",
+                    "the port prompt was refused: {}",
                     host_ask_refusal_text(*reason)
                 )),
             }),
@@ -708,12 +708,22 @@ impl BoxActor {
                 )
             }
             Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
+                // A port outside the box's range says so in the outcome, so
+                // the log tail tells it apart from a stance refusal.
+                let outcome = if matches!(
+                    refusal,
+                    crate::net::policy::ExposeRefusal::OutOfRange { .. }
+                ) {
+                    "refused: out of range"
+                } else {
+                    "refused"
+                };
                 tracing::info!(
                     name = %box_name,
                     port,
                     decision = %decision,
                     decided_by = %decided_by,
-                    outcome = "refused",
+                    outcome,
                     reason = %refusal,
                     "dynamic ingress expose"
                 );

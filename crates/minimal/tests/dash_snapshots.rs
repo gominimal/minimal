@@ -1,6 +1,10 @@
 //! Snapshot tests for the `view` half: render a fixed model into a
 //! `TestBackend` buffer and compare against the checked-in snapshots.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use boxes::{NetworkMode, SessionId};
 use chrono::DateTime;
 use minimal::dash::app::{self, Detail, Model, Msg, SessionKey};
@@ -77,6 +81,9 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
@@ -84,6 +91,8 @@ fn record(name: Option<&str>, network: NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // No run ever minted these records, so none ends with one.
+        ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
         box_type: None,

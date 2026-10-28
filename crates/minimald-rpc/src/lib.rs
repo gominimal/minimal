@@ -502,6 +502,14 @@ pub struct BoxConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
+    /// Whether the box ends with the one `min task run` it is created for
+    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// record as [`boxes::Record::ends_with_run`] by the create itself, so
+    /// a daemon restart at any point after the create destroys the box
+    /// rather than resuming it. Defaults to `false`, which is every other
+    /// create and every client that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon writes none of its own: NET-079's
     /// per-box enforcement is a daemon-owned launch record, carried on the
@@ -909,6 +917,83 @@ pub struct WithdrawPortRequest {
     /// Which side of the in-VM daemon reported it
     /// ([`PortReportSource`]).
     pub source: PortReportSource,
+}
+
+/// Who decided a dynamic ingress request, as the in-VM daemon's expose
+/// decision report names it ([`ExposeDecisionReport`]): the same three
+/// deciders, in the same kebab-case spelling, as the in-VM daemon's own
+/// audit record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExposeDecidedBy {
+    /// The box's own `dynamic_ingress` declaration.
+    BoxPolicy,
+    /// The attached human, answering an `ask` (NET-045).
+    AttachedHuman,
+    /// The in-VM daemon, failing an `ask` closed with nobody attached.
+    Daemon,
+}
+
+/// What became of a dynamic ingress request, as the expose decision report
+/// names it ([`ExposeDecisionReport`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExposeDecisionOutcome {
+    /// The port was published.
+    Published,
+    /// The request was refused.
+    Refused,
+    /// The publish could not be made.
+    PublishFailed,
+}
+
+/// The in-VM daemon's report of one dynamic ingress decision (NET-046): the
+/// host keeps a copy of each decision in its own audit log, outside the VM,
+/// so the record survives a box that erases the in-VM log.
+///
+/// Fixed and size-bounded like the port reports: the row key, the port, and
+/// three closed enums. The box is named by the host from the row at
+/// `switch_address`, never by a string the guest sends. A report keyed at
+/// no row is refused and leaves no record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExposeDecisionReport {
+    /// The switch address of the row the decision is about.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The port the box asked to publish.
+    pub port: u16,
+    /// The decision the box's `dynamic_ingress` setting made.
+    pub decision: DynamicIngress,
+    /// Who decided it.
+    pub decided_by: ExposeDecidedBy,
+    /// What became of the request.
+    pub outcome: ExposeDecisionOutcome,
+}
+
+/// The longest `proto` or `rule` text a [`RefusedEgressReport`] carries.
+/// The host clamps a longer one, so a report cannot grow the host's log.
+pub const REFUSED_EGRESS_TEXT_MAX: usize = 64;
+
+/// The in-VM daemon's report of one refused own-address egress flow: the
+/// relay dropped a box's frame against its egress rules and said so in its
+/// rate-limited drop line, and the same event is reported to the host,
+/// which appends it to its own audit log outside the VM.
+///
+/// Sent at most once per drop line, so under the same rate limit as that
+/// line and never once per frame. The host caps the records it writes per
+/// box again on its side, whatever the guest sends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefusedEgressReport {
+    /// The switch address of the row of the box whose frame was dropped.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The destination the dropped frame was sent to, when it had an IPv4
+    /// destination to read.
+    pub destination: Option<std::net::SocketAddrV4>,
+    /// The frame's protocol as the drop line names it (`tcp`, `udp`,
+    /// `icmp`, `ipv6`, ...), at most [`REFUSED_EGRESS_TEXT_MAX`] bytes.
+    pub proto: String,
+    /// The rule that dropped it, as the drop line names it, at most
+    /// [`REFUSED_EGRESS_TEXT_MAX`] bytes.
+    pub rule: String,
 }
 
 /// The read-only row verb's key: the box's name, the identity a row is
@@ -1340,6 +1425,16 @@ pub enum BoxControlRequest {
     /// steered name with the proxy's address only while the answer is
     /// `true`, and SERVFAIL otherwise.
     ProxyListening,
+    /// The in-VM daemon's report of one dynamic ingress decision
+    /// ([`ExposeDecisionReport`], NET-046): carried on the daemon's own
+    /// control channel, appended to the host's audit log, and answered with
+    /// [`BoxControlReply::Audited`].
+    ReportExposeDecision(ExposeDecisionReport),
+    /// The in-VM daemon's report of one refused own-address egress flow
+    /// ([`RefusedEgressReport`]): carried on the daemon's own control
+    /// channel, appended to the host's audit log under a per-box cap, and
+    /// answered with [`BoxControlReply::Audited`].
+    ReportRefusedEgress(RefusedEgressReport),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1716,6 +1811,14 @@ pub enum BoxControlReply {
         /// Whether the proxy's listener is live.
         listening: bool,
     },
+    /// An audit report's answer: whether the host wrote a record for it.
+    /// `false` when the host's per-box cap suppressed the record, which the
+    /// host counts in its log instead. `audited` is required — the marker
+    /// that keeps this document from decoding as any other reply.
+    Audited {
+        /// Whether a record was written.
+        audited: bool,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -1757,9 +1860,9 @@ impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
-    /// addresses, hooks on, no attrs, no sealed deliveries, no root
-    /// certificate, the session verb, no project root, no version
-    /// assertion, and no spec.
+    /// addresses, hooks on, not ended with a run, no attrs, no sealed
+    /// deliveries, no root certificate, the session verb, no project root,
+    /// no version assertion, and no spec.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1776,6 +1879,7 @@ impl CreateSessionRequest {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: default_hooks_enabled(),
+                ends_with_run: false,
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
