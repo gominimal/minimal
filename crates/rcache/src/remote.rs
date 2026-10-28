@@ -32,8 +32,14 @@ pub enum Error<BE: std::fmt::Debug> {
     IO(std::io::Error),
     /// An error occurred interacting with the local cache.
     Cache(lcache::CacheErr),
-    /// A remote object was not found.
-    NotFound,
+    /// The remote cache has no artifact for `object`: a spec the index does
+    /// not list, or an index hit whose artifact the store no longer has.
+    NotFound {
+        /// Which identifier `object` is: the spec hash an index was asked
+        /// for, or the artifact file a store was asked for.
+        what: &'static str,
+        object: String,
+    },
     /// An error occurred unpacking an archive.
     ArchiveError(archive::ArchiveError),
     /// The sha256 hash that was requested differed from what was written/downloaded.
@@ -56,6 +62,9 @@ pub enum Error<BE: std::fmt::Debug> {
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::NotFound { what, object } => {
+                write!(f, "the remote cache has no artifact for {what} {object}")
+            }
             Error::Unavailable { object, status } => match status {
                 Some(status) => write!(
                     f,
@@ -801,6 +810,26 @@ impl<B: FetchBackend> RemoteCache<B> {
             .map_err(Error::Request)?;
 
         let mut resp = self.backend.execute(req).await?;
+        // An index hit whose object is gone (inbox#535): the index said the
+        // artifact exists and the store says it does not. That is a normal
+        // state of this architecture, not an outage: a snapshot index keeps
+        // every record forever, and the store's retention deletes cold
+        // objects out from under them. It is a miss, reported as one, and
+        // not retried; the warning is the divergence signal an operator
+        // watches, since a burst of it against the root index means someone
+        // deleted objects the root still names.
+        if resp.status_code() == 404 {
+            let object = format!("{}.zst", hex::encode(sha256));
+            tracing::warn!(
+                kind = "dangling_hit",
+                object = %object,
+                "the remote cache lists an artifact the store no longer has; it is a miss"
+            );
+            return Err(Error::NotFound {
+                what: "artifact file",
+                object,
+            });
+        }
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
         // Classified as the index path classifies it: `Fetch { status }`, so
@@ -863,7 +892,13 @@ impl<B: FetchBackend> RemoteCache<B> {
         cache: &Cache<LocalDir>,
         span_name: &str,
     ) -> Result<(Duration, PendingDir), Error<<B::Response as FetchResponse>::Error>> {
-        let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
+        let sha256: [u8; 32] = self
+            .index
+            .sha256(spec_hash)
+            .ok_or_else(|| Error::NotFound {
+                what: "spec hash",
+                object: spec_hash.0.to_hex().to_string(),
+            })?;
 
         let materialize_op = OpTracker::new_with_root(&self.ot).with_op(Operation::FetchPkg {
             name: span_name.to_string(),
@@ -1637,6 +1672,42 @@ mod tests {
         );
     }
 
+    /// inbox#535: an index hit whose artifact object is gone is a miss, not a
+    /// failure: `NotFound`, after one attempt, so the caller falls back to a
+    /// local build the way it does for a spec the index never had.
+    #[tokio::test(start_paused = true)]
+    async fn materialize_dangling_index_hit_is_a_miss() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses).script(
+            &art_url,
+            vec![(404, b"gone".to_vec()), (404, b"gone".to_vec())],
+        );
+        let calls = backend.calls.clone();
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        assert!(rc.exists(&spec_hash), "the index names it: a hit");
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc
+            .materialize(&spec_hash, &cache, "dangling")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound { .. }),
+            "a dangling hit is a miss, got {err:?}"
+        );
+        // The index fetch, then one artifact attempt: a gone object is not retried.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn corrupt_local_snapshot_copy_is_refetched_not_fatal() {
         const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
@@ -1806,7 +1877,7 @@ mod tests {
             .materialize(&SpecHash::from_bytes([0x11; 32]), &cache, "absent")
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::NotFound), "got {err:?}");
+        assert!(matches!(err, Error::NotFound { .. }), "got {err:?}");
         // Only the index fetch: an absent spec is deterministic, no attempts.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
