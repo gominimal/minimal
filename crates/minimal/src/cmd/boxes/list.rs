@@ -1,26 +1,53 @@
-//! `min box list`: every box record the daemon keeps, in any state
-//! (BOX-158, rendered as BCLI-001 pulls it forward into the first slice).
+//! `min box list`: the box records the daemon keeps for the current
+//! project, or for the whole host with `--all`, in any state (BOX-158,
+//! rendered as BCLI-001 pulls it forward into the first slice).
 
 use super::*;
 
-/// Lists every box on this host with its state, one row for each box.
-pub async fn cmd_box_list(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+/// Lists the boxes of the current project with their state, one row for
+/// each box. With `--all`, lists every box on this host.
+pub async fn cmd_box_list(global: &GlobalArgs, args: BoxListArgs) -> Result<(), anyhow::Error> {
+    let scope = if args.all {
+        None
+    } else {
+        let cwd = crate::attach::cwd_host_path(global)?;
+        Some(box_list_scope(cwd.as_ref())?)
+    };
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
-    let boxes = list_box_records(&mut client).await?;
+    let scoped = scope.is_some();
+    let boxes = list_box_records(&mut client, scope).await?;
     let mut out = std::io::stdout().lock();
-    render_box_list(&mut out, &boxes)?;
+    render_box_list(&mut out, &boxes, scoped)?;
     Ok(())
 }
 
-/// Every box record the daemon keeps, through `ListBoxes`.
+/// The project root that a scoped listing sends for `dir`: the root a
+/// create from `dir` stamps on its box, as `stamp_project_root` resolves
+/// it, so the listing finds the boxes this project created.
+pub(crate) fn box_list_scope(dir: &camino::Utf8Path) -> Result<paths::HostAbsPath, anyhow::Error> {
+    let root = resolve_upload_root(dir)?;
+    paths::HostAbsPath::try_new(root).context("Invalid project root")
+}
+
+/// The `ListBoxes` request for a listing scoped to `project_root`, or for
+/// every box on the host when it is `None`.
+pub(crate) fn list_boxes_request(
+    project_root: Option<paths::HostAbsPath>,
+) -> minimald_rpc::ListBoxesRequest {
+    minimald_rpc::ListBoxesRequest { project_root }
+}
+
+/// The box records the daemon keeps, through `ListBoxes`: those of
+/// `project_root`, or every box on the host when it is `None`.
 pub(crate) async fn list_box_records(
     client: &mut client::Client,
+    project_root: Option<paths::HostAbsPath>,
 ) -> Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error> {
-    use minimald_rpc::{Errorable, ListBoxes, ListBoxesRequest};
+    use minimald_rpc::{Errorable, ListBoxes};
 
     match client
-        .oneshot_rpc::<ListBoxes>(ListBoxesRequest::default())
+        .oneshot_rpc::<ListBoxes>(list_boxes_request(project_root))
         .await
         .context("ListBoxes RPC failed")?
     {
@@ -28,6 +55,13 @@ pub(crate) async fn list_box_records(
         Errorable::Err { error } => bail!("{error}"),
     }
 }
+
+/// The line a scoped listing prints when the current project has no box.
+pub(crate) const EMPTY_PROJECT_LIST: &str = "This project has no boxes. \
+     Run `min box list --all` to list every box on this host.";
+
+/// The line `min box list --all` prints when the host has no box.
+pub(crate) const EMPTY_HOST_LIST: &str = "No boxes on this host.";
 
 /// A value the record does not carry prints as this.
 pub(crate) const NO_VALUE: &str = "-";
@@ -61,13 +95,17 @@ pub(crate) fn box_state_label(entry: &minimald_rpc::BoxListingEntry) -> String {
 
 /// Writes the listing as a table: a header row, then one row for each
 /// box in the order the daemon returned them. With no box, one line says
-/// so.
+/// so: for the current project when `scoped`, else for the host.
 pub(crate) fn render_box_list(
     out: &mut impl std::io::Write,
     boxes: &[minimald_rpc::BoxListingEntry],
+    scoped: bool,
 ) -> std::io::Result<()> {
     if boxes.is_empty() {
-        return writeln!(out, "No boxes on this host.");
+        if scoped {
+            return writeln!(out, "{EMPTY_PROJECT_LIST}");
+        }
+        return writeln!(out, "{EMPTY_HOST_LIST}");
     }
     let header = ["ID", "NAME", "TYPE", "PARENT", "PROJECT", "STATE"];
     let rows: Vec<[String; 6]> = boxes
@@ -189,7 +227,7 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        render_box_list(&mut out, &listing).unwrap();
+        render_box_list(&mut out, &listing, true).unwrap();
         let text = String::from_utf8(out).unwrap();
         let expected = "\
 ID                                    NAME          TYPE     PARENT                                PROJECT         STATE
@@ -201,9 +239,48 @@ ID                                    NAME          TYPE     PARENT             
 ";
         assert_eq!(text, expected);
 
+        // An empty listing says so: for the project when scoped, and for
+        // the host with `--all`.
         let mut out = Vec::new();
-        render_box_list(&mut out, &[]).unwrap();
+        render_box_list(&mut out, &[], true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "This project has no boxes. \
+             Run `min box list --all` to list every box on this host.\n"
+        );
+        let mut out = Vec::new();
+        render_box_list(&mut out, &[], false).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "No boxes on this host.\n");
+
+        // A scoped listing sends the root a create from the same directory
+        // stamps. `--all` sends none.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut create = minimald_rpc::CreateSessionRequest::new(
+            "rooted",
+            paths::HostAbsPath::try_new(sub.clone()).unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
+        );
+        stamp_project_root(&mut create, &sub).unwrap();
+        let scope = box_list_scope(&sub).unwrap();
+        assert_eq!(
+            Some(scope.clone()),
+            Some(paths::HostAbsPath::try_new(root.to_path_buf()).unwrap())
+        );
+        assert_eq!(Some(scope.clone()), create.config.project_root);
+        assert_eq!(
+            list_boxes_request(Some(scope.clone())).project_root,
+            Some(scope)
+        );
+        assert_eq!(list_boxes_request(None).project_root, None);
 
         // A read of the stopped session box.
         let shown = ShowBoxResponse {

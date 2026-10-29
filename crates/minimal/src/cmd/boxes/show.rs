@@ -12,7 +12,8 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
-    let listing = list_box_records(&mut client).await?;
+    // A box name is not scoped to a project, so the lookup reads every box.
+    let listing = list_box_records(&mut client, None).await?;
     let id = find_listed_box(&listing, &args.target)?;
     let shown = match client
         .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
