@@ -8393,6 +8393,46 @@ mod tests {
             "the refusal names the iptables rule, its table and chain: {text}"
         );
 
+        // A CONNMARK --restore-mark with no mask, or an all-ones one, copies
+        // every bit of the connection mark, so it is refused too.
+        for restore in ["--restore-mark", "--restore-mark --ctmask 0xffffffff"] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(
+                tools.path(),
+                "",
+                &format!(
+                    "*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK {restore}\nCOMMIT\n"
+                ),
+            );
+            let refused = run_install_with(&mount, &[], tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success()
+                    && text.contains(&format!(
+                        "iptables table mangle, chain OUTPUT: -A OUTPUT -p udp -j CONNMARK \
+                         {restore} (writes every bit of the connection mark)"
+                    )),
+                "a CONNMARK {restore} is refused as a whole-mark writer: {text}"
+            );
+        }
+
+        // A restore with a narrow mask is no conflict.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n\
+             -A OUTPUT -p udp -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff\nCOMMIT\n",
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "a --restore-mark with a narrow mask does not block the install: {}",
+            said(&installed)
+        );
+
         // A writer that keeps every bit but its own is no conflict.
         let mount = standin_mount();
         let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
