@@ -615,6 +615,12 @@ pub struct BoxActor {
     /// when compose saw no mfile (or the actor was rebuilt from disk),
     /// where the check falls back to evaluating the graph itself.
     composed_graph_names: Option<HashSet<String>>,
+
+    /// How the box ended, kept when a stop killed its processes but could
+    /// not write the `stopped` record. The actor then keeps hosting the box,
+    /// and a retried stop writes this ending, not one it has no process
+    /// left to observe.
+    unrecorded_stop: Option<boxes::core::record::StopEnding>,
 }
 
 impl BoxActor {
@@ -678,6 +684,8 @@ impl BoxActor {
             // `None` until then (and forever for an actor restored from
             // disk, whose compose predates this process).
             composed_graph_names: None,
+            // No stop has run yet.
+            unrecorded_stop: None,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1169,6 +1177,12 @@ impl BoxActor {
                 // to `stopped`, and the name is held as a shutdown stop
                 // holds it.
                 let stopped = self.stop_box(force, grace).await;
+                if stopped.is_err() {
+                    // The record is not `stopped` yet. The actor keeps
+                    // hosting the box, so a retried stop can finish it.
+                    let _ = reply.send(stopped);
+                    return ControlFlow::Continue(());
+                }
                 self.mark_name_stopped().await;
                 let _ = reply.send(stopped);
                 // The actor ends with the box, and evicts itself: no actor

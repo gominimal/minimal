@@ -12531,6 +12531,61 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
 /// BOX-013: a container supervisor that already exited and was reaped has
 /// no readable namespace. Its pid can belong to an unrelated process by
 /// then, so the stop finds no process of the box and signals nothing.
+/// BOX-013: the `stopped` record is the step a stop cannot skip. When the
+/// `exited` event cannot be written, the stop still answers with its ending
+/// and the record still reads `stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_a_failing_event_write_still_records_stopped() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the events file belongs: every append fails.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut broken = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let events = dir.join("events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir(&events).unwrap();
+        broken += 1;
+    }
+    assert_eq!(broken, 1, "the server holds one box");
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("a failed event write does not fail the stop");
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
 #[test]
 fn of_container_on_a_reaped_supervisor_signals_nothing() {
     let mut child = std::process::Command::new("/bin/true")

@@ -1592,8 +1592,18 @@ impl BoxActor {
             BoxInner::Draft { .. } => None,
         };
         self.publish_host();
-        let ending = match launched {
-            Some((host, task)) => {
+        let ending = match (self.unrecorded_stop, launched) {
+            // An earlier stop ended the processes and could not write the
+            // record. This one writes how they ended then.
+            (Some(ending), _) => {
+                tracing::info!(
+                    box_id = %box_id,
+                    ending = ?ending,
+                    "stop: the processes ended in an earlier stop; writing its record"
+                );
+                ending
+            }
+            (None, Some((host, task))) => {
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
@@ -1626,7 +1636,7 @@ impl BoxActor {
                 }
                 outcome.ending
             }
-            None => {
+            (None, None) => {
                 tracing::info!(box_id = %box_id, "stop: the box has no process to signal");
                 boxes::core::record::StopEnding::AtDaemonStart
             }
@@ -1635,9 +1645,19 @@ impl BoxActor {
         // other stop does.
         self.stop_running(false).await;
 
-        let mut record = self.record.record().await?;
-        record.set_state(boxes::core::record::RecordState::Stopped(ending));
-        self.record.write(record).await?;
+        // The `stopped` record is the step a stop cannot skip. A failed
+        // read or write keeps the ending on the actor and returns the error,
+        // and the actor keeps hosting the box for a retried stop.
+        self.unrecorded_stop = Some(ending);
+        if let Err(error) = self.write_stopped_record(ending).await {
+            tracing::warn!(
+                box_id = %box_id,
+                %error,
+                "stop: the processes ended, but the record could not be set to stopped"
+            );
+            return Err(error);
+        }
+        self.unrecorded_stop = None;
         let state = boxes::core::record::RecordState::Stopped(ending);
         tracing::info!(
             box_id = %box_id,
@@ -1645,13 +1665,35 @@ impl BoxActor {
             signal = state.signal(),
             "stop: set the record to stopped"
         );
-        let object = self.record.object().await?;
-        crate::box_manager::write_box_event(
-            &object,
-            boxes::events::BoxEventType::Exited,
-            stopped_event_data(ending),
-        )?;
+        // The record already says `stopped`, so a failed event write is
+        // logged and the stop still answers with its ending.
+        let event = match self.record.object().await {
+            Ok(object) => crate::box_manager::write_box_event(
+                &object,
+                boxes::events::BoxEventType::Exited,
+                stopped_event_data(ending),
+            )
+            .map(drop),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = event {
+            tracing::warn!(
+                box_id = %box_id,
+                %error,
+                "stop: the record is stopped, but its exited event could not be written"
+            );
+        }
         Ok(ending)
+    }
+
+    /// Sets the box's record to `stopped` with `ending`.
+    async fn write_stopped_record(
+        &self,
+        ending: boxes::core::record::StopEnding,
+    ) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        record.set_state(boxes::core::record::RecordState::Stopped(ending));
+        self.record.write(record).await
     }
 }
 
