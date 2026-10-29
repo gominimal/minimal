@@ -29,9 +29,13 @@
 //! named it ([`crate::net::dns_pins`]), under the same window and per-name
 //! cap a box's pins hold. An endpoint spelled as a subnet (`a.b.c.d/n`) is
 //! admitted as it stands. Which registry and which cache the node plane
-//! uses is the deployment's to say ([`NodePlaneBaseline::with_registry`],
-//! [`NodePlaneBaseline::with_cache`]), every change is logged, and neither
-//! category is ever dropped from the enumeration by saying it.
+//! uses is the deployment's to say (`MINVMD_BASELINE_REGISTRY`,
+//! `MINVMD_BASELINE_CACHE`), every change is logged, and neither category is
+//! ever dropped from the enumeration by saying it.
+//!
+//! One path is not bounded yet: a frame from the node address that wears the
+//! box mark is decided by the node row's interim
+//! ([`BOX_MARKED_NODE_PHASE`]), and the posture says so.
 
 use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use std::io;
@@ -143,10 +147,58 @@ impl NodeBaselinePhase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Announced => "announced (node row's allow-all interim)",
-            Self::InForce => "in force",
+            Self::InForce => match BOX_MARKED_NODE_PHASE {
+                BoxMarkedNodePhase::NodeRowInterim => {
+                    "in force (a process with root in this VM can still bypass it)"
+                }
+                BoxMarkedNodePhase::Bounded => "in force",
+            },
         }
     }
 }
+
+/// How the host-side gate decides a frame from the node address that wears
+/// the box mark (`boxes::core::egress::BOX_COHORT_DSCP`). The guest's table
+/// writes the mark for a host-address box's connections, and root in the
+/// guest can write it on any frame. So the mark says which rules an honest
+/// sender asks for, and never proves a box (NET-085).
+///
+/// The bound the design gives a marked frame is the union of the resident
+/// host-address boxes' rules (design §4.3 rule 2). The host does not hold
+/// those rules yet: a host-address box registers no row of its own, and the
+/// node row that carries its frames is the run path's allow-all interim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxMarkedNodePhase {
+    /// The announced interim this build ships: the node row decides a marked
+    /// frame, so a process with root in the VM that writes the mark is not
+    /// bounded by the baseline set. The start-up line logs it, and the
+    /// posture the policy display spells says so.
+    NodeRowInterim,
+    /// The bound arm: a marked frame is decided by the baseline set, the way
+    /// an unmarked one is. Built today only by the tests that pin it
+    /// ([`NodePlaneBaseline::box_marked_bounded`]).
+    Bounded,
+}
+
+impl BoxMarkedNodePhase {
+    /// The phase as the gate's start-up line logs it, under
+    /// `box_marked_node_frames`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeRowInterim => "node row (allow-all interim)",
+            Self::Bounded => "baseline set",
+        }
+    }
+}
+
+/// The phase this build ships for a marked frame from the node address: the
+/// node row's allow-all interim. The flip condition: the host-side creator
+/// registers each host-address box's compiled rules, so the gate can decide a
+/// marked frame by their union and drop it when no host-address box is
+/// resident. That change replaces [`BoxMarkedNodePhase::Bounded`]'s
+/// baseline-only decision with the union, and the posture drops its caveat.
+pub(crate) const BOX_MARKED_NODE_PHASE: BoxMarkedNodePhase = BoxMarkedNodePhase::NodeRowInterim;
 
 /// The phase this build ships: in force. The registry and cache entries name
 /// the hosts the daemon's own fetches go to, and the node plane's own lookups
@@ -165,14 +217,79 @@ pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::InF
 /// next are objects in the cache ([`DAEMON_CACHE_ENDPOINT`]). Nothing on a
 /// VM host configures another location for the guest daemon, so the
 /// daemon's configured registry is this default. A deployment re-points the
-/// category with [`NodePlaneBaseline::with_registry`].
+/// category with [`BASELINE_REGISTRY_ENV`].
 pub const DAEMON_REGISTRY_ENDPOINT: &str = "github.com";
 
 /// The cache the daemon's own fetches read package content from: the host of
 /// its default remote cache read location (`mctx`'s
 /// `DEFAULT_REMOTE_CACHE_READ_URL`, `https://cache.minimal.dev/`). A
-/// deployment re-points the category with [`NodePlaneBaseline::with_cache`].
+/// deployment re-points the category with [`BASELINE_CACHE_ENV`].
 pub const DAEMON_CACHE_ENDPOINT: &str = "cache.minimal.dev";
+
+/// The environment variable that re-points the registry category: a
+/// comma-separated list of host names (`pkgs.example.com`) and subnets
+/// (`a.b.c.d/n`). Absent, the category keeps [`DAEMON_REGISTRY_ENDPOINT`].
+/// Set and empty, the category stays carried and admits nothing. Read from
+/// the reading process's own environment each time the set is built.
+pub(crate) const BASELINE_REGISTRY_ENV: &str = "MINVMD_BASELINE_REGISTRY";
+
+/// The environment variable that re-points the cache category, spelled the
+/// way [`BASELINE_REGISTRY_ENV`] is. Absent, the category keeps
+/// [`DAEMON_CACHE_ENDPOINT`].
+pub(crate) const BASELINE_CACHE_ENV: &str = "MINVMD_BASELINE_CACHE";
+
+/// One category's endpoints as the deployment spelled them in `var`, or
+/// `None` when the variable is absent. A value that is not Unicode keeps the
+/// built-in endpoints and logs a warning that names the variable.
+fn baseline_endpoints_from_env(var: &str) -> Option<Vec<String>> {
+    match std::env::var(var) {
+        Ok(raw) => Some(baseline_endpoints_from_raw(var, &raw)),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                variable = var,
+                "the node-plane baseline entry's variable is not valid Unicode; the built-in \
+                 endpoints stay in force",
+            );
+            None
+        }
+    }
+}
+
+/// Parses one category's endpoint list: comma-separated terms, whitespace
+/// trimmed, empty terms skipped. A term with a `/` must be an IPv4 subnet,
+/// and any other term must be a host name of letters, digits, `-` and `.`.
+/// A term that is neither is skipped with a warning that names it, so a typo
+/// narrows the set and never widens it.
+fn baseline_endpoints_from_raw(var: &str, raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .filter(|term| {
+            let valid = if term.contains('/') {
+                Ipv4Cidr::parse(term).is_some()
+            } else {
+                term.trim_end_matches('.').split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            };
+            if !valid {
+                tracing::warn!(
+                    variable = var,
+                    term = %term,
+                    "skipped a node-plane baseline endpoint that is neither a host name nor an \
+                     IPv4 subnet",
+                );
+            }
+            valid
+        })
+        .map(str::to_string)
+        .collect()
+}
 
 /// The environment variable the daemon's host-exposure port list is read
 /// from, each time the daemon starts the VM's network — from the daemon's
@@ -265,6 +382,9 @@ pub struct NodePlaneBaseline {
     rules: EgressRules,
     /// The posture the gate decides the set under: the shipped constant.
     phase: NodeBaselinePhase,
+    /// How the gate decides a marked frame from the node address: the
+    /// shipped constant.
+    box_marked: BoxMarkedNodePhase,
     /// The configured host exposures over the alias, as inclusive port
     /// ranges: the ports the node plane reaches the host alias at, every
     /// other port refused through the alias. Empty unless the deployment
@@ -285,9 +405,13 @@ impl NodePlaneBaseline {
     ///   package index and package content.
     ///
     /// Which registry and which cache the node plane uses is the
-    /// deployment's to say: [`with_registry`](Self::with_registry) and
-    /// [`with_cache`](Self::with_cache) replace these endpoints within their
-    /// category, and a category is replaced, never absent.
+    /// deployment's to say: [`BASELINE_REGISTRY_ENV`] and
+    /// [`BASELINE_CACHE_ENV`], when set, replace these endpoints within their
+    /// category through [`with_registry`](Self::with_registry) and
+    /// [`with_cache`](Self::with_cache), and each change is logged. A category
+    /// is replaced, never absent. The VM host daemon reads them at VM start,
+    /// and the policy display reads them from its own environment, so the two
+    /// show one set when both run with the same environment.
     ///
     /// The set carries no row for the switch fabric itself: the categories
     /// are the design's named service planes, and the plane the node lives
@@ -302,7 +426,7 @@ impl NodePlaneBaseline {
     /// keeps the node resolving, which is how its named endpoints get pinned.
     #[must_use]
     pub fn built_in(subnet: SwitchSubnet) -> Self {
-        Self::from_entries(
+        let mut baseline = Self::from_entries(
             subnet.daemon_ip().octets(),
             subnet.dns_server().octets(),
             vec![
@@ -315,7 +439,14 @@ impl NodePlaneBaseline {
                     endpoints: vec![DAEMON_CACHE_ENDPOINT.to_string()],
                 },
             ],
-        )
+        );
+        if let Some(endpoints) = baseline_endpoints_from_env(BASELINE_REGISTRY_ENV) {
+            baseline = baseline.with_registry(endpoints);
+        }
+        if let Some(endpoints) = baseline_endpoints_from_env(BASELINE_CACHE_ENV) {
+            baseline = baseline.with_cache(endpoints);
+        }
+        baseline
     }
 
     /// The in-VM daemon's own address on the fabric: the one source identity
@@ -344,6 +475,13 @@ impl NodePlaneBaseline {
     #[must_use]
     pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
+    }
+
+    /// How the gate decides a frame from the node address that wears the box
+    /// mark: by the node row's interim, the shipped posture, or by this set.
+    #[must_use]
+    pub fn box_marked_phase(&self) -> BoxMarkedNodePhase {
+        self.box_marked
     }
 
     /// The host-name endpoints of every entry, each with the categories that
@@ -465,6 +603,15 @@ impl NodePlaneBaseline {
         self
     }
 
+    /// Pins the bound arm of the marked-frame phase
+    /// ([`BoxMarkedNodePhase::Bounded`]): a marked frame from the node
+    /// address is decided by this set. Kept so the tests can pin both arms.
+    #[cfg(test)]
+    pub(crate) fn box_marked_bounded(mut self) -> Self {
+        self.box_marked = BoxMarkedNodePhase::Bounded;
+        self
+    }
+
     /// Re-points one category's endpoints, rebuilds the compiled set, and
     /// logs the change with the endpoints before and after it. A category
     /// the enumeration does not carry is added rather than skipped, so
@@ -504,6 +651,7 @@ impl NodePlaneBaseline {
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
+            box_marked: BOX_MARKED_NODE_PHASE,
             host_exposure: Vec::new(),
         }
     }
@@ -528,9 +676,10 @@ impl NodePlaneBaseline {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselineCategory, BaselineEntry, DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT,
-        HOST_EXPOSURE_PORTS_ENV, NodeBaselinePhase, NodePlaneBaseline,
-        host_exposure_ports_from_raw,
+        BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry,
+        BoxMarkedNodePhase, DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT,
+        HOST_EXPOSURE_PORTS_ENV, NodeBaselinePhase, NodePlaneBaseline, baseline_endpoints_from_env,
+        baseline_endpoints_from_raw, host_exposure_ports_from_raw,
     };
     use boxes::core::egress::{FrameVerdict, summarize, verdict};
     use std::net::Ipv4Addr;
@@ -626,9 +775,48 @@ mod tests {
         // And it carries the in-VM daemon's own address, the one source
         // identity the set's verdict accepts.
         assert_eq!(baseline.node_addr(), SUBNET.daemon_ip().octets());
-        // The shipped posture is in force: the set decides the node plane.
+        // The shipped posture is in force: the set decides the node plane's
+        // unmarked frames. A marked frame is still the node row's interim, and
+        // the posture says so rather than claim the whole node address.
         assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
-        assert_eq!(baseline.phase().as_str(), "in force");
+        assert_eq!(
+            baseline.box_marked_phase(),
+            BoxMarkedNodePhase::NodeRowInterim
+        );
+        assert_eq!(
+            baseline.phase().as_str(),
+            "in force (a process with root in this VM can still bypass it)"
+        );
+        assert_eq!(
+            baseline.clone().box_marked_bounded().box_marked_phase(),
+            BoxMarkedNodePhase::Bounded
+        );
+
+        // The deployment's spelling of an entry: host names and subnets,
+        // whitespace trimmed, and a term that is neither skipped, so a typo
+        // narrows the set and never widens it. Set and empty, the category
+        // is carried with no endpoint.
+        assert_eq!(
+            baseline_endpoints_from_raw(
+                BASELINE_REGISTRY_ENV,
+                " pkgs.example.com , 203.0.113.0/24,,bad name,10.0.0.0/99,a..b "
+            ),
+            vec!["pkgs.example.com".to_string(), "203.0.113.0/24".to_string()]
+        );
+        assert!(baseline_endpoints_from_raw(BASELINE_CACHE_ENV, "").is_empty());
+        let emptied = baseline
+            .clone()
+            .with_cache(baseline_endpoints_from_raw(BASELINE_CACHE_ENV, " "));
+        assert!(
+            entry(&emptied, BaselineCategory::Cache)
+                .endpoints()
+                .is_empty(),
+            "an emptied cache is carried and admits nothing, never absent"
+        );
+        // Absent, the built-in endpoints stand: this run sets neither
+        // variable, which is how the built-in assertions above hold.
+        assert_eq!(baseline_endpoints_from_env(BASELINE_REGISTRY_ENV), None);
+        assert_eq!(baseline_endpoints_from_env(BASELINE_CACHE_ENV), None);
 
         // Which registry the node plane uses is the host's to say. The
         // registry category is replaced within itself, and the cache is

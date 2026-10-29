@@ -175,7 +175,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
+use super::baseline::{BoxMarkedNodePhase, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
@@ -1093,6 +1093,8 @@ impl EgressGate {
             baseline = %baseline.render(),
             node_addr = %Ipv4Addr::from(baseline.node_addr()),
             node_baseline_phase = baseline.phase().as_str(),
+            box_marked_node_frames = baseline.box_marked_phase().as_str(),
+            box_marked_node_rule = BOX_MARKED_NODE_FRAME_RULE,
             "node-plane baseline set at the gate; each entry's addresses are pinned from the \
              node's own lookups",
         );
@@ -4432,7 +4434,10 @@ async fn relay_frames_to_switch(
         // frameless and unpublishable for the rest of the VM's life, over a
         // shuttle close its control path rode out.
         let src = match admitted {
-            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane => summary.source(),
+            GateAdmit::Baseline
+            | GateAdmit::Row
+            | GateAdmit::ProxyLane
+            | GateAdmit::BoxMarkedInterim => summary.source(),
         };
         if let Some(src) = src
             && src != baseline.node_addr()
@@ -4668,7 +4673,18 @@ enum GateAdmit {
     /// the row's own fact; nothing the guest says grants one, and nothing in
     /// it opens the address's other ports or protocols.
     ProxyLane,
+    /// The node row's allow-all interim admitted a frame from the node
+    /// address that wears the box mark ([`BOX_MARKED_NODE_FRAME_RULE`]). The
+    /// guest's table marks a host-address box's connections, and root in the
+    /// guest can mark any frame, so this admission is the one the baseline
+    /// set does not bound yet (NET-085).
+    BoxMarkedInterim,
 }
+
+/// The name of the interim that decides a marked frame from the node address
+/// by the node row: the value a test asserts and a reader of the gate's
+/// start-up line finds beside `box_marked_node_frames`.
+pub(crate) const BOX_MARKED_NODE_FRAME_RULE: &str = "node-row-box-mark-interim";
 
 /// How long a bare SYN the ingress leg delivered at a port no publish dials
 /// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
@@ -5462,16 +5478,42 @@ fn gate_verdict(
     // the default network mode, leaves from it too. What tells them apart
     // is the sender's cgroup, which the guest's classifier writes into the
     // frame as `BOX_COHORT_DSCP` for a connection a box opened and clears
-    // on every other packet. A marked frame is a box's, and the node row
-    // and the box's own classifier leaf decide it below. An unmarked frame
-    // is the daemon's own, and the baseline set decides it, so a guest
-    // whose classifier never loaded fails closed to the baseline.
-    if baseline.phase() == NodeBaselinePhase::InForce
-        && src == baseline.node_addr()
-        && !summary.box_cohort_marked()
-    {
-        return node_plane_verdict(summary, l4, table, baseline, pins);
+    // on every other packet. An unmarked frame is the daemon's own, and the
+    // baseline set decides it, so a guest whose classifier never loaded
+    // fails closed to the baseline.
+    // The mark is no proof of a box: root in the guest can write it on any
+    // frame (NET-085). The design bounds a marked frame by the resident
+    // host-address boxes' rules, and the host does not hold them yet. So
+    // the marked-frame phase this build ships is an announced interim
+    // (`BOX_MARKED_NODE_PHASE`): the node row decides a marked frame, its
+    // admission is `GateAdmit::BoxMarkedInterim`, the start-up line logs the
+    // phase, and the posture says the set can be bypassed. The bound arm
+    // decides a marked frame by the baseline set, like an unmarked one.
+    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+        if !summary.box_cohort_marked()
+            || baseline.box_marked_phase() == BoxMarkedNodePhase::Bounded
+        {
+            return node_plane_verdict(summary, l4, table, baseline, pins);
+        }
+        return row_verdict(summary, l4, table, baseline, pins, src).map(|admit| match admit {
+            GateAdmit::Row => GateAdmit::BoxMarkedInterim,
+            other => other,
+        });
     }
+    row_verdict(summary, l4, table, baseline, pins, src)
+}
+
+/// The rest of [`gate_verdict`]'s order for a frame the node-plane arm did
+/// not decide: the source's row, then the infrastructure set, then the proxy
+/// lane, then the row's rules, then the pin arm.
+fn row_verdict(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+    src: [u8; 4],
+) -> Result<GateAdmit, GateDrop> {
     // No namespace holds the source — NET-081's failure case, held
     // unconditionally, under no phase (NET-085, T89 #1925): an address no
     // namespace holds never leaves the VM, toward every destination alike,
@@ -6940,13 +6982,13 @@ mod tests {
         send_frame, unexpose_request, wait_for_log,
     };
     use super::{
-        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter, EgressGate,
-        GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE,
-        MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, PublishedForwards, Record, ReplyTables,
-        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE,
-        UNREGISTERED_LIVE_LEASE_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
-        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins,
-        gate_verdict, max_frame, render_record, serve_connection,
+        AcceptFailure, BOX_MARKED_NODE_FRAME_RULE, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb,
+        DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, PublishedForwards,
+        Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
+        UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE, UNREGISTERED_PUBLISH_RULE,
+        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
+        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{NodeBaselinePhase, NodePlaneBaseline};
@@ -14670,6 +14712,9 @@ mod tests {
             /// The row's declared credentialed lane admitted the frame at
             /// the proxy's address (NET-134): the admission no rules made.
             AdmittedByProxyLane,
+            /// The node row's interim admitted a box-marked frame from the
+            /// node address ([`BOX_MARKED_NODE_FRAME_RULE`]).
+            AdmittedByBoxMarkInterim,
             /// The gate dropped the frame, by the rule whose name the drop
             /// warning carries.
             Dropped(&'static str),
@@ -14717,6 +14762,7 @@ mod tests {
                     Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                     Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
                     Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
+                    Ok(GateAdmit::BoxMarkedInterim) => Verdict::AdmittedByBoxMarkInterim,
                     Err(drop) => Verdict::Dropped(drop.rule()),
                 };
             Attempt {
@@ -14935,10 +14981,50 @@ mod tests {
                 // below. A proxy-lane admit is none of this test's attempts
                 // — no attempt names the proxy's address — and the arm
                 // keeps the match exhaustive for the ones that will.
-                Verdict::AdmittedByNodeRow | Verdict::AdmittedByProxyLane | Verdict::Dropped(_) => {
-                }
+                Verdict::AdmittedByNodeRow
+                | Verdict::AdmittedByProxyLane
+                | Verdict::AdmittedByBoxMarkInterim
+                | Verdict::Dropped(_) => {}
             }
         }
+
+        // The box-marked spoof (NET-085): root in the VM writes the box mark
+        // on a frame from the node address. The shipped marked-frame phase
+        // is the announced interim, so the node row admits it even to the
+        // outside, under the interim's own name: the one gap this bound has
+        // today, pinned so its flip is a visible change. The bound arm
+        // decides the same frame by the baseline set: the outside is the
+        // unpinned drop, and the pinned endpoint stays reachable.
+        let marked = |baseline: &NodePlaneBaseline, dst: [u8; 4], port: u16| {
+            let frame =
+                boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, dst, port)));
+            assert!(frame.box_cohort_marked());
+            gate_verdict(&frame, None, &table, baseline, &pins, &ReplyTables::new())
+        };
+        assert_eq!(
+            baseline.box_marked_phase(),
+            crate::net::baseline::BoxMarkedNodePhase::NodeRowInterim
+        );
+        assert_eq!(
+            marked(&baseline, outside, 443),
+            Ok(GateAdmit::BoxMarkedInterim),
+            "the shipped interim admits a marked spoof under {BOX_MARKED_NODE_FRAME_RULE}"
+        );
+        let bounded = baseline.clone().box_marked_bounded();
+        assert_eq!(
+            marked(&bounded, outside, 443),
+            Err(GateDrop::NodePlaneUnpinned {
+                src: node,
+                dst: outside,
+                dst_port: 443,
+            }),
+            "the bound arm refuses a marked spoof to an address no entry pinned"
+        );
+        assert_eq!(
+            marked(&bounded, baseline_endpoint, 443),
+            Ok(GateAdmit::Baseline),
+            "the bound arm keeps the pinned endpoint"
+        );
 
         // The universal the table makes cheap, beside the membership loop
         // above — NET-085 as a bound, not a list. Two halves:
@@ -15291,13 +15377,15 @@ mod tests {
     }
 
     /// The node address carries two senders: the guest daemon and every
-    /// host-address box, the default network mode. The sender's cgroup tells
-    /// them apart, as the guest's classifier writes it into the frame. A
-    /// frame from a box's cgroup at the node address is judged by the box's
-    /// verdict (the node row, beside the box's own classifier leaf in the
-    /// guest), so a default session keeps its outbound network (NET-107).
+    /// host-address box, the default network mode. The guest's classifier
+    /// writes the sender's cgroup into the frame as the box mark. Under the
+    /// announced interim this build ships, a marked frame at the node address
+    /// is decided by the node row, beside the box's own classifier leaf in
+    /// the guest, so a default session keeps its outbound network (NET-107).
+    /// Root in the guest can write the mark too, so the admission carries the
+    /// interim's own name and the escape test pins it as the open gap.
     #[test]
-    fn box_cgroup_frame_at_node_address_judged_by_box_verdict() {
+    fn box_marked_node_frame_decided_by_node_row_interim() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(7654);
         let table = registry.table();
@@ -15318,8 +15406,9 @@ mod tests {
                 &pins,
                 &ReplyTables::new()
             ),
-            Ok(GateAdmit::Row),
-            "a box's frame at the node address is the box's to decide, not the baseline's"
+            Ok(GateAdmit::BoxMarkedInterim),
+            "a marked frame at the node address is the node row's interim \
+             ({BOX_MARKED_NODE_FRAME_RULE}), not the baseline's"
         );
         // The box's verdict still keeps the floors every row keeps: the
         // link-local metadata service and the switch's own ports stay
@@ -15535,14 +15624,17 @@ mod tests {
             gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline).await;
 
         // VM start says what the node plane may reach, one term per category,
-        // and that the set is in force: the line a diagnostic bundle's daemon
-        // log tail carries.
+        // that the set is in force, and that a box-marked frame from the node
+        // address is still the node row's announced interim: the line a
+        // diagnostic bundle's daemon log tail carries.
         wait_for_log(&h.log, "node-plane baseline set").await;
         let logged = h.log.contents();
         for term in [
             "registry=github.com",
             "cache=cache.minimal.dev",
-            "node_baseline_phase=\"in force\"",
+            "node_baseline_phase=\"in force (a process with root in this VM can still bypass it)\"",
+            "box_marked_node_frames=\"node row (allow-all interim)\"",
+            "box_marked_node_rule=\"node-row-box-mark-interim\"",
             "node_addr=100.64.255.253",
         ] {
             assert!(
