@@ -819,6 +819,9 @@ impl ExposeRefusal {
                 host_loopback: false,
                 ..
             } => format!("{self}, so it already answers at {box_name}.min.internal:{port}"),
+            // The same words for an allow-stance and an ask-stance box: the
+            // range refused the port before any prompt (NET-047).
+            Self::OutOfRange { .. } => format!("{self}. Nothing was published."),
             _ => self.to_string(),
         }
     }
@@ -844,7 +847,7 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::OutOfRange { requested, range } => write!(
                 f,
-                "port {requested} is outside this box's declared dynamic range {}-{}",
+                "port {requested} is outside this box's --dynamic-range {}-{}",
                 range.0, range.1
             ),
             Self::NoPublishedAddress => write!(
@@ -946,7 +949,8 @@ impl fmt::Display for ExposeFailure {
 /// derive — the one derivation this decision and the listen watcher's
 /// verdict share, so the two runtime ingress surfaces cannot part ways on a
 /// port — and this is the half that renders each fact as the refusal the
-/// box's `min net expose` prints.
+/// box's `min net expose` prints. An `ask` box's range is checked here too,
+/// so a port outside it is refused without a prompt.
 pub fn dynamic_ingress_decision(
     ingress: Option<&IngressPolicy>,
     port: u16,
@@ -954,7 +958,15 @@ pub fn dynamic_ingress_decision(
     match IngressRules::from_policy(ingress).dynamic_verdict(port) {
         DynamicPortVerdict::Allow => Ok(boxes::DynamicIngress::Allow),
         DynamicPortVerdict::Deny => Err(ExposeRefusal::DeniedByPolicy),
-        DynamicPortVerdict::Ask => Err(ExposeRefusal::AskNeedsAnswer),
+        // An `ask` box with a range refuses a port outside it here, before
+        // any prompt is routed: no answer could publish it (NET-047).
+        DynamicPortVerdict::Ask => match ingress.and_then(|i| i.dynamic_allowed_range) {
+            Some(range) if port < range.0 || port > range.1 => Err(ExposeRefusal::OutOfRange {
+                requested: port,
+                range,
+            }),
+            _ => Err(ExposeRefusal::AskNeedsAnswer),
+        },
         DynamicPortVerdict::NoRange => Err(ExposeRefusal::NoDynamicRange),
         DynamicPortVerdict::OutOfRange { range } => Err(ExposeRefusal::OutOfRange {
             requested: port,
@@ -2026,7 +2038,15 @@ mod tests {
                     // range, in the words `min net expose` prints.
                     let expected_decision = match stance {
                         None | Some(DynamicIngress::Deny) => Err(ExposeRefusal::DeniedByPolicy),
-                        Some(DynamicIngress::Ask) => Err(ExposeRefusal::AskNeedsAnswer),
+                        Some(DynamicIngress::Ask) => match range {
+                            Some((low, high)) if port < low || port > high => {
+                                Err(ExposeRefusal::OutOfRange {
+                                    requested: port,
+                                    range: (low, high),
+                                })
+                            }
+                            _ => Err(ExposeRefusal::AskNeedsAnswer),
+                        },
                         Some(DynamicIngress::Allow) => match range {
                             None => Err(ExposeRefusal::NoDynamicRange),
                             Some((low, high)) if low <= port && port <= high => {

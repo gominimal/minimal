@@ -32,7 +32,7 @@ fn minvmd_bin() -> OsString {
 }
 
 /// Isolated state dir under `/tmp`: macOS's `$TMPDIR` is deep enough that a
-/// provider socket beneath a default tempdir would overflow `sun_path` (104).
+/// host socket beneath a default tempdir would overflow `sun_path` (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")

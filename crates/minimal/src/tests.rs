@@ -630,12 +630,12 @@ fn matching_versions_are_not_a_skew() {
     assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
 }
 
-/// The host-cache warm-up is gated on the session provider: a VM-backed
-/// provider caches on its own guest volume and never reads the host cache,
+/// The host-cache warm-up is gated on the session host: a VM-backed
+/// host caches on its own guest volume and never reads the host cache,
 /// so `--provider local-minvmd` (and macOS, always minvmd-backed) skip the
 /// warm-up, while the native daemon shares the host cache and downloads.
 #[test]
-fn host_cache_warmup_skips_vm_backed_providers() {
+fn host_cache_warmup_skips_vm_backed_hosts() {
     assert!(
         !should_warm_host_cache(true),
         "a VM-backed provider must not warm the host cache"
@@ -653,88 +653,6 @@ fn host_cache_warmup_skips_vm_backed_providers() {
 fn cli_command_tree_stays_renderable() {
     use clap::CommandFactory as _;
     Cli::command().debug_assert();
-}
-
-/// `min login` mints nothing (NET-109): the verb runs without a daemon and
-/// writes no key or certificate to the config directory, where the reverse
-/// proxy's files used to land, and it prints the one line saying there is
-/// nothing to mint. The `--cert-dir` flag that steered the old writes is
-/// refused by the parser.
-#[tokio::test]
-async fn login_mints_no_certificate() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config");
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().join("state")),
-        config_dir: Some(config.clone()),
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-
-    // No daemon is running and none may be spawned: with the certificate
-    // RPC gone the verb has nothing to ask one for. The notice is captured
-    // from the verb itself, so the assertions below hold what it emits.
-    let mut out = Vec::new();
-    cmd_login(&global, LoginArgs {}, &mut out)
-        .await
-        .expect("a verb with nothing to mint succeeds without a daemon");
-
-    // The config directory is where the key and CA used to be written.
-    for file in ["client.pem", "client.key", "ca.pem"] {
-        assert!(
-            !config.join("minimal").join(file).exists(),
-            "login wrote {file}; it must write no key or certificate"
-        );
-    }
-
-    // The one line it prints, read back out of what the verb wrote: a
-    // handler that stopped emitting it, printed something else, or printed
-    // it twice fails here rather than passing on the helper's own text.
-    let printed = String::from_utf8(out).expect("stdout is UTF-8");
-    assert!(
-        printed.contains("Nothing to mint"),
-        "the line must say there is nothing to mint, got: {printed}"
-    );
-    assert_eq!(
-        printed,
-        format!("{}\n", login_nothing_to_mint_line()),
-        "the verb prints exactly the one required line"
-    );
-
-    // And the minting is gone from the verb's body, asserted on the source
-    // the way `the_activation_path_makes_no_version_round_trip` is: the
-    // certificate RPC, the write sites, the cert paths, and the daemon
-    // spawn must all be absent.
-    let text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/admin.rs"),
-    )
-    .expect("readable source");
-    let body = function_body(&text, "cmd_login").expect("admin.rs no longer defines cmd_login");
-    for minted_again in [
-        "IssueClientCert",
-        "client.pem",
-        "client.key",
-        "ca.pem",
-        "fs::write",
-        "ensure_daemon",
-    ] {
-        assert!(
-            !body.contains(minted_again),
-            "cmd_login mints again ({minted_again})"
-        );
-    }
-
-    // The flag that directed the writes is retired with them.
-    use clap::Parser as _;
-    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
-        panic!("--cert-dir is retired and must not parse");
-    };
-    assert!(
-        err.to_string().contains("--cert-dir"),
-        "the refusal must name the retired flag, got: {err}"
-    );
 }
 
 /// The CLI reference documents no retired command (NET-111): the reference
@@ -818,7 +736,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
     assert_eq!(
         render_bare_status("~/w", &entries, &cwd, true),
         "No terminal: not attaching. State for ~/w:\n\
-             \x20 sessions: 1 (web, active)\n\
+             \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
              \x20 min session run web <task>\n\
@@ -895,7 +813,7 @@ fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        warning.contains("run `min ls` until its status is active"),
+        warning.contains("run `min ls` until its status is running"),
         "the wait guidance names the command to watch, got: {warning}"
     );
     assert!(
@@ -2445,9 +2363,8 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
 #[tokio::test]
 async fn stop_force_stops_a_wedged_vm_from_the_host() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     // The alive lock is held the way a real VM holds it: by the VMM process,
     // through the inherited fd, so it is released when that process dies and
     // not before.
@@ -2507,9 +2424,8 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
 #[tokio::test]
 async fn stop_force_refuses_a_booting_vm() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Starting,
@@ -2552,9 +2468,8 @@ async fn stop_force_refuses_a_booting_vm() {
 #[tokio::test]
 async fn stop_without_force_on_a_booting_vm_names_the_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Starting,
@@ -2626,9 +2541,8 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
 #[tokio::test]
 async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -3023,7 +2937,7 @@ fn cli_reference_documents_network_flags() {
 }
 
 /// Stand up the two-VM shape the named-VM tests below need (NET-057/NET-058):
-/// a minimal state dir laid out as the minvmd provider nests a named VM
+/// a minimal state dir laid out as the minvmd host nests a named VM
 /// (NET-052) — the default VM serving `providers/local-minvmd0/ssh.sock`,
 /// `alpha` serving `providers/local-minvmd0/alpha/ssh.sock` — with a real
 /// daemon behind each socket. Real daemons, not stub sockets, because both
@@ -3363,8 +3277,8 @@ async fn ls_shows_vm_per_box() {
 #[tokio::test]
 async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
     let state = tempfile::tempdir().expect("a temp minimal state dir for two VMs");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("alpha")).expect("the named VM's provider subdir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("alpha")).expect("the named VM's provider subdir");
     let default_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
             .expect("the default VM's socket path");
@@ -3374,7 +3288,7 @@ async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
     let default_vm = minimald::test_harness::TestServer::new().await;
     create_box_on(&default_vm, "api").await;
     let alpha = minimald::test_harness::TestServer::new().await;
-    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    alpha.listen_on_uds(&host_dir.join("alpha/ssh.sock")).await;
     create_box_on(&alpha, "web").await;
 
     let global = vm_globals(state.path(), None);
@@ -3412,9 +3326,9 @@ async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
 #[tokio::test]
 async fn ls_leashes_the_vms_it_did_not_select() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("alpha")).expect("the wedged VM's dir");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("alpha")).expect("the wedged VM's dir");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     // The selected VM, running, with its box.
     let default_sock =
@@ -3426,7 +3340,7 @@ async fn ls_leashes_the_vms_it_did_not_select() {
 
     // A wedged VM: the socket accepts and never speaks SSH — the shape a
     // suspended microVM presents behind an always-accepting bridge.
-    let wedged = tokio::net::UnixListener::bind(provider.join("alpha/ssh.sock"))
+    let wedged = tokio::net::UnixListener::bind(host_dir.join("alpha/ssh.sock"))
         .expect("the wedged VM's socket binds");
     tokio::spawn(async move {
         // Accepted connections are held, never read, never closed: the
@@ -3438,7 +3352,7 @@ async fn ls_leashes_the_vms_it_did_not_select() {
     });
 
     // A stopped VM: the listener died and left its socket path behind.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3473,8 +3387,8 @@ async fn ls_leashes_the_vms_it_did_not_select() {
 #[tokio::test]
 async fn a_stopped_vm_does_not_hold_a_listing() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     // The selected VM, running, with its box.
     let default_sock =
@@ -3485,7 +3399,7 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
     create_box_on(&default_vm, "api").await;
 
     // The stopped VM: the listener died and left its socket path behind.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3641,8 +3555,8 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
 #[tokio::test]
 async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     let default_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
@@ -3652,7 +3566,7 @@ async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
     create_box_on(&default_vm, "api").await;
 
     // The stopped VM: a dead listener's socket path, still enumerable.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3691,9 +3605,9 @@ async fn attach_refuses_a_box_name_two_vms_know() {
     // Three VMs: the selected one, plus alpha and beta, which both own the
     // ambiguous name.
     let state = tempfile::tempdir().expect("a temp minimal state dir for three VMs");
-    let provider = state.path().join("providers/local-minvmd0");
+    let host_dir = state.path().join("providers/local-minvmd0");
     for vm in ["alpha", "beta"] {
-        std::fs::create_dir_all(provider.join(vm)).expect("the named VM's provider subdir");
+        std::fs::create_dir_all(host_dir.join(vm)).expect("the named VM's provider subdir");
     }
     let selected_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
@@ -3701,9 +3615,9 @@ async fn attach_refuses_a_box_name_two_vms_know() {
     let selected_vm = minimald::test_harness::TestServer::new().await;
     selected_vm.listen_on_uds(&selected_sock).await;
     let alpha = minimald::test_harness::TestServer::new().await;
-    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    alpha.listen_on_uds(&host_dir.join("alpha/ssh.sock")).await;
     let beta = minimald::test_harness::TestServer::new().await;
-    beta.listen_on_uds(&provider.join("beta/ssh.sock")).await;
+    beta.listen_on_uds(&host_dir.join("beta/ssh.sock")).await;
 
     // The selected VM knows a box of its own — so the connection, and the
     // version gate the lookup carries, are real — but not this name.
@@ -4926,9 +4840,9 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
-    let provider_dir = dir.path().join("providers").join("local-minvmd0");
-    std::fs::create_dir_all(&provider_dir).unwrap();
-    let sock_path = provider_dir.join("control.sock");
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let sock_path = host_dir.join("control.sock");
     let attachments = minvmd::bep_attach::Attachments::new();
     let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
         .feeding_proxy_attachments(attachments.clone());
@@ -4944,7 +4858,7 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     for creation in 0..CREATIONS {
         let before = now_ms();
         let mut registered = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             Some(dir.path()),
             boxes::NetworkMode::OwnIp,
             "web",
@@ -5108,9 +5022,9 @@ async fn colliding_box_id_refuses_creation() {
         quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
-    let provider_dir = dir.path().join("providers").join("local-minvmd0");
-    std::fs::create_dir_all(&provider_dir).unwrap();
-    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(host_dir.join("control.sock")).unwrap();
 
     // The id a retained record already holds, and the refusal the host's
     // control server replies with when a mint lands on it.
@@ -5141,7 +5055,7 @@ async fn colliding_box_id_refuses_creation() {
     });
 
     let err = register_box_for_activation(
-        paths::ProviderKind::Minvmd,
+        paths::HostKind::Minvmd,
         Some(dir.path()),
         boxes::NetworkMode::OwnIp,
         "web",

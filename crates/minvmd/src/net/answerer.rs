@@ -108,8 +108,8 @@ use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 /// it.
 const COMPONENT: &str = "zone-answerer";
 
-/// The machine's answerer port: the next one after the egress (`:7654`) and
-/// mTLS (`:7655`) proxies, mirroring the native daemon's own default
+/// The machine's answerer port, above the hostname proxy on `:7654`,
+/// mirroring the native daemon's own default
 /// (`ANSWERER_PORT` in minimald's `net/answerer.rs`) — `minvmd` does not
 /// depend on the daemon, so the value is pinned here beside the one it
 /// mirrors, and the e2e lane names it in the resolver command it builds.
@@ -121,7 +121,7 @@ const COMPONENT: &str = "zone-answerer";
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
 /// The interim answerer channel socket's file name inside a state dir's
-/// provider-instance dir. Deliberately beside [`crate::control`]'s
+/// host dir. Deliberately beside [`crate::control`]'s
 /// `control.sock` rather than in the `paths` crate: this name only means
 /// something where two VM host daemons share a machine.
 pub const CHANNEL_SOCK_FILE: &str = "answerer.sock";

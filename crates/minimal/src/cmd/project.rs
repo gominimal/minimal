@@ -551,10 +551,33 @@ pub(crate) fn run_init_flow(
         }
     }
 
-    std::fs::write(&plan.toml_path, &plan.content)
-        .with_context(|| format!("writing {}", plan.toml_path.display()))?;
+    // Whether the file existed under the lock, which decides Created vs
+    // Updated, and whether the edit refused, so the refusal is not wrapped
+    // in the "writing" context meant for I/O errors.
+    let mut existed = exists;
+    let mut refused = false;
+    let written = mfile::File::edit_exclusively::<anyhow::Error>(&plan.toml_path, |content| {
+        // The `exists` check above ran before the lock was taken, so a
+        // concurrent writer (another `min add`/`min update` scaffolding
+        // this file) may have created it since. Re-check under the lock:
+        // clobbering it without --force is the same destructive overwrite
+        // that check exists to prevent.
+        existed = content.is_some();
+        if existed && !force {
+            refused = true;
+            bail!(
+                "refusing to overwrite existing {} without confirmation; pass --force",
+                plan.toml_path.display()
+            );
+        }
+        Ok(Some(plan.content.clone()))
+    });
+    match written {
+        Err(e) if refused => return Err(e),
+        written => written.with_context(|| format!("writing {}", plan.toml_path.display()))?,
+    }
 
-    Ok(if exists {
+    Ok(if existed {
         InitOutcome::Updated(plan.toml_path)
     } else {
         InitOutcome::Created(plan.toml_path)
@@ -577,12 +600,12 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
 /// Whether `min update` / `min add` should warm the host artifact cache after
 /// moving a pin.
 ///
-/// Only a native daemon reads the host cache. A VM-backed provider caches on
+/// Only a native daemon reads the host cache. A VM-backed host caches on
 /// its own guest data volume and never reads the host cache, so warming it
 /// there spends bandwidth and disk on artifacts no session start reads — the
 /// daemon re-fetches the whole closure on the next activate regardless.
 pub(crate) fn should_warm_host_cache(use_minvmd: bool) -> bool {
-    client::client_provider_kind(use_minvmd) != paths::ProviderKind::Minvmd
+    client::client_host_kind(use_minvmd) != paths::HostKind::Minvmd
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
@@ -711,8 +734,11 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
             c.to,
         );
     }
+    for c in &report.skipped {
+        println!("{}", c.skipped_message("min update"));
+    }
 
-    if report.upstream.is_some() || !report.sideloads.is_empty() {
+    if report.repinned() {
         println!(
             "\nRe-pinned minimal.toml (a diff to commit). The next \
              'min session activate' materializes the new closure, which can \
@@ -720,7 +746,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
              This did not update the 'min' binary; reinstall it with the \
              installer to do that."
         );
-    } else {
+    } else if report.skipped.is_empty() {
         println!("Already up to date; no pins moved and minimal.toml is unchanged.");
     }
 

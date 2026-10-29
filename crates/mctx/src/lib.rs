@@ -816,58 +816,89 @@ impl Context {
             None
         };
 
-        use orchestrator::LocalBackend;
-        let orchestrator = LocalBackend::new_orchestrator(
-            self.daemon.config.builds_base_dir(),
-            rc.clone(),
-            self.remote_storage().await?,
-            self.daemon.config.num_parallel_builds(),
-            graph.clone(),
-            cache.clone(),
-            self.daemon_id(),
-            log_sink,
-            self.daemon.config.ot.clone(),
-            cancel,
-        )?;
+        // Specs the remote index lists but whose artifact the store no longer
+        // has (a dangling hit, inbox#535). The planner trusts the index, so
+        // such a spec is planned as a cache fill with no build behind it; the
+        // fill reports the miss and the graph is planned again with the spec
+        // masked out of every cache, which makes it a build like any other
+        // miss. Each pass masks one more spec, so the loop is bounded by the
+        // graph.
+        let mut dangling: Vec<BuildSpecRef> = Vec::new();
+        loop {
+            use orchestrator::LocalBackend;
+            let orchestrator = LocalBackend::new_orchestrator(
+                self.daemon.config.builds_base_dir(),
+                rc.clone(),
+                self.remote_storage().await?,
+                self.daemon.config.num_parallel_builds(),
+                graph.clone(),
+                cache.clone(),
+                self.daemon_id(),
+                log_sink.clone(),
+                self.daemon.config.ot.clone(),
+                cancel.clone(),
+            )?;
 
-        let mut bin_provider: Box<dyn BinProvider> = match (
-            self.daemon.config.use_local_cache(),
-            self.daemon.config.use_remote_cache(),
-        ) {
-            // No local or remote cache
-            (false, false) => Box::new(()),
-            // Both caches
-            (true, true) => {
-                let local_adapter = CacheBinProvider::new(graph, cache.clone());
-                let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
-                Box::new((local_adapter, remote_adapter))
+            let mut bin_provider: Box<dyn BinProvider> = match (
+                self.daemon.config.use_local_cache(),
+                self.daemon.config.use_remote_cache(),
+            ) {
+                // No local or remote cache
+                (false, false) => Box::new(()),
+                // Both caches
+                (true, true) => {
+                    let local_adapter = CacheBinProvider::new(graph, cache.clone());
+                    let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
+                    Box::new((local_adapter, remote_adapter))
+                }
+                // Only remote cache
+                (false, true) => Box::new(RemoteBinProvider::new(graph, rc.as_ref().unwrap())),
+                // Only local cache
+                (true, false) => Box::new(CacheBinProvider::new(graph, cache.clone())),
+            };
+            if rebuild_top_level {
+                // Forcing a rebuild of named packages was requested. To do this, we wrap the BinProvider
+                // with one that pretends the named packages are never in any cache, resulting in a build for them.
+                bin_provider = Box::new(MaskingBinProvider::new(
+                    bin_provider,
+                    graph.top_levels.clone(),
+                ));
             }
-            // Only remote cache
-            (false, true) => Box::new(RemoteBinProvider::new(graph, rc.as_ref().unwrap())),
-            // Only local cache
-            (true, false) => Box::new(CacheBinProvider::new(graph, cache.clone())),
-        };
-        if rebuild_top_level {
-            // Forcing a rebuild of named packages was requested. To do this, we wrap the BinProvider
-            // with one that pretends the named packages are never in any cache, resulting in a build for them.
-            bin_provider = Box::new(MaskingBinProvider::new(
-                bin_provider,
-                graph.top_levels.clone(),
-            ));
+            if !dangling.is_empty() {
+                bin_provider = Box::new(MaskingBinProvider::new(
+                    bin_provider,
+                    dangling.iter().copied(),
+                ));
+            }
+
+            let (built, result) = LocalBackend::run_local_build(orchestrator, bin_provider).await;
+
+            // commit all built artifacts to the local cache
+            for (pending_dir, meta) in built {
+                pending_dir
+                    .finalize(meta)
+                    .map_err(|e| Error::Other(e.into()))?;
+            }
+            match result {
+                Ok(()) => return Ok(()),
+                Err(orchestrator::Error::DanglingCacheHit(hits))
+                    if hits.iter().all(|b| !dangling.contains(b)) =>
+                {
+                    for bsr in hits {
+                        let spec = graph.get(&bsr).map(|b| b.name.as_str()).unwrap_or("?");
+                        tracing::warn!(
+                            kind = "dangling_replan",
+                            spec,
+                            "the remote cache lists a package the store no longer has; building it locally"
+                        );
+                        dangling.push(bsr);
+                    }
+                }
+                // propagate any other error (a dangling hit on a spec already
+                // masked cannot happen: a masked spec is never a cache fill)
+                Err(e) => return Err(e.into()),
+            }
         }
-
-        let (built, result) = LocalBackend::run_local_build(orchestrator, bin_provider).await;
-
-        // commit all built artifacts to the local cache
-        for (pending_dir, meta) in built {
-            pending_dir
-                .finalize(meta)
-                .map_err(|e| Error::Other(e.into()))?;
-        }
-        // propergate any error
-        result?;
-
-        Ok(())
     }
 
     pub fn iter_tasks(&self, graph: &Graph) -> Vec<(String, TaskSource)> {
@@ -1152,21 +1183,28 @@ impl Context {
                 // from the activation that needed it.
                 let fetch = async move {
                     let sema = semaphore.acquire().await;
-                    let res = rc_clone
-                        .materialize(&spec_hash, &cache_clone, &name)
-                        .await
-                        .map(|(t, d)| {
-                            (
-                                d,
-                                lcache::EntryMeta {
-                                    inner: lcache::MetaInner::Spec(name),
-                                    fetched: true,
-                                    fetch_ms: Some(t.as_millis() as usize),
-                                    origin: Some(origin),
-                                    ..Default::default()
-                                },
-                            )
-                        });
+                    let package = name.clone();
+                    let res = match rc_clone.materialize(&spec_hash, &cache_clone, &name).await {
+                        Ok((t, d)) => Ok(Some((
+                            d,
+                            lcache::EntryMeta {
+                                inner: lcache::MetaInner::Spec(name),
+                                fetched: true,
+                                fetch_ms: Some(t.as_millis() as usize),
+                                origin: Some(origin),
+                                ..Default::default()
+                            },
+                        ))),
+                        // A dangling index hit: the index lists an artifact the
+                        // store no longer has. That is a miss, not a failure;
+                        // the package is built locally like any other miss,
+                        // and rcache has logged it (`kind = "dangling_hit"`).
+                        Err(rcache::Error::NotFound { .. }) => Ok(None),
+                        // The error names the package, not just the object:
+                        // "the remote cache has no artifact for ..." alone
+                        // tells the user nothing about which package.
+                        Err(e) => Err(anyhow::anyhow!("{package}: {e}")),
+                    };
                     drop(sema);
                     res
                 };
@@ -1180,9 +1218,15 @@ impl Context {
         // Wait for all materialization tasks to complete, committing each pending dir
         // to the cache as it is finished being staged
         while let Some(result) = task_set.join_next().await {
-            let (pending_dir, meta) = result
+            let Some((pending_dir, meta)) = result
                 .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+                .map_err(Error::Other)?
+            else {
+                // a dangling hit: nothing to commit. A build (`build_graph`) makes the
+                // package; a prefetch-only caller (mip add/update/check) leaves it
+                // uncached, which rcache's `dangling_hit` warning has recorded.
+                continue;
+            };
             pending_dir
                 .finalize(meta)
                 .map_err(|e| Error::Other(e.into()))?;
@@ -1209,74 +1253,101 @@ impl Context {
             }
         };
 
-        let toml = std::fs::read_to_string(&mfile_path)
-            .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
-        let mut doc = toml
-            .parse::<DocumentMut>()
-            .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
-
-        let resolved: Vec<String> = deps
-            .as_bsrs(graph)?
-            .into_iter()
-            .map(|bsr| graph.get(&bsr).unwrap().name.clone())
-            .collect();
-
+        // The whole read-edit-write runs under `File::edit_exclusively`'s
+        // lock so a concurrent `min` command cannot interleave between our read
+        // and our write (the write itself is an atomic replace).
         let mut did_edit = false;
-        match mode {
-            AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
-                    println!("Added {} to stack.build_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
-                    println!("Added {} to stack.runtime_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::TaskPackages { name } => {
-                if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_like_mut()
-                {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
-                    println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [tasks.{}] in minimal.toml: needed for update",
-                        name
-                    )));
-                }
-            }
-            AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_like_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
-                } else {
-                    doc.insert(
-                        "session",
-                        Item::Table(toml_edit::Table::from_iter([(
-                            "packages",
-                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                        )])),
-                    );
-                    did_edit = true;
-                }
-                println!("Added {} to session.packages", resolved.join(", "));
-            }
-        }
+        let mut added = None;
+        mfile::File::edit_exclusively(&mfile_path, |content| {
+            let toml = content.ok_or_else(|| {
+                Error::IO(
+                    "reading minimal.toml for add",
+                    mfile_path.to_path_buf(),
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "minimal.toml disappeared"),
+                )
+            })?;
+            let mut doc = toml
+                .parse::<DocumentMut>()
+                .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
 
+            let resolved: Vec<String> = deps
+                .as_bsrs(graph)?
+                .into_iter()
+                .map(|bsr| graph.get(&bsr).unwrap().name.clone())
+                .collect();
+
+            let mut edited = false;
+            match mode {
+                AddDepMode::BuildPackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.build_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::RuntimePackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.runtime_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::TaskPackages { name } => {
+                    if let Some(tasks) = doc.get_mut("tasks")
+                        && let Some(t) = tasks.get_mut(&name)
+                        && let Some(t) = t.as_table_like_mut()
+                    {
+                        edited |= upsert_toml_packages_list(t, "packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to tasks.{}.packages",
+                            resolved.join(", "),
+                            name
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [tasks.{}] in minimal.toml: needed for update",
+                            name
+                        )));
+                    }
+                }
+                AddDepMode::SessionPackages => {
+                    if let Some(h) = doc["session"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    } else {
+                        doc.insert(
+                            "session",
+                            Item::Table(toml_edit::Table::from_iter([(
+                                "packages",
+                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                            )])),
+                        );
+                        edited = true;
+                    }
+                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
+                }
+            }
+
+            did_edit = edited;
+            Ok(if edited { Some(doc.to_string()) } else { None })
+        })?;
+
+        // Printed only once the write has succeeded.
+        if let Some(added) = added {
+            println!("{added}");
+        }
         if did_edit {
-            std::fs::write(&mfile_path, doc.to_string())
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
             *self = self.cloned_reinit()?;
         }
         Ok(())

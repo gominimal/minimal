@@ -10,7 +10,7 @@ use minimal::GlobalArgs;
 ///
 /// The UDS socket is placed at `<tempdir>/providers/local-minimald0/ssh.sock`
 /// so that `resolve_socket_path(Some(tempdir), false)` finds it (the native
-/// minimald provider dir the CLI resolves without `--provider local-minvmd`).
+/// minimald host dir the CLI resolves without `--provider local-minvmd`).
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.

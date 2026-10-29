@@ -121,14 +121,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
     Secret(SecretArgs),
-    /// Print that there is nothing to mint
+    // NET-109: `min login` is the alias for `min auth login`, so it takes
+    // the same arguments and runs the same sign-in.
+    /// Sign in to GitHub (the same as min auth login)
     ///
-    /// The HTTPS reverse proxy this verb once served is retired, so it
-    /// issues nothing and writes nothing to disk. The verb stays as the
-    /// future home of the sign-in that replaces it.
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -646,7 +646,7 @@ impl GlobalArgs {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 
-    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// Publish `--vm` as this process's VM name so every host dir the
     /// command resolves — socket, state dir, autospawn — names the same VM
     /// (NET-052). Called once at dispatch, before any path resolution; the
     /// default VM is untouched when the flag is absent (NET-053).
@@ -810,7 +810,7 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-/// Which daemon backend ("provider") hosts sessions.
+/// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
 /// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
@@ -1300,10 +1300,6 @@ pub struct SecretRmArgs {
     #[arg(long)]
     pub store: Option<String>,
 }
-
-/// Arguments for `min login`.
-#[derive(Debug, Args)]
-pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]
