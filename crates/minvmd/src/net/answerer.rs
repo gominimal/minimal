@@ -121,7 +121,7 @@ const COMPONENT: &str = "zone-answerer";
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
 /// The interim answerer channel socket's file name inside a state dir's
-/// provider-instance dir. Deliberately beside [`crate::control`]'s
+/// host dir. Deliberately beside [`crate::control`]'s
 /// `control.sock` rather than in the `paths` crate: this name only means
 /// something where two VM host daemons share a machine.
 pub const CHANNEL_SOCK_FILE: &str = "answerer.sock";

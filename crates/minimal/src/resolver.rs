@@ -9979,7 +9979,7 @@ resolvectl domain minzone0 '~min.internal'
     /// `minzoned`, released out of the daemon serving this session and
     /// then started as the manager-held answerer — and the socket the
     /// command asks to release is the native daemon's own, the control
-    /// socket beside its ssh socket in the Minimald provider dir this
+    /// socket beside its ssh socket in the Minimald host dir this
     /// CLI's state dir resolves. The advisory goes quiet only once the
     /// service holds the zone, never when the resolver step alone is done.
     #[test]

@@ -600,12 +600,12 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
 /// Whether `min update` / `min add` should warm the host artifact cache after
 /// moving a pin.
 ///
-/// Only a native daemon reads the host cache. A VM-backed provider caches on
+/// Only a native daemon reads the host cache. A VM-backed host caches on
 /// its own guest data volume and never reads the host cache, so warming it
 /// there spends bandwidth and disk on artifacts no session start reads — the
 /// daemon re-fetches the whole closure on the next activate regardless.
 pub(crate) fn should_warm_host_cache(use_minvmd: bool) -> bool {
-    client::client_provider_kind(use_minvmd) != paths::ProviderKind::Minvmd
+    client::client_host_kind(use_minvmd) != paths::HostKind::Minvmd
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.

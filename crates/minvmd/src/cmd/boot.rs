@@ -26,7 +26,7 @@ pub fn run(foreground: bool) -> Result<()> {
     // owns it.
     tracing::info!(
         vm = %crate::state::vm_name(),
-        state_dir = %crate::state::provider_dir().display(),
+        state_dir = %crate::state::host_dir().display(),
         "starting VM"
     );
 

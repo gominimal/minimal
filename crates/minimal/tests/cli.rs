@@ -5023,7 +5023,7 @@ async fn net_forward_announces_the_bound_local_port() {
 /// so the assertion is on the process actually terminating.
 ///
 /// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
-/// the native `local-minimald` provider socket, which the harness daemon
+/// the native `local-minimald` host socket, which the harness daemon
 /// serves on a UDS; macOS resolves `local-minvmd` instead.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -5114,8 +5114,8 @@ async fn activate_own_ip_on_vm_host<G>(
     stand_up: impl FnOnce(&std::path::Path) -> G,
 ) -> std::process::Output {
     let state = tempfile::TempDir::new().unwrap();
-    let provider_dir = state.path().join("providers").join("local-minvmd0");
-    let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+    let host_dir = state.path().join("providers").join("local-minvmd0");
+    let state_dir = minvmd::state::StateDir::new(host_dir.clone()).unwrap();
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -5124,8 +5124,8 @@ async fn activate_own_ip_on_vm_host<G>(
         .unwrap();
     let _alive = state_dir.try_acquire_alive_lock().unwrap();
     let server = minimald::test_harness::TestServer::new().await;
-    server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
-    let _control = stand_up(&provider_dir.join("control.sock"));
+    server.listen_on_uds(&host_dir.join("ssh.sock")).await;
+    let _control = stand_up(&host_dir.join("control.sock"));
 
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();

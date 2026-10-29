@@ -155,10 +155,10 @@ pub fn try_minimal_state_dir() -> Option<DaemonAbsPath> {
     try_default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
 }
 
-/// File name of the daemon SSH socket in a provider instance dir. Served by
+/// File name of the daemon SSH socket in a host dir. Served by
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
-/// File name of the SSH `known_hosts` in a provider instance dir, recording the
+/// File name of the SSH `known_hosts` in a host dir, recording the
 /// daemon's host key under the `local-<kind><instance>` hostname. Written at
 /// startup by native minimald, and by minvmd from the guest's boot beacon.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
@@ -167,44 +167,44 @@ pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
 
-/// Which local daemon backend ("provider") an instance directory belongs to.
+/// Which local daemon backend (box host) an instance directory belongs to.
 ///
 /// The kind is embedded in the instance name so the native host minimald and
-/// the minvmd microVM backends occupy distinct provider dirs — and distinct SSH
+/// the minvmd microVM backends occupy distinct host dirs — and distinct SSH
 /// host-key identities — rather than colliding on a shared `local-<N>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
+pub enum HostKind {
     /// Native host minimald (DM2).
     Minimald,
     /// minimald inside the minvmd microVM (DM1).
     Minvmd,
 }
 
-impl ProviderKind {
+impl HostKind {
     /// The tag embedded in the instance name (`local-<tag><instance>`).
     #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
-            ProviderKind::Minimald => "minimald",
-            ProviderKind::Minvmd => "minvmd",
+            HostKind::Minimald => "minimald",
+            HostKind::Minvmd => "minvmd",
         }
     }
 }
 
-/// The provider-instance name, `local-<kind><instance>` (e.g. `local-minimald0`,
+/// The host name, `local-<kind><instance>` (e.g. `local-minimald0`,
 /// `local-minvmd0`). Used both as the `providers/<name>` directory name and as
 /// the SSH host-key identity recorded in `known_hosts`.
 #[must_use]
-pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
+pub fn host_name(kind: HostKind, instance: u32) -> String {
     format!("local-{}{instance}", kind.tag())
 }
 
-/// The SSH host alias a client connects with for a provider directory. This
+/// The SSH host alias a client connects with for a host directory. This
 /// is the single source of the `known_hosts` host identity — the daemon
 /// records the guest key under it and the ssh readers derive it from the
 /// socket's parent directory, so the two can never disagree.
 ///
-/// A provider-instance dir (`providers/<name>`) maps to its basename, so the
+/// A host dir (`providers/<name>`) maps to its basename, so the
 /// default VM keeps `local-minvmd0`. A named VM's dir nests one level deeper
 /// (`providers/local-minvmd0/<vm>`) and maps to `<vm>.local-minvmd0`: ssh
 /// matches the host argument against the user's `~/.ssh/config` `Host`
@@ -212,9 +212,9 @@ pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
 /// block meant for a real machine. VM names never contain `.`, so the
 /// namespaced form cannot clash with another VM's alias.
 #[must_use]
-pub fn ssh_host_alias(provider_dir: &Path) -> Option<String> {
-    let name = provider_dir.file_name()?.to_str()?;
-    match provider_dir
+pub fn ssh_host_alias(host_dir: &Path) -> Option<String> {
+    let name = host_dir.file_name()?.to_str()?;
+    match host_dir
         .parent()
         .and_then(Path::file_name)
         .and_then(|n| n.to_str())
@@ -227,17 +227,13 @@ pub fn ssh_host_alias(provider_dir: &Path) -> Option<String> {
 /// `<state_dir>/providers/local-<kind><instance>` — the directory holding the
 /// sockets, locks, and state files a client needs to reach one local daemon
 /// instance.
-pub fn provider_instance_dir(
-    state_dir: &DaemonAbsPath,
-    kind: ProviderKind,
-    instance: u32,
-) -> DaemonAbsPath {
-    sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
+pub fn host_dir(state_dir: &DaemonAbsPath, kind: HostKind, instance: u32) -> DaemonAbsPath {
+    sub_path!(state_dir, "providers").sub_path_unchecked(&host_name(kind, instance))
 }
 
 /// The VM name that means "the default VM": the single unnamed instance whose
 /// on-disk layout predates named VMs. Every path of that VM must stay
-/// unchanged (NET-053), so it resolves to the provider-instance dir itself
+/// unchanged (NET-053), so it resolves to the host dir itself
 /// rather than a per-name subdirectory.
 pub const DEFAULT_VM_NAME: &str = "default";
 
@@ -248,7 +244,7 @@ pub const DEFAULT_VM_NAME: &str = "default";
 const MAX_VM_NAME_BYTES: usize = 24;
 
 /// The VM name reserved for the in-guest diagnostic bundle's directory inside
-/// a provider dir (`providers/<provider>/guest/`, see the `min` diag
+/// a host dir (`providers/<host>/guest/`, see the `min` diag
 /// collector): a VM named `guest` would collide with it and be invisible to
 /// every diagnostic listing.
 const RESERVED_VM_NAME: &str = "guest";
@@ -258,12 +254,12 @@ fn vm_name_byte_allowed(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
 }
 
-/// Validate a VM name (`--vm <NAME>`): it names a directory under the provider
+/// Validate a VM name (`--vm <NAME>`): it names a directory under the host
 /// dir, so the rule is an allowlist, not a sanitiser — ASCII lowercase
 /// letters, digits and `-`, at most [`MAX_VM_NAME_BYTES`] bytes, starting
 /// with a letter or digit, and never the reserved [`RESERVED_VM_NAME`]. A name
-/// that fits can only select a subdirectory *under* the provider dir: it can
-/// never escape it, and it can never shadow one of the provider dir's own
+/// that fits can only select a subdirectory *under* the host dir: it can
+/// never escape it, and it can never shadow one of the host dir's own
 /// files (`ssh.sock`, the payload `guest/` dir).
 ///
 /// # Errors
@@ -283,26 +279,26 @@ pub fn validate_vm_name(vm: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The per-name provider-instance dir (NET-052, NET-054): the directory
+/// The per-name host dir (NET-052, NET-054): the directory
 /// holding one named VM's own state files, socket, and locks.
 ///
 /// A named VM — any `vm` other than [`DEFAULT_VM_NAME`] — nests under a
 /// per-name subdirectory:
 /// `<state_dir>/providers/local-<kind><instance>/<vm>/`. The default VM
-/// resolves to the provider-instance dir itself, exactly as
-/// [`provider_instance_dir`] does, so its paths are unchanged (NET-053).
+/// resolves to the host dir itself, exactly as
+/// [`host_dir`] does, so its paths are unchanged (NET-053).
 ///
 /// # Errors
 ///
 /// [`Error::InvalidVmName`] when `vm` breaks the naming rule (see
 /// [`validate_vm_name`]).
-pub fn provider_instance_dir_named(
+pub fn host_dir_named(
     state_dir: &DaemonAbsPath,
-    kind: ProviderKind,
+    kind: HostKind,
     instance: u32,
     vm: &str,
 ) -> Result<DaemonAbsPath, Error> {
-    let base = provider_instance_dir(state_dir, kind, instance);
+    let base = host_dir(state_dir, kind, instance);
     if vm == DEFAULT_VM_NAME {
         return Ok(base);
     }
@@ -316,7 +312,7 @@ pub fn provider_instance_dir_named(
 /// existing on-disk instances are not orphaned by the rename.
 ///
 /// Each legacy dir's kind is inferred from its contents (see
-/// [`classify_legacy_provider_dir`]). Best-effort and idempotent: it never
+/// [`classify_legacy_host_dir`]). Best-effort and idempotent: it never
 /// aborts the caller. Only genuine I/O failures (an unreadable providers dir, a
 /// failed rename) warn on stderr — these are rare and actionable. The benign
 /// "nothing to migrate here" outcomes are silent so the CLI, which runs this on
@@ -329,7 +325,7 @@ pub fn provider_instance_dir_named(
 /// daemon. A live daemon keeps serving via its already-open socket/lock inodes
 /// (which survive a dir rename on Unix), but stopping daemons before upgrading
 /// avoids the edge entirely.
-pub fn migrate_legacy_provider_dirs(state_dir: &DaemonAbsPath) {
+pub fn migrate_legacy_host_dirs(state_dir: &DaemonAbsPath) {
     let providers = sub_path!(state_dir, "providers");
     let providers = providers.as_utf8_path().as_std_path();
     let entries = match std::fs::read_dir(providers) {
@@ -360,11 +356,11 @@ pub fn migrate_legacy_provider_dirs(state_dir: &DaemonAbsPath) {
         let path = entry.path();
         // Ambiguous or empty contents: can't tell the backend apart, so leave it
         // untouched. Silent — this recurs on every CLI invocation otherwise.
-        let Some(kind) = classify_legacy_provider_dir(&path) else {
+        let Some(kind) = classify_legacy_host_dir(&path) else {
             continue;
         };
 
-        let target_name = provider_instance_name(kind, instance);
+        let target_name = host_name(kind, instance);
         let target = providers.join(&target_name);
         // Target already claimed: don't clobber it. Silent, for the same reason.
         if target.exists() {
@@ -390,20 +386,20 @@ fn legacy_instance_num(name: &str) -> Option<u32> {
     suffix.parse().ok()
 }
 
-/// Infer which backend a legacy provider dir belonged to from its contents.
+/// Infer which backend a legacy host dir belonged to from its contents.
 ///
 /// A minvmd instance carries VM artifacts the native daemon never writes — its
 /// `minvmd.toml` state file, its alive lock, or the data-volume image. A native
 /// minimald dir carries an on-disk SSH host key (the guest daemon writes its key
 /// inside the VM, not the host dir) or its own lock. Returns `None` when both or
 /// neither class of marker is present, so the caller can skip rather than guess.
-fn classify_legacy_provider_dir(dir: &std::path::Path) -> Option<ProviderKind> {
+fn classify_legacy_host_dir(dir: &std::path::Path) -> Option<HostKind> {
     let has = |file: &str| dir.join(file).exists();
     let minvmd = has("minvmd.toml") || has(MINVMD_LOCK_FILE) || has("data-vol.raw");
     let minimald = has("ssh_host_ed25519_key") || has(MINIMALD_LOCK_FILE);
     match (minvmd, minimald) {
-        (true, false) => Some(ProviderKind::Minvmd),
-        (false, true) => Some(ProviderKind::Minimald),
+        (true, false) => Some(HostKind::Minvmd),
+        (false, true) => Some(HostKind::Minimald),
         _ => None,
     }
 }
@@ -1986,23 +1982,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_instance_dir_layout() {
+    fn host_dir_layout() {
         let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
         assert_eq!(
-            provider_instance_dir(&state, ProviderKind::Minimald, 0).as_str(),
+            host_dir(&state, HostKind::Minimald, 0).as_str(),
             "/state/minimal/providers/local-minimald0",
         );
         assert_eq!(
-            provider_instance_dir(&state, ProviderKind::Minimald, 3).as_str(),
+            host_dir(&state, HostKind::Minimald, 3).as_str(),
             "/state/minimal/providers/local-minimald3",
         );
         assert_eq!(
-            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+            host_dir(&state, HostKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
         );
     }
 
-    /// The SSH host alias is the provider-instance name for the default VM
+    /// The SSH host alias is the host name for the default VM
     /// and the VM name namespaced under it for a named VM, so a VM name can
     /// never match a user's own `~/.ssh/config` `Host` block.
     #[test]
@@ -2018,40 +2014,40 @@ mod tests {
         assert_eq!(ssh_host_alias(Path::new("/")), None);
     }
 
-    /// A named VM's provider dir nests under a per-name subdirectory
-    /// (NET-054); the default VM's is the provider dir itself, unchanged
+    /// A named VM's host dir nests under a per-name subdirectory
+    /// (NET-054); the default VM's is the host dir itself, unchanged
     /// (NET-053); and a name outside the allowlist is rejected rather than
-    /// resolved somewhere outside the provider dir — one from every class
+    /// resolved somewhere outside the host dir — one from every class
     /// the allowlist exists to catch.
     #[test]
-    fn provider_instance_dir_accepts_a_name() {
+    fn host_dir_accepts_a_name() {
         let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
 
-        // A named VM: its own directory under the provider dir.
+        // A named VM: its own directory under the host dir.
         assert_eq!(
-            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, "alpha")
+            host_dir_named(&state, HostKind::Minvmd, 0, "alpha")
                 .unwrap()
                 .as_str(),
             "/state/minimal/providers/local-minvmd0/alpha",
         );
         // The default VM: byte-for-byte the pre-named-VMs layout.
         assert_eq!(
-            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, DEFAULT_VM_NAME)
+            host_dir_named(&state, HostKind::Minvmd, 0, DEFAULT_VM_NAME)
                 .unwrap()
                 .as_str(),
-            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+            host_dir(&state, HostKind::Minvmd, 0).as_str(),
         );
         assert_eq!(
-            provider_instance_dir_named(&state, ProviderKind::Minimald, 2, DEFAULT_VM_NAME)
+            host_dir_named(&state, HostKind::Minimald, 2, DEFAULT_VM_NAME)
                 .unwrap()
                 .as_str(),
-            provider_instance_dir(&state, ProviderKind::Minimald, 2).as_str(),
+            host_dir(&state, HostKind::Minimald, 2).as_str(),
         );
 
         // The length cap is inclusive: 24 bytes still resolves.
         let capped = "a".repeat(24);
         assert!(
-            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, &capped).is_ok(),
+            host_dir_named(&state, HostKind::Minvmd, 0, &capped).is_ok(),
             "a 24-byte name is at the cap, not over it"
         );
 
@@ -2077,7 +2073,7 @@ mod tests {
         .chain(std::iter::once("a".repeat(25)))
         .collect();
         for bad in &bad_names {
-            let err = provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, bad)
+            let err = host_dir_named(&state, HostKind::Minvmd, 0, bad)
                 .expect_err("an invalid VM name must be rejected");
             assert_eq!(err, Error::InvalidVmName(bad.clone()));
         }
@@ -2111,7 +2107,7 @@ mod tests {
         std::fs::create_dir_all(&native).unwrap();
         std::fs::write(native.join("ssh_host_ed25519_key"), b"key").unwrap();
 
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
 
         assert!(providers.join("local-minvmd0").join("minvmd.toml").exists());
         assert!(!providers.join("local-0").exists());
@@ -2137,7 +2133,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("keep"), b"keep").unwrap();
 
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
 
         assert!(
             legacy.exists(),
@@ -2151,7 +2147,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let providers = tmp.path().join("providers");
 
-        // Already-migrated names and non-provider entries must not be touched.
+        // Already-migrated names and non-host entries must not be touched.
         for kept in ["local-minvmd0", "local-minimald1", "remote-x"] {
             std::fs::create_dir_all(providers.join(kept)).unwrap();
         }
@@ -2164,7 +2160,7 @@ mod tests {
         let empty = providers.join("local-9");
         std::fs::create_dir_all(&empty).unwrap();
 
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
 
         for kept in ["local-minvmd0", "local-minimald1", "remote-x"] {
             assert!(providers.join(kept).exists(), "{kept} must be left alone");
@@ -2192,7 +2188,7 @@ mod tests {
         std::fs::create_dir_all(&native_lock_dir).unwrap();
         std::fs::write(native_lock_dir.join(MINIMALD_LOCK_FILE), b"").unwrap();
 
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
 
         assert!(providers.join("local-minvmd0").exists());
         assert!(providers.join("local-minvmd1").exists());
@@ -2207,9 +2203,9 @@ mod tests {
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("minvmd.toml"), "x").unwrap();
 
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
         // A second pass finds only the kind-tagged name and does nothing.
-        migrate_legacy_provider_dirs(&state_root(&tmp));
+        migrate_legacy_host_dirs(&state_root(&tmp));
 
         assert!(providers.join("local-minvmd0").join("minvmd.toml").exists());
         assert!(!providers.join("local-0").exists());

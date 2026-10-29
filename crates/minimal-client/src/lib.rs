@@ -68,11 +68,11 @@ pub fn init_trace_context(ctx: minimald_rpc::trace::TraceContext) {
 
 static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
+/// Set the process-wide VM name (`--vm <NAME>`) so every host dir this
 /// process resolves names the same VM (NET-052). First call wins; must be
 /// called at command dispatch, before any path resolution. A name outside
 /// the allowlist is rejected here rather than resolved to a directory outside
-/// the provider dir.
+/// the host dir.
 ///
 /// # Errors
 ///
@@ -1324,18 +1324,18 @@ pub async fn ensure_version_match(client: &mut Client) -> Result<(), anyhow::Err
     ensure_version_reported(Some(&daemon.version))
 }
 
-/// The provider kind the CLI should talk to, given `--provider`.
+/// The host kind the CLI should talk to, given `--provider`.
 ///
-/// The native minimald and minvmd backends now occupy distinct provider dirs,
+/// The native minimald and minvmd backends now occupy distinct host dirs,
 /// so connecting — not just spawning — must pick the right one. macOS is always
 /// minvmd-backed regardless of the flag; keying on the compile target keeps the
 /// in-guest CLI (Linux, native) and the host CLI (macOS, minvmd) each pointed at
 /// the dir their local daemon actually uses.
-pub fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
+pub fn client_host_kind(use_minvmd: bool) -> paths::HostKind {
     if use_minvmd || cfg!(target_os = "macos") {
-        paths::ProviderKind::Minvmd
+        paths::HostKind::Minvmd
     } else {
-        paths::ProviderKind::Minimald
+        paths::HostKind::Minimald
     }
 }
 
@@ -1357,34 +1357,34 @@ fn resolve_state_base(
 }
 
 /// Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
-/// before the CLI resolves a provider dir, so an upgraded client finds an
+/// before the CLI resolves a host dir, so an upgraded client finds an
 /// existing instance instead of missing it. Best-effort: a bad `--minimal-dir`
 /// is left for the resolve/connect path to report.
-pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
+pub fn migrate_legacy_host_dirs(minimal_dir_override: Option<&std::path::Path>) {
     if let Ok(base) = resolve_state_base(minimal_dir_override) {
-        paths::migrate_legacy_provider_dirs(&base);
+        paths::migrate_legacy_host_dirs(&base);
     }
 }
 
-/// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
+/// Resolve the host dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
-/// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+/// state dir. `use_minvmd` selects the backend's dir (see [`client_host_kind`]).
 ///
 /// This is the default VM ([`paths::DEFAULT_VM_NAME`]); [`vm_name()`] selects the
 /// process's VM, so call [`set_vm_name`] first to talk to a named VM.
-pub fn resolve_provider_dir(
+pub fn resolve_host_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm_name())
+    resolve_host_dir_named(minimal_dir_override, use_minvmd, vm_name())
 }
 
-/// [`resolve_provider_dir`] for an explicit VM. A named VM nests under its own
-/// subdirectory of the provider dir (NET-052/NET-054):
+/// [`resolve_host_dir`] for an explicit VM. A named VM nests under its own
+/// subdirectory of the host dir (NET-052/NET-054):
 /// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
-/// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
+/// host dir itself (NET-053). The native `minimald` backend hosts no VMs,
 /// so a named VM is an error there rather than a silent fall-back to the base
-/// provider dir — a `--vm` that resolves to the default daemon's directory
+/// host dir — a `--vm` that resolves to the default daemon's directory
 /// would mean a different VM than the one asked for.
 ///
 /// # Errors
@@ -1393,33 +1393,33 @@ pub fn resolve_provider_dir(
 /// the naming rule, with a "named VMs need the minvmd provider" message when
 /// the backend is native `minimald`, or when `minimal_dir_override` is not
 /// usable.
-pub fn resolve_provider_dir_named(
+pub fn resolve_host_dir_named(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
     vm: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
-    let kind = client_provider_kind(use_minvmd);
-    if kind != paths::ProviderKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
+    let kind = client_host_kind(use_minvmd);
+    if kind != paths::HostKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
         return Err(std::io::Error::other(
             "named VMs need the minvmd provider (`--provider local-minvmd`); \
              the native local-minimald backend hosts no VMs",
         ));
     }
-    let dir = if kind == paths::ProviderKind::Minvmd {
-        paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
+    let dir = if kind == paths::HostKind::Minvmd {
+        paths::host_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
     } else {
-        paths::provider_instance_dir(&base, kind, 0)
+        paths::host_dir(&base, kind, 0)
     };
     Ok(dir.as_utf8_path().as_std_path().to_path_buf())
 }
 
-/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
-/// serves this endpoint under its own provider dir, so `use_minvmd` must select
+/// Resolve the daemon socket path: `<host dir>/ssh.sock`. Each backend
+/// serves this endpoint under its own host dir, so `use_minvmd` must select
 /// the same backend the daemon was spawned as.
 ///
 /// This is the default VM's socket; a named VM serves its own (see
-/// [`resolve_provider_dir_named`]).
+/// [`resolve_host_dir_named`]).
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
@@ -1427,20 +1427,17 @@ pub fn resolve_socket_path(
     resolve_socket_path_named(minimal_dir_override, use_minvmd, vm_name())
 }
 
-/// [`resolve_socket_path`] for an explicit VM: `<named provider dir>/ssh.sock`.
+/// [`resolve_socket_path`] for an explicit VM: `<named host dir>/ssh.sock`.
 ///
 /// # Errors
 ///
-/// As [`resolve_provider_dir_named`].
+/// As [`resolve_host_dir_named`].
 pub fn resolve_socket_path_named(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
     vm: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(
-        resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm)?
-            .join(paths::SSH_SOCK_FILE),
-    )
+    Ok(resolve_host_dir_named(minimal_dir_override, use_minvmd, vm)?.join(paths::SSH_SOCK_FILE))
 }
 
 /// One VM's daemon socket with the name that selects it: the pair a client
@@ -1456,7 +1453,7 @@ pub struct VmSocket {
 }
 
 /// Enumerate every VM's socket on this host, default VM first: the default
-/// VM's provider dir plus one entry per named VM that has a state dir
+/// VM's host dir plus one entry per named VM that has a state dir
 /// (NET-052's layout). A VM that is not running is still enumerated — its
 /// daemon simply is not answering, which each caller reports its own way —
 /// so the set is the host's, not the running half of it.
@@ -1465,13 +1462,13 @@ pub struct VmSocket {
 /// callers fall back to [`resolve_socket_path`], the one socket that backend
 /// serves (and the path that refuses a named `--vm` there, as it must).
 /// Directories whose name breaks the naming rule are skipped rather than
-/// reported: the provider dir also holds non-VM trappings — `ssh.sock`, the
+/// reported: the host dir also holds non-VM trappings — `ssh.sock`, the
 /// reserved `guest/` payload dir — and a stray must not fail a listing.
 ///
 /// # Errors
 ///
 /// [`std::io::Error`] when `minimal_dir_override` is not usable or the
-/// provider dir cannot be read. A provider dir that does not exist yet
+/// host dir cannot be read. A host dir that does not exist yet
 /// (no VM created, ever) is not an error: the default VM is still reported,
 /// with a socket nothing serves yet.
 pub fn enumerate_vm_sockets(
@@ -1479,12 +1476,12 @@ pub fn enumerate_vm_sockets(
     use_minvmd: bool,
 ) -> std::io::Result<Vec<VmSocket>> {
     let base = resolve_state_base(minimal_dir_override)?;
-    let kind = client_provider_kind(use_minvmd);
-    if kind != paths::ProviderKind::Minvmd {
+    let kind = client_host_kind(use_minvmd);
+    if kind != paths::HostKind::Minvmd {
         return Ok(Vec::new());
     }
-    let provider = paths::provider_instance_dir(&base, kind, 0);
-    let dir = provider.as_utf8_path().as_std_path();
+    let host_dir = paths::host_dir(&base, kind, 0);
+    let dir = host_dir.as_utf8_path().as_std_path();
     let mut vms = vec![VmSocket {
         vm: paths::DEFAULT_VM_NAME.to_string(),
         sock: dir.join(paths::SSH_SOCK_FILE),
@@ -1495,7 +1492,7 @@ pub fn enumerate_vm_sockets(
     let mut named: Vec<String> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        // No provider dir yet: no VM has ever been created on this host.
+        // No host dir yet: no VM has ever been created on this host.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vms),
         Err(e) => return Err(e),
     };
@@ -1509,7 +1506,7 @@ pub fn enumerate_vm_sockets(
             continue;
         };
         // `default` is the unnamed VM, already first; a name that breaks the
-        // rule is not a VM (see the provider dir's other trappings).
+        // rule is not a VM (see the host dir's other trappings).
         if name != paths::DEFAULT_VM_NAME && paths::validate_vm_name(name).is_ok() {
             named.push(name.to_string());
         }
@@ -1635,7 +1632,7 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, resolve_provider_dir, resolve_socket_path};
+    use super::{Client, resolve_host_dir, resolve_socket_path};
     use std::path::Path;
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
@@ -1708,12 +1705,12 @@ mod tests {
         );
     }
 
-    /// A named VM must resolve to its own provider dir and socket under a
+    /// A named VM must resolve to its own host dir and socket under a
     /// per-name subdirectory (NET-052/NET-054).
     #[test]
     fn named_vm_gets_its_own_dir_and_socket() {
         let dir =
-            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+            super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
                 .unwrap();
         assert_eq!(
             dir,
@@ -1735,7 +1732,7 @@ mod tests {
     fn default_vm_paths_are_unchanged() {
         let base = Path::new("/tmp/minimal-test/providers/local-minvmd0");
         for name in [None, Some("default")] {
-            let dir = super::resolve_provider_dir_named(
+            let dir = super::resolve_host_dir_named(
                 Some(Path::new("/tmp/minimal-test")),
                 true,
                 name.unwrap_or("default"),
@@ -1753,18 +1750,18 @@ mod tests {
     }
 
     /// The native `minimald` backend hosts no VMs, so a named VM must be
-    /// refused there rather than silently resolved to the base provider dir:
+    /// refused there rather than silently resolved to the base host dir:
     /// `min --vm alpha` against the native backend would otherwise talk to
     /// the default daemon while claiming to talk to alpha. The default VM
     /// still resolves — it is the only VM that backend has.
     ///
-    /// Linux-only: `client_provider_kind` forces Minvmd on macOS, so a
+    /// Linux-only: `client_host_kind` forces Minvmd on macOS, so a
     /// `false` there is not the native backend.
     #[cfg(target_os = "linux")]
     #[test]
     fn native_backend_refuses_a_named_vm() {
         let err =
-            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
+            super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
                 .expect_err("a named VM on the native backend must be refused");
         assert!(
             err.to_string()
@@ -1773,7 +1770,7 @@ mod tests {
         );
 
         assert_eq!(
-            super::resolve_provider_dir_named(
+            super::resolve_host_dir_named(
                 Some(Path::new("/tmp/minimal-test")),
                 false,
                 paths::DEFAULT_VM_NAME,
@@ -1784,7 +1781,7 @@ mod tests {
     }
 
     /// A VM name outside the allowlist must be refused, not resolved to a
-    /// directory outside the provider dir; the refusal states the rule.
+    /// directory outside the host dir; the refusal states the rule.
     #[test]
     fn vm_name_must_fit_the_allowlist() {
         for name in [
@@ -1799,7 +1796,7 @@ mod tests {
             "guest",
         ] {
             let err =
-                super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
+                super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
                     .unwrap_err();
             assert!(
                 err.to_string().contains("invalid VM name"),
@@ -1822,7 +1819,7 @@ mod tests {
             // The child, whose process-global starts unset: the assertion.
             super::set_vm_name("alpha").unwrap();
             assert_eq!(super::vm_name(), "alpha");
-            let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            let dir = resolve_host_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
             assert_eq!(
                 dir,
                 Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
@@ -2013,20 +2010,20 @@ mod tests {
 
     /// Enumerating the host's VMs covers the default VM plus every named one
     /// with a state dir — default first, the rest alphabetical — and skips the
-    /// trappings a provider dir also holds (NET-057 lists across every entry
+    /// trappings a host dir also holds (NET-057 lists across every entry
     /// this returns; NET-058's resolution probes them).
     #[test]
     fn enumerates_the_default_vm_then_every_named_one() {
         let base = tempfile::tempdir().unwrap();
-        let provider = base.path().join("providers").join("local-minvmd0");
+        let host_dir = base.path().join("providers").join("local-minvmd0");
         for vm in ["beta", "alpha"] {
-            std::fs::create_dir_all(provider.join(vm)).unwrap();
+            std::fs::create_dir_all(host_dir.join(vm)).unwrap();
         }
-        // The provider dir's own trappings: a socket file and a reserved,
+        // The host dir's own trappings: a socket file and a reserved,
         // non-VM directory. Neither is a VM, and neither must fail the
         // enumeration.
-        std::fs::write(provider.join("ssh.sock"), b"").unwrap();
-        std::fs::create_dir_all(provider.join("guest")).unwrap();
+        std::fs::write(host_dir.join("ssh.sock"), b"").unwrap();
+        std::fs::create_dir_all(host_dir.join("guest")).unwrap();
 
         let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
         assert_eq!(
@@ -2034,25 +2031,25 @@ mod tests {
             vec![
                 super::VmSocket {
                     vm: "default".to_string(),
-                    sock: provider.join("ssh.sock"),
+                    sock: host_dir.join("ssh.sock"),
                 },
                 super::VmSocket {
                     vm: "alpha".to_string(),
-                    sock: provider.join("alpha").join("ssh.sock"),
+                    sock: host_dir.join("alpha").join("ssh.sock"),
                 },
                 super::VmSocket {
                     vm: "beta".to_string(),
-                    sock: provider.join("beta").join("ssh.sock"),
+                    sock: host_dir.join("beta").join("ssh.sock"),
                 },
             ]
         );
     }
 
-    /// A host with no provider dir yet still enumerates the default VM: a
+    /// A host with no host dir yet still enumerates the default VM: a
     /// socket nothing serves yet is a valid probe, not an error — the host's
     /// set is enumerated, not the running half of it.
     #[test]
-    fn a_host_with_no_provider_dir_still_lists_the_default_vm() {
+    fn a_host_with_no_host_dir_still_lists_the_default_vm() {
         let base = tempfile::tempdir().unwrap();
         let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
         assert_eq!(
@@ -2070,7 +2067,7 @@ mod tests {
 
     /// The native `minimald` backend hosts no VMs, so it enumerates nothing:
     /// callers fall back to the one socket that backend serves. (Linux-only,
-    /// as [`super::native_backend_refuses_a_named_vm`]: `client_provider_kind`
+    /// as [`super::native_backend_refuses_a_named_vm`]: `client_host_kind`
     /// forces the minvmd kind on macOS, so a `false` there is not the native
     /// backend.)
     #[cfg(target_os = "linux")]

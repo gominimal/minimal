@@ -2,7 +2,7 @@ use super::*;
 
 // The other command families reach these helpers through `session::`.
 pub(crate) use super::box_verbs::{
-    advisory_host_reads, control_sock_beside, daemon_provider_kind, host_asks_box,
+    advisory_host_reads, control_sock_beside, daemon_host_kind, host_asks_box,
     vm_host_answerer_status_at,
 };
 
@@ -66,7 +66,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 
     let host_asks = host_asks_box(global, name.as_deref());
     box_via_ssh(
-        daemon_provider_kind(global),
+        daemon_host_kind(global),
         &sock,
         id,
         None,
@@ -103,7 +103,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    box_via_ssh(daemon_provider_kind(global), &sock, r.id, wire, None, None).await
+    box_via_ssh(daemon_host_kind(global), &sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -135,7 +135,7 @@ pub async fn cmd_session_run(
     );
 
     box_via_ssh(
-        daemon_provider_kind(global),
+        daemon_host_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
@@ -236,7 +236,7 @@ pub async fn cmd_session_policy(
             // microVM backend's run path builds its registry and the
             // helper's enumeration from the default plan, so that is the
             // plan the display can name for it. Keyed on the backend this
-            // command actually talks to — `client_provider_kind`, the same
+            // command actually talks to — `client_host_kind`, the same
             // key `resolve_socket_path` turns on — not on `use_minvmd()`,
             // which is true only under an explicit `--provider
             // local-minvmd`: on macOS that kind is `Minvmd` without the
@@ -245,7 +245,7 @@ pub async fn cmd_session_policy(
             // carry — and it has no host-side gate the set would describe —
             // so that arm passes `None` and the block is left out rather
             // than printed from a plan the session does not attach to.
-            let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+            let fabric = (daemon_host_kind(global) == paths::HostKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
             format_policy(
@@ -540,7 +540,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     let mut client = match connect_daemon_unchecked(global).await {
         Ok(client) => client,
         Err(connect_err) => {
-            if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
+            if daemon_host_kind(global) != paths::HostKind::Minvmd {
                 return Err(connect_err);
             }
             // The VM may have gone down between the probe and the connect:
@@ -572,7 +572,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // still draining past the generic RPC deadline must not be killed sooner
     // than minvmd itself would kill it. A native daemon keeps the generic
     // deadline (a zero extra budget).
-    let drain_budget = if daemon_provider_kind(global) == paths::ProviderKind::Minvmd {
+    let drain_budget = if daemon_host_kind(global) == paths::HostKind::Minvmd {
         minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
     } else {
         std::time::Duration::ZERO
@@ -593,7 +593,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // error takes, reached by the same evidence.
     let resp = match resp {
         Err(rpc_err)
-            if daemon_provider_kind(global) == paths::ProviderKind::Minvmd
+            if daemon_host_kind(global) == paths::HostKind::Minvmd
                 && !daemon_confirmed_stopped(global.use_minvmd(), global.minimal_dir.clone())
                     .await =>
         {
@@ -663,10 +663,8 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
             if holds_name(&record) {
-                let control_sock = vm_host_control_sock(
-                    daemon_provider_kind(global),
-                    global.minimal_dir.as_deref(),
-                );
+                let control_sock =
+                    vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
                 release_held_box_name(
                     control_sock.clone(),
                     record.id,

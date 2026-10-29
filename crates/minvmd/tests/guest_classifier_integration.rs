@@ -94,7 +94,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// provider sockets beneath a default tempdir would overflow sun_path (104).
+/// host sockets beneath a default tempdir would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -361,13 +361,13 @@ impl Guest {
     /// deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let boot_log_path = std::env::var_os("MINVMD_BOOT_LOG")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| provider_dir.join("boot.log"));
+            .unwrap_or_else(|| host_dir.join("boot.log"));
         let mut guest = Guest {
-            sock_path: provider_dir.join("ssh.sock"),
+            sock_path: host_dir.join("ssh.sock"),
             boot_log_path,
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,

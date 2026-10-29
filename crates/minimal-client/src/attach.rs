@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_command_targets_the_provider_alias() {
+    fn attach_command_targets_the_host_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
         let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
-    /// host is the VM name namespaced under the provider-instance name.
+    /// host is the VM name namespaced under the host name.
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
@@ -1450,7 +1450,7 @@ mod tests {
         }
     }
 
-    /// A VM-backed provider dir carries the guest's recorded host key, so
+    /// A VM-backed host dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
     #[test]
     fn host_key_opts_pin_to_an_adjacent_known_hosts() {
