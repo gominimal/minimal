@@ -278,6 +278,14 @@ enum ManagerMessage {
     /// object, so the read runs off the mainloop. `None` for an id no
     /// retained record names.
     EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
+    /// The record and the on-disk object of the box `id`, read under one
+    /// teardown check (BOX-017). `None` for an id no record names, and
+    /// for a box being torn down, as to [`GetRecord`](Self::GetRecord).
+    /// It never starts an actor.
+    EndedSource(
+        SessionId,
+        Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
+    ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -333,6 +341,7 @@ impl ManagerMessage {
             Self::List(..) => "List",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
+            Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
@@ -1540,7 +1549,18 @@ impl BoxManagerHandle {
         &self,
         id: SessionId,
     ) -> Result<Option<EndedBox>, BoxManagerError> {
-        let Some(record) = self.get_record(BoxKeyPredicate::Id(id)).await? else {
+        // One manager message reads the record and the object, so a delete
+        // cannot start between the two reads.
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EndedSource(id, send))
+            .await;
+        let Some((record, object)) = recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        else {
             return Ok(None);
         };
         let state = record
@@ -1553,14 +1573,8 @@ impl BoxManagerHandle {
         ) {
             return Ok(None);
         }
-        // The events source is the store's object for the record, with no
-        // actor behind it. Its directories are the box's retained files.
-        let object = match self.box_events(id).await {
-            Ok(reader) => reader.object,
-            // Reaped between the two reads.
-            Err(e) if e.kind() == NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
+        // The object is the store's object for the record, with no actor
+        // behind it. Its directories are the box's retained files.
         use boxes::store::BoxObject as _;
         Ok(Some(EndedBox {
             state,
@@ -2349,6 +2363,25 @@ impl BoxManager {
                     Ok::<_, BoxManagerError>(
                         match self.store.find(RecordPredicate::Id(id)).await? {
                             Some(handle) => Some(handle.object().await?),
+                            None => None,
+                        },
+                    )
+                })
+                .await;
+            }
+            ManagerMessage::EndedSource(id, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            // Gone, as to `GetRecord`: a delete that has
+                            // started hands out no paths of the box.
+                            Some(handle) if tearing_down.contains(handle.id()) => None,
+                            Some(handle) => Some((handle.record().await?, handle.object().await?)),
                             None => None,
                         },
                     )
