@@ -12580,7 +12580,9 @@ fn box_package_build_under_box_egress_verdict() {
         super::setup::box_build_leaf(root, "sealed", "sealed", true),
         Err(
             "the build for box sealed did not start: box sealed runs under \
-             egress rules, and this host cannot apply them to the build"
+             egress rules, and its shell is not running to apply them to the \
+             build. Run `min session attach sealed` to start its shell, then \
+             run the build again."
                 .to_string()
         )
     );
@@ -12933,7 +12935,9 @@ fn box_package_build_under_box_egress_verdict_refuses_task_of_placed_box_without
     assert_eq!(
         refusal.to_string(),
         "the build for box sealed did not start: box sealed runs under \
-         egress rules, and this host cannot apply them to the build"
+         egress rules, and its shell is not running to apply them to the \
+         build. Run `min session attach sealed` to start its shell, then \
+         run the build again."
     );
     assert_eq!(
         Err(refusal.to_string()),

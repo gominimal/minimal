@@ -160,10 +160,18 @@ impl sandbox::Network for OwnAddressBuildNetwork {
 /// in a classifier leaf and that leaf is gone (NET-155). Every refusal of
 /// this kind uses this text: [`box_build_leaf`] and the task path
 /// (`exec::task_build_refusal`).
+///
+/// Only an Active box reaches this refusal: `context()` refuses a stopped or
+/// exited box first. An Active placed box loses its leaf when its shell ends
+/// (the host's teardown removes the leaf). An attach with no running shell
+/// mints a new one, and that launch places the box in a leaf again, so the
+/// attach is the next step.
 pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
     format!(
         "the build for box {box_name} did not start: box {box_name} runs under \
-         egress rules, and this host cannot apply them to the build"
+         egress rules, and its shell is not running to apply them to the build. \
+         Run `min session attach {box_name}` to start its shell, then run the \
+         build again."
     )
 }
 
