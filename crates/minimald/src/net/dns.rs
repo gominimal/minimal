@@ -880,6 +880,12 @@ pub struct HostnameRegistry {
     /// a caller fact without a lease is an unreported own-address lease only
     /// for a session that is not in this set (NET-070).
     host_net: HashSet<SessionId>,
+    /// The own-address boxes whose attach is running and has not reported
+    /// its switch lease yet ([`Self::begin_lease_attach`]). Only these make
+    /// [`Self::has_unreported_lease_callers`] true: a box created and never
+    /// started, or stopped, has no attach in flight and connects from no
+    /// lease at all (NET-070).
+    attaching: HashSet<SessionId>,
     /// The lease-to-session map that names a caller (NET-070): the switch
     /// address a proxied request's peer resolves to a session with. Reserved
     /// switch addresses never appear in it — the switch hands a PTask a lease
@@ -927,6 +933,7 @@ impl HostnameRegistry {
             own: HashMap::new(),
             callers: HashMap::new(),
             host_net: HashSet::new(),
+            attaching: HashSet::new(),
             by_lease: HashMap::new(),
         }
     }
@@ -1189,20 +1196,33 @@ impl HostnameRegistry {
             .any(|id| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id))
     }
 
-    /// Whether any live session with caller facts is an own-address box whose
-    /// switch lease is not reported yet: it is not a `HostNet` registration
-    /// and has no lease in the reported set. Such a box sits between
-    /// [`Self::register_caller`] at finalize and [`Self::report_own_address`]
-    /// at the end of its attach. Its connections come from a lease this node
-    /// does not hold, so [`connecting_box`] answers
-    /// [`ConnectingOwner::OffNode`] for them. While this is true, the proxy
-    /// cannot tell such a peer from a host-side client off the node, and it
-    /// refuses the peer as unattributed (NET-070, design §7.1).
+    /// Whether any own-address box is attaching and has not reported its
+    /// switch lease yet: it sits between [`Self::begin_lease_attach`] at the
+    /// start of its attach and [`Self::report_own_address`] at the end of it.
+    /// Its connections come from a lease this node does not hold, so
+    /// [`connecting_box`] answers [`ConnectingOwner::OffNode`] for them. While
+    /// this is true, the proxy cannot tell such a peer from a host-side client
+    /// off the node, and it refuses the peer as unattributed (NET-070, design
+    /// §7.1). A box that is registered but not attaching does not count: it
+    /// runs nothing that can connect.
     #[must_use]
     pub fn has_unreported_lease_callers(&self) -> bool {
-        self.callers
-            .keys()
-            .any(|id| !self.host_net.contains(id) && !self.own.contains_key(id))
+        self.attaching.iter().any(|id| !self.host_net.contains(id))
+    }
+
+    /// Marks `session_id` as an own-address box whose attach has started and
+    /// whose switch lease is not reported yet (NET-070). The mark ends at
+    /// [`Self::report_own_address`], at [`Self::end_lease_attach`] when the
+    /// attach fails or is abandoned, at [`Self::mark_stopped`] and at
+    /// [`Self::forget_own_address`].
+    pub fn begin_lease_attach(&mut self, session_id: SessionId) {
+        self.attaching.insert(session_id);
+    }
+
+    /// Ends the attach mark [`Self::begin_lease_attach`] set, for an attach
+    /// that failed or was abandoned before it reported a lease (NET-070).
+    pub fn end_lease_attach(&mut self, session_id: SessionId) {
+        self.attaching.remove(&session_id);
     }
 
     /// The own-address publishes standing inside the reserved local range, as
@@ -1369,6 +1389,7 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
+        self.attaching.remove(&session_id);
         // Recorded before the route is derived from it, so the route this
         // registration installs already targets the lease it is reporting:
         // [`Self::own_route`] reads the box's lease from this map, and a box
@@ -1396,6 +1417,7 @@ impl HostnameRegistry {
         }
         self.callers.remove(&session_id);
         self.host_net.remove(&session_id);
+        self.attaching.remove(&session_id);
         self.stopped.remove(&session_id);
     }
 
@@ -1801,6 +1823,8 @@ impl HostnameRegistry {
     /// address keeps answering A: that address answers for it alone, and a
     /// client connecting there is told where the box would be.
     pub fn mark_stopped(&mut self, session_id: SessionId) {
+        // A stopped box has no attach in flight (NET-070).
+        self.attaching.remove(&session_id);
         if self.stopped.insert(session_id) {
             tracing::info!(
                 session_id = %session_id,

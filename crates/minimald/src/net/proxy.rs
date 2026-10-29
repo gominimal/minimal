@@ -334,9 +334,9 @@ impl<T: HostRoute> Router<T> {
     /// is denied by default (design §7.1). Only a socket that no box owns,
     /// or a peer at an address the node does not hold, is
     /// [`CallerLookup::NoBox`]. The second holds only while no own-address
-    /// box waits for its lease report: such a box connects from a lease the
-    /// node does not hold, so while one is live an off-node peer is
-    /// [`CallerLookup::Unattributed`].
+    /// box is attaching and waits for its lease report: such a box connects
+    /// from a lease the node does not hold, so while one is attaching an
+    /// off-node peer is [`CallerLookup::Unattributed`].
     async fn caller_for(&self, peer: SocketAddrV4, local: Option<SocketAddr>) -> CallerLookup {
         if let Some(caller) = self.caller_at(*peer.ip()) {
             return CallerLookup::Box(caller);
@@ -4012,8 +4012,14 @@ mod tests {
         // pending box reports its lease.
         reg.register_host_net(host_box, "hostbox");
         reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
-        // The own-address caller: caller facts, no reported lease.
+        // The own-address caller: caller facts, an attach in flight, no
+        // reported lease.
         reg.register_caller(pending, "pending", &deny_all, subnet, None);
+        assert!(
+            !reg.has_unreported_lease_callers(),
+            "a registered box that is not attaching runs nothing that can connect"
+        );
+        reg.begin_lease_attach(pending);
         assert!(reg.has_unreported_lease_callers());
         let table = Arc::new(RwLock::new(reg));
         let router = Router::new(Arc::clone(&table), proxied_request_verdict)
@@ -4040,6 +4046,71 @@ mod tests {
         assert!(
             routed.contains("200 OK"),
             "expected an off-node peer to route once every lease is reported, got: {routed}"
+        );
+    }
+
+    /// NET-070, design §7.1: an own-address box that registered its caller
+    /// facts at finalize but never attached, or whose attach failed or whose
+    /// box stopped, runs nothing that can connect. It does not make the proxy
+    /// refuse an off-node peer, such as the host side of a VM's forwarded
+    /// port: that peer is no box and its request routes.
+    #[tokio::test]
+    async fn proxy_unattached_lease_caller_not_refused() {
+        let backend_port = spawn_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let idle = SessionId::parse_str("00000000-0000-0000-0000-000000000014").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        // A live host-address box keeps the socket-owner lookup running.
+        reg.register_host_net(host_box, "hostbox");
+        reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
+        // Registered at finalize, never attached.
+        reg.register_caller(idle, "idle", &deny_all, subnet, None);
+        assert!(!reg.has_unreported_lease_callers());
+        // An attach that failed before it reported a lease.
+        reg.begin_lease_attach(idle);
+        reg.end_lease_attach(idle);
+        assert!(!reg.has_unreported_lease_callers());
+        // An attach that was in flight when the box stopped.
+        reg.begin_lease_attach(idle);
+        reg.mark_stopped(idle);
+        assert!(!reg.has_unreported_lease_callers());
+        let table = Arc::new(RwLock::new(reg));
+        let router = Router::new(Arc::clone(&table), proxied_request_verdict)
+            .with_socket_owner(stub_socket_owner);
+
+        let peer = SocketAddrV4::new(OFF_NODE_ADDR, 40000);
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3128));
+        assert!(
+            matches!(
+                router.caller_for(peer, Some(local)).await,
+                CallerLookup::NoBox
+            ),
+            "an off-node peer is no box while no box is attaching"
+        );
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let routed = proxy_get_from(proxy_addr, OFF_NODE_ADDR, "web.min.internal:18080").await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected an off-node peer to route while no box is attaching, got: {routed}"
         );
     }
 
