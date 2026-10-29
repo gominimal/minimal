@@ -2250,7 +2250,7 @@ STUB
         OUT="$root/hc.$label"
         set +e
         env -i \
-            PATH="$hcbin:/usr/bin:/bin" \
+            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \

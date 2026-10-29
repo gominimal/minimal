@@ -6969,7 +6969,7 @@ mod tests {
                 "a rule that only reads the ct mark is not a writer: {text}"
             );
             assert!(
-                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                !mount.root.join(sandbox2::classifier::TABLE_MARKER).exists(),
                 "a refused install writes no marker: {text}"
             );
         }
@@ -7055,7 +7055,7 @@ mod tests {
                 "the refusal names min finalize-install with a placeholder for the mask: {text}"
             );
             assert!(
-                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                !mount.root.join(sandbox2::classifier::TABLE_MARKER).exists(),
                 "a refused install writes no marker: {text}"
             );
         }
@@ -7078,7 +7078,7 @@ mod tests {
     #[test]
     fn host_ip_box_ipv6_egress_refused() {
         let ruleset = rendered_ruleset();
-        let boxes = format!("{}/{}", tree_root_name(), sandbox::classifier::BOXES_DIR);
+        let boxes = format!("{}/{}", tree_root_name(), sandbox2::classifier::BOXES_DIR);
         assert!(
             ruleset.contains(
                 "chain ipv6_out {\n        type filter hook output priority filter; policy accept;"
