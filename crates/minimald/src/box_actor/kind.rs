@@ -20,6 +20,7 @@ impl BoxMessage {
             Self::Rename { .. } => "Rename",
             Self::IsBusy { .. } => "IsBusy",
             Self::Stop { .. } => "Stop",
+            Self::StopBox { .. } => "StopBox",
             Self::Destroy { .. } => "Destroy",
             Self::DestroyIfUnfinalized(_) => "DestroyIfUnfinalized",
             Self::GetRecord { .. } => "GetRecord",

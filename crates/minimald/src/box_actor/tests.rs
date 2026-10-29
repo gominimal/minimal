@@ -84,7 +84,9 @@ async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
 
     // A loop that accepted the kill but never resolves — models the
     // mainloop parked mid-`step()`.
-    let mut task = crate::traced::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+    let mut task = crate::traced::spawn(std::future::pending::<
+        Result<crate::box_runtime::HostExit, std::io::Error>,
+    >());
 
     // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
     // the deadline that returns this call. Reaching GIVE_UP would mean the
@@ -13138,4 +13140,552 @@ fn box_package_build_under_box_egress_verdict_builds_unenforced_box_without_rule
         ),
         None
     );
+}
+
+/// Spawns a stand-in box: `/bin/sh` sets `trap`, then loops on `sleep`.
+/// It answers once the shell set the trap and started its first `sleep`, so
+/// a stop never reaches a shell that still has the default SIGTERM action.
+fn spawn_stand_in_box(trap: &str) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "{trap}; sleep 0.05 & echo ready; wait; while :; do sleep 0.05; done"
+        ))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in box");
+    let stdout = child.stdout.take().expect("the stand-in box's stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read the stand-in box's ready line");
+    assert_eq!(line.trim(), "ready", "the stand-in box set its trap");
+    child
+}
+
+/// A stand-in host loop for `child`: it reaps the child and reports the end
+/// as `hakoniwa` does. A signalled child has no exit status of its own and
+/// carries the container's 125.
+fn stand_in_entrypoint(
+    child: std::process::Child,
+) -> tokio::task::JoinHandle<Result<crate::box_runtime::HostExit, std::io::Error>> {
+    crate::traced::spawn_blocking(move || {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = child;
+        let status = child.wait()?;
+        let reason = match status.code() {
+            Some(code) => crate::box_runtime::ExitReason {
+                code,
+                exit_code: Some(code),
+                reason: format!("process(stand-in) exited with code {code}"),
+            },
+            None => crate::box_runtime::ExitReason {
+                code: 125,
+                exit_code: None,
+                reason: format!(
+                    "container received signal {}",
+                    status.signal().unwrap_or_default()
+                ),
+            },
+        };
+        Ok(crate::box_runtime::HostExit {
+            code: reason.code,
+            reason: Some(reason),
+        })
+    })
+}
+
+/// BOX-013: a stop sends SIGTERM to every process in the box, waits the
+/// grace period, sends SIGKILL to those still running, and the record ends
+/// `stopped` with an `exited` event that carries `reason = "stopped"` and
+/// the signal that ended the entrypoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    // A box that ignores SIGTERM: the grace runs out and SIGKILL ends it.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    assert!(
+        !processes.pids().is_empty(),
+        "the stand-in box should be running"
+    );
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_millis(500),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "a graceful stop waits the grace period before SIGKILL"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(outcome.unfinished.is_none());
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the stop"
+    );
+
+    // Through the daemon: the mock shell ends on SIGTERM, and the record
+    // and its events keep that signal.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+    assert!(host.is_alive());
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    assert_eq!(
+        ending,
+        StopEnding::Signalled {
+            signal: libc::SIGTERM
+        }
+    );
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+    assert_eq!(record.signal, Some(libc::SIGTERM));
+    assert_eq!(record.exit_code, None);
+
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the stop records an exited event");
+    assert_eq!(exited.data["reason"], "stopped");
+    assert_eq!(exited.data["signal"], libc::SIGTERM);
+    assert!(!exited.data.contains_key("exit_code"));
+}
+
+/// BOX-013: a forced stop kills every process in the box at once, without
+/// the grace period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_force_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        true,
+        Duration::from_secs(60),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a forced stop does not wait the grace period: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}
+
+/// BOX-013: a forced stop that arrives while a graceful stop waits out its
+/// grace period ends the grace. The graceful stop sends SIGKILL at once, and
+/// the box does not wait the rest of the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forced_during_a_graceful_stop_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let forced = super::StopForce::default();
+
+    // The forced stop arrives inside the graceful stop's grace period.
+    let setter = std::sync::Arc::clone(&forced);
+    crate::traced::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(60),
+        &forced,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the graceful stop waited until the forced stop arrived: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a forced stop cuts the grace period short: {elapsed:?}"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}
+
+/// BOX-013: an entrypoint that exits 125 on SIGTERM inside the grace period
+/// keeps its own exit status. `hakoniwa` reports 125 for a signalled
+/// container as well, so only the reaped reason tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let child = spawn_stand_in_box("trap 'exit 125' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(outcome.sent[0], libc::SIGTERM);
+    let ending = outcome.ending;
+    assert_eq!(ending, StopEnding::ExitedFirst { exit_code: 125 });
+    assert!(outcome.unfinished.is_none());
+
+    // The record and the event the stop writes for this ending.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let mut record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("the box has a record");
+    record.set_state(RecordState::Stopped(ending));
+    assert_eq!(record.exit_code, Some(125));
+    assert_eq!(record.signal, None);
+
+    let exited = super::stopped_event_data(ending);
+    assert_eq!(exited["reason"], "stopped");
+    assert_eq!(exited["exit_code"], 125);
+    assert!(!exited.contains_key("signal"));
+}
+
+/// BOX-013: a stop that ends the processes and cannot write the `stopped`
+/// record keeps the box hosted. No launch starts new processes in it until a
+/// retried stop writes the record with the ending of the first stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_an_unwritable_record_refuses_launches_until_retried() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = Vec::new();
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged.push(tmp);
+        }
+    }
+    assert_eq!(staged.len(), 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+    host.closed().await;
+
+    let refused = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect_err("no launch while the stop's record is unwritten");
+    assert!(
+        refused
+            .to_string()
+            .contains("stopped state is not saved yet"),
+        "the refusal says why: {refused}"
+    );
+
+    for tmp in &staged {
+        std::fs::remove_dir(tmp).unwrap();
+    }
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the retried stop writes the record");
+    assert_eq!(
+        ending,
+        boxes::core::record::StopEnding::Signalled {
+            signal: libc::SIGTERM
+        },
+        "the retried stop keeps how the first stop ended the box"
+    );
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
+/// NET-128 fail-closed: a stop that ends the box's processes and cannot
+/// write the `stopped` record still marks the box's name stopped. A
+/// shared-address name does not keep answering for a box with no process.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_box_with_an_unwritable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unwritbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged += 1;
+        }
+    }
+    assert_eq!(staged, 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unwritbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unwritbox".to_string(),
+            address: None,
+        },
+        "a failed record write still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unwritbox.min.internal"),
+        None,
+        "the proxy does not forward a box whose stop could not write its record"
+    );
+}
+
+/// BOX-013: the `stopped` record is the step a stop cannot skip. When the
+/// `exited` event cannot be written, the stop still answers with its ending
+/// and the record still reads `stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_a_failing_event_write_still_records_stopped() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the events file belongs: every append fails.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut broken = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let events = dir.join("events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir(&events).unwrap();
+        broken += 1;
+    }
+    assert_eq!(broken, 1, "the server holds one box");
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("a failed event write does not fail the stop");
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
+/// BOX-013: a container supervisor that already exited and was reaped has
+/// no readable namespace. Its pid can belong to an unrelated process by
+/// then, so the stop finds no process of the box and signals nothing.
+#[test]
+fn of_container_on_a_reaped_supervisor_signals_nothing() {
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn the stand-in supervisor");
+    let pid = child.id();
+    child.wait().expect("reap the stand-in supervisor");
+
+    for root in [pid, u32::try_from(i32::MAX).unwrap()] {
+        let processes = crate::box_runtime::BoxProcesses::of_container(root);
+        assert!(
+            processes.pids().is_empty(),
+            "a supervisor with no readable namespace has no processes"
+        );
+        // Signal 0 checks delivery and sends nothing, so a reused pid is safe.
+        assert_eq!(processes.signal(0), 0, "no process is signalled");
+    }
+}
+
+/// BOX-013: a pid in the daemon's own namespace that is not the daemon's
+/// child is not a supervisor the daemon spawned. A reaped supervisor's pid
+/// can be reused by such a process, so the stop signals nothing.
+#[test]
+fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
+    use std::io::BufRead as _;
+
+    // The shell's background `sleep` is a grandchild: its parent is the shell.
+    let mut shell = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in shell");
+    let mut line = String::new();
+    std::io::BufReader::new(shell.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("read the grandchild's pid");
+    let grandchild: u32 = line.trim().parse().expect("a pid");
+
+    let processes = crate::box_runtime::BoxProcesses::of_container(grandchild);
+    assert!(
+        processes.pids().is_empty(),
+        "a process the daemon did not spawn is not the box's supervisor"
+    );
+    assert_eq!(processes.signal(0), 0, "no process is signalled");
+
+    // The grandchild is still alive: the stop did not reach it.
+    // SAFETY: `kill` reads no memory of ours.
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(grandchild).unwrap(), 0) },
+        0
+    );
+    // SAFETY: as above. This ends the stand-in before the shell is reaped.
+    unsafe { libc::kill(i32::try_from(grandchild).unwrap(), libc::SIGKILL) };
+    shell.wait().expect("reap the stand-in shell");
 }
