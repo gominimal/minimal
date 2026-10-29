@@ -3061,3 +3061,217 @@ async fn stopped_box_record_readable_until_reaped() {
         ErrorKind::NotFound
     );
 }
+
+/// Sets a retained record to `state` through a store over `state_dir`, as
+/// the box's own stop or exit would have left it.
+async fn set_record_state(
+    state_dir: &std::path::Path,
+    id: SessionId,
+    state: boxes::core::record::RecordState,
+) {
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let mut record = handle.record().await.unwrap();
+    record.set_state(state);
+    handle.write(record).await.unwrap();
+}
+
+/// A config named `name` whose project root is `root`, built from a
+/// working path that is the same for every box.
+fn rooted_config(name: &str, root: &str) -> minimald_rpc::BoxConfig {
+    let mut config = sample_config();
+    config.name = Some(name.to_string());
+    config.project_path = HostAbsPath::try_new("/home/dev/proj").unwrap();
+    config.project_root = Some(HostAbsPath::try_new(root).unwrap());
+    config
+}
+
+/// BOX-158: the listing holds every retained record, in any state, with
+/// its id, name, type, parent, project root and state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_returns_every_retained_record_with_state() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let (state, cache, mngr) = manager().await;
+    let stopped =
+        create_active_session_with(&mngr, rooted_config("stopped", "/home/dev/proj")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/home/dev/proj")).await;
+    drop(mngr);
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::Signalled {
+            signal: libc::SIGTERM,
+        }),
+    )
+    .await;
+    set_record_state(state.path(), exited, RecordState::Exited(ExitEnding::Oom)).await;
+
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let running =
+        create_active_session_with(&mngr, rooted_config("running", "/home/dev/proj")).await;
+    let pending = mngr
+        .create_session(rooted_config("pending", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    let ids: Vec<_> = listing.iter().map(|entry| entry.box_id).collect();
+    let mut expected = vec![stopped, exited, running, pending];
+    expected.sort();
+    assert_eq!(ids, expected, "every retained record, in box id order");
+
+    let entry = |id| listing.iter().find(|entry| entry.box_id == id).unwrap();
+    let root = Some(HostAbsPath::try_new("/home/dev/proj").unwrap());
+    for (id, name, state) in [
+        (stopped, "stopped", "stopped"),
+        (exited, "exited", "exited"),
+        (running, "running", "running"),
+        (pending, "pending", "pending"),
+    ] {
+        let entry = entry(id);
+        assert_eq!(entry.name.as_deref(), Some(name));
+        assert_eq!(entry.state, state, "{entry:?}");
+        assert_eq!(entry.box_type.as_deref(), Some(boxes::SESSION_BOX_TYPE));
+        assert_eq!(entry.parent, None, "a box created outside any box");
+        assert_eq!(entry.project_root, root);
+    }
+    assert_eq!(entry(stopped).reason.as_deref(), Some("stopped"));
+    assert_eq!(entry(stopped).signal, Some(libc::SIGTERM));
+    assert_eq!(entry(stopped).exit_code, None);
+    assert_eq!(entry(exited).reason.as_deref(), Some("oom"));
+    assert_eq!(entry(exited).exit_code, Some(137));
+    assert_eq!(entry(running).reason, None);
+}
+
+/// BOX-158: a listing scoped to a project holds only the records whose
+/// recorded project root is that project's, whatever their working path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_scoped_to_project_reads_project_root() {
+    let (_state, _cache, mngr) = manager().await;
+    let inside = mngr
+        .create_session(rooted_config("inside", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    // Built from the same working path, under another project's root.
+    let _outside = mngr
+        .create_session(rooted_config("outside", "/home/dev"), None)
+        .await
+        .unwrap();
+
+    let root = HostAbsPath::try_new("/home/dev/proj").unwrap();
+    let scoped = mngr.list_boxes(Some(&root)).await.unwrap();
+    let ids: Vec<_> = scoped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(ids, [inside]);
+
+    let elsewhere = HostAbsPath::try_new("/home/dev/elsewhere").unwrap();
+    assert!(mngr.list_boxes(Some(&elsewhere)).await.unwrap().is_empty());
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+}
+
+/// BOX-159: a read returns the record with its state and ending, the
+/// identity the box runs under, and its live execs. An unknown id reads
+/// as none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_returns_record_state_identity_and_live_execs() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("shown", "/home/dev/proj")).await;
+
+    let running = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the box is retained");
+    assert_eq!(running.record.state, "running");
+    assert_eq!(running.identity, minimald_rpc::BoxIdentity::None);
+    // No exec runs in the box.
+    assert!(running.live_execs.is_empty(), "{:?}", running.live_execs);
+    drop(mngr);
+
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 3 }),
+    )
+    .await;
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let shown = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the box is retained");
+    assert_eq!(
+        shown.record,
+        minimald_rpc::BoxListingEntry {
+            box_id: id,
+            name: Some("shown".to_string()),
+            box_type: Some(boxes::SESSION_BOX_TYPE.to_string()),
+            parent: None,
+            project_root: Some(HostAbsPath::try_new("/home/dev/proj").unwrap()),
+            state: "stopped".to_string(),
+            reason: Some("stopped".to_string()),
+            exit_code: Some(3),
+            signal: None,
+        }
+    );
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+    assert!(shown.live_execs.is_empty());
+    assert_eq!(
+        mngr.running_count().await,
+        0,
+        "a read starts no actor for the box"
+    );
+
+    assert_eq!(mngr.show_box(SessionId::mint()).await.unwrap(), None);
+}
+
+/// BOX-158, BOX-159: the id a listing prints reads back through show,
+/// also for a record whose `box_id` differs from its `id`, as on a VM
+/// guest. The record `id` still reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_box_finds_a_box_by_the_id_list_prints() {
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("guest", "/home/dev/proj")).await;
+    drop(mngr);
+
+    let box_id = SessionId::mint();
+    assert_ne!(box_id, id);
+    let store = crate::store::Store::init(daemon_abs(state.path()))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let mut record = handle.record().await.unwrap();
+    record.box_id = Some(box_id);
+    handle.write(record).await.unwrap();
+    drop(store);
+
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let listing = mngr.list_boxes(None).await.unwrap();
+    let listed: Vec<_> = listing.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(listed, [box_id], "the listing prints the box_id");
+
+    let shown = mngr
+        .show_box(box_id)
+        .await
+        .unwrap()
+        .expect("the id the listing prints finds the box");
+    assert_eq!(shown.record, listing[0]);
+    let by_record_id = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the record id still finds the box");
+    assert_eq!(by_record_id.record.box_id, box_id);
+}
