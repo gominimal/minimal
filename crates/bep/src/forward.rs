@@ -824,10 +824,6 @@ impl Flow {
     ) -> Result<String, &'static str> {
         let span = tracing::Span::current();
         let identifier = admit.identifier();
-        // The connection span names the reference as the audit record
-        // does, and never the value (BEP-028).
-        span.record("store", admit.store.as_str());
-        span.record("identifier", identifier.as_str());
         let header = match &admit.inject {
             Inject::Header { name, .. } => name.to_ascii_lowercase(),
             Inject::BasicAuth { .. } => "authorization".to_owned(),
@@ -883,6 +879,11 @@ impl Flow {
         );
         match result {
             Ok(()) => {
+                // The connection span names the reference as the audit
+                // record does, and never the value (BEP-028). It is set
+                // only for an injection that happened.
+                span.record("store", admit.store.as_str());
+                span.record("identifier", identifier.as_str());
                 span.record("substitution", "substituted");
                 span.record("cohort_attributed", admit.cohort_attributed);
                 self.record(
@@ -2483,6 +2484,21 @@ mod tests {
             .unwrap_or_else(|| panic!("no span close in {log}"));
         assert!(!close.contains("store="), "{close}");
         assert!(!close.contains("identifier="), "{close}");
+
+        // A refused reference: nothing was injected, so the span has no
+        // store and no identifier, and says the substitution was refused.
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let (_, end) = send_store(&flow, &format!("x-api-key: {sealed}"));
+            assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{end:?}");
+        });
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(!close.contains("store="), "{close}");
+        assert!(!close.contains("identifier="), "{close}");
+        assert!(close.contains("refused"), "{close}");
     }
 
     // BEP-032: an admitted store reference reaches the rule's upstream with
