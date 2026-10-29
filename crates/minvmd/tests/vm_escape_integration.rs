@@ -1560,6 +1560,18 @@ impl HostListener {
         log.join("; ")
     }
 
+    /// How many connections the listener accepted so far. The switch's NAT
+    /// dials the listener when a SYN arrives, before it answers the SYN, so
+    /// a new accept proves a SYN left the VM whatever happens to its reply.
+    fn accepted(&self) -> usize {
+        self.log
+            .lock()
+            .expect("log lock is held only across this read")
+            .iter()
+            .filter(|entry| entry.starts_with("a connection was accepted"))
+            .count()
+    }
+
     /// Whether a marker whose text contains `needle` has arrived yet.
     fn seen_any(&self, needle: &str) -> bool {
         self.seen
@@ -1996,7 +2008,18 @@ async fn vm_escape_bounded_to_resident_union() {
         verdict,
     });
     // A second `host_ip` box whose rules name the listener: the marked frame
-    // passes under that box's rules, and its marker arrives.
+    // passes under that box's rules, and its SYN reaches the listener.
+    //
+    // The spoofer cannot complete the handshake, and the gate is not why.
+    // The in-VM daemon holds the node address with its own MAC, and its own
+    // traffic keeps the switch's neighbor entry for that address reachable.
+    // An unsolicited ARP reply does not override a reachable entry, so the
+    // SYN-ACK goes to the daemon's connection, where the VM's kernel answers
+    // it, and never to the spoofer's. A real host_ip box shares the daemon's
+    // address and MAC, so its replies take that same path. What the gate
+    // decides is the outbound frame, and the NAT's dial at the listener is
+    // the proof that the SYN left the VM: the NAT dials the backend before
+    // it answers the SYN.
     let reaching = boxes::SessionId::mint();
     host_ip_box(
         &guest.control_sock,
@@ -2011,23 +2034,42 @@ async fn vm_escape_bounded_to_resident_union() {
     )
     .expect("admitting a host_ip box that reaches the listener");
     let admitted = marked_flow("admitted", 41_003);
-    match spoofed_flow(&guest.gate_sock, &admitted, Duration::from_secs(20)) {
-        Ok(_) => {}
-        Err(e) => panic!(
-            "vm_escape_integration: a box-marked frame a resident host_ip box admits \
-             never completed its flow to {host}:{port} ({e}); the gate said: {}",
-            gate_account(&guest)
-        ),
+    let accepted_before = listener.accepted();
+    // The flow ends at its deadline without a SYN-ACK: the reply goes to the
+    // in-VM daemon (see above). A completed flow is fine too.
+    let outcome = match spoofed_flow(&guest.gate_sock, &admitted, Duration::from_secs(10)) {
+        Ok(marker_ack) => format!("the flow completed [{marker_ack}]"),
+        Err(e) => format!("the reply went to the in-VM daemon [{e}]"),
+    };
+    let dialed_end = Instant::now() + Duration::from_secs(10);
+    while listener.accepted() <= accepted_before && Instant::now() < dialed_end {
+        std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        listener.wait_for(&admitted.marker, Duration::from_secs(10)),
-        "the admitted marked frame's marker never reached the host listener"
+        listener.accepted() > accepted_before,
+        "vm_escape_integration: a box-marked frame a resident host_ip box admits \
+         never reached {host}:{port}: the listener accepted no new connection \
+         ({outcome}); the listener saw: {}; the gate said: {}",
+        listener.report(),
+        gate_account(&guest)
+    );
+    assert!(
+        !guest
+            .log_lines(&["egress-host-ip-boxes"])
+            .iter()
+            .any(|line| line.contains("resident_host_ip_boxes=2")),
+        "the gate dropped the admitted marked frame under the host_ip rule; \
+         the gate said: {}",
+        gate_account(&guest)
     );
     attempts.push(Attempt {
         source: node,
         destination: host,
         port,
-        verdict: "marked frame admitted by a resident host_ip box's rules".to_string(),
+        verdict: format!(
+            "marked frame admitted by a resident host_ip box's rules, and its SYN \
+             reached the listener ({outcome})"
+        ),
     });
     for session in [elsewhere, reaching] {
         host_ip_box(&guest.control_sock, session, None, false)
