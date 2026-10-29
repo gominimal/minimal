@@ -1306,6 +1306,16 @@ impl InfrastructureDenySet {
             ],
         }
     }
+
+    /// Adds a second host address the switch maps to the host loopback,
+    /// as a `/32` in the always-refused class. A carved switch maps the
+    /// documented host literal beside its own alias, so the literal is one
+    /// of the switch's own addresses and no name may resolve to it.
+    #[must_use]
+    pub fn with_host_literal(mut self, literal: [u8; 4]) -> Self {
+        self.fixed.push(Ipv4Cidr::exact(literal));
+        self
+    }
 }
 
 /// The IPv6 half of the infrastructure deny set, as a record for the IPv6

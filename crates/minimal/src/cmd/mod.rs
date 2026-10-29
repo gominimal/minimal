@@ -24,6 +24,7 @@ mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]
 mod box_verbs;
+mod doctor;
 mod finalize_install;
 mod list;
 mod net;
@@ -248,6 +249,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Doctor) => doctor::cmd_doctor(),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
