@@ -1822,9 +1822,11 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     .await
 }
 
-/// Resolve a named attach target to its record and the socket the hand-off
-/// runs over — the target `min session attach` lands in when the name alone
-/// decides where to look (NET-058).
+/// Resolve a named box to its record and the socket the hand-off runs over:
+/// the target `min session attach`, `min session exec`, `min session run` and
+/// `min net forward` land in when the name alone decides where to look
+/// (NET-058). `verb` leads the one line that says which VM the box was found
+/// on ("Attaching to", "Running in", ...).
 ///
 /// The selected VM's daemon is asked first (`client`, reached over `sock`):
 /// the common case — a box on the VM the operator is already on — costs
@@ -1836,21 +1838,31 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// named the box, so a skewed VM cannot be reached through it. Nothing found
 /// anywhere returns the selected VM's own error — the "no session found" it
 /// computed, or its skew — as the more useful of the two answers.
-pub(crate) async fn resolve_attach_target_version_gated(
+pub(crate) async fn resolve_named_box_version_gated(
     global: &GlobalArgs,
     client: &mut client::Client,
     sock: std::path::PathBuf,
     name: &str,
+    verb: &str,
 ) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
     match resolve_session_version_gated(client, name).await {
         Ok(record) => Ok((record, sock)),
         Err(selected) => match attach::resolve_box_vm(global, name).await? {
             Some(resolved) => {
+                // From here the process acts on the owning VM, as `--vm`
+                // would have made it: everything keyed on the VM's name
+                // (the VM host control socket the pre-attach re-hold asks,
+                // the answerer beside it) must be that VM's, or the re-hold
+                // lands on the selected VM's host daemon as a name with no
+                // row behind it and the hand-off stalls. The enumeration
+                // validated the name; a second set (none happens before a
+                // resolution) is a no-op.
+                let _ = client::set_vm_name(&resolved.vm);
                 // The operator never chose the VM the way they chose the
                 // session, so tell them which one they're landing in.
                 if should_announce_session(global) {
                     eprintln!(
-                        "Attaching to session {} on VM {}",
+                        "{verb} session {} on VM {}",
                         session_announce_label(
                             &resolved.record.id,
                             resolved.record.name.as_deref()
@@ -1863,6 +1875,17 @@ pub(crate) async fn resolve_attach_target_version_gated(
             None => Err(selected),
         },
     }
+}
+
+/// [`resolve_named_box_version_gated`] for `min session attach`: the attach
+/// target, announced as one.
+pub(crate) async fn resolve_attach_target_version_gated(
+    global: &GlobalArgs,
+    client: &mut client::Client,
+    sock: std::path::PathBuf,
+    name: &str,
+) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
+    resolve_named_box_version_gated(global, client, sock, name, "Attaching to").await
 }
 
 /// Executes a command in an existing session.
@@ -1884,8 +1907,12 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     // Gated by hand for the same reason as `cmd_attach`: this hands off into a
     // live session (the daemon mints the exec channel and runs the attach
     // hooks around it), which is not something to drive on a skewed pair. The
-    // gate rides on the lookup's reply — no `GetVersion` ahead of it.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // gate rides on the lookup's reply — no `GetVersion` ahead of it. The name
+    // alone decides where to look (NET-058), as it does for attach: a box on
+    // another VM is reached over that VM's socket, with no global flag.
+    let (r, sock) =
+        resolve_named_box_version_gated(global, &mut client, sock, &args.session, "Running in")
+            .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -1914,8 +1941,16 @@ pub async fn cmd_session_run(
         .await
         .context("Failed to connect to minimald")?;
     // Gated by hand for the same reason as `cmd_exec`: this hands off into a
-    // live session, which is not something to drive on a skewed pair.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // live session, which is not something to drive on a skewed pair. The name
+    // alone decides where to look (NET-058), as for exec.
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running the task in",
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
