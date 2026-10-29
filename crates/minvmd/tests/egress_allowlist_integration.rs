@@ -61,7 +61,7 @@ mod common;
 const TOOLCHAIN_HOSTS: &[&str] = boxes::NET068_TOOLCHAIN_EGRESS_HOSTS;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// provider sockets beneath a default tempdir would overflow sun_path (104).
+/// host sockets beneath a default tempdir would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -220,13 +220,13 @@ impl Guest {
     /// deadlines, quoting the supervisor's `run.log`.
     fn boot() -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
-        let sock_path = provider_dir.join("ssh.sock");
-        let control_sock = provider_dir.join(minvmd::control::CONTROL_SOCK_FILE);
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
+        let sock_path = host_dir.join("ssh.sock");
+        let control_sock = host_dir.join(minvmd::control::CONTROL_SOCK_FILE);
         let boot_log_path = std::env::var_os(MINVMD_BOOT_LOG_ENV)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| provider_dir.join("boot.log"));
+            .unwrap_or_else(|| host_dir.join("boot.log"));
 
         // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
         // the caller); the rootfs stays generic.

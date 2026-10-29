@@ -5,6 +5,10 @@
 //! invoked the CLI. The daemon's state is inspected directly (via
 //! `TestClient`) to verify side-effects.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 mod common;
 
 use boxes::SessionId;
@@ -295,7 +299,7 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("PROJECT PATH"),
         "header should list PROJECT PATH: {text}"
     );
-    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(text.contains("running"), "row should show status: {text}");
     assert!(
         text.contains("/work/proj"),
         "row should show project path: {text}"
@@ -4386,8 +4390,8 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 /// client-certificate RPC, or the `ssh-forward` feature that compiled
 /// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
 /// daemon's build flags from here, so assert on its sources and manifests —
-/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
-/// uses to prove a verb dropped a surface.
+/// a source scan, the way `minimal`'s own unit tests prove a verb dropped
+/// a surface.
 #[test]
 fn retired_surfaces_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4462,6 +4466,11 @@ fn retired_surfaces_absent() {
         ("Cargo.toml", &["rcgen"]),
         // Nothing passes a removed feature to the daemon builds.
         ("justfile", &["networking-proxy", "{{features}}"]),
+        // A `min bug` bundle collects no client certificate.
+        ("crates/minimal/src/diag/collect.rs", &["client.pem"]),
+        // Neither answerer documents the retired proxy port.
+        ("crates/minimald/src/net/answerer.rs", &[":7655"]),
+        ("crates/minvmd/src/net/answerer.rs", &[":7655"]),
     ];
     for (rel, retired) in retired_surfaces.iter().copied() {
         let text = source(rel);
@@ -4472,6 +4481,50 @@ fn retired_surfaces_absent() {
             );
         }
     }
+}
+
+/// `min login` is the GitHub sign-in, the alias for `min auth login`
+/// (NET-109): it takes the same arguments, parses into the same arguments,
+/// and its help describes the sign-in, not a retired certificate.
+#[test]
+fn login_runs_auth_login() {
+    use clap::{CommandFactory as _, Parser as _};
+
+    let cli = Cli::try_parse_from(["min", "login", "--device"]).expect("min login --device parses");
+    let Some(Command::Login(AuthLoginArgs { device })) = cli.command else {
+        panic!("min login must parse into the auth login arguments");
+    };
+    assert!(device, "--device reaches the sign-in");
+
+    let mut cmd = Cli::command();
+    let login = cmd
+        .find_subcommand_mut("login")
+        .expect("min login is a command");
+    assert!(!login.is_hide_set(), "min login is listed in min --help");
+    let help = login.render_long_help().to_string();
+    assert!(
+        help.contains("Sign in to GitHub (the same as min auth login)"),
+        "min login --help must describe the GitHub sign-in, got: {help}"
+    );
+    assert!(
+        help.contains("--device"),
+        "min login --help lists --device: {help}"
+    );
+    for retired in ["mint", "certificate", "reverse proxy"] {
+        assert!(
+            !help.contains(retired),
+            "min login --help still names `{retired}`: {help}"
+        );
+    }
+
+    // The flag that steered the retired certificate writes is refused.
+    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
+        panic!("--cert-dir is retired and must not parse");
+    };
+    assert!(
+        err.to_string().contains("--cert-dir"),
+        "the refusal must name the retired flag, got: {err}"
+    );
 }
 
 /// The daemon's `ListSessions` reply no longer carries the mTLS field, and a
@@ -4967,7 +5020,7 @@ async fn net_forward_announces_the_bound_local_port() {
 /// so the assertion is on the process actually terminating.
 ///
 /// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
-/// the native `local-minimald` provider socket, which the harness daemon
+/// the native `local-minimald` host socket, which the harness daemon
 /// serves on a UDS; macOS resolves `local-minvmd` instead.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -5058,8 +5111,8 @@ async fn activate_own_ip_on_vm_host<G>(
     stand_up: impl FnOnce(&std::path::Path) -> G,
 ) -> std::process::Output {
     let state = tempfile::TempDir::new().unwrap();
-    let provider_dir = state.path().join("providers").join("local-minvmd0");
-    let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+    let host_dir = state.path().join("providers").join("local-minvmd0");
+    let state_dir = minvmd::state::StateDir::new(host_dir.clone()).unwrap();
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -5068,8 +5121,8 @@ async fn activate_own_ip_on_vm_host<G>(
         .unwrap();
     let _alive = state_dir.try_acquire_alive_lock().unwrap();
     let server = minimald::test_harness::TestServer::new().await;
-    server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
-    let _control = stand_up(&provider_dir.join("control.sock"));
+    server.listen_on_uds(&host_dir.join("ssh.sock")).await;
+    let _control = stand_up(&host_dir.join("control.sock"));
 
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();

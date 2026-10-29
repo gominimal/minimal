@@ -950,7 +950,7 @@ impl ServerStateHandle {
         self.0.lock().await.config.minimal_state_dir.clone()
     }
 
-    /// The daemon's identity dir — the provider instance dir it runs under,
+    /// The daemon's identity dir — the host dir it runs under,
     /// whose canonical path is the node id its channel client publishes
     /// under (`main`'s `client_instance_dir`). `None` for a daemon with no
     /// identity dir configured (a harness server): its node id falls back
@@ -1020,6 +1020,87 @@ pub trait Listener: Send {
     const IS_LOCAL: bool;
 
     fn accept(&self) -> impl Future<Output = std::io::Result<(Self::Stream, Self::Addr)>> + Send;
+
+    /// The vsock CID of a peer this transport refuses at accept, or `None`
+    /// to serve it. The accept loop asks this before it reads a byte from
+    /// the connection, and drops a refused one unread. Only the vsock
+    /// transport refuses a peer ([`vsock_peer_refused`]); a UDS peer is
+    /// gated by its socket's file mode instead.
+    fn refused_cid(_peer: &Self::Addr) -> Option<u32> {
+        None
+    }
+}
+
+/// Whether a vsock peer at `cid` is refused by the in-VM daemon's RPC
+/// listener (NET-139): every CID but the host's (`VMADDR_CID_HOST`, 2). The
+/// vsock channel into a VM runs host to guest only, so a guest-local peer
+/// (loopback CID 1, the VM's own CID, or a sibling) is not the host and is
+/// refused, whatever the box seal's state.
+#[cfg(target_os = "linux")]
+pub(crate) fn vsock_peer_refused(cid: u32) -> bool {
+    cid != tokio_vsock::VMADDR_CID_HOST
+}
+
+/// How often the refusal line for one peer CID is written (NET-139): the
+/// first refusal in a window writes the line, and the line carries the
+/// count of refusals since the last one, so a peer that connects in a loop
+/// cannot flood the daemon's log.
+const PEER_REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peer CIDs the refusal limiter tracks at once. Past it the
+/// table is cleared, so a peer that cycles CIDs costs a line per CID, not
+/// memory.
+const PEER_REFUSAL_TRACKED: usize = 64;
+
+/// Per peer CID: when its refusal line was last written, and how many
+/// refusals came after that line.
+static PEER_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (std::time::Instant, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records one refused peer at `cid` and answers how many refusals the
+/// line to write now covers, or `None` while the CID's window is still
+/// open and the line is suppressed.
+fn peer_refusal_due(cid: u32, now: std::time::Instant) -> Option<u64> {
+    let mut refusals = PEER_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refusals.len() >= PEER_REFUSAL_TRACKED && !refusals.contains_key(&cid) {
+        refusals.clear();
+    }
+    match refusals.get_mut(&cid) {
+        Some((last, unlogged)) if now.duration_since(*last) < PEER_REFUSAL_LOG_INTERVAL => {
+            *unlogged = unlogged.saturating_add(1);
+            None
+        }
+        Some((last, unlogged)) => {
+            let covered = unlogged.saturating_add(1);
+            *last = now;
+            *unlogged = 0;
+            Some(covered)
+        }
+        None => {
+            refusals.insert(cid, (now, 0));
+            Some(1)
+        }
+    }
+}
+
+/// Writes the audited line for a refused vsock peer (NET-139), rate-limited
+/// per CID by [`peer_refusal_due`]. The line names the CID and counts the
+/// refusals it covers. It is a warn line in the daemon's log, which the
+/// diagnostics bundle ships.
+fn log_refused_peer(transport: &'static str, cid: u32) {
+    if let Some(refused) = peer_refusal_due(cid, std::time::Instant::now()) {
+        tracing::warn!(
+            audit = true,
+            transport,
+            peer_cid = cid,
+            refused,
+            "refused an RPC connection from a vsock peer that is not the host; \
+             only the host (CID 2) may connect"
+        );
+    }
 }
 
 impl Listener for UnixListener {
@@ -1055,6 +1136,14 @@ impl Listener for tokio_vsock::VsockListener {
 
     async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
         tokio_vsock::VsockListener::accept(self).await
+    }
+
+    /// The vsock listener serves only the host (NET-139): a vsock listener
+    /// is what a VM-hosted daemon binds (`--vsock`), and its every peer
+    /// but CID 2 is refused at accept.
+    fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+        let cid = peer.cid();
+        vsock_peer_refused(cid).then_some(cid)
     }
 }
 
@@ -1197,6 +1286,14 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
+            // NET-139: a peer the transport refuses is dropped here, at
+            // accept, before a byte of its stream is read and before it
+            // takes a connection id or a task.
+            if let Some(cid) = L::refused_cid(&peer) {
+                drop(stream);
+                log_refused_peer(L::TRANSPORT, cid);
+                continue;
+            }
             // One span per accepted connection: every record the connection
             // and its channels emit carries `conn`, so accept, channel
             // bindings, and close correlate across the log with a grep

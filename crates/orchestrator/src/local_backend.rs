@@ -297,21 +297,29 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     .ok();
                 });
 
-                let (fetch_time, pending_dir) = remote_cache
+                match remote_cache
                     .materialize(&spec_hash, &shared.cache, build.name.as_str())
                     .await
-                    .map_err(|e| Error::Other(e.into()))?;
-
-                Ok(Either::Left((
-                    pending_dir,
-                    EntryMeta {
-                        inner: MetaInner::Spec(build.name.clone()),
-                        fetched: true,
-                        fetch_ms: Some(fetch_time.as_millis() as usize),
-                        origin: Some(build.from.as_ref().clone()),
-                        ..Default::default()
-                    },
-                )))
+                {
+                    Ok((fetch_time, pending_dir)) => Ok(Either::Left((
+                        pending_dir,
+                        EntryMeta {
+                            inner: MetaInner::Spec(build.name.clone()),
+                            fetched: true,
+                            fetch_ms: Some(fetch_time.as_millis() as usize),
+                            origin: Some(build.from.as_ref().clone()),
+                            ..Default::default()
+                        },
+                    ))),
+                    // A dangling index hit: the index lists an artifact the
+                    // store no longer has. rcache has logged it
+                    // (`kind = "dangling_hit"`); it is a miss, not a failure,
+                    // but this deliverable is a cache fill with no build to
+                    // fall back on, so the orchestrator hands the spec back
+                    // for a re-plan that treats it as uncached.
+                    Err(rcache::Error::NotFound { .. }) => Err(Error::DanglingCacheHit(vec![bsr])),
+                    Err(e) => Err(Error::Other(anyhow::anyhow!("{}: {e}", build.name))),
+                }
             } else {
                 Err(Error::Cache(CacheErr::NotFound))
             };

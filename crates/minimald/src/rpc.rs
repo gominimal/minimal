@@ -748,7 +748,7 @@ async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
 }
 
 /// The answerer control socket's file name, beside the daemon's identity
-/// dir (its provider instance dir) — the native door the answerer's
+/// dir (its host dir) — the native door the answerer's
 /// handover verbs knock on, the counterpart of the VM host daemon's
 /// `control.sock` (its `minvmd` control module's socket of the same
 /// name): one door per daemon, in a dir only this operator (and root)
@@ -773,7 +773,7 @@ const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// else: this daemon's boxes register over RPC channels, not over this
 /// door, so every box verb is refused as a wrong-door ask.
 ///
-/// The socket lives in the daemon's identity dir (its provider instance
+/// The socket lives in the daemon's identity dir (its host
 /// dir, the dir its node id is), at [`ANSWERER_CONTROL_SOCK_FILE`], bound
 /// before the answerer's acquisition starts so a control surface is
 /// there whatever the acquisition decides; a daemon with no identity dir
@@ -947,7 +947,9 @@ async fn serve_answerer_control(
                 | BoxControlRequest::SubscribeAsks(_)
                 | BoxControlRequest::ResumeBox(_)
                 | BoxControlRequest::RowStanding(_)
-                | BoxControlRequest::ProxyListening => BoxControlReply::Error {
+                | BoxControlRequest::ProxyListening
+                | BoxControlRequest::ReportExposeDecision(_)
+                | BoxControlRequest::ReportRefusedEgress(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),

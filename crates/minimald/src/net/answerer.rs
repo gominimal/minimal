@@ -62,14 +62,14 @@ use super::SwitchSubnet;
 use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, ZoneEntry};
 use super::proxy::BindFailure;
 
-/// Port the box-zone answerer listens on: the next one after the egress
-/// (`:7654`) and mTLS (`:7655`) proxies. Non-privileged by design — the
+/// Port the box-zone answerer listens on, above the hostname proxy on
+/// `:7654`. Non-privileged by design — the
 /// resolver hook that routes the zone here names it with a `port` directive
 /// (design §7.1), and an unprivileged daemon must still be able to bind it.
 pub const ANSWERER_PORT: u16 = 7656;
 
 /// The `component` field every answerer log line carries, matching the
-/// proxies' `dns-proxy`/`https-proxy` convention.
+/// proxies' `dns-proxy` convention.
 const COMPONENT: &str = "zone-answerer";
 
 /// Largest datagram the answerer reads: a DNS query fits far below this
@@ -1118,7 +1118,7 @@ fn zone_rows_of(registry: &Arc<std::sync::RwLock<HostnameRegistry>>) -> Vec<Regi
 }
 
 /// This daemon's node id: the canonical identity dir the daemon runs under
-/// (its provider instance dir), so the id is the same across restarts and
+/// (its host dir), so the id is the same across restarts and
 /// across symlinked spellings of one dir, and no two instances of the
 /// daemon on one machine share one. The `#native` tail is the wire's shape
 /// — a node's id is a dir and what it runs as, the way a VM host daemon's
@@ -2534,10 +2534,8 @@ mod tests {
     /// anything else to ride in.
     ///
     /// The rest of the requirement already holds outside this change: the
-    /// only certificate authority in the daemon is the mTLS proxy's (feature
-    /// `networking-proxy`), which mints `localhost`-SAN certificates and is
-    /// untouched here, and the tree writes no audit log for the answerer to
-    /// reach for.
+    /// daemon holds no certificate authority, and the tree writes no audit
+    /// log for the answerer to reach for.
     #[test]
     fn min_internal_absent_from_certs_and_audit() {
         let answ = answerer(registry(false), AnswerScope::Native);

@@ -59,7 +59,7 @@
 //! own, so a door's other connections never wait behind a human. Every ask
 //! event appends one line to the same audit log.
 //!
-//! The socket lives beside the daemon's ssh socket in the provider-instance
+//! The socket lives beside the daemon's ssh socket in the host
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
 //! box table. The serving shape mirrors [`crate::net::HostGvproxy::spawn`]
@@ -71,7 +71,7 @@
 //! egress gate dropping its frames under the unregistered rule (NET-085).
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
-//! provider dir to 0700 when the daemon owns it, refuses one it does not
+//! host dir to 0700 when the daemon owns it, refuses one it does not
 //! own, and sets the socket to 0600; every connection's peer uid is then
 //! checked against the daemon's own (`SO_PEERCRED` on Linux, `getpeereid`
 //! on macOS) and a foreign uid is dropped unanswered. Within the
@@ -110,14 +110,14 @@ use minimald_rpc::{
 use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
-/// The control socket's file name inside the provider-instance dir, beside
+/// The control socket's file name inside the host dir, beside
 /// `paths::SSH_SOCK_FILE`. Deliberately not in the `paths` crate: that crate
 /// is shared with consumers that have no box table, and this name only
 /// means something where `minvmd` supervises one.
 pub const CONTROL_SOCK_FILE: &str = "control.sock";
 
 /// The in-VM daemon's control channel's file name, beside the control
-/// socket in the same provider-instance dir: the door the port reports
+/// socket in the same host dir: the door the port reports
 /// (NET-138) arrive on, bridged to the guest over vsock at
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the one channel from inside
 /// the microVM that answers, because a report the grant refused must be
@@ -133,7 +133,7 @@ pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 pub const GUEST_REPORT_SOCK_ENV: &str = "MINVMD_GUEST_REPORT_SOCK";
 
 /// The audit log the daemon appends its host-side copy of each recorded
-/// admission to, relative to the provider dir the sockets live in — the
+/// admission to, relative to the host dir the sockets live in — the
 /// daemon's own audit log, beside the state it keeps for the VM it
 /// serves.
 const AUDIT_LOG_RELATIVE_PATH: &str = "audit/box-admissions.log";
@@ -160,7 +160,7 @@ fn unix_now_secs() -> u64 {
 /// decides what a report may record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlDoor {
-    /// The host's control socket, in the provider dir beside the ssh
+    /// The host's control socket, in the host dir beside the ssh
     /// socket: registrations, withdrawals, and both read-only verbs.
     Host,
     /// The in-VM daemon's control channel: the port reports alone. Bound
@@ -500,11 +500,11 @@ impl BepListening {
     }
 }
 
-/// Resolve the control socket's path: `<provider dir>/control.sock`, the
+/// Resolve the control socket's path: `<host dir>/control.sock`, the
 /// dir the CLI resolves the ssh socket under, so the client finds both by
 /// the same rule.
 pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
-    Ok(crate::state::provider_dir().join(CONTROL_SOCK_FILE))
+    Ok(crate::state::host_dir().join(CONTROL_SOCK_FILE))
 }
 
 /// Bind the control socket at `sock_path` and serve box control requests
@@ -535,7 +535,7 @@ pub fn spawn(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -614,7 +614,7 @@ pub fn spawn_guest_reports_door_with_proxy(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -752,7 +752,7 @@ fn serve_connection(
     // Check the peer's credentials: only the daemon's own uid may reach
     // the box table. The 0600 socket mode is the primary gate; this is
     // defense in depth against a mis-moded file or a group- or
-    // world-writable provider directory. The kernel captures the peer's
+    // world-writable host directory. The kernel captures the peer's
     // credentials at connect time, so a descriptor a same-uid connector
     // passes on still carries that connector's uid.
     //
@@ -1001,7 +1001,16 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            let reply = order.apply(|| withdraw_box(boxes, answerer, request));
+            let reply = order.apply(|| {
+                let (name, switch_address) = (request.name.clone(), request.switch_address);
+                let reply = withdraw_box(boxes, answerer, request);
+                // The box is gone: its audit window ends, and the count of
+                // the records it suppressed lands now.
+                if matches!(reply, BoxControlReply::Addresses(_)) {
+                    flush_guest_audit(audit_path, &name, switch_address);
+                }
+                reply
+            });
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ResumeBox(request), ControlDoor::Host) => {
@@ -1080,6 +1089,16 @@ fn serve_request(
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
             let reply = order.apply(|| withdraw_report(boxes, &request));
+            write_reply(stream, &reply)
+        }
+        // The audit reports touch no row, so they take no ticket: each is
+        // a line in the host's audit log, under the per-box cap.
+        (BoxControlRequest::ReportExposeDecision(request), ControlDoor::GuestReports) => {
+            let reply = audit_expose_decision(boxes, audit_path, &request);
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ReportRefusedEgress(request), ControlDoor::GuestReports) => {
+            let reply = audit_refused_egress(boxes, audit_path, &request);
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
@@ -1427,6 +1446,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
+        BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
     }
 }
 
@@ -1953,7 +1974,7 @@ fn source_text(source: PortReportSource) -> &'static str {
 }
 
 /// The audit copy's path, derived from the control socket's own dir: the
-/// provider-instance dir is this daemon's state for the VM it serves, so
+/// host dir is this daemon's state for the VM it serves, so
 /// the log lives beside the sockets and the persisted state it speaks for.
 fn audit_log_path(sock_path: &Path) -> PathBuf {
     match sock_path.parent() {
@@ -2011,18 +2032,426 @@ fn append_audit_copy(
     );
 }
 
+/// How long one box's audit window lasts: the guest's expose decision
+/// reports for a box write at most [`GUEST_AUDIT_RECORDS_PER_WINDOW`]
+/// records in it, and its refused egress reports as many again.
+const GUEST_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most records each kind of the guest's audit reports (expose
+/// decisions, refused egress) writes for one box in one
+/// [`GUEST_AUDIT_WINDOW`]. Each kind has its own budget, so a flood of
+/// refused flows never hides a later expose decision. Past it a report is
+/// counted, not written, and one line with the count precedes the next
+/// window's first record, or lands when the box is withdrawn. So a hostile
+/// box cannot fill the host's disk through its reports.
+const GUEST_AUDIT_RECORDS_PER_WINDOW: u32 = 30;
+
+/// The most refused flows one box's window remembers to fold repeats.
+const GUEST_AUDIT_FLOWS_PER_WINDOW: usize = 256;
+
+/// The most boxes the audit cap tracks at once, across every door in the
+/// process. Past it the windows that ended are pruned.
+const GUEST_AUDIT_TRACKED: usize = 1024;
+
+/// One box's audit window: when it opened, how many records of each kind
+/// it wrote, how many it suppressed, and the refused flows it already
+/// recorded.
+#[derive(Debug)]
+struct GuestAuditWindow {
+    opened: std::time::Instant,
+    expose_written: u32,
+    egress_written: u32,
+    suppressed: u64,
+    flows: HashSet<String>,
+}
+
+/// The audit windows, by the audit log they write to and the box's row
+/// key. The log is part of the key so that two doors in one process (the
+/// tests) never share a cap.
+static GUEST_AUDIT_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, Ipv4Addr), GuestAuditWindow>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// What the per-box cap says about one report.
+#[derive(Debug, PartialEq, Eq)]
+enum GuestAuditAdmission {
+    /// Write the record, after a line counting the `suppressed` records of
+    /// the window that ended, when there were any.
+    Write { suppressed: u64 },
+    /// The same refused flow is already recorded in this window: no record,
+    /// because a flow is recorded once, never per frame.
+    Repeat,
+    /// The window's cap is reached: no record, and the count goes up.
+    Suppressed,
+}
+
+/// Decides one report against its box's window at `now`. `flow` is the
+/// refused flow's identity, or `None` for a report that is not a flow (an
+/// expose decision, each of which is its own record).
+fn admit_guest_audit(
+    audit_path: &Path,
+    switch_address: Ipv4Addr,
+    flow: Option<String>,
+    now: std::time::Instant,
+) -> GuestAuditAdmission {
+    let mut windows = GUEST_AUDIT_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (audit_path.to_path_buf(), switch_address);
+    if windows.len() >= GUEST_AUDIT_TRACKED && !windows.contains_key(&key) {
+        windows.retain(|_, window| {
+            now.duration_since(window.opened) < GUEST_AUDIT_WINDOW || window.suppressed > 0
+        });
+    }
+    let window = windows.entry(key).or_insert_with(|| GuestAuditWindow {
+        opened: now,
+        expose_written: 0,
+        egress_written: 0,
+        suppressed: 0,
+        flows: HashSet::new(),
+    });
+    let mut carried = 0;
+    if now.duration_since(window.opened) >= GUEST_AUDIT_WINDOW {
+        carried = window.suppressed;
+        *window = GuestAuditWindow {
+            opened: now,
+            expose_written: 0,
+            egress_written: 0,
+            suppressed: 0,
+            flows: HashSet::new(),
+        };
+    }
+    if let Some(flow) = &flow
+        && window.flows.contains(flow)
+    {
+        return GuestAuditAdmission::Repeat;
+    }
+    // Each kind spends its own budget: refused flows never use up the
+    // records an expose decision needs.
+    let written = if flow.is_some() {
+        &mut window.egress_written
+    } else {
+        &mut window.expose_written
+    };
+    if *written >= GUEST_AUDIT_RECORDS_PER_WINDOW {
+        window.suppressed = window.suppressed.saturating_add(1);
+        return GuestAuditAdmission::Suppressed;
+    }
+    *written += 1;
+    if let Some(flow) = flow
+        && window.flows.len() < GUEST_AUDIT_FLOWS_PER_WINDOW
+    {
+        window.flows.insert(flow);
+    }
+    GuestAuditAdmission::Write {
+        suppressed: carried,
+    }
+}
+
+/// The host's copy of one dynamic ingress decision the in-VM daemon
+/// reported (NET-046): the box named from the host's own row, never from
+/// text the guest sent.
+#[derive(serde::Serialize)]
+struct ExposeDecisionAudit {
+    /// When the report was recorded: Unix seconds.
+    ts: u64,
+    /// Always `expose_decision`.
+    event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
+    /// The box the decision was about, from the row.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The row key the report named.
+    switch_address: Ipv4Addr,
+    /// The port the box asked to publish.
+    port: u16,
+    /// The decision the box's `dynamic_ingress` setting made.
+    decision: boxes::DynamicIngress,
+    /// Who decided it.
+    decided_by: minimald_rpc::ExposeDecidedBy,
+    /// What became of the request.
+    outcome: minimald_rpc::ExposeDecisionOutcome,
+}
+
+/// The host's copy of one refused own-address egress flow the in-VM
+/// daemon reported.
+#[derive(serde::Serialize)]
+struct RefusedEgressAudit {
+    /// When the report was recorded: Unix seconds.
+    ts: u64,
+    /// Always `egress_refused`.
+    event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
+    /// The box whose flow was refused, from the row.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The row key the report named.
+    switch_address: Ipv4Addr,
+    /// The destination the flow was sent to, when it had one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<std::net::SocketAddrV4>,
+    /// The flow's protocol, clamped.
+    proto: String,
+    /// The rule that refused it, clamped.
+    rule: String,
+}
+
+/// The line that counts the records a box's audit window suppressed.
+#[derive(serde::Serialize)]
+struct SuppressedAudit {
+    /// When the line was written: Unix seconds.
+    ts: u64,
+    /// Always `audit_suppressed`.
+    event: &'static str,
+    /// The box whose records were suppressed.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The box's row key.
+    switch_address: Ipv4Addr,
+    /// How many records the cap suppressed in the window that ended.
+    suppressed: u64,
+}
+
+/// Writes the line that counts `suppressed` records for the box, when
+/// there are any.
+fn append_suppressed_audit(
+    audit_path: &Path,
+    box_name: &str,
+    switch_address: Ipv4Addr,
+    suppressed: u64,
+) {
+    if suppressed == 0 {
+        return;
+    }
+    tracing::warn!(
+        box = %box_name,
+        %switch_address,
+        suppressed,
+        "the box's audit reports passed the host's cap; records were suppressed"
+    );
+    append_audit_line(
+        audit_path,
+        &SuppressedAudit {
+            ts: unix_now_secs(),
+            event: "audit_suppressed",
+            box_name: box_name.to_string(),
+            switch_address,
+            suppressed,
+        },
+    );
+}
+
+/// Writes the suppressed-count line when the admission carries one, and
+/// says whether the record itself is to be written.
+fn take_guest_audit(
+    audit_path: &Path,
+    box_name: &str,
+    switch_address: Ipv4Addr,
+    admission: &GuestAuditAdmission,
+) -> bool {
+    match admission {
+        GuestAuditAdmission::Write { suppressed } => {
+            append_suppressed_audit(audit_path, box_name, switch_address, *suppressed);
+            true
+        }
+        GuestAuditAdmission::Repeat | GuestAuditAdmission::Suppressed => false,
+    }
+}
+
+/// Ends a withdrawn box's audit window. The window is forgotten, so a later
+/// box at the same address starts a fresh one. The count of the records it
+/// suppressed is written now: a box that stops reporting opens no later
+/// window, so without this flush that count is never written.
+fn flush_guest_audit(audit_path: &Path, box_name: &str, switch_address: Ipv4Addr) {
+    let window = GUEST_AUDIT_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(audit_path.to_path_buf(), switch_address));
+    if let Some(window) = window {
+        append_suppressed_audit(audit_path, box_name, switch_address, window.suppressed);
+    }
+}
+
+/// Clamps a guest-sent text to [`minimald_rpc::REFUSED_EGRESS_TEXT_MAX`]
+/// bytes of printable ASCII: the guest names the protocol and the rule,
+/// and the host log takes nothing longer or stranger.
+fn clamp_guest_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(minimald_rpc::REFUSED_EGRESS_TEXT_MAX)
+        .collect()
+}
+
+/// Serves the in-VM daemon's expose decision report (NET-046): one record
+/// in the host's audit log, the box named from the row at the report's
+/// switch address. A report at no row is refused and writes nothing.
+fn audit_expose_decision(
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: &minimald_rpc::ExposeDecisionReport,
+) -> BoxControlReply {
+    let Some(record) = boxes.table().by_source(request.switch_address.octets()) else {
+        tracing::debug!(
+            switch_address = %request.switch_address,
+            "refused an expose decision report at an address no row holds"
+        );
+        return BoxControlReply::Error {
+            error: format!("no box is registered at {}", request.switch_address),
+        };
+    };
+    let admission = admit_guest_audit(
+        audit_path,
+        request.switch_address,
+        None,
+        std::time::Instant::now(),
+    );
+    let audited = take_guest_audit(
+        audit_path,
+        record.name(),
+        request.switch_address,
+        &admission,
+    );
+    if audited {
+        tracing::info!(
+            box = %record.name(),
+            port = request.port,
+            decision = ?request.decision,
+            decided_by = ?request.decided_by,
+            outcome = ?request.outcome,
+            reported_by = "guest",
+            "recorded the box's expose decision in the host audit log"
+        );
+        append_audit_line(
+            audit_path,
+            &ExposeDecisionAudit {
+                ts: unix_now_secs(),
+                event: "expose_decision",
+                reported_by: "guest",
+                box_name: record.name().to_string(),
+                switch_address: request.switch_address,
+                port: request.port,
+                decision: request.decision,
+                decided_by: request.decided_by,
+                outcome: request.outcome,
+            },
+        );
+    }
+    BoxControlReply::Audited { audited }
+}
+
+/// Serves the in-VM daemon's refused egress report: one record per refused
+/// flow in the host's audit log, under the box's cap, the box named from
+/// the row at the report's switch address. A repeat of a flow already
+/// recorded in the window writes nothing. A report at no row is refused.
+fn audit_refused_egress(
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: &minimald_rpc::RefusedEgressReport,
+) -> BoxControlReply {
+    let Some(record) = boxes.table().by_source(request.switch_address.octets()) else {
+        tracing::debug!(
+            switch_address = %request.switch_address,
+            "refused a refused-egress report at an address no row holds"
+        );
+        return BoxControlReply::Error {
+            error: format!("no box is registered at {}", request.switch_address),
+        };
+    };
+    let proto = clamp_guest_text(&request.proto);
+    let rule = clamp_guest_text(&request.rule);
+    let destination = request
+        .destination
+        .map_or_else(|| "none".to_string(), |d| d.to_string());
+    let flow = format!("{destination}/{proto}/{rule}");
+    let admission = admit_guest_audit(
+        audit_path,
+        request.switch_address,
+        Some(flow),
+        std::time::Instant::now(),
+    );
+    let audited = take_guest_audit(
+        audit_path,
+        record.name(),
+        request.switch_address,
+        &admission,
+    );
+    if audited {
+        tracing::info!(
+            box = %record.name(),
+            %destination,
+            %proto,
+            %rule,
+            reported_by = "guest",
+            "recorded the box's refused egress in the host audit log"
+        );
+        append_audit_line(
+            audit_path,
+            &RefusedEgressAudit {
+                ts: unix_now_secs(),
+                event: "egress_refused",
+                reported_by: "guest",
+                box_name: record.name().to_string(),
+                switch_address: request.switch_address,
+                destination: request.destination,
+                proto,
+                rule,
+            },
+        );
+    }
+    BoxControlReply::Audited { audited }
+}
+
+/// The size the host-side audit log may reach before it rotates (NET-046).
+/// The per-box caps bound the rate a guest can report at, not the total, so
+/// the file itself is bounded too: the append that would carry it past this
+/// size first renames it to `box-admissions.log.1`, replacing the generation
+/// rotated before it, and starts a fresh file. One kept generation bounds
+/// the log at about twice this size. The same bound and shape as the in-VM
+/// daemon's own audit log (`minimald`'s `audit::MAX_LOG_BYTES`).
+const MAX_AUDIT_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Serialises every append to the host-side audit log. The ask threads and
+/// the doors append concurrently, and a rotation is a size read, a rename
+/// and a reopen: two writers deciding it at once could each rotate, and the
+/// second rename would replace the full generation the first one kept.
+static AUDIT_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// Append one JSON line to the daemon's owner-only audit log: the shared
 /// half of the admission copy and the ask records.
 fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
+    append_audit_line_capped(path, line, MAX_AUDIT_LOG_BYTES);
+}
+
+/// [`append_audit_line`] with the rotation size passed in, so a test can
+/// rotate the log without writing a mebibyte.
+fn append_audit_line_capped(path: &Path, line: &impl serde::Serialize, cap: u64) {
     let Ok(json) = serde_json_lenient::to_string(line) else {
         // A plain struct of primitives serializes; this arm is unreachable
         // in practice and costs nothing to keep honest.
         tracing::warn!("an audit line did not serialize");
         return;
     };
+    let bytes = format!("{json}\n");
+    // A poisoned lock guards no data: the append it serialised failed or
+    // panicked, and the next append is still safe to make.
+    let _guard = AUDIT_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let written = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let len = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if audit_log_rotates(len, bytes.len() as u64, cap) {
+            std::fs::rename(path, audit_log_rotated_path(path))?;
         }
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2031,9 +2460,9 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             .append(true)
             .mode(0o600)
             .open(path)?;
-        // One write per line: the ask threads append concurrently, and a
-        // line written in two pieces could interleave with another's.
-        file.write_all(format!("{json}\n").as_bytes())
+        // One write per line: a line written in two pieces could interleave
+        // with another writer's outside this process.
+        file.write_all(bytes.as_bytes())
     })();
     if let Err(error) = written {
         tracing::warn!(
@@ -2042,6 +2471,22 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             "an audit line could not be appended to the host-side audit log"
         );
     }
+}
+
+/// Whether a log already holding `len` bytes rotates before an `incoming`
+/// line lands: only when the line would carry it past `cap`, and never when
+/// it is empty, so a single line longer than the cap goes into a fresh file
+/// rather than rotating on every append.
+fn audit_log_rotates(len: u64, incoming: u64, cap: u64) -> bool {
+    len > 0 && len.saturating_add(incoming) > cap
+}
+
+/// The one rotated generation's path beside the live log:
+/// `box-admissions.log.1`.
+fn audit_log_rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
 }
 
 /// Run one ask verb's connection on a thread of its own (NET-045): the ask
@@ -3000,6 +3445,77 @@ mod tests {
     /// for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
 
+    /// NET-046: the host-side audit log is bounded. Past its cap it rotates
+    /// to one kept generation, so neither file grows past the cap however
+    /// many records a guest reports, and the newest records are the ones
+    /// kept.
+    #[test]
+    fn host_audit_log_rotates_within_its_bound_and_keeps_the_newest_records() {
+        #[derive(serde::Serialize)]
+        struct Line {
+            seq: u64,
+        }
+        fn seqs(path: &Path) -> Vec<u64> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    serde_json_lenient::from_str::<serde_json_lenient::Value>(line)
+                        .expect("each kept line is whole JSON")["seq"]
+                        .as_u64()
+                        .expect("seq")
+                })
+                .collect()
+        }
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(AUDIT_LOG_RELATIVE_PATH);
+        let rotated = audit_log_rotated_path(&path);
+        let cap = 512;
+        let total = 1000;
+        for seq in 0..total {
+            append_audit_line_capped(&path, &Line { seq }, cap);
+            assert!(
+                std::fs::metadata(&path).unwrap().len() <= cap,
+                "the live log stays within its cap"
+            );
+            if let Ok(meta) = std::fs::metadata(&rotated) {
+                assert!(
+                    meta.len() <= cap,
+                    "the kept generation stays within its cap"
+                );
+            }
+        }
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "one rotated generation is kept, never more: {files:?}"
+        );
+        let kept: Vec<u64> = seqs(&rotated).into_iter().chain(seqs(&path)).collect();
+        assert_eq!(
+            kept.last().copied(),
+            Some(total - 1),
+            "the newest record is kept"
+        );
+        let first = kept[0];
+        assert_eq!(
+            kept,
+            (first..total).collect::<Vec<_>>(),
+            "the kept records are the newest, contiguous and in order"
+        );
+        assert!(
+            kept.len() as u64 * 12 > cap,
+            "a rotation keeps at least a full generation: {}",
+            kept.len()
+        );
+        // The host's own records still land after rotation.
+        append_audit_line_capped(&path, &Line { seq: total }, cap);
+        assert_eq!(seqs(&path).last().copied(), Some(total));
+    }
+
     /// A process-global log capture. The server serves on its own OS
     /// thread, so the thread-local captures the crate's other tests install
     /// do not see its lines; the global default is installed once per
@@ -3150,7 +3666,7 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -3629,7 +4145,7 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -3749,7 +4265,8 @@ mod tests {
                 other @ BoxControlReply::RowStanding { .. } => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
-                other @ BoxControlReply::ProxyListening { .. } => {
+                other @ (BoxControlReply::ProxyListening { .. }
+                | BoxControlReply::Audited { .. }) => {
                     panic!(
                         "a box verb is never answered with a proxy-listening read, got {other:?}"
                     )
@@ -3822,7 +4339,7 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -4488,11 +5005,11 @@ mod tests {
         assert!(!is_root_peer(me.wrapping_add(1).max(1)));
     }
 
-    /// The bind tightens a provider dir the daemon owns but `StateDir::new`
+    /// The bind tightens a host dir the daemon owns but `StateDir::new`
     /// created under the umask (0755), rather than refusing every existing
     /// install, and then serves on it.
     #[test]
-    fn bind_tightens_an_owned_provider_dir_to_0700() {
+    fn bind_tightens_an_owned_host_dir_to_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("local-minvmd0");
@@ -6857,5 +7374,277 @@ mod tests {
             .with_facts(Some(&facts));
         let json = serde_json::to_value(&line).expect("serialise the ask audit line");
         assert_eq!(json["box_id"], "019a2b3c4d5e7f608192a3b4c5d6e7f8");
+    }
+
+    /// Registers one box on the host socket for the audit report tests and
+    /// answers its row: a plain box, so its switch address is a row key the
+    /// guest door's reports can name.
+    fn register_audited_box(sock_path: &std::path::Path, name: &str) -> RegisteredBox {
+        handed(
+            register(
+                sock_path,
+                &RegisterBoxRequest {
+                    name: name.to_string(),
+                    ingress_ports: vec![],
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        )
+    }
+
+    /// The host's audit log beside `sock_path`, parsed one record per line.
+    fn host_audit_records(sock_path: &std::path::Path) -> Vec<serde_json::Value> {
+        let logged = std::fs::read_to_string(audit_log_path(sock_path)).unwrap_or_default();
+        logged
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one audit line is one record"))
+            .collect()
+    }
+
+    /// NET-046 on a VM host: a decision the in-VM daemon reports on the guest
+    /// door lands in the host's own audit log, outside the VM, the box named
+    /// from the host's row and not from the report. A denied expose and a
+    /// published one are each one record. A report at an address no row
+    /// holds is refused and writes nothing.
+    #[test]
+    fn expose_decision_recorded_on_host() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = register_audited_box(&sock_path, "web");
+
+        for (port, decision, outcome) in [
+            (
+                4000,
+                boxes::DynamicIngress::Deny,
+                minimald_rpc::ExposeDecisionOutcome::Refused,
+            ),
+            (
+                3000,
+                boxes::DynamicIngress::Allow,
+                minimald_rpc::ExposeDecisionOutcome::Published,
+            ),
+        ] {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                    switch_address: web.switch_address,
+                    port,
+                    decision,
+                    decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                    outcome,
+                }),
+            )
+            .expect("the report is answered");
+            assert_eq!(reply, BoxControlReply::Audited { audited: true });
+        }
+        let stray = control(
+            &guest,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: Ipv4Addr::new(192, 0, 2, 1),
+                port: 3000,
+                decision: boxes::DynamicIngress::Allow,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Published,
+            }),
+        )
+        .expect("the stray report is answered");
+        assert!(
+            matches!(stray, BoxControlReply::Error { .. }),
+            "a report at no row is refused: {stray:?}"
+        );
+        // The host socket does not take the guest's reports.
+        let wrong_door = control(
+            &sock_path,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: web.switch_address,
+                port: 3001,
+                decision: boxes::DynamicIngress::Allow,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Published,
+            }),
+        )
+        .expect("the wrong-door report is answered");
+        assert!(matches!(wrong_door, BoxControlReply::Error { .. }));
+
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "expose_decision")
+            .collect();
+        assert_eq!(records.len(), 2, "one record per decision: {records:?}");
+        assert_eq!(records[0]["box"], "web");
+        assert_eq!(records[0]["port"], 4000);
+        assert_eq!(records[0]["decision"], "deny");
+        assert_eq!(records[0]["decided_by"], "box-policy");
+        assert_eq!(records[0]["outcome"], "refused");
+        assert_eq!(records[0]["reported_by"], "guest");
+        assert_eq!(records[1]["port"], 3000);
+        assert_eq!(records[1]["reported_by"], "guest");
+        assert_eq!(records[1]["decision"], "allow");
+        assert_eq!(records[1]["outcome"], "published");
+    }
+
+    /// A refused own-address egress flow the in-VM daemon reports lands in
+    /// the host's audit log: one record per refused flow, never per frame, so
+    /// a repeat of the same flow writes nothing more. The records a box
+    /// writes are capped per window, the rest counted, and the next window
+    /// opens with one line that says how many were suppressed. The guest's
+    /// texts are clamped.
+    #[test]
+    fn egress_refusal_logged_on_host() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = register_audited_box(&sock_path, "web");
+        let refused = |port: u16, rule: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::ReportRefusedEgress(minimald_rpc::RefusedEgressReport {
+                    switch_address: web.switch_address,
+                    destination: Some(std::net::SocketAddrV4::new(
+                        Ipv4Addr::new(203, 0, 113, 9),
+                        port,
+                    )),
+                    proto: "tcp".to_string(),
+                    rule: rule.to_string(),
+                }),
+            )
+            .expect("the report is answered")
+        };
+
+        assert_eq!(
+            refused(443, "undeclared subnet"),
+            BoxControlReply::Audited { audited: true }
+        );
+        assert_eq!(
+            refused(443, "undeclared subnet"),
+            BoxControlReply::Audited { audited: false },
+            "the same flow again is not a second record"
+        );
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "egress_refused")
+            .collect();
+        assert_eq!(records.len(), 1, "one record per refused flow: {records:?}");
+        assert_eq!(records[0]["box"], "web");
+        assert_eq!(records[0]["destination"], "203.0.113.9:443");
+        assert_eq!(records[0]["proto"], "tcp");
+        assert_eq!(records[0]["rule"], "undeclared subnet");
+        assert_eq!(records[0]["reported_by"], "guest");
+
+        // A flood of distinct flows writes up to the cap, and the rest are
+        // counted, not written.
+        let long_rule = "x".repeat(500);
+        let mut written = 1;
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16 + 20) {
+            if refused(port, &long_rule) == (BoxControlReply::Audited { audited: true }) {
+                written += 1;
+            }
+        }
+        assert_eq!(written, GUEST_AUDIT_RECORDS_PER_WINDOW);
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "egress_refused")
+            .collect();
+        assert_eq!(records.len() as u32, GUEST_AUDIT_RECORDS_PER_WINDOW);
+        assert!(
+            records.iter().all(|record| record["rule"]
+                .as_str()
+                .is_some_and(|rule| rule.len() <= minimald_rpc::REFUSED_EGRESS_TEXT_MAX)),
+            "a guest's rule text is clamped: {records:?}"
+        );
+
+        // The flood used up the egress budget, not the expose one: a denied
+        // `min net expose` after it is still recorded.
+        let expose = control(
+            &guest,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: web.switch_address,
+                port: 4000,
+                decision: boxes::DynamicIngress::Deny,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+            }),
+        )
+        .expect("the report is answered");
+        assert_eq!(
+            expose,
+            BoxControlReply::Audited { audited: true },
+            "a flood of refused flows never hides an expose decision"
+        );
+        assert_eq!(
+            host_audit_records(&guest)
+                .iter()
+                .filter(|record| record["event"] == "expose_decision")
+                .count(),
+            1
+        );
+
+        // The window's end: the next record is preceded by the count.
+        let audit_path = audit_log_path(&guest);
+        let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
+        let admission = admit_guest_audit(
+            &audit_path,
+            web.switch_address,
+            Some("later".to_string()),
+            later,
+        );
+        assert_eq!(admission, GuestAuditAdmission::Write { suppressed: 21 });
+        assert!(take_guest_audit(
+            &audit_path,
+            "web",
+            web.switch_address,
+            &admission
+        ));
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(
+            suppressed.len(),
+            1,
+            "one line counts the suppressed records"
+        );
+        assert_eq!(suppressed[0]["box"], "web");
+        assert_eq!(suppressed[0]["suppressed"], 21);
+
+        // A box that floods and then goes quiet: its withdrawal writes the
+        // count, since no later report will.
+        let mut dropped = 0u64;
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16 + 5) {
+            if refused(port, "quiet after") == (BoxControlReply::Audited { audited: false }) {
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0, "the flood passed the cap");
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: None,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the box is withdrawn: {withdrawn:?}"
+        );
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(suppressed.len(), 2, "the withdrawal flushes the count");
+        assert_eq!(suppressed[1]["box"], "web");
+        assert_eq!(suppressed[1]["suppressed"], dropped);
     }
 }

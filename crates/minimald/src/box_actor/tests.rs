@@ -8561,7 +8561,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
             assert!(
                 source
                     .to_string()
-                    .contains("the VM host daemon refused to open the port"),
+                    .contains("the request to open the port was refused"),
                 "the refused publish says who refused it: {source}"
             );
         }
@@ -9186,13 +9186,12 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         .lines()
         .find(|line| {
             line.contains("dynamic ingress expose")
-                && line.contains("outcome=\"refused\"")
+                && line.contains("outcome=\"refused: out of range\"")
                 && line.contains("port=4500")
         })
         .unwrap_or_else(|| panic!("the out-of-range refusal must be logged, got: {logged}"));
     assert!(
-        refused_line
-            .contains("reason=port 4500 is outside this box's declared dynamic range 3000-3999"),
+        refused_line.contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
         "the refusal names the port and the declared range: {refused_line}"
     );
     let failed_line = logged
@@ -9207,6 +9206,89 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         failed_line.contains("returned HTTP 500"),
         "the failed publish names the switch's refusal: {failed_line}"
     );
+}
+
+/// NET-047: a port outside the box's `--dynamic-range` is refused with the
+/// range named, for an `allow` box and an `ask` box alike. The `ask` box
+/// refuses it before any prompt is routed: the same box's in-range request
+/// is routed, and with nobody attached it ends as the nobody-to-answer
+/// refusal, which an out-of-range request never reaches. Neither box keeps a
+/// mapping, and the request's info line says `refused: out of range`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_out_of_range_refusal_names_range() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    for (name, stance, octet) in [
+        ("rangeallow", boxes::DynamicIngress::Allow, 41),
+        ("rangeask", boxes::DynamicIngress::Ask, 42),
+    ] {
+        let id = finalize_dynamic_ingress_session(
+            &mut client,
+            name,
+            std::net::Ipv4Addr::new(100, 64, 128, octet),
+            std::net::Ipv4Addr::new(127, 0, 64, octet),
+            Some(stance),
+            Some((3000, 3999)),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        let refusal = match handle.expose_dynamic(4500).await {
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::OutOfRange {
+                    requested: 4500,
+                    range: (3000, 3999),
+                },
+            )) => refusal,
+            other => panic!("{name}: a port outside the range is refused by range: {other:?}"),
+        };
+        assert_eq!(
+            refusal.for_caller(name, boxes::NetworkMode::OwnIp, 4500),
+            "port 4500 is outside this box's --dynamic-range 3000-3999. Nothing was published.",
+            "{name}: the refusal names the port and the range"
+        );
+        if stance == boxes::DynamicIngress::Ask {
+            // The in-range ask is routed, and nobody is attached to answer:
+            // the out-of-range one above never got that far.
+            match handle.expose_dynamic(3000).await {
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                )) => {}
+                other => panic!("an in-range ask is routed to a prompt: {other:?}"),
+            }
+        }
+        let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+            .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(id))
+            .await;
+        assert_eq!(
+            live,
+            minimald_rpc::Errorable::Ok(vec![]),
+            "{name}: a refused request leaves no mapping"
+        );
+    }
+    let logged = capture.contents();
+    for (name, decision) in [("rangeallow", "allow"), ("rangeask", "ask")] {
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains(&format!("name={name}"))
+                    && line.contains("port=4500")
+            })
+            .unwrap_or_else(|| panic!("{name}: the refusal must be logged, got: {logged}"));
+        assert!(
+            line.contains("outcome=\"refused: out of range\"")
+                && line.contains(&format!("decision={decision}"))
+                && line
+                    .contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
+            "{name}: the line names the outcome, the port and the range: {line}"
+        );
+    }
 }
 
 /// NET-044 on the shared-address interim: under an absent range verdict every

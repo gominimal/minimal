@@ -1,10 +1,10 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
 //! All runtime files live in the VM's state directory — the minvmd
-//! provider-instance dir (`<minimal_state_dir>/providers/local-minvmd0/`,
-//! see [`paths::provider_instance_dir`]) for the default VM, or its per-name
+//! host dir (`<minimal_state_dir>/providers/local-minvmd0/`,
+//! see [`paths::host_dir`]) for the default VM, or its per-name
 //! subdirectory `local-minvmd0/<vm>/` for a named one (see
-//! [`vm_name`], [`provider_dir_for`]):
+//! [`vm_name`], [`host_dir_for`]):
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
 //! - `lifecycle.lock` — advisory lock guarding concurrent transitions (R4.6).
@@ -57,7 +57,7 @@ pub fn state_dir_override() -> Option<&'static DaemonAbsPath> {
 /// call wins; must be called before any path resolution, so every path the
 /// process derives already names the right VM. A name outside the allowlist
 /// ([`paths::validate_vm_name`]) is rejected here rather than resolved into a
-/// directory outside the provider dir.
+/// directory outside the host dir.
 ///
 /// # Errors
 ///
@@ -90,16 +90,16 @@ pub fn state_base_dir() -> DaemonAbsPath {
 /// The state directory holding one VM's runtime files (NET-052, NET-054),
 /// for an explicit state-dir base and VM name. Pure — no process-global
 /// state — so a named VM's layout is unit-testable:
-/// `<base>/providers/local-minvmd0/<vm>/` for a named VM, the provider
-/// instance dir itself for the default VM.
+/// `<base>/providers/local-minvmd0/<vm>/` for a named VM, the host
+/// dir itself for the default VM.
 ///
 /// # Panics
 ///
 /// Panics when `vm` breaks the naming rule ([`paths::validate_vm_name`]).
 /// The CLI validates the name at parse time ([`set_vm_name`]) before any
 /// path resolution, so this is a caller bug, never user input.
-pub fn provider_dir_for(base: &DaemonAbsPath, vm: &str) -> PathBuf {
-    paths::provider_instance_dir_named(base, paths::ProviderKind::Minvmd, 0, vm)
+pub fn host_dir_for(base: &DaemonAbsPath, vm: &str) -> PathBuf {
+    paths::host_dir_named(base, paths::HostKind::Minvmd, 0, vm)
         .expect("VM name is validated at parse time")
         .as_utf8_path()
         .as_std_path()
@@ -108,8 +108,8 @@ pub fn provider_dir_for(base: &DaemonAbsPath, vm: &str) -> PathBuf {
 
 /// The state directory holding this process's VM's runtime files:
 /// `<minimal_state_dir>/providers/local-minvmd0[/<vm>/]`.
-pub fn provider_dir() -> PathBuf {
-    provider_dir_for(&state_base_dir(), vm_name())
+pub fn host_dir() -> PathBuf {
+    host_dir_for(&state_base_dir(), vm_name())
 }
 
 /// The argv a re-exec'd child needs to resolve the same VM's state directory
@@ -179,7 +179,7 @@ impl State {
 
 // ── StateDir ─────────────────────────────────────────────────────────────────
 
-/// Root of the minvmd state directory (the provider-instance dir).
+/// Root of the minvmd state directory (the host dir).
 pub struct StateDir {
     dir: PathBuf,
 }
@@ -192,7 +192,7 @@ impl StateDir {
     }
 
     /// Bind to `dir` without creating it, for readers that must not change
-    /// what they observe — the diagnostic collector reports on providers,
+    /// what they observe — the diagnostic collector reports on hosts,
     /// including deleted ones, and [`StateDir::new`] would resurrect the
     /// directory as a side effect of looking. Every path accessor and the
     /// read-only liveness probes work unchanged; the lock-taking and
@@ -203,9 +203,9 @@ impl StateDir {
         Self { dir }
     }
 
-    /// Default path: [`provider_dir`].
+    /// Default path: [`host_dir`].
     pub fn default_path() -> PathBuf {
-        provider_dir()
+        host_dir()
     }
 
     /// The directory this `StateDir` operates on.
@@ -517,23 +517,23 @@ mod tests {
 
     /// A VM's state directory for an explicit base and name — the per-name
     /// subdirectory the named VM keeps its own state, socket, and daemon
-    /// under, and the unchanged provider dir for the default VM.
+    /// under, and the unchanged host dir for the default VM.
     #[test]
-    fn provider_dir_for_nests_a_named_vm_and_pins_the_default() {
+    fn host_dir_for_nests_a_named_vm_and_pins_the_default() {
         let base = DaemonAbsPath::try_new("/state/minimal").unwrap();
-        let default = paths::provider_instance_dir(&base, paths::ProviderKind::Minvmd, 0)
+        let default = paths::host_dir(&base, paths::HostKind::Minvmd, 0)
             .as_str()
             .to_owned();
 
         // NET-054: a named VM nests under a per-name subdirectory.
         assert_eq!(
-            provider_dir_for(&base, "alpha").to_str().unwrap(),
+            host_dir_for(&base, "alpha").to_str().unwrap(),
             format!("{default}/alpha"),
         );
         // NET-053: the default VM's paths are unchanged, with and without the
         // explicit default name.
         assert_eq!(
-            provider_dir_for(&base, paths::DEFAULT_VM_NAME)
+            host_dir_for(&base, paths::DEFAULT_VM_NAME)
                 .to_str()
                 .unwrap(),
             default
