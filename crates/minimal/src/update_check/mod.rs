@@ -55,11 +55,11 @@ mod tests;
 pub use notice::{disclosure, disclosure_due, notice, notice_due};
 use request::spawn_background;
 pub use request::{cmd_update_check, fetch_latest, request_url};
-use state::new_install_id;
 pub use state::{
     Install, State, acquire_lock, build_key, due, now_secs, read_install, read_state,
     record_answer, record_notified, release_lock, valid_field, valid_install_id, write_state,
 };
+use state::{claim_install_id, record_disclosed};
 pub use switches::{ConfigState, UpdateDisabledReason, off_switch};
 
 /// The version endpoint; `MINIMAL_UPDATE_CHECK_URL` overrides it.
@@ -180,18 +180,26 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     let install = read_install(&dir, std::env::current_exe().ok().as_deref());
     let tty = std::io::stderr().is_terminal();
 
+    // The id is minted under the spawn lock and written by re-reading the
+    // file, so two first commands that run together mint one id between
+    // them (the other finds it on disk, or finds the lock held and leaves
+    // the minting to the next command) and neither clobbers the other's
+    // write: a last-writer-wins here was one install counted twice.
     let first_run = state.install_id.is_none();
     if first_run {
-        state.install_id = Some(new_install_id());
+        match claim_install_id(&dir, &state_path) {
+            Some(claimed) => state = claimed,
+            None => return,
+        }
     }
     let visible = leaves_the_notice_visible(command);
     let disclose = disclosure_due(&state, tty) && visible;
     if disclose {
         state.disclosed = true;
         let _ = writeln!(std::io::stderr(), "{}", disclosure());
-    }
-    if (first_run || disclose) && write_state(&state_path, &state).is_err() {
-        return;
+        if record_disclosed(&state_path).is_err() {
+            return;
+        }
     }
     // No request in the command that minted the id, nor in the one that
     // printed the disclosure: the request waits for a later command either

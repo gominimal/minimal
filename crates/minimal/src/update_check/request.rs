@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 use super::{
-    ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, new_install_id,
-    read_install, read_state, record_answer, release_lock, state_dir, write_state,
+    ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, read_install,
+    read_state, record_answer, release_lock, state_dir,
 };
 use crate::cli::{GlobalArgs, UpdateCheckArgs};
 
@@ -120,11 +120,15 @@ pub async fn cmd_update_check(
     // without one (its parent minted it).
     // A disabled install keeps no id: the switches are read first.
     if state.install_id.is_none() && off.is_none() && !args.dry_run && !args.background {
-        state.install_id = Some(new_install_id());
-        // Sent only once it is on disk: an id that was not written would
-        // be minted again next time, and the count would see two installs.
-        write_state(&state_path, &state)
-            .map_err(|e| anyhow::anyhow!("writing {}: {e}", state_path.display()))?;
+        // Sent only once it is on disk, and minted under the spawn lock by
+        // re-reading the file (as the per-command hook does): an id that was
+        // not written, or one written over another command's, would count
+        // the install twice.
+        state = super::state::claim_install_id(&dir, &state_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "another min command is minting the install id or checking now; run this again"
+            )
+        })?;
     }
     let id = state
         .install_id

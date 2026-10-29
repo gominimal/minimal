@@ -190,6 +190,37 @@ pub(super) fn new_install_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// The install id, minted if the file has none: taken under the spawn lock
+/// ([`acquire_lock`]) so two first commands running together mint one id
+/// between them, and written by re-reading the file so nothing another
+/// command wrote meanwhile is put back. `None` when the lock is held (the
+/// other command is minting, or has spawned the check; this command does
+/// nothing and the next one finds the id) or the write failed.
+pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Option<State> {
+    let lock = dir.join(super::LOCK_FILE);
+    if !acquire_lock(&lock) {
+        return None;
+    }
+    let mut state = read_state(state_path);
+    let written = match state.install_id {
+        Some(_) => Ok(()),
+        None => {
+            state.install_id = Some(new_install_id());
+            write_state(state_path, &state)
+        }
+    };
+    release_lock(&lock);
+    written.ok().map(|()| state)
+}
+
+/// Records that the disclosure was printed. Re-read and one field changed,
+/// as [`record_notified`] does, so a child's answer written meanwhile stays.
+pub(super) fn record_disclosed(state_path: &Path) -> std::io::Result<()> {
+    let mut state = read_state(state_path);
+    state.disclosed = true;
+    write_state(state_path, &state)
+}
+
 /// Records that the user was told about `latest`. The file is re-read and
 /// only `notified` changes: the child this command may have just spawned
 /// can finish in between, and its answer must not be overwritten with the

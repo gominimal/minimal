@@ -1,3 +1,4 @@
+use super::state::{claim_install_id, new_install_id, record_disclosed, valid_install_id};
 use super::*;
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -187,6 +188,38 @@ fn the_state_round_trips_and_a_bad_file_is_the_default() {
     );
     std::fs::write(&path, "{not json").unwrap();
     assert_eq!(read_state(&path), State::default());
+}
+
+/// Two first commands at once mint one id between them: the second finds
+/// the first's on disk under the lock, and a child's answer written in the
+/// meantime is not clobbered by the disclosure write.
+#[test]
+fn a_first_run_claims_one_id_and_keeps_what_was_written_meanwhile() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path();
+    let path = dir.join(STATE_FILE);
+    let first = claim_install_id(dir, &path).expect("minted");
+    let second = claim_install_id(dir, &path).expect("read back");
+    assert_eq!(first.install_id, second.install_id, "one id for both");
+    assert!(!dir.join(LOCK_FILE).exists(), "the lock is released");
+    // the lock held by another command: no mint, no clobber
+    std::fs::write(dir.join(LOCK_FILE), b"").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(claim_install_id(dir, &path).is_none());
+    assert!(!path.exists(), "nothing written while the lock is held");
+    std::fs::remove_file(dir.join(LOCK_FILE)).unwrap();
+    // a child's answer lands between the read and the disclosure write
+    let state = claim_install_id(dir, &path).unwrap();
+    record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+    record_disclosed(&path).unwrap();
+    let read = read_state(&path);
+    assert!(read.disclosed);
+    assert_eq!(
+        read.latest.as_deref(),
+        Some("0.7.2"),
+        "the answer written meanwhile stays"
+    );
+    assert_eq!(read.install_id, state.install_id);
 }
 
 /// A hand-edited state file cannot put anything into the request query or
