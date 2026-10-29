@@ -417,6 +417,23 @@ impl BoxHandle {
             .await;
     }
 
+    /// Tells the session's actor its publish moved from `from` to `to`
+    /// (#2748), so it moves the forwards its `min net expose` bound at
+    /// `from` if its box is running. Not answered: a box that is gone or
+    /// stopped has no forward to move.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn move_exposed_ports(
+        &self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+    ) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "an actor that is gone has no box to move the forwards for"
+        )]
+        let _ = self.0.send(BoxMessage::MoveExposedPorts { from, to }).await;
+    }
+
     /// Continues a parked runtime port-publish ask (NET-045) with the attached
     /// human's answer, or its absence — sent by the task
     /// [`BoxActor::route_ask`] spawned, never by the actor itself. Keyed by the

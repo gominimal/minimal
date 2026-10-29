@@ -38,6 +38,8 @@ impl BoxMessage {
             Self::AskAnswered { .. } => "AskAnswered",
             #[cfg(target_os = "linux")]
             Self::BindHandedPort { .. } => "BindHandedPort",
+            #[cfg(target_os = "linux")]
+            Self::MoveExposedPorts { .. } => "MoveExposedPorts",
             Self::SetWorkspaceUploadInFlight(..) => "SetWorkspaceUploadInFlight",
             #[cfg(test)]
             Self::PeekPendingAsks(_) => "PeekPendingAsks",

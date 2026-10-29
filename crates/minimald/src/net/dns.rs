@@ -635,6 +635,20 @@ struct OwnPublished {
     ports: BTreeSet<u16>,
 }
 
+/// A box's publish moved to a new address (#2748): the present landing moved
+/// it off the `127.0.0.1` interim ([`HostnameRegistry::hand_over_moved_publish`]).
+/// Sent as data so the receiver can move the forwards the box's runtime
+/// `min net expose` bound at the old address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishMove {
+    /// The session whose box moved.
+    pub holder: SessionId,
+    /// The address the box published at before the move.
+    pub from: Ipv4Addr,
+    /// The address the box publishes at now.
+    pub to: Ipv4Addr,
+}
+
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
@@ -845,6 +859,12 @@ pub struct HostnameRegistry {
     /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
     /// change of record alone, bound at the new holder's next attach.
     hand_overs: Option<tokio::sync::mpsc::UnboundedSender<PortHandOver>>,
+    /// Where each move of a box's publish is sent
+    /// ([`Self::hand_over_moved_publish`]), for the sessions manager to move
+    /// the forwards the box's `min net expose` bound while its box runs
+    /// ([`Self::notify_publish_moves`]). `None` leaves those forwards where
+    /// they are until the box's spawn ends.
+    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<PublishMove>>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
     /// whether the publish lands at it or at the `127.0.0.1` interim — a
@@ -916,6 +936,7 @@ impl HostnameRegistry {
             own_holders: HashMap::new(),
             own_bound: HashMap::new(),
             hand_overs: None,
+            publish_moves: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
             by_host: HashMap::new(),
@@ -945,6 +966,18 @@ impl HostnameRegistry {
         self.hand_overs = Some(sender);
     }
 
+    /// Sends every move of a box's publish from here on to `sender`
+    /// (#2748): the receiver moves the forwards the box's runtime
+    /// `min net expose` bound at the old address, if its box is running.
+    /// The send never waits, so the registry's lock is held no longer for
+    /// it.
+    pub fn notify_publish_moves(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<PublishMove>,
+    ) {
+        self.publish_moves = Some(sender);
+    }
+
     /// The box holding `port` at `address` of record (NET-129), declared or
     /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
     /// also asks for a declared publish, cannot see a dynamic holder.
@@ -969,16 +1002,37 @@ impl HostnameRegistry {
     /// Sends the box `session_id` one hand-over per declared port it holds
     /// at the address it publishes at now (NET-123 §7.1), and returns them.
     /// The present landing calls it for each box it moves off the
-    /// `127.0.0.1` interim: a box that runs has its forwards bound where its
-    /// attach bound them, at the interim, so the name would answer at an
-    /// address no forward listens on. The receiver binds each port's forward
-    /// at the new address while the box runs ([`Self::notify_hand_overs`]);
-    /// a box that is not running binds them there at its next attach. A port
-    /// another box holds at the address is not sent: the box yields it.
-    pub fn hand_over_moved_publish(&self, session_id: SessionId) -> Vec<PortHandOver> {
+    /// `127.0.0.1` interim (`from`): a box that runs has its forwards bound
+    /// at the interim, so the name would answer at an address no forward
+    /// listens on. The receiver binds each port's forward at the new address
+    /// while the box runs ([`Self::notify_hand_overs`]); a box that is not
+    /// running binds them there at its next attach. A port another box holds
+    /// at the address is not sent: the box yields it.
+    ///
+    /// The box's runtime publications follow too. The move itself is sent
+    /// once ([`Self::notify_publish_moves`]), and its receiver moves the
+    /// forwards the box's `min net expose` bound at `from`. The listen
+    /// watcher reads the box's published address here on every poll, and
+    /// moves the ports it published itself.
+    pub fn hand_over_moved_publish(
+        &self,
+        session_id: SessionId,
+        from: Ipv4Addr,
+    ) -> Vec<PortHandOver> {
         let Some(own) = self.own_published.get(&session_id) else {
             return Vec::new();
         };
+        if own.address != from
+            && let Some(sender) = &self.publish_moves
+        {
+            // A receiver that is gone moves nothing: the box's runtime
+            // forwards come down with its spawn.
+            drop(sender.send(PublishMove {
+                holder: session_id,
+                from,
+                to: own.address,
+            }));
+        }
         let mut hand_overs = Vec::new();
         for &port in &own.ports {
             if !self.holds_shared_port(session_id, own.address, port) {

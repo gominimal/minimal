@@ -1329,6 +1329,131 @@ impl BoxActor {
         }
     }
 
+    /// Moves the forwards this box's `min net expose` bound at `from` to
+    /// `to`, the address its publish moved to (#2748). The present landing
+    /// moves a box off the `127.0.0.1` interim while it runs, and a runtime
+    /// publish binds at the address the box published at when it was asked,
+    /// so without this the name would answer at `to` while the exposed port
+    /// listens at `from`.
+    ///
+    /// Each forward is bound at `to` first, toward the same lease, and only
+    /// then is the one at `from` unbound, so the port is served the whole
+    /// way through. The box's gate and the VM host daemon's row name the port,
+    /// not the address, so neither changes. A bind that fails is logged and
+    /// leaves the forward at `from`. An unbind that fails keeps the old
+    /// forward for the box's stop or its spawn's end to unbind.
+    ///
+    /// Nothing is moved for a box with no host running or whose spawn has
+    /// ended, or when the registry no longer publishes the box at `to`,
+    /// since the move is read after other changes may have landed.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn move_exposed_ports(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+    ) {
+        if !self.has_live_host() || self.live_ingress.is_detached() {
+            return;
+        }
+        let moving = self.live_ingress.bound_at(from);
+        if moving.is_empty() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        let switch_address = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if registry.published_own_address(record.id) != Some(to) {
+                return;
+            }
+            match record.box_addresses {
+                Some(addresses) => Some(addresses.switch_address),
+                None => registry.own_lease(record.id),
+            }
+        };
+        let Some(switch_address) = switch_address else {
+            return;
+        };
+        let session_name = record
+            .name
+            .as_deref()
+            .unwrap_or(crate::rpc::ANONYMOUS_SESSION);
+        let control = self.switch_control().await;
+        for (port, proto) in moving {
+            let forwarder = match crate::net::policy::expose_dynamic(
+                &control,
+                to,
+                switch_address,
+                port,
+                proto,
+                None,
+            )
+            .await
+            {
+                Ok(forwarder) => forwarder,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.id,
+                        session_name,
+                        port,
+                        %from,
+                        %to,
+                        %error,
+                        owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                        "binding an exposed port at the box's new address failed; \
+                         it stays at the old address until the box stops"
+                    );
+                    continue;
+                }
+            };
+            let mapping = minimald_rpc::LiveMapping {
+                local: forwarder.local().to_string(),
+                internal_port: forwarder.internal_port(),
+                proto,
+                pending: None,
+            };
+            let moved = crate::net::provider::LiveIngressForward { forwarder, mapping };
+            let old = match self.live_ingress.rebind(from, moved) {
+                Ok(old) => old,
+                Err(moved) => {
+                    // The spawn ended, or the port was withdrawn, while the
+                    // bind was in flight: the new forward comes down here.
+                    crate::net::policy::remove_ingress(&control, &[moved.forwarder]).await;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                crate::net::policy::unexpose_forwarder(&control, &old.forwarder).await
+            {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name,
+                    port,
+                    %from,
+                    %error,
+                    "unbinding an exposed port at the box's old address failed; \
+                     it is unbound again when the box stops"
+                );
+                if let Err(stale) = self.live_ingress.retire(old.forwarder) {
+                    crate::net::policy::remove_ingress(&control, &[stale]).await;
+                }
+            }
+            tracing::info!(
+                session_id = %record.id,
+                session_name,
+                port,
+                %from,
+                %to,
+                owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                "moved an exposed port to the box's new address"
+            );
+        }
+    }
+
     /// The switch's control channel, read off the daemon's shared switch under
     /// a lock held only for the two sync reads — never across the publish it
     /// feeds.

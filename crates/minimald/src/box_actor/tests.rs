@@ -6753,6 +6753,189 @@ async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
     );
 }
 
+/// #2748, the runtime publications: a handed box standing on the
+/// `127.0.0.1` interim publishes one port with `min net expose` and one by
+/// listening on it, and both forwards bind at the interim. When the range
+/// lands present and the box's name moves to its hand, both forwards move
+/// with it: each is bound at the hand toward the box's lease and unbound at
+/// the interim, the listed rows name the hand, and the listened port's hold
+/// of record moves to the hand. The box declares no port, so no declared
+/// hand-over is what moves them.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_its_hand() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    // One port the box listens on, and a free one it exposes.
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let exposed = port_of(&listening_socket());
+    let range = (listened.min(exposed), listened.max(exposed));
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 3);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 3);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        lease,
+        handed,
+        Some(boxes::DynamicIngress::Allow),
+        Some(range),
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(interim),
+        "the absent verdict stands the handed box on the interim"
+    );
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock.clone(), 200).await;
+    let gate = Arc::new(crate::net::switch::BoxGate::for_session(
+        "web".to_string(),
+        lease,
+        &listen_policy_over(range),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::box_actor::listen_plan_seam::seed(
+        web,
+        crate::box_actor::listen_plan_seam::Seeded {
+            lease,
+            published: interim,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate,
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    handle
+        .expose_dynamic(exposed)
+        .await
+        .expect("a port in the box's range is exposed");
+    let at = |address: std::net::Ipv4Addr, port: u16| format!("{address}:{port}");
+    listed_once(&handle, |rows| {
+        rows.exposed
+            .iter()
+            .any(|row| row.local == at(interim, exposed))
+            && rows
+                .listened
+                .iter()
+                .any(|row| row.local == at(interim, listened))
+    })
+    .await;
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(web),
+        "the listened port is held at the interim"
+    );
+
+    // `min finalize-install` applies the range, and the next session start
+    // walks it again.
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+
+    let rows = listed_once(&handle, |rows| {
+        rows.exposed
+            .iter()
+            .any(|row| row.local == at(handed, exposed))
+            && rows
+                .listened
+                .iter()
+                .any(|row| row.local == at(handed, listened))
+    })
+    .await;
+    assert!(
+        rows.exposed
+            .iter()
+            .chain(&rows.listened)
+            .all(|row| !row.local.starts_with("127.0.0.1:")),
+        "no row names the interim after the move: {rows:?}"
+    );
+    for port in [exposed, listened] {
+        soon(|| {
+            served_naming(&served, interim, port)
+                .iter()
+                .any(|request| request.starts_with("POST /services/forwarder/unexpose "))
+        })
+        .await;
+        let moved = served_naming(&served, handed, port);
+        assert!(
+            moved.iter().any(
+                |request| request.starts_with("POST /services/forwarder/expose ")
+                    && request.contains(&format!("\"remote\":\"{lease}:{port}\""))
+            ),
+            "the port is bound at the hand toward the box's lease: {moved:?}"
+        );
+    }
+    {
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.shared_port_holder(handed, listened),
+            Some(web),
+            "the listened port is held where the box serves it now"
+        );
+        assert_eq!(
+            registry.shared_port_holder(interim, listened),
+            None,
+            "the interim hold is released"
+        );
+    }
+    forwarder.abort();
+    drop(listener);
+}
+
 /// The wiring test for the hand's verdict gate (the `.filter(vouches_for)`
 /// and the bounded wait on the hand's read, §7.1): a handed reserved address
 /// finalizes to `published_own_address == 127.0.0.1` under an absent book —
