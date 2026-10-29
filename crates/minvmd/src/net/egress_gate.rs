@@ -417,11 +417,29 @@ const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
 /// The rule name for a frame from the in-VM daemon's own address, under the
 /// in-force node-plane baseline, toward an address no baseline entry pinned
-/// (NET-085, NET-130): the node plane reaches the addresses its own lookups
-/// resolved a registry or cache name to, the entries' subnets, the host
+/// (NET-085, NET-130), or toward a pinned address at another protocol or
+/// port: the node plane reaches the addresses its own lookups resolved a
+/// registry or cache name to at TCP 443, the entries' subnets, the host
 /// alias at the configured host exposures, the resolver and the boxes'
 /// leases, and nothing else.
 const NODE_PLANE_UNPINNED_RULE: &str = "egress-node-plane-unpinned";
+
+/// The IP protocol a pinned baseline address is reached over: TCP alone,
+/// because the registry and the cache the daemon fetches from serve HTTPS
+/// (`https://github.com/gominimal/pkgs`, `https://cache.minimal.dev/`). A
+/// pin names an address, and a registry or cache name often resolves to a
+/// shared CDN address, so without this bound the pin would open that address
+/// at every protocol and port. QUIC is not admitted: carrying it would be a
+/// stated choice that adds UDP here. An endpoint spelled as a subnet is the
+/// deployment's own allowance and is decided by the set's compiled rules,
+/// without this bound.
+const NODE_PLANE_FETCH_PROTOCOL: u8 = egress::IPPROTO_TCP;
+
+/// The ports a pinned baseline address is reached at, over
+/// [`NODE_PLANE_FETCH_PROTOCOL`]: the HTTPS port the daemon's registry and
+/// cache fetches use. Any other port to a pinned address is
+/// [`NODE_PLANE_UNPINNED_RULE`]'s drop, the same as an address no pin names.
+const NODE_PLANE_FETCH_PORTS: [u16; 1] = [443];
 
 /// The rule name for a frame headed to the switch's own address — the plan's
 /// gateway — that is not a resolver query: TCP or UDP to the resolver's port
@@ -5212,7 +5230,8 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// address (NET-085, NET-130). The frame is admitted to:
 ///
 /// - an address the node plane's own lookups pinned for a baseline entry's
-///   name, or a flow such a pin established ([`dns_pins::DnsPins::admits_node_frame`]);
+///   name, or a flow such a pin established ([`dns_pins::DnsPins::admits_node_frame`]),
+///   at [`NODE_PLANE_FETCH_PROTOCOL`] and [`NODE_PLANE_FETCH_PORTS`] only;
 /// - a subnet a baseline entry names, and the resolver carve-out, both by the
 ///   set's compiled rules;
 /// - the host alias at the configured host exposures, over TCP or UDP;
@@ -5278,7 +5297,9 @@ fn node_plane_verdict(
     match egress::verdict(summary, baseline.rules()) {
         FrameVerdict::Admit => Ok(GateAdmit::Baseline),
         FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
-            if pins.admits_node_frame(table, baseline, dst, l4, Instant::now()) =>
+            if summary.protocol() == Some(NODE_PLANE_FETCH_PROTOCOL)
+                && NODE_PLANE_FETCH_PORTS.contains(&dst_port)
+                && pins.admits_node_frame(table, baseline, dst, l4, Instant::now()) =>
         {
             Ok(GateAdmit::Baseline)
         }
@@ -5999,7 +6020,8 @@ impl DropLimiter {
                     port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
                     rule_matched = NODE_PLANE_UNPINNED_RULE,
                     "dropped a node-plane frame leaving the VM toward an address no baseline \
-                     entry pinned; the node plane reaches the registry and the cache at the \
+                     entry pinned, or toward a pinned address at a port other than TCP 443; \
+                     the node plane reaches the registry and the cache at TCP 443 on the \
                      addresses its own lookups resolved them to",
                 );
                 true
@@ -15202,6 +15224,21 @@ mod tests {
             Ok(GateAdmit::Baseline),
             "the pinned address is admitted"
         );
+        // The pin opens the address at TCP 443 alone: another TCP port, UDP
+        // to the same port, and ICMP are the drop for want of a pin, so a
+        // shared address a registry name resolves to is not open at every
+        // port.
+        for (proto, port) in [(6, 22), (6, 80), (17, 443), (1, 0)] {
+            assert_eq!(
+                decide(proto, cache, port),
+                Err(GateDrop::NodePlaneUnpinned {
+                    src: node,
+                    dst: cache,
+                    dst_port: port
+                }),
+                "the pinned address is refused at protocol {proto} port {port}"
+            );
+        }
 
         // A neighbour of the pinned address, and a public address no lookup
         // named, stay refused for want of a pin.
