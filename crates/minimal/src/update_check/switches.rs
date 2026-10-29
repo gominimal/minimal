@@ -16,6 +16,10 @@ pub enum UpdateDisabledReason {
     ConfigUnreadable,
     /// An environment variable, named.
     Env(&'static str),
+    /// `--minimal-dir`: an alternate state directory has its own state file
+    /// and no install record, so the same install would be counted twice,
+    /// once as a `source` build.
+    MinimalDir,
 }
 
 impl std::fmt::Display for UpdateDisabledReason {
@@ -26,6 +30,7 @@ impl std::fmt::Display for UpdateDisabledReason {
                 f.write_str("a config.toml that could not be read or parsed (the check stays off until it is fixed)")
             }
             UpdateDisabledReason::Env(name) => write!(f, "{name} in the environment"),
+            UpdateDisabledReason::MinimalDir => f.write_str("--minimal-dir (an alternate state directory is not counted)"),
         }
     }
 }

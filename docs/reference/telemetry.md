@@ -249,7 +249,7 @@ later command then prints one line on stderr, once per new release, naming
 the channel's current release and the command that updates your install:
 
 ```
-min 0.7.1: the stable channel is now at 0.7.2. To update: curl -fsSL https://go.minimal.dev/stable | sh
+min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/reference/telemetry#update-check
 ```
 
 The line goes to stderr only when stderr is a terminal. stdout, the exit
@@ -269,8 +269,9 @@ The request carries six fields and nothing else:
 | id | a random UUID minted on the first run, stored in `<state>/minimal/update-check.json`; delete the file to rotate it |
 
 The endpoint also sees the country and network (ASN) of the request, as any
-web request shows, and does not store the address. The service source is in
-`workers/update-check/` in the minimal repository.
+web request shows, and does not store the address. The service source is
+`workers/update-check/` in the gominimal/webapp repository, beside the
+other edge Workers.
 
 `min update-check --dry-run` prints the exact request that would be made
 and the switch that stops it, if one is set. `min update-check` with no

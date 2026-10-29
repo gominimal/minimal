@@ -12,20 +12,14 @@ pub fn disclosure() -> String {
     )
 }
 
-/// The notice: the newer pointer and the upgrade path for the recorded
-/// install method. One function, so the text has one home (the verb a
-/// self-update command gets is gominimal/arch#101's call; the installer
-/// line needs none).
+/// The notice: the newer pointer, and where the update paths are written
+/// up. One function, so the text has one home. No command is printed: the
+/// per-method upgrade lines named packages nothing ships yet (no package
+/// writes an `install.toml`), and the installer line is gominimal/arch#101's
+/// call; a line the user can run as written goes here once one exists.
 pub fn notice(install: &Install, latest: &str) -> String {
-    let how = match install.method.as_str() {
-        "installer" => format!("curl -fsSL https://go.minimal.dev/{} | sh", install.channel),
-        "brew" => "brew upgrade min".to_string(),
-        "apt" => "sudo apt update && sudo apt install --only-upgrade min".to_string(),
-        "aur" => "update minimal-bin with your AUR helper".to_string(),
-        _ => format!("see {DOCS_URL}"),
-    };
     format!(
-        "min {}: the {} channel is now at {latest}. To update: {how}",
+        "min {}: the {} channel is now at {latest}. How to update: {DOCS_URL}",
         version::VERSION,
         install.channel
     )

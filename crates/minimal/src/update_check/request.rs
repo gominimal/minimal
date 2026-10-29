@@ -6,9 +6,8 @@
 use serde::Deserialize;
 
 use super::{
-    ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, config_state,
-    new_install_id, off_switch, read_install, read_state, record_answer, release_lock, state_dir,
-    write_state,
+    ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, new_install_id,
+    read_install, read_state, record_answer, release_lock, state_dir, write_state,
 };
 use crate::cli::{GlobalArgs, UpdateCheckArgs};
 
@@ -108,7 +107,7 @@ pub async fn cmd_update_check(
     global: &GlobalArgs,
     args: UpdateCheckArgs,
 ) -> Result<(), anyhow::Error> {
-    let off = off_switch(config_state(global), |n| std::env::var_os(n));
+    let off = super::off(global);
     let Some(dir) = state_dir(global) else {
         anyhow::bail!("no state directory (HOME is not set)");
     };

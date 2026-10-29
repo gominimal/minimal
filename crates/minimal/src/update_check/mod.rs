@@ -58,7 +58,7 @@ pub use request::{cmd_update_check, fetch_latest, request_url};
 use state::new_install_id;
 pub use state::{
     Install, State, acquire_lock, build_key, due, now_secs, read_install, read_state,
-    record_answer, record_notified, release_lock, valid_field, write_state,
+    record_answer, record_notified, release_lock, valid_field, valid_install_id, write_state,
 };
 pub use switches::{ConfigState, UpdateDisabledReason, off_switch};
 
@@ -93,6 +93,17 @@ fn state_dir(global: &GlobalArgs) -> Option<PathBuf> {
         .minimal_dir
         .clone()
         .or_else(|| paths::try_minimal_state_dir().map(|p| AsRef::<Path>::as_ref(&p).to_path_buf()))
+}
+
+/// The switch that turns the check off for this invocation, if any:
+/// [`off_switch`]'s environment and config, then `--minimal-dir`.
+fn off(global: &GlobalArgs) -> Option<UpdateDisabledReason> {
+    off_switch(config_state(global), |n| std::env::var_os(n)).or_else(|| {
+        global
+            .minimal_dir
+            .is_some()
+            .then_some(UpdateDisabledReason::MinimalDir)
+    })
 }
 
 /// What the user config says. A missing config is the default, on. A config
@@ -158,7 +169,7 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     if skip_for(command) {
         return;
     }
-    if off_switch(config_state(global), |n| std::env::var_os(n)).is_some() {
+    if off(global).is_some() {
         return;
     }
     let Some(dir) = state_dir(global) else {

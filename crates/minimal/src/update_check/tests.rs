@@ -172,7 +172,7 @@ fn the_state_round_trips_and_a_bad_file_is_the_default() {
     let path = tmp.path().join("sub").join(STATE_FILE);
     assert_eq!(read_state(&path), State::default());
     let state = State {
-        install_id: Some("id".into()),
+        install_id: Some("0f4b7c1e-2d3a-4b5c-8d6e-7f8091a2b3c4".into()),
         checked_at: Some(7),
         latest: Some("0.7.2".into()),
         latest_channel: Some("stable".into()),
@@ -187,6 +187,32 @@ fn the_state_round_trips_and_a_bad_file_is_the_default() {
     );
     std::fs::write(&path, "{not json").unwrap();
     assert_eq!(read_state(&path), State::default());
+}
+
+/// A hand-edited state file cannot put anything into the request query or
+/// onto the terminal: a field outside its charset reads as absent (the id
+/// is minted again, the pointer fetched again), the rest is kept.
+#[test]
+fn a_state_field_outside_its_charset_reads_as_absent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join(STATE_FILE);
+    let state = State {
+        install_id: Some("id&x=1".into()),
+        checked_at: Some(7),
+        latest: Some("0.7.2\u{1b}[31m".into()),
+        latest_channel: Some("stable".into()),
+        notified: Some("../etc".into()),
+        disclosed: true,
+    };
+    write_state(&path, &state).unwrap();
+    let read = read_state(&path);
+    assert_eq!(read.install_id, None);
+    assert_eq!(read.latest, None);
+    assert_eq!(read.notified, None);
+    assert_eq!(read.latest_channel.as_deref(), Some("stable"));
+    assert_eq!(read.checked_at, Some(7));
+    assert!(read.disclosed);
+    assert!(valid_install_id(&new_install_id()), "what we mint passes");
 }
 
 #[test]
@@ -402,14 +428,19 @@ fn the_notice_names_the_pointer_and_the_upgrade_path() {
     let text = notice(&install, "0.7.2");
     assert!(text.contains("0.7.2"), "{text}");
     assert!(
-        text.contains("curl -fsSL https://go.minimal.dev/stable | sh"),
+        text.contains(
+            "the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/"
+        ),
         "{text}"
     );
     let brew = Install {
         method: "brew".into(),
         ..install.clone()
     };
-    assert!(notice(&brew, "0.7.2").contains("brew upgrade min"));
+    assert!(
+        notice(&brew, "0.7.2")
+            .contains("is now at 0.7.2. How to update: https://docs.minimal.dev/")
+    );
     let other = Install {
         method: "snap".into(),
         ..install

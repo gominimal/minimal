@@ -101,11 +101,33 @@ pub struct State {
     pub disclosed: bool,
 }
 
+/// A field read back from the state file is trusted no further than one
+/// read from the install file: the id goes into the request query and the
+/// pointer onto the terminal, and the file is the user's to edit. A value
+/// outside the charset is dropped (an id is minted again; a pointer is
+/// fetched again).
 pub fn read_state(path: &Path) -> State {
-    std::fs::read_to_string(path)
+    let mut state: State = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json_lenient::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    state.install_id = state.install_id.filter(|id| valid_install_id(id));
+    state.latest = state.latest.filter(|s| valid_field(s));
+    state.latest_channel = state.latest_channel.filter(|s| valid_field(s));
+    state.notified = state.notified.filter(|s| valid_field(s));
+    state
+}
+
+/// The shape [`new_install_id`] mints: a hyphenated UUID, lowercase hex.
+pub fn valid_install_id(id: &str) -> bool {
+    id.len() == 36
+        && id.chars().enumerate().all(|(i, c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit() && !c.is_ascii_uppercase()
+            }
+        })
 }
 
 /// Writes through a temp file and a rename, so a reader never sees a
@@ -176,6 +198,8 @@ pub(super) fn new_install_id() -> String {
 pub fn record_notified(state_path: &Path, latest: &str) {
     let mut state = read_state(state_path);
     state.notified = Some(latest.to_string());
+    // A state file that cannot be written costs one repeated notice on a
+    // later command; the command this runs before has nothing to say about it.
     let _ = write_state(state_path, &state);
 }
 
@@ -191,5 +215,7 @@ pub fn record_answer(state_path: &Path, answer: Option<(String, String)>) {
         state.latest_channel = Some(channel);
     }
     state.checked_at = Some(now_secs());
+    // Unwritable: the next command finds the check still due and tries again;
+    // this is the silent background child, with nobody to tell.
     let _ = write_state(state_path, &state);
 }
