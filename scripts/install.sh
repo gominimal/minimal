@@ -478,7 +478,9 @@ maybe_remove_finalize_install() {
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
-        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned"
+        # minzone0-link.service is the boot unit that re-creates the link at
+        # every boot. Its enable link goes with it, before the daemon-reload.
+        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /etc/systemd/system/minzone0-link.service /etc/systemd/system/multi-user.target.wants/minzone0-link.service"
         _ns_paths="$_ns_files /sys/class/net/minzone0"
         _ns_chan="$_fi_root/run/minimal/answerer.sock"
     fi

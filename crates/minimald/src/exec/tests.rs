@@ -2142,15 +2142,15 @@ async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
     for _ in 0..200 {
         msg_tx.send(data(1, 7)).unwrap(); // to the cap, one byte at a time
     }
-    let feeder = tokio::spawn(async move {
-        loop {
-            // One more byte each time the reader has made room for it.
-            if msg_tx.send(data(1, 7)).is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    });
+    // The client is ahead of the command: one-byte chunks already wait
+    // behind the cap, so each read lets one in and the next is refused at
+    // once. A feeder on the reader's own period raced it instead, and only
+    // queued chunks when it happened to run ahead, so the window filled
+    // late or not at all (a timeout about one run in twelve on `main`).
+    // A hundred chunks outlast the 5 s timeout at one read per 50 ms.
+    for _ in 0..100 {
+        msg_tx.send(data(1, 7)).unwrap();
+    }
     let trickle = tokio::spawn(async move {
         let mut byte = [0u8; 1];
         loop {
@@ -2160,7 +2160,6 @@ async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
     });
     let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
     trickle.abort();
-    feeder.abort();
     ended
         .expect("a trickle reader fed in one-byte chunks is ended within a window")
         .unwrap();
