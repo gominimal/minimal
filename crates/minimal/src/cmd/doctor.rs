@@ -1,0 +1,289 @@
+//! `min doctor`: checks of this host's state that a person runs by hand.
+//!
+//! The one check today verifies the hash chain of the Box Egress Proxy's
+//! audit log across every segment (BEP-049). Whole-log verification lives
+//! here, never behind a `min box audit` flag.
+
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::Context as _;
+use bep::audit::{LogCheck, verify_dir};
+
+use crate::task::TaskExit;
+
+/// The result lines of the audit chain check, as `min doctor` prints them.
+// The two outcome lines are fixed by the plan's diagnostics for BEP-049.
+// A log with missing files (the BEP-049 residual) has its own first line, so
+// a script that reads the first line never sees "chain verified." for it.
+// Missing files exit 0: a prune and a deletion look the same on disk, and
+// a prune leaves a restart on every healthy host, so a non-zero code fails
+// a healthy host. The first line and the `files_missing` log field tell
+// this case apart. A broken chain exits 6 and a verified chain exits 0.
+fn audit_lines(check: &LogCheck) -> Vec<String> {
+    match &check.broken {
+        Some((segment, record)) => vec![format!(
+            "Audit log: the hash chain breaks at record {record} of {}; a record was changed or removed.",
+            segment.display()
+        )],
+        None if !check.restarts.is_empty() => {
+            let mut lines = vec![
+                "Audit log: some audit files are missing. The chain in the files that remain verifies."
+                    .to_owned(),
+            ];
+            for segment in &check.restarts {
+                lines.push(format!(
+                    "Audit log: the files before {} are missing, so the check starts again there.",
+                    segment.display()
+                ));
+            }
+            lines.push(
+                "Audit log: min removes old audit files, so the check cannot tell if a person removed them."
+                    .to_owned(),
+            );
+            lines
+        }
+        None if check.records == 0 => vec!["Audit log: no records yet.".to_owned()],
+        None => vec!["Audit log: chain verified.".to_owned()],
+    }
+}
+
+/// The outcome the audit chain check reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// The chain verifies, or the log has no records yet.
+    Verified,
+    /// Audit files are missing, and the chain in the files that remain
+    /// verifies.
+    FilesMissing,
+    /// The chain breaks. This takes precedence over missing files.
+    Broken,
+}
+
+impl Outcome {
+    fn of(check: &LogCheck) -> Self {
+        if check.broken.is_some() {
+            Self::Broken
+        } else if !check.restarts.is_empty() {
+            Self::FilesMissing
+        } else {
+            Self::Verified
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::FilesMissing => "files_missing",
+            Self::Broken => "broken",
+        }
+    }
+}
+
+/// Runs every check against the audit log in `dir` and writes one line for
+/// each to `out`. Returns the outcome the check reached.
+pub(crate) fn run(dir: &Path, out: &mut impl Write) -> anyhow::Result<Outcome> {
+    let check = verify_dir(dir)
+        .with_context(|| format!("cannot read the audit log in {}", dir.display()))?;
+    let result = Outcome::of(&check);
+    let outcome = result.label();
+    tracing::info!(
+        dir = %dir.display(),
+        segments = ?check.segments.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        records = check.records,
+        restarts = ?check.restarts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        outcome,
+        "checked the audit log hash chain"
+    );
+    for line in audit_lines(&check) {
+        writeln!(out, "{line}")?;
+    }
+    Ok(result)
+}
+
+/// `min doctor`. Exits 0 when the audit chain verifies, 6 when the chain
+/// breaks, and 0 when audit files are missing and the chain in the files
+/// that remain verifies. A non-zero exit prints no further message.
+pub(crate) fn cmd_doctor() -> anyhow::Result<()> {
+    // Interim (BEP-042), as for `min box audit`: the client reads the
+    // operator-owned log files under file mode, on the host. The design
+    // reads over the proxy's local socket (ruled on gominimal/arch#137;
+    // architecture, audit paragraph; Gatehouse §6.10). The interim is
+    // https://github.com/gominimal/minimal/issues/2459, and it ends when
+    // https://github.com/gominimal/minimal/issues/2463 serves the read.
+    // Flip: read the chain over that socket, and drop this direct read.
+    let dir = bep::audit::default_dir()
+        .context("cannot find the home directory, so the audit log cannot be found")?;
+    match run(&dir, &mut std::io::stdout().lock())? {
+        Outcome::Verified => Ok(()),
+        Outcome::Broken => Err(TaskExit(6).into()),
+        Outcome::FilesMissing => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bep::audit::{AuditLog, Decision, Kind, Mapping, Rotation};
+
+    fn decision() -> Decision {
+        Decision {
+            kind: Kind::Decision,
+            box_id: "01920000-0000-7000-8000-000000000001".to_owned(),
+            authority: "api.github.com".to_owned(),
+            identifier: None,
+            jti: String::new(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: bep::audit::Outcome::Refuse,
+            marker: Some("off_module".to_owned()),
+        }
+    }
+
+    fn run_to_string(dir: &Path) -> (super::Outcome, String) {
+        let mut out = Vec::new();
+        let outcome = run(dir, &mut out).unwrap();
+        (outcome, String::from_utf8(out).unwrap())
+    }
+
+    // BEP-049: editing one audit record makes `min doctor` name the record
+    // and the segment where the chain breaks.
+    #[test]
+    fn doctor_reports_a_broken_audit_chain() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let dir = tmp.path().join("audit");
+
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                super::Outcome::Verified,
+                "Audit log: no records yet.\n".to_owned()
+            )
+        );
+
+        // One record to a segment, so the chain crosses segments.
+        let rotation = Rotation {
+            bound: 1,
+            ..Rotation::default()
+        };
+        let mut log = AuditLog::open_dir(&dir, rotation).unwrap();
+        for _ in 0..3 {
+            log.append(&decision()).unwrap();
+        }
+        drop(log);
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                super::Outcome::Verified,
+                "Audit log: chain verified.\n".to_owned()
+            )
+        );
+
+        // Change the first segment's record without recomputing any hash.
+        // The next record, the first of the second segment, no longer
+        // carries the hash of the line before it.
+        let segments = bep::audit::segments(&dir).unwrap();
+        assert!(segments.len() >= 2, "the log rotated: {segments:?}");
+        let first = std::fs::read_to_string(&segments[0]).unwrap();
+        std::fs::write(
+            &segments[0],
+            first.replace("api.github.com", "api.github.org"),
+        )
+        .unwrap();
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                super::Outcome::Broken,
+                format!(
+                    "Audit log: the hash chain breaks at record 1 of {}; a record was changed or removed.\n",
+                    segments[1].display()
+                )
+            )
+        );
+
+        // With the oldest file gone, the rest verifies. The first line is not
+        // "chain verified.", and the check says where it starts again.
+        std::fs::remove_file(&segments[0]).unwrap();
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                super::Outcome::FilesMissing,
+                format!(
+                    "Audit log: some audit files are missing. The chain in the files that remain verifies.\n\
+                     Audit log: the files before {} are missing, so the check starts again there.\n\
+                     Audit log: min removes old audit files, so the check cannot tell if a person removed them.\n",
+                    segments[1].display()
+                )
+            )
+        );
+
+        // With only an empty file left past the gap, the check still says
+        // that files are missing, not "no records yet.".
+        let last = segments.last().unwrap();
+        for segment in &segments[1..segments.len() - 1] {
+            std::fs::remove_file(segment).unwrap();
+        }
+        std::fs::write(last, "").unwrap();
+        assert_eq!(
+            run_to_string(&dir),
+            (
+                super::Outcome::FilesMissing,
+                format!(
+                    "Audit log: some audit files are missing. The chain in the files that remain verifies.\n\
+                     Audit log: the files before {} are missing, so the check starts again there.\n\
+                     Audit log: min removes old audit files, so the check cannot tell if a person removed them.\n",
+                    last.display()
+                )
+            )
+        );
+    }
+
+    fn revocation() -> Decision {
+        Decision {
+            kind: Kind::Revocation,
+            authority: String::new(),
+            marker: None,
+            ..decision()
+        }
+    }
+
+    // One record to a segment, `first` then two decisions.
+    fn three_segment_log(dir: &Path, first: &Decision) -> Vec<std::path::PathBuf> {
+        let rotation = Rotation {
+            bound: 1,
+            ..Rotation::default()
+        };
+        let mut log = AuditLog::open_dir(dir, rotation).unwrap();
+        log.append(first).unwrap();
+        for _ in 0..2 {
+            log.append(&decision()).unwrap();
+        }
+        drop(log);
+        let segments = bep::audit::segments(dir).unwrap();
+        assert!(segments.len() >= 3, "the log rotated: {segments:?}");
+        segments
+    }
+
+    // A missing middle segment gives the missing-files outcome (exit 0), and
+    // an edited record gives the broken outcome (exit 6).
+    #[test]
+    fn doctor_outcome_for_a_missing_segment_and_an_edited_record() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+
+        let missing = tmp.path().join("missing");
+        // A gap after a segment that holds a revocation record is one a
+        // prune can leave, so the chain starts again past it.
+        let segments = three_segment_log(&missing, &revocation());
+        std::fs::remove_file(&segments[1]).unwrap();
+        assert_eq!(run_to_string(&missing).0, super::Outcome::FilesMissing);
+
+        let edited = tmp.path().join("edited");
+        let segments = three_segment_log(&edited, &decision());
+        let first = std::fs::read_to_string(&segments[0]).unwrap();
+        std::fs::write(
+            &segments[0],
+            first.replace("api.github.com", "api.github.org"),
+        )
+        .unwrap();
+        assert_eq!(run_to_string(&edited).0, super::Outcome::Broken);
+    }
+}

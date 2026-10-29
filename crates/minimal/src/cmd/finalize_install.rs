@@ -611,10 +611,12 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
                     crate::resolver::range_text()
                 )
             } else {
+                // The boot unit is part of the step: without it the
+                // setting is gone after the next restart.
                 format!(
                     "configures this machine's DNS (systemd-resolved) to send \
                      *.{zone} lookups to Minimal's DNS service on \
-                     127.0.0.1:{port}{}",
+                     127.0.0.1:{port} at every boot{}",
                     if install.is_some() {
                         " and installs that service"
                     } else {
@@ -2451,7 +2453,7 @@ mod tests {
              reserves the box IPs (127.0.64.0/24) on this machine's loopback at every boot"
         } else {
             "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups \
-             to Minimal's DNS service on 127.0.0.1:15353"
+             to Minimal's DNS service on 127.0.0.1:15353 at every boot"
         };
         assert_eq!(missing.step.as_deref(), Some(expected_step));
         assert!(NAMES_LABEL.contains(crate::resolver::ZONE), "{NAMES_LABEL}");
@@ -2507,7 +2509,7 @@ mod tests {
             );
         } else {
             assert!(
-                step.ends_with("on 127.0.0.1:15353 and installs that service"),
+                step.ends_with("on 127.0.0.1:15353 at every boot and installs that service"),
                 "{step}"
             );
         }
