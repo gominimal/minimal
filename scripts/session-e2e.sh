@@ -5170,7 +5170,7 @@ fresh_install_range_lands_on_macos() {
   # The box's own address: the zone answerer's A record for its name.
   for _ in $(seq 1 40); do
     frm_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' \
       | head -n1)"
     [ -n "$frm_ans_port" ] && break
     sleep 0.25
@@ -26783,7 +26783,7 @@ proof_macos_box_opens_by_name_and_proxy() {
   for _ in $(seq 1 40); do
     mo_ls="$(mnl ls 2>/dev/null || true)"
     mo_ans_port="$(printf '%s\n' "$mo_ls" \
-      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' | head -n1)"
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' | head -n1)"
     mo_proxy_port="$(printf '%s\n' "$mo_ls" \
       | sed -En 's/^HOSTNAME PROXY: .*listening on 127\.0\.0\.1:([0-9]+).*/\1/p' | head -n1)"
     [ -n "$mo_ans_port" ] && [ -n "$mo_proxy_port" ] && break
@@ -26872,7 +26872,7 @@ while True:
       kill -0 "$MACOS_OPEN_HOLD_PID" 2>/dev/null || break
       sleep 0.25
     done
-    if ! grep -q '^held' "$WORK/mo-hold.out" 2>/dev/null; then
+    if ! grep -q '^held [1-9]' "$WORK/mo-hold.out" 2>/dev/null; then
       echo "::error::could not hold port $mo_declared on the other range addresses with a plain listener"
       cat "$WORK/mo-hold.err" 2>/dev/null || true
       fail
