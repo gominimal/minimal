@@ -1118,7 +1118,7 @@ fn zone_rows_of(registry: &Arc<std::sync::RwLock<HostnameRegistry>>) -> Vec<Regi
 }
 
 /// This daemon's node id: the canonical identity dir the daemon runs under
-/// (its provider instance dir), so the id is the same across restarts and
+/// (its host dir), so the id is the same across restarts and
 /// across symlinked spellings of one dir, and no two instances of the
 /// daemon on one machine share one. The `#native` tail is the wire's shape
 /// — a node's id is a dir and what it runs as, the way a VM host daemon's

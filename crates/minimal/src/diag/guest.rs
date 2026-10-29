@@ -123,7 +123,7 @@ const NESTED_MAX_DECOMPRESSED: u64 = 1024 * 1024 * 1024;
 /// stops naming the real cause.
 const NESTED_STREAM_SLACK: u64 = (NESTED_MAX_ENTRIES as u64 + 1) * 1024;
 
-/// What the guest step left in the bundle for one provider.
+/// What the guest step left in the bundle for one host.
 ///
 /// Read by [`crate::diag::collect::explain_absent_log_prefixes`], which uses
 /// it to decide what may be said about `logs/minimald.log*` missing from the
@@ -161,14 +161,14 @@ enum DaemonLogs {
 const NESTED_DAEMON_LOG_PREFIX: &str = "logs/minimald.log";
 
 /// Downloads the daemon bundle over `client` and stores it under
-/// `providers/<provider>/guest/`. On failure writes `error.txt` there,
+/// `providers/<host>/guest/`. On failure writes `error.txt` there,
 /// records a collector error, and falls back to reading the data volume image
 /// from the host ([`volume_fallback`]) — `min bug` always produces a bundle,
 /// and a dead transport is exactly when the guest's logs matter.
 pub async fn collect(
     w: &mut BundleWriter,
-    provider: &str,
-    provider_dir: &Path,
+    host: &str,
+    host_dir: &Path,
     client: &mut Client,
     timeout: Duration,
 ) -> Result<GuestOutcome, anyhow::Error> {
@@ -181,7 +181,7 @@ pub async fn collect(
     )
     .await;
 
-    let dest = format!("providers/{provider}/guest/daemon-diag.tar.zst");
+    let dest = format!("providers/{host}/guest/daemon-diag.tar.zst");
     let failure = match result {
         Ok(Ok((bytes, truncated))) => {
             // Verify before recording, but record either way (R7.3): a bundle
@@ -203,7 +203,7 @@ pub async fn collect(
                 Ok(_) => GuestOutcome::BundleUnconfirmed,
                 Err(failed) => {
                     w.error(
-                        format!("guest.{provider}.verify"),
+                        format!("guest.{host}.verify"),
                         format!("nested bundle stored unverified — {failed}"),
                         started.elapsed(),
                     );
@@ -215,14 +215,14 @@ pub async fn collect(
         Err(_) => format!("guest bundle download timed out after {timeout:?}"),
     };
 
-    w.error(format!("guest.{provider}"), &failure, started.elapsed());
+    w.error(format!("guest.{host}"), &failure, started.elapsed());
     w.add_bytes(
-        &format!("providers/{provider}/guest/error.txt"),
+        &format!("providers/{host}/guest/error.txt"),
         failure.as_bytes(),
         Redaction::None,
     )
     .await?;
-    volume_fallback(w, provider, provider_dir)
+    volume_fallback(w, host, host_dir)
         .await
         .map(|()| GuestOutcome::NoBundle)
 }
@@ -331,10 +331,10 @@ struct VolumeMeta {
 /// installed; otherwise leaves the exact offline command in the manifest.
 pub async fn volume_fallback(
     w: &mut BundleWriter,
-    provider: &str,
-    provider_dir: &Path,
+    host: &str,
+    host_dir: &Path,
 ) -> Result<(), anyhow::Error> {
-    let image = provider_dir.join("data-vol.raw");
+    let image = host_dir.join("data-vol.raw");
     // "Absent" and "unreadable" are different diagnoses and must not collapse
     // into the same `exists: false`. This runs when the daemon is already
     // suspect, so "the image is not there" versus "the image is there and I
@@ -344,7 +344,7 @@ pub async fn volume_fallback(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             w.error(
-                format!("guest.{provider}.volume_fallback"),
+                format!("guest.{host}.volume_fallback"),
                 format!("stat {}: {e}", image.display()),
                 std::time::Duration::ZERO,
             );
@@ -366,7 +366,7 @@ pub async fn volume_fallback(
     };
     let json = serde_json_lenient::to_vec_pretty(&info).context("serializing volume meta")?;
     w.add_bytes(
-        &format!("providers/{provider}/guest/volume-meta.json"),
+        &format!("providers/{host}/guest/volume-meta.json"),
         &json,
         Redaction::None,
     )
@@ -375,7 +375,7 @@ pub async fn volume_fallback(
         return Ok(());
     }
 
-    let dest_dir = format!("providers/{provider}/guest/volume-logs");
+    let dest_dir = format!("providers/{host}/guest/volume-logs");
     // Resolved once and quoted into the hint: when the harvest is declined or
     // fails, the reader gets the command that will actually run on this host,
     // not one that depends on their `PATH` looking like ours.
@@ -517,11 +517,11 @@ async fn harvest_dir(w: &mut BundleWriter, dest_dir: &str, src: &Path) -> usize 
 /// Records why guest collection didn't run (no daemon, `--no-guest`).
 pub async fn record_skipped(
     w: &mut BundleWriter,
-    provider: &str,
+    host: &str,
     reason: &str,
 ) -> Result<(), anyhow::Error> {
     w.add_bytes(
-        &format!("providers/{provider}/guest/error.txt"),
+        &format!("providers/{host}/guest/error.txt"),
         reason.as_bytes(),
         Redaction::None,
     )

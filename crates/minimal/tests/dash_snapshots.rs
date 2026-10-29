@@ -9,7 +9,7 @@ use boxes::{NetworkMode, SessionId};
 use chrono::DateTime;
 use minimal::dash::app::{self, Detail, Model, Msg, SessionKey};
 use minimal::dash::render;
-use minimal::dash::rpc::ProviderData;
+use minimal::dash::rpc::HostData;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -47,15 +47,15 @@ fn entry_with_git(
     e
 }
 
-fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> ProviderData {
-    ProviderData {
+fn host(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> HostData {
+    HostData {
         label: label.to_string(),
         version: "0.1".to_string(),
         sessions,
     }
 }
 
-fn fixed_model(providers: Vec<ProviderData>) -> Model {
+fn fixed_model(hosts: Vec<HostData>) -> Model {
     let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
         .unwrap()
         .to_utc();
@@ -63,7 +63,7 @@ fn fixed_model(providers: Vec<ProviderData>) -> Model {
     app::update(
         &mut model,
         Msg::Refreshed {
-            ok: providers,
+            ok: hosts,
             failed: Vec::new(),
         },
     );
@@ -115,8 +115,8 @@ fn empty_list() {
 }
 
 #[test]
-fn single_provider() {
-    let mut model = fixed_model(vec![provider(
+fn single_host() {
+    let mut model = fixed_model(vec![host(
         "host",
         vec![
             entry(1, Some("api-staging"), "/src/api"),
@@ -127,10 +127,10 @@ fn single_provider() {
 }
 
 #[test]
-fn two_providers() {
+fn two_hosts() {
     let mut model = fixed_model(vec![
-        provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
-        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+        host("host", vec![entry(1, Some("api-staging"), "/src/api")]),
+        host("vm", vec![entry(3, Some("bench"), "/src/bench")]),
     ]);
     insta::assert_snapshot!(render(&mut model));
 }
@@ -138,8 +138,8 @@ fn two_providers() {
 #[test]
 fn filtered() {
     let mut model = fixed_model(vec![
-        provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
-        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+        host("host", vec![entry(1, Some("api-staging"), "/src/api")]),
+        host("vm", vec![entry(3, Some("bench"), "/src/bench")]),
     ]);
     model.filter.input = "bench".to_string();
     model.clamp_cursor();
@@ -151,8 +151,8 @@ fn filtered_with_status() {
     // The status reserves the footer's right edge; it must not overdraw
     // the hints, long as they are with a filter applied.
     let mut model = fixed_model(vec![
-        provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
-        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+        host("host", vec![entry(1, Some("api-staging"), "/src/api")]),
+        host("vm", vec![entry(3, Some("bench"), "/src/bench")]),
     ]);
     model.filter.input = "bench".to_string();
     model.clamp_cursor();
@@ -169,12 +169,12 @@ fn filtered_with_status() {
 
 #[test]
 fn preview_section_with_screen_snapshot() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     // A synthetic live screen: a build log over a shell prompt, with one
@@ -219,12 +219,12 @@ fn preview_section_with_screen_snapshot() {
 
 #[test]
 fn detail_pane_with_policy() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -262,12 +262,12 @@ fn detail_pane_names_a_declared_deny_all() {
     // Every allow list present and empty: the box declared deny-all, and the
     // pane names it as `min session policy` does instead of printing the
     // empty dimension rows as blankness.
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -302,12 +302,12 @@ fn detail_pane_names_a_declared_deny_all() {
 /// marked `allow-all (default)`, as `min session policy` prints it.
 #[test]
 fn detail_pane_marks_the_allow_all_default() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -331,12 +331,12 @@ fn detail_pane_marks_the_allow_all_default() {
 /// text `min session policy` prints (one shared sessions function).
 #[test]
 fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -360,12 +360,12 @@ fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
 /// "loading policy…" for an answer that never comes.
 #[test]
 fn detail_pane_names_an_unavailable_policy() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -388,12 +388,12 @@ fn detail_pane_names_an_unavailable_policy() {
 /// as `min session policy` does, not the bare declaration's allow-all.
 #[test]
 fn detail_pane_marks_the_deny_all_default() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -415,12 +415,12 @@ fn detail_pane_marks_the_deny_all_default() {
 
 #[test]
 fn detail_pane_shows_dynamic_ingress() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -458,7 +458,7 @@ fn detail_pane_shows_dynamic_ingress() {
 /// tagged as a worktree, in the detail Info section.
 #[test]
 fn sidebar_and_info_show_git_context() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![
             entry_with_git(1, "api-staging", "/src/api", false),
@@ -513,12 +513,12 @@ fn sidebar_and_info_show_git_context() {
 /// enum name.
 #[test]
 fn detail_pane_spells_the_network_mode_word() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: "host".to_string(),
+        host: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -546,7 +546,7 @@ fn detail_pane_spells_the_network_mode_word() {
 /// keeping the Info column layout byte-identical to pre-git renders.
 #[test]
 fn info_section_omits_git_rows_without_git_info() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry(1, Some("plain"), "/src/plain")],
     )]);
@@ -565,15 +565,15 @@ fn info_section_omits_git_rows_without_git_info() {
 /// pushing the network label and activity indicator off the right edge.
 #[test]
 fn sidebar_truncates_a_long_branch() {
-    let mut model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![host(
         "host",
         vec![entry_with_git(1, "api", "/src/api", false)],
     )]);
     let long_branch = format!("feature/{}", "x".repeat(120));
-    model.providers[0].sessions[0].git.as_mut().unwrap().branch = long_branch;
+    model.hosts[0].sessions[0].git.as_mut().unwrap().branch = long_branch;
     model.details.insert(
         SessionKey {
-            provider: "host".to_string(),
+            host: "host".to_string(),
             id: id(1),
         },
         Detail {
@@ -611,7 +611,7 @@ fn sidebar_shows_activity_indicator_for_recent_stdout() {
         audible_bell: None,
         visual_bell: None,
     });
-    let mut model = fixed_model(vec![provider("host", vec![hot])]);
+    let mut model = fixed_model(vec![host("host", vec![hot])]);
     model.now = now;
     assert!(render(&mut model).contains('◐'));
 }
@@ -635,10 +635,10 @@ fn sidebar_shows_bell_indicator() {
         }),
         visual_bell: None,
     });
-    let mut model = fixed_model(vec![provider("host", vec![ringing])]);
+    let mut model = fixed_model(vec![host("host", vec![ringing])]);
     model.now = now;
     assert!(render(&mut model).contains('●'));
-    // Provider headers also render ● (health); the bell assert above counts
+    // Host headers also render ● (health); the bell assert above counts
     // on both. After focusing the session, its bell is acknowledged and only
     // the header dot remains — check the session row specifically.
     model.cursor = 1;
@@ -666,7 +666,7 @@ fn sidebar_scrolls_to_keep_the_cursor_visible() {
     let sessions = (0..40)
         .map(|n| entry(n, Some(&format!("s{n:02}")), "/src/x"))
         .collect();
-    let mut model = fixed_model(vec![provider("host", sessions)]);
+    let mut model = fixed_model(vec![host("host", sessions)]);
     model.cursor = model.visible_rows().len() - 1;
     let rendered = render(&mut model);
     assert!(
@@ -680,18 +680,18 @@ fn sidebar_scrolls_to_keep_the_cursor_visible() {
     );
 }
 
-/// A provider whose refresh failed keeps its group header, marked
+/// A host whose refresh failed keeps its group header, marked
 /// unreachable (red health dot), instead of vanishing from the sidebar.
 #[test]
-fn sidebar_marks_a_failed_provider_unreachable() {
+fn sidebar_marks_a_failed_host_unreachable() {
     let mut model = fixed_model(vec![
-        provider("host", vec![entry(1, Some("api"), "/src/api")]),
-        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+        host("host", vec![entry(1, Some("api"), "/src/api")]),
+        host("vm", vec![entry(3, Some("bench"), "/src/bench")]),
     ]);
     app::update(
         &mut model,
         Msg::Refreshed {
-            ok: vec![provider("host", vec![entry(1, Some("api"), "/src/api")])],
+            ok: vec![host("host", vec![entry(1, Some("api"), "/src/api")])],
             failed: vec!["vm".to_string()],
         },
     );

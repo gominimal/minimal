@@ -309,13 +309,13 @@ impl Guest {
     /// Panics past the deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let guest = Guest {
-            sock_path: provider_dir.join("ssh.sock"),
+            sock_path: host_dir.join("ssh.sock"),
             // The gate binds the socket beside the switch socket, which sits
             // beside the bridge socket.
-            gate_sock: provider_dir.join("gvproxy-gate.sock"),
-            control_sock: provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            gate_sock: host_dir.join("gvproxy-gate.sock"),
+            control_sock: host_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
             _state: state,

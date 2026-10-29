@@ -40,7 +40,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             );
             let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
             box_via_ssh(
-                daemon_provider_kind(global),
+                daemon_host_kind(global),
                 &sock,
                 entry.id,
                 None,
@@ -282,7 +282,7 @@ pub(crate) fn display_with_home_tilde(
 
 /// Open the session manager TUI.
 ///
-/// The TUI probes both provider sockets itself; if neither daemon is
+/// The TUI probes both host sockets itself; if neither daemon is
 /// running, autospawn the default backend first so the dashboard has
 /// something to show (mirroring what the flat subcommands do).
 pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
@@ -334,7 +334,7 @@ pub struct VmListing {
 /// — that one was just ensured, so a failure there is the failure to report
 /// (and a skewed one is refused there, as `min ls` always has). Nothing
 /// enumerable — the native backend, which hosts no VMs — falls back to the
-/// selected provider's daemon, exactly the listing `min ls` has always
+/// selected host's daemon, exactly the listing `min ls` has always
 /// printed.
 pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
     listings_across_vms(global, true).await
@@ -713,15 +713,15 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
 /// The VM a session-start line names, as a fact about the backend kind: the
 /// selected VM on the VM backend, where the session that just started landed
 /// on one VM of several, and nothing on the native backend, whose one daemon
-/// hosts no VMs to name. Keyed on the provider kind the daemon connection
-/// resolves through — the same rule [`super::session::daemon_provider_kind`]
+/// hosts no VMs to name. Keyed on the host kind the daemon connection
+/// resolves through — the same rule [`super::session::daemon_host_kind`]
 /// states — and never on `use_minvmd()`: the flag is how Linux asks for the
 /// VM host, while macOS reaches it with no flag at all, and a line that
 /// keyed on the flag would name no VM for exactly the host whose every
 /// invocation is VM-backed.
 #[must_use]
-pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
-    (kind == paths::ProviderKind::Minvmd).then(client::vm_name)
+pub fn hostname_proxy_vm(kind: paths::HostKind) -> Option<&'static str> {
+    (kind == paths::HostKind::Minvmd).then(client::vm_name)
 }
 
 /// Format the session list for the given output mode. Split from

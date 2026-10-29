@@ -164,7 +164,7 @@ fn named_vm_reaches_autospawn() {
 }
 
 /// Without `--vm`, autospawn must behave exactly as before: no `--vm` in the
-/// spawned daemon's argv, and the state dir read is the bare provider dir
+/// spawned daemon's argv, and the state dir read is the bare host dir
 /// (NET-053 — the default VM's paths are unchanged).
 #[test]
 fn default_vm_autospawn_is_unchanged() {

@@ -14,8 +14,8 @@ use minimal_client::box_registration::{
     resume_box_row,
 };
 
-/// The provider kind this invocation's daemon connection resolves through:
-/// `client_provider_kind`, the same key the socket resolution itself and the
+/// The host kind this invocation's daemon connection resolves through:
+/// `client_host_kind`, the same key the socket resolution itself and the
 /// fabric display turn on. Every gate that decides whether the host is
 /// VM-backed keys on this and never on `use_minvmd()` — the flag is the
 /// linux-only way to *ask* for the VM host, while macOS has no native
@@ -23,17 +23,17 @@ use minimal_client::box_registration::{
 /// and the flag's own reading would leave exactly that host with no box
 /// registration, no control socket to withdraw through, and a start line
 /// that names no VM (NET-081's macOS half).
-pub(crate) fn daemon_provider_kind(global: &GlobalArgs) -> paths::ProviderKind {
-    client::client_provider_kind(global.use_minvmd())
+pub(crate) fn daemon_host_kind(global: &GlobalArgs) -> paths::HostKind {
+    client::client_host_kind(global.use_minvmd())
 }
 
 /// The VM host daemon's control socket, when the daemon this invocation
 /// talks to is minvmd-backed (T66): it sits beside the ssh socket in the
-/// provider dir the daemon connection resolves through, so the client
+/// host dir the daemon connection resolves through, so the client
 /// finds both by the same rule — named VMs included, since the resolution
 /// reads the same process-global VM name.
 ///
-/// Keyed on the provider kind — [`daemon_provider_kind`], the rule the
+/// Keyed on the host kind — [`daemon_host_kind`], the rule the
 /// fabric display already uses — never on `use_minvmd()` alone: the flag is
 /// how Linux asks for the VM host, and macOS reaches it with no flag at
 /// all, so the destroy and Ctrl-C withdrawals must resolve their socket for
@@ -44,10 +44,10 @@ pub(crate) fn daemon_provider_kind(global: &GlobalArgs) -> paths::ProviderKind {
 /// unresolvable dir — asks for nothing, and the withdrawal's own warning is
 /// the one that names the row left published.
 pub(crate) fn vm_host_control_sock(
-    kind: paths::ProviderKind,
+    kind: paths::HostKind,
     minimal_dir: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    if kind != paths::ProviderKind::Minvmd {
+    if kind != paths::HostKind::Minvmd {
         return None;
     }
     let ssh_sock = client::resolve_socket_path(minimal_dir, true).ok()?;
@@ -56,7 +56,7 @@ pub(crate) fn vm_host_control_sock(
 
 /// The control socket beside an ssh socket a client already resolved (T66's
 /// rule, one definition for every caller): the VM host daemon serves both
-/// from the same provider dir, so the socket a listing or an activation
+/// from the same host dir, so the socket a listing or an activation
 /// reached a VM on is the one to find that VM's control socket beside. A
 /// native minimald serves its answerer control socket (`minimald`'s
 /// `rpc::ANSWERER_CONTROL_SOCK_FILE`, the same file name) beside its ssh
@@ -116,9 +116,9 @@ pub(crate) async fn advisory_host_reads(
     // The daemons the step asks to release the hook port: this CLI's
     // own state dir's — its running VM host daemons or its native
     // daemon — never another state dir's.
-    let controls = match daemon_provider_kind(global) {
-        paths::ProviderKind::Minvmd => running_vm_controls(global.minimal_dir.as_deref()).await,
-        paths::ProviderKind::Minimald => {
+    let controls = match daemon_host_kind(global) {
+        paths::HostKind::Minvmd => running_vm_controls(global.minimal_dir.as_deref()).await,
+        paths::HostKind::Minimald => {
             client::resolve_socket_path(global.minimal_dir.as_deref(), false)
                 .ok()
                 .and_then(|sock| control_sock_beside(&sock))
@@ -133,7 +133,7 @@ pub(crate) async fn advisory_host_reads(
 
 /// The machine's zone-answerer state, read from the VM host daemon's
 /// control socket (NET-138) — the read-only status verb, over the same
-/// socket the box rows ride, so the posture (a 0600 socket in the provider
+/// socket the box rows ride, so the posture (a 0600 socket in the host
 /// dir, the connection's own reach) is the one every other verb is served
 /// under.
 ///
@@ -144,14 +144,14 @@ pub(crate) async fn advisory_host_reads(
 /// deadline passes, or the daemon predates the verb and refuses the line:
 /// each is the same honest silence a daemon still bringing its answerer up
 /// gets, and the verbs print nothing they cannot prove. Whether the
-/// invocation is on a VM-backed host is [`daemon_provider_kind`]'s to say,
+/// invocation is on a VM-backed host is [`daemon_host_kind`]'s to say,
 /// the rule every VM-backed gate keys on — never `use_minvmd()` alone
 /// (NET-081's macOS half).
 pub(crate) async fn vm_host_answerer_status(
     global: &GlobalArgs,
 ) -> Option<minimald_rpc::AnswererStatusReply> {
     vm_host_answerer_status_at(vm_host_control_sock(
-        daemon_provider_kind(global),
+        daemon_host_kind(global),
         global.minimal_dir.as_deref(),
     ))
     .await
@@ -333,12 +333,12 @@ pub(crate) async fn release_held_name_after_attach(
 /// only the answerer verbs, and asking it was a refusal warned on every
 /// native attach and exec's stderr (#2213).
 pub(crate) async fn rehold_held_name_before_attach(
-    kind: paths::ProviderKind,
+    kind: paths::HostKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     record: Option<&boxes::Record>,
 ) {
-    if kind != paths::ProviderKind::Minvmd {
+    if kind != paths::HostKind::Minvmd {
         return;
     }
     let Some(record) = record else {
@@ -503,18 +503,18 @@ mod tests {
     #[tokio::test]
     async fn running_vm_controls_skip_a_stopped_named_vm() {
         let base = tempfile::tempdir().unwrap();
-        let provider = base.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider).unwrap();
+        let host_dir = base.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         // A running named VM: its bridge and control sockets are listening,
         // so its daemon's control socket is asked for the release.
-        let alpha = provider.join("alpha");
+        let alpha = host_dir.join("alpha");
         std::fs::create_dir_all(&alpha).unwrap();
         let _alpha_bridge = std::os::unix::net::UnixListener::bind(alpha.join("ssh.sock")).unwrap();
         let _alpha_control =
             std::os::unix::net::UnixListener::bind(alpha.join("control.sock")).unwrap();
         // A stopped named VM that ran: both socket files remain, but nothing
         // listens behind them, so its daemon's control socket is not asked.
-        let beta = provider.join("beta");
+        let beta = host_dir.join("beta");
         std::fs::create_dir_all(&beta).unwrap();
         drop(std::os::unix::net::UnixListener::bind(beta.join("ssh.sock")).unwrap());
         drop(std::os::unix::net::UnixListener::bind(beta.join("control.sock")).unwrap());
@@ -532,16 +532,16 @@ mod tests {
     #[tokio::test]
     async fn running_vm_controls_skip_a_stopped_default_vm() {
         let base = tempfile::tempdir().unwrap();
-        let provider = base.path().join("providers").join("local-minvmd0");
-        let gamma = provider.join("gamma");
+        let host_dir = base.path().join("providers").join("local-minvmd0");
+        let gamma = host_dir.join("gamma");
         std::fs::create_dir_all(&gamma).unwrap();
         let _gamma_bridge = std::os::unix::net::UnixListener::bind(gamma.join("ssh.sock")).unwrap();
         let _gamma_control =
             std::os::unix::net::UnixListener::bind(gamma.join("control.sock")).unwrap();
         // The default VM ran once and stopped: its socket files remain in
-        // the provider dir with no listener behind them.
-        drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
-        drop(std::os::unix::net::UnixListener::bind(provider.join("control.sock")).unwrap());
+        // the host dir with no listener behind them.
+        drop(std::os::unix::net::UnixListener::bind(host_dir.join("ssh.sock")).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(host_dir.join("control.sock")).unwrap());
         assert_eq!(
             running_vm_controls(Some(base.path())).await,
             vec![gamma.join("control.sock").display().to_string()]
@@ -623,12 +623,12 @@ mod tests {
 
         // The successful shape, driven the way the activation drives it:
         // through `register_box_for_activation`, whose socket resolution
-        // lands on the provider dir the daemon connection uses — here the
+        // lands on the host dir the daemon connection uses — here the
         // stand-in bound where a real minvmd's control socket would be.
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let requests = fake_vm_host(
             sock_path.clone(),
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
@@ -640,7 +640,7 @@ mod tests {
             ..Default::default()
         };
         let handed = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             global.minimal_dir.as_deref(),
             NetworkMode::OwnIp,
             "web",
@@ -686,7 +686,7 @@ mod tests {
         // Neither touches a socket, so neither needs a dir.
         assert!(
             register_box_for_activation(
-                paths::ProviderKind::Minimald,
+                paths::HostKind::Minimald,
                 None,
                 NetworkMode::OwnIp,
                 "web",
@@ -699,7 +699,7 @@ mod tests {
         );
         assert!(
             register_box_for_activation(
-                paths::ProviderKind::Minvmd,
+                paths::HostKind::Minvmd,
                 global.minimal_dir.as_deref(),
                 NetworkMode::HostNet,
                 "web",
@@ -750,16 +750,16 @@ mod tests {
     #[tokio::test]
     async fn activation_registers_task_slots_for_own_ip_box() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         let requests = fake_vm_host(
-            provider_dir.join("control.sock"),
+            host_dir.join("control.sock"),
             r#"{"switch_address":"100.64.128.0","loopback_address":"127.0.64.0","box_id":"0123456789abcdef0123456789abcdef","task_addresses":["100.64.128.1","100.64.128.2"]}"#
                 .to_string(),
         )
         .await;
         let handed = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             Some(dir.path()),
             NetworkMode::OwnIp,
             "web",
@@ -790,7 +790,7 @@ mod tests {
     }
 
     /// The CLI and `min dash` register a box through one exchange: the
-    /// activation's registration, resolved by provider kind, and the
+    /// activation's registration, resolved by host kind, and the
     /// dashboard's, resolved beside the ssh socket it holds, put the same
     /// request line on the same control socket — so the two front-ends
     /// cannot drift in what they declare or hold.
@@ -811,15 +811,15 @@ mod tests {
             quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         let requests = fake_vm_host(
-            provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            host_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
         )
         .await;
         let cli = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             Some(dir.path()),
             NetworkMode::OwnIp,
             "web",
@@ -960,9 +960,9 @@ mod tests {
 
         for (policy, name) in [(granted, "granted"), (ungranted, "ungranted")] {
             let dir = tempfile::TempDir::new().unwrap();
-            let provider_dir = dir.path().join("providers").join("local-minvmd0");
-            std::fs::create_dir_all(&provider_dir).unwrap();
-            let sock_path = provider_dir.join("control.sock");
+            let host_dir = dir.path().join("providers").join("local-minvmd0");
+            std::fs::create_dir_all(&host_dir).unwrap();
+            let sock_path = host_dir.join("control.sock");
             let requests = fake_vm_host(
                 sock_path.clone(),
                 r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
@@ -974,7 +974,7 @@ mod tests {
                 ..Default::default()
             };
             register_box_for_activation(
-                paths::ProviderKind::Minvmd,
+                paths::HostKind::Minvmd,
                 global.minimal_dir.as_deref(),
                 NetworkMode::OwnIp,
                 name,
@@ -1026,9 +1026,9 @@ mod tests {
         // CLI holds is compared against the attachment a real registration
         // issued, not a stand-in's reply.
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let subnet = switch::SwitchSubnet::default();
         let attachments = minvmd::bep_attach::Attachments::new();
         let registry = minvmd::box_registry::BoxRegistry::new(subnet)
@@ -1049,7 +1049,7 @@ mod tests {
         // The first registration: the request carries no id, the host
         // mints one for this creation, and the reply returns it.
         let first = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             global.minimal_dir.as_deref(),
             NetworkMode::OwnIp,
             "web",
@@ -1100,7 +1100,7 @@ mod tests {
         )
         .await;
         let again = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             global.minimal_dir.as_deref(),
             NetworkMode::OwnIp,
             "web-again",
@@ -1162,9 +1162,9 @@ mod tests {
             quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
         let _server = minvmd::control::spawn(
             sock_path,
@@ -1180,7 +1180,7 @@ mod tests {
         // Bound for the test's life: the registration's lease holds the
         // row, and dropping it would withdraw the row.
         let _held_box = register_box_reminting_autogen(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             minimal_dir,
             NetworkMode::OwnIp,
             &mut held,
@@ -1197,7 +1197,7 @@ mod tests {
         // An autogen name folding to the live row's re-mints and registers.
         let mut name = "proj-9c1e".to_string();
         let registered = register_box_reminting_autogen(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             minimal_dir,
             NetworkMode::OwnIp,
             &mut name,
@@ -1226,7 +1226,7 @@ mod tests {
         // the spelling the live row holds.
         let mut user = "PROJ-9C1E".to_string();
         let refused = register_box_reminting_autogen(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             minimal_dir,
             NetworkMode::OwnIp,
             &mut user,
@@ -1258,9 +1258,9 @@ mod tests {
             quic443: None,
         };
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
         let _server = minvmd::control::spawn(
             sock_path,
@@ -1273,7 +1273,7 @@ mod tests {
         let policy = &policy;
         let register = move || {
             register_box_for_activation(
-                paths::ProviderKind::Minvmd,
+                paths::HostKind::Minvmd,
                 minimal_dir,
                 NetworkMode::OwnIp,
                 "web",
@@ -1330,9 +1330,9 @@ mod tests {
         // protocol the registrations ride — built with the wire types so
         // the reply cannot drift from what the daemon sends.
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Status(
             minimald_rpc::AnswererStatusReply {
                 answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
@@ -1392,10 +1392,10 @@ mod tests {
         // parse — the wire's version corner, answered with the same
         // silence rather than a guessed state.
         let old_dir = tempfile::TempDir::new().unwrap();
-        let old_provider = old_dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&old_provider).unwrap();
+        let old_host = old_dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&old_host).unwrap();
         let _old_requests = fake_vm_host(
-            old_provider.join("control.sock"),
+            old_host.join("control.sock"),
             r#"{"error":"unknown verb"}"#.to_string(),
         )
         .await;
@@ -1453,9 +1453,9 @@ mod tests {
     #[tokio::test]
     async fn destroy_sends_the_withdraw() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let requests = fake_vm_host(
             sock_path.clone(),
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
@@ -1472,11 +1472,11 @@ mod tests {
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
         // The withdrawal the destroy side owes: the pair comes off the
-        // session record, the control socket off the provider dir the
-        // daemon connection resolves through — reached by the provider kind,
+        // session record, the control socket off the host dir the
+        // daemon connection resolves through — reached by the host kind,
         // the flag-independent rule, exactly as the destroy does.
         withdraw_box_row(
-            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            vm_host_control_sock(paths::HostKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
             Some(handed),
             Some(box_id),
@@ -1503,7 +1503,7 @@ mod tests {
         // And a session that registered nothing owes nothing: no pair, no
         // name, no VM host — each sends nothing, on the same socket.
         withdraw_box_row(
-            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            vm_host_control_sock(paths::HostKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
             None,
             None,
@@ -1515,7 +1515,7 @@ mod tests {
             "no pair on the record, no withdrawal"
         );
         withdraw_box_row(
-            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            vm_host_control_sock(paths::HostKind::Minvmd, global.minimal_dir.as_deref()),
             None,
             Some(handed),
             None,
@@ -1527,7 +1527,7 @@ mod tests {
             "no name on the record, no withdrawal"
         );
         withdraw_box_row(
-            vm_host_control_sock(paths::ProviderKind::Minimald, None),
+            vm_host_control_sock(paths::HostKind::Minimald, None),
             Some("web"),
             Some(handed),
             None,
@@ -1551,15 +1551,15 @@ mod tests {
     #[tokio::test]
     async fn destroy_releases_a_held_name_and_a_failed_activation_does_not() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
-        let sock_path = provider_dir.join("control.sock");
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
         let requests = fake_vm_host(
             sock_path.clone(),
             r#"{"name":"web","held":false}"#.to_string(),
         )
         .await;
-        let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
+        let control_sock = || vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path()));
         let decode = |line: &str| -> minimald_rpc::BoxControlRequest {
             serde_json_lenient::from_str(line).expect("the request is the wire type")
         };
@@ -1624,14 +1624,14 @@ mod tests {
     #[tokio::test]
     async fn a_finished_task_run_releases_its_sessions_name_hold() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         let requests = fake_vm_host(
-            provider_dir.join("control.sock"),
+            host_dir.join("control.sock"),
             r#"{"name":"task-build-9c1e","held":false}"#.to_string(),
         )
         .await;
-        let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
+        let control_sock = || vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path()));
         let id = boxes::SessionId::nil();
 
         crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", true).await;
@@ -1750,15 +1750,14 @@ mod tests {
         assert!(record.box_addresses.is_none());
 
         // A record that is not there: nothing to re-hold by.
-        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, None).await;
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "no record read, no hold re-made"
         );
 
         // The session's own hold, re-made before the attach.
-        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
-            .await;
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, Some(&record)).await;
         {
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 1, "one hold, one request");
@@ -1788,8 +1787,7 @@ mod tests {
             minimald_rpc::Errorable::Ok(_) => {}
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
-        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
-            .await;
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, Some(&record)).await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 3, "a hold, then its release");
         let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
@@ -1831,7 +1829,7 @@ mod tests {
             .expect("the session's record is read");
         assert_eq!(record.network, boxes::NetworkMode::HostNet);
 
-        rehold_held_name_before_attach(paths::ProviderKind::Minimald, &ssh_sock, id, Some(&record))
+        rehold_held_name_before_attach(paths::HostKind::Minimald, &ssh_sock, id, Some(&record))
             .await;
         assert!(
             requests.lock().unwrap().is_empty(),
@@ -1883,7 +1881,7 @@ mod tests {
         )
         .await;
 
-        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, gone, Some(&record))
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, gone, Some(&record))
             .await;
         let seen = requests.lock().unwrap();
         let holds: Vec<_> = seen
@@ -1961,8 +1959,7 @@ mod tests {
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
 
-        rehold_held_name_before_attach(paths::ProviderKind::Minvmd, &ssh_sock, id, Some(&record))
-            .await;
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, Some(&record)).await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "the refused hold, and nothing after it");
         assert!(matches!(
@@ -2035,8 +2032,8 @@ mod tests {
     /// The macOS shape of every VM-backed gate (NET-081's other half): the
     /// provider flag is how Linux *asks* for the VM host, so on a host where
     /// minvmd is the only backend the flag is unset even though every
-    /// invocation is VM-backed. Each gate therefore keys on the provider kind
-    /// the daemon connection resolves through — `client_provider_kind`,
+    /// invocation is VM-backed. Each gate therefore keys on the host kind
+    /// the daemon connection resolves through — `client_host_kind`,
     /// which folds that platform in — and never on the flag's own reading:
     /// a flagless macOS activation would otherwise register no box, resolve
     /// no control socket to withdraw through, and name no VM on its start
@@ -2050,7 +2047,7 @@ mod tests {
     /// flag at all, which is exactly what a gate that read the flag would
     /// skip.
     #[tokio::test]
-    async fn vm_backed_gates_key_on_the_provider_kind_not_the_flag() {
+    async fn vm_backed_gates_key_on_the_host_kind_not_the_flag() {
         // The premise, then the rule as an expectation about the kinds rather
         // than about the rule's own implementation: a flagless invocation
         // reads `use_minvmd` as false on every host, and the kind it resolves
@@ -2062,12 +2059,12 @@ mod tests {
             "no provider flag, no flag reading: the premise of the macOS shape"
         );
         let flagless_kind = if cfg!(target_os = "macos") {
-            paths::ProviderKind::Minvmd
+            paths::HostKind::Minvmd
         } else {
-            paths::ProviderKind::Minimald
+            paths::HostKind::Minimald
         };
         assert_eq!(
-            daemon_provider_kind(&flagless),
+            daemon_host_kind(&flagless),
             flagless_kind,
             "a flagless invocation is VM-backed exactly where minvmd is the \
              only backend"
@@ -2081,25 +2078,25 @@ mod tests {
             "--provider local-minvmd is the flag's own reading"
         );
         assert_eq!(
-            daemon_provider_kind(&flagged),
-            paths::ProviderKind::Minvmd,
+            daemon_host_kind(&flagged),
+            paths::HostKind::Minvmd,
             "--provider local-minvmd asks for the VM host by name"
         );
 
-        // The registration gate, driven by kind on one provider dir: the
+        // The registration gate, driven by kind on one host dir: the
         // minvmd kind registers through the control socket sitting beside
         // the ssh socket, the native kind asks for nothing from it.
         let dir = tempfile::TempDir::new().unwrap();
-        let provider_dir = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider_dir).unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         let requests = fake_vm_host(
-            provider_dir.join("control.sock"),
+            host_dir.join("control.sock"),
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
         )
         .await;
         let policy = boxes::BoxPolicy::default();
         let handed = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             Some(dir.path()),
             NetworkMode::OwnIp,
             "web",
@@ -2114,7 +2111,7 @@ mod tests {
         );
         assert!(
             register_box_for_activation(
-                paths::ProviderKind::Minimald,
+                paths::HostKind::Minimald,
                 Some(dir.path()),
                 NetworkMode::OwnIp,
                 "web",
@@ -2134,21 +2131,21 @@ mod tests {
         // The control-socket gate the destroy and Ctrl-C withdrawals resolve
         // through, and the start line's VM name: both read the kind.
         assert_eq!(
-            vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path())),
-            Some(provider_dir.join("control.sock")),
+            vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path())),
+            Some(host_dir.join("control.sock")),
             "a minvmd-backed host's control socket sits beside its ssh socket"
         );
         assert!(
-            vm_host_control_sock(paths::ProviderKind::Minimald, Some(dir.path())).is_none(),
+            vm_host_control_sock(paths::HostKind::Minimald, Some(dir.path())).is_none(),
             "the native backend has no control socket to withdraw through"
         );
         assert_eq!(
-            hostname_proxy_vm(paths::ProviderKind::Minvmd),
+            hostname_proxy_vm(paths::HostKind::Minvmd),
             Some(client::vm_name()),
             "a minvmd-backed host names its VM on the start line"
         );
         assert_eq!(
-            hostname_proxy_vm(paths::ProviderKind::Minimald),
+            hostname_proxy_vm(paths::HostKind::Minimald),
             None,
             "the native backend hosts no VMs to name"
         );
@@ -2156,7 +2153,7 @@ mod tests {
         // The activation path, driven flagless — no provider flag anywhere —
         // against the same stand-ins the refused-registration test uses,
         // resolved the way the invocation itself resolves
-        // them: a VM host daemon recorded as running behind the provider dir
+        // them: a VM host daemon recorded as running behind the host dir
         // the flagless kind names, and a real daemon behind the ssh socket in
         // the dir that same kind resolves the daemon connection through. On a
         // host with no native backend the two are one dir, and the
@@ -2165,9 +2162,9 @@ mod tests {
         // same invocation asks the VM host for nothing, and any gate that
         // reached for the VM host anyway would be seen here asking.
         let state = tempfile::TempDir::new().unwrap();
-        let vm_provider_dir = client::resolve_provider_dir(Some(state.path()), true).unwrap();
-        std::fs::create_dir_all(&vm_provider_dir).unwrap();
-        let vm_state = minvmd::state::StateDir::new(vm_provider_dir.clone()).unwrap();
+        let vm_host_dir = client::resolve_host_dir(Some(state.path()), true).unwrap();
+        std::fs::create_dir_all(&vm_host_dir).unwrap();
+        let vm_state = minvmd::state::StateDir::new(vm_host_dir.clone()).unwrap();
         vm_state
             .write_state(&minvmd::state::State {
                 lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -2180,7 +2177,7 @@ mod tests {
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
         let requests = fake_vm_host(
-            vm_provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            vm_host_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
         )
         .await;
@@ -2215,7 +2212,7 @@ mod tests {
         // not asked for at all — the kind's own answer, never the flag's.
         assert_eq!(
             requests.lock().unwrap().len(),
-            usize::from(flagless_kind == paths::ProviderKind::Minvmd),
+            usize::from(flagless_kind == paths::HostKind::Minvmd),
             "the flagless activation asked the VM host for a row exactly when \
              its provider kind is minvmd"
         );
@@ -2233,7 +2230,7 @@ mod tests {
             .expect("the flagless activation created the session");
         assert_eq!(
             record.box_addresses,
-            (flagless_kind == paths::ProviderKind::Minvmd).then_some(handed),
+            (flagless_kind == paths::HostKind::Minvmd).then_some(handed),
             "the create carried the addresses the registration handed back, \
              or nothing when nothing was registered"
         );
@@ -2255,8 +2252,8 @@ mod tests {
         // the create is one refusal away from succeeding when the
         // registration goes first.
         let state = tempfile::TempDir::new().unwrap();
-        let provider_dir = state.path().join("providers").join("local-minvmd0");
-        let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+        let host_dir = state.path().join("providers").join("local-minvmd0");
+        let state_dir = minvmd::state::StateDir::new(host_dir.clone()).unwrap();
         state_dir
             .write_state(&minvmd::state::State {
                 lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -2265,13 +2262,13 @@ mod tests {
             .unwrap();
         let _alive = state_dir.try_acquire_alive_lock().unwrap();
         let requests = fake_vm_host(
-            provider_dir.join("control.sock"),
+            host_dir.join("control.sock"),
             r#"{"error":"the switch's address plan is exhausted; no box address remains"}"#
                 .to_string(),
         )
         .await;
         let server = minimald::test_harness::TestServer::new().await;
-        server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
+        server.listen_on_uds(&host_dir.join("ssh.sock")).await;
 
         // A project directory with nothing special about it: the activation
         // is refused at the registration, before any of the loadout or
