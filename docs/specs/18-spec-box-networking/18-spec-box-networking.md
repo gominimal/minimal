@@ -334,7 +334,7 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald network_none_attach_works
   <!-- S4a/AC3; prose 25; state-driven -->
 
-- **NET-040** WHEN `min session activate --network own_ip --ingress 8080:8080` is run on a fresh install THE SYSTEM SHALL publish `127.0.0.1:8080` on the host so that a request to it returns the in-box server's response.
+- **NET-040** WHEN `min session activate --network own_ip --ingress 8080:8080` is run on a fresh install THE SYSTEM SHALL publish the box's port 8080 on the host at the loopback address its name resolves to, its own reserved-range address (NET-010) or `127.0.0.1` under NET-123's interim, so that a request to it returns the in-box server's response.
   tier:     T0
   verify:   ./scripts/session-e2e.sh fresh_install_own_ip_ingress_publishes_loopback
   <!-- S4b/AC1-2; prose 26; event-driven; Linux and macOS both -->
