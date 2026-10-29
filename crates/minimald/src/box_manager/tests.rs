@@ -2926,3 +2926,139 @@ async fn events_follow_replays_then_tails_until_reaped() {
         "the stream ends at the reap"
     );
 }
+
+/// BOX-154: a daemon that starts and finds a `running` record with no
+/// process left in the box sets it to `stopped`, with no exit code and no
+/// signal, and records an `exited` event with that reason and no signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_sets_orphaned_running_record_stopped_without_signal() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (state, cache, mngr) = manager().await;
+    let mut config = sample_config();
+    config.name = Some("orphaned".to_string());
+    let orphaned = create_active_session_with(&mngr, config).await;
+    let run_owned = create_active_session_with(&mngr, run_owned_config()).await;
+    drop(mngr);
+
+    // The restart: a fresh store over the same state, and no process of
+    // the earlier daemon's boxes left.
+    let store = crate::store::Store::init(daemon_abs(state.path()))
+        .await
+        .unwrap();
+    assert_eq!(
+        stop_orphaned_running_records(&store).await.unwrap(),
+        1,
+        "exactly the plain running record is set to stopped"
+    );
+    let restarted = manager_over(state.path(), cache.path()).await;
+
+    let record = restarted
+        .get_record(BoxKeyPredicate::Id(orphaned))
+        .await
+        .unwrap()
+        .expect("the restart keeps the record");
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
+    assert_eq!(record.status, boxes::BoxState::Stopped);
+    assert_eq!(record.exit_code, None);
+    assert_eq!(record.signal, None);
+
+    let mut reader = restarted.box_events(orphaned).await.unwrap();
+    let events = reader.read_new().unwrap();
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [BoxEventType::Created, BoxEventType::Exited]);
+    let exited = &events[1];
+    assert_eq!(exited.box_id, orphaned);
+    assert_eq!(exited.data["reason"], "stopped");
+    assert!(!exited.data.contains_key("signal"), "{:?}", exited.data);
+    assert!(!exited.data.contains_key("exit_code"), "{:?}", exited.data);
+
+    // The run's box is the resume's to destroy (NET-131), not this flip's.
+    let run_record = restarted
+        .get_record(BoxKeyPredicate::Id(run_owned))
+        .await
+        .unwrap()
+        .expect("the flip leaves a run's box alone");
+    assert_eq!(run_record.status, boxes::BoxState::Active);
+}
+
+/// BOX-018: a stopped box keeps its spec, exit code, ending signal, events
+/// and parent readable until it is reaped, and the reap removes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_box_record_readable_until_reaped() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, sample_config()).await;
+    // A spec beside the record, as a create that carries one writes it
+    // (BOX-068).
+    let spec = br#"{"type":"session"}"#.to_vec();
+    mngr.box_events(id)
+        .await
+        .unwrap()
+        .object
+        .store_spec(&spec)
+        .unwrap();
+    session(&mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+
+    let ending = mngr
+        .stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    assert_eq!(
+        ending,
+        StopEnding::Signalled {
+            signal: libc::SIGTERM
+        }
+    );
+
+    // A second stop is refused: the box is not running.
+    let again = mngr
+        .stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+        .await
+        .expect_err("a stopped box cannot be stopped again");
+    assert_eq!(again.kind(), ErrorKind::InvalidInput);
+
+    // Read twice, so the record stays readable and unchanged.
+    for _ in 0..2 {
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("a stopped box keeps its record");
+        assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+        assert_eq!(record.signal, Some(libc::SIGTERM));
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.parent, None, "a box created outside any box");
+
+        let reader = mngr.box_events(id).await.unwrap();
+        assert_eq!(reader.object.load_spec().unwrap(), Some(spec.clone()));
+        let mut reader = reader;
+        let events = reader.read_new().unwrap();
+        let exited = events
+            .iter()
+            .find(|e| e.kind == BoxEventType::Exited)
+            .expect("the stop's exited event is kept");
+        assert_eq!(exited.data["reason"], "stopped");
+        assert_eq!(exited.data["signal"], libc::SIGTERM);
+        assert_eq!(exited.parent, None);
+    }
+
+    // The reap removes the record and its events.
+    mngr.delete_session(id).await.unwrap();
+    assert_eq!(
+        mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        mngr.box_events(id).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
