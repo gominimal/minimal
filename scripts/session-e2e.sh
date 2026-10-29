@@ -11774,11 +11774,11 @@ proof_published_proxy_routes_from_host() {
 # `bep serve` beside gvproxy on a production boot, and the proxy opens its
 # control socket under the real home. Records case $1 as NOT RUN and returns
 # 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
-# Keychain), without gvproxy (the daemon starts the proxy beside it),
-# without a bep binary (MINVMD_BEP_BIN, else the bep beside minvmd, as
-# rt_bep_bin resolves it; the macOS CI testbed ships none) or
-# without a GitHub sign-in a person made with `min auth login` (a case that
-# passes "no_sign_in" as $2 skips that check). Everywhere
+# Keychain), without gvproxy (the daemon starts the proxy beside it), or
+# without a GitHub sign-in a person made with `min auth login`. A case that
+# passes "no_sign_in" as $2 skips the sign-in check, and is NOT RUN without
+# a bep binary in its place (MINVMD_BEP_BIN, else the bep beside minvmd, as
+# rt_bep_bin resolves it; the macOS CI testbed ships none). Everywhere
 # else the proxy must come up, so a proxy that does not is a failure, never
 # NOT RUN.
 #
@@ -11806,12 +11806,16 @@ bep_live_gate() {
     not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
     return 1
   fi
-  if ! rt_bep_bin >/dev/null 2>&1; then
-    not_run "$1" "no bep binary beside minvmd: set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
-    return 1
-  fi
-  # A case that needs no GitHub sign-in passes "no_sign_in" as $2.
-  if [ "${2:-}" != no_sign_in ]; then
+  # A case that needs no GitHub sign-in passes "no_sign_in" as $2. Such a
+  # case can reach a lane that ships no bep binary, so only that case turns
+  # a missing binary into NOT RUN. For a signed-in case a missing binary
+  # stays a failure.
+  if [ "${2:-}" = no_sign_in ]; then
+    if ! rt_bep_bin >/dev/null 2>&1; then
+      not_run "$1" "no bep binary beside minvmd: set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+      return 1
+    fi
+  else
     lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
     if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
       not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
@@ -12524,15 +12528,17 @@ proof_bep_store_reference_end_to_end() {
   # This reads the real home, as bep_live_gate does.
   # shellcheck disable=SC2031
   local sr_control="$HOME/.minimal/bep/control.sock" sr_pids
-  sr_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+  # r3_proxy_pids selects this run's proxy by its listener socket, so a
+  # proxy from another checkout or a person's own proxy is not stopped.
+  sr_pids="$(r3_proxy_pids)"
   if [ -n "$sr_pids" ]; then
     # shellcheck disable=SC2086
     kill -TERM $sr_pids 2>/dev/null || true
     for _ in $(seq 1 20); do
-      pgrep -f '/bep serve ' >/dev/null 2>&1 || break
+      [ -n "$(r3_proxy_pids)" ] || break
       sleep 0.5
     done
-    sr_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+    sr_pids="$(r3_proxy_pids)"
     # shellcheck disable=SC2086
     [ -n "$sr_pids" ] && kill -KILL $sr_pids 2>/dev/null
     for _ in $(seq 1 20); do
