@@ -95,7 +95,8 @@ impl fmt::Display for Error {
             }
             Error::Graph(e) => write!(f, "graph: {:?}", e),
             Error::Cancelled => write!(f, "cancelled"),
-            Error::Other(e) => write!(f, "{}", e),
+            // alternate: the whole chain, so a cache read that failed says why
+            Error::Other(e) => write!(f, "{:#}", e),
         }
     }
 }

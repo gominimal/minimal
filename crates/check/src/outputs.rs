@@ -501,9 +501,12 @@ impl DetbuildScan {
         let root = cached_build.path();
         for path in self.outputs_naming_detbuild(root)? {
             result.verdict = CheckVerdict::Fail;
+            // User-facing (AGENTS.md): the situation, then one next step the
+            // user can run as written; the flag is `mip check`'s.
             result.err.push(format!(
-                "{}: contains `libdetbuild`: the build's LD_PRELOAD shim leaked into what ships; \
-                 nothing in an output may name it (gominimal/minimal#2489)",
+                "{} contains the text `libdetbuild`. The build wrote the name of its build-time \
+                 library into this output, and the package must not ship it. Remove the reference \
+                 from the output, or skip this check with `--skip-checkers \"{NO_DETBUILD_CHECK}\"`.",
                 path.strip_prefix(root).unwrap_or(&path).display()
             ));
         }
@@ -520,7 +523,7 @@ impl DetbuildScan {
             crate::bail_if_cancelled(&self.cancel)?;
             let matched = common::match_files_for_glob_no_follow(root, glob)
                 .map_err(|e| Error::Other(anyhow!("{e}")))?;
-            files.extend(matched.into_iter().filter(|path| path.is_file()));
+            files.extend(matched);
         }
         let stop = || self.cancel.is_cancelled();
         files
@@ -802,8 +805,13 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
         );
         assert_eq!(result.err.len(), 1, "one file, one error: {:?}", result.err);
         assert!(
-            result.err[0].starts_with("bin/wrapped:"),
+            result.err[0].starts_with("bin/wrapped contains the text `libdetbuild`."),
             "{:?}",
+            result.err
+        );
+        assert!(
+            result.err[0].contains(&format!("--skip-checkers \"{NO_DETBUILD_CHECK}\"")),
+            "the message names the skip flag: {:?}",
             result.err
         );
 

@@ -321,7 +321,7 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
 /// [`match_files_for_glob`] that does not descend into a symlinked directory:
 /// a loop in an output (`a -> .`) or a link out of it is not walked, while a
 /// symlinked file still matches. For the scans that read whatever a build
-/// produced (minimal#2652's review).
+/// produced.
 pub fn match_files_for_glob_no_follow(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     match_files_for_glob_with(dir, glob, false)
 }
@@ -354,13 +354,15 @@ fn match_files_for_glob_with(
 
             let path = entry.path();
             let subset = path.strip_prefix(root_dir).unwrap();
-            if path.is_file() && matcher.is_match(subset) {
-                results.push(path);
-            } else if if follow {
+            // a symlinked directory is a directory only to the walk that follows links
+            let descend = if follow {
                 path.is_dir()
             } else {
                 entry.file_type()?.is_dir()
-            } {
+            };
+            if path.is_file() && matcher.is_match(subset) {
+                results.push(path);
+            } else if descend {
                 // Recursively walk subdirectories
                 walk_dir(&path, root_dir, matcher, follow, results)?;
             }
