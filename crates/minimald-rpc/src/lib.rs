@@ -2470,7 +2470,8 @@ pub struct ShowBoxResponse {
     ///
     /// The daemon does not give an exec an id yet (BOX-149), so this
     /// list is always empty. An empty list does not mean that no process
-    /// runs in the box. The list fills when each exec has an id.
+    /// runs in the box. The list fills when each exec has an id:
+    /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
     #[serde(default)]
     pub live_execs: Vec<String>,
 }

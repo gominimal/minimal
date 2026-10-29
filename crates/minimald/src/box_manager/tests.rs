@@ -3233,3 +3233,46 @@ async fn show_returns_record_state_identity_and_live_execs() {
 
     assert_eq!(mngr.show_box(SessionId::mint()).await.unwrap(), None);
 }
+
+/// BOX-158, BOX-159: the id a listing prints reads back through show,
+/// also for a record whose `box_id` differs from its `id`, as on a VM
+/// guest. The record `id` still reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_box_finds_a_box_by_the_id_list_prints() {
+    let (state, cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("guest", "/home/dev/proj")).await;
+    drop(mngr);
+
+    let box_id = SessionId::mint();
+    assert_ne!(box_id, id);
+    let store = crate::store::Store::init(daemon_abs(state.path()))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let mut record = handle.record().await.unwrap();
+    record.box_id = Some(box_id);
+    handle.write(record).await.unwrap();
+    drop(store);
+
+    let mngr = manager_over(state.path(), cache.path()).await;
+    let listing = mngr.list_boxes(None).await.unwrap();
+    let listed: Vec<_> = listing.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(listed, [box_id], "the listing prints the box_id");
+
+    let shown = mngr
+        .show_box(box_id)
+        .await
+        .unwrap()
+        .expect("the id the listing prints finds the box");
+    assert_eq!(shown.record, listing[0]);
+    let by_record_id = mngr
+        .show_box(id)
+        .await
+        .unwrap()
+        .expect("the record id still finds the box");
+    assert_eq!(by_record_id.record.box_id, box_id);
+}

@@ -287,8 +287,10 @@ impl BoxManagerHandle {
     }
 
     /// One box record with its state, the identity the box runs under and
-    /// its live execs (BOX-159). `None` for an id no retained record
-    /// names. It starts no actor.
+    /// its live execs (BOX-159). `id` is the id a listing reports: it
+    /// resolves as a record's `box_id` first and as its `id` second, so
+    /// every id [`list_boxes`](Self::list_boxes) prints reads back here.
+    /// `None` for an id no retained record names. It starts no actor.
     pub async fn show_box(
         &self,
         id: SessionId,
@@ -296,7 +298,19 @@ impl BoxManagerHandle {
         use tracing::Instrument as _;
         let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
         async {
-            let record = self.get_record(BoxKeyPredicate::Id(id)).await?;
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            // The listing reports `box_id` where a record has one (a VM
+            // guest's differs from its `id`), so that key wins.
+            let record = records
+                .iter()
+                .find(|record| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|record| record.id == id))
+                .cloned();
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
             Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
@@ -306,7 +320,8 @@ impl BoxManagerHandle {
                 identity: minimald_rpc::BoxIdentity::None,
                 // BOX-149: the daemon does not give an exec an id yet, so
                 // this list is always empty, even when a process runs in
-                // the box. It fills when each exec has an id (BOX-149).
+                // the box. It fills when each exec has an id (BOX-149):
+                // https://github.com/gominimal/minimal/issues/2404 (T30).
                 live_execs: Vec::new(),
             }))
         }
