@@ -77,6 +77,9 @@ pub enum SftpError {
     Eof,
     /// SFTP packet recognised but not implemented.
     Unsupported,
+    /// A mutating request on a read-only session: the box is stopped or
+    /// exited, and its retained files are served for retrieval only.
+    ReadOnly,
 }
 
 impl From<std::io::Error> for SftpError {
@@ -95,7 +98,7 @@ impl From<SftpError> for StatusCode {
                 ErrorKind::UnexpectedEof => StatusCode::Eof,
                 _ => StatusCode::Failure,
             },
-            SftpError::PathTraversal => StatusCode::PermissionDenied,
+            SftpError::PathTraversal | SftpError::ReadOnly => StatusCode::PermissionDenied,
             SftpError::UnknownHandle | SftpError::WrongHandleType => StatusCode::Failure,
             SftpError::Eof => StatusCode::Eof,
             SftpError::Unsupported => StatusCode::OpUnsupported,
@@ -155,6 +158,9 @@ pub struct SftpSession {
     home: DaemonAbsPath,
     handles: HashMap<String, OpenHandle>,
     next_handle_id: u64,
+    /// Refuse every request that changes the exports. Set for a stopped or
+    /// exited box, whose files are kept for retrieval and for a later resume.
+    read_only: bool,
 }
 
 impl SftpSession {
@@ -178,7 +184,27 @@ impl SftpSession {
             home: canonicalize(&home).await?,
             handles: HashMap::new(),
             next_handle_id: 0,
+            read_only: false,
         })
+    }
+
+    /// Makes this session refuse every mutating request with
+    /// `SSH_FX_PERMISSION_DENIED`: an open that can write, create, truncate
+    /// or append, and every write, setstat, fsetstat, mkdir, rmdir, remove,
+    /// rename and symlink. Reads, stats, listings and path lookups still work.
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// Refuses the request when this session is read-only.
+    fn ensure_writable(&self, op: &'static str) -> Result<(), SftpError> {
+        if self.read_only {
+            tracing::debug!(op, "sftp: refused a mutating request on an ended box");
+            return Err(SftpError::ReadOnly);
+        }
+        Ok(())
     }
 
     /// The exported directories, each paired with the client-facing root it
@@ -430,6 +456,14 @@ impl russh_sftp::server::Handler for SftpSession {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        let mutating = OpenFlags::WRITE
+            | OpenFlags::APPEND
+            | OpenFlags::CREATE
+            | OpenFlags::TRUNCATE
+            | OpenFlags::EXCLUDE;
+        if pflags.intersects(mutating) {
+            self.ensure_writable("open")?;
+        }
         let host = self.resolve(&filename).await?.real()?;
         let mut opts = OpenOptions::new();
         // `resolve` proved a path; this opens a *name*, and the two are only
@@ -491,6 +525,7 @@ impl russh_sftp::server::Handler for SftpSession {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        self.ensure_writable("write")?;
         let f = self.file_mut(&handle)?;
         f.seek(SeekFrom::Start(offset)).await?;
         f.write_all(&data).await?;
@@ -557,18 +592,21 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        self.ensure_writable("mkdir")?;
         let host = self.resolve(&path).await?.real()?;
         fs::create_dir(host.as_str()).await?;
         Ok(ok_status(id))
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        self.ensure_writable("rmdir")?;
         let host = self.resolve_below_export(&path).await?;
         fs::remove_dir(host.as_str()).await?;
         Ok(ok_status(id))
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        self.ensure_writable("remove")?;
         let host = self.resolve_below_export(&filename).await?;
         fs::remove_file(host.as_str()).await?;
         Ok(ok_status(id))
@@ -580,6 +618,7 @@ impl russh_sftp::server::Handler for SftpSession {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
+        self.ensure_writable("rename")?;
         let from = self.resolve_below_export(&oldpath).await?;
         let to = self.resolve_below_export(&newpath).await?;
         fs::rename(from.as_str(), to.as_str()).await?;
@@ -592,6 +631,7 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        self.ensure_writable("setstat")?;
         let host = self.resolve(&path).await?.real()?;
         if let Some(perms) = perm_from_mode(attrs.permissions) {
             // `chmod` follows symlinks, so like `open` this re-resolves the
@@ -624,10 +664,23 @@ impl russh_sftp::server::Handler for SftpSession {
         handle: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        self.ensure_writable("fsetstat")?;
         if let Some(perms) = perm_from_mode(attrs.permissions) {
             self.file_mut(&handle)?.set_permissions(perms).await?;
         }
         Ok(ok_status(id))
+    }
+
+    /// Not served: a read-only session refuses it as a mutation, and any
+    /// other session reports it unsupported, as before.
+    async fn symlink(
+        &mut self,
+        _id: u32,
+        _linkpath: String,
+        _targetpath: String,
+    ) -> Result<Status, Self::Error> {
+        self.ensure_writable("symlink")?;
+        Err(SftpError::Unsupported)
     }
 }
 
@@ -708,8 +761,8 @@ pub(crate) async fn handle_sftp_subsystem(
 /// Opens the SFTP conversation on `channel` against the directories of the
 /// box `session_id`, under the caller's `sftp.subsystem` span.
 ///
-/// A stopped or exited box is served from its retained directories, read
-/// from its record, with no actor started for it (BOX-017). Any other box
+/// A stopped or exited box is served read-only from its retained
+/// directories, read from its record, with no actor started for it (BOX-017). Any other box
 /// is served through its actor, which the lookup starts when it is idle.
 async fn serve_box_files(
     s: ServerStateHandle,
@@ -728,11 +781,12 @@ async fn serve_box_files(
         }
     };
     tracing::Span::current().record("ended", ended.is_some());
+    let read_only = ended.is_some();
     let paths = if let Some(ended) = ended {
         tracing::info!(
             %session_id,
             state = ended.state.name(),
-            "sftp: serving the retained files of an ended box, with no actor"
+            "sftp: serving the retained files of an ended box, read-only, with no actor"
         );
         ended.paths
     } else {
@@ -765,6 +819,9 @@ async fn serve_box_files(
     // touch before the channel is accepted: a session whose directories are
     // gone cannot serve any request on this channel anyway.
     let sftp = match SftpSession::new(paths.working, paths.home).await {
+        // An ended box is served for retrieval only: a write would change the
+        // state a later resume restarts from (BOX-017, BOX-025).
+        Ok(sftp) if read_only => sftp.read_only(),
         Ok(sftp) => sftp,
         Err(e) => {
             tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: session directories are unusable");
@@ -909,6 +966,45 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert!(listed.contains(&"tree.txt".to_string()), "{listed:?}");
+        assert!(sftp.metadata("kept.txt").await.unwrap().is_regular());
+
+        // The retained files are for retrieval only: every mutating request
+        // is refused, and the file is left as the box left it.
+        assert_denied(sftp.create("kept.txt").await);
+        assert_denied(sftp.open_with_flags("kept.txt", OpenFlags::WRITE).await);
+        assert_denied(sftp.open_with_flags("kept.txt", OpenFlags::APPEND).await);
+        assert_denied(sftp.create("new.txt").await);
+        assert_denied(sftp.remove_file("kept.txt").await);
+        assert_denied(sftp.rename("kept.txt", "moved.txt").await);
+        assert_denied(sftp.create_dir("made").await);
+        assert_denied(sftp.remove_dir(env::WORKSPACE_ROOT).await);
+        assert_denied(sftp.symlink("link", "kept.txt").await);
+        let mut attrs = russh_sftp::protocol::FileAttributes::empty();
+        attrs.permissions = Some(0o600);
+        assert_denied(sftp.set_metadata("kept.txt", attrs).await);
+        assert_eq!(sftp.read("kept.txt").await.unwrap(), payload);
+
+        let paths = mngr
+            .ended_box(session_id)
+            .await
+            .unwrap()
+            .expect("the box is still ended")
+            .paths;
+        let on_disk = tokio::fs::read(paths.home.sub_path_unchecked("kept.txt").as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            on_disk, payload,
+            "the refused requests left the file unchanged"
+        );
+        for absent in ["new.txt", "moved.txt", "made", "link"] {
+            assert!(
+                !tokio::fs::try_exists(paths.home.sub_path_unchecked(absent).as_str())
+                    .await
+                    .unwrap(),
+                "{absent} was not created"
+            );
+        }
 
         assert_eq!(
             mngr.running_count().await,
