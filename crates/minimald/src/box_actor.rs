@@ -738,8 +738,11 @@ impl BoxActor {
             tracing::warn!(%error, home = %home, "writing the git credential helper");
         }
 
+        // BOX-025: an ended box comes up hosted, with no host. Only the
+        // attach that resumes it starts its processes again.
+        let ended = matches!(obj.record().status, BoxState::Stopped | BoxState::Exited);
         let inner = match obj.record().status {
-            BoxState::Active => {
+            BoxState::Active | BoxState::Stopped | BoxState::Exited => {
                 let composition = load_composition(&conf.record).await;
                 BoxInner::Active {
                     composition,
@@ -780,16 +783,6 @@ impl BoxActor {
                     std::io::ErrorKind::InvalidData,
                     "session record is Materializing but has no in-memory composition \
                      (restart-orphaned actor); destroy the session and re-activate",
-                ));
-            }
-            // BOX-011: an ended box has no process to host. No path writes
-            // these states yet, so refuse it as for `Materializing`. #2393
-            // (T6, BOX-025) makes resume bring a stopped PTY box back up
-            // from its record, and there the actor learns to host an ended box.
-            BoxState::Stopped | BoxState::Exited => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "session record has ended (stopped or exited); no actor hosts an ended session",
                 ));
             }
         };
@@ -869,7 +862,14 @@ impl BoxActor {
         #[cfg(target_os = "linux")]
         if registers_name {
             actor.register_hostname(obj.record(), false).await;
+            // NET-128: an ended box holds its name and answers as stopped
+            // until a resume starts it again.
+            if ended {
+                actor.mark_name_stopped().await;
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ended;
 
         // The actor outlives the message that brought it up (a create, the
         // resume an RPC naming the box makes): its own root, linked to that
@@ -994,6 +994,215 @@ impl BoxActor {
                     .mark_stopped(*self.record.id());
             }
         }
+    }
+
+    /// Resumes a stopped or exited box before an attach (BOX-025, BOX-030):
+    /// sets its record to `running` from the spec stored at its creation,
+    /// and records a `resumed` event. The attach that follows starts its
+    /// processes from its retained filesystem, under the same id and name.
+    /// Answers `Ok(false)` for a box that has not ended.
+    ///
+    /// The refusals run in a fixed order, and the first that applies
+    /// decides: the terminal, the name, the spec, an upload in flight, then
+    /// the volumes. Each leaves the record as it was. One `box.resume` span
+    /// covers the resume and carries its outcome.
+    pub(super) async fn resume(&mut self) -> Result<bool, AttachError> {
+        use boxes::core::record::RecordState;
+
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?;
+        let from = match record.state() {
+            Ok(state @ (RecordState::Stopped(_) | RecordState::Exited(_))) => state,
+            Ok(_) => return Ok(false),
+            Err(error) => {
+                return Err(AttachError::LoadoutFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                )));
+            }
+        };
+        let span = tracing::info_span!(
+            "box.resume",
+            box_id = %self.record.id(),
+            from = from.name(),
+            outcome = tracing::field::Empty,
+        );
+        let resumed =
+            tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
+        match &resumed {
+            Ok(()) => {
+                span.record("outcome", "resumed");
+            }
+            Err(error) => {
+                span.record("outcome", "refused");
+                span.in_scope(
+                    || tracing::info!(%error, "resume refused; the box state is unchanged"),
+                );
+            }
+        }
+        resumed.map(|()| true)
+    }
+
+    /// [`Self::resume`] for a box whose record says it ended `from`.
+    async fn resume_ended(
+        &mut self,
+        record: Record,
+        from: boxes::core::record::RecordState,
+    ) -> Result<(), AttachError> {
+        use boxes::core::record::RecordState;
+
+        let name = registry_name(&record);
+        let refused = |kind: std::io::ErrorKind, why: String| {
+            AttachError::ResumeRefused(std::io::Error::new(
+                kind,
+                format!(
+                    "session `{name}` cannot resume, and it stays {}. {why}",
+                    from.name()
+                ),
+            ))
+        };
+        let object = self
+            .record
+            .object()
+            .await
+            .map_err(AttachError::LoadoutFailed)?;
+        let stored = object.load_spec().map_err(AttachError::LoadoutFailed)?;
+
+        // BOX-030: only a box whose spec sets `pty_enabled` resumes. A box
+        // filed with no spec (a client that predates it, the dashboard
+        // create) has only its Box Type to go by, and a session has a
+        // terminal.
+        let pty = match &stored {
+            Some(bytes) => box_runtime::stored_spec_sets_pty(bytes),
+            None => record
+                .box_type
+                .as_deref()
+                .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
+        };
+        if !pty {
+            tracing::info!(
+                refusal = "terminal",
+                "resume: the box spec sets no terminal"
+            );
+            return Err(refused(
+                std::io::ErrorKind::InvalidInput,
+                "It runs without a terminal, and only a session with a terminal can resume."
+                    .to_string(),
+            ));
+        }
+
+        // BOX-025: a running box that holds this box's name keeps it. The
+        // manager answers from the store alone, bounded so a manager that
+        // waits on this actor cannot wedge the attach.
+        let manager = self.manager.upgrade().ok_or_else(|| {
+            AttachError::LoadoutFailed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ))
+        })?;
+        let holder = tokio::time::timeout(
+            HOST_PROBE_TIMEOUT,
+            manager.running_name_holder(*self.record.id(), name.clone()),
+        )
+        .await
+        .map_err(|_| AttachError::SessionBusy)?
+        .map_err(AttachError::LoadoutFailed)?;
+        if let Some((holder, holder_id)) = holder {
+            tracing::info!(
+                refusal = "name",
+                holder = %holder,
+                holder_id = %holder_id,
+                "resume: a running box holds the name"
+            );
+            return Err(refused(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "The running session `{holder}` holds the name `{name}`. Rename it with \
+                     `min session rename {holder_id} <new-name>`, then attach again."
+                ),
+            ));
+        }
+
+        // BOX-025: the box restarts from the spec stored at its creation
+        // (BOX-068), refused as a create of that spec would be refused.
+        let mut resumed = record.clone();
+        if let Some(bytes) = &stored {
+            let unsatisfiable = |error: std::io::Error| {
+                tracing::info!(refusal = "spec", %error, "resume: the stored spec cannot be satisfied");
+                refused(
+                    error.kind(),
+                    format!(
+                        "{error} Destroy it with `min session destroy {name}`, then start a new \
+                         one with `min session activate`."
+                    ),
+                )
+            };
+            let spec = box_runtime::stored_spec(bytes).map_err(unsatisfiable)?;
+            box_runtime::restart_from_stored_spec(&mut resumed, &spec);
+            resumed.validate_policy().map_err(|error| {
+                unsatisfiable(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Its network settings are not valid: {error}."),
+                ))
+            })?;
+            if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+                resumed.network,
+                box_runtime::host_ip_enforcement_fact().can_decide_per_box(),
+                resumed.policy.egress.as_ref(),
+            ) {
+                return Err(unsatisfiable(
+                    crate::net::classifier::unenforceable_declaration_refusal(&rules),
+                ));
+            }
+        }
+
+        // An upload into the workspace changes the filesystem the box
+        // resumes from, so the resume waits for it to land.
+        if self.workspace_uploads_in_flight > 0 {
+            tracing::info!(
+                refusal = "upload",
+                "resume: a workspace upload is in flight"
+            );
+            return Err(AttachError::WorkspaceUploadInFlight);
+        }
+
+        // BVOL-013's volume-hold check comes last. A box has no volumes in
+        // this build, so no volume holds it.
+
+        resumed.set_state(RecordState::Running);
+        self.record
+            .write(resumed)
+            .await
+            .map_err(AttachError::LaunchRecordUnwritable)?;
+        if let Err(error) = crate::box_manager::write_box_event(
+            &object,
+            boxes::events::BoxEventType::Resumed,
+            crate::box_manager::resumed_event_data(&from),
+        ) {
+            // The record says running, and the attach goes on: a missing
+            // event must not strand a box that already resumed.
+            tracing::warn!(%error, "resume: could not write the resumed event");
+        }
+        #[cfg(target_os = "linux")]
+        self.hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .mark_running(*self.record.id());
+        let hooks: Vec<&str> = crate::hooks::HookEvent::ALL
+            .into_iter()
+            .filter(|event| event.runs_on_resume())
+            .map(crate::hooks::HookEvent::as_str)
+            .collect();
+        tracing::info!(
+            from = from.name(),
+            restarted_from_stored_spec = stored.is_some(),
+            hooks = ?hooks,
+            "resume: the box is running again"
+        );
+        Ok(())
     }
 
     /// The async task which handles interactions with the session.

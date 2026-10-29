@@ -319,6 +319,10 @@ enum ManagerMessage {
     /// actors it started.
     #[cfg(target_os = "linux")]
     ResumeActive(Responder<usize>),
+    /// The running box, other than the one named by the id, that holds the
+    /// name a resume asks for (BOX-025): its name and id, or `None`. Read
+    /// from the store alone, so it never waits on an actor.
+    RunningNameHolder(SessionId, String, Responder<Option<(String, SessionId)>>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
@@ -349,6 +353,7 @@ impl ManagerMessage {
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
             Self::ResumeActive(..) => "ResumeActive",
+            Self::RunningNameHolder(..) => "RunningNameHolder",
             Self::Evict(..) => "Evict",
         }
     }
@@ -456,6 +461,15 @@ impl BoxManager {
         // them linger and confuse `min ls` / hold their names
         // hostage.
         reap_unresumable_records(&store).await?;
+        // BOX-154: no box process outlives the daemon that launched it, so
+        // every `running` record this start finds has none left.
+        let stopped = stop_orphaned_running_records(&store).await?;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "restart: set running records with no process left to stopped"
+            );
+        }
 
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
@@ -1387,17 +1401,8 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 /// box. A record marked to end with its run is left to the resume, which
 /// destroys it (NET-131, gominimal/inbox#731).
 ///
-/// Not called at daemon start yet. No actor hosts a `stopped` box until
-/// #2393 (BOX-025), so the flip at start would leave every session that
-/// the restart resumes today without a way back. #2393 calls this from
-/// [`BoxManager::init`] beside [`reap_unresumable_records`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called at daemon start once a stopped box can be resumed (#2393)"
-    )
-)]
+/// [`BoxManager::init`] calls this beside [`reap_unresumable_records`]. The
+/// attach that names such a box resumes it (BOX-025).
 pub(crate) async fn stop_orphaned_running_records(
     store: &crate::store::StoreHandle,
 ) -> Result<usize, std::io::Error> {
@@ -1437,7 +1442,47 @@ pub(crate) async fn stop_orphaned_running_records(
     Ok(stopped)
 }
 
+/// The data of the `resumed` event a resume records (BOX-025): the state
+/// the box resumed from, `stopped` or `exited`.
+pub(crate) fn resumed_event_data(from: &boxes::core::record::RecordState) -> EventData {
+    let mut data = EventData::new();
+    data.insert("from".to_string(), from.name().into());
+    data
+}
+
 impl BoxManagerHandle {
+    /// The running box other than `id` that holds the name `name`, for a
+    /// resume's name check (BOX-025): its name and id, or `None`. The
+    /// manager reads only the store to answer.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's error.
+    pub(crate) async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<(String, SessionId)>, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::RunningNameHolder(id, name, send))
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ))
+        })
+    }
+
     /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
     /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
     /// how the box ended.
@@ -1891,6 +1936,50 @@ impl BoxManager {
         Ok(resumed)
     }
 
+    /// The running box other than `id` whose name is `name` (BOX-025): the
+    /// name its route answers to, as [`crate::box_actor::registry_name`]
+    /// gives it, compared without ASCII case as hostnames are. Answers that
+    /// box's name and id, or `None`. A box being torn down holds no name, and
+    /// a record that cannot be read is logged and skipped.
+    async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: &str,
+    ) -> Result<Option<(String, SessionId)>, BoxManagerError> {
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for handle in self.store.handles().await? {
+            let other = *handle.id();
+            if other == id || tearing_down.contains(&other) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %other,
+                        %error,
+                        "resume: could not read a record while checking the name; skipping it",
+                    );
+                    continue;
+                }
+            };
+            if matches!(
+                record.state(),
+                Ok(boxes::core::record::RecordState::Running)
+            ) {
+                let held = crate::box_actor::registry_name(&record);
+                if held.eq_ignore_ascii_case(name) {
+                    return Ok(Some((held, other)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// The manager's half of a teardown: the box's actor in `running`, or one
     /// brought up from its record and put in `running`. The actor stays there
     /// until its caller removes or evicts it once the teardown ends, so an
@@ -2300,6 +2389,9 @@ impl BoxManager {
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
+            }
+            ManagerMessage::RunningNameHolder(id, name, r) => {
+                r.handle(self.running_name_holder(id, &name)).await;
             }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {

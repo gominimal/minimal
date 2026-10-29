@@ -54,6 +54,16 @@ pub(crate) enum HookEvent {
 }
 
 impl HookEvent {
+    /// Every event, in the order a box's life meets them.
+    pub(crate) const ALL: [Self; 4] = [Self::Activate, Self::Attach, Self::Detach, Self::Destroy];
+
+    /// Whether this event runs when a box resumes. A resume is not an
+    /// activation, so only `on_attach` runs, on the attach that resumes
+    /// the box (BOX-027).
+    pub(crate) fn runs_on_resume(self) -> bool {
+        matches!(self, Self::Attach)
+    }
+
     /// The name as declared in configuration, and as reported to the
     /// hook in `MINIMAL_HOOK_EVENT`.
     pub(crate) fn as_str(self) -> &'static str {

@@ -46,6 +46,11 @@ pub enum AttachError {
     /// a re-run as the way forward, and a new activation once the host no
     /// longer holds the creator's record to resume from.
     BoxHostRowEnded,
+    /// The attach named a stopped or exited box, and its resume was refused
+    /// (BOX-025, BOX-030). The box's state is unchanged. The error's kind
+    /// is the one a create of the same spec gives, and its text names the
+    /// cause.
+    ResumeRefused(std::io::Error),
 }
 
 impl std::error::Error for AttachError {
@@ -54,6 +59,7 @@ impl std::error::Error for AttachError {
             AttachError::InvalidPolicy(e) => Some(e),
             AttachError::LoadoutFailed(e) => Some(e),
             AttachError::LaunchRecordUnwritable(e) => Some(e),
+            AttachError::ResumeRefused(e) => Some(e),
             _ => None,
         }
     }
@@ -94,6 +100,7 @@ impl fmt::Display for AttachError {
                  destroy the session with `min session destroy <session>` and start \
                  it again with `min session activate`"
             ),
+            AttachError::ResumeRefused(e) => write!(f, "{e}"),
         }
     }
 }
@@ -262,6 +269,11 @@ impl BoxActor {
             // `Active`.
             self.finalize().await.map_err(AttachError::LoadoutFailed)?;
         }
+
+        // BOX-025: an attach to a stopped or exited box resumes it first.
+        // The resume sets the record to `running`, so the gate below passes
+        // and the launch starts the box from its stored spec.
+        self.resume().await?;
 
         // Attach is gated on `Active` — a Materializing session has
         // a composition but its patches may not be on disk yet,

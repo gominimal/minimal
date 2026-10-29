@@ -13083,3 +13083,467 @@ fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
     unsafe { libc::kill(i32::try_from(grandchild).unwrap(), libc::SIGKILL) };
     shell.wait().expect("reap the stand-in shell");
 }
+
+/// A session spec as a create sends it (BOX-068), with `pty_enabled` as
+/// given and every other setting at its default.
+fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = pty_enabled;
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// Creates an `Active` session through the whole create flow. Its create
+/// carries `spec`, and `name: None` creates an unnamed session.
+async fn create_session_with_spec(
+    client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let mut req = create_session_req(name.unwrap_or("unnamed"), project);
+    if name.is_none() {
+        req.config.name = None;
+    }
+    req.spec = spec;
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// Stops the box `id` through the daemon (BOX-013), and waits until the
+/// manager no longer holds its actor, so the next attach brings one up
+/// from the stopped record.
+async fn stop_through_daemon(
+    server: &TestServer,
+    id: SessionId,
+) -> boxes::core::record::StopEnding {
+    let manager = server.state.sessions_manager().await;
+    let before = manager.running_count().await;
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the session resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let ending = manager
+        .stop_box_with_grace(id, true, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while manager.running_count().await >= before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stopped box's actor was not evicted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ending
+}
+
+/// The directory that holds the record of `id`.
+async fn record_dir(server: &TestServer, id: SessionId) -> std::path::PathBuf {
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        let Ok(bytes) = std::fs::read(dir.join("record.json")) else {
+            continue;
+        };
+        let record: boxes::Record = serde_json_lenient::from_slice(&bytes).unwrap();
+        if record.id == id {
+            return dir;
+        }
+    }
+    panic!("no record directory holds {id}");
+}
+
+/// Changes the record of `id` on disk, as a change made while the box ran
+/// or an ending this build has no path for leaves it. The store reads the
+/// record from disk on every read.
+async fn rewrite_record(
+    server: &TestServer,
+    id: SessionId,
+    change: impl FnOnce(&mut boxes::Record),
+) {
+    let path = record_dir(server, id).await.join("record.json");
+    let mut record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    change(&mut record);
+    std::fs::write(&path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+}
+
+/// Overwrites the spec stored beside the record of `id`.
+async fn rewrite_spec(server: &TestServer, id: SessionId, spec: &serde_json_lenient::Value) {
+    let path = record_dir(server, id).await.join("spec.json");
+    std::fs::write(path, serde_json_lenient::to_vec(spec).unwrap()).unwrap();
+}
+
+/// Attaches to `id` and sends a line. `Ok` when the shell echoes it, and
+/// `Err` with what the channel carried when it closes first.
+async fn attach_and_echo(client: &mut TestClient, id: SessionId) -> Result<(), String> {
+    let mut channel = client.open_shell(id).await;
+    let _ = channel.data_bytes(b"hello\n".to_vec()).await;
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                out.extend_from_slice(&data);
+                if String::from_utf8_lossy(&out).contains("got:hello") {
+                    return Ok(());
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(String::from_utf8_lossy(&out).into_owned()),
+        }
+    }
+}
+
+async fn read_record(server: &TestServer, id: SessionId) -> boxes::Record {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box keeps its record")
+}
+
+async fn event_kinds(server: &TestServer, id: SessionId) -> Vec<boxes::events::BoxEvent> {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .box_events(id)
+        .await
+        .unwrap()
+        .read_new()
+        .unwrap()
+}
+
+/// BOX-025: an attach to a stopped PTY box starts it again from the spec
+/// stored at its creation, from its retained files, under the same id and
+/// name, and records a `resumed` event. A change made to the record's
+/// settings while the box ran does not carry into the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_restarts_from_stored_spec_same_id_and_name() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let paths = session_paths(&server, id).await;
+    let kept = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    // A change while the box runs: the stored spec has hooks on.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
+
+    let ending = stop_through_daemon(&server, id).await;
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped PTY box resumes it");
+
+    let record = read_record(&server, id).await;
+    assert_eq!(record.id, id, "the box keeps its id");
+    assert_eq!(
+        record.name.as_deref(),
+        Some("resume-box"),
+        "the box keeps its name"
+    );
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(
+        (record.reason.is_none(), record.exit_code, record.signal),
+        (true, None, None)
+    );
+    assert!(
+        record.hooks_enabled,
+        "the box restarts from its stored spec, not the record's change"
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "still here");
+
+    let events = event_kinds(&server, id).await;
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    let exited = kinds
+        .iter()
+        .position(|k| *k == boxes::events::BoxEventType::Exited)
+        .expect("the stop records an exited event");
+    let resumed = kinds
+        .iter()
+        .position(|k| *k == boxes::events::BoxEventType::Resumed)
+        .expect("the resume records a resumed event");
+    assert!(exited < resumed, "{kinds:?}");
+    assert_eq!(events[resumed].box_id, id);
+    assert_eq!(events[resumed].data["from"], "stopped");
+}
+
+/// BOX-030: a PTY box resumes from `stopped` and from `exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_box_resumes_from_stopped_and_exited() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("pty-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+
+    stop_through_daemon(&server, id).await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("a stopped PTY box resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    // No path in this build ends a box `exited`, so the record is set so
+    // after a stop.
+    stop_through_daemon(&server, id).await;
+    rewrite_record(&server, id, |record| {
+        record.set_state(RecordState::Exited(ExitEnding::Exit { exit_code: 3 }));
+    })
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an exited PTY box resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    let froms: Vec<_> = event_kinds(&server, id)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == boxes::events::BoxEventType::Resumed)
+        .map(|e| e.data["from"].clone())
+        .collect();
+    assert_eq!(froms, ["stopped", "exited"]);
+}
+
+/// Asserts that the resume of `id` was refused: the attach closed with
+/// `words` and no shell, the record is still `state`, and no `resumed`
+/// event was written.
+async fn assert_resume_refused(
+    server: &TestServer,
+    client: &mut TestClient,
+    id: SessionId,
+    state: boxes::core::record::RecordState,
+    words: &[&str],
+) {
+    let out = attach_and_echo(client, id)
+        .await
+        .expect_err("the resume is refused");
+    for word in words {
+        assert!(out.contains(word), "{word:?} not in {out:?}");
+    }
+    assert!(out.contains("cannot resume"), "{out:?}");
+    assert_eq!(read_record(server, id).await.state().unwrap(), state);
+    assert!(
+        event_kinds(server, id)
+            .await
+            .iter()
+            .all(|e| e.kind != boxes::events::BoxEventType::Resumed),
+        "a refused resume writes no resumed event"
+    );
+}
+
+/// BOX-025: a resume whose stored spec this daemon cannot start from is
+/// refused with the kind a create of that spec gives, and the box stays
+/// stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_unsatisfiable_spec_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("old-spec"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let mut spec = resume_spec(true);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, id, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `old-spec`",
+            "version 99",
+            "min session destroy old-spec",
+        ],
+    )
+    .await;
+
+    // A spec that does not parse is refused the same way.
+    rewrite_spec(
+        &server,
+        id,
+        &serde_json_lenient::json!({"v": 0, "io": {"pty_enabled": true}}),
+    )
+    .await;
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["cannot be read"],
+    )
+    .await;
+}
+
+/// BOX-025: a resume is refused while a running box holds the box's name,
+/// naming that box, and the name check comes before the spec check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_when_name_held_by_running_box() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let stopped =
+        create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
+    let ending = stop_through_daemon(&server, stopped).await;
+    // An unnamed box answers to its project directory's name.
+    let holder = create_session_with_spec(&mut client, None, "/b/proj", None).await;
+    assert_eq!(
+        read_record(&server, holder).await.state().unwrap(),
+        RecordState::Running
+    );
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = resume_spec(true);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, stopped, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        stopped,
+        RecordState::Stopped(ending),
+        &[
+            "The running session `proj` holds the name `proj`",
+            &format!("min session rename {holder} <new-name>"),
+        ],
+    )
+    .await;
+}
+
+/// BOX-030: a resume of a box whose spec does not set `pty_enabled` is
+/// refused, and the box stays stopped. The terminal check comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_non_pty_box_refuses_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("no-pty"),
+        "/uwu",
+        Some(resume_spec(false)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = resume_spec(false);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, id, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["session `no-pty`", "runs without a terminal"],
+    )
+    .await;
+}
+
+/// BOX-027: a resume runs no lifecycle hook but `on_attach`, on the attach
+/// that resumes the box. The box's `on_activate` ran once, at activation,
+/// and does not run again when the box resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_runs_only_on_attach_hook() {
+    use crate::hooks::HookEvent;
+
+    let resume_hooks: Vec<_> = HookEvent::ALL
+        .into_iter()
+        .filter(|event| event.runs_on_resume())
+        .collect();
+    assert_eq!(resume_hooks, [HookEvent::Attach]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-hooks",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", marker.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+
+    stop_through_daemon(&server, id).await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the stopped box resumes");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "ran\n",
+        "on_activate ran again on resume"
+    );
+}
