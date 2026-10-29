@@ -490,6 +490,8 @@ impl BoxManager {
         // host-address boxes answer at. A native node's address is the host
         // loopback itself, which it already owns.
         #[cfg(target_os = "linux")]
+        let range_walk: Arc<std::sync::OnceLock<Arc<RangeWalk>>> = Arc::default();
+        #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
             // This daemon's start, on the record's own clock: the stamp the
             // sweep's race guard reads. A grant another daemon on this host
@@ -654,70 +656,26 @@ impl BoxManager {
                 // each box under the registry's write lock before it
                 // publishes, and releases a grant drawn for a box whose
                 // publish is gone.
-                let book = Arc::clone(&loopback);
-                let registry = Arc::clone(&hostnames);
+                //
+                // The same walk runs again at each session start
+                // ([`RangeWalk::session_start`]), so a host that gains the
+                // range after this daemon started publishes its next box in
+                // the range, and a host that loses it moves its boxes to the
+                // interim. The walk lets one walk
+                // run at a time, so the session-start walk never overlaps
+                // this one on the forwarder.
+                let walk = Arc::new(RangeWalk::new(
+                    RangeWalkSource::Forwarder(crate::net::policy::ControlChannel::Vsock {
+                        cid,
+                        port,
+                    }),
+                    Arc::clone(&loopback),
+                    Arc::clone(&hostnames),
+                ));
+                // The cell is new and empty here, so the set cannot fail.
+                let _ = range_walk.set(Arc::clone(&walk));
                 crate::traced::spawn(async move {
-                    let probe = crate::net::policy::probe_publish_surface(
-                        &crate::net::policy::ControlChannel::Vsock { cid, port },
-                    )
-                    .await;
-                    tracing::info!(
-                        via = "forwarder",
-                        surface = probe.surface(),
-                        interim = probe.interim(),
-                        first_failure = ?probe.first_failure,
-                        "the daemon-start range probe walked the forwarder's loopback \
-                         and picked the publish surface",
-                    );
-                    land_range_verdict(
-                        &book,
-                        &registry,
-                        if probe.present() {
-                            crate::net::dns::RangeVerdict::Present
-                        } else {
-                            crate::net::dns::RangeVerdict::Absent
-                        },
-                    );
-                    if !probe.present() {
-                        tracing::warn!(
-                            first_failure = ?probe.first_failure,
-                            "the reserved local range is absent on the publish surface; \
-                             publishing boxes on the 127.0.0.1 interim",
-                        );
-                        return;
-                    }
-                    let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
-                        crate::net::dns::LoopbackGrant::Granted(address) => address,
-                        crate::net::dns::LoopbackGrant::RecordUnavailable => {
-                            // The shutdown shape: a daemon that went down
-                            // mid-walk has closed its book, and the grant that
-                            // comes back is the closed book's, not a fault on
-                            // the host — the manager stops every session
-                            // before it closes, so there is nothing left to
-                            // publish an interim for either. An unreadable
-                            // record lands here too, said at the same level:
-                            // neither is a verdict about this host's range.
-                            tracing::debug!(
-                                grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
-                                "the node's own loopback address was not granted — \
-                                 the book was closed for shutdown, or its record could \
-                                 not be read or written",
-                            );
-                            return;
-                        }
-                        other => {
-                            tracing::warn!(
-                                grant = ?other,
-                                "the node's own loopback address was not granted; \
-                                 publishing host-address boxes on the 127.0.0.1 interim",
-                            );
-                            return;
-                        }
-                    };
-                    registry
-                        .write()
-                        .expect("hostname registry lock poisoned")
-                        .set_node_address(node);
+                    walk.daemon_start().await;
                 });
             }
             (hostnames, loopback)
@@ -728,6 +686,8 @@ impl BoxManager {
             in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(target_os = "linux")]
+            range_walk,
             #[cfg(all(test, target_os = "linux"))]
             loopback: Arc::clone(&loopback),
         };
@@ -798,6 +758,260 @@ impl BoxManager {
     }
 }
 
+/// What asks whether the host binds the reserved local range, for a daemon
+/// whose publish surface is the host's loopback, not its own.
+#[cfg(target_os = "linux")]
+pub(crate) enum RangeWalkSource {
+    /// The host forwarder, asked over the control channel the publishes
+    /// ride ([`crate::net::policy::probe_publish_surface`]).
+    Forwarder(crate::net::policy::ControlChannel),
+    /// A test's stand-in for the forwarder's binds: no Linux host can make
+    /// the range absent, and no harness daemon has a host forwarder.
+    #[cfg(test)]
+    StandIn(Arc<dyn Fn() -> crate::net::loopback::RangeProbe + Send + Sync>),
+}
+
+/// The answer a session-start range walk gives the create handler.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct RangeWalkAnswer {
+    /// The probe the verdict rests on: this walk's, or the concurrent
+    /// walk's when this call took that walk's answer.
+    pub(crate) probe: crate::net::loopback::RangeProbe,
+    /// Whether this session start walked the range. `false` only when a
+    /// walk that ended while this one waited for its turn gave the answer.
+    pub(crate) walked: bool,
+    /// How many boxes the landing moved off the `127.0.0.1` interim onto
+    /// their range addresses.
+    pub(crate) moved: usize,
+    /// Whether this walk was a fault of the channel over a landed present
+    /// verdict, so the verdict stayed present and `probe` is the failed
+    /// walk's, not the verdict's.
+    pub(crate) kept_present: bool,
+}
+
+/// Whether a probe that did not bind the whole range rests on a refusal
+/// the forwarder answered, recorded as `AddrNotAvailable`, rather than on
+/// a fault of the channel.
+#[cfg(target_os = "linux")]
+fn range_probe_refused(probe: &crate::net::loopback::RangeProbe) -> bool {
+    matches!(
+        probe.first_failure,
+        Some((_, std::io::ErrorKind::AddrNotAvailable))
+    )
+}
+
+/// The forwarder-conducted walk of the reserved local range (NET-123) and
+/// the landing of its verdict, shared by the daemon-start walk and every
+/// session-start walk of a microVM daemon.
+///
+/// One walk runs at a time: the walks share one probe port on one
+/// forwarder, and a session start that waits behind a walk takes that
+/// walk's answer, not a second walk of its own.
+#[cfg(target_os = "linux")]
+pub(crate) struct RangeWalk {
+    source: RangeWalkSource,
+    book: Arc<crate::net::dns::LoopbackLeaseBook>,
+    registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// How many walks ended, read before a caller waits for its turn.
+    walks: std::sync::atomic::AtomicU64,
+    /// The turn, and the last walk's probe.
+    last: Mutex<Option<crate::net::loopback::RangeProbe>>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RangeWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match &self.source {
+            RangeWalkSource::Forwarder(_) => "forwarder",
+            #[cfg(test)]
+            RangeWalkSource::StandIn(_) => "stand-in",
+        };
+        f.debug_struct("RangeWalk")
+            .field("source", &source)
+            .field(
+                "walks",
+                &self.walks.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RangeWalk {
+    pub(crate) fn new(
+        source: RangeWalkSource,
+        book: Arc<crate::net::dns::LoopbackLeaseBook>,
+        registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    ) -> Self {
+        Self {
+            source,
+            book,
+            registry,
+            walks: std::sync::atomic::AtomicU64::new(0),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Asks the source to bind the whole range once.
+    async fn probe(&self) -> crate::net::loopback::RangeProbe {
+        match &self.source {
+            RangeWalkSource::Forwarder(control) => {
+                crate::net::policy::probe_publish_surface(control).await
+            }
+            #[cfg(test)]
+            RangeWalkSource::StandIn(walk) => walk(),
+        }
+    }
+
+    /// Walks the range and lands the verdict. The caller holds the turn.
+    ///
+    /// A walk that neither bound the whole range nor got a refusal from the
+    /// forwarder (a timeout, a missing socket, a malformed reply) is a fault
+    /// of the channel, not a fact about the host's loopback. Over a landed
+    /// present verdict such a walk lands nothing: the verdict stays present
+    /// and every box keeps its range address. The returned flag says so.
+    /// Over a pending or absent verdict the walk lands absent as before,
+    /// because the interim is what the surface can promise without an answer.
+    async fn walk_and_land(&self) -> (crate::net::loopback::RangeProbe, usize, bool) {
+        let probe = self.probe().await;
+        if !probe.present() && !range_probe_refused(&probe) && self.present_landed() {
+            tracing::warn!(
+                probe = %probe.summary(),
+                first_failure = ?probe.first_failure,
+                action = "loopback-range-walk-inconclusive",
+                "the range walk got no answer from the forwarder; \
+                 the present verdict stays and every box keeps its address",
+            );
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return (probe, 0, true);
+        }
+        let moved = land_range_verdict(
+            &self.book,
+            &self.registry,
+            if probe.present() {
+                crate::net::dns::RangeVerdict::Present
+            } else {
+                crate::net::dns::RangeVerdict::Absent
+            },
+        );
+        if probe.present() {
+            self.grant_node_address();
+        }
+        self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        (probe, moved, false)
+    }
+
+    /// Whether the book holds a landed present verdict: it vouches for an
+    /// address inside the reserved range only then.
+    fn present_landed(&self) -> bool {
+        ::switch::loopback::range_hosts()
+            .next()
+            .is_some_and(|host| self.book.vouches_for(host))
+    }
+
+    /// Hands the node its own loopback address once the range is present
+    /// (NET-129). The grant is idempotent by namespace, so a later present
+    /// landing asks again at no cost.
+    fn grant_node_address(&self) {
+        let node = match self.book.grant(crate::net::dns::LeaseNamespace::Node) {
+            crate::net::dns::LoopbackGrant::Granted(address) => address,
+            crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                // The shutdown shape: a daemon that went down mid-walk has
+                // closed its book, and the grant that comes back is the
+                // closed book's, not a fault on the host — the manager stops
+                // every session before it closes, so there is nothing left
+                // to publish an interim for either. An unreadable record
+                // lands here too, said at the same level: neither is a
+                // verdict about this host's range.
+                tracing::debug!(
+                    grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
+                    "the node's own loopback address was not granted — \
+                     the book was closed for shutdown, or its record could \
+                     not be read or written",
+                );
+                return;
+            }
+            other => {
+                tracing::warn!(
+                    grant = ?other,
+                    "the node's own loopback address was not granted; \
+                     publishing host-address boxes on the 127.0.0.1 interim",
+                );
+                return;
+            }
+        };
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .set_node_address(node);
+    }
+
+    /// The daemon-start walk: spawned off `BoxManager::init`'s critical
+    /// path, it lands the first verdict the book opened pending on.
+    pub(crate) async fn daemon_start(&self) {
+        let mut last = self.last.lock().await;
+        let (probe, _, _) = self.walk_and_land().await;
+        tracing::info!(
+            via = "forwarder",
+            surface = probe.surface(),
+            interim = probe.interim(),
+            first_failure = ?probe.first_failure,
+            "the daemon-start range probe walked the forwarder's loopback \
+             and picked the publish surface",
+        );
+        if !probe.present() {
+            tracing::warn!(
+                first_failure = ?probe.first_failure,
+                "the reserved local range is absent on the publish surface; \
+                 publishing boxes on the 127.0.0.1 interim",
+            );
+        }
+        *last = Some(probe);
+    }
+
+    /// The session-start walk: walks the range again at every session
+    /// start, whatever verdict landed last, and lands what it finds. The
+    /// range can go away under a running VM, so a present verdict is
+    /// bind-probed again too: a present-to-absent walk lands the absent
+    /// arm, which moves every box in the range onto the `127.0.0.1`
+    /// interim. Only a refusal the forwarder answered lands that arm over a
+    /// present verdict. A walk that got no answer keeps the verdict
+    /// ([`Self::walk_and_land`]). A walk that ended while this call waited for its turn gives
+    /// this call its answer.
+    pub(crate) async fn session_start(&self) -> RangeWalkAnswer {
+        let seen = self.walks.load(std::sync::atomic::Ordering::Acquire);
+        let mut last = self.last.lock().await;
+        let ended_while_waiting = self.walks.load(std::sync::atomic::Ordering::Acquire) != seen;
+        if let Some(probe) = last.as_ref().filter(|_| ended_while_waiting) {
+            return RangeWalkAnswer {
+                probe: probe.clone(),
+                walked: false,
+                moved: 0,
+                kept_present: false,
+            };
+        }
+        let (probe, moved, kept_present) = self.walk_and_land().await;
+        if kept_present {
+            // The verdict did not move, so the last walk's probe stays the
+            // one a waiting session start takes as its answer.
+            return RangeWalkAnswer {
+                probe,
+                walked: true,
+                moved,
+                kept_present,
+            };
+        }
+        *last = Some(probe.clone());
+        RangeWalkAnswer {
+            probe,
+            walked: true,
+            moved,
+            kept_present,
+        }
+    }
+}
+
 /// One box's move off the `127.0.0.1` interim, as the present landing's
 /// sweep draws it: the box (`session`, `name`, `ports`) and the address it
 /// is to move to — its own hand for a box a creator handed one (`hand`,
@@ -822,7 +1036,7 @@ pub(crate) struct InterimUpgrade {
 }
 
 /// Lands a range verdict the way the deferred walk lands it
-/// ([`crate::box_manager::BoxManager::init`]'s spawned probe): the state moves
+/// ([`RangeWalk`]'s daemon-start and session-start walks): the state moves
 /// first, then the arm that follows it runs over the publishes the old
 /// verdict left standing — the one moment a verdict's landing has effects
 /// beside the atomic it sets, and the reason the walk cannot simply store
@@ -834,7 +1048,9 @@ pub(crate) struct InterimUpgrade {
 /// destroy. The landing is the one moment the daemon holds both facts — the
 /// verdict and every publish it contradicts — so it re-publishes each such
 /// box at the interim, name and route with it, and the box's attach binds
-/// where the surface listens instead of failing until destroy. The arm is
+/// where the surface listens instead of failing until destroy. The node's
+/// own address moves to the interim too when it stands in the range, so
+/// the names of host-address boxes stop answering at it. The arm is
 /// a belt behind the pending window's gate: no production path publishes a
 /// reserved-range address under anything but a landed present verdict — a
 /// hand waits for one or stands at the interim, and a resumed box the
@@ -868,19 +1084,21 @@ pub(crate) struct InterimUpgrade {
 /// the verdict under the registry's write lock before it publishes — its
 /// ask by the verdict's own arm, and each sweep only re-publishes what
 /// still stands.
+///
+/// Returns how many boxes the present arm moved off the interim, for the
+/// session-start walk's log line. The other arms return `0`.
 #[cfg(target_os = "linux")]
 fn land_range_verdict(
     book: &crate::net::dns::LoopbackLeaseBook,
     registry: &RwLock<crate::net::dns::HostnameRegistry>,
     verdict: crate::net::dns::RangeVerdict,
-) {
+) -> usize {
     book.set_range_verdict(verdict);
     match verdict {
-        crate::net::dns::RangeVerdict::Present => {
-            for upgrade in draw_interim_upgrades(book, registry) {
-                apply_interim_upgrade(book, registry, &upgrade);
-            }
-        }
+        crate::net::dns::RangeVerdict::Present => draw_interim_upgrades(book, registry)
+            .iter()
+            .filter(|upgrade| apply_interim_upgrade(book, registry, upgrade))
+            .count(),
         crate::net::dns::RangeVerdict::Absent => {
             // The boxes the window published at reserved-range addresses:
             // the surface cannot bind what they hold, and their attach
@@ -902,10 +1120,27 @@ fn land_range_verdict(
                 reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
                 reg.register_own_ip(session, &name, ports);
             }
+            // The node's own address a present landing granted: host-address
+            // boxes route at it, and the surface cannot bind it now. The
+            // node's lease stays in the book, so the next present landing
+            // grants the same address back.
+            let node = reg.node_address();
+            if ::switch::loopback::range_hosts().any(|host| host == node) {
+                tracing::warn!(
+                    from = %node,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-node",
+                    "the node's own loopback address stood inside the reserved \
+                     local range; the range is absent on the publish surface, \
+                     so the node's names move to the 127.0.0.1 interim",
+                );
+                reg.set_node_address(Ipv4Addr::LOCALHOST);
+            }
+            0
         }
         // The state a book opens on and the state a test re-opens it in:
         // nothing has been published under it to sweep.
-        crate::net::dns::RangeVerdict::Pending => {}
+        crate::net::dns::RangeVerdict::Pending => 0,
     }
 }
 

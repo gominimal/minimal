@@ -3896,20 +3896,35 @@ async fn a_box_nobody_handed_an_address_publishes_at_the_answerers_grant() {
 /// NET-129's sub-requirement (report, don't translate) covers the boxes that
 /// *do* share an address; this is the case the shared-address mode exists to
 /// avoid.
+///
+/// The boxes are created after the range lands the way a microVM daemon
+/// lands it once `min finalize-install` ran: the daemon-start walk found the
+/// range absent, and the first create's session-start walk finds it present.
+/// A stand-in walk stands in for the host forwarder's binds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_box_gets_own_loopback_address() {
     let alpha_handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let beta_handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.install_range_walk_standin(|| {
+        let hosts = ::switch::loopback::range_hosts().count();
+        crate::net::loopback::RangeProbe {
+            bound: hosts,
+            probed: hosts,
+            first_failure: None,
+        }
+    });
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
     let mut client = server.connect().await;
-    let _alpha = finalize_handed_own_ip_session(
+    let alpha = finalize_handed_own_ip_session(
         &mut client,
         "alpha",
         std::net::Ipv4Addr::new(100, 64, 128, 9),
         alpha_handed,
     )
     .await;
-    let _beta = finalize_handed_own_ip_session(
+    let beta = finalize_handed_own_ip_session(
         &mut client,
         "beta",
         std::net::Ipv4Addr::new(100, 64, 128, 10),
@@ -3938,6 +3953,19 @@ async fn each_box_gets_own_loopback_address() {
     // number each box asked for — no translation, no remap around the pair.
     let registry = server.state.sessions_manager().await.hostnames();
     let routes = registry.read().expect("registry lock");
+    // Each box stands at its own hand, not the interim: the publish is the
+    // address the attach path binds the box's forwards at.
+    for (name, id, handed, address) in [
+        ("alpha", alpha, alpha_handed, alpha_address),
+        ("beta", beta, beta_handed, beta_address),
+    ] {
+        assert_eq!(
+            routes.published_own_address(id),
+            Some(handed),
+            "{name}'s forwards bind at the address it was handed, after the range landed"
+        );
+        assert_eq!(address, handed, "{name}'s name answers at its own address");
+    }
     for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
         let route = routes
             .resolve(&format!("{name}.min.internal"))
