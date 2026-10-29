@@ -232,7 +232,7 @@ pub(crate) async fn release_held_box_name(
 /// host reads it twice — before the attach, for the pair the box's row was
 /// registered with, and after, to tell whether the attach ended in a
 /// daemon-side destroy ([`release_held_name_after_attach`]).
-pub(super) async fn attached_box_record(
+pub(crate) async fn attached_box_record(
     sock: &std::path::Path,
     id: boxes::SessionId,
 ) -> anyhow::Result<Option<boxes::Record>> {
@@ -355,13 +355,23 @@ pub(crate) async fn rehold_held_name_before_attach(
     // same reason the name is re-held: a VM host daemon that restarted
     // holds no `host_ip` box's policy, and its gate then drops every frame
     // the box sends outside the VM (NET-085). Idempotent.
-    host_ip_box_with_vm_host(
+    //
+    // The record was read before the admit, so a destroy in between can
+    // retire the box first and leave its rules standing for a gone session.
+    // The session is looked up again once the admit is made, and a session
+    // gone by then has its rules retired, as the name re-hold below undoes
+    // its hold. A destroy that lands after that lookup retires them itself.
+    if host_ip_box_with_vm_host(
         control_sock_beside(sock),
         id,
         record.policy.egress.clone(),
         true,
     )
-    .await;
+    .await
+        && let Ok(None) = attached_box_record(sock, id).await
+    {
+        host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
+    }
     if record.box_addresses.is_some() {
         return;
     }
@@ -2057,14 +2067,18 @@ mod tests {
             "the gone session's re-hold, then the name handed back to the live one"
         );
         // The re-hold re-admits the box's egress first (NET-085), by the
-        // session the record names.
+        // session the record names. The session is gone, so the second
+        // lookup finds nothing and the admit is retired again.
         let residency = residency.lock().unwrap();
         assert!(
             matches!(
                 residency.as_slice(),
-                [minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit)] if admit.session_id == gone
+                [
+                    minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit),
+                    minimald_rpc::BoxControlRequest::RetireHostIpBox(retire),
+                ] if admit.session_id == gone && retire.session_id == gone
             ),
-            "one admit for the attached session: {residency:?}"
+            "an admit for the gone session, then its retire: {residency:?}"
         );
     }
 

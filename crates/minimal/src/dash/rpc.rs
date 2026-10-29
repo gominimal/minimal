@@ -337,15 +337,25 @@ pub async fn prepare_attach(
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
     // A `host_ip` box's egress, re-admitted as `min session attach` re-admits
     // it: a VM host daemon that restarted holds none, and its gate then drops
-    // the box's frames outside the VM (NET-085). Idempotent.
+    // the box's frames outside the VM (NET-085). Idempotent. The record was
+    // read before the admit, so a session destroyed in between has its rules
+    // retired here once a second lookup finds it gone.
     if let Some(record) = record.as_ref()
         && record.network == NetworkMode::HostNet
-    {
-        crate::host_ip_box_with_vm_host(
+        && crate::host_ip_box_with_vm_host(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
             record.policy.egress.clone(),
             true,
+        )
+        .await
+        && let Ok(None) = crate::attached_box_record(sock, record.id).await
+    {
+        crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            record.id,
+            None,
+            false,
         )
         .await;
     }
