@@ -6773,6 +6773,112 @@ async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
     );
 }
 
+/// #2748, a declared port whose bind at the hand fails: the landing moves the
+/// box's name to its hand, but the switch refuses the declared port's bind
+/// there. The forward the attach bound at the interim is the only one that
+/// serves the port, so it stays bound: it is unbound only once the bind at
+/// the hand stands.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_port_whose_bind_at_the_hand_fails_keeps_its_interim_forward() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 8);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 8);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let web = finalize_handed_own_ip_session(&mut client, "web", lease, handed).await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch binds everything at the interim and nothing at the hand.
+    let refused_at = format!("\"local\":\"{handed}:");
+    let (forwarder, served) =
+        deciding_forwarder(sock.clone(), move |request| !request.contains(&refused_at)).await;
+    let mapping = boxes::PortMapping {
+        external_port: 18080,
+        internal_port: 80,
+        proto: boxes::IpProto::Tcp,
+    };
+    let control = crate::net::policy::ControlChannel::Unix(sock);
+    let Ok(crate::net::policy::HandedBind::Bound(attached)) =
+        crate::net::policy::bind_handed_port(&control, interim, lease, &mapping, None).await
+    else {
+        panic!("the stand-in binds the attach's forward");
+    };
+    let (ingress, _) = handle.ingress_cells().await.expect("the actor answers");
+    ingress.record_attached(std::slice::from_ref(&attached));
+
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    // The actor asked for the port at the hand, and the switch refused it.
+    soon(|| {
+        served_naming(&served, handed, 18080)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    // The move's handling ends in the actor's own turn: a round trip to it
+    // after the refused bind is after the release would have been asked.
+    handle.live_ingress().await.expect("the actor answers");
+    forwarder.abort();
+    assert!(
+        served_naming(&served, interim, 18080)
+            .iter()
+            .all(|request| !request.starts_with("POST /services/forwarder/unexpose ")),
+        "the forward at the interim is not unbound while no bind at the hand stands: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !attached.is_revoked(),
+        "the attach's forward at the interim still serves the port"
+    );
+}
+
 /// #2748, the runtime publications: a handed box standing on the
 /// `127.0.0.1` interim publishes one port with `min net expose` and one by
 /// listening on it, and both forwards bind at the interim. When the range
@@ -7218,6 +7324,77 @@ async fn a_listen_port_does_not_move_onto_a_port_another_box_holds() {
     })
     .await;
     drop(listener);
+}
+
+/// #2748: a range walk that ends inconclusive, as one whose probe round the
+/// VM host's gate kept contended past the walk's budget does, never replaces
+/// a present verdict. Every box keeps its range address, so a guest that
+/// holds a probe round cannot move the host's boxes back to the interim.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contended_walk_never_replaces_a_present_verdict() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let contended = Arc::new(AtomicBool::new(false));
+    {
+        let contended = Arc::clone(&contended);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if contended.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts - 1,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 5),
+                        std::io::ErrorKind::TimedOut,
+                    )),
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 7);
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 7),
+        handed,
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the present verdict publishes the box at its hand"
+    );
+
+    contended.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 0, "an inconclusive walk moves nothing");
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the box keeps its range address over an inconclusive walk"
+    );
 }
 
 /// #2748, a box with no actor: the present landing moves every box standing

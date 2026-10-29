@@ -281,7 +281,9 @@ enum ManagerMessage {
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// The handle of the session's live actor, if it has one. Read-only
     /// against the `running` map: unlike [`GetSession`](Self::GetSession)
-    /// it never starts an actor, so a stopped box stays without one.
+    /// it never starts an actor, so a stopped box stays without one. Linux
+    /// only, like the publish-move receiver that asks it: on macOS minimald
+    /// runs inside the Linux guest.
     #[cfg(target_os = "linux")]
     GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s

@@ -1932,15 +1932,47 @@ async fn relay_control(
         None
     };
     let mut probe_round = None;
-    let decision = match range_probe_listener(verb, &request) {
+    // What an admitted round writes to the switch: the request rebuilt from
+    // the fields the gate checked, never the guest's bytes
+    // ([`canonical_probe_request`]).
+    let mut probe_spoken = None;
+    let probe = range_probe_listener(verb, &request);
+    if let Some(listener) = probe
+        && !probe_body_is_strict(verb, &request)
+    {
+        // A probe-shaped body with a key the gate's shape check does not
+        // read: unknown, repeated, or a case variant gvproxy's decoder would
+        // take for one of the probe's fields. Refused with an answer, never
+        // relayed.
+        refuse_request(
+            &limiter,
+            &RefusedRequest {
+                rule: RANGE_PROBE_RULE,
+                addr: Some(listener.0),
+                what: Some(format!("port {}", listener.1)),
+                reason: "a loopback range probe round carried a key beyond its own fields"
+                    .to_string(),
+            },
+        );
+        answer_unrelayed(
+            &mut guest,
+            &mut guest_tx,
+            &probe_malformed_answer(),
+            drain_timeout,
+        )
+        .await;
+        return;
+    }
+    let decision = match probe {
         Some(listener) if !range_address_held(&table, forwards, listener.0) => {
+            probe_spoken = Some(canonical_probe_request(verb, listener));
             if verb == ControlVerb::Expose {
                 match forwards.begin_probe(listener) {
                     Ok(generation) => {
                         tokio::spawn(
                             release_probe_after_hold(
                                 switch_sock.to_path_buf(),
-                                Arc::clone(forwards),
+                                Arc::downgrade(forwards),
                                 generation,
                             )
                             .in_current_span(),
@@ -2146,9 +2178,13 @@ async fn relay_control(
     };
     // Admitted: the head and body are forwarded together, in one write, so
     // the request gvproxy sees is exactly the request the guest sent and
-    // exactly the request the table admitted.
-    let mut spoken = head;
-    spoken.extend_from_slice(&request);
+    // exactly the request the table admitted. A probe round is the
+    // exception: it is written as the gate rebuilt it from what it checked.
+    let spoken = probe_spoken.unwrap_or_else(|| {
+        let mut spoken = head;
+        spoken.extend_from_slice(&request);
+        spoken
+    });
     if let Err(error) = switch.write_all(&spoken).await {
         tracing::warn!(%error, "egress gate could not forward an admitted control request");
         if let Some(listener) = noted {
@@ -3903,25 +3939,101 @@ const MAX_ZONE_RECORDS: usize = MAX_REQUEST_RECORDS;
 /// probe may bind ([`PublishedForwards::begin_probe`],
 /// [`range_address_held`], [`RANGE_PROBE_HOLD`]).
 fn range_probe_listener(verb: ControlVerb, body: &[u8]) -> Option<Listener> {
-    let (local, protocol) = match verb {
-        ControlVerb::Expose => {
-            let parsed = serde_json_lenient::from_slice::<ExposeBody>(body).ok()?;
-            if parsed.remote != switch::loopback::RANGE_PROBE_REMOTE {
-                return None;
-            }
-            (parsed.local, parsed.protocol)
+    // Read as a plain object, keyed as written, a repeated key's last value
+    // winning as it does in gvproxy's decoder, so a body that would bind as a
+    // probe round there is recognised as one here, and the strict read that
+    // follows ([`probe_body_is_strict`]) refuses it if it carries anything
+    // beyond the round's own fields.
+    let value: serde_json_lenient::Value = serde_json_lenient::from_slice(body).ok()?;
+    let field = |name: &str| value.get(name).and_then(serde_json_lenient::Value::as_str);
+    match verb {
+        ControlVerb::Expose if field("remote")? != switch::loopback::RANGE_PROBE_REMOTE => {
+            return None;
         }
-        ControlVerb::Unexpose => {
-            let parsed = serde_json_lenient::from_slice::<UnexposeBody>(body).ok()?;
-            (parsed.local, parsed.protocol)
-        }
+        ControlVerb::Expose | ControlVerb::Unexpose => {}
         ControlVerb::DnsAdd => return None,
-    };
-    let listener = loopback_listener(&local).ok()?;
-    (protocol == "tcp"
+    }
+    let listener = loopback_listener(field("local")?).ok()?;
+    (field("protocol")? == "tcp"
         && listener.1 == switch::loopback::RANGE_PROBE_PORT
         && in_reserved_local_range(Ipv4Addr::from(listener.0)))
     .then_some(listener)
+}
+
+/// A range probe round's expose body, read strictly: exactly these fields,
+/// once each, spelled exactly. gvproxy's Go decoder matches keys without
+/// regard to case and lets a repeated key win, so a body carrying anything
+/// else could bind there what the gate never checked.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeExposeBody {
+    local: String,
+    remote: String,
+    protocol: String,
+}
+
+/// A range probe round's unexpose body, read as strictly as
+/// [`ProbeExposeBody`].
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeUnexposeBody {
+    local: String,
+    protocol: String,
+}
+
+/// Whether a probe-shaped body carries its own fields and nothing else:
+/// no unknown key, no key twice, no case variant of one.
+fn probe_body_is_strict(verb: ControlVerb, body: &[u8]) -> bool {
+    match verb {
+        ControlVerb::Expose => serde_json_lenient::from_slice::<ProbeExposeBody>(body).is_ok(),
+        ControlVerb::Unexpose => serde_json_lenient::from_slice::<ProbeUnexposeBody>(body).is_ok(),
+        ControlVerb::DnsAdd => false,
+    }
+}
+
+/// The request an admitted range probe round writes to the switch, built
+/// from the listener the gate checked and the probe's own constants, in the
+/// guest daemon's own spelling: gvproxy sees exactly what the gate decided,
+/// whatever bytes the guest sent.
+fn canonical_probe_request(verb: ControlVerb, listener: Listener) -> Vec<u8> {
+    let local = forward_revoke::listener_local(listener.0, listener.1);
+    let protocol = "tcp".to_string();
+    let (path, body) = match verb {
+        ControlVerb::Unexpose => (
+            "/services/forwarder/unexpose",
+            serde_json_lenient::to_vec(&ProbeUnexposeBody { local, protocol }),
+        ),
+        _ => (
+            "/services/forwarder/expose",
+            serde_json_lenient::to_vec(&ProbeExposeBody {
+                local,
+                remote: switch::loopback::RANGE_PROBE_REMOTE.to_string(),
+                protocol,
+            }),
+        ),
+    };
+    let body = body.expect("three strings always serialize");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request
+}
+
+/// The answer to a probe-shaped round the gate refuses for a key beyond its
+/// own fields: an HTTP refusal, so the guest reads a refusal, never a fault
+/// of the channel.
+fn probe_malformed_answer() -> Vec<u8> {
+    const BODY: &str = "a loopback range probe round carried a key beyond its own fields";
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\r\n{BODY}\n",
+        BODY.len() + 1
+    )
+    .into_bytes()
 }
 
 /// Whether a control request names a listener a range probe round can bind:
@@ -3976,18 +4088,29 @@ fn probe_refused_answer() -> Vec<u8> {
     .into_bytes()
 }
 
+/// How many times the gate asks the switch to release a round the guest
+/// left bound before it gives up ([`release_probe_after_hold`]).
+const RANGE_PROBE_RELEASE_ATTEMPTS: usize = 3;
+
 /// Releases the range probe round `generation` once [`RANGE_PROBE_HOLD`] has
 /// passed, if the guest has not released it: a guest that binds a round and
 /// never unexposes it holds the probe port at that address no longer than
-/// the bound. The round is accounted until its unexpose stands, so a release
-/// the switch does not answer is asked again at the next hold.
+/// the bound. The round stays accounted until the switch answers its
+/// release, unbound or never bound, so a release the switch does not answer
+/// is asked again a hold later, [`RANGE_PROBE_RELEASE_ATTEMPTS`] times in all.
+/// After the last failure the round stays outstanding, and with it the gate
+/// admits no other round, failing closed. The task holds the gate's ledger
+/// only weakly, and ends with the gate.
 async fn release_probe_after_hold(
     switch_sock: PathBuf,
-    forwards: Arc<PublishedForwards>,
+    forwards: std::sync::Weak<PublishedForwards>,
     generation: u64,
 ) {
-    loop {
+    for attempt in 1..=RANGE_PROBE_RELEASE_ATTEMPTS {
         tokio::time::sleep(RANGE_PROBE_HOLD).await;
+        let Some(forwards) = forwards.upgrade() else {
+            return;
+        };
         let _turn = forwards.probe_turn.lock().await;
         let Some(listener) = forwards.probe_listener(generation) else {
             return;
@@ -4012,11 +4135,22 @@ async fn release_probe_after_hold(
                 );
                 return;
             }
+            Err(error) if attempt == RANGE_PROBE_RELEASE_ATTEMPTS => {
+                tracing::error!(
+                    rule_matched = RANGE_PROBE_RULE,
+                    %local,
+                    %error,
+                    attempts = attempt,
+                    "gave up releasing a loopback range probe round the guest left bound; \
+                     it stays accounted, and the gate admits no other round"
+                );
+            }
             Err(error) => {
                 tracing::warn!(
                     rule_matched = RANGE_PROBE_RULE,
                     %local,
                     %error,
+                    attempt,
                     "releasing a loopback range probe round failed; asking again"
                 );
             }
@@ -16026,10 +16160,94 @@ mod tests {
                 format!(r#"{{"local":"{local}","protocol":"tcp"}}"#),
             )
         };
-        let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\n").into_bytes();
+        control_request(path, &body)
+    }
+
+    /// A control request in the guest daemon's own spelling
+    /// (`post_json_within`, `crates/minimald/src/net/policy.rs`).
+    fn control_request(path: &str, body: &str) -> Vec<u8> {
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        )
+        .into_bytes();
         request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         request.extend_from_slice(body.as_bytes());
         request
+    }
+
+    /// #2748: gvproxy's Go decoder matches a key without regard to case and
+    /// lets a repeated key win, so a probe-shaped body with any key beyond the
+    /// round's own fields could bind there what the gate never checked. Each
+    /// is refused with an HTTP refusal and never relayed.
+    #[tokio::test]
+    async fn a_probe_round_with_a_key_beyond_its_own_fields_is_refused() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        let remote = switch::loopback::RANGE_PROBE_REMOTE;
+        for body in [
+            format!(
+                r#"{{"local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp","LOCAL":"0.0.0.0:2222","REMOTE":"10.0.0.1:22"}}"#
+            ),
+            format!(
+                r#"{{"local":"0.0.0.0:2222","local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp"}}"#
+            ),
+            format!(
+                r#"{{"local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp","extra":1}}"#
+            ),
+        ] {
+            let refused =
+                answered_unrelayed(&h, &control_request("/services/forwarder/expose", &body)).await;
+            assert!(
+                refused.starts_with("HTTP/1.1 400 "),
+                "{body} is refused with an HTTP refusal, got: {refused}"
+            );
+        }
+        let release = format!(r#"{{"local":"127.0.64.5:{port}","protocol":"tcp","Local":"x"}}"#);
+        let refused = answered_unrelayed(
+            &h,
+            &control_request("/services/forwarder/unexpose", &release),
+        )
+        .await;
+        assert!(
+            refused.starts_with("HTTP/1.1 400 "),
+            "a release with a case variant is refused too, got: {refused}"
+        );
+        // No round was admitted by any of them.
+        relayed_and_answered(&h, &probe_round("127.0.64.5", true)).await;
+    }
+
+    /// #2748: an admitted round reaches the switch as the gate rebuilt it from
+    /// the fields it checked, never as the guest's own bytes.
+    #[tokio::test]
+    async fn an_admitted_probe_round_is_relayed_as_its_canonical_request() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        // The round's own fields, in another order and spacing, under a
+        // different head.
+        let body = format!(
+            r#"{{ "protocol": "tcp", "remote": "{}", "local": "127.0.64.5:{port}" }}"#,
+            switch::loopback::RANGE_PROBE_REMOTE
+        );
+        let mut sent = b"POST /services/forwarder/expose HTTP/1.1\r\nHost: x\r\n".to_vec();
+        sent.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        sent.extend_from_slice(body.as_bytes());
+        let canonical = probe_round("127.0.64.5", true);
+        assert_ne!(sent, canonical);
+        assert_eq!(
+            canonical,
+            super::canonical_probe_request(super::ControlVerb::Expose, ([127, 0, 64, 5], port)),
+            "the gate's canonical request is the guest daemon's own spelling"
+        );
+
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest.write_all(&sent).await.expect("writing the round");
+        let mut spoken = vec![0u8; canonical.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(
+            String::from_utf8_lossy(&spoken),
+            String::from_utf8_lossy(&canonical),
+            "the switch reads the canonical request, not the guest's bytes"
+        );
     }
 
     /// Speaks `request` on a fresh control connection and answers it from
@@ -16200,7 +16418,7 @@ mod tests {
             super::RANGE_PROBE_HOLD * 3,
             super::release_probe_after_hold(
                 dir.path().join("no-switch.sock"),
-                std::sync::Arc::clone(&forwards),
+                std::sync::Arc::downgrade(&forwards),
                 generation,
             ),
         )
@@ -16219,6 +16437,57 @@ mod tests {
             ControlVerb::Expose,
             elsewhere.as_bytes()
         ));
+    }
+
+    /// The gate's release of a round is bounded: it ends with the gate, and a
+    /// switch that never answers is asked [`super::RANGE_PROBE_RELEASE_ATTEMPTS`]
+    /// times, after which the round stays accounted and no other is admitted.
+    #[tokio::test]
+    async fn the_holds_release_ends_with_the_gate_and_gives_up_bounded() {
+        use super::PublishedForwards;
+        let dir = TempDir::new().unwrap();
+        let listener = ([127, 0, 64, 7], switch::loopback::RANGE_PROBE_PORT);
+
+        // The gate is gone: the release ends without asking anything.
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let generation = forwards
+            .begin_probe(listener)
+            .expect("no round is outstanding");
+        let gone = std::sync::Arc::downgrade(&forwards);
+        drop(forwards);
+        tokio::time::timeout(
+            super::RANGE_PROBE_HOLD * 2,
+            super::release_probe_after_hold(dir.path().join("no-switch.sock"), gone, generation),
+        )
+        .await
+        .expect("the release ends with the gate");
+
+        // No switch answers: the release gives up after its attempts, and the
+        // round stays accounted.
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let generation = forwards
+            .begin_probe(listener)
+            .expect("no round is outstanding");
+        let attempts = u32::try_from(super::RANGE_PROBE_RELEASE_ATTEMPTS).unwrap();
+        tokio::time::timeout(
+            super::RANGE_PROBE_HOLD * (attempts + 2),
+            super::release_probe_after_hold(
+                dir.path().join("no-switch.sock"),
+                std::sync::Arc::downgrade(&forwards),
+                generation,
+            ),
+        )
+        .await
+        .expect("the release gives up after a bounded number of attempts");
+        assert_eq!(
+            forwards.outstanding_probe(),
+            Some((listener, generation)),
+            "a round the switch never confirmed released stays accounted"
+        );
+        assert!(
+            forwards.begin_probe(([127, 0, 64, 8], listener.1)).is_err(),
+            "and no other round is admitted"
+        );
     }
 
     /// The probe's shape is exact: an address of the reserved range, the probe

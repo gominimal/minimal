@@ -1271,6 +1271,21 @@ async fn probe_publish_surface_within(
             let leftover = !held.insert(*address);
             let mut answer =
                 post_json_within(control, "/services/forwarder/expose", &expose, request).await;
+            // The VM host's egress gate admits one probe round at a time, and
+            // another one is still bound there (#2748): a contention, not an
+            // answer about this address. The round waits it out and asks
+            // again. Contention that outlasts the walk's budget ends the walk
+            // inconclusive, never absent, so it cannot replace a present
+            // verdict.
+            while answer
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::ResourceBusy)
+            {
+                tokio::time::sleep(RANGE_PROBE_CONTENTION_WAIT).await;
+                answer =
+                    post_json_within(control, "/services/forwarder/expose", &expose, request)
+                        .await;
+            }
             if leftover
                 && answer
                     .as_ref()
@@ -1391,6 +1406,13 @@ async fn probe_publish_surface_within(
         probe
             .first_failure
             .get_or_insert((stuck, io::ErrorKind::TimedOut));
+    } else if walk.is_err()
+        && let Some(last) = hosts.last()
+    {
+        // The budget expired inside the last round: the same overrun.
+        probe
+            .first_failure
+            .get_or_insert((*last, io::ErrorKind::TimedOut));
     }
     probe
 }
@@ -1559,6 +1581,12 @@ pub(crate) async fn post_json_within<T: Serialize>(
             && (said.contains(ADDRESS_IN_USE_BODY) || said.contains(ALREADY_RUNNING_BODY))
         {
             io::ErrorKind::AddrInUse
+        } else if status == RANGE_PROBE_CONTENTION_STATUS {
+            // The VM host's egress gate holds another range probe round and
+            // admits one at a time (#2748). gvproxy itself never answers 409,
+            // so this says nothing about the host's loopback: the walk waits
+            // it out.
+            io::ErrorKind::ResourceBusy
         } else {
             io::ErrorKind::Other
         };
@@ -1742,6 +1770,16 @@ static RANGE_WALK_TURN: tokio::sync::Mutex<BTreeMap<String, BTreeSet<Ipv4Addr>>>
 /// the addresses it never reached are the ones it cannot vouch for, so the
 /// range reads absent, the interim.
 const RANGE_PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// The status the VM host's egress gate answers a range probe round with
+/// while another round is still bound there (#2748). gvproxy itself never
+/// answers it.
+const RANGE_PROBE_CONTENTION_STATUS: u16 = 409;
+
+/// How long a contended range probe round waits before it asks again. The
+/// gate releases a round left bound within seconds, and the walk's whole
+/// budget bounds the waiting.
+const RANGE_PROBE_CONTENTION_WAIT: Duration = Duration::from_millis(250);
 
 /// Upper bound on **one** request/response round of the forwarder-conducted
 /// range walk — tighter than the [`GVPROXY_CONTROL_TIMEOUT`] the publish verbs
@@ -2662,29 +2700,64 @@ mod tests {
             );
         }
 
-        /// #2748: the VM host's egress gate refuses a round while another is
-        /// still bound with an HTTP 409. The walk reads that as the
-        /// forwarder's refusal, an address that does not bind, never a fault
-        /// of the channel, so the range reads absent.
+        /// #2748: the VM host's egress gate admits one probe round at a time
+        /// and answers 409 while another is still bound there. That is
+        /// contention, not an answer about the address: the walk waits it
+        /// out and asks again, and reads the range present once the round
+        /// binds.
         #[tokio::test]
-        async fn reads_the_gates_outstanding_round_refusal_as_an_address_that_does_not_bind() {
+        async fn waits_out_the_gates_outstanding_round_and_reads_the_answer_after_it() {
             let dir = tempfile::TempDir::new().unwrap();
             let sock = dir.path().join("gvproxy.sock");
-            let refused = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            let contended = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&asked);
             let (forwarder, _asked) =
                 spawn_forwarder_answering(sock.clone(), Duration::ZERO, move |local| {
-                    if local == refused { 409 } else { 200 }
+                    if local == contended
+                        && counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3
+                    {
+                        409
+                    } else {
+                        200
+                    }
                 });
             let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+            assert!(
+                probe.present(),
+                "contention is waited out, not read as a missing address: {}",
+                probe.summary()
+            );
+            assert_eq!(probe.first_failure, None);
+            assert!(asked.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+        }
+
+        /// #2748: contention that outlasts the walk's budget ends the walk
+        /// inconclusive, a fault of the channel, never a refusal. The landing
+        /// keeps a present verdict over such a walk, so a guest that holds a
+        /// probe round cannot flip the range to absent.
+        #[tokio::test]
+        async fn contention_past_the_budget_reads_inconclusive_never_refused() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let contended = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, move |local| {
+                    if local == contended { 409 } else { 200 }
+                });
+            let probe = probe_publish_surface_within(
+                &ControlChannel::Unix(sock),
+                Duration::from_secs(2),
+                RANGE_PROBE_REQUEST_BUDGET,
+            )
+            .await;
             forwarder.abort();
             assert!(!probe.present(), "{}", probe.summary());
             assert_eq!(
                 probe.first_failure,
-                Some((
-                    Ipv4Addr::new(127, 0, 64, 5),
-                    io::ErrorKind::AddrNotAvailable
-                )),
-                "the refusal reads as the address not binding: {}",
+                Some((Ipv4Addr::new(127, 0, 64, 5), io::ErrorKind::TimedOut)),
+                "contention reads as a fault of the channel, not a refusal: {}",
                 probe.summary()
             );
         }

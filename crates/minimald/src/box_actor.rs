@@ -356,7 +356,8 @@ enum BoxMessage {
     /// forwards at `from`, then move the forwards its `min net expose`
     /// bound at `from`, if the box is running, so they listen where its
     /// name answers. Sent by the sessions manager for each move the name
-    /// registry makes, to a box whose actor runs.
+    /// registry makes, to a box whose actor runs. Linux only, as the
+    /// registry's hand-overs are: on macOS minimald runs inside the Linux guest.
     #[cfg(target_os = "linux")]
     PublishMoved {
         from: std::net::Ipv4Addr,
