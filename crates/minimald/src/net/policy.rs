@@ -2662,6 +2662,33 @@ mod tests {
             );
         }
 
+        /// #2748: the VM host's egress gate refuses a round while another is
+        /// still bound with an HTTP 409. The walk reads that as the
+        /// forwarder's refusal, an address that does not bind, never a fault
+        /// of the channel, so the range reads absent.
+        #[tokio::test]
+        async fn reads_the_gates_outstanding_round_refusal_as_an_address_that_does_not_bind() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let refused = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, move |local| {
+                    if local == refused { 409 } else { 200 }
+                });
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+            assert!(!probe.present(), "{}", probe.summary());
+            assert_eq!(
+                probe.first_failure,
+                Some((
+                    Ipv4Addr::new(127, 0, 64, 5),
+                    io::ErrorKind::AddrNotAvailable
+                )),
+                "the refusal reads as the address not binding: {}",
+                probe.summary()
+            );
+        }
+
         /// A range address whose probe port something already holds: a box's
         /// forward through this forwarder (`proxy already running`) at one
         /// address, a host_ip mirror held by another host process (the OS's
