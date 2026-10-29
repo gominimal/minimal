@@ -2449,10 +2449,10 @@ pub struct ShowBoxRequest {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BoxIdentity {
-    /// The host is not enrolled with a Gatehouse. The box has no
-    /// identity beyond its box id, and no caller inside it is known.
+    /// The box has no per-box identity, because the host is not
+    /// enrolled with a Gatehouse. It serialises as `{"kind":"none"}`.
     #[default]
-    Unenrolled,
+    None,
     /// An identity this build does not know.
     #[serde(other)]
     Unknown,
@@ -2467,6 +2467,10 @@ pub struct ShowBoxResponse {
     #[serde(default)]
     pub identity: BoxIdentity,
     /// The exec id of each exec running in the box now.
+    ///
+    /// The daemon does not give an exec an id yet (BOX-149), so this
+    /// list is always empty. An empty list does not mean that no process
+    /// runs in the box. The list fills when each exec has an id.
     #[serde(default)]
     pub live_execs: Vec<String>,
 }
@@ -3403,7 +3407,7 @@ mod box_listing_tests {
 
         let show = ShowBoxResponse {
             record: stopped,
-            identity: BoxIdentity::Unenrolled,
+            identity: BoxIdentity::None,
             live_execs: vec!["exec-1".to_string()],
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
@@ -3411,6 +3415,11 @@ mod box_listing_tests {
             Errorable::Ok(back) => assert_eq!(back, show),
             Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
         }
+        // The identity none serialises with the name BOX-140 reports.
+        assert_eq!(
+            serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),
+            r#"{"kind":"none"}"#
+        );
         // An identity a newer daemon reports reads as unknown, not as a
         // failed reply.
         let newer: BoxIdentity = serde_json_lenient::from_str(r#"{"kind":"enrolled"}"#).unwrap();

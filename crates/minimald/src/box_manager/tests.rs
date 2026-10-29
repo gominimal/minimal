@@ -3192,7 +3192,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
         .unwrap()
         .expect("the box is retained");
     assert_eq!(running.record.state, "running");
-    assert_eq!(running.identity, minimald_rpc::BoxIdentity::Unenrolled);
+    assert_eq!(running.identity, minimald_rpc::BoxIdentity::None);
     // No exec runs in the box.
     assert!(running.live_execs.is_empty(), "{:?}", running.live_execs);
     drop(mngr);
@@ -3223,7 +3223,7 @@ async fn show_returns_record_state_identity_and_live_execs() {
             signal: None,
         }
     );
-    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::Unenrolled);
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
     assert!(shown.live_execs.is_empty());
     assert_eq!(
         mngr.running_count().await,

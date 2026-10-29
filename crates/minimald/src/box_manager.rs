@@ -302,10 +302,11 @@ impl BoxManagerHandle {
             Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
                 record: box_listing_entry(&record),
                 // BOX-140: no host this daemon runs on is enrolled with a
-                // Gatehouse, so every box reports the un-enrolled identity.
-                identity: minimald_rpc::BoxIdentity::Unenrolled,
+                // Gatehouse, so every box reports the identity none.
+                identity: minimald_rpc::BoxIdentity::None,
                 // BOX-149: the daemon does not give an exec an id yet, so
-                // it has none to report.
+                // this list is always empty, even when a process runs in
+                // the box. It fills when each exec has an id (BOX-149).
                 live_execs: Vec::new(),
             }))
         }
@@ -2382,7 +2383,7 @@ impl BoxManager {
                 })
                 .await;
             }
-            // Gets the record for a specific session.
+            // Gets every retained record, in any state.
             ManagerMessage::Records(r) => {
                 // A record in teardown is gone here, as it is to `List`.
                 let tearing_down = self
@@ -2401,6 +2402,7 @@ impl BoxManager {
                 })
                 .await;
             }
+            // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 let tearing_down = self
                     .tearing_down
