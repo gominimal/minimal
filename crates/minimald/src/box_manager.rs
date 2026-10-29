@@ -406,6 +406,14 @@ enum ManagerMessage {
     /// object, so the read runs off the mainloop. `None` for an id no
     /// retained record names.
     EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
+    /// The record and the on-disk object of the box `id`, read under one
+    /// teardown check (BOX-017). `None` for an id no record names, and
+    /// for a box being torn down, as to [`GetRecord`](Self::GetRecord).
+    /// It never starts an actor.
+    EndedSource(
+        SessionId,
+        Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
+    ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
@@ -470,6 +478,7 @@ impl ManagerMessage {
             Self::Records(..) => "Records",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
+            Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
@@ -1738,6 +1747,69 @@ impl BoxManagerHandle {
         }
         stopped
     }
+
+    /// The state and directories of the box `id` when the box is stopped
+    /// or exited, read from the store with no actor started (BOX-017).
+    /// Answers `None` for an id no record names, for a box being torn
+    /// down, and for a box that is not ended: that box has, or can get,
+    /// an actor through [`Self::get_session`].
+    ///
+    /// # Errors
+    ///
+    /// A store error, or `InvalidData` for a record whose state this
+    /// build cannot read.
+    pub(crate) async fn ended_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<EndedBox>, BoxManagerError> {
+        // One manager message reads the record and the object, so a delete
+        // cannot start between the two reads.
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EndedSource(id, send))
+            .await;
+        let Some((record, object)) = recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        else {
+            return Ok(None);
+        };
+        let state = record
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if !matches!(
+            state,
+            boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)
+        ) {
+            return Ok(None);
+        }
+        // The object is the store's object for the record, with no actor
+        // behind it. Its directories are the box's retained files.
+        use boxes::store::BoxObject as _;
+        Ok(Some(EndedBox {
+            state,
+            paths: crate::box_actor::BoxPaths {
+                working: object.workspace_path(),
+                cache: object.cache_path(),
+                home: object.home_path(),
+                patches: object.patches_path(),
+                hooks: object.hooks_path(),
+            },
+        }))
+    }
+}
+
+/// A stopped or exited box, as [`BoxManagerHandle::ended_box`] reads it
+/// from the store.
+#[derive(Debug)]
+pub(crate) struct EndedBox {
+    /// How the box ended.
+    pub state: boxes::core::record::RecordState,
+    /// The box's retained directories.
+    pub paths: crate::box_actor::BoxPaths,
 }
 
 /// Per-session deadline for the host probes this manager makes — the
@@ -2620,6 +2692,25 @@ impl BoxManager {
                 })
                 .await;
             }
+            ManagerMessage::EndedSource(id, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            // Gone, as to `GetRecord`: a delete that has
+                            // started hands out no paths of the box.
+                            Some(handle) if tearing_down.contains(handle.id()) => None,
+                            Some(handle) => Some((handle.record().await?, handle.object().await?)),
+                            None => None,
+                        },
+                    )
+                })
+                .await;
+            }
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
@@ -3492,6 +3583,162 @@ mod create_stamp_tests {
         assert_eq!(
             record(&mngr, id).await.project_root,
             Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
+        );
+    }
+}
+
+/// [`BoxManagerHandle::ended_box`] against a delete in flight (BOX-017).
+#[cfg(test)]
+mod ended_box_tests {
+    use super::*;
+    use boxes::wire::primitives::{
+        WireHookScript, WireLifecycleHook, WireProvenancedHook, WireSource,
+    };
+    use boxes::wire::request::WireContribution;
+    use tempfile::TempDir;
+
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// A manager over fresh state and cache directories, its boxes on the
+    /// mock launcher.
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = BoxManager::init(
+            daemon_abs(state.path()),
+            daemon_abs(cache.path()),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap();
+        (state, cache, mngr)
+    }
+
+    fn config(name: &str) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new("/proj").unwrap(),
+            network: boxes::NetworkMode::default(),
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            ends_with_run: false,
+            attrs: Default::default(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    /// Creates the box `name` and activates it with the `on_destroy` hook
+    /// `body`.
+    async fn active_box(mngr: &BoxManagerHandle, name: &str, body: String) -> SessionId {
+        let id = mngr.create_session(config(name), None).await.unwrap();
+        let handle = mngr
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the new box resolves");
+        let contribution = WireContribution {
+            lifecycle_hooks: vec![WireProvenancedHook {
+                hook: WireLifecycleHook {
+                    on_destroy: Some(WireHookScript::Inline {
+                        body,
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(
+            handle
+                .configure_loadout(contribution)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        handle.finalize().await.unwrap();
+        id
+    }
+
+    /// A delete that has started hides the box from `ended_box`, as it
+    /// does from every other read: the read hands out no paths of a box
+    /// that the delete is about to remove.
+    ///
+    /// The delete message goes into the manager's mailbox ahead of the
+    /// read, with no wait for its answer. The mailbox is served in order,
+    /// one message at a time, and the delete puts the box in the
+    /// tearing-down set before the manager takes the next message. So the
+    /// read lands after the delete has started: inside its window, or
+    /// after it removed the record. A stopped box's delete has no hook
+    /// that a test can hold open, because no actor hosts an ended box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ended_box_refuses_a_box_whose_delete_has_started() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = active_box(&mngr, "ended", "true".to_string()).await;
+        mngr.stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+            .await
+            .expect("the stop succeeds");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while mngr.running_count().await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stopped box's actor did not end");
+        let ended = mngr
+            .ended_box(id)
+            .await
+            .unwrap()
+            .expect("a stopped box with no delete in flight is served");
+        assert!(
+            std::path::Path::new(ended.paths.working.as_str()).exists(),
+            "the stopped box keeps its files"
+        );
+
+        let (send, deleted) = Responder::channel();
+        mngr.sender
+            .send(ManagerMessage::DeleteSession(id, false, send))
+            .await
+            .expect("the manager takes the delete");
+        assert!(
+            mngr.ended_box(id).await.unwrap().is_none(),
+            "a box whose delete has started hands out no paths"
+        );
+
+        deleted
+            .await
+            .expect("the manager answers the delete")
+            .expect("the delete succeeds");
+        assert!(mngr.ended_box(id).await.unwrap().is_none());
+        assert!(
+            mngr.get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the delete removed the record"
         );
     }
 }
