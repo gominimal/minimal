@@ -6936,6 +6936,295 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
     drop(listener);
 }
 
+/// #2748, a listen-published port whose move fails: the box's name moved to
+/// its hand, but the switch refuses the port's bind there, so the forward and
+/// the box's hold of record stay at the `127.0.0.1` interim. A box that
+/// publishes the port at the interim then yields to that hold. When the
+/// listener closes, the hold is released where the forward was bound, and
+/// the port passes to the box that was waiting on it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listen_port_whose_move_failed_releases_its_hold_where_it_was_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 4);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 4);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        lease,
+        handed,
+        Some(boxes::DynamicIngress::Allow),
+        Some((listened, listened)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch binds everything at the interim and nothing at the hand.
+    let refused_at = format!("\"local\":\"{handed}:");
+    let (forwarder, served) =
+        deciding_forwarder(sock.clone(), move |request| !request.contains(&refused_at)).await;
+    crate::box_actor::listen_plan_seam::seed(
+        web,
+        crate::box_actor::listen_plan_seam::Seeded {
+            lease,
+            published: interim,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: Arc::new(crate::net::switch::BoxGate::for_session(
+                "web".to_string(),
+                lease,
+                &listen_policy_over((listened, listened)),
+                crate::net::SwitchSubnet::default(),
+                None,
+            )),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let at_interim = format!("{interim}:{listened}");
+    listed_once(&handle, |rows| {
+        rows.listened.iter().any(|row| row.local == at_interim)
+    })
+    .await;
+
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    // The watcher asked for the port at the hand, and the switch refused it.
+    soon(|| {
+        served_naming(&served, handed, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    let registry = manager.hostnames();
+    {
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.shared_port_holder(interim, listened),
+            Some(web),
+            "the hold stays where the forward is still bound"
+        );
+        assert_eq!(
+            registry.shared_port_holder(handed, listened),
+            None,
+            "nothing is held at the hand while no forward is bound there"
+        );
+    }
+    let rows = handle.live_ingress().await.expect("the actor answers");
+    assert!(
+        rows.listened.iter().any(|row| row.local == at_interim),
+        "the row names where the forward is still bound: {rows:?}"
+    );
+
+    // Another box publishes the port at the interim and yields to the hold.
+    let waiting = SessionId::parse_str("00000000-0000-0000-0000-0000000000db").unwrap();
+    registry
+        .write()
+        .expect("registry lock")
+        .publish_own_address(
+            waiting,
+            "db",
+            interim,
+            std::collections::BTreeSet::from([listened]),
+        );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(web),
+        "the waiting box yields to the box serving the port"
+    );
+
+    // The listener closes: the forward comes down at the interim, and the
+    // hold there passes to the waiting box.
+    drop(listener);
+    soon(|| {
+        served_naming(&served, interim, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/unexpose "))
+    })
+    .await;
+    soon(|| {
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened)
+            == Some(waiting)
+    })
+    .await;
+    forwarder.abort();
+}
+
+/// #2748, a box with no actor: the present landing moves every box standing
+/// on the `127.0.0.1` interim, stopped ones included, and the move of a
+/// box's publish is passed only to a live actor. A box whose actor is not
+/// running has no forward to move, so the landing starts none for it, and
+/// its next attach binds at the new address.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_starts_no_actor_for_a_box_without_one() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 5);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 5),
+        handed,
+        Some(boxes::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    // A restarted daemon that has not resumed the box: its record stands,
+    // and no actor runs for it.
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    manager.install_range_walk_standin(|| {
+        let hosts = ::switch::loopback::range_hosts().count();
+        crate::net::loopback::RangeProbe {
+            bound: hosts,
+            probed: hosts,
+            first_failure: None,
+        }
+    });
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    // The box stands on the interim with its hand, as a box that published
+    // under the absent verdict does.
+    {
+        let registry = manager.hostnames();
+        let mut registry = registry.write().expect("registry lock");
+        registry.record_own_hand(web, handed);
+        registry.publish_own_address(
+            web,
+            "web",
+            std::net::Ipv4Addr::LOCALHOST,
+            std::collections::BTreeSet::new(),
+        );
+        registry.register_own_ip(web, "web", std::collections::BTreeSet::new());
+    }
+    assert_eq!(
+        manager.running_count().await,
+        0,
+        "no actor runs for the box"
+    );
+
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the box's publish moves to its hand"
+    );
+    // The move is passed on off the landing's task: give it the time an
+    // actor's start would take, then read that none started.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        manager.running_count().await,
+        0,
+        "the landing starts no actor for a box without one"
+    );
+}
+
+/// A stand-in for the host gvproxy that answers each request 200 when
+/// `accept` takes it and 500 when it does not, recording every request as
+/// [`fake_forwarder`] does — so a test can have the switch refuse binds at
+/// one address for as long as it runs, however often they are asked.
+#[cfg(target_os = "linux")]
+async fn deciding_forwarder(
+    sock: std::path::PathBuf,
+    accept: impl Fn(&str) -> bool + Send + 'static,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let server = crate::traced::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            let answer = if accept(&request) {
+                "200 OK"
+            } else {
+                "500 Internal Server Error"
+            };
+            recorded.lock().expect("served lock").push(request);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(format!("HTTP/1.1 {answer}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await;
+        }
+    });
+    (server, served)
+}
+
 /// The wiring test for the hand's verdict gate (the `.filter(vouches_for)`
 /// and the bounded wait on the hand's read, §7.1): a handed reserved address
 /// finalizes to `published_own_address == 127.0.0.1` under an absent book —

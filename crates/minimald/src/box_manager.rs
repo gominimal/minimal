@@ -279,6 +279,11 @@ enum ManagerMessage {
     /// retained record names.
     EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
+    /// The handle of the session's live actor, if it has one. Read-only
+    /// against the `running` map: unlike [`GetSession`](Self::GetSession)
+    /// it never starts an actor, so a stopped box stays without one.
+    #[cfg(target_os = "linux")]
+    GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
@@ -334,6 +339,8 @@ impl ManagerMessage {
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
             Self::GetSession(..) => "GetSession",
+            #[cfg(target_os = "linux")]
+            Self::GetRunning(..) => "GetRunning",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
@@ -731,7 +738,10 @@ impl BoxManager {
         // #2748: each move of a box's publish is passed to that box's
         // session, which moves the forwards its `min net expose` bound at
         // the old address if the box is running. Off the registry's lock,
-        // like the hand-overs above.
+        // like the hand-overs above. Only a live actor is asked: the
+        // landing moves stopped boxes too, and a box with no actor has no
+        // forward to move, so none is started for it. Its next attach binds
+        // at the new address.
         #[cfg(target_os = "linux")]
         {
             let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
@@ -747,8 +757,7 @@ impl BoxManager {
                         let Some(manager) = manager.upgrade() else {
                             return;
                         };
-                        let holder = manager.get_session(BoxKeyPredicate::Id(moved.holder)).await;
-                        if let Ok(Some(holder)) = holder {
+                        if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
                             holder.move_exposed_ports(moved.from, moved.to).await;
                         }
                     }
@@ -2373,6 +2382,12 @@ impl BoxManager {
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
+            }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::GetRunning(id, r) => {
+                let running = self.running.get(&id).cloned();
+                r.handle(async move { Ok::<_, BoxManagerError>(running) })
+                    .await;
             }
             // Snapshot a running session's screen without starting its
             // actor. A name resolves through the store to its id, then the

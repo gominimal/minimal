@@ -445,6 +445,22 @@ impl BoxManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
+    /// The handle of the session's live actor, if it has one. Never starts
+    /// an actor. See [`ManagerMessage::GetRunning`].
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn running_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<BoxHandle>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a send that fails drops the responder, and the recv below reports it"
+        )]
+        let _ = self.sender.send(ManagerMessage::GetRunning(id, send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
     /// Snapshots the terminal screen of a running session. `Ok(None)` when
     /// the session is unknown or has no live host — never starts an actor.
     pub async fn get_screen(
