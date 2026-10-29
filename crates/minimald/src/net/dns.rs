@@ -870,6 +870,14 @@ pub struct HostnameRegistry {
     /// so [`Self::has_unleased_callers`] counts a box with this mark as live
     /// (NET-070).
     launching: HashSet<SessionId>,
+    /// Each box's current host launch number ([`Self::begin_host_launch`]).
+    /// A host loop that a newer launch replaced holds an older number, so its
+    /// late stop mark ([`Self::mark_host_stopped`]) changes nothing (NET-070).
+    host_launches: HashMap<SessionId, u64>,
+    /// The last launch number [`Self::begin_host_launch`] gave out. One
+    /// counter for every box, so a number never repeats, even for a box id
+    /// that [`Self::forget_own_address`] forgot and a later attach reuses.
+    last_host_launch: u64,
     /// box name → the route a host-side proxy forwards its requests on.
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
@@ -935,6 +943,8 @@ impl HostnameRegistry {
             hands: HashMap::new(),
             stopped: HashSet::new(),
             launching: HashSet::new(),
+            host_launches: HashMap::new(),
+            last_host_launch: 0,
             by_host: HashMap::new(),
             by_session: HashMap::new(),
             own: HashMap::new(),
@@ -1239,8 +1249,15 @@ impl HostnameRegistry {
     /// [`Self::mark_running`], at [`Self::mark_stopped`], at
     /// [`Self::forget_own_address`] and at [`Self::end_host_launch`] when the
     /// launch fails.
-    pub fn begin_host_launch(&mut self, session_id: SessionId) {
+    ///
+    /// Returns this launch's number, which becomes the box's current launch.
+    /// The host's loop passes it to [`Self::mark_host_stopped`], so the loop
+    /// of a host this launch replaced cannot mark the new host's box stopped.
+    pub fn begin_host_launch(&mut self, session_id: SessionId) -> u64 {
+        self.last_host_launch += 1;
+        self.host_launches.insert(session_id, self.last_host_launch);
         self.launching.insert(session_id);
+        self.last_host_launch
     }
 
     /// Ends the launch mark [`Self::begin_host_launch`] set, for a launch
@@ -1449,6 +1466,7 @@ impl HostnameRegistry {
         self.host_net.remove(&session_id);
         self.attaching.remove(&session_id);
         self.launching.remove(&session_id);
+        self.host_launches.remove(&session_id);
         self.stopped.remove(&session_id);
     }
 
@@ -1847,6 +1865,27 @@ impl HostnameRegistry {
         }
     }
 
+    /// Marks a box's host as stopped from the loop of the host that `launch`
+    /// started ([`Self::begin_host_launch`]), as [`Self::mark_stopped`] does.
+    /// A loop that a newer launch replaced can end after that launch, so a
+    /// `launch` older than the box's current launch changes nothing: the box
+    /// stays live for [`Self::has_unleased_callers`] (NET-070, design §7.1).
+    pub fn mark_host_stopped(&mut self, session_id: SessionId, launch: u64) {
+        if let Some(&current) = self.host_launches.get(&session_id)
+            && launch < current
+        {
+            tracing::debug!(
+                session_id = %session_id,
+                launch,
+                current,
+                action = "stale-host-stop-ignored",
+                "a replaced host's loop ended; its stop mark is ignored"
+            );
+            return;
+        }
+        self.mark_stopped(session_id);
+    }
+
     /// Marks a box's host as stopped (NET-128). The name stays **held** — a
     /// stopped box is never mistaken for one that never existed, so the zone
     /// never says NXDOMAIN for it — but a name it shares with the node answers
@@ -1854,6 +1893,9 @@ impl HostnameRegistry {
     /// not silently impersonated by a dead box's declaration. A box at its own
     /// address keeps answering A: that address answers for it alone, and a
     /// client connecting there is told where the box would be.
+    ///
+    /// This mark has no launch guard. A host's loop marks its stop through
+    /// [`Self::mark_host_stopped`].
     pub fn mark_stopped(&mut self, session_id: SessionId) {
         // A stopped box has no attach in flight (NET-070).
         self.attaching.remove(&session_id);

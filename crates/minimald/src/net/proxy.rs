@@ -4329,6 +4329,73 @@ mod tests {
         );
     }
 
+    /// NET-070: the loop of a replaced host can end after the newer launch's
+    /// host runs. Its stop mark carries the older launch number, so it does
+    /// not mark the running box stopped. The box stays live, and a deny-all
+    /// host-address box's request from the node's address is still refused.
+    #[tokio::test]
+    async fn proxy_host_address_caller_egress_denied_after_late_host_stop() {
+        let backend_port = spawn_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        reg.register_host_net(host_box, "hostbox");
+        reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
+        let table = Arc::new(RwLock::new(reg));
+
+        let first = table.write().unwrap().begin_host_launch(host_box);
+        let second = table.write().unwrap().begin_host_launch(host_box);
+        assert!(second > first, "each launch gets a newer number");
+        table.write().unwrap().mark_running(host_box);
+
+        // The first host's loop ends late, after the second host runs.
+        crate::box_runtime::NameMarker::new(Arc::clone(&table), host_box, first).mark_stopped();
+        assert!(
+            table.read().unwrap().has_unleased_callers(),
+            "a replaced host's late stop mark leaves the running box live"
+        );
+
+        // The host-address box owns every connecting socket here.
+        fn host_box_owner(
+            _peer: SocketAddrV4,
+            _local: SocketAddrV4,
+        ) -> crate::net::dns::ConnectingOwner {
+            crate::net::dns::ConnectingOwner::Box(SessionId::parse_str(HOST_BOX).unwrap())
+        }
+        let router = Router::new(Arc::clone(&table), proxied_request_verdict)
+            .with_socket_owner(host_box_owner);
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let refused = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected the deny-all host-address box's request to be refused, got: {refused}"
+        );
+
+        // The current launch's own stop mark still marks the box stopped.
+        crate::box_runtime::NameMarker::new(Arc::clone(&table), host_box, second).mark_stopped();
+        assert!(
+            !table.read().unwrap().has_unleased_callers(),
+            "the current host's stop mark marks the box stopped"
+        );
+    }
+
     /// NET-070's verify line: a request through the hostname proxy from a
     /// caller whose egress rules deny the target is refused — put to the same
     /// pure verdict the caller's own outbound frames meet on the relay,

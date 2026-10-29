@@ -833,7 +833,10 @@ impl BoxActor {
         // `mark_running`, and the launch can start its processes before that.
         // The launch mark counts the box as live from here, so the hostname
         // proxy looks up who owns a connection from the node's address.
-        self.hostnames
+        // The launch number guards the stop mark: a host loop that this
+        // launch replaces cannot mark this launch's box stopped.
+        let host_launch = self
+            .hostnames
             .write()
             .expect("hostname registry lock poisoned")
             .begin_host_launch(record.id);
@@ -866,6 +869,7 @@ impl BoxActor {
                 name_marker: Some(box_runtime::NameMarker::new(
                     Arc::clone(&self.hostnames),
                     record.id,
+                    host_launch,
                 )),
             },
         ));
