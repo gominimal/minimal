@@ -140,10 +140,13 @@ pub(crate) struct BoxActorConfig {
 }
 
 /// A resume that set the record to `running` and waits for its launch:
-/// [`BoxActor::finish_resume`] records the `resumed` event, or puts the
-/// record back when the launch fails.
+/// [`BoxActor::finish_resume`] records the `resumed` event, or writes the
+/// record it read before the resume back when the launch fails.
 pub(super) struct PendingResume {
     from: boxes::core::record::RecordState,
+    /// The record as the resume read it, before it took the stored spec's
+    /// settings and the `running` state.
+    before: Record,
     span: tracing::Span,
     restarted_from_stored_spec: bool,
 }
@@ -1040,11 +1043,13 @@ impl BoxActor {
             from = from.name(),
             outcome = tracing::field::Empty,
         );
+        let before = record.clone();
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
         match resumed {
             Ok(restarted_from_stored_spec) => Ok(Some(PendingResume {
                 from,
+                before,
                 span,
                 restarted_from_stored_spec,
             })),
@@ -1060,9 +1065,10 @@ impl BoxActor {
 
     /// Completes a [`Self::resume`] once the attach's launch answered
     /// `launched`. A box that now has a host is running again: it records
-    /// the `resumed` event. A launch that failed and left no host puts the
-    /// record back in the state it resumed from, so the box does not read
-    /// as running with no processes, and marks its name stopped again.
+    /// the `resumed` event. A launch that failed and left no host writes
+    /// back the whole record the resume read, so the box does not read as
+    /// running with no processes and keeps the settings it had, and marks
+    /// its name stopped again.
     pub(super) async fn finish_resume(
         &mut self,
         pending: PendingResume,
@@ -1070,6 +1076,7 @@ impl BoxActor {
     ) {
         let PendingResume {
             from,
+            before,
             span,
             restarted_from_stored_spec,
         } = pending;
@@ -1078,12 +1085,7 @@ impl BoxActor {
             let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
             if let (Err(error), false) = (launched, has_host) {
                 span.record("outcome", "launch failed");
-                let restored = async {
-                    let mut record = self.record.record().await?;
-                    record.set_state(from);
-                    self.record.write(record).await
-                }
-                .await;
+                let restored = self.record.write(before).await;
                 match restored {
                     Ok(()) => tracing::info!(
                         %error,
@@ -1117,15 +1119,11 @@ impl BoxActor {
                     tracing::warn!(%error, "resume: could not open the box to write the resumed event");
                 }
             }
-            let hooks: Vec<&str> = crate::hooks::HookEvent::ALL
-                .into_iter()
-                .filter(|event| event.runs_on_resume())
-                .map(crate::hooks::HookEvent::as_str)
-                .collect();
+            // BOX-027: the resume runs no hook itself. The attach's launch
+            // ran `on_attach`, and logs what its hooks did there.
             tracing::info!(
                 from = from.name(),
                 restarted_from_stored_spec,
-                hooks = ?hooks,
                 "resume: the box is running again"
             );
         };
@@ -1141,14 +1139,19 @@ impl BoxActor {
         use boxes::core::record::RecordState;
 
         let name = registry_name(&record);
-        let refused = |kind: std::io::ErrorKind, why: String| {
-            AttachError::ResumeRefused(std::io::Error::new(
-                kind,
-                format!(
-                    "session `{name}` cannot resume, and it stays {}. {why}",
-                    from.name()
+        // The exit status is 2 for the terminal and the name refusals, and
+        // 3 for a stored-spec refusal.
+        let refused = |kind: std::io::ErrorKind, code: u32, why: String| {
+            AttachError::ResumeRefused(
+                std::io::Error::new(
+                    kind,
+                    format!(
+                        "session `{name}` cannot resume, and it stays {}. {why}",
+                        from.name()
+                    ),
                 ),
-            ))
+                code,
+            )
         };
         let object = self
             .record
@@ -1175,6 +1178,7 @@ impl BoxActor {
             );
             return Err(refused(
                 std::io::ErrorKind::InvalidInput,
+                2,
                 "It runs without a terminal, and only a session with a terminal can resume."
                     .to_string(),
             ));
@@ -1205,6 +1209,7 @@ impl BoxActor {
             );
             return Err(refused(
                 std::io::ErrorKind::AlreadyExists,
+                2,
                 format!(
                     "The running session `{holder}` holds the name `{name}`. Rename it with \
                      `min session rename {holder_id} <new-name>`, then attach again."
@@ -1220,6 +1225,7 @@ impl BoxActor {
                 tracing::info!(refusal = "spec", %error, "resume: the stored spec cannot be satisfied");
                 refused(
                     error.kind(),
+                    3,
                     format!(
                         "{error} Destroy it with `min session destroy {name}`, then start a new \
                          one with `min session activate`."

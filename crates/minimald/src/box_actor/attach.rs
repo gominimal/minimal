@@ -49,8 +49,20 @@ pub enum AttachError {
     /// The attach named a stopped or exited box, and its resume was refused
     /// (BOX-025, BOX-030). The box's state is unchanged. The error's kind
     /// is the one a create of the same spec gives, and its text names the
-    /// cause.
-    ResumeRefused(std::io::Error),
+    /// cause. The `u32` is the exit status the attach ends with: 2 for the
+    /// terminal and the name refusals, 3 for a stored-spec refusal.
+    ResumeRefused(std::io::Error, u32),
+}
+
+impl AttachError {
+    /// The exit status the client's attach ends with, for an error that
+    /// carries one. The connection sends it before it closes the channel.
+    pub fn exit_code(&self) -> Option<u32> {
+        match self {
+            AttachError::ResumeRefused(_, code) => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 impl std::error::Error for AttachError {
@@ -59,7 +71,7 @@ impl std::error::Error for AttachError {
             AttachError::InvalidPolicy(e) => Some(e),
             AttachError::LoadoutFailed(e) => Some(e),
             AttachError::LaunchRecordUnwritable(e) => Some(e),
-            AttachError::ResumeRefused(e) => Some(e),
+            AttachError::ResumeRefused(e, _) => Some(e),
             _ => None,
         }
     }
@@ -100,7 +112,7 @@ impl fmt::Display for AttachError {
                  destroy the session with `min session destroy <session>` and start \
                  it again with `min session activate`"
             ),
-            AttachError::ResumeRefused(e) => write!(f, "{e}"),
+            AttachError::ResumeRefused(e, _) => write!(f, "{e}"),
         }
     }
 }

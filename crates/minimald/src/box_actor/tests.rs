@@ -13209,11 +13209,16 @@ async fn rewrite_spec(server: &TestServer, id: SessionId, spec: &serde_json_leni
 }
 
 /// Attaches to `id` and sends a line. `Ok` when the shell echoes it, and
-/// `Err` with what the channel carried when it closes first.
-async fn attach_and_echo(client: &mut TestClient, id: SessionId) -> Result<(), String> {
+/// `Err` with what the channel carried when it closes first, and the
+/// `ChannelMsg::ExitStatus` it saw, if any.
+async fn attach_and_echo(
+    client: &mut TestClient,
+    id: SessionId,
+) -> Result<(), (String, Option<u32>)> {
     let mut channel = client.open_shell(id).await;
     let _ = channel.data_bytes(b"hello\n".to_vec()).await;
     let mut out = Vec::new();
+    let mut exit_status = None;
     loop {
         match tokio::time::timeout(Duration::from_secs(30), channel.wait()).await {
             Ok(Some(ChannelMsg::Data { data })) => {
@@ -13222,8 +13227,11 @@ async fn attach_and_echo(client: &mut TestClient, id: SessionId) -> Result<(), S
                     return Ok(());
                 }
             }
+            Ok(Some(ChannelMsg::ExitStatus { exit_status: code })) => exit_status = Some(code),
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return Err(String::from_utf8_lossy(&out).into_owned()),
+            Ok(None) | Err(_) => {
+                return Err((String::from_utf8_lossy(&out).into_owned(), exit_status));
+            }
         }
     }
 }
@@ -13317,9 +13325,10 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
     assert_eq!(events[resumed].data["from"], "stopped");
 }
 
-/// BOX-025: a resume whose launch fails puts the record back in the state
-/// it resumed from and records no `resumed` event, so the box never reads
-/// as running with no processes. The next attach resumes it.
+/// BOX-025: a resume whose launch fails writes back the record it read,
+/// byte for byte, and records no `resumed` event, so the box never reads
+/// as running with no processes and keeps the settings it had. The next
+/// attach resumes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_launch_failure_keeps_stopped_state() {
     use boxes::core::record::RecordState;
@@ -13333,7 +13342,13 @@ async fn resume_launch_failure_keeps_stopped_state() {
         Some(resume_spec(true)),
     )
     .await;
+    // A setting the stored spec changes on resume: the stored spec has
+    // hooks on.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
     let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let before = std::fs::read(&record_path).unwrap();
+    assert!(!read_record(&server, id).await.hooks_enabled);
 
     super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostDiedBeforeAttach);
     attach_and_echo(&mut client, id)
@@ -13343,6 +13358,11 @@ async fn resume_launch_failure_keeps_stopped_state() {
         read_record(&server, id).await.state().unwrap(),
         RecordState::Stopped(ending),
         "a failed launch leaves the box stopped"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&record_path).unwrap()),
+        String::from_utf8_lossy(&before),
+        "a failed launch leaves the record as it was"
     );
     assert!(
         !event_kinds(&server, id)
@@ -13410,18 +13430,20 @@ async fn pty_box_resumes_from_stopped_and_exited() {
 }
 
 /// Asserts that the resume of `id` was refused: the attach closed with
-/// `words` and no shell, the record is still `state`, and no `resumed`
-/// event was written.
+/// `words`, no shell and the exit status `code`, the record is still
+/// `state`, and no `resumed` event was written.
 async fn assert_resume_refused(
     server: &TestServer,
     client: &mut TestClient,
     id: SessionId,
     state: boxes::core::record::RecordState,
     words: &[&str],
+    code: u32,
 ) {
-    let out = attach_and_echo(client, id)
+    let (out, exit_status) = attach_and_echo(client, id)
         .await
         .expect_err("the resume is refused");
+    assert_eq!(exit_status, Some(code), "{out:?}");
     for word in words {
         assert!(out.contains(word), "{word:?} not in {out:?}");
     }
@@ -13467,6 +13489,7 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
             "version 99",
             "min session destroy old-spec",
         ],
+        3,
     )
     .await;
 
@@ -13483,6 +13506,7 @@ async fn resume_refuses_unsatisfiable_spec_keeps_state() {
         id,
         RecordState::Stopped(ending),
         &["cannot be read"],
+        3,
     )
     .await;
 }
@@ -13518,6 +13542,7 @@ async fn resume_refuses_when_name_held_by_running_box() {
             "The running session `proj` holds the name `proj`",
             &format!("min session rename {holder} <new-name>"),
         ],
+        2,
     )
     .await;
 }
@@ -13549,44 +13574,40 @@ async fn resume_non_pty_box_refuses_keeps_state() {
         id,
         RecordState::Stopped(ending),
         &["session `no-pty`", "runs without a terminal"],
+        2,
     )
     .await;
 }
 
 /// BOX-027: a resume runs no lifecycle hook but `on_attach`, on the attach
 /// that resumes the box. The box's `on_activate` ran once, at activation,
-/// and does not run again when the box resumes.
+/// and does not run again when the box resumes. The resume itself runs
+/// no hook. The `on_attach` run is the attach's own, and the mock launcher
+/// cannot show it (see the note above
+/// `destroy_runs_its_destroy_hooks_against_a_live_host`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_runs_only_on_attach_hook() {
-    use crate::hooks::HookEvent;
-
-    let resume_hooks: Vec<_> = HookEvent::ALL
-        .into_iter()
-        .filter(|event| event.runs_on_resume())
-        .collect();
-    assert_eq!(resume_hooks, [HookEvent::Attach]);
-
     let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("activated");
+    let activated = dir.path().join("activated");
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let id = session_with_hook(
         &mut client,
         "resume-hooks",
         boxes::wire::primitives::WireLifecycleHook {
-            on_activate: Some(inline(format!("echo ran >> {}", marker.display()))),
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
             ..Default::default()
         },
     )
     .await;
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+    assert_eq!(std::fs::read_to_string(&activated).unwrap(), "ran\n");
 
     stop_through_daemon(&server, id).await;
     attach_and_echo(&mut client, id)
         .await
         .expect("the stopped box resumes");
     assert_eq!(
-        std::fs::read_to_string(&marker).unwrap(),
+        std::fs::read_to_string(&activated).unwrap(),
         "ran\n",
         "on_activate ran again on resume"
     );
