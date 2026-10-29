@@ -492,7 +492,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 - **Invariant:** THE SYSTEM SHALL never write a secret value in any output mode.
   enforced by: every rendering of a spec or record carries a secret as a reference only (architecture Output conventions: secrets never appear in any output mode)
-  covered by: BCLI-021, BCLI-063
+  covered by: BCLI-063
 
 ## Rollout
 
