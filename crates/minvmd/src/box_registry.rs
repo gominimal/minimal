@@ -5873,6 +5873,14 @@ impl BoxRegistry {
     /// The policy is the host-side client's, carried over the host's
     /// control socket, never anything the guest says. One info line names
     /// the session and the count of resident boxes.
+    ///
+    /// Only a client of this host retires the rules
+    /// ([`Self::retire_host_ip_box`]). Two cases leave them in
+    /// `host_ip_boxes` until the VM host daemon restarts: a destroy that no
+    /// client of this host issues, such as the in-VM daemon's reap, and a
+    /// retire that fails. Until then the union the gate decides a
+    /// box-marked frame by can include a box that is no longer live.
+    /// <https://github.com/gominimal/minimal/issues/2747> owns closing it.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
