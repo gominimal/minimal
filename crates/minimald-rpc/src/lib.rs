@@ -2374,6 +2374,109 @@ impl OneshotSshRpc for StopBox {
     type Response = Errorable<StopBoxResponse>;
 }
 
+/// An RPC to list the box records this host keeps, in any state
+/// (BOX-158).
+pub struct ListBoxes;
+
+/// The request for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesRequest {
+    /// List only the boxes whose project root is this one. Absent, the
+    /// listing holds every box on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// One box record in a [`ListBoxes`] or [`ShowBox`] reply (BOX-158,
+/// BOX-159): who the box is and the state its record is in (BOX-011).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxListingEntry {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// The box's name, when it has one.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The box's type, `None` for a record that predates the field.
+    #[serde(default)]
+    pub box_type: Option<String>,
+    /// The box that created this one, `None` for a box created outside
+    /// any box.
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    /// The root of the project the box came from, `None` for a record
+    /// that predates the field.
+    #[serde(default)]
+    pub project_root: Option<paths::HostAbsPath>,
+    /// The record's state as BOX-011 spells it: `pending`,
+    /// `materializing`, `running`, `stopped` or `exited`.
+    pub state: String,
+    /// Why a `stopped` or `exited` box ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The entrypoint's exit status, where BOX-011 gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended a stopped box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+}
+
+/// The response for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesResponse {
+    /// Every retained record in the listing's scope, in box id order.
+    #[serde(default)]
+    pub boxes: Vec<BoxListingEntry>,
+}
+
+impl OneshotSshRpc for ListBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes");
+    type Request<'a> = ListBoxesRequest;
+    type Response = Errorable<ListBoxesResponse>;
+}
+
+/// An RPC to read one box record (BOX-159).
+pub struct ShowBox;
+
+/// The request for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxRequest {
+    /// The box to read.
+    pub id: SessionId,
+}
+
+/// The identity a box runs under, as the host reports it (BOX-140).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoxIdentity {
+    /// The host is not enrolled with a Gatehouse. The box has no
+    /// identity beyond its box id, and no caller inside it is known.
+    #[default]
+    Unenrolled,
+    /// An identity this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The response for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxResponse {
+    /// The record, with its state.
+    pub record: BoxListingEntry,
+    /// The identity the box runs under.
+    #[serde(default)]
+    pub identity: BoxIdentity,
+    /// The exec id of each exec running in the box now.
+    #[serde(default)]
+    pub live_execs: Vec<String>,
+}
+
+impl OneshotSshRpc for ShowBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
+    type Request<'a> = ShowBoxRequest;
+    type Response = Errorable<ShowBoxResponse>;
+}
+
 /// An RPC to destroy an existing session.
 pub struct DestroySession;
 
@@ -3237,6 +3340,89 @@ mod stop_box_tests {
         assert_eq!(
             StopBox::NAME,
             constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox")
+        );
+    }
+}
+
+#[cfg(test)]
+mod box_listing_tests {
+    use super::*;
+
+    fn entry(state: &str) -> BoxListingEntry {
+        BoxListingEntry {
+            box_id: SessionId::mint(),
+            name: Some("web".to_string()),
+            box_type: Some("session".to_string()),
+            parent: None,
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+            state: state.to_string(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+        }
+    }
+
+    /// BOX-158, BOX-159: a listing reply and a read reply keep each box's
+    /// state, its ending and its parent across the wire.
+    #[test]
+    fn box_listing_reply_carries_state_and_parent() {
+        let running = entry("running");
+        let mut stopped = entry("stopped");
+        stopped.parent = Some(running.box_id);
+        stopped.reason = Some("stopped".to_string());
+        stopped.signal = Some(15);
+        let mut exited = entry("exited");
+        exited.reason = Some("oom".to_string());
+        exited.exit_code = Some(137);
+        let listing = ListBoxesResponse {
+            boxes: vec![running.clone(), stopped.clone(), exited],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(listing.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ListBoxesResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => {
+                assert_eq!(back, listing);
+                assert_eq!(back.boxes[1].state, "stopped");
+                assert_eq!(back.boxes[1].parent, Some(running.box_id));
+                assert_eq!(back.boxes[0].parent, None);
+            }
+            Errorable::Err { error } => panic!("the listing read back as an error: {error}"),
+        }
+
+        // An unscoped request is the bare object, and a scoped one keeps
+        // its project root.
+        let bare: ListBoxesRequest = serde_json_lenient::from_str("{}").unwrap();
+        assert_eq!(bare.project_root, None);
+        let scoped = ListBoxesRequest {
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+        };
+        let bytes = serde_json_lenient::to_vec(&scoped).unwrap();
+        assert_eq!(
+            serde_json_lenient::from_slice::<ListBoxesRequest>(&bytes).unwrap(),
+            scoped
+        );
+
+        let show = ShowBoxResponse {
+            record: stopped,
+            identity: BoxIdentity::Unenrolled,
+            live_execs: vec!["exec-1".to_string()],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => assert_eq!(back, show),
+            Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
+        }
+        // An identity a newer daemon reports reads as unknown, not as a
+        // failed reply.
+        let newer: BoxIdentity = serde_json_lenient::from_str(r#"{"kind":"enrolled"}"#).unwrap();
+        assert_eq!(newer, BoxIdentity::Unknown);
+
+        assert_eq!(
+            ListBoxes::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes")
+        );
+        assert_eq!(
+            ShowBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox")
         );
     }
 }
