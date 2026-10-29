@@ -613,10 +613,11 @@ async fn delete_after_a_failed_resume_teardown_runs_the_destroy_hooks_once() {
 }
 
 /// The run-owned check takes only the boxes it marked: a plain
-/// session in the same store survives the restart and resumes as
-/// before, so the fix does not cost every session its restart.
+/// session in the same store survives the restart. The restart sets it
+/// `stopped` and keeps it (BOX-154), and the resume does not bring it
+/// back: its next attach does (BOX-025).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
+async fn resume_keeps_a_plain_session_stopped_beside_a_run_owned_one() {
     let (state, cache, mngr) = manager().await;
     let marked = create_active_session_with(&mngr, run_owned_config()).await;
     let mut keeper_config = sample_config();
@@ -626,22 +627,19 @@ async fn resume_still_resumes_a_plain_session_beside_a_run_owned_one() {
     let restarted = manager_over(state.path(), cache.path()).await;
     let resumed = restarted.resume_active_sessions().await.unwrap();
 
-    assert_eq!(resumed, 1, "exactly the plain session should resume");
+    assert_eq!(resumed, 0, "the restart brings no box back");
     wait_for_record_gone(&restarted, marked).await;
-    assert!(
-        restarted
-            .get_record(BoxKeyPredicate::Id(keeper))
-            .await
-            .unwrap()
-            .is_some(),
-        "the plain session's record should survive the resume"
+    let record = restarted
+        .get_record(BoxKeyPredicate::Id(keeper))
+        .await
+        .unwrap()
+        .expect("the plain session's record should survive the resume");
+    assert_eq!(
+        record.state().unwrap(),
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+        "the restart sets the plain session stopped and keeps it"
     );
-    wait_for_actor_count(
-        &restarted,
-        1,
-        "the plain session should have its actor back",
-    )
-    .await;
+    wait_for_no_actors(&restarted).await;
 }
 
 /// The create writes the run-owned mark on the record itself, so the
@@ -676,11 +674,12 @@ async fn create_persists_the_run_owned_mark_on_the_record() {
     );
 }
 
-/// The resume's teardown of a run-owned box leaves alone the route of
-/// a box with the same name that the same resume brought back. Both
-/// boxes are unnamed, with projects that share the basename "app", so
-/// both derive the registry name "app". The plain box is the older
-/// one, so the resume registers its route first.
+/// The resume's teardown of a run-owned box takes no route for its name
+/// and leaves alone a box with the same name. Both boxes are unnamed,
+/// with projects that share the basename "app", so both derive the
+/// registry name "app". The restart sets the plain box `stopped` and
+/// keeps it (BOX-154), so the resume brings only the run-owned box up,
+/// to destroy it.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
@@ -706,17 +705,25 @@ async fn resume_teardown_keeps_the_route_of_a_same_named_box() {
 
     let restarted = manager_over(state.path(), cache.path()).await;
     let resumed = restarted.resume_active_sessions().await.unwrap();
-    assert_eq!(resumed, 1, "exactly the plain box should resume");
+    assert_eq!(resumed, 0, "the restart brings no box back");
     wait_for_record_gone(&restarted, marked).await;
 
     assert!(
-        restarted
+        !restarted
             .hostnames()
             .read()
             .expect("registry lock")
-            .name_held_by(plain, "app"),
-        "the run-owned box's teardown must not take over or withdraw \
-         the resumed box's route",
+            .name_held_by(marked, "app"),
+        "the run-owned box's teardown must not take the route of its name",
+    );
+    let record = restarted
+        .get_record(BoxKeyPredicate::Id(plain))
+        .await
+        .unwrap()
+        .expect("the teardown leaves the same-named box's record alone");
+    assert_eq!(
+        record.state().unwrap(),
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
     );
 }
 
@@ -2941,16 +2948,8 @@ async fn restart_sets_orphaned_running_record_stopped_without_signal() {
     let run_owned = create_active_session_with(&mngr, run_owned_config()).await;
     drop(mngr);
 
-    // The restart: a fresh store over the same state, and no process of
-    // the earlier daemon's boxes left.
-    let store = crate::store::Store::init(daemon_abs(state.path()))
-        .await
-        .unwrap();
-    assert_eq!(
-        stop_orphaned_running_records(&store).await.unwrap(),
-        1,
-        "exactly the plain running record is set to stopped"
-    );
+    // The restart: a fresh manager over the same state, and no process of
+    // the earlier daemon's boxes left. Its start sets the record stopped.
     let restarted = manager_over(state.path(), cache.path()).await;
 
     let record = restarted

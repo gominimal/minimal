@@ -873,11 +873,29 @@ impl BoxActor {
         // take over a name another box already routes.
         #[cfg(target_os = "linux")]
         if registers_name {
-            actor.register_hostname(obj.record(), false).await;
-            // NET-128: an ended box holds its name and answers as stopped
-            // until a resume starts it again.
-            if ended {
-                actor.mark_name_stopped().await;
+            // An ended box comes up for an RPC that names it, such as the
+            // attach that resumes it. It does not take over a name another
+            // box routes: a stopped box never moves a running box's name
+            // (BOX-025). Its resume registers the name if the resume starts.
+            let name_routed_elsewhere = ended
+                && actor
+                    .hostnames
+                    .read()
+                    .expect("hostname registry lock poisoned")
+                    .hostname_held_by_another(*actor.record.id(), &registry_name(obj.record()))
+                    .is_some();
+            if name_routed_elsewhere {
+                tracing::info!(
+                    session_id = %actor.record.id(),
+                    "an ended box's name routes to another box; its name is not registered",
+                );
+            } else {
+                actor.register_hostname(obj.record(), false).await;
+                // NET-128: an ended box holds its name and answers as stopped
+                // until a resume starts it again.
+                if ended {
+                    actor.mark_name_stopped().await;
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -1193,35 +1211,40 @@ impl BoxActor {
                 minimald_rpc::SHUTDOWN_REFUSAL,
             ))
         })?;
-        let holder = tokio::time::timeout(
-            HOST_PROBE_TIMEOUT,
-            manager.running_name_holder(*self.record.id(), name.clone()),
-        )
-        .await
-        .map_err(|_| AttachError::SessionBusy)?
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::ConnectionRefused {
-                return AttachError::LoadoutFailed(error);
+        let id = *self.record.id();
+        let check_name = || async {
+            let holder = tokio::time::timeout(
+                HOST_PROBE_TIMEOUT,
+                manager.running_name_holder(id, name.clone()),
+            )
+            .await
+            .map_err(|_| AttachError::SessionBusy)?
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                    return AttachError::LoadoutFailed(error);
+                }
+                tracing::info!(refusal = "name", %error, "resume: the name check failed");
+                refused(error.kind(), 2, error.to_string())
+            })?;
+            if let Some((holder, holder_id)) = holder {
+                tracing::info!(
+                    refusal = "name",
+                    holder = %holder,
+                    holder_id = %holder_id,
+                    "resume: a running box holds the name"
+                );
+                return Err(refused(
+                    std::io::ErrorKind::AlreadyExists,
+                    2,
+                    format!(
+                        "The running session `{holder}` holds the name `{name}`. Rename it \
+                         with `min session rename {holder_id} <new-name>`, then attach again."
+                    ),
+                ));
             }
-            tracing::info!(refusal = "name", %error, "resume: the name check failed");
-            refused(error.kind(), 2, error.to_string())
-        })?;
-        if let Some((holder, holder_id)) = holder {
-            tracing::info!(
-                refusal = "name",
-                holder = %holder,
-                holder_id = %holder_id,
-                "resume: a running box holds the name"
-            );
-            return Err(refused(
-                std::io::ErrorKind::AlreadyExists,
-                2,
-                format!(
-                    "The running session `{holder}` holds the name `{name}`. Rename it with \
-                     `min session rename {holder_id} <new-name>`, then attach again."
-                ),
-            ));
-        }
+            Ok(())
+        };
+        check_name().await?;
 
         // BOX-025: the box restarts from the spec stored at its creation
         // (BOX-068), refused as a create of that spec would be refused.
@@ -1271,15 +1294,45 @@ impl BoxActor {
         // this build, so no volume holds it.
 
         resumed.set_state(RecordState::Running);
+        #[cfg(target_os = "linux")]
+        let registered = resumed.clone();
         self.record
             .write(resumed)
             .await
             .map_err(AttachError::LaunchRecordUnwritable)?;
+        // The check above and this write are not one step, and each box has
+        // its own actor. Two stopped boxes that share a name can both pass
+        // the check and both write `running`. So the name is checked again
+        // now that this record reads `running`. A resume that finds another
+        // running holder puts its record back and refuses. Of two such
+        // resumes, the later check always sees the earlier write, so at
+        // most one box keeps the name.
+        if let Err(error) = check_name().await {
+            if let Err(write_error) = self.record.write(record).await {
+                tracing::warn!(
+                    error = %write_error,
+                    "resume: could not put the record back after the second name check",
+                );
+            }
+            return Err(error);
+        }
+        // The box came up without its name when another box routed it. That
+        // box no longer runs with the name, so the resumed box takes it.
         #[cfg(target_os = "linux")]
-        self.hostnames
-            .write()
-            .expect("hostname registry lock poisoned")
-            .mark_running(*self.record.id());
+        {
+            let held = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned")
+                .name_held_by(id, &name);
+            if !held {
+                self.register_hostname(&registered, false).await;
+            }
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .mark_running(id);
+        }
         Ok(stored.is_some())
     }
 

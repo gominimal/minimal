@@ -462,6 +462,19 @@ impl BoxManager {
         // hostage.
         reap_unresumable_records(&store).await?;
 
+        // BOX-154: no box process outlives the daemon that launched it, so
+        // every record still `running` here has no process left. Set each
+        // to `stopped` with no code and no signal. An attach resumes it
+        // from its stored spec (BOX-025), and the restart's resume below
+        // no longer brings it back.
+        let stopped = stop_orphaned_running_records(&store).await?;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "restart: set running records with no process left to stopped"
+            );
+        }
+
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
@@ -1392,18 +1405,9 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 /// box. A record marked to end with its run is left to the resume, which
 /// destroys it (NET-131, gominimal/inbox#731).
 ///
-/// Not called at daemon start yet. An attach now resumes a stopped box
-/// (BOX-025), but a restart still brings every `running` box back and routes
-/// its name ([`BoxManager::resume_active_sessions`]), and the restart tests
-/// pin that. The flip at start must replace that behaviour in the same
-/// change, so it waits for a task that owns those tests.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called at daemon start once the restart stops running boxes (BOX-154)"
-    )
-)]
+/// [`BoxManager::init`] calls this before the restart's resume
+/// ([`BoxManager::resume_active_sessions`]), so that resume finds no
+/// orphaned `running` record to bring back.
 pub(crate) async fn stop_orphaned_running_records(
     store: &crate::store::StoreHandle,
 ) -> Result<usize, std::io::Error> {
@@ -1692,7 +1696,14 @@ impl BoxManager {
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
-    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// (`HostNet`, `OwnIp`) and has no actor yet.
+    ///
+    /// A restart no longer relaunches a box whose processes are gone
+    /// (BOX-154): [`BoxManager::init`] already set each such record to
+    /// `stopped`, so this resume skips it, and the box's next attach resumes
+    /// it from its stored spec (BOX-025). What this resume still finds
+    /// `Active` is a record whose box is still live, plus a run's box, which
+    /// it destroys (NET-131). A session's name is
     /// registered when its actor starts ([`BoxActor::run`]), and a restarted
     /// daemon otherwise starts an actor only when an RPC first names the
     /// session, so until then the name of a session `min ls` lists as active

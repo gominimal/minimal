@@ -5301,17 +5301,19 @@ async fn restart(server: TestServer, client: TestClient) -> TestServer {
     TestServer::new_in(server.into_state_dir()).await
 }
 
-/// A restarted daemon routes the names of the active sessions it restored
-/// as soon as it resumes them, with no RPC naming either session first.
-/// Resuming is idempotent: a second resume starts nothing, and an RPC that
-/// names a resumed session finds its actor instead of registering again.
+/// A restarted daemon does not route the names of the boxes it found
+/// `running`: its start set each one `stopped` (BOX-154), and the resume at
+/// start brings none back. An attach resumes a box (BOX-025), and its name
+/// routes again from then on. The other box stays stopped and unrouted.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
+async fn a_restarted_daemon_routes_a_restored_name_once_an_attach_resumes_it() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let alpha = create_configured_session(&mut client, "restored-alpha", "/uwu").await;
-    create_configured_session(&mut client, "restored-beta", "/uwu").await;
+    let beta = create_configured_session(&mut client, "restored-beta", "/uwu").await;
     assert_eq!(
         route_owner(&server, "restored-alpha.min.internal").await,
         Some("restored-alpha".to_owned()),
@@ -5319,62 +5321,143 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
     );
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    assert_eq!(
-        route_owner(&server, "restored-alpha.min.internal").await,
-        None,
-        "before the resume the restored session's name is unregistered"
-    );
-
-    let resumed = manager.enqueue_resume_active_sessions().await;
-    assert_eq!(
-        manager.running_count().await,
-        2,
-        "a message sent after the enqueue returns is served after the resume"
-    );
-    assert_eq!(
-        resumed.await.unwrap(),
-        2,
-        "both active sessions are resumed"
-    );
-    for name in ["restored-alpha", "restored-beta"] {
-        assert_eq!(
-            route_owner(&server, &format!("{name}.min.internal")).await,
-            Some(name.to_owned()),
-            "{name}'s name routes after the resume, with no RPC naming it"
-        );
-    }
-
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
         0,
-        "a second resume starts nothing"
+        "the restart brings no box back"
     );
-    manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(alpha))
+    assert_eq!(manager.running_count().await, 0);
+    for id in [alpha, beta] {
+        assert_eq!(
+            read_record(&server, id).await.state().unwrap(),
+            RecordState::Stopped(StopEnding::AtDaemonStart)
+        );
+    }
+    for name in ["restored-alpha", "restored-beta"] {
+        assert_eq!(
+            route_owner(&server, &format!("{name}.min.internal")).await,
+            None,
+            "{name}'s name does not route while the box is stopped"
+        );
+    }
+
+    attach_and_echo(&mut client, alpha)
         .await
-        .unwrap()
-        .expect("the resumed session resolves");
+        .expect("an attach resumes the stopped box");
     assert_eq!(
-        manager.running_count().await,
-        2,
-        "an RPC naming a resumed session reuses its actor"
+        read_record(&server, alpha).await.state().unwrap(),
+        RecordState::Running
     );
     assert_eq!(
         route_owner(&server, "restored-alpha.min.internal").await,
         Some("restored-alpha".to_owned()),
-        "the name still routes to its own session"
+        "the resumed box's name routes to its own session"
+    );
+    assert_eq!(
+        read_record(&server, beta).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        "the box nobody attached to stays stopped"
     );
 }
 
-/// A restarted daemon's resume launches the host of a restored own-address
-/// box — no RPC, no exec, no attach — so the box's declared ingress is
-/// bound and its name keeps answering without a client. A `HostNet` box
-/// gets no such launch: it owns no declared ingress and publishes no
-/// address, so its restored actor alone is the whole box, as before.
+/// BOX-154 and BOX-025 across a daemon restart: a `running` record whose
+/// box has no process left reads `stopped` after the restart, with no exit
+/// code and no signal, and with an `exited` event that says so. An attach
+/// then resumes the box with its files, its id and its name.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
+async fn restart_stops_running_record_and_attach_resumes_it() {
+    use boxes::core::record::{RecordState, StopEnding};
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let paths = session_paths(&server, id).await;
+    let kept = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    // The restart: every process of the first daemon's boxes is gone.
+    let server = restart(server, client).await;
+    let mut client = server.connect().await;
+    assert_eq!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .resume_active_sessions()
+            .await
+            .unwrap(),
+        0,
+        "the restart brings no box back"
+    );
+
+    let record = read_record(&server, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
+    assert_eq!(record.status, boxes::BoxState::Stopped);
+    assert_eq!((record.exit_code, record.signal), (None, None));
+    let events = event_kinds(&server, id).await;
+    let exited = events
+        .iter()
+        .rposition(|e| e.kind == BoxEventType::Exited)
+        .expect("the restart records an exited event");
+    assert_eq!(events[exited].data["reason"], "stopped");
+    assert!(
+        !events[exited].data.contains_key("signal"),
+        "{:?}",
+        events[exited].data
+    );
+    assert!(
+        !events[exited].data.contains_key("exit_code"),
+        "{:?}",
+        events[exited].data
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach resumes the box the restart stopped");
+    let record = read_record(&server, id).await;
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(record.id, id, "the box keeps its id");
+    assert_eq!(record.name.as_deref(), Some("restart-box"), "and its name");
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        "still here",
+        "and its files"
+    );
+    let events = event_kinds(&server, id).await;
+    let resumed = events
+        .iter()
+        .rposition(|e| e.kind == BoxEventType::Resumed)
+        .expect("the resume records a resumed event");
+    assert!(exited < resumed);
+    assert_eq!(events[resumed].data["from"], "stopped");
+}
+
+/// A restarted daemon launches no host for a box it found `running`: the
+/// restart set the box `stopped` (BOX-154). An attach resumes the
+/// own-address box (BOX-025) with its network mode and its recorded
+/// address, and the registry publishes it at that address again.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_resumes_an_own_ip_box_on_attach_with_its_address() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -5385,107 +5468,108 @@ async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
         handed,
     )
     .await;
-    create_configured_session(&mut client, "restored-hostnet", "/uwu").await;
+    let before = read_record(&server, web).await;
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both active sessions are resumed"
+        0,
+        "the restart brings no box back"
+    );
+    assert_eq!(manager.running_count().await, 0, "and launches no host");
+    assert_eq!(
+        read_record(&server, web).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
     );
 
-    let web = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+    attach_and_echo(&mut client, web)
         .await
-        .unwrap()
-        .expect("the own-address box's session resolves");
-    for _ in 0..100 {
-        if web.get_attrs().await.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        web.get_attrs().await.is_some(),
-        "the resumed own-address box holds a host no client asked for"
+        .expect("an attach resumes the own-address box");
+    let record = read_record(&server, web).await;
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(record.network, boxes::NetworkMode::OwnIp);
+    assert_eq!(
+        record.box_addresses, before.box_addresses,
+        "the box keeps its recorded address"
     );
-
-    let hostnet = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Name(
-            "restored-hostnet".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .expect("the host-network box's session resolves");
-    // Held for a settle rather than read once: a launch wrongly spawned
-    // for it would be in flight alongside the own-address box's.
-    for _ in 0..20 {
-        assert!(
-            hostnet.get_attrs().await.is_none(),
-            "a resumed host-network box launches no host"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the registry publishes the box at its address again"
+    );
 }
 
-/// One restored session whose actor cannot start costs only its own name:
-/// the resume logs it and goes on, and the other session still routes.
+/// One restored box whose resume fails costs only itself. The restart set
+/// both boxes `stopped` (BOX-154). The attach to the broken one fails and
+/// leaves it stopped. The attach to the healthy one resumes it, and its
+/// name routes.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_session_that_fails_to_resume_does_not_stop_the_others() {
-    let capture = crate::test_harness::captured_log();
+    use boxes::core::record::{RecordState, StopEnding};
+
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let broken = create_configured_session(&mut client, "resume-broken", "/uwu").await;
-    create_configured_session(&mut client, "resume-healthy", "/uwu").await;
+    let healthy = create_configured_session(&mut client, "resume-healthy", "/uwu").await;
     let home = session_paths(&server, broken).await.home;
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     // A file where the session's home directory belongs: the actor's
     // bring-up cannot create its directories, so it fails to start.
     std::fs::remove_dir_all(home.as_utf8_path()).unwrap();
     std::fs::write(home.as_utf8_path(), b"not a directory").unwrap();
 
-    let manager = server.state.sessions_manager().await;
+    attach_and_echo(&mut client, broken)
+        .await
+        .expect_err("the broken box reaches no shell");
     assert_eq!(
-        manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only the healthy session is resumed"
-    );
-    assert_eq!(
-        route_owner(&server, "resume-healthy.min.internal").await,
-        Some("resume-healthy".to_owned()),
-        "the healthy session's name routes"
+        read_record(&server, broken).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        "the broken box stays stopped"
     );
     assert_eq!(
         route_owner(&server, "resume-broken.min.internal").await,
         None,
         "the broken session's name stays unregistered"
     );
-    let logged = capture.contents();
-    assert!(
-        logged
-            .lines()
-            .any(|line| line.contains("could not start the session's actor")
-                && line.contains("session_name=\"resume-broken\"")),
-        "the failed resume is logged naming the session, got: {logged}"
+
+    attach_and_echo(&mut client, healthy)
+        .await
+        .expect("the healthy box resumes");
+    assert_eq!(
+        read_record(&server, healthy).await.state().unwrap(),
+        RecordState::Running
+    );
+    assert_eq!(
+        route_owner(&server, "resume-healthy.min.internal").await,
+        Some("resume-healthy".to_owned()),
+        "the healthy session's name routes"
     );
 }
 
 /// Two restored sessions whose box names fold to one hostname (two unnamed
-/// sessions whose project directories' basenames differ only in case): the
-/// resume routes the name for one of them and skips the other with a
-/// collision warning, rather than letting the second registration take the
-/// route over.
+/// sessions whose project directories' basenames differ only in case). The
+/// restart sets both `stopped` (BOX-154). The first attach resumes its box
+/// and routes the name. The second attach is refused with exit status 2
+/// (BOX-025), so the name does not move.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_hostname_collision_is_logged_and_skipped() {
+async fn a_restored_hostname_collision_is_refused_on_resume() {
+    use boxes::core::record::{RecordState, StopEnding};
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    let mut ids = Vec::new();
     for project in ["/x/FoldApp", "/y/foldapp"] {
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = None;
@@ -5509,50 +5593,65 @@ async fn a_restored_hostname_collision_is_logged_and_skipped() {
             Errorable::Ok(_) => {}
             Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
         }
+        ids.push(id);
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only one of the colliding sessions is resumed"
+        0,
+        "the restart brings neither box back"
     );
-    let owner = route_owner(&server, "foldapp.min.internal")
+
+    attach_and_echo(&mut client, ids[0])
         .await
-        .expect("the folded name routes for one of the sessions");
-    assert!(
-        owner == "FoldApp" || owner == "foldapp",
-        "the name routes to one of the colliding sessions, got {owner}"
+        .expect("the first attach resumes its box");
+    assert_eq!(
+        route_owner(&server, "foldapp.min.internal").await,
+        Some("FoldApp".to_owned()),
+        "the name routes for the resumed box"
+    );
+    assert_resume_refused(
+        &server,
+        &mut client,
+        ids[1],
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        &["The running session `FoldApp` holds the name `foldapp`"],
+        2,
+    )
+    .await;
+    assert_eq!(
+        route_owner(&server, "foldapp.min.internal").await,
+        Some("FoldApp".to_owned()),
+        "the refused resume does not move the name"
     );
     let logged = capture.contents();
     assert!(
         logged
             .lines()
-            .any(|line| line.contains("hostname-collision")
-                && line.contains("resume:")
-                && line.contains(&format!("owner=\"{owner}\""))),
-        "the skipped session is logged as a collision, got: {logged}"
+            .any(|line| line.contains("resume: a running box holds the name")
+                && line.contains("holder=FoldApp")),
+        "the refusal is logged naming the holder, got: {logged}"
     );
 }
-
-/// Two restored sessions that share one registry name *outright* — two
-/// unnamed sessions whose project directories share a basename, the pair
-/// the store's name-uniqueness check never sees, since it only runs for
-/// assigned names. The check keys on the session id, not the name: an
-/// owner carrying the same name string is not this session, so the resume
-/// routes the name for one of them, skips the other with a collision
-/// warning, and never lets the second registration take the first's
-/// route over — which would move the name with no warning at all, both
-/// registrations being under the same name.
+/// Two restored sessions that share one registry name outright: two unnamed
+/// sessions whose project directories share a basename, the pair the
+/// store's name-uniqueness check never sees. The restart sets both
+/// `stopped` (BOX-154). The first attach resumes its box and routes the
+/// name. The second attach is refused with exit status 2 (BOX-025), so the
+/// name does not move.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() {
+async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on_resume() {
+    use boxes::core::record::{RecordState, StopEnding};
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    let mut ids = Vec::new();
     for project in ["/a/twins", "/b/twins"] {
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = None;
@@ -5576,34 +5675,47 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() 
             Errorable::Ok(_) => {}
             Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
         }
+        ids.push(id);
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only one of the name-sharing sessions is resumed"
+        0,
+        "the restart brings neither box back"
     );
-    assert_eq!(
-        manager.running_count().await,
-        1,
-        "the skipped session never starts an actor, so its registration \
-         cannot take the resumed one's route over"
-    );
+
+    attach_and_echo(&mut client, ids[0])
+        .await
+        .expect("the first attach resumes its box");
     assert_eq!(
         route_owner(&server, "twins.min.internal").await,
         Some("twins".to_owned()),
-        "the shared name routes for the one resumed session"
+        "the name routes for the resumed box"
+    );
+    assert_resume_refused(
+        &server,
+        &mut client,
+        ids[1],
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        &["The running session `twins` holds the name `twins`"],
+        2,
+    )
+    .await;
+    assert_eq!(
+        route_owner(&server, "twins.min.internal").await,
+        Some("twins".to_owned()),
+        "the refused resume does not move the name"
     );
     let logged = capture.contents();
     assert!(
         logged
             .lines()
-            .any(|line| line.contains("hostname-collision")
-                && line.contains("resume:")
-                && line.contains("owner=\"twins\"")),
-        "the skipped session is logged as a collision, got: {logged}"
+            .any(|line| line.contains("resume: a running box holds the name")
+                && line.contains("holder=twins")),
+        "the refusal is logged naming the holder, got: {logged}"
     );
 }
 
@@ -7034,58 +7146,36 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     );
 }
 
-/// NET-129 at daemon start: a shared-address port goes to the box created
-/// earliest among the boxes publishing it, whatever order the store lists
-/// them in. The store lists its records by the last five hex digits of
-/// each id, which are random, so the pair this test restarts with is chosen
-/// to list the newer box first — the order that hands it the port unless
-/// the resume sorts by id.
+/// NET-129 after a daemon restart: the restart sets both boxes `stopped`
+/// (BOX-154), and the resume at start brings neither back, so neither holds
+/// the shared-address port. Each attach resumes its box (BOX-025) with its
+/// address and its declared port. Resumed in creation order, the box created
+/// earliest holds the port again and the newer box yields to it.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_address_holder_same_in_any_resume_order() {
+async fn shared_address_holder_kept_when_boxes_resume_in_creation_order() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let store_key = |id: SessionId| {
-        let id = id.to_string();
-        id[id.len() - 5..].to_owned()
-    };
-
-    // Keep two boxes on the port, replacing the older one until the newer
-    // box's store key sorts first. Destroying the older box hands the port
-    // to the one left, so the older of the pair always holds it.
-    let mut older = (
-        finalize_handed_own_ip_session(
-            &mut client,
-            "box-0",
-            std::net::Ipv4Addr::new(100, 64, 128, 9),
-            shared,
-        )
-        .await,
-        "box-0".to_owned(),
-    );
-    let mut newer = None;
-    for n in 1..=32u8 {
-        let name = format!("box-{n}");
-        let id = finalize_handed_own_ip_session(
-            &mut client,
-            &name,
-            std::net::Ipv4Addr::new(100, 64, 128, 9 + n),
-            shared,
-        )
-        .await;
-        if store_key(id) < store_key(older.0) {
-            newer = Some(id);
-            break;
-        }
-        destroy_session(&mut client, older.0).await;
-        older = (id, name);
-    }
-    let newer = newer.expect("some newer box's store key sorts before an older box's");
-    let (older, older_name) = older;
+    let older = finalize_handed_own_ip_session(
+        &mut client,
+        "box-0",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let newer = finalize_handed_own_ip_session(
+        &mut client,
+        "box-1",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
     let held_by_older = vec![crate::net::dns::SharedPortCollision {
         port: 18080,
-        other: format!("{older_name}.min.internal"),
+        other: "box-0.min.internal".to_owned(),
     }];
     {
         let registry = server.state.sessions_manager().await.hostnames();
@@ -7095,12 +7185,24 @@ async fn shared_address_holder_same_in_any_resume_order() {
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both boxes are resumed"
+        0,
+        "the restart brings neither box back"
     );
+    for id in [older, newer] {
+        assert_eq!(
+            read_record(&server, id).await.state().unwrap(),
+            RecordState::Stopped(StopEnding::AtDaemonStart)
+        );
+    }
+    for id in [older, newer] {
+        attach_and_echo(&mut client, id)
+            .await
+            .expect("an attach resumes the box");
+    }
     let registry = manager.hostnames();
     let routes = registry.read().expect("registry lock");
     assert!(
@@ -7110,7 +7212,7 @@ async fn shared_address_holder_same_in_any_resume_order() {
     assert_eq!(
         routes.shared_port_collisions(newer),
         held_by_older,
-        "and the newer box yields to it, though the store lists it first"
+        "and the newer box yields to it"
     );
 }
 
@@ -7118,10 +7220,18 @@ async fn shared_address_holder_same_in_any_resume_order() {
 /// creation order: a box's id is minted at create and it publishes at
 /// finalize, so a box created later can finalize first and hold the port.
 /// Once that box has launched — bound the port's forward — it holds the
-/// port after a restart too, though the resume starts the older box first.
+/// port after a restart too. The restart sets both boxes `stopped`
+/// (BOX-154), and the box that bound the port keeps it on its record. Each
+/// box publishes again when an RPC that names it brings it up, the older
+/// one first, and the newer box takes the port back at its own publish. The
+/// older box then resumes on its attach and still yields. The newer box's
+/// own attach waits for its client to restore its row (NET-138), which this
+/// harness does not do.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -7160,24 +7270,37 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     drop(channel);
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both boxes are resumed"
+        0,
+        "the restart brings neither box back"
     );
-    let record = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(newer))
-        .await
-        .unwrap()
-        .expect("the box resolves")
-        .record()
-        .await
-        .expect("the record reads back");
+    let record = read_record(&server, newer).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
     assert_eq!(
         record.bound_ports,
         std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
-        "the launch recorded the port it bound on the box's record"
+        "the stopped box keeps the port it bound on its record"
+    );
+
+    for id in [older, newer] {
+        manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+    }
+    attach_and_echo(&mut client, older)
+        .await
+        .expect("an attach resumes the older box");
+    assert_eq!(
+        read_record(&server, older).await.state().unwrap(),
+        RecordState::Running
     );
     let registry = manager.hostnames();
     let routes = registry.read().expect("registry lock");
@@ -7188,7 +7311,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     assert_eq!(
         routes.shared_port_collisions(older),
         held_by_newer,
-        "and the older box still yields to it, though it is resumed first"
+        "and the older box still yields to it, though it resumed first"
     );
 }
 
