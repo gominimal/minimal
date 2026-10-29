@@ -447,6 +447,14 @@ enum ManagerMessage {
     /// actors it started.
     #[cfg(target_os = "linux")]
     ResumeActive(Responder<usize>),
+    /// The box, other than the one named by the id, that holds the name a
+    /// resume asks for (BOX-025), or `None`. A `None` claims the name for
+    /// the id until [`Self::ReleaseNameClaim`]. Read from the store and the
+    /// claims alone, so it never waits on an actor.
+    RunningNameHolder(SessionId, String, Responder<Option<NameHolder>>),
+    /// Fire-and-forget: drop the name claim of a resume that ended, as
+    /// refused or as running (BOX-025). A no-op for an id with no claim.
+    ReleaseNameClaim(SessionId),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
@@ -478,6 +486,8 @@ impl ManagerMessage {
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
             Self::ResumeActive(..) => "ResumeActive",
+            Self::RunningNameHolder(..) => "RunningNameHolder",
+            Self::ReleaseNameClaim(..) => "ReleaseNameClaim",
             Self::Evict(..) => "Evict",
         }
     }
@@ -509,6 +519,12 @@ pub struct BoxManager {
     /// bring-up or a second destroy in that window starts no second actor and
     /// runs no `on_destroy` hook twice. A task removes its id as it ends.
     tearing_down: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    /// The names that resumes in flight claimed, keyed by the resuming box
+    /// (BOX-025). Each box has its own actor, so two stopped boxes that
+    /// share a name can resume at once. The name check claims the name, and
+    /// a later check for that name finds the claim, so at most one of them
+    /// writes `running`. The resume releases its claim when it ends.
+    name_claims: BTreeMap<SessionId, String>,
     /// The teardown tasks, joined by `Shutdown` before the state volume is
     /// quiesced: a hook still running or a record delete still in flight
     /// would otherwise race the unmount.
@@ -585,6 +601,19 @@ impl BoxManager {
         // them linger and confuse `min ls` / hold their names
         // hostage.
         reap_unresumable_records(&store).await?;
+
+        // BOX-154: no box process outlives the daemon that launched it, so
+        // every record still `running` here has no process left. Set each
+        // to `stopped` with no code and no signal. An attach resumes it
+        // from its stored spec (BOX-025), and the restart's resume below
+        // no longer brings it back.
+        let stopped = stop_orphaned_running_records(&store).await?;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "restart: set running records with no process left to stopped"
+            );
+        }
 
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
@@ -862,6 +891,7 @@ impl BoxManager {
             receiver,
             running,
             tearing_down: Arc::default(),
+            name_claims: BTreeMap::new(),
             teardowns: tokio::task::JoinSet::new(),
             store,
             weak_self,
@@ -1516,17 +1546,9 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 /// box. A record marked to end with its run is left to the resume, which
 /// destroys it (NET-131, gominimal/inbox#731).
 ///
-/// Not called at daemon start yet. No actor hosts a `stopped` box until
-/// #2393 (BOX-025), so the flip at start would leave every session that
-/// the restart resumes today without a way back. #2393 calls this from
-/// [`BoxManager::init`] beside [`reap_unresumable_records`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called at daemon start once a stopped box can be resumed (#2393)"
-    )
-)]
+/// [`BoxManager::init`] calls this before the restart's resume
+/// ([`BoxManager::resume_active_sessions`]), so that resume finds no
+/// orphaned `running` record to bring back.
 pub(crate) async fn stop_orphaned_running_records(
     store: &crate::store::StoreHandle,
 ) -> Result<usize, std::io::Error> {
@@ -1566,7 +1588,69 @@ pub(crate) async fn stop_orphaned_running_records(
     Ok(stopped)
 }
 
+/// The data of the `resumed` event a resume records (BOX-025): the state
+/// the box resumed from, `stopped` or `exited`.
+pub(crate) fn resumed_event_data(from: &boxes::core::record::RecordState) -> EventData {
+    let mut data = EventData::new();
+    data.insert("from".to_string(), from.name().into());
+    data
+}
+
+/// The box that holds a name a resume asks for (BOX-025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameHolder {
+    /// The name the box answers to.
+    pub(crate) name: String,
+    /// The box's id.
+    pub(crate) id: SessionId,
+    /// `true` when the box does not run yet, and its own resume claimed the
+    /// name. `false` when its record reads `running`.
+    pub(crate) resuming: bool,
+}
+
 impl BoxManagerHandle {
+    /// The box other than `id` that holds the name `name`, for a resume's
+    /// name check (BOX-025), or `None`. A `None` claims the name for `id`,
+    /// so a concurrent resume of another box with that name finds it held.
+    /// The caller must release the claim with [`Self::release_name_claim`]
+    /// once the resume writes `running` or is refused. The manager reads
+    /// only the store and its claims to answer.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's error.
+    pub(crate) async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::RunningNameHolder(id, name, send))
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ))
+        })
+    }
+
+    /// Drops the name claim that [`Self::running_name_holder`] made for `id`.
+    /// A no-op when `id` holds no claim or the manager is gone.
+    pub(crate) async fn release_name_claim(&self, id: SessionId) {
+        // A send error means the manager is gone, and its claims with it.
+        let _ = self.sender.send(ManagerMessage::ReleaseNameClaim(id)).await;
+    }
+
     /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
     /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
     /// how the box ended.
@@ -1775,7 +1859,14 @@ impl BoxManager {
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
-    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// (`HostNet`, `OwnIp`) and has no actor yet.
+    ///
+    /// A restart no longer relaunches a box whose processes are gone
+    /// (BOX-154): [`BoxManager::init`] already set each such record to
+    /// `stopped`, so this resume skips it, and the box's next attach resumes
+    /// it from its stored spec (BOX-025). What this resume still finds
+    /// `Active` is a record whose box is still live, plus a run's box, which
+    /// it destroys (NET-131). A session's name is
     /// registered when its actor starts ([`BoxActor::run`]), and a restarted
     /// daemon otherwise starts an actor only when an RPC first names the
     /// session, so until then the name of a session `min ls` lists as active
@@ -2018,6 +2109,90 @@ impl BoxManager {
             tracing::info!(resumed, "resumed active sessions so their names route");
         }
         Ok(resumed)
+    }
+
+    /// The running box other than `id` whose name is `name` (BOX-025): the
+    /// name its route answers to, as [`crate::box_actor::registry_name`]
+    /// gives it, compared without ASCII case as hostnames are. Answers that
+    /// box's name and id, or `None`. A box being torn down holds no name. A
+    /// record that cannot be read can belong to a running box that holds the
+    /// name, so it fails the check, and the resume is refused.
+    async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: &str,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for handle in self.store.handles().await? {
+            let other = *handle.id();
+            if other == id || tearing_down.contains(&other) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                // A record removed since the listing belongs to no box.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %other,
+                        %error,
+                        "resume: could not read a record while checking the name",
+                    );
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "The record of session `{other}` cannot be read, so its name is \
+                             not known: {error}."
+                        ),
+                    ));
+                }
+            };
+            if matches!(
+                record.state(),
+                Ok(boxes::core::record::RecordState::Running)
+            ) {
+                let held = crate::box_actor::registry_name(&record);
+                if held.eq_ignore_ascii_case(name) {
+                    return Ok(Some(NameHolder {
+                        name: held,
+                        id: other,
+                        resuming: false,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`Self::running_name_holder`], then the claims of the resumes in
+    /// flight (BOX-025). When neither holds `name`, `id` claims it. The
+    /// manager loop runs one message at a time, so of two checks for one
+    /// name, the later one sees the claim of the earlier one.
+    async fn claim_name(
+        &mut self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        if let Some(holder) = self.running_name_holder(id, &name).await? {
+            return Ok(Some(holder));
+        }
+        let claimed = self
+            .name_claims
+            .iter()
+            .find(|(other, held)| **other != id && held.eq_ignore_ascii_case(&name));
+        if let Some((other, held)) = claimed {
+            return Ok(Some(NameHolder {
+                name: held.clone(),
+                id: *other,
+                resuming: true,
+            }));
+        }
+        self.name_claims.insert(id, name);
+        Ok(None)
     }
 
     /// The manager's half of a teardown: the box's actor in `running`, or one
@@ -2448,6 +2623,12 @@ impl BoxManager {
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
+            }
+            ManagerMessage::RunningNameHolder(id, name, r) => {
+                r.handle(self.claim_name(id, name)).await;
+            }
+            ManagerMessage::ReleaseNameClaim(id) => {
+                self.name_claims.remove(&id);
             }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
@@ -2892,6 +3073,8 @@ impl BoxManager {
             // reused, so a stale evict can't remove a fresh actor.
             ManagerMessage::Evict(id) => {
                 self.running.remove(&id);
+                // An actor that ended mid-resume holds its claim no more.
+                self.name_claims.remove(&id);
             }
         }
     }

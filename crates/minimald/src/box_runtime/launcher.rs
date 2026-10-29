@@ -1683,3 +1683,50 @@ impl BoxLauncher for SandboxLauncher {
         })
     }
 }
+
+/// Whether the spec stored beside a box's record sets `io.pty_enabled`
+/// (BOX-030). It reads only that key, so the PTY check of a resume runs
+/// before the spec is parsed whole: a spec this daemon cannot start from is
+/// a later refusal (BOX-025). Bytes that are not a JSON object read as no
+/// PTY.
+pub(crate) fn stored_spec_sets_pty(bytes: &[u8]) -> bool {
+    serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes)
+        .ok()
+        .and_then(|spec| spec.get("io")?.get("pty_enabled")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// The spec stored beside a box's record at its creation (BOX-068), parsed
+/// for a resume to restart the box from (BOX-025).
+///
+/// # Errors
+///
+/// `InvalidInput`, as a create gives for a spec it refuses, when the bytes
+/// are not a spec of the version this daemon reads,
+/// [`mfile::spec::BOX_SPEC_VERSION`].
+pub(crate) fn stored_spec(bytes: &[u8]) -> io::Result<mfile::spec::BoxSpec> {
+    let refused = |why: String| io::Error::new(io::ErrorKind::InvalidInput, why);
+    let spec: mfile::spec::BoxSpec = serde_json_lenient::from_slice(bytes).map_err(|e| {
+        refused(format!(
+            "The settings it was created with cannot be read: {e}."
+        ))
+    })?;
+    if spec.v != mfile::spec::BOX_SPEC_VERSION {
+        return Err(refused(format!(
+            "The settings it was created with are version {}, and this daemon reads only version {}.",
+            spec.v,
+            mfile::spec::BOX_SPEC_VERSION
+        )));
+    }
+    Ok(spec)
+}
+
+/// Restarts `record` from `spec` (BOX-025): the network mode, the policy
+/// and the hooks switch the box was created with. A change made to them
+/// while the box ran does not carry into the restart. Every launch reads
+/// these settings from the record, so the restart writes them there.
+pub(crate) fn restart_from_stored_spec(record: &mut boxes::Record, spec: &mfile::spec::BoxSpec) {
+    record.network = spec.network.mode;
+    record.policy = spec.network.policy.clone();
+    record.hooks_enabled = spec.hooks_enabled;
+}

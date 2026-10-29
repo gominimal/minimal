@@ -457,6 +457,11 @@ impl russh::server::Handler for ConnectionHandler {
                 let _ = hnd
                     .data(id, format!("Error attaching to session: {e}\r\n"))
                     .await;
+                // A refusal with its own exit status (a refused resume,
+                // BOX-025) ends the client's attach with it, not 255.
+                if let Some(code) = e.exit_code() {
+                    let _ = hnd.exit_status_request(id, code).await;
+                }
                 let _ = hnd.close(id).await;
             }
         };
