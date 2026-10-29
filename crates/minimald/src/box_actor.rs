@@ -1199,7 +1199,13 @@ impl BoxActor {
         )
         .await
         .map_err(|_| AttachError::SessionBusy)?
-        .map_err(AttachError::LoadoutFailed)?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                return AttachError::LoadoutFailed(error);
+            }
+            tracing::info!(refusal = "name", %error, "resume: the name check failed");
+            refused(error.kind(), 2, error.to_string())
+        })?;
         if let Some((holder, holder_id)) = holder {
             tracing::info!(
                 refusal = "name",

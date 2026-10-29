@@ -1940,8 +1940,9 @@ impl BoxManager {
     /// The running box other than `id` whose name is `name` (BOX-025): the
     /// name its route answers to, as [`crate::box_actor::registry_name`]
     /// gives it, compared without ASCII case as hostnames are. Answers that
-    /// box's name and id, or `None`. A box being torn down holds no name, and
-    /// a record that cannot be read is logged and skipped.
+    /// box's name and id, or `None`. A box being torn down holds no name. A
+    /// record that cannot be read can belong to a running box that holds the
+    /// name, so it fails the check, and the resume is refused.
     async fn running_name_holder(
         &self,
         id: SessionId,
@@ -1959,13 +1960,21 @@ impl BoxManager {
             }
             let record = match handle.record().await {
                 Ok(record) => record,
+                // A record removed since the listing belongs to no box.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     tracing::warn!(
                         session_id = %other,
                         %error,
-                        "resume: could not read a record while checking the name; skipping it",
+                        "resume: could not read a record while checking the name",
                     );
-                    continue;
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "The record of session `{other}` cannot be read, so its name is \
+                             not known: {error}."
+                        ),
+                    ));
                 }
             };
             if matches!(

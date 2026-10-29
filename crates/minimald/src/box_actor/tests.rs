@@ -13547,6 +13547,31 @@ async fn resume_refuses_when_name_held_by_running_box() {
     .await;
 }
 
+/// BOX-025: a record the name check cannot read can belong to a running
+/// box that holds the name, so the resume is refused and the box stays
+/// stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_when_another_record_is_unreadable() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let stopped =
+        create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
+    let ending = stop_through_daemon(&server, stopped).await;
+    let other = create_session_with_spec(&mut client, Some("other"), "/b/y", None).await;
+    let path = record_dir(&server, other).await.join("record.json");
+    std::fs::write(&path, b"not a record").unwrap();
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        stopped,
+        boxes::core::record::RecordState::Stopped(ending),
+        &[&format!("The record of session `{other}` cannot be read")],
+        2,
+    )
+    .await;
+}
+
 /// BOX-030: a resume of a box whose spec does not set `pty_enabled` is
 /// refused, and the box stays stopped. The terminal check comes first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
