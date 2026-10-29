@@ -1344,11 +1344,18 @@ impl DnsPins {
     /// leg keeps. A query over TCP is never recorded — the UDP datagram is
     /// the one DNS path v1 carries and the one a reply can pin by — and a
     /// query from a source no row holds records nothing either.
+    ///
+    /// `box_cohort_marked` is the query frame's own mark. A query from the
+    /// node address records into exactly one entry, so the name split
+    /// matches the address split (NET-085): a marked query into the
+    /// resident `host_ip` boxes' entry, and an unmarked one into the node
+    /// row's entry. A reply pins only in the entry that recorded its query.
     pub(crate) fn observe_query(
         &self,
         table: &BoxTable,
         pkt: &L4Packet,
         datagram: &[u8],
+        box_cohort_marked: bool,
         now: Instant,
     ) {
         if pkt.proto != IPPROTO_UDP
@@ -1357,10 +1364,11 @@ impl DnsPins {
         {
             return;
         }
-        if *pkt.src.ip() == table.subnet().daemon_ip()
-            && let Some(entry) = self.host_ip_entry(table)
-        {
-            entry.record_query(pkt, datagram, now);
+        if *pkt.src.ip() == table.subnet().daemon_ip() && box_cohort_marked {
+            if let Some(entry) = self.host_ip_entry(table) {
+                entry.record_query(pkt, datagram, now);
+            }
+            return;
         }
         let Some(record) = table.by_source(pkt.src.ip().octets()) else {
             return;
@@ -1861,6 +1869,19 @@ pub(crate) mod tests {
     /// sockets: from the box, on its lookup's own source port, to the plan's
     /// resolver, in the datagram shape the relay hands the table.
     fn lookup(pins: &DnsPins, table: &BoxTable, lease: [u8; 4], name: &str, now: Instant) {
+        lookup_marked(pins, table, lease, name, false, now);
+    }
+
+    /// [`lookup`] with the query frame's box-cohort mark spelled out: a
+    /// marked query from the node address is a resident `host_ip` box's.
+    fn lookup_marked(
+        pins: &DnsPins,
+        table: &BoxTable,
+        lease: [u8; 4],
+        name: &str,
+        marked: bool,
+        now: Instant,
+    ) {
         let query = udp_payload_frame(
             Ipv4Addr::from(lease),
             40000,
@@ -1870,7 +1891,7 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&query)
             .expect("the test's query frame parses as the egress leg parses it");
-        pins.observe_query(table, &pkt, datagram, now);
+        pins.observe_query(table, &pkt, datagram, marked, now);
     }
 
     /// Observes one reply the switch returned toward `lease`, answering
@@ -1966,6 +1987,21 @@ pub(crate) mod tests {
         observe(pins, table, node, name, answers, &DropLimiter::new(), now);
     }
 
+    /// Drives one lookup a resident `host_ip` box makes from the node
+    /// address: the query leaves box-marked, and the reply returns to the
+    /// node address.
+    fn host_ip_resolves(
+        pins: &DnsPins,
+        table: &BoxTable,
+        name: &str,
+        answers: &[Ipv4Addr],
+        now: Instant,
+    ) {
+        let node = SUBNET.daemon_ip().octets();
+        lookup_marked(pins, table, node, name, true, now);
+        observe(pins, table, node, name, answers, &DropLimiter::new(), now);
+    }
+
     /// NET-085: a resident `host_ip` box's declared names pin in an entry
     /// of their own, fed by the node address's lookups. Its pins admit a
     /// box-marked frame and never the node plane's own frames, a baseline
@@ -1994,7 +2030,7 @@ pub(crate) mod tests {
             !pins.admits_host_ip_frame(&table, site.octets(), None, now),
             "nothing is pinned before a lookup"
         );
-        node_resolves(&pins, &table, &baseline, "example.com", &[site], now);
+        host_ip_resolves(&pins, &table, "example.com", &[site], now);
         assert!(
             pins.admits_host_ip_frame(&table, site.octets(), None, now),
             "the box's declared name pins its answer for a box-marked frame"
@@ -2021,6 +2057,42 @@ pub(crate) mod tests {
         assert!(
             !pins.admits_host_ip_frame(&table, site.octets(), None, now),
             "a retired box's pins go with it"
+        );
+    }
+
+    /// NET-085: the node address's lookups split by the query frame's mark,
+    /// the same way its frames split. A marked query for a baseline name
+    /// never pins for the node plane, and an unmarked query for a name a
+    /// resident `host_ip` box declared never pins for that box.
+    #[test]
+    fn node_address_queries_pin_only_in_the_entry_their_mark_names() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        assert!(registry.admit_host_ip_box(
+            boxes::SessionId::mint(),
+            Some(&EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                deny_subnets: None,
+            }),
+        ));
+        pins.adopt_baseline(&baseline);
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+        host_ip_resolves(&pins, &table, DAEMON_CACHE_ENDPOINT, &[cache], now);
+        assert!(
+            !pins.admits_node_frame(&table, &baseline, cache.octets(), None, now),
+            "a marked query for a baseline name never pins for the node plane"
+        );
+        let site = Ipv4Addr::new(203, 0, 113, 50);
+        node_resolves(&pins, &table, &baseline, "example.com", &[site], now);
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "an unmarked query for a host_ip box's name never pins for that box"
         );
     }
 

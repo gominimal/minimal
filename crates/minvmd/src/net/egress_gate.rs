@@ -4529,7 +4529,13 @@ async fn relay_frames_to_switch(
         // the resolver's port — and only for a frame the queue took, which
         // is why this sits after the enqueue.
         if let Some((query, datagram)) = dns {
-            pins.observe_query(table, &query, datagram, Instant::now());
+            pins.observe_query(
+                table,
+                &query,
+                datagram,
+                summary.box_cohort_marked(),
+                Instant::now(),
+            );
         }
     }
 }
