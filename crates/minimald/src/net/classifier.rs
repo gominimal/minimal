@@ -2622,6 +2622,13 @@ static HELD_DATAGRAM_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
 /// a port the box never saw refused.
 pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
     let listeners = bind_probe_listeners()?;
+    // Every endpoint binds before any drain thread runs, so a failed
+    // datagram bind returns with no TCP listener served and none published.
+    let sockets = bind_datagram_endpoints()?;
+    let datagram_endpoints: Vec<(Family, SocketAddr)> = sockets
+        .iter()
+        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
     let endpoints: Vec<(Family, SocketAddr)> = listeners
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
@@ -2641,11 +2648,6 @@ pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
             ))
         })?;
     }
-    let sockets = bind_datagram_endpoints()?;
-    let datagram_endpoints: Vec<(Family, SocketAddr)> = sockets
-        .iter()
-        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
-        .collect();
     for (family, socket) in sockets {
         let draining = std::thread::Builder::new()
             .name(format!("minimald-classifier-probe-udp-{}", family.name()))
@@ -8393,43 +8395,20 @@ mod tests {
             "the refusal names the iptables rule, its table and chain: {text}"
         );
 
-        // A CONNMARK --restore-mark with no mask, or an all-ones one, copies
-        // every bit of the connection mark, so it is refused too.
-        for restore in ["--restore-mark", "--restore-mark --ctmask 0xffffffff"] {
-            let mount = standin_mount();
-            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
-            host_ruleset_tools(
-                tools.path(),
-                "",
-                &format!(
-                    "*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK {restore}\nCOMMIT\n"
-                ),
-            );
-            let refused = run_install_with(&mount, &[], tools.path());
-            let text = said(&refused);
-            assert!(
-                !refused.status.success()
-                    && text.contains(&format!(
-                        "iptables table mangle, chain OUTPUT: -A OUTPUT -p udp -j CONNMARK \
-                         {restore} (writes every bit of the connection mark)"
-                    )),
-                "a CONNMARK {restore} is refused as a whole-mark writer: {text}"
-            );
-        }
-
-        // A restore with a narrow mask is no conflict.
+        // A CONNMARK --restore-mark writes only the packet mark, never the
+        // connection mark, so a restore with no mask is no conflict.
         let mount = standin_mount();
         let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
         host_ruleset_tools(
             tools.path(),
             "",
             "*mangle\n:OUTPUT ACCEPT [0:0]\n\
-             -A OUTPUT -p udp -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff\nCOMMIT\n",
+             -A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n",
         );
         let installed = run_install_with(&mount, &[], tools.path());
         assert!(
             installed.status.success(),
-            "a --restore-mark with a narrow mask does not block the install: {}",
+            "a --restore-mark with no mask does not block the install: {}",
             said(&installed)
         );
 

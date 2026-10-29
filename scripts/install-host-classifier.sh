@@ -1201,10 +1201,7 @@ ct_mark_conflicts_in() {
             # nft `ct mark set` whose value is not a read of the ct mark
             # itself (`ct mark set meta mark`, `ct mark set 0x1`), a CONNMARK
             # --set-mark or --set-xmark with no "/mask", and a CONNMARK
-            # --save-mark with no --mask or --ctmask. A CONNMARK
-            # --restore-mark with no --mask, --ctmask or --nfmask, or an
-            # all-ones one, copies every bit of the connection mark into the
-            # packet mark, and counts as a whole-mark writer too.
+            # --save-mark with no --mask or --ctmask.
             if (match(line, /ct mark set /)) {
                 if (substr(line, RSTART + RLENGTH) !~ /^ct mark( |$)/) whole = 1
             }
@@ -1218,10 +1215,6 @@ ct_mark_conflicts_in() {
                 if (line ~ /--save-mark/) {
                     if (line !~ /--(mask|ctmask) /) whole = 1
                     if (tolower(line) ~ /--(mask|ctmask) 0xffffffff/) whole = 1
-                }
-                if (line ~ /--restore-mark/) {
-                    if (line !~ /--(mask|ctmask|nfmask) /) whole = 1
-                    if (tolower(line) ~ /--(mask|ctmask|nfmask) 0xffffffff/) whole = 1
                 }
             }
             if (whole) hit = 1

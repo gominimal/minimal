@@ -3169,10 +3169,9 @@ still vouches for the table it loaded" \
     check 1 "$rc" "an explicit default-mask install refuses again"
     NFT_RULESET=
 
-    # --- A CONNMARK --restore-mark with no mask, or an all-ones one, copies
-    # every bit of the connection mark, so it is refused as a whole-mark
-    # writer under any mask. A restore with a narrow mask is no conflict.
-    # A stand-in iptables-save serves the listing beside it.
+    # --- A CONNMARK --restore-mark copies the connection mark into the
+    # packet mark and never writes the connection mark, so a restore with
+    # no mask is no conflict. A stand-in iptables-save serves the listing.
     _iptdir="$root/hc-iptables-save"; mkdir -p "$_iptdir"
     cat >"$_iptdir/iptables-save" <<'STUB'
 #!/bin/sh
@@ -3180,22 +3179,11 @@ cat "$(dirname "$0")/listing"
 STUB
     chmod 0755 "$_iptdir/iptables-save"
     HC_PATH_PREFIX="$_iptdir"
-    for _restore in "" "--ctmask 0xffffffff"; do
-        printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark%s\nCOMMIT\n' \
-            "${_restore:+ $_restore}" >"$_iptdir/listing"
-        run_hc "restore_mark_${_restore:-nomask}" "$root/mi-on" --user "$me" \
-            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-        check 1 "$rc" "a --restore-mark with mask [${_restore}] is refused"
-        want_ok "the refusal names the restore-mark rule [${_restore}]" \
-            grep -q "iptables table mangle, chain OUTPUT: -A OUTPUT -p udp -j CONNMARK --restore-mark${_restore:+ $_restore} (writes every bit of the connection mark)" "$OUT"
-        want_ok "the refusal says no --ct-mark-mask avoids it [${_restore}]" \
-            grep -q "no --ct-mark-mask avoids it" "$OUT"
-    done
-    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff\nCOMMIT\n' \
+    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n' \
         >"$_iptdir/listing"
-    run_hc restore_mark_narrow "$root/mi-on" --user "$me" \
+    run_hc restore_mark_nomask "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 0 "$rc" "a --restore-mark with a narrow mask does not block the install"
+    check 0 "$rc" "a --restore-mark with no mask does not block the install"
     unset HC_PATH_PREFIX
 
     # --- A mask in a range a well-known component classes with is refused
