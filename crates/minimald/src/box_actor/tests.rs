@@ -13720,6 +13720,57 @@ async fn resume_refuses_when_name_held_by_running_box() {
     .await;
 }
 
+/// BOX-025, BOX-005: two stopped boxes that share a name resume at once.
+/// Each has its own actor, so the name check claims the name in the
+/// manager. Exactly one box runs. The other is refused with exit status 2
+/// and keeps its `stopped` record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_concurrent_same_name_runs_exactly_one() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut boxes_ = Vec::new();
+    // Unnamed boxes answer to their project directory's name, a pair the
+    // store's name-uniqueness check never sees.
+    for project in ["/a/pair", "/b/pair"] {
+        let id =
+            create_session_with_spec(&mut client, None, project, Some(resume_spec(true))).await;
+        let ending = stop_through_daemon(&server, id).await;
+        boxes_.push((id, ending));
+    }
+    let mut first = server.connect().await;
+    let mut second = server.connect().await;
+    let (a, b) = tokio::join!(
+        attach_and_echo(&mut first, boxes_[0].0),
+        attach_and_echo(&mut second, boxes_[1].0),
+    );
+
+    let (ran, refused, out) = match (a, b) {
+        (Ok(()), Err(out)) => (boxes_[0], boxes_[1], out),
+        (Err(out), Ok(())) => (boxes_[1], boxes_[0], out),
+        other => panic!("exactly one resume must run: {other:?}"),
+    };
+    let (text, exit_status) = out;
+    assert_eq!(exit_status, Some(2), "{text:?}");
+    assert!(text.contains("cannot resume"), "{text:?}");
+    assert_eq!(
+        read_record(&server, ran.0).await.state().unwrap(),
+        RecordState::Running
+    );
+    assert_eq!(
+        read_record(&server, refused.0).await.state().unwrap(),
+        RecordState::Stopped(refused.1)
+    );
+    assert!(
+        event_kinds(&server, refused.0)
+            .await
+            .iter()
+            .all(|e| e.kind != boxes::events::BoxEventType::Resumed),
+        "a refused resume writes no resumed event"
+    );
+}
+
 /// BOX-025: a record the name check cannot read can belong to a running
 /// box that holds the name, so the resume is refused and the box stays
 /// stopped.

@@ -1277,9 +1277,12 @@ impl BoxActor {
             ));
         }
 
-        // BOX-025: a running box that holds this box's name keeps it. The
-        // manager answers from the store alone, bounded so a manager that
-        // waits on this actor cannot wedge the attach.
+        // BOX-025: a running box that holds this box's name keeps it, and so
+        // does a box whose resume claimed the name first. A check that finds
+        // no holder claims the name for this box, and every path below
+        // releases the claim. The manager answers from the store and its
+        // claims alone, bounded so a manager that waits on this actor cannot
+        // wedge the attach.
         let manager = self.manager.upgrade().ok_or_else(|| {
             AttachError::LoadoutFailed(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -1301,7 +1304,33 @@ impl BoxActor {
                 tracing::info!(refusal = "name", %error, "resume: the name check failed");
                 refused(error.kind(), 2, error.to_string())
             })?;
-            if let Some((holder, holder_id)) = holder {
+            if let Some(crate::box_manager::NameHolder {
+                name: holder,
+                id: holder_id,
+                resuming: true,
+            }) = holder
+            {
+                tracing::info!(
+                    refusal = "name",
+                    holder = %holder,
+                    holder_id = %holder_id,
+                    "resume: another box resuming now claimed the name"
+                );
+                return Err(refused(
+                    std::io::ErrorKind::AlreadyExists,
+                    2,
+                    format!(
+                        "Session `{holder_id}` is resuming now with the name `{name}`. Attach \
+                         again when that resume ends."
+                    ),
+                ));
+            }
+            if let Some(crate::box_manager::NameHolder {
+                name: holder,
+                id: holder_id,
+                ..
+            }) = holder
+            {
                 tracing::info!(
                     refusal = "name",
                     holder = %holder,
@@ -1319,8 +1348,12 @@ impl BoxActor {
             }
             Ok(())
         };
-        check_name().await?;
-
+        if let Err(error) = check_name().await {
+            // A check that timed out can still have claimed the name.
+            manager.release_name_claim(id).await;
+            return Err(error);
+        }
+        let outcome: Result<bool, AttachError> = async {
         // BOX-025: the box restarts from the spec stored at its creation
         // (BOX-068), refused as a create of that spec would be refused.
         let mut resumed = record.clone();
@@ -1375,22 +1408,6 @@ impl BoxActor {
             .write(resumed)
             .await
             .map_err(AttachError::LaunchRecordUnwritable)?;
-        // The check above and this write are not one step, and each box has
-        // its own actor. Two stopped boxes that share a name can both pass
-        // the check and both write `running`. So the name is checked again
-        // now that this record reads `running`. A resume that finds another
-        // running holder puts its record back and refuses. Of two such
-        // resumes, the later check always sees the earlier write, so at
-        // most one box keeps the name.
-        if let Err(error) = check_name().await {
-            if let Err(write_error) = self.record.write(record).await {
-                tracing::warn!(
-                    error = %write_error,
-                    "resume: could not put the record back after the second name check",
-                );
-            }
-            return Err(error);
-        }
         // The box came up without its name when another box routed it. That
         // box no longer runs with the name, so the resumed box takes it.
         #[cfg(target_os = "linux")]
@@ -1409,6 +1426,12 @@ impl BoxActor {
                 .mark_running(id);
         }
         Ok(stored.is_some())
+        }
+        .await;
+        // The record reads `running` now, or the resume was refused: the
+        // record holds the name from here, or nothing does.
+        manager.release_name_claim(id).await;
+        outcome
     }
 
     /// The async task which handles interactions with the session.
