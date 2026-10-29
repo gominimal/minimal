@@ -6,7 +6,7 @@
 //! before it is loaded, and a request through the proxy is answered before
 //! anything refused it.
 //!
-//! Seven proofs, all `#[ignore]`d so the default suite and the surveyed
+//! Ten proofs, all `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
 //! `minimald-root-integration` job runs this binary, and its recipe
 //! (`just test-root-integration`) runs it unprivileged — the same posture
@@ -44,8 +44,13 @@
 //! only the mask's bits move (`foreign_ct_mark_bits_survive_classification`);
 //! and that the install refuses over a host already classing with the
 //! default bits, naming the rule and the override that escapes it
-//! (`install_refuses_an_overlapping_ct_mark_user`). The identity proof
-//! drives an eighth `#[ignore]`d test as its observer — the half of
+//! (`install_refuses_an_overlapping_ct_mark_user`). Three more close the
+//! classifier's gaps: the install refuses over a rule that writes the
+//! whole mark (`install_refuses_a_whole_mark_ct_writer`) and a mask in a
+//! well-known component's range (`install_refuses_a_well_known_mark_range`),
+//! and the table refuses an allow box's IPv6 connection to a peer
+//! (`host_ip_box_ipv6_egress_refused`). The identity proof drives an
+//! eleventh `#[ignore]`d test as its observer — the half of
 //! itself that runs re-exec'd inside the peer's namespace — which passes
 //! on its own, with nothing to observe.
 //!
@@ -63,7 +68,7 @@
 )]
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -847,7 +852,16 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
 
     // The reading: the table's refusal as the probe's legs met it, one
     // errno per family — the two loopbacks the decision's proofs name.
+    // `read_filter` is the per-launch reading, whose datagram leg pays no
+    // SYN retransmit: a refused TCP connect fails only at the first one, a
+    // second after it was sent.
+    let began = std::time::Instant::now();
     let reading = read_filter(&scratch);
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the per-launch reading of a refusing table waits no retransmit: {elapsed:?}"
+    );
     let legs = reading.legs();
     assert!(
         matches!(reading, Reading::Refused(_)),
@@ -2217,4 +2231,289 @@ fn install_refuses_an_overlapping_ct_mark_user() {
          rendered it: {}",
         scratch.display()
     );
+}
+
+/// A refusal's whole text, stdout and stderr together, for the asserts.
+fn refusal_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// A rule that writes the connection mark with no mask writes every bit
+/// of it, so it overlaps the bits of any mask. The scan reads it live
+/// here: a fixture table stands in for such a component, as wg-quick's
+/// `ct mark set meta mark` is one, and is loaded before the install. The
+/// install refuses with the default mask and with a mask nothing else
+/// names, it names the rule with its table and chain, and it lays out
+/// nothing.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "proves the install's conflict scan live, over a standing whole-mark ct writer on this host; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn install_refuses_a_whole_mark_ct_writer() {
+    if !nft_present() {
+        eprintln!(
+            "skipping install_refuses_a_whole_mark_ct_writer: no nft on this \
+             host — the install's nftables transaction is the artifact under \
+             proof (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-whole-{}", std::process::id()));
+    let _install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+
+    // The standing writer, kept inert by the narrowest match that still
+    // writes the whole mark.
+    let fixture = format!("minimald_proof_whole_{}", std::process::id());
+    load_fixture_table(
+        &fixture,
+        &format!(
+            "table inet {fixture} {{
+    chain set_mark {{
+        type filter hook output priority filter; policy accept;
+        oifname \"lo\" tcp dport 9 ct mark set meta mark
+    }}
+}}
+"
+        ),
+    );
+    let _fixture = FixtureTable(fixture.clone());
+
+    for extra in [&[][..], &["--ct-mark-mask", "0x0c000000"][..]] {
+        let refused = install_over_scratch_with(&scratch, &account, extra);
+        let refusal = refusal_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses over a whole-mark ct writer with {extra:?}: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("table inet {fixture}, chain set_mark: ")),
+            "the refusal names the table and chain the rule is in: {refusal}"
+        );
+        // nft can list `meta mark` with or without its `meta`.
+        assert!(
+            refusal.contains("ct mark set meta mark") || refusal.contains("ct mark set mark"),
+            "the refusal names the rule it found: {refusal}"
+        );
+        assert!(
+            refusal.contains("writes every bit of the connection mark"),
+            "the refusal says why no mask avoids the rule: {refusal}"
+        );
+        assert!(
+            !scratch.exists(),
+            "the refused install laid out no tree: {refusal}"
+        );
+    }
+}
+
+/// `--ct-mark-mask` refuses a mask in a range a well-known component
+/// classes with, on a host that shows no user of it yet: the component
+/// can start after the install. The refusal names the range and the
+/// component, names `min finalize-install --ct-mark-mask <mask>`, and lays
+/// out nothing.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "runs the install over this host's real cgroup2 with a mask in a well-known range; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn install_refuses_a_well_known_mark_range() {
+    if !nft_present() {
+        eprintln!(
+            "skipping install_refuses_a_well_known_mark_range: no nft on this \
+             host — the install's nftables transaction is the artifact under \
+             proof (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-range-{}", std::process::id()));
+    let _install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    for (mask, component, range) in [
+        ("0x00030000", "Tailscale", "0x00ff0000"),
+        ("0x0000c000", "kube-proxy", "0x0000c000"),
+    ] {
+        let refused = install_over_scratch_with(&scratch, &account, &["--ct-mark-mask", mask]);
+        let refusal = refusal_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses mask {mask}: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("uses bits in {range}, the range {component}")),
+            "the refusal names the range and its component: {refusal}"
+        );
+        assert!(
+            refusal.contains("min finalize-install --ct-mark-mask <mask>"),
+            "the refusal names the command that reruns with two other bits: {refusal}"
+        );
+        assert!(
+            !scratch.exists(),
+            "the refused install laid out no tree: {refusal}"
+        );
+    }
+}
+
+/// The host-side end of the IPv6 proof's veth pair and the two addresses
+/// on it, out of the IPv6 documentation prefix, which no host routes.
+const HOST_VETH6: &str = "mclass6-host";
+const PEER_VETH6: &str = "mclass6-peer";
+const HOST_VETH6_ADDRESS: &str = "2001:db8:6c::1";
+const PEER6_ADDRESS: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x6c, 0, 0, 0, 0, 2);
+
+/// The packets the loaded table's named refusal counter holds, as
+/// `nft list counter` prints them.
+fn refused_packets() -> u64 {
+    let listed = nft(&["list", "counter", "inet", TABLE_NAME, "refused"]);
+    assert!(
+        listed.status.success(),
+        "listing the table's refusal counter: {}",
+        refusal_text(&listed)
+    );
+    let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+    text.split("packets ")
+        .nth(1)
+        .and_then(|counted| counted.split_whitespace().next())
+        .and_then(|counted| counted.parse().ok())
+        .unwrap_or_else(|| panic!("the refusal counter's packets: {text}"))
+}
+
+/// NET-079, live: an allow box of the host-address cohort opens an IPv6
+/// connection to a peer behind a veth, and the loaded table refuses it,
+/// EACCES, the IPv6 reading of `reject with icmpx admin-prohibited`. A
+/// leg from the daemon's leaf, outside the boxes subtree, reaches the same
+/// peer, which answers with a reset (no listener there), so the refusal is
+/// the table's and not the path's. The box's IPv6 loopback stays open, and
+/// the refusal counts in the table's one refusal counter.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "loads the installer's table and drives an allow box's IPv6 connection to a peer behind a veth; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn host_ip_box_ipv6_egress_refused() {
+    if !nft_present() {
+        eprintln!(
+            "skipping host_ip_box_ipv6_egress_refused: no nft on this host — \
+             the install's nftables transaction is the artifact under proof \
+             (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-ipv6-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    place_this_process_in_the_tree(&scratch);
+    let leaf = create_box_leaf(&scratch, "ipv6box", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    install.leaf = Some(leaf.clone());
+
+    // The veth pair and the peer's namespace. `nodad` makes each address
+    // usable at once, with no duplicate-address wait.
+    let _veth = Veth(HOST_VETH6);
+    let holder = spawn_netns_holder();
+    let host_prefix = format!("{HOST_VETH6_ADDRESS}/64");
+    let peer_prefix = format!("{PEER6_ADDRESS}/64");
+    ip(&[
+        "link", "add", HOST_VETH6, "type", "veth", "peer", "name", PEER_VETH6,
+    ]);
+    ip(&["link", "set", PEER_VETH6, "netns", &holder.pid.to_string()]);
+    ip(&[
+        "-6",
+        "address",
+        "add",
+        &host_prefix,
+        "dev",
+        HOST_VETH6,
+        "nodad",
+    ]);
+    ip(&["link", "set", HOST_VETH6, "up"]);
+    nsenter_ip(holder.pid, &["link", "set", "lo", "up"]);
+    nsenter_ip(
+        holder.pid,
+        &[
+            "-6",
+            "address",
+            "add",
+            &peer_prefix,
+            "dev",
+            PEER_VETH6,
+            "nodad",
+        ],
+    );
+    nsenter_ip(holder.pid, &["link", "set", PEER_VETH6, "up"]);
+    // Port 9 in a fresh namespace: nothing listens, so a SYN that arrives
+    // is answered with a reset.
+    let peer = SocketAddr::from((PEER6_ADDRESS, 9));
+
+    // The control leg, from the daemon's leaf: the peer is reachable, and
+    // answers with a reset.
+    migrate_self(&daemon_leaf(&scratch).join("cgroup.procs"));
+    let control = TcpStream::connect_timeout(&peer, Duration::from_secs(10));
+    assert_eq!(
+        control
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ECONNREFUSED),
+        "the daemon leaf's IPv6 leg reaches the peer, which resets it: {control:?}"
+    );
+
+    // The box's leg, from the allow leaf: refused by the table.
+    let before = refused_packets();
+    migrate_self(&leaf.join("cgroup.procs"));
+    let refused = TcpStream::connect_timeout(&peer, Duration::from_secs(10));
+    assert_eq!(
+        refused
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::EACCES),
+        "the allow box's IPv6 connection to the peer is refused by the table: {refused:?}"
+    );
+    assert!(
+        refused_packets() > before,
+        "the IPv6 refusal counts in the table's refusal counter"
+    );
+
+    // The same box's IPv6 loopback is not refused.
+    let loopback =
+        TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).expect("binding an IPv6 loopback listener");
+    let loop_port = loopback
+        .local_addr()
+        .expect("the IPv6 loopback listener's address")
+        .port();
+    TcpStream::connect((Ipv6Addr::LOCALHOST, loop_port))
+        .expect("the allow box's IPv6 loopback leg is not refused");
+
+    // Out of the box's leaf before the guard removes it.
+    migrate_self(&daemon_leaf(&scratch).join("cgroup.procs"));
 }
