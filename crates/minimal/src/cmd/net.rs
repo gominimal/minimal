@@ -55,7 +55,16 @@ pub async fn cmd_net_forward(
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-    let record = resolve_session_version_gated(&mut client, &args.session).await?;
+    // The name alone decides where to look (NET-058): a box on another VM is
+    // forwarded over that VM's socket, with no global flag.
+    let (record, sock) = crate::cmd::resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Forwarding to",
+    )
+    .await?;
 
     // Loopback only: the forward publishes a box's service to the laptop
     // running the command, not to the network the laptop sits on. A local
