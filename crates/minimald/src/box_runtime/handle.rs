@@ -562,4 +562,9 @@ pub struct HostAttrs {
     /// launch. Nothing for a none box or an own-IP box, whose verdicts are
     /// decided on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
+
+    /// The pid of the box's container supervisor, which a stop signals the
+    /// box's processes from (BOX-013). `None` only for attrs no host
+    /// reported.
+    pub(crate) container_pid: Option<u32>,
 }

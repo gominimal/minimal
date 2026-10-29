@@ -1377,6 +1377,156 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
     Ok(())
 }
 
+/// BOX-154: sets every record the daemon finds `running` at its start, with
+/// no process left in the box, to `stopped` with no exit code and no signal,
+/// and records an `exited` event with that reason and no signal. No signal
+/// of this daemon ended such a box. Answers how many records it set.
+///
+/// Every box process dies with the daemon that launched it (the container
+/// arms `PR_SET_PDEATHSIG`), so a starting daemon finds no process in any
+/// box. A record marked to end with its run is left to the resume, which
+/// destroys it (NET-131, gominimal/inbox#731).
+///
+/// Not called at daemon start yet. No actor hosts a `stopped` box until
+/// #2393 (BOX-025), so the flip at start would leave every session that
+/// the restart resumes today without a way back. #2393 calls this from
+/// [`BoxManager::init`] beside [`reap_unresumable_records`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called at daemon start once a stopped box can be resumed (#2393)"
+    )
+)]
+pub(crate) async fn stop_orphaned_running_records(
+    store: &crate::store::StoreHandle,
+) -> Result<usize, std::io::Error> {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let mut stopped = 0;
+    for handle in store.handles().await? {
+        let mut record = match handle.record().await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %handle.id(),
+                    %error,
+                    "restart: could not read the record; its state is left as it is",
+                );
+                continue;
+            }
+        };
+        if record.ends_with_run || !matches!(record.state(), Ok(RecordState::Running)) {
+            continue;
+        }
+        let ending = StopEnding::AtDaemonStart;
+        record.set_state(RecordState::Stopped(ending));
+        handle.write(record).await?;
+        let object = handle.object().await?;
+        write_box_event(
+            &object,
+            BoxEventType::Exited,
+            crate::box_actor::stopped_event_data(ending),
+        )?;
+        tracing::info!(
+            session_id = %handle.id(),
+            "restart: set a running record with no process left to stopped, with no signal",
+        );
+        stopped += 1;
+    }
+    Ok(stopped)
+}
+
+impl BoxManagerHandle {
+    /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
+    /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
+    /// how the box ended.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is not running, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the stop itself ended on.
+    pub async fn stop_box(
+        &self,
+        id: SessionId,
+        force: bool,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        self.stop_box_with_grace(id, force, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::stop_box`] with the grace period `grace`.
+    pub(crate) async fn stop_box_with_grace(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let unknown = || {
+            std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            )
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        match record.state() {
+            Ok(boxes::core::record::RecordState::Running) => {}
+            Ok(state) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "session `{}` is {}, not running, so there is nothing to stop",
+                        id.as_ref(),
+                        state.name()
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+            }
+        }
+        tracing::info!(session_id = %id, force, "stop: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        let stopped = session.stop_box(force, grace).await;
+        if stopped.is_err() {
+            // A stop that waited behind another stop of the same box finds
+            // the actor gone when the first one ends. The record then says
+            // how the box ended, and that is this stop's answer too.
+            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
+                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
+            {
+                tracing::info!(
+                    session_id = %id,
+                    ending = ?ending,
+                    "stop: an earlier stop ended the box; answering with its ending"
+                );
+                return Ok(ending);
+            }
+        }
+        stopped
+    }
+}
+
 /// Per-session deadline for the host probes this manager makes — the
 /// attributes [`ManagerMessage::List`] reports, and the screen snapshot
 /// [`ManagerMessage::GetScreen`] answers with.
