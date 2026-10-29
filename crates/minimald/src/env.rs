@@ -2077,10 +2077,11 @@ impl BoxChannel {
             let lines = tapped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(refusal) = egress_refusal(
+            if let Some(refusal) = patched_build_refusal(
                 build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
                 pkg_name,
                 &self.name,
+                &e.to_string(),
                 lines.iter().map(String::as_str),
             ) {
                 let _ = writeln!(stream, "error: {refusal}");
@@ -2885,22 +2886,61 @@ impl tokio::io::AsyncWrite for StreamWriter {
 /// How many output lines of one build [`LineTap`] keeps.
 const TAPPED_LINES: usize = 64;
 
+/// The most bytes of one unfinished line [`LineTap`] holds. Past this bound
+/// it keeps only the tail, so output that never ends a line stays bounded.
+const TAPPED_LINE_BYTES: usize = 4096;
+
 /// A writer that passes every byte to `inner` and keeps the last
-/// [`TAPPED_LINES`] complete lines in `lines` (NET-155), so a build that
-/// fails can say what it could not reach.
-struct LineTap<W> {
+/// [`TAPPED_LINES`] lines in `lines` (NET-155), so a build that fails can say
+/// what it could not reach. A `\n` or a `\r` ends a line, so a progress meter
+/// that redraws with `\r` gives lines too. The text after the last line end
+/// is kept as a line when the tap shuts down or is dropped.
+pub(crate) struct LineTap<W> {
     inner: W,
     buf: Vec<u8>,
     lines: Arc<Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl<W> LineTap<W> {
-    fn new(inner: W, lines: Arc<Mutex<std::collections::VecDeque<String>>>) -> Self {
+    pub(crate) fn new(inner: W, lines: Arc<Mutex<std::collections::VecDeque<String>>>) -> Self {
         Self {
             inner,
             buf: Vec::new(),
             lines,
         }
+    }
+
+    /// How many bytes of an unfinished line the tap holds.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn keep(&self, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(line).into_owned();
+        let mut lines = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.len() == TAPPED_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    /// Keeps the text after the last line end as a line.
+    fn flush_line(&mut self) {
+        let rest = std::mem::take(&mut self.buf);
+        self.keep(&rest);
+    }
+}
+
+impl<W> Drop for LineTap<W> {
+    fn drop(&mut self) {
+        self.flush_line();
     }
 }
 
@@ -2916,17 +2956,15 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
             other => return other,
         };
         this.buf.extend_from_slice(&buf[..written]);
-        while let Some(pos) = this.buf.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&this.buf[..pos]).into_owned();
-            this.buf.drain(..=pos);
-            let mut lines = this
-                .lines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if lines.len() == TAPPED_LINES {
-                lines.pop_front();
+        if let Some(last) = this.buf.iter().rposition(|&b| b == b'\n' || b == b'\r') {
+            let done: Vec<u8> = this.buf.drain(..=last).collect();
+            for line in done.split(|&b| b == b'\n' || b == b'\r') {
+                this.keep(line);
             }
-            lines.push_back(line);
+        }
+        if this.buf.len() > TAPPED_LINE_BYTES {
+            let cut = this.buf.len() - TAPPED_LINE_BYTES;
+            this.buf.drain(..cut);
         }
         Poll::Ready(Ok(written))
     }
@@ -2942,6 +2980,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
+        self.flush_line();
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -3024,6 +3063,32 @@ pub(crate) fn build_denies_all(
         Some(leaf) => leaf.is_deny(),
         None => network.is_some_and(op::BuildNetwork::denies_all),
     }
+}
+
+/// The error line for an in-box patched build that the egress rules of its
+/// box refused (NET-155), or `None` when the refusal is not the rules'.
+/// `failure` is the build's own error. The error of a patched build names no
+/// package, so the refusal holds only when that error itself carries the
+/// destination [`refused_destination`] reads from `lines`. A build that
+/// tolerated a failed download and then failed for another reason is left
+/// with its own error.
+pub(crate) fn patched_build_refusal<'a>(
+    denies_all: bool,
+    package: &str,
+    box_name: &str,
+    failure: &str,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let destination = refused_destination(lines.iter().copied())?;
+    let host = destination
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or(destination.as_str(), |(h, _)| h);
+    if !failure.contains(host) {
+        return None;
+    }
+    egress_refusal(denies_all, package, box_name, lines)
 }
 
 /// The error line for a package build that the egress rules of its box

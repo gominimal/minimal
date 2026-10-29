@@ -12751,6 +12751,84 @@ fn box_package_build_refusal_names_destination_and_box() {
     );
 }
 
+/// NET-155: the in-box patched build reports a refusal only when the
+/// build's own error carries the refused destination. A deny box whose build
+/// tolerated a failed download and then failed to compile keeps the compile
+/// error.
+#[test]
+fn box_package_build_refusal_names_destination_and_box_only_for_the_error() {
+    use crate::env::{build_denies_all, patched_build_refusal};
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let deny = ClassifierLeaf::under(root, "b1", Verdict::Deny);
+    let denies_all = build_denies_all(Some(&deny), None);
+    let download = "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server";
+
+    // The download ended the build: its error carries the failed download.
+    let failure = format!("Invocation 0 failed with exit code 7: exit status\nstderr:\n{download}");
+    assert_eq!(
+        patched_build_refusal(
+            denies_all,
+            "hello",
+            "my-box",
+            &failure,
+            ["make: entering", download]
+        ),
+        Some(
+            "the build of hello could not reach example.com:443: \
+             the egress rules of box my-box do not allow it"
+                .to_string()
+        )
+    );
+
+    // A compile failure after a tolerated download is the build's own error.
+    let failure = "Invocation 0 failed with exit code 1: exit status\nstderr:\nerror: cc failed";
+    assert_eq!(
+        patched_build_refusal(
+            denies_all,
+            "hello",
+            "my-box",
+            failure,
+            [download, "cc -c hello.c", "error: cc failed"]
+        ),
+        None
+    );
+}
+
+/// NET-155: the build output tap ends a line at `\r` as well as `\n`, holds
+/// a bounded part of an unfinished line, and keeps the last unfinished line
+/// when it shuts down, so a final failure with no newline is still read.
+#[tokio::test]
+async fn box_package_build_refusal_names_destination_and_box_from_unfinished_output() {
+    use crate::env::{LineTap, refused_destination};
+    use tokio::io::AsyncWriteExt;
+
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut tap = LineTap::new(tokio::io::sink(), lines.clone());
+    for pct in 0..1000 {
+        tap.write_all(format!("  {pct:>3}% [=====>      ] 1.2MB/s\r").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(tap.pending(), 0);
+    }
+    // A long run with no line end at all keeps only a bounded tail.
+    tap.write_all(&vec![b'#'; 64 * 1024]).await.unwrap();
+    assert!(tap.pending() <= 4096, "held {} bytes", tap.pending());
+    tap.write_all(b"\n").await.unwrap();
+    tap.write_all(b"curl: (7) Failed to connect to example.com port 443")
+        .await
+        .unwrap();
+    tap.shutdown().await.unwrap();
+
+    let lines = lines.lock().unwrap();
+    assert!(lines.len() <= 64);
+    assert_eq!(
+        refused_destination(lines.iter().map(String::as_str)).as_deref(),
+        Some("example.com:443")
+    );
+}
+
 /// NET-155: a task of a box whose launch placed it in a classifier leaf is
 /// refused when the task's context has no leaf, with the same text the build
 /// side operation gives. Its builds never run outside the box's egress verdict.
