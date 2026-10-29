@@ -469,11 +469,23 @@ async fn serve_create_session(
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
-                    // naming advisory again (NET-122). NET-018 reads the
+                    // naming advisory again (NET-122). On a VM-backed daemon
+                    // the guest's own `lo` always carries the range, so the
+                    // forwarder walks the host's loopback instead, and the
+                    // flag is the host's verdict. NET-018 reads the
                     // answerer's half straight off the state, not off this
-                    // probe: the range the probe covers is the guest's on a
-                    // VM-backed host, so it is not the reply's fact to read.
-                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
+                    // probe.
+                    #[cfg(target_os = "linux")]
+                    let walked = mngr
+                        .session_start_range_walk()
+                        .await
+                        .map(|answer| session_start_range_walk_line(&id, &answer));
+                    #[cfg(not(target_os = "linux"))]
+                    let walked: Option<bool> = None;
+                    let interim_loopback = match walked {
+                        Some(interim) => interim,
+                        None => session_start_loopback_probe(&id).await.interim(),
+                    };
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -651,6 +663,40 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
         "session-start loopback probe picked the publish surface"
     );
     probe
+}
+
+/// The session-start line of a VM-backed daemon (NET-123): the same record
+/// [`session_start_loopback_probe`] writes, over the forwarder's walk of the
+/// host's loopback, with whether this start walked and how many boxes the
+/// landing moved off the `127.0.0.1` interim. Returns the reply's interim
+/// flag.
+#[cfg(target_os = "linux")]
+fn session_start_range_walk_line(
+    session_id: &SessionId,
+    answer: &crate::sessions::RangeWalkAnswer,
+) -> bool {
+    let probe = &answer.probe;
+    // A walk that got no answer over a present verdict keeps that verdict,
+    // so the box publishes in the range and the surface is the range's.
+    let interim = probe.interim() && !answer.kept_present;
+    let surface = if answer.kept_present {
+        "reserved-range"
+    } else {
+        probe.surface()
+    };
+    tracing::info!(
+        session_id = %session_id,
+        via = "forwarder",
+        walked = answer.walked,
+        moved_off_interim = answer.moved,
+        verdict_kept = answer.kept_present,
+        probe = %probe.summary(),
+        surface = %surface,
+        first_failure = ?probe.first_failure,
+        interim_loopback = interim,
+        "session-start loopback probe picked the publish surface"
+    );
+    interim
 }
 
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
@@ -5928,6 +5974,400 @@ mod tests {
             line.contains("interim_loopback=true"),
             "the interim verdict is on the line, for the log's reader: {line}"
         );
+    }
+
+    /// NET-123 on a VM-backed daemon, after `min finalize-install`: the
+    /// create handler asks the forwarder's walk of the host's loopback, not the
+    /// guest's own `lo`. Each session start walks again, whatever verdict
+    /// landed last. The walk after the host gains the range lands present: the
+    /// box standing at the `127.0.0.1` interim moves onto a range address, the
+    /// new box's grant comes from the range, and its reply clears the interim
+    /// flag. A present verdict is walked again too. When the range goes away
+    /// under the running VM, the next walk lands absent: the reply carries the
+    /// interim flag and the earlier box moves back to `127.0.0.1`. The stand-in
+    /// walk stands in for the host forwarder, which a harness daemon does not
+    /// have.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "linux")]
+    // Multi-thread: the held-forward step runs the real forwarder walk from
+    // inside the sync stand-in, through `block_in_place`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_start_rewalks_range_after_finalize_install() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // No local-probe stand-in may leak into these creates: the walk, not
+        // the local probe, must decide every reply here.
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let log = crate::test_harness::captured_log();
+        let server = TestServer::new().await;
+        let mngr = server.state.sessions_manager().await;
+        let installed = Arc::new(AtomicBool::new(false));
+        // When set, the stand-in walk times out at its first round: the
+        // forwarder never answered.
+        let stalled = Arc::new(AtomicBool::new(false));
+        let walks = Arc::new(AtomicUsize::new(0));
+        // When set, the stand-in runs the real forwarder walk against this
+        // control socket, in place of a fixed verdict.
+        let forwarder: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        {
+            let installed = Arc::clone(&installed);
+            let stalled = Arc::clone(&stalled);
+            let walks = Arc::clone(&walks);
+            let forwarder = Arc::clone(&forwarder);
+            mngr.install_range_walk_standin(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                let sock = forwarder.lock().expect("forwarder lock").clone();
+                if stalled.load(Ordering::SeqCst) {
+                    crate::net::loopback::RangeProbe {
+                        bound: 0,
+                        probed: ::switch::loopback::range_hosts().count(),
+                        first_failure: Some((
+                            std::net::Ipv4Addr::new(127, 0, 64, 1),
+                            std::io::ErrorKind::TimedOut,
+                        )),
+                    }
+                } else if let Some(sock) = sock {
+                    let control = crate::net::policy::ControlChannel::Unix(sock);
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(crate::net::policy::probe_publish_surface(&control))
+                    })
+                } else if installed.load(Ordering::SeqCst) {
+                    let hosts = ::switch::loopback::range_hosts().count();
+                    crate::net::loopback::RangeProbe {
+                        bound: hosts,
+                        probed: hosts,
+                        first_failure: None,
+                    }
+                } else {
+                    absent_range_probe()
+                }
+            });
+        }
+        // The daemon-start walk's verdict on a host without the range.
+        mngr.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+        let mut client = server.connect().await;
+
+        let before = client
+            .call::<CreateSession>(&req("before-install", "/uwu"))
+            .await
+            .ok()
+            .expect("an absent range must not refuse the session");
+        assert!(
+            before.interim_loopback,
+            "the host's walk found the range absent, so the reply carries the interim"
+        );
+        let line = probe_line(&log.contents(), &before.id);
+        assert!(
+            line.contains("via=\"forwarder\"") && line.contains("walked=true"),
+            "a session start on an absent verdict walks the forwarder: {line}"
+        );
+        assert!(
+            line.contains("surface=127.0.0.1-interim"),
+            "the line names the interim as the surface picked: {line}"
+        );
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+
+        // The box the absent verdict published at the interim.
+        let ports = std::collections::BTreeSet::from([8080]);
+        {
+            let registry = mngr.hostnames();
+            let mut routes = registry.write().expect("registry lock");
+            routes.publish_own_address(
+                before.id,
+                "before-install",
+                std::net::Ipv4Addr::LOCALHOST,
+                ports.clone(),
+            );
+            routes.register_own_ip(before.id, "before-install", ports);
+        }
+
+        // `min finalize-install` applies the range on the host.
+        installed.store(true, Ordering::SeqCst);
+        let after = client
+            .call::<CreateSession>(&req("after-install", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with the range present");
+        assert!(
+            !after.interim_loopback,
+            "the walk found the range present, so the reply clears the interim"
+        );
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "the session start walked again"
+        );
+        let line = probe_line(&log.contents(), &after.id);
+        assert!(
+            line.contains("surface=reserved-range") && line.contains("moved_off_interim=1"),
+            "the line names the range and the box it moved off the interim: {line}"
+        );
+
+        let moved = mngr
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(before.id)
+            .expect("the earlier box is still published");
+        assert!(
+            ::switch::loopback::range_hosts().any(|host| host == moved),
+            "the box at the interim moves onto a range address, got {moved}"
+        );
+        let after_address = match mngr
+            .loopback_book()
+            .grant(crate::net::dns::LeaseNamespace::Box { session: after.id })
+        {
+            crate::net::dns::LoopbackGrant::Granted(address) => {
+                assert!(
+                    ::switch::loopback::range_hosts().any(|host| host == address),
+                    "the new box is granted a range address, got {address}"
+                );
+                assert_ne!(address, moved, "the two boxes hold distinct addresses");
+                address
+            }
+            other => panic!("the new box's grant must come from the range, got {other:?}"),
+        };
+        assert!(
+            log.contents().lines().any(|line| {
+                line.contains("loopback-range-present-box")
+                    && line.contains(&format!("session_id={}", before.id))
+                    && line.contains(&format!("to={moved}"))
+            }),
+            "the move is logged with the session id and both addresses"
+        );
+
+        // A present verdict is walked again: the range can go away under a
+        // running VM, so every session start bind-probes it.
+        let later = client
+            .call::<CreateSession>(&req("later", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with the range present");
+        assert!(!later.interim_loopback);
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            3,
+            "a present verdict is walked again at the next session start"
+        );
+        let line = probe_line(&log.contents(), &later.id);
+        assert!(
+            line.contains("walked=true") && line.contains("surface=reserved-range"),
+            "the session start walked the range and found it present: {line}"
+        );
+
+        // A box holds a forward at its range address on the probe's own port:
+        // the real walk asks the stand-in forwarder, which refuses that
+        // address's round as in use. The address exists, so the walk counts it
+        // bound, the range stays present, and every box keeps its address.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        let held = format!("{moved}:21064");
+        let (unexposed_tx, mut unexposed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let stand_in = spawn_holding_forwarder(sock.clone(), held.clone(), unexposed_tx);
+        *forwarder.lock().expect("forwarder lock") = Some(sock);
+        let held_start = client
+            .call::<CreateSession>(&req("forward-held", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with the range present");
+        *forwarder.lock().expect("forwarder lock") = None;
+        stand_in.abort();
+        assert!(
+            !held_start.interim_loopback,
+            "a held probe port at one range address does not read the range absent"
+        );
+        assert_eq!(walks.load(Ordering::SeqCst), 4);
+        let line = probe_line(&log.contents(), &held_start.id);
+        assert!(
+            line.contains("walked=true") && line.contains("surface=reserved-range"),
+            "the walk found the range present beside the held forward: {line}"
+        );
+        {
+            let registry = mngr.hostnames();
+            let routes = registry.read().expect("registry lock");
+            assert_eq!(
+                routes.published_own_address(before.id),
+                Some(moved),
+                "the box holding the forward keeps its range address"
+            );
+        }
+        assert_eq!(
+            mngr.loopback_book()
+                .grant(crate::net::dns::LeaseNamespace::Box { session: after.id }),
+            crate::net::dns::LoopbackGrant::Granted(after_address),
+            "the other box keeps its range address"
+        );
+        let mut unexposed = Vec::new();
+        while let Ok(local) = unexposed_rx.try_recv() {
+            unexposed.push(local);
+        }
+        assert!(
+            !unexposed.contains(&held),
+            "the walk never releases the forward the box holds: {unexposed:?}"
+        );
+
+        // The forwarder stalls: the walk times out and gets no answer. That is
+        // a fault of the channel, not an absent range, so the present verdict
+        // stays and every box keeps its range address.
+        stalled.store(true, Ordering::SeqCst);
+        let stalled_start = client
+            .call::<CreateSession>(&req("forwarder-stalled", "/uwu"))
+            .await
+            .ok()
+            .expect("a stalled walk must not refuse the session");
+        stalled.store(false, Ordering::SeqCst);
+        assert!(
+            !stalled_start.interim_loopback,
+            "a walk with no answer keeps the present verdict, so the reply stays off the interim"
+        );
+        assert_eq!(walks.load(Ordering::SeqCst), 5);
+        let line = probe_line(&log.contents(), &stalled_start.id);
+        assert!(
+            line.contains("walked=true")
+                && line.contains("verdict_kept=true")
+                && line.contains("surface=reserved-range"),
+            "the line says the walk kept the present verdict: {line}"
+        );
+        assert!(
+            mngr.loopback_book()
+                .vouches_for(::switch::loopback::range_hosts().next().unwrap()),
+            "the book still holds the present verdict"
+        );
+        assert_eq!(
+            mngr.hostnames()
+                .read()
+                .expect("registry lock")
+                .published_own_address(before.id),
+            Some(moved),
+            "a stalled walk moves no box off its range address"
+        );
+        let node = mngr
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .node_address();
+        assert!(
+            ::switch::loopback::range_hosts().any(|host| host == node),
+            "the present landing granted the node a range address, got {node}"
+        );
+
+        // The range goes away under the running VM.
+        installed.store(false, Ordering::SeqCst);
+        let gone = client
+            .call::<CreateSession>(&req("range-gone", "/uwu"))
+            .await
+            .ok()
+            .expect("an absent range must not refuse the session");
+        assert!(
+            gone.interim_loopback,
+            "the walk found the range absent after a present landing, so the \
+             reply carries the interim"
+        );
+        assert_eq!(walks.load(Ordering::SeqCst), 6);
+        let line = probe_line(&log.contents(), &gone.id);
+        assert!(
+            line.contains("walked=true") && line.contains("surface=127.0.0.1-interim"),
+            "the line names the interim as the surface picked: {line}"
+        );
+        assert_eq!(
+            mngr.hostnames()
+                .read()
+                .expect("registry lock")
+                .published_own_address(before.id),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "the absent landing moves the earlier box off its range address onto the interim"
+        );
+        assert!(
+            log.contents().lines().any(|line| {
+                line.contains("loopback-range-absent-box")
+                    && line.contains(&format!("session_id={}", before.id))
+                    && line.contains(&format!("from={moved}"))
+            }),
+            "the move back to the interim is logged with the session id and both addresses"
+        );
+        assert_eq!(
+            mngr.hostnames()
+                .read()
+                .expect("registry lock")
+                .node_address(),
+            std::net::Ipv4Addr::LOCALHOST,
+            "the absent landing moves the node's address off the range onto the interim"
+        );
+        assert!(
+            log.contents().lines().any(|line| {
+                line.contains("loopback-range-absent-node")
+                    && line.contains(&format!("from={node}"))
+                    && line.contains("to=127.0.0.1")
+            }),
+            "the node's move to the interim is logged with both addresses"
+        );
+    }
+
+    /// A stand-in host forwarder on `path` for the range walk: it answers every
+    /// expose `200`, except an expose of `held`, which it refuses as a forward
+    /// it already runs (`proxy already running`, HTTP 500). It reports each
+    /// unexpose's `local` on `unexposed`.
+    #[cfg(target_os = "linux")]
+    fn spawn_holding_forwarder(
+        path: std::path::PathBuf,
+        held: String,
+        unexposed: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        crate::traced::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut scratch = [0u8; 512];
+                let body = loop {
+                    let n = conn.read(&mut scratch).await.unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&scratch[..n]);
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break Some(String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned());
+                    }
+                };
+                let Some(body) = body else { continue };
+                let local = body
+                    .split("\"local\":\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let is_expose = body.contains("\"remote\"");
+                let answer = if is_expose && local == held {
+                    let said = "proxy already running";
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                        said.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                let _ = conn.write_all(answer.as_bytes()).await;
+                if !is_expose {
+                    let _ = unexposed.send(local);
+                }
+            }
+        })
     }
 
     /// NET-018: once the answerer is serving beside the proxy, the replies

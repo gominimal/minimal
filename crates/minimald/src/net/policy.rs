@@ -20,7 +20,7 @@
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -929,7 +929,10 @@ pub async fn expose_dynamic(
 /// local probe classifies its binds — every address bound reads the range
 /// present; the first refusal names the first missing alias; anything that
 /// is not a bind — a refused request, a stall, an unreachable control
-/// channel — reads absent, never present.
+/// channel — reads absent, never present. The first failure's kind tells
+/// the two apart: `AddrNotAvailable` is a refusal the forwarder answered,
+/// and any other kind is a fault of the channel. The session-start walk
+/// keeps a present verdict over a fault (`RangeWalk` in `box_manager`).
 ///
 /// Why a second probe beside the local one: an own-address box's declared
 /// ports are bound by the **forwarder**, not by the daemon. On a native host
@@ -962,6 +965,19 @@ async fn probe_publish_surface_within(
     budget: Duration,
     request: Duration,
 ) -> ::switch::loopback::RangeProbe {
+    // One walk at a time in this process. The daemon-start walk and each
+    // session-start walk ask the same forwarder to bind the same probe port,
+    // so a second walk that overlapped the first would read the first's
+    // bind as a refusal. The wait is outside the budget: a session-start
+    // walk queued behind the daemon-start one still gets its whole walk.
+    let mut turn = RANGE_WALK_TURN.lock().await;
+    // The addresses at which an earlier walk on this channel may have left
+    // its own probe forward bound: an unexpose that failed, or a budget that
+    // expired between a round's expose and its unexpose. The forwarder
+    // answers `already running` from its own forward table, so a leftover
+    // probe forward would read as a held address, and so as bound, on every
+    // later walk, even after the host lost the address.
+    let held = turn.entry(format!("{control:?}")).or_default();
     let mut probe = ::switch::loopback::RangeProbe::failed_to_run();
     let hosts: Vec<Ipv4Addr> = ::switch::loopback::range_hosts().collect();
     let walk = tokio::time::timeout(budget, async {
@@ -972,34 +988,101 @@ async fn probe_publish_surface_within(
                 remote: format!("{}:1", Ipv4Addr::LOCALHOST),
                 protocol: "tcp".to_string(),
             };
-            match post_json_within(control, "/services/forwarder/expose", &expose, request).await {
-                Ok(()) => {
-                    probe.bound += 1;
-                    let unexpose = UnexposeRequest {
-                        local: expose.local,
-                        protocol: expose.protocol,
-                    };
-                    if let Err(error) = post_json_within(
-                        control,
-                        "/services/forwarder/unexpose",
-                        &unexpose,
-                        request,
-                    )
-                    .await
-                    {
-                        // Best-effort, like teardown's: a probe round left
-                        // bound holds one obscure port at one address, while
-                        // a walk that stopped here would leave the range
-                        // unread — the worse leak by far.
-                        tracing::warn!(
-                            local = %unexpose.local,
-                            error = %error,
-                            "releasing the loopback range probe's forwarder bind failed",
+            // Marked before the expose, so a budget cut inside this round
+            // leaves the address marked for the next walk to release.
+            let leftover = !held.insert(*address);
+            let mut answer =
+                post_json_within(control, "/services/forwarder/expose", &expose, request).await;
+            if leftover
+                && answer
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::AddrInUse)
+            {
+                // The holder can be this walk's own earlier probe forward.
+                // Release it and ask again, so the round reads the host and
+                // not the leftover. Only a probe round binds this port at a
+                // marked address, so the release takes no box's forward.
+                match release_range_probe(control, &expose.local, request).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            local = %expose.local,
+                            "released a loopback range probe forward that an earlier walk left bound",
                         );
+                        answer = post_json_within(
+                            control,
+                            "/services/forwarder/expose",
+                            &expose,
+                            request,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        // The leftover stays, so this round cannot vouch for
+                        // the address. Read it as the release's own failure.
+                        probe.first_failure.get_or_insert((*address, error.kind()));
+                        tracing::warn!(
+                            local = %expose.local,
+                            error = %error,
+                            "releasing a leftover loopback range probe forward failed, so the address does not count as bound",
+                        );
+                        continue;
                     }
                 }
+            }
+            match answer {
+                Ok(()) => {
+                    probe.bound += 1;
+                    match release_range_probe(control, &expose.local, request).await {
+                        Ok(()) => {
+                            held.remove(address);
+                        }
+                        Err(error) => {
+                            // Best-effort, like teardown's: a probe round left
+                            // bound holds one obscure port at one address, while
+                            // a walk that stopped here would leave the range
+                            // unread — the worse leak by far. The address stays
+                            // marked, so the next walk releases it first.
+                            tracing::warn!(
+                                local = %expose.local,
+                                error = %error,
+                                "releasing the loopback range probe's forwarder bind failed",
+                            );
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    // Something else already holds the probe port at this
+                    // address: a box's forward or a host_ip mirror on the same
+                    // port. The bind reached the address, so the address
+                    // exists and counts as bound (NET-123). Nothing of the
+                    // probe's is bound, so no unexpose runs: one would tear
+                    // down the holder's forward.
+                    held.remove(address);
+                    probe.bound += 1;
+                    tracing::debug!(
+                        local = %expose.local,
+                        error = %error,
+                        "the loopback range probe port is held at this address, so it counts as bound",
+                    );
+                }
                 Err(error) => {
-                    probe.first_failure.get_or_insert((*address, error.kind()));
+                    // A refusal the forwarder answered is recorded as the
+                    // bind refusal the local probe records, `AddrNotAvailable`:
+                    // the host said this address does not bind. Every other
+                    // error keeps its own kind (a timeout, a missing socket,
+                    // a malformed reply), so a session-start walk can tell a
+                    // fault of the channel from an answer about the range.
+                    let refused = is_forwarder_refusal(&error);
+                    if refused {
+                        // A refused bind holds nothing at the address.
+                        held.remove(address);
+                    }
+                    let kind = if refused {
+                        io::ErrorKind::AddrNotAvailable
+                    } else {
+                        error.kind()
+                    };
+                    probe.first_failure.get_or_insert((*address, kind));
                     if error.kind() == io::ErrorKind::TimedOut {
                         // A control channel that does not answer is not a
                         // fact about the host's loopback at all, so the walk
@@ -1032,6 +1115,20 @@ async fn probe_publish_surface_within(
             .get_or_insert((stuck, io::ErrorKind::TimedOut));
     }
     probe
+}
+
+/// Releases the range probe's forward at `local` (`POST
+/// /services/forwarder/unexpose`), within the walk's round bound.
+async fn release_range_probe(
+    control: &ControlChannel,
+    local: &str,
+    request: Duration,
+) -> io::Result<()> {
+    let unexpose = UnexposeRequest {
+        local: local.to_string(),
+        protocol: "tcp".to_string(),
+    };
+    post_json_within(control, "/services/forwarder/unexpose", &unexpose, request).await
 }
 
 /// A gvproxy DNS zone-add request body for `POST /services/dns/add`
@@ -1175,11 +1272,47 @@ pub(crate) async fn post_json_within<T: Serialize>(
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "gvproxy {path} returned HTTP {status}: {}",
-            String::from_utf8_lossy(body_after_headers(&response))
-        )))
+        let said = String::from_utf8_lossy(body_after_headers(&response));
+        // A refusal that says the listener is already held, by another host
+        // process (the OS's bind text) or by a forward this forwarder already
+        // runs, carries `AddrInUse`: the address exists, and a caller that
+        // reads the kind (the range walk) can tell it from a missing one.
+        let kind = if status == 500
+            && (said.contains(ADDRESS_IN_USE_BODY) || said.contains(ALREADY_RUNNING_BODY))
+        {
+            io::ErrorKind::AddrInUse
+        } else {
+            io::ErrorKind::Other
+        };
+        Err(io::Error::new(
+            kind,
+            ForwarderRefusal(format!("gvproxy {path} returned HTTP {status}: {said}")),
+        ))
     }
+}
+
+/// The error a control request carries when the forwarder answered with a
+/// non-2xx status: the forwarder was reached and said no. The range walk
+/// reads it apart from a fault of the channel itself (a timeout, a missing
+/// socket, a malformed reply), because only an answer is a fact about the
+/// host's loopback (NET-123).
+#[derive(Debug)]
+struct ForwarderRefusal(String);
+
+impl std::fmt::Display for ForwarderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ForwarderRefusal {}
+
+/// Whether `error` is a [`ForwarderRefusal`]: the forwarder answered the
+/// request and refused it.
+fn is_forwarder_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ForwarderRefusal>())
 }
 
 /// Writes `request` to a freshly-connected control stream and reads the response
@@ -1307,8 +1440,20 @@ const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 /// probes a given forwarder — the one that publishes through it, and a host
 /// gvproxy has one of those (the second-daemon-on-a-host shape is native,
 /// where the local bind probe runs instead) — so no concurrent walk can
-/// collide on it.
+/// collide on it. That daemon walks at its start and again at each session
+/// start, and [`RANGE_WALK_TURN`] runs those walks one at a time. A round
+/// that finds the port already held at an address (a box's forward or a
+/// host_ip mirror) counts that address as bound.
 const RANGE_PROBE_PORT: u16 = 21064;
+
+/// The turn every forwarder-conducted range walk in this process takes
+/// before its first round, so the daemon-start walk and the session-start
+/// walks never bind [`RANGE_PROBE_PORT`] at the same time. It also keeps,
+/// per control channel, the addresses at which a walk may have left its own
+/// probe forward bound, so the next walk releases that forward before it
+/// reads the address.
+static RANGE_WALK_TURN: tokio::sync::Mutex<BTreeMap<String, BTreeSet<Ipv4Addr>>> =
+    tokio::sync::Mutex::const_new(BTreeMap::new());
 
 /// Upper bound on the whole forwarder-conducted range walk — the backstop for
 /// the one pathology the per-request [`GVPROXY_CONTROL_TIMEOUT`] cannot
@@ -2207,6 +2352,187 @@ mod tests {
             );
         }
 
+        /// A range address whose probe port something already holds: a box's
+        /// forward through this forwarder (`proxy already running`) at one
+        /// address, a host_ip mirror held by another host process (the OS's
+        /// bind text) at another. Both refusals say the address exists, so
+        /// the walk counts each one bound and reads the range present. The
+        /// walk sends no unexpose for a held address, so the holder's forward
+        /// stays up.
+        #[tokio::test]
+        async fn counts_an_address_whose_probe_port_is_held_as_bound() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let box_held = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 3));
+            let mirror_held = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 9));
+            let (tx, mut asked) = mpsc::channel::<(String, String)>(1024);
+            let (box_held_s, mirror_held_s) = (box_held.clone(), mirror_held.clone());
+            let forwarder = crate::traced::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // An expose body carries `remote`, an unexpose body
+                    // does not: that tells the two verbs apart.
+                    let body = read_request(&mut conn).await;
+                    let local = local_of(&body);
+                    let verb = if String::from_utf8_lossy(&body).contains("\"remote\"") {
+                        "expose"
+                    } else {
+                        "unexpose"
+                    };
+                    let said = if verb == "expose" && local == box_held_s {
+                        Some("proxy already running".to_string())
+                    } else if verb == "expose" && local == mirror_held_s {
+                        Some(format!("listen tcp {local}: bind: address already in use"))
+                    } else {
+                        None
+                    };
+                    let answer = match said {
+                        Some(said) => format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                            said.len()
+                        ),
+                        None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    };
+                    conn.write_all(answer.as_bytes())
+                        .await
+                        .expect("the fake forwarder must answer");
+                    if tx.send((verb.to_string(), local)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+
+            assert!(
+                probe.present(),
+                "a held probe port says the address exists: {}",
+                probe.summary()
+            );
+            assert_eq!(probe.first_failure, None);
+            assert_eq!(probe.bound, 254, "{}", probe.summary());
+
+            let mut unexposed = Vec::new();
+            while let Some((verb, local)) = asked.recv().await {
+                if verb == "unexpose" {
+                    unexposed.push(local);
+                }
+            }
+            assert_eq!(
+                unexposed.len(),
+                252,
+                "one release per address the probe bound"
+            );
+            assert!(
+                !unexposed.contains(&box_held) && !unexposed.contains(&mirror_held),
+                "the walk never releases a forward it did not bind: {unexposed:?}"
+            );
+        }
+
+        /// A probe forward that an earlier walk left bound is released, not
+        /// counted. The first walk's unexpose fails at one address, so its
+        /// probe forward stays in the forwarder's table. The host then loses
+        /// that address. The forwarder still answers `already running` there
+        /// from its table, but the next walk releases its own leftover, asks
+        /// again, and reads the refusal: the range is absent.
+        #[tokio::test]
+        async fn a_probe_forward_left_by_an_earlier_walk_is_released_not_counted() {
+            use std::collections::BTreeSet;
+            use std::sync::{Arc, Mutex};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stuck = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            // The forwarder's forward table, the addresses the host binds,
+            // and how many unexposes at the stuck address still fail.
+            let table: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+            let host_has_stuck = Arc::new(Mutex::new(true));
+            let failing_unexposes = Arc::new(Mutex::new(1u32));
+            let (table_s, host_s, failing_s, stuck_s) = (
+                table.clone(),
+                host_has_stuck.clone(),
+                failing_unexposes.clone(),
+                stuck.clone(),
+            );
+            let forwarder = crate::traced::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let body = read_request(&mut conn).await;
+                    let local = local_of(&body);
+                    let expose = String::from_utf8_lossy(&body).contains("\"remote\"");
+                    let said: Option<String> = {
+                        let mut table = table_s.lock().unwrap();
+                        if expose {
+                            if table.contains(&local) {
+                                Some("proxy already running".to_string())
+                            } else if local == stuck_s && !*host_s.lock().unwrap() {
+                                Some(format!(
+                                    "listen tcp {local}: bind: can't assign requested address"
+                                ))
+                            } else {
+                                table.insert(local.clone());
+                                None
+                            }
+                        } else {
+                            let mut failing = failing_s.lock().unwrap();
+                            if local == stuck_s && *failing > 0 {
+                                *failing -= 1;
+                                Some("unexpose failed".to_string())
+                            } else {
+                                table.remove(&local);
+                                None
+                            }
+                        }
+                    };
+                    let answer = match said {
+                        Some(said) => format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                            said.len()
+                        ),
+                        None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    };
+                    conn.write_all(answer.as_bytes())
+                        .await
+                        .expect("the fake forwarder must answer");
+                }
+            });
+            let control = ControlChannel::Unix(sock);
+
+            let first = probe_publish_surface(&control).await;
+            assert!(first.present(), "{}", first.summary());
+            assert!(
+                table.lock().unwrap().contains(&stuck),
+                "the failed unexpose left the probe forward bound"
+            );
+
+            *host_has_stuck.lock().unwrap() = false;
+            let second = probe_publish_surface(&control).await;
+            forwarder.abort();
+
+            assert!(
+                !second.present(),
+                "a leftover probe forward never vouches for an address the host lost: {}",
+                second.summary()
+            );
+            assert_eq!(
+                second.first_failure,
+                Some((
+                    Ipv4Addr::new(127, 0, 64, 5),
+                    io::ErrorKind::AddrNotAvailable
+                )),
+            );
+            assert!(
+                table.lock().unwrap().is_empty(),
+                "the second walk released its leftover"
+            );
+        }
+
         /// The stock macOS host's shape (`docs/spikes/2026-09-22-macos-loopback-alias.md`):
         /// every bind on the range refused, so every expose is answered `500`
         /// — the range reads absent and the daemon behind that forwarder
@@ -2227,11 +2553,16 @@ mod tests {
             assert!(!probe.present());
             assert!(probe.interim());
             assert_eq!(probe.surface(), "127.0.0.1-interim");
-            // The refused request comes back as gvproxy's folded error, whose
-            // kind is `Other` — the address is the record's, never guessed.
+            // The forwarder answered and refused, so the walk records the
+            // bind refusal's kind, `AddrNotAvailable` — the answer a
+            // session-start walk lands absent on. The address is the
+            // record's, never guessed.
             assert_eq!(
                 probe.first_failure,
-                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::Other))
+                Some((
+                    Ipv4Addr::new(127, 0, 64, 1),
+                    io::ErrorKind::AddrNotAvailable
+                ))
             );
         }
 
