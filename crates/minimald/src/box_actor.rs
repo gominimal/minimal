@@ -139,6 +139,15 @@ pub(crate) struct BoxActorConfig {
     pub registers_name: bool,
 }
 
+/// A resume that set the record to `running` and waits for its launch:
+/// [`BoxActor::finish_resume`] records the `resumed` event, or puts the
+/// record back when the launch fails.
+pub(super) struct PendingResume {
+    from: boxes::core::record::RecordState,
+    span: tracing::Span,
+    restarted_from_stored_spec: bool,
+}
+
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
 /// as a state machine. Session-lifetime state (record snapshot, dirs,
 /// tracker, handles) lives on [`BoxActor`] itself.
@@ -997,16 +1006,17 @@ impl BoxActor {
     }
 
     /// Resumes a stopped or exited box before an attach (BOX-025, BOX-030):
-    /// sets its record to `running` from the spec stored at its creation,
-    /// and records a `resumed` event. The attach that follows starts its
-    /// processes from its retained filesystem, under the same id and name.
-    /// Answers `Ok(false)` for a box that has not ended.
+    /// sets its record to `running` from the spec stored at its creation.
+    /// The attach that follows starts its processes from its retained
+    /// filesystem, under the same id and name, and then hands the answer
+    /// to [`Self::finish_resume`]. Answers `Ok(None)` for a box that has not
+    /// ended.
     ///
     /// The refusals run in a fixed order, and the first that applies
     /// decides: the terminal, the name, the spec, an upload in flight, then
     /// the volumes. Each leaves the record as it was. One `box.resume` span
-    /// covers the resume and carries its outcome.
-    pub(super) async fn resume(&mut self) -> Result<bool, AttachError> {
+    /// covers the resume and its launch, and carries its outcome.
+    pub(super) async fn resume(&mut self) -> Result<Option<PendingResume>, AttachError> {
         use boxes::core::record::RecordState;
 
         let record = self
@@ -1016,7 +1026,7 @@ impl BoxActor {
             .map_err(AttachError::LoadoutFailed)?;
         let from = match record.state() {
             Ok(state @ (RecordState::Stopped(_) | RecordState::Exited(_))) => state,
-            Ok(_) => return Ok(false),
+            Ok(_) => return Ok(None),
             Err(error) => {
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1032,18 +1042,94 @@ impl BoxActor {
         );
         let resumed =
             tracing::Instrument::instrument(self.resume_ended(record, from), span.clone()).await;
-        match &resumed {
-            Ok(()) => {
-                span.record("outcome", "resumed");
-            }
+        match resumed {
+            Ok(restarted_from_stored_spec) => Ok(Some(PendingResume {
+                from,
+                span,
+                restarted_from_stored_spec,
+            })),
             Err(error) => {
                 span.record("outcome", "refused");
                 span.in_scope(
                     || tracing::info!(%error, "resume refused; the box state is unchanged"),
                 );
+                Err(error)
             }
         }
-        resumed.map(|()| true)
+    }
+
+    /// Completes a [`Self::resume`] once the attach's launch answered
+    /// `launched`. A box that now has a host is running again: it records
+    /// the `resumed` event. A launch that failed and left no host puts the
+    /// record back in the state it resumed from, so the box does not read
+    /// as running with no processes, and marks its name stopped again.
+    pub(super) async fn finish_resume(
+        &mut self,
+        pending: PendingResume,
+        launched: &Result<(), AttachError>,
+    ) {
+        let PendingResume {
+            from,
+            span,
+            restarted_from_stored_spec,
+        } = pending;
+        let outcome_span = span.clone();
+        let finish = async {
+            let has_host = matches!(self.inner, BoxInner::Active { host: Some(_), .. });
+            if let (Err(error), false) = (launched, has_host) {
+                span.record("outcome", "launch failed");
+                let restored = async {
+                    let mut record = self.record.record().await?;
+                    record.set_state(from);
+                    self.record.write(record).await
+                }
+                .await;
+                match restored {
+                    Ok(()) => tracing::info!(
+                        %error,
+                        to = from.name(),
+                        "resume: the launch failed, and the box is back in the state it resumed from"
+                    ),
+                    Err(restore_error) => tracing::warn!(
+                        %error,
+                        %restore_error,
+                        to = from.name(),
+                        "resume: the launch failed, and the record could not be put back"
+                    ),
+                }
+                self.mark_name_stopped().await;
+                return;
+            }
+            span.record("outcome", "resumed");
+            match self.record.object().await {
+                Ok(object) => {
+                    if let Err(error) = crate::box_manager::write_box_event(
+                        &object,
+                        boxes::events::BoxEventType::Resumed,
+                        crate::box_manager::resumed_event_data(&from),
+                    ) {
+                        // The record says running, and the attach went on: a
+                        // missing event must not strand a box that resumed.
+                        tracing::warn!(%error, "resume: could not write the resumed event");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "resume: could not open the box to write the resumed event");
+                }
+            }
+            let hooks: Vec<&str> = crate::hooks::HookEvent::ALL
+                .into_iter()
+                .filter(|event| event.runs_on_resume())
+                .map(crate::hooks::HookEvent::as_str)
+                .collect();
+            tracing::info!(
+                from = from.name(),
+                restarted_from_stored_spec,
+                hooks = ?hooks,
+                "resume: the box is running again"
+            );
+        };
+        tracing::Instrument::instrument(finish, outcome_span).await;
     }
 
     /// [`Self::resume`] for a box whose record says it ended `from`.
@@ -1051,7 +1137,7 @@ impl BoxActor {
         &mut self,
         record: Record,
         from: boxes::core::record::RecordState,
-    ) -> Result<(), AttachError> {
+    ) -> Result<bool, AttachError> {
         use boxes::core::record::RecordState;
 
         let name = registry_name(&record);
@@ -1177,32 +1263,12 @@ impl BoxActor {
             .write(resumed)
             .await
             .map_err(AttachError::LaunchRecordUnwritable)?;
-        if let Err(error) = crate::box_manager::write_box_event(
-            &object,
-            boxes::events::BoxEventType::Resumed,
-            crate::box_manager::resumed_event_data(&from),
-        ) {
-            // The record says running, and the attach goes on: a missing
-            // event must not strand a box that already resumed.
-            tracing::warn!(%error, "resume: could not write the resumed event");
-        }
         #[cfg(target_os = "linux")]
         self.hostnames
             .write()
             .expect("hostname registry lock poisoned")
             .mark_running(*self.record.id());
-        let hooks: Vec<&str> = crate::hooks::HookEvent::ALL
-            .into_iter()
-            .filter(|event| event.runs_on_resume())
-            .map(crate::hooks::HookEvent::as_str)
-            .collect();
-        tracing::info!(
-            from = from.name(),
-            restarted_from_stored_spec = stored.is_some(),
-            hooks = ?hooks,
-            "resume: the box is running again"
-        );
-        Ok(())
+        Ok(stored.is_some())
     }
 
     /// The async task which handles interactions with the session.

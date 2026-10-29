@@ -272,9 +272,36 @@ impl BoxActor {
 
         // BOX-025: an attach to a stopped or exited box resumes it first.
         // The resume sets the record to `running`, so the gate below passes
-        // and the launch starts the box from its stored spec.
-        self.resume().await?;
+        // and the launch starts the box from its stored spec. A launch that
+        // fails puts the record back in the state it resumed from.
+        let resumed = self.resume().await?;
+        let launched = self
+            .attach_launch(
+                session_hnd,
+                conn_username,
+                channel,
+                sz,
+                attach_env,
+                session_keys,
+            )
+            .await;
+        if let Some(pending) = resumed {
+            self.finish_resume(pending, &launched).await;
+        }
+        launched
+    }
 
+    /// The launch half of [`Self::attach`]: past the loadout and the resume,
+    /// it hands the channel to the box's host, minting one when none runs.
+    async fn attach_launch(
+        &mut self,
+        session_hnd: BoxHandle,
+        conn_username: String,
+        channel: Channel<Msg>,
+        sz: WinSize,
+        attach_env: box_runtime::AttachEnv,
+        session_keys: SessionKeys,
+    ) -> Result<(), AttachError> {
         // Attach is gated on `Active` — a Materializing session has
         // a composition but its patches may not be on disk yet,
         // and materializing without them would produce a broken

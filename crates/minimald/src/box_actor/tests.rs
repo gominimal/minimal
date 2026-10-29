@@ -13317,6 +13317,50 @@ async fn resume_restarts_from_stored_spec_same_id_and_name() {
     assert_eq!(events[resumed].data["from"], "stopped");
 }
 
+/// BOX-025: a resume whose launch fails puts the record back in the state
+/// it resumed from and records no `resumed` event, so the box never reads
+/// as running with no processes. The next attach resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_launch_failure_keeps_stopped_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-fails"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostDiedBeforeAttach);
+    attach_and_echo(&mut client, id)
+        .await
+        .expect_err("the attach whose launch fails reaches no shell");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending),
+        "a failed launch leaves the box stopped"
+    );
+    assert!(
+        !event_kinds(&server, id)
+            .await
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Resumed),
+        "a failed launch records no resumed event"
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the next attach resumes the box");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
 /// BOX-030: a PTY box resumes from `stopped` and from `exited`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_box_resumes_from_stopped_and_exited() {
