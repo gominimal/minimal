@@ -85,9 +85,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- event-driven; the architecture's `min box restart` (L466), and design principle 8 (L334): `restart` follows `lifetime = "until_stopped"`, not type. BOX defines no restart operation for it (Rollout) -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_restart_until_stopped_restarts_same_id_and_name
-  - IF `min box restart` targets a box whose spec does not set `lifetime = "until_stopped"` THEN THE SYSTEM SHALL fail with exit 2, naming `min task run <task>` for a box of type `task` and `min box run <entry>` for any other.
+  - IF `min box restart` targets a box whose spec does not set `lifetime = "until_stopped"` THEN THE SYSTEM SHALL fail with exit 2 and a hint naming `min task run`, chosen by `lifetime` as BCLI-009 chooses its hint for a box that runs to completion.
     tier:   T0
-    verify: cargo nextest run -p minimal box_restart_not_until_stopped_exit2_names_run
+    verify: cargo nextest run -p minimal box_restart_not_until_stopped_exit2_hint_by_lifetime
 
 - **BCLI-010** WHEN `min task run <task> [-- <args>…]` or `min box run <entry> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
   <!-- type-neutral, so `min box run` too; the `pty_enabled` case waits on gominimal/arch#127 (Open questions) -->
