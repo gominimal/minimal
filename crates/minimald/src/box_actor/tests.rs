@@ -12701,6 +12701,16 @@ fn box_package_build_refusal_names_destination_and_box() {
             None
         );
     }
+    // An earlier tolerated failure does not hide the one that ended the build.
+    assert_eq!(
+        refused_destination([
+            "curl: (6) Could not resolve host: optional.example",
+            "make: entering",
+            "curl: (7) Failed to connect to example.com port 443 after 2 ms: Couldn't connect to server",
+        ])
+        .as_deref(),
+        Some("example.com:443"),
+    );
     // A failure that names no destination is left as the build said it.
     assert_eq!(
         egress_refusal(

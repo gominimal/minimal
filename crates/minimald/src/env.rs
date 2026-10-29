@@ -2947,9 +2947,11 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
 }
 
 /// The destination a failed build's output says it could not reach
-/// (NET-155), read from the last lines the build printed. It knows the
-/// failure lines of `curl` and `wget`, which also cover `git` over HTTPS:
-/// a host it could not resolve, or a host and port it could not connect to.
+/// (NET-155), read from the last lines the build printed, newest first, so
+/// the failure that ended the build wins over an earlier tolerated one. It
+/// knows the failure lines of `curl` and `wget`, which also cover `git` over
+/// HTTPS: a host it could not resolve, or a host and port it could not
+/// connect to.
 /// `None` when no line names a destination.
 pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let word = |rest: &str| -> Option<String> {
@@ -2960,7 +2962,8 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
         let host = host.trim_end_matches(['.', ':']);
         (!host.is_empty()).then(|| host.to_string())
     };
-    lines.into_iter().find_map(|line| {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    lines.into_iter().rev().find_map(|line| {
         // curl: `Could not resolve host: example.com`
         if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
             return word(rest);

@@ -365,10 +365,6 @@ fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
-/// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
-/// `env` lives on a single stack frame across every spawn — that frame
-/// is alive for the whole life of this tokio task, which in turn is
-/// governed by the consumer's stream.
 /// Refuses the package builds of a task (NET-155) when the box's launch
 /// placed it in a classifier leaf (`enforcement` is
 /// [`boxes::HostIpEnforcement::PerBox`]) and the task's context has no leaf.
@@ -392,6 +388,10 @@ pub(crate) fn task_build_refusal(
     Ok(())
 }
 
+/// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
+/// `env` lives on a single stack frame across every spawn — that frame
+/// is alive for the whole life of this tokio task, which in turn is
+/// governed by the consumer's stream.
 async fn task_producer(
     exec: TaskExec,
     session: BoxHandle,
