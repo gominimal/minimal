@@ -2077,7 +2077,7 @@ async fn relay_control(
     {
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
-        warn_interim_publish(&limiter, &decision);
+        warn_interim_publish(&limiter, decision);
         // And the lease it named is one the guest daemon vouched for while
         // no row held it, whatever the request published: the fact the
         // live-lease drop line reads ([`PublishedForwards::lease_live_at`]).
