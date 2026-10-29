@@ -492,6 +492,16 @@ impl BuildTap {
             )
         })
     }
+
+    /// The error to report for a failed build. A build the box's egress
+    /// rules refused names the destination and the box before the build's
+    /// own error. Any other failure is the build's own error, unchanged.
+    pub(crate) fn failure(&self, placement: &BuildPlacement, failure: String) -> String {
+        match self.refusal(placement, &failure) {
+            Some(refusal) => format!("{refusal}\n{failure}"),
+            None => failure,
+        }
+    }
 }
 
 /// Session side-operation.
@@ -646,15 +656,10 @@ impl SideOp {
                     Some(_) if cancel_flag.is_cancelled() => BuildOutcome::Cancelled,
                     // NET-155: a build the box's rules refused names the
                     // destination and the box before the build's own error.
-                    Some(msg) => {
-                        let refusal = tap
-                            .as_ref()
-                            .and_then(|(tap, placement)| tap.refusal(placement, &msg));
-                        BuildOutcome::Failed(match refusal {
-                            Some(refusal) => format!("{refusal}\n{msg}"),
-                            None => msg,
-                        })
-                    }
+                    Some(msg) => BuildOutcome::Failed(match &tap {
+                        Some((tap, placement)) => tap.failure(placement, msg),
+                        None => msg,
+                    }),
                 };
 
                 finish(&build_inner, BuildUpdate::Finished(outcome)).await;
@@ -830,11 +835,18 @@ impl SideOp {
         session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
+        placement: BuildPlacement,
         buffer: usize,
     ) -> Result<(Self, mpsc::Receiver<MaterializeUpdate>), std::io::Error> {
         let (tx, rx) = mpsc::channel(buffer);
-        let sop = Self::new_materialize(session, opts, ctx, vec![MaterializeSink::Structured(tx)])
-            .await?;
+        let sop = Self::new_materialize(
+            session,
+            opts,
+            ctx,
+            placement,
+            vec![MaterializeSink::Structured(tx)],
+        )
+        .await?;
         Ok((sop, rx))
     }
 
@@ -842,11 +854,13 @@ impl SideOp {
     /// The output is resolved here, before the op spawns, so a bad name or arch
     /// errors to the caller rather than through a channel it has yet to be
     /// handed. The cancel token stops the package build only: assembly is not
-    /// interruptible.
+    /// interruptible. `placement` is the box's placement, which the caller
+    /// already applied to `ctx`: the run reads it to name a refusal.
     async fn new_materialize(
         session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
+        placement: BuildPlacement,
         sinks: Vec<MaterializeSink>,
     ) -> Result<Self, std::io::Error> {
         let output = ctx
@@ -893,8 +907,19 @@ impl SideOp {
             crate::traced::spawn(async move {
                 let mut ctx = ctx;
 
+                // NET-155: tap the package builds' output, so a build the
+                // box's egress rules refused names the destination and the
+                // box, as the build side-op's does.
+                let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded::<BuildEvent>();
+                let tap = crate::traced::spawn(async move {
+                    let mut tap = BuildTap::default();
+                    while let Some(event) = log_rx.next().await {
+                        tap.observe(&event, &placement);
+                    }
+                    (tap, placement)
+                });
                 let build_err = match ctx
-                    .build_graph_with_cancel(&graph, false, None, build_cancel)
+                    .build_graph_with_cancel(&graph, false, Some(log_tx), build_cancel)
                     .await
                 {
                     Ok(()) => None,
@@ -903,10 +928,14 @@ impl SideOp {
                         Some(e.to_string())
                     }
                 };
+                let tap = tap.await.ok();
                 if let Some(msg) = build_err {
                     let outcome = match cancel_flag.is_cancelled() {
                         true => MaterializeOutcome::Cancelled,
-                        false => MaterializeOutcome::Failed(msg),
+                        false => MaterializeOutcome::Failed(match &tap {
+                            Some((tap, placement)) => tap.failure(placement, msg),
+                            None => msg,
+                        }),
                     };
                     finish(&op_inner, MaterializeUpdate::Finished(outcome)).await;
                     return;

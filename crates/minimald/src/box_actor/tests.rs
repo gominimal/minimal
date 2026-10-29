@@ -12658,6 +12658,70 @@ fn box_package_build_under_box_egress_verdict() {
     assert_eq!(tap.refusal(&placement, "the build was cancelled"), None);
 }
 
+/// NET-155: a materialize reports the error of a package build it started
+/// the way the build side operation does. A build in a deny leaf whose
+/// output names a refused destination fails with the refusal, which names
+/// the destination and the box, before the build's own error.
+#[test]
+fn box_package_build_refusal_names_destination_and_box_for_materialize() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let placement = BuildPlacement {
+        box_name: "sealed".to_string(),
+        leaf: Some(ClassifierLeaf::under(root, "sealed", Verdict::Deny)),
+        network: None,
+    };
+    let mut tap = BuildTap::default();
+    for event in build_events(
+        "fetcher",
+        &[
+            "curl: (6) Could not resolve host: downloads.example.org",
+            "build command failed",
+        ],
+    ) {
+        tap.observe(&event, &placement);
+    }
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "fetcher".to_string(),
+        op::Error::Other(anyhow::anyhow!("build command failed")),
+    ))
+    .to_string();
+    assert_eq!(
+        tap.failure(&placement, failed.clone()),
+        format!(
+            "the build of fetcher could not reach downloads.example.org: \
+             the egress rules of box sealed do not allow it\n{failed}"
+        )
+    );
+}
+
+/// NET-155: a materialize build in a deny leaf that fails for a reason other
+/// than the box's egress rules keeps the build's own error, unchanged.
+#[test]
+fn box_package_build_refusal_names_destination_and_box_for_materialize_only_when_refused() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let placement = BuildPlacement {
+        box_name: "sealed".to_string(),
+        leaf: Some(ClassifierLeaf::under(root, "sealed", Verdict::Deny)),
+        network: None,
+    };
+    let mut tap = BuildTap::default();
+    for event in build_events("compiler", &["cc -c hello.c", "error: cc failed"]) {
+        tap.observe(&event, &placement);
+    }
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "compiler".to_string(),
+        op::Error::Other(anyhow::anyhow!("build command failed")),
+    ))
+    .to_string();
+    assert_eq!(tap.failure(&placement, failed.clone()), failed);
+}
+
 /// NET-155: the error of a build the box's egress rules refused names the
 /// destination the build could not reach and the box whose rules refused
 /// it, for the failure lines of `curl`, `wget` and `git`.

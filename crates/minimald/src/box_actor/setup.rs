@@ -1031,7 +1031,7 @@ impl BoxActor {
         // NET-155: the package builds a materialize starts run in the box's
         // leaf, the same as a build side-op's.
         let placement = self.build_placement().await?;
-        let ctx = match (placement.leaf, placement.network) {
+        let ctx = match (placement.leaf.clone(), placement.network.clone()) {
             (Some(leaf), _) => {
                 tracing::info!(
                     box_name = %placement.box_name,
@@ -1059,7 +1059,8 @@ impl BoxActor {
                 ctx
             }
         };
-        let (sop, rx) = SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, 64).await?;
+        let (sop, rx) =
+            SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, placement, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
             BoxInner::Draft { .. } => {
