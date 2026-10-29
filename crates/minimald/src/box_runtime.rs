@@ -2212,6 +2212,9 @@ mod proxy_env_tests {
                 ..Default::default()
             },
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -2221,6 +2224,7 @@ mod proxy_env_tests {
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            ends_with_run: false,
             box_type: None,
             parent: None,
             project_root: None,

@@ -955,14 +955,30 @@ where
                     gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
                 });
             if !pinned {
-                gate.limiter.warn(
+                let remote = drop_remote(&summary);
+                let transport = drop_transport(&reason);
+                // The VM host daemon keeps its own record of the refused
+                // flow, outside the VM: reported only when the drop line
+                // fires, so under the same rate limit, never per frame.
+                if gate.limiter.warn(
                     &gate.label,
                     Direction::Egress,
-                    drop_remote(&summary),
-                    drop_transport(&reason),
+                    remote,
+                    transport,
                     None,
                     reason.rule(),
-                );
+                ) {
+                    let destination = match remote {
+                        Some(SocketAddr::V4(destination)) => Some(destination),
+                        _ => None,
+                    };
+                    crate::net::listeners::report_refused_egress(
+                        reject.lease,
+                        destination,
+                        &transport.to_string(),
+                        reason.rule(),
+                    );
+                }
                 continue;
             }
         }
@@ -2163,6 +2179,31 @@ impl BoxGate {
         self.terminate_port(port)
     }
 
+    /// The TCP ports this gate admits because the box published them at
+    /// runtime: the listen-published ones (NET-016) and the explicitly
+    /// exposed ones (NET-044), without the declared set. The hostname
+    /// registry reads this when it resolves the box's name, so the proxy
+    /// forwards exactly the runtime ports a direct connection reaches
+    /// (NET-069, NET-071). A runtime port is the same number outside and
+    /// inside the box, so the set needs no translation.
+    pub(crate) fn runtime_published_tcp(&self) -> BTreeSet<u16> {
+        let mut ports: BTreeSet<u16> = self
+            .listen_published
+            .lock()
+            .expect("gate listen-published lock poisoned")
+            .iter()
+            .copied()
+            .collect();
+        ports.extend(
+            self.exposed
+                .lock()
+                .expect("gate exposed lock poisoned")
+                .iter()
+                .copied(),
+        );
+        ports
+    }
+
     /// Whether this gate admits a new inbound TCP connection to `port` —
     /// the declared ports (NET-121), the listen-published ones (NET-016)
     /// and the explicitly exposed ones (NET-044) together: the one
@@ -2775,9 +2816,12 @@ pub struct Refusal {
 ///
 /// The caller's declaration comes first, in the order a direct connection
 /// meets the two: its frame clears the caller's own egress gate before the
-/// target's ingress gate ever sees it (NET-070). The target's declaration is
-/// the port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
-/// applies — a port its ingress does not publish routes nowhere.
+/// target's ingress gate ever sees it (NET-070). The target's half is the
+/// port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
+/// applies over the target's published set: the declared ports and the ports
+/// it published at runtime ([`BoxGate::runtime_published_tcp`], read into
+/// the route when its name resolved). A port in neither routes nowhere, and
+/// is refused with the rule a direct connection's drop carries.
 #[must_use]
 pub fn proxied_request_verdict(
     caller: Option<&crate::net::dns::Caller>,

@@ -1,7 +1,7 @@
 //! Persisted per-VM resource configuration (#747, R9.4).
 //!
 //! User-set resource parameters (vcpu count, RAM MiB) live in `config.toml` in
-//! the provider-instance dir, **separate** from the runtime [`State`](crate::state::State):
+//! the host dir, **separate** from the runtime [`State`](crate::state::State):
 //! `State::stopped()` and `StartingGuard` reset runtime state on every stop or
 //! crash, so config kept there would be silently wiped. This file is written
 //! only by `minvmd config set` and read at boot and by `minvmd status` /
@@ -32,7 +32,7 @@ pub struct ResourceConfig {
 }
 
 impl ResourceConfig {
-    /// Path to `config.toml` within `dir` (the provider-instance dir).
+    /// Path to `config.toml` within `dir` (the host dir).
     #[must_use]
     pub fn path(dir: &Path) -> PathBuf {
         dir.join("config.toml")

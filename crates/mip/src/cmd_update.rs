@@ -27,6 +27,9 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
             c.to,
         );
     }
+    for c in &report.skipped {
+        println!("{}", c.skipped_message("mip update"));
+    }
 
     // Enumerate all the reachable transitive packages and make sure we download
     // any we are missing but are available remotely. This is a separate step

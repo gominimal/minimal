@@ -92,7 +92,7 @@ fn run_vmm() -> Result<()> {
 
     // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
     // On by default: the image lives at the resolved path (MINVMD_DATA_VOLUME_PATH
-    // override, else `<provider dir>/data-vol.raw`) and is created sparse if
+    // override, else `<host dir>/data-vol.raw`) and is created sparse if
     // missing.
     // Provisioning at the literal path — not a stem-reconstructed one — so an
     // explicit override is honoured verbatim.
@@ -105,14 +105,14 @@ fn run_vmm() -> Result<()> {
         .context("applying VmConfig to krun context")?;
 
     // Console capture (hvc0 → host file). `MINVMD_BOOT_LOG=<path>` overrides;
-    // the default is `<provider dir>/boot.log` — a silently-discarded console
+    // the default is `<host dir>/boot.log` — a silently-discarded console
     // is exactly the evidence lost in wedged-boot/dead-transport incidents,
-    // and `min bug` bundles this file (tail-capped) per provider. Truncated
+    // and `min bug` bundles this file (tail-capped) per host. Truncated
     // each boot so it holds the current VM generation's console.
     let boot_log = std::env::var_os("MINVMD_BOOT_LOG")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+        .unwrap_or_else(|| crate::state::host_dir().join("boot.log"));
     // Capture is diagnostics, not a boot dependency: any failure — creating
     // the file or wiring the console — warns and boots on, never propagates.
     // The log is 0640 (BEP-047): the VM user writes it, and the login reads

@@ -3478,21 +3478,20 @@ async fn create_handed_own_ip_session(
     id
 }
 
-/// NET-121, design §7.1: a declared TCP host port that another process
-/// already holds at the box's published address fails the finalize. The
-/// error names the port and the next step, and the box never reaches
-/// `Active`.
+/// The finalize of a box whose declared port is held fails with the typed
+/// refusal (NET-144). Then the destroy the client's activate cleanup sends
+/// removes the box, which proves it never reached `Active`, and no record is
+/// left behind.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_fails_on_a_taken_declared_host_port() {
-    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
-    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
-    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
-    // Another process holds the declared host port at the handed address.
-    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
-    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+async fn assert_refused_and_cleaned_up(
+    client: &mut TestClient,
+    id: SessionId,
+    expected: minimald_rpc::PortInUseRefusal,
+) {
+    use minimald_rpc::{
+        DestroySession, DestroySessionRequest, Errorable, FinalizeSession, FinalizeSessionRequest,
+        ListSessions,
+    };
     let reply = client
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
@@ -3500,13 +3499,220 @@ async fn finalize_fails_on_a_taken_declared_host_port() {
         })
         .await;
     match reply {
-        Errorable::Err { error } => assert!(
-            error.contains("host port 18080 is already in use")
-                && error.contains("--ingress <other>:<internal>"),
-            "the error must name the port and the next step, got: {error}"
-        ),
-        Errorable::Ok(ok) => panic!("finalize must fail on a taken host port, got {ok:?}"),
+        Errorable::Err { error } => {
+            assert_eq!(
+                minimald_rpc::PortInUseRefusal::find_in(&error),
+                Some(expected.clone()),
+                "the refusal names the port and its holder, got: {error}"
+            );
+            assert!(
+                error.contains(&expected.to_string()),
+                "the daemon's text is the refusal's own text, got: {error}"
+            );
+        }
+        Errorable::Ok(ok) => panic!("finalize must fail on a held port, got {ok:?}"),
     }
+    // `only_if_unfinalized` is the client's activate cleanup: it removes
+    // only a box that never reached `Active`.
+    match client
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: true,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the activate cleanup's destroy failed: {error}"),
+    }
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed.sessions.iter().all(|entry| entry.id != id),
+        "a refused activation leaves no record: {:?}",
+        listed.sessions
+    );
+}
+
+/// NET-121, NET-144, design §7.1: a declared TCP host port that a program
+/// outside Minimal already holds at the box's published address fails the
+/// finalize. The refusal names the port and the host as its holder, and
+/// the box leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
+    let capture = crate::test_harness::captured_log();
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    // Another process holds the declared host port at the handed address.
+    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+    assert_refused_and_cleaned_up(
+        &mut client,
+        id,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Host,
+        },
+    )
+    .await;
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={id}"))
+            && line.contains("port=18080")
+            && line.contains("127.0.64.77")
+            && line.contains("holder=host")),
+        "one warn line names the session, port, address and holder, got: {logged}"
+    );
+}
+
+/// NET-144: at the shared `127.0.0.1` fallback a declared port that another
+/// box already holds fails the second box's activation, naming the box that
+/// holds it, where before the second box yielded the port. The first box
+/// keeps the port, and the second leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fallback() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    // No reserved range on this host: every box publishes at `127.0.0.1`.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let first = create_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 78),
+        std::net::Ipv4Addr::new(127, 0, 64, 78),
+    )
+    .await;
+    finalize_session(&mut client, first).await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 79),
+        std::net::Ipv4Addr::new(127, 0, 64, 79),
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(first),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the first box publishes at the fallback"
+    );
+    assert_refused_and_cleaned_up(
+        &mut client,
+        second,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Box("first".to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .own_port_holder(std::net::Ipv4Addr::LOCALHOST, 18080)
+            .map(|(holder, _)| holder),
+        Some(first),
+        "the first box keeps the port"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={second}"))
+            && line.contains("holder=box:first")),
+        "the warn line names the holding box, got: {logged}"
+    );
+}
+
+/// NET-144, under a pending range verdict: a second box at the `127.0.0.1`
+/// interim yields the declared port the first box holds there, because a
+/// present landing moves both to their own addresses. When the verdict
+/// lands absent, the second box stays at the fallback with the port unbound,
+/// and the daemon log reports it with the port and the holder. The first
+/// box, which holds the port, is not reported.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict_lands_absent() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    // The bound is shrunk so both finalizes publish at the interim.
+    manager.reset_hand_verdict_deadline(100);
+    let mut client = server.connect().await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 81),
+        std::net::Ipv4Addr::new(127, 0, 64, 81),
+    )
+    .await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 82),
+        std::net::Ipv4Addr::new(127, 0, 64, 82),
+    )
+    .await;
+    let finalized = finalize_session(&mut client, second).await;
+    assert!(
+        finalized
+            .shared_port_collisions
+            .iter()
+            .any(|collision| collision.port == 18080 && collision.held_by.starts_with("first")),
+        "under the pending verdict the second box yields the port: {finalized:?}"
+    );
+    let registry = manager.hostnames();
+    for id in [first, second] {
+        assert_eq!(
+            registry
+                .read()
+                .expect("registry lock")
+                .published_own_address(id),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "both boxes stand at the interim while the verdict walks"
+        );
+    }
+    let reported = |logged: &str, id: SessionId| {
+        logged.lines().any(|line| {
+            line.contains("host-port-in-use")
+                && line.contains("127.0.0.1 fallback")
+                && line.contains(&format!("session={id}"))
+        })
+    };
+    assert!(
+        !reported(&capture.contents(), second),
+        "nothing is reported while the verdict is pending"
+    );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reported(&capture.contents(), second) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains("127.0.0.1 fallback")
+            && line.contains(&format!("session={second}"))
+            && line.contains("port=18080")
+            && line.contains("address=127.0.0.1")
+            && line.contains("holder=box:first")),
+        "the absent landing reports the held port, the address and the holder, got: {logged}"
+    );
+    assert!(
+        !reported(&logged, first),
+        "the box that holds the port is not reported: {logged}"
+    );
 }
 
 /// Waits until a registration is parked on the range verdict, so the
@@ -8020,14 +8226,18 @@ async fn expose_allow_publishes_and_lists() {
     // binds at the address the box's name answers at.
     let manager = server.state.sessions_manager().await;
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // Addresses no other test's box uses: the live-gate table the proxy and
+    // the expose both read is process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 96);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 96);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         // This test's own box name: under the shared capture every test's
         // lines ride one buffer, so each assertion finds its line by the
         // box it names.
         "listweb",
-        std::net::Ipv4Addr::new(100, 64, 128, 21),
-        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        switch,
+        loopback,
         Some(boxes::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
@@ -8041,6 +8251,37 @@ async fn expose_allow_publishes_and_lists() {
         .ensure_host("tester".to_string())
         .await
         .expect("the allowing box launches its host");
+    // The box's relay gate, registered under its switch address as the
+    // relay's spawn registers it, and the lease its attach reports to the
+    // hostname registry: what a direct connection and the proxy both meet.
+    let gate = std::sync::Arc::new(crate::net::switch::BoxGate::for_session(
+        "listweb".to_string(),
+        switch,
+        &boxes::BoxPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let hostnames = manager.hostnames();
+    hostnames
+        .write()
+        .expect("registry lock")
+        .report_own_address(web, "listweb", switch, std::collections::BTreeMap::new());
+    // Before the expose, the proxy refuses the port with the refusal a
+    // direct connection gets: the box published nothing at it.
+    let before = {
+        let route = hostnames
+            .read()
+            .expect("registry lock")
+            .resolve("listweb.min.internal")
+            .expect("the box's name resolves");
+        crate::net::switch::proxied_request_verdict(None, &route, 3000)
+    };
+    assert!(
+        matches!(before, crate::net::switch::ProxiedRequest::Refused(_)),
+        "an unpublished port is refused through the proxy: {before:?}"
+    );
+    assert!(!gate.admits_tcp(3000));
     let sock = handle
         .net_switch()
         .await
@@ -8055,7 +8296,7 @@ async fn expose_allow_publishes_and_lists() {
         .await
         .expect("the allowed port publishes");
     let expected = minimald_rpc::LiveMapping {
-        local: "127.0.64.21:3000".to_string(),
+        local: "127.0.64.96:3000".to_string(),
         internal_port: 3000,
         proto: boxes::IpProto::Tcp,
         pending: Some(false),
@@ -8122,9 +8363,64 @@ async fn expose_allow_publishes_and_lists() {
     assert!(
         line.contains("port=3000")
             && line.contains("decision=allow")
-            && line.contains("local=127.0.64.21:3000"),
+            && line.contains("local=127.0.64.96:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+    // The publish is reachable through the hostname proxy at once (NET-044,
+    // NET-069): the box's gate admits the port, so the proxy forwards a
+    // request for it to the forward the publish bound — the mapping's own
+    // `local` — and a request through the proxy reaches what listens there.
+    assert!(
+        gate.admits_tcp(3000),
+        "the publish admits the port at the gate"
+    );
+    let route = hostnames
+        .read()
+        .expect("registry lock")
+        .resolve("listweb.min.internal")
+        .expect("the box's name resolves");
+    assert_eq!(
+        route.source(3000),
+        Some(crate::net::dns::RouteSource::Runtime),
+        "the route carries the exposed port as a runtime publish"
+    );
+    let local: std::net::SocketAddr = mapping.local.parse().expect("the mapping names a socket");
+    assert_eq!(
+        crate::net::switch::proxied_request_verdict(None, &route, 3000),
+        crate::net::switch::ProxiedRequest::Forward(local),
+        "the proxy forwards the exposed port to the forward the publish bound"
+    );
+    // The fake forwarder bound nothing, so this test stands in for the box
+    // behind the forward, at the mapping's own address.
+    let backend = tokio::net::TcpListener::bind(local)
+        .await
+        .expect("the mapping's address is free to stand in for the forward");
+    crate::traced::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        while let Ok((mut sock, _)) = backend.accept().await {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("the proxy binds");
+    let proxy_addr = proxy.local_addr().expect("the proxy has an address");
+    crate::traced::spawn(crate::net::proxy::serve(
+        proxy,
+        crate::net::proxy::Router::new(
+            std::sync::Arc::clone(&hostnames),
+            crate::net::switch::proxied_request_verdict,
+        ),
+    ));
+    let reached = crate::net::proxy::proxy_get(proxy_addr, "listweb.min.internal:3000").await;
+    assert!(
+        reached.contains("200 OK"),
+        "the exposed port opens through the hostname proxy: {reached}"
     );
 }
 
@@ -8471,7 +8767,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
             assert!(
                 source
                     .to_string()
-                    .contains("the VM host daemon refused to open the port"),
+                    .contains("the request to open the port was refused"),
                 "the refused publish says who refused it: {source}"
             );
         }
@@ -9064,13 +9360,12 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         .lines()
         .find(|line| {
             line.contains("dynamic ingress expose")
-                && line.contains("outcome=\"refused\"")
+                && line.contains("outcome=\"refused: out of range\"")
                 && line.contains("port=4500")
         })
         .unwrap_or_else(|| panic!("the out-of-range refusal must be logged, got: {logged}"));
     assert!(
-        refused_line
-            .contains("reason=port 4500 is outside this box's declared dynamic range 3000-3999"),
+        refused_line.contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
         "the refusal names the port and the declared range: {refused_line}"
     );
     let failed_line = logged
@@ -9085,6 +9380,89 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         failed_line.contains("returned HTTP 500"),
         "the failed publish names the switch's refusal: {failed_line}"
     );
+}
+
+/// NET-047: a port outside the box's `--dynamic-range` is refused with the
+/// range named, for an `allow` box and an `ask` box alike. The `ask` box
+/// refuses it before any prompt is routed: the same box's in-range request
+/// is routed, and with nobody attached it ends as the nobody-to-answer
+/// refusal, which an out-of-range request never reaches. Neither box keeps a
+/// mapping, and the request's info line says `refused: out of range`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_out_of_range_refusal_names_range() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    for (name, stance, octet) in [
+        ("rangeallow", boxes::DynamicIngress::Allow, 41),
+        ("rangeask", boxes::DynamicIngress::Ask, 42),
+    ] {
+        let id = finalize_dynamic_ingress_session(
+            &mut client,
+            name,
+            std::net::Ipv4Addr::new(100, 64, 128, octet),
+            std::net::Ipv4Addr::new(127, 0, 64, octet),
+            Some(stance),
+            Some((3000, 3999)),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        let refusal = match handle.expose_dynamic(4500).await {
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::OutOfRange {
+                    requested: 4500,
+                    range: (3000, 3999),
+                },
+            )) => refusal,
+            other => panic!("{name}: a port outside the range is refused by range: {other:?}"),
+        };
+        assert_eq!(
+            refusal.for_caller(name, boxes::NetworkMode::OwnIp, 4500),
+            "port 4500 is outside this box's --dynamic-range 3000-3999. Nothing was published.",
+            "{name}: the refusal names the port and the range"
+        );
+        if stance == boxes::DynamicIngress::Ask {
+            // The in-range ask is routed, and nobody is attached to answer:
+            // the out-of-range one above never got that far.
+            match handle.expose_dynamic(3000).await {
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                )) => {}
+                other => panic!("an in-range ask is routed to a prompt: {other:?}"),
+            }
+        }
+        let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+            .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(id))
+            .await;
+        assert_eq!(
+            live,
+            minimald_rpc::Errorable::Ok(vec![]),
+            "{name}: a refused request leaves no mapping"
+        );
+    }
+    let logged = capture.contents();
+    for (name, decision) in [("rangeallow", "allow"), ("rangeask", "ask")] {
+        let line = logged
+            .lines()
+            .find(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains(&format!("name={name}"))
+                    && line.contains("port=4500")
+            })
+            .unwrap_or_else(|| panic!("{name}: the refusal must be logged, got: {logged}"));
+        assert!(
+            line.contains("outcome=\"refused: out of range\"")
+                && line.contains(&format!("decision={decision}"))
+                && line
+                    .contains("reason=port 4500 is outside this box's --dynamic-range 3000-3999"),
+            "{name}: the line names the outcome, the port and the range: {line}"
+        );
+    }
 }
 
 /// NET-044 on the shared-address interim: under an absent range verdict every

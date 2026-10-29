@@ -376,6 +376,43 @@ pub struct Route {
     /// proxy's verdict and the relay's port gate stays the one derivation
     /// ([`super::switch::declared_ingress_ports`]).
     declared: Option<BTreeSet<u16>>,
+    /// The ports the target published at runtime (NET-044, NET-016): the
+    /// ports a `min net expose` decided `allow` and the ports a listener
+    /// published, read from the box's own relay gate when the name is
+    /// resolved ([`HostnameRegistry::resolve`]). The same set the gate admits
+    /// a direct connection on beside the declared ports, so the proxy's
+    /// verdict and the direct connection's read one published set
+    /// (NET-069, NET-071). Empty for a host-address box, whose route gates
+    /// nothing, and for a box with no live relay. A runtime port is the
+    /// same number outside and inside the box: an expose and a listen
+    /// publication both bind `port` to `port`.
+    runtime: BTreeSet<u16>,
+}
+
+/// Why a [`Route`] carries a port: what the proxy's per-request line names
+/// as the route source, and what a refusal line names when it carries none
+/// (NET-069).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSource {
+    /// The target's ingress declaration publishes the port.
+    Declared,
+    /// The target published the port at runtime: an expose or a listener.
+    Runtime,
+    /// The target is a host-address box, whose direct connections no gate
+    /// filters, so the route carries every port.
+    Ungated,
+}
+
+impl RouteSource {
+    /// The value the proxy's log lines carry in their `route_source` field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Runtime => "runtime",
+            Self::Ungated => "ungated",
+        }
+    }
 }
 
 /// The upstream a [`Route`] forwards to.
@@ -412,6 +449,7 @@ impl Route {
             target: Target::Loopback { address },
             session: session.into(),
             declared,
+            runtime: BTreeSet::new(),
         }
     }
 
@@ -432,6 +470,40 @@ impl Route {
             },
             session: session.into(),
             declared: Some(declared_keys(&ports)),
+            runtime: BTreeSet::new(),
+        }
+    }
+
+    /// This route with `runtime` as the ports its target published at
+    /// runtime (see [`Route::runtime`]). A host-address route gates no port,
+    /// so it keeps no runtime set: every port is open on it already.
+    #[must_use]
+    pub(crate) fn with_runtime(mut self, runtime: BTreeSet<u16>) -> Self {
+        if self.declared.is_some() {
+            self.runtime = runtime;
+        }
+        self
+    }
+
+    /// The ports the target published at runtime, as this route carries them
+    /// (see [`Route::runtime`]).
+    #[must_use]
+    pub fn runtime_ports(&self) -> &BTreeSet<u16> {
+        &self.runtime
+    }
+
+    /// Why this route carries `port`, or `None` when it does not: the
+    /// declaration publishes it, the target published it at runtime, or the
+    /// target is a host-address box that gates nothing. A declared port wins
+    /// over a runtime one with the same number, because the declared mapping
+    /// is the forward bound at that port.
+    #[must_use]
+    pub fn source(&self, port: u16) -> Option<RouteSource> {
+        match &self.declared {
+            None => Some(RouteSource::Ungated),
+            Some(declared) if declared.contains(&port) => Some(RouteSource::Declared),
+            Some(_) if self.runtime.contains(&port) => Some(RouteSource::Runtime),
+            Some(_) => None,
         }
     }
 
@@ -453,18 +525,21 @@ impl Route {
     /// forwards any port: its direct connections are ungated, so its proxied
     /// requests are too — while an own-address route with an empty set is a
     /// deny-all gate, the posture of a box that declared no ingress (NET-071).
+    /// A port the target published at runtime ([`Route::runtime_ports`]) is
+    /// carried too, at the same number: on a lease route the box's own port,
+    /// on a loopback route the forward the publish bound at the box's
+    /// published address (NET-044, NET-016).
     #[must_use]
     pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
-        if let Some(declared) = self.declared_ports()
-            && !declared.contains(&port)
-        {
-            return None;
-        }
-        match &self.target {
-            Target::Loopback { address } => Some(SocketAddr::new(IpAddr::V4(*address), port)),
-            Target::Lease { lease, ports } => {
+        let source = self.source(port)?;
+        match (&self.target, source) {
+            (Target::Loopback { address }, _) => Some(SocketAddr::new(IpAddr::V4(*address), port)),
+            (Target::Lease { lease, ports }, RouteSource::Declared | RouteSource::Ungated) => {
                 let internal = ports.get(&port).copied()?;
                 Some(SocketAddr::new(IpAddr::V4(*lease), internal))
+            }
+            (Target::Lease { lease, .. }, RouteSource::Runtime) => {
+                Some(SocketAddr::new(IpAddr::V4(*lease), port))
             }
         }
     }
@@ -1391,6 +1466,42 @@ impl HostnameRegistry {
             .unwrap_or_default()
     }
 
+    /// The box that holds `port` at `address`, with its box name (NET-144):
+    /// the holder the shared-port table records there, declared or dynamic.
+    /// The name is the box's registered session name, or its stable id when
+    /// nothing answers for it. `None` when no box holds the port there.
+    #[must_use]
+    pub fn own_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<(SessionId, String)> {
+        let holder = *self.own_holders.get(&(address, port))?;
+        let name = self
+            .by_session
+            .iter()
+            .find(|(_, registration)| registration.id == holder)
+            .map_or_else(|| holder.to_string(), |(name, _)| name.clone());
+        Some((holder, name))
+    }
+
+    /// The first declared port another box already holds where this box
+    /// publishes at the shared `127.0.0.1` fallback, with the holder's box
+    /// name (NET-144). Nobody chose to share the fallback, so a port another
+    /// box holds there is a refusal at activation, never a yielded port. A
+    /// box at any other address gets `None`: a host-address box that shares
+    /// its node's address keeps the shared-address rule (NET-129), and
+    /// yields the port. The registry does not know the range verdict, so
+    /// the finalize asks [`LoopbackLeaseBook::range_verdict`] whether the
+    /// box stays at the fallback before it refuses.
+    #[must_use]
+    pub fn fallback_port_refusal(&self, session_id: SessionId) -> Option<(u16, String)> {
+        let own = self.own_published.get(&session_id)?;
+        if own.address != Ipv4Addr::LOCALHOST {
+            return None;
+        }
+        own.ports.iter().find_map(|&port| {
+            let (holder, name) = self.own_port_holder(own.address, port)?;
+            (holder != session_id).then_some((port, name))
+        })
+    }
+
     /// Elects the next holder of each of `ports` at `address` that `leaving`
     /// held and no longer publishes there (NET-129): the lowest
     /// [`SessionId`] among the boxes still publishing the port at the
@@ -1761,7 +1872,33 @@ impl HostnameRegistry {
         // the node's shared address keeps its name held, but nothing may be
         // forwarded there — the node's own listener at that port would answer
         // for the dead box.
-        route.filter(|route| !self.stopped_on_shared_address(route))
+        route
+            .filter(|route| !self.stopped_on_shared_address(route))
+            .map(|route| {
+                let runtime = self.runtime_published(&route);
+                route.with_runtime(runtime)
+            })
+    }
+
+    /// The ports `route`'s box published at runtime, read from its live relay
+    /// gate (NET-044, NET-016, NET-069): the ports a `min net expose` decided
+    /// `allow` and the ports a listener published — the set the gate admits
+    /// a direct connection on beside the declared ports. Read at resolve
+    /// time, so a publish is reachable through the proxy from the moment its
+    /// gate admits it, and a withdrawal is refused from the moment the gate
+    /// drops it, without a second copy of the set to keep in step. Empty for
+    /// a host-address route (it gates nothing), for a box that has reported
+    /// no lease, and for a box whose relay is gone.
+    fn runtime_published(&self, route: &Route) -> BTreeSet<u16> {
+        if route.declared_ports().is_none() {
+            return BTreeSet::new();
+        }
+        self.by_session
+            .get(route.session())
+            .and_then(|registration| self.own.get(&registration.id))
+            .and_then(|own| super::switch::live_gate(own.lease))
+            .map(|gate| gate.runtime_published_tcp())
+            .unwrap_or_default()
     }
 
     /// Whether `route`'s box is stopped while publishing on the node's shared
@@ -2322,6 +2459,17 @@ impl LoopbackLeaseBook {
         RangeVerdict::from_key(self.verdict.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    /// The verdict over the reserved range as it stands now, for a caller
+    /// outside the book (NET-144): a finalize refuses a port another box
+    /// holds at the `127.0.0.1` fallback only once a landed verdict keeps
+    /// the box there. Under [`RangeVerdict::Pending`] a box at the interim
+    /// moves to its hand when the verdict lands present, so its collision
+    /// there is not lasting.
+    #[must_use]
+    pub fn range_verdict(&self) -> RangeVerdict {
+        self.verdict()
+    }
+
     /// Applies the bind probe's verdict over the reserved local range, when
     /// the book opened before the probe that produced it could answer.
     ///
@@ -2343,6 +2491,24 @@ impl LoopbackLeaseBook {
         // every box standing on the interim), so the registration that
         // subscribes afterwards must still read the verdict that landed.
         self.verdict_landing.send_replace(verdict);
+    }
+
+    /// Waits, without a bound, for the verdict to land, and returns it. A
+    /// verdict already landed returns at once. When the book is dropped
+    /// before a landing, this returns [`RangeVerdict::Pending`]. The watcher
+    /// of a box finalized at the `127.0.0.1` fallback under a pending verdict
+    /// waits here (NET-144).
+    pub async fn await_landing(&self) -> RangeVerdict {
+        let mut landing = self.verdict_landing.subscribe();
+        loop {
+            let verdict = *landing.borrow_and_update();
+            if verdict != RangeVerdict::Pending {
+                return verdict;
+            }
+            if landing.changed().await.is_err() {
+                return RangeVerdict::Pending;
+            }
+        }
     }
 
     /// The daemon's one verdict deadline, as an instant: the moment the book
@@ -3428,6 +3594,43 @@ mod tests {
                 .is_empty(),
             "the same port on a different address is not a collision"
         );
+    }
+
+    /// NET-144: at the shared `127.0.0.1` fallback a port another box holds
+    /// is a refusal that names the holder's box name. At a node's shared
+    /// address the same collision stays a yielded port (NET-129).
+    #[test]
+    fn activation_refused_when_declared_port_is_held_at_the_fallback_only() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let ports = BTreeSet::from([8080u16]);
+        for (address, first, second) in [
+            (Ipv4Addr::LOCALHOST, id("1"), id("2")),
+            (node, id("3"), id("4")),
+        ] {
+            reg.publish_own_address(first, &format!("first-{first}"), address, ports.clone());
+            reg.register_own_ip(first, &format!("first-{first}"), ports.clone());
+            reg.publish_own_address(second, "second", address, ports.clone());
+            assert_eq!(
+                reg.fallback_port_refusal(first),
+                None,
+                "the holder is never refused"
+            );
+            if address == Ipv4Addr::LOCALHOST {
+                assert_eq!(
+                    reg.fallback_port_refusal(second),
+                    Some((8080, format!("first-{first}"))),
+                    "the fallback refuses and names the holder by its box name"
+                );
+            } else {
+                assert_eq!(
+                    reg.fallback_port_refusal(second),
+                    None,
+                    "a node's shared address keeps the yield"
+                );
+            }
+            reg.unpublish_own_address(second);
+        }
     }
 
     /// NET-129's shared address is first-come: the later box records the

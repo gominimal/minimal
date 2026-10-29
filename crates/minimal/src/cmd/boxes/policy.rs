@@ -980,7 +980,7 @@ pub(crate) async fn box_policy_as_json(
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
     // native daemon's per-daemon switch.
-    let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+    let fabric = (daemon_host_kind(global) == paths::HostKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
     write_policy_json_noting(

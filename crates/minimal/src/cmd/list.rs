@@ -40,7 +40,7 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             );
             let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
             box_via_ssh(
-                daemon_provider_kind(global),
+                daemon_host_kind(global),
                 &sock,
                 entry.id,
                 None,
@@ -257,11 +257,13 @@ pub(crate) fn duplicate_session_warning(
                 "{lead} To reuse it instead: min session attach {key}"
             ))
         }
-        _ => Some(format!(
+        boxes::BoxState::Pending | boxes::BoxState::Materializing => Some(format!(
             "{lead} The existing session is still being created; run `min ls` \
-             until its status is active, then attach to it with `min session \
+             until its status is running, then attach to it with `min session \
              attach <session>` instead of creating a second."
         )),
+        // An ended session is not one attach accepts, so no reuse command.
+        boxes::BoxState::Stopped | boxes::BoxState::Exited => Some(lead),
     }
 }
 
@@ -280,7 +282,7 @@ pub(crate) fn display_with_home_tilde(
 
 /// Open the session manager TUI.
 ///
-/// The TUI probes both provider sockets itself; if neither daemon is
+/// The TUI probes both host sockets itself; if neither daemon is
 /// running, autospawn the default backend first so the dashboard has
 /// something to show (mirroring what the flat subcommands do).
 pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
@@ -332,7 +334,7 @@ pub struct VmListing {
 /// — that one was just ensured, so a failure there is the failure to report
 /// (and a skewed one is refused there, as `min ls` always has). Nothing
 /// enumerable — the native backend, which hosts no VMs — falls back to the
-/// selected provider's daemon, exactly the listing `min ls` has always
+/// selected host's daemon, exactly the listing `min ls` has always
 /// printed.
 pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
     listings_across_vms(global, true).await
@@ -711,15 +713,15 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
 /// The VM a session-start line names, as a fact about the backend kind: the
 /// selected VM on the VM backend, where the session that just started landed
 /// on one VM of several, and nothing on the native backend, whose one daemon
-/// hosts no VMs to name. Keyed on the provider kind the daemon connection
-/// resolves through — the same rule [`super::session::daemon_provider_kind`]
+/// hosts no VMs to name. Keyed on the host kind the daemon connection
+/// resolves through — the same rule [`super::session::daemon_host_kind`]
 /// states — and never on `use_minvmd()`: the flag is how Linux asks for the
 /// VM host, while macOS reaches it with no flag at all, and a line that
 /// keyed on the flag would name no VM for exactly the host whose every
 /// invocation is VM-backed.
 #[must_use]
-pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
-    (kind == paths::ProviderKind::Minvmd).then(client::vm_name)
+pub fn hostname_proxy_vm(kind: paths::HostKind) -> Option<&'static str> {
+    (kind == paths::HostKind::Minvmd).then(client::vm_name)
 }
 
 /// Format the session list for the given output mode. Split from
@@ -1272,13 +1274,18 @@ pub fn format_ls_across_vms_on(
     Ok(())
 }
 
-/// Human-readable lifecycle status for the `ls` table, using the same
-/// snake_case tokens the `--json` surface emits so the two agree.
+/// Human-readable lifecycle status for the `ls` table: the state names
+/// BOX-011 gives, which the `--json` surface also emits, except that it
+/// still spells `running` as `active`.
 pub(crate) fn status_label(status: boxes::BoxState) -> &'static str {
     match status {
         boxes::BoxState::Pending => "pending",
         boxes::BoxState::Materializing => "materializing",
-        boxes::BoxState::Active => "active",
+        // BOX-011 names the state `running`. The record still stores it as
+        // `active`, so `--json` prints that word.
+        boxes::BoxState::Active => "running",
+        boxes::BoxState::Stopped => "stopped",
+        boxes::BoxState::Exited => "exited",
     }
 }
 
@@ -1295,5 +1302,23 @@ pub(crate) fn format_memory(bytes: u64) -> String {
         }
     } else {
         format!("{} MiB", bytes / MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_label;
+
+    // BOX-011: `min ls` labels each state with its BOX-011 name.
+    #[test]
+    fn list_labels_a_running_box_running() {
+        assert_eq!(status_label(boxes::BoxState::Active), "running");
+        assert_eq!(status_label(boxes::BoxState::Pending), "pending");
+        assert_eq!(
+            status_label(boxes::BoxState::Materializing),
+            "materializing"
+        );
+        assert_eq!(status_label(boxes::BoxState::Stopped), "stopped");
+        assert_eq!(status_label(boxes::BoxState::Exited), "exited");
     }
 }

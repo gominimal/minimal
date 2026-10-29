@@ -29,13 +29,13 @@ use crate::box_registry::BoxRegistry;
 /// The zone table's file name inside this daemon's state dir —
 /// `<state>/providers/local-minvmd0[/<vm>/]`, the directory the CLI's
 /// diagnostic bundle already walks per VM, so the zone table lands where a
-/// bundle's provider listing names it.
+/// bundle's host listing names it.
 pub const ZONE_TABLE_FILE: &str = "zone.json";
 
 /// This daemon's zone-table dump path.
 #[must_use]
 pub fn zone_table_path() -> PathBuf {
-    crate::state::provider_dir().join(ZONE_TABLE_FILE)
+    crate::state::host_dir().join(ZONE_TABLE_FILE)
 }
 
 /// One row of the dump: the name under the zone, the host-answerable
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn zone_table_dump_carries_every_row_name_address_and_liveness() {
         let dir = tempfile::TempDir::new().expect("a temp dir for the state base");
-        // The state-dir override routes `provider_dir()` — the dump's parent —
+        // The state-dir override routes `host_dir()` — the dump's parent —
         // under the temp base, the same override the daemon's own start
         // applies, so the test writes nowhere outside the temp dir.
         crate::state::set_state_dir_override(

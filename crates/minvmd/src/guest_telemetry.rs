@@ -257,7 +257,7 @@ pub fn spawn_guest_telemetry_door(control_sock_path: &Path) -> io::Result<PathBu
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
