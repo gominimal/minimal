@@ -6641,7 +6641,9 @@ async fn an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late() 
 /// range, and the next session start's walk lands present. The landing
 /// moves the box's name to its own hand, and the box's forward follows it:
 /// the running box binds its declared port at the hand, toward its switch
-/// lease, so the name and the forward answer at one address.
+/// lease, so the name and the forward answer at one address. Once that bind
+/// stands, the forward its attach bound at the interim is unbound, so no
+/// listener is left on the shared interim for another box's bind to meet.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
@@ -6704,7 +6706,23 @@ async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
         .lock()
         .await
         .control_socket();
-    let (forwarder, served) = fake_forwarder(sock, 200).await;
+    let (forwarder, served) = fake_forwarder(sock.clone(), 200).await;
+    let mapping = boxes::PortMapping {
+        external_port: 18080,
+        internal_port: 80,
+        proto: boxes::IpProto::Tcp,
+    };
+    // The declared forward the box's attach bound at the interim, as the
+    // attach shares it with the box's actor. The mock launch binds none.
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let control = crate::net::policy::ControlChannel::Unix(sock);
+    let Ok(crate::net::policy::HandedBind::Bound(attached)) =
+        crate::net::policy::bind_handed_port(&control, interim, lease, &mapping, None).await
+    else {
+        panic!("the stand-in binds the attach's forward");
+    };
+    let (ingress, _) = handle.ingress_cells().await.expect("the actor answers");
+    ingress.record_attached(std::slice::from_ref(&attached));
 
     // `min finalize-install` applies the range, and the next session start
     // walks it again.
@@ -6728,28 +6746,30 @@ async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
         .expect("the name survives the landing");
     assert_eq!(address, handed, "the name answers at the hand");
 
-    let requests = await_served(&served, 1).await;
+    // The attach's bind, the hand's bind, then the interim's unbind.
+    let requests = await_served(&served, 3).await;
     forwarder.abort();
-    let (line, body) = requests[0]
+    let (line, body) = requests[1]
         .split_once('\n')
         .expect("the served request carries its request line and body");
     assert!(
         line.starts_with("POST /services/forwarder/expose "),
         "the landing binds the running box's forward at its hand: {requests:?}"
     );
-    let declared = crate::net::policy::expose_request(
-        &boxes::PortMapping {
-            external_port: 18080,
-            internal_port: 80,
-            proto: boxes::IpProto::Tcp,
-        },
-        handed,
-        lease,
-    );
+    let declared = crate::net::policy::expose_request(&mapping, handed, lease);
     assert_eq!(
         body,
         String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
         "the forward listens where the name answers, toward the box's lease"
+    );
+    assert!(
+        requests[2].starts_with("POST /services/forwarder/unexpose ")
+            && requests[2].contains(&format!("\"local\":\"{interim}:18080\"")),
+        "the forward at the interim is unbound after the hand's bind stands: {requests:?}"
+    );
+    assert!(
+        attached.is_revoked(),
+        "the attach's teardown asks nothing more of the forward unbound here"
     );
 }
 
@@ -7103,26 +7123,124 @@ async fn a_listen_port_whose_move_failed_releases_its_hold_where_it_was_bound() 
     forwarder.abort();
 }
 
+/// #2748, a listen port whose new address another box holds: an absent
+/// landing moves a box at its range address onto the shared `127.0.0.1`
+/// interim, where a box with no forward behind it, such as a stopped one,
+/// declared the port first. The listening port does not move there: the
+/// other box keeps the port of record, and the forward stays at the old
+/// address. Once that box gives the port up, the next poll moves it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listen_port_does_not_move_onto_a_port_another_box_holds() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 6);
+    let (handle, _gate, served, _gate_sender, web) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "web",
+        true,
+        std::net::Ipv4Addr::new(100, 64, 128, 6),
+        handed,
+        (listened, listened),
+        Vec::new(),
+    )
+    .await;
+    let at_hand = format!("{handed}:{listened}");
+    listed_once(&handle, |rows| {
+        rows.listened.iter().any(|row| row.local == at_hand)
+    })
+    .await;
+    // Another box declared the port at the interim and binds nothing there.
+    let registry = manager.hostnames();
+    let other = SessionId::parse_str("00000000-0000-0000-0000-0000000000db").unwrap();
+    registry
+        .write()
+        .expect("registry lock")
+        .publish_own_address(
+            other,
+            "db",
+            interim,
+            std::collections::BTreeSet::from([listened]),
+        );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(interim),
+        "the absent landing moves the box onto the interim"
+    );
+    // A few of the watcher's polls.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        served_naming(&served, interim, listened).is_empty(),
+        "the listening port is not bound where another box holds it"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(other),
+        "the other box keeps the port of record"
+    );
+    let rows = handle.live_ingress().await.expect("the actor answers");
+    assert!(
+        rows.listened.iter().any(|row| row.local == at_hand),
+        "the row names where the forward is still bound: {rows:?}"
+    );
+
+    // The other box gives the port up, and the port follows the box.
+    let (_, hand_overs) = registry
+        .write()
+        .expect("registry lock")
+        .unpublish_own_address(other);
+    assert!(hand_overs.is_empty(), "no box waits on the port");
+    soon(|| {
+        served_naming(&served, interim, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    soon(|| {
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened)
+            == Some(web)
+    })
+    .await;
+    drop(listener);
+}
+
 /// #2748, a box with no actor: the present landing moves every box standing
 /// on the `127.0.0.1` interim, stopped ones included, and the move of a
-/// box's publish is passed only to a live actor. A box whose actor is not
-/// running has no forward to move, so the landing starts none for it, and
-/// its next attach binds at the new address.
+/// box's publish is passed only to a live actor, with the hand-over for
+/// each port the box declares. A box whose actor is not running has no
+/// forward to move, so the landing starts none for it, not even for the
+/// port it declares, and its next attach binds at the new address.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_present_landing_starts_no_actor_for_a_box_without_one() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 5);
-    let web = finalize_dynamic_ingress_session(
+    // The box declares port 18080.
+    let web = finalize_handed_own_ip_session(
         &mut client,
         "web",
         std::net::Ipv4Addr::new(100, 64, 128, 5),
         handed,
-        Some(boxes::DynamicIngress::Allow),
-        Some((3000, 3999)),
     )
     .await;
+    let declared = std::collections::BTreeSet::from([18080u16]);
     // A restarted daemon that has not resumed the box: its record stands,
     // and no actor runs for it.
     let server = restart(server, client).await;
@@ -7142,13 +7260,8 @@ async fn a_present_landing_starts_no_actor_for_a_box_without_one() {
         let registry = manager.hostnames();
         let mut registry = registry.write().expect("registry lock");
         registry.record_own_hand(web, handed);
-        registry.publish_own_address(
-            web,
-            "web",
-            std::net::Ipv4Addr::LOCALHOST,
-            std::collections::BTreeSet::new(),
-        );
-        registry.register_own_ip(web, "web", std::collections::BTreeSet::new());
+        registry.publish_own_address(web, "web", std::net::Ipv4Addr::LOCALHOST, declared.clone());
+        registry.register_own_ip(web, "web", declared.clone());
     }
     assert_eq!(
         manager.running_count().await,
@@ -7161,15 +7274,19 @@ async fn a_present_landing_starts_no_actor_for_a_box_without_one() {
         .await
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
-    assert_eq!(
-        manager
-            .hostnames()
-            .read()
-            .expect("registry lock")
-            .published_own_address(web),
-        Some(handed),
-        "the box's publish moves to its hand"
-    );
+    {
+        let registry = manager.hostnames();
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.published_own_address(web),
+            Some(handed),
+            "the box's publish moves to its hand"
+        );
+        assert!(
+            registry.holds_shared_port(web, handed, 18080),
+            "the box holds its declared port at the hand, so the move made its hand-over"
+        );
+    }
     // The move is passed on off the landing's task: give it the time an
     // actor's start would take, then read that none started.
     tokio::time::sleep(Duration::from_millis(500)).await;

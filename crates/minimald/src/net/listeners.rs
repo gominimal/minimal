@@ -1045,6 +1045,18 @@ impl ListenPlan {
         })
     }
 
+    /// The box holding `port` at the plan's published address of record
+    /// (NET-129), declared or dynamic. `None` when nobody holds it, or the
+    /// launch carried no registry.
+    fn holder_at_published(&self, port: u16) -> Option<boxes::SessionId> {
+        self.hostnames.as_ref().and_then(|registry| {
+            registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .shared_port_holder(self.published, port)
+        })
+    }
+
     /// Moves the hold [`Self::record_dynamic_hold`] recorded at `from` to
     /// the box's published address (#2748): the forward moved there, so the
     /// port is released at `from`, where another box may take it over, and
@@ -1821,6 +1833,29 @@ impl WatchState {
             return;
         };
         let from = bound_address(&old);
+        // Another box holding the port at the new address keeps it, as a
+        // declared publish there would (NET-129, first-come): the forward
+        // stays where it is, and a later poll moves it once that box gives
+        // the port up. The `127.0.0.1` interim an absent landing moves the
+        // box to is shared, and a stopped box's hold stands there with no
+        // forward behind it.
+        if let Some(holder) = self.plan.holder_at_published(port)
+            && holder != self.plan.session_id
+        {
+            if self.reported_move_failures.insert(port) {
+                tracing::info!(
+                    session = %self.plan.box_name,
+                    host = %self.plan.published,
+                    port,
+                    from = old.local(),
+                    other = %holder,
+                    owner = %PublicationOwner::Listen.as_str(),
+                    "another box holds the listening port at the box's new address; \
+                     it stays at the old address until that box gives it up"
+                );
+            }
+            return;
+        }
         let moved = match expose_mapping(
             &self.plan.control,
             self.plan.published,

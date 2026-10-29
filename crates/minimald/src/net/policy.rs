@@ -316,6 +316,24 @@ impl PortForwarder {
             }
         }
     }
+
+    /// Unbinds the forward a move of the box's publish left at the old
+    /// address (#2748). The gate keeps admitting the port, since the forward
+    /// bound at the new address serves it now. The forwarder is marked
+    /// revoked once the unbind stands, so the attach's teardown, which holds
+    /// a clone, asks nothing more of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from the failing `unexpose` call.
+    pub async fn unbind_moved(&self, control: &ControlChannel) -> io::Result<()> {
+        if self.is_revoked() {
+            return Ok(());
+        }
+        unexpose_mapping(control, &self.mapping).await?;
+        self.revoked.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
@@ -1245,7 +1263,7 @@ async fn probe_publish_surface_within(
             probe.probed += 1;
             let expose = ExposeRequest {
                 local: format!("{address}:{RANGE_PROBE_PORT}"),
-                remote: format!("{}:1", Ipv4Addr::LOCALHOST),
+                remote: ::switch::loopback::RANGE_PROBE_REMOTE.to_string(),
                 protocol: "tcp".to_string(),
             };
             // Marked before the expose, so a budget cut inside this round
@@ -1703,8 +1721,10 @@ const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 /// collide on it. That daemon walks at its start and again at each session
 /// start, and [`RANGE_WALK_TURN`] runs those walks one at a time. A round
 /// that finds the port already held at an address (a box's forward or a
-/// host_ip mirror) counts that address as bound.
-const RANGE_PROBE_PORT: u16 = 21064;
+/// host_ip mirror) counts that address as bound. The host-side egress gate
+/// of a VM-backed host admits each round by this port and
+/// [`::switch::loopback::RANGE_PROBE_REMOTE`].
+const RANGE_PROBE_PORT: u16 = ::switch::loopback::RANGE_PROBE_PORT;
 
 /// The turn every forwarder-conducted range walk in this process takes
 /// before its first round, so the daemon-start walk and the session-start

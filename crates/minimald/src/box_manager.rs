@@ -736,12 +736,12 @@ impl BoxManager {
             );
         }
         // #2748: each move of a box's publish is passed to that box's
-        // session, which moves the forwards its `min net expose` bound at
-        // the old address if the box is running. Off the registry's lock,
-        // like the hand-overs above. Only a live actor is asked: the
-        // landing moves stopped boxes too, and a box with no actor has no
-        // forward to move, so none is started for it. Its next attach binds
-        // at the new address.
+        // session, which binds its declared ports at the new address and
+        // moves the forwards its `min net expose` bound at the old one, if
+        // the box is running. Off the registry's lock, like the hand-overs
+        // above. Only a live actor is asked: the landing moves stopped boxes
+        // too, and a box with no actor has no forward to move, so none is
+        // started for it. Its next attach binds at the new address.
         #[cfg(target_os = "linux")]
         {
             let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
@@ -758,7 +758,10 @@ impl BoxManager {
                             return;
                         };
                         if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
-                            holder.move_exposed_ports(moved.from, moved.to).await;
+                            let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
+                            holder
+                                .publish_moved(moved.from, moved.to, ports.collect())
+                                .await;
                         }
                     }
                 },
@@ -1267,14 +1270,15 @@ pub(crate) fn draw_interim_upgrades(
 /// stopped box keeps its name, so the move applies to it with its stopped
 /// marker intact.
 ///
-/// A move also sends the box a hand-over for each port it declares, and the
-/// move itself ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]).
+/// A move also sends the move itself, with a hand-over for each port the box
+/// declares ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]).
 /// A box that runs has its forwards at the interim, where its attach,
 /// its `min net expose` and its listen watcher bound them, so without these
 /// its name would answer at an address no forward listens on. Its actor
 /// binds the declared forwards and moves the exposed ones to the new
 /// address. Its listen watcher reads the new address on its next poll and
-/// moves the ports it published.
+/// moves the ports it published. A box with no actor running gets nothing:
+/// none is started for it, and its next attach binds at the new address.
 ///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task

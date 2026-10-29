@@ -1912,17 +1912,26 @@ async fn relay_control(
                 return;
             }
         };
-    let decision = match decide_control_request(verb, &request, &table, phase, forwards) {
-        Ok(decision) => decision,
-        Err(refused) => {
-            // Refused, and said so at the frame drops' cadence: a guest can
-            // attempt a publish on a fresh connection as cheaply as it can
-            // send a frame, and the refusal must not become the flood. The
-            // connection's halves come down with the return — nothing was
-            // written on, so gvproxy never saw the request, and the guest's
-            // read of its own side ends it.
-            refuse_request(&limiter, &refused);
-            return;
+    // One round of the guest daemon's loopback range probe is relayed
+    // without a row's decision and without a ledger note
+    // ([`is_range_probe_round`]): it binds nothing a box serves, and the
+    // guest cannot publish the range verdict any other way.
+    let decision = if is_range_probe_round(verb, &request, forwards) {
+        tracing::debug!(?verb, "relaying a loopback range probe round");
+        None
+    } else {
+        match decide_control_request(verb, &request, &table, phase, forwards) {
+            Ok(decision) => Some(decision),
+            Err(refused) => {
+                // Refused, and said so at the frame drops' cadence: a guest
+                // can attempt a publish on a fresh connection as cheaply as
+                // it can send a frame, and the refusal must not become the
+                // flood. The connection's halves come down with the return —
+                // nothing was written on, so gvproxy never saw the request,
+                // and the guest's read of its own side ends it.
+                refuse_request(&limiter, &refused);
+                return;
+            }
         }
     };
     // A publish's two ends go to the ledger before the request is written
@@ -1960,8 +1969,8 @@ async fn relay_control(
     // not written on either: the switch refuses a second expose of a
     // listener it holds, and the daemon fails the attach on any refused
     // bind. The gate answers it as bound, which it is.
-    let noted = match (verb, forward_listener(verb, &request)) {
-        (ControlVerb::Expose, Some(listener)) => {
+    let noted = match (verb, forward_listener(verb, &request), &decision) {
+        (ControlVerb::Expose, Some(listener), Some(decision)) => {
             match (published_inside(&request), published_protocol(&request)) {
                 (Some(inside), Some(proto)) => {
                     let addr = decision.request.switch_addr();
@@ -2063,7 +2072,9 @@ async fn relay_control(
         }
         return;
     }
-    if decision.applied == Applied::Interim {
+    if let Some(decision) = &decision
+        && decision.applied == Applied::Interim
+    {
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
         warn_interim_publish(&limiter, &decision);
@@ -3701,6 +3712,49 @@ struct DnsRecordBody {
 /// — and a request wider than the summary holds is refused rather than
 /// truncated, because a truncated request is a different request.
 const MAX_ZONE_RECORDS: usize = MAX_REQUEST_RECORDS;
+
+/// Whether a control request is one round of the guest daemon's loopback
+/// range probe (NET-123): the expose that binds the probe port at one address
+/// of the reserved local range, or the unexpose that releases it. The guest
+/// cannot see the host's loopback, so it asks the forwarder to bind there,
+/// and the answer is the range verdict its publishes follow. No row holds the
+/// probe's placeholder remote, so the row decision would refuse every round
+/// and the guest would read the range as absent while this host answers its
+/// boxes' names inside it (#2748).
+///
+/// A round is admitted by its exact shape alone: an address of the range,
+/// [`switch::loopback::RANGE_PROBE_PORT`], tcp, and for the expose
+/// [`switch::loopback::RANGE_PROBE_REMOTE`], which is never dialed. Its
+/// forward binds a port no box is served at and accepts no connection. An
+/// unexpose is a round only when no applied publish holds the listener in
+/// the ledger, so a probe can never take a box's forward down.
+fn is_range_probe_round(verb: ControlVerb, body: &[u8], forwards: &PublishedForwards) -> bool {
+    let (local, protocol) = match verb {
+        ControlVerb::Expose => {
+            let Ok(parsed) = serde_json_lenient::from_slice::<ExposeBody>(body) else {
+                return false;
+            };
+            if parsed.remote != switch::loopback::RANGE_PROBE_REMOTE {
+                return false;
+            }
+            (parsed.local, parsed.protocol)
+        }
+        ControlVerb::Unexpose => {
+            let Ok(parsed) = serde_json_lenient::from_slice::<UnexposeBody>(body) else {
+                return false;
+            };
+            (parsed.local, parsed.protocol)
+        }
+        ControlVerb::DnsAdd => return false,
+    };
+    let Ok(listener) = loopback_listener(&local) else {
+        return false;
+    };
+    protocol == "tcp"
+        && listener.1 == switch::loopback::RANGE_PROBE_PORT
+        && in_reserved_local_range(Ipv4Addr::from(listener.0))
+        && (verb == ControlVerb::Expose || forwards.protocol_of(listener).is_none())
+}
 
 /// Summarizes an expose request into a [`SwitchRequest`]: the remote is the
 /// switch address the forwarder dials and the address the publish is at; the
@@ -15671,6 +15725,117 @@ mod tests {
             Err(_) => panic!("the gate left the switch side hanging"),
         }
         expect_teardown(&mut guest).await;
+    }
+
+    /// #2748: one round of the guest daemon's loopback range probe reaches
+    /// the switch, its bind and its release both, though no row holds the
+    /// probe's placeholder remote. Refused, every round would read as a fault
+    /// of the channel, and the guest would land the range absent while this
+    /// host answers its boxes' names inside it.
+    #[tokio::test]
+    async fn a_range_probe_round_reaches_the_switch_with_no_row_behind_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        let local = format!("127.0.64.1:{}", switch::loopback::RANGE_PROBE_PORT);
+        let control = |path: &str, body: String| {
+            let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\n").into_bytes();
+            request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            request.extend_from_slice(body.as_bytes());
+            request
+        };
+        let expose = control(
+            "/services/forwarder/expose",
+            format!(
+                r#"{{"local":"{local}","remote":"{}","protocol":"tcp"}}"#,
+                switch::loopback::RANGE_PROBE_REMOTE
+            ),
+        );
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the probe's expose");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, expose, "the probe's bind reached the switch whole");
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(seen, answer, "the bind's answer reaches the guest verbatim");
+
+        let unexpose = control(
+            "/services/forwarder/unexpose",
+            format!(r#"{{"local":"{local}","protocol":"tcp"}}"#),
+        );
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&unexpose)
+            .await
+            .expect("writing the probe's unexpose");
+        let mut spoken = vec![0u8; unexpose.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(
+            spoken, unexpose,
+            "the probe's release reached the switch whole"
+        );
+    }
+
+    /// The probe rule admits the probe's exact shape and nothing beside it: an
+    /// address of the reserved range, the probe port, tcp, and the
+    /// placeholder remote. A release is a probe round only while no applied
+    /// publish holds the listener, so it never takes a box's forward down.
+    #[test]
+    fn the_range_probe_rule_admits_only_the_probes_own_shape() {
+        use super::{ControlVerb, PublishedForwards, is_range_probe_round};
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        let remote = switch::loopback::RANGE_PROBE_REMOTE;
+        let forwards = PublishedForwards::new();
+        let expose = |local: &str, remote: &str, protocol: &str| {
+            format!(r#"{{"local":"{local}","remote":"{remote}","protocol":"{protocol}"}}"#)
+        };
+        let round = format!("127.0.64.7:{port}");
+        assert!(is_range_probe_round(
+            ControlVerb::Expose,
+            expose(&round, remote, "tcp").as_bytes(),
+            &forwards
+        ));
+        for (local, remote, protocol) in [
+            (format!("127.0.0.1:{port}"), remote, "tcp"),
+            (format!("127.0.64.7:{}", port + 1), remote, "tcp"),
+            (round.clone(), "100.64.0.9:1", "tcp"),
+            (round.clone(), remote, "udp"),
+        ] {
+            assert!(
+                !is_range_probe_round(
+                    ControlVerb::Expose,
+                    expose(&local, remote, protocol).as_bytes(),
+                    &forwards
+                ),
+                "{local} {remote} {protocol} is not a probe round"
+            );
+        }
+        let release = format!(r#"{{"local":"{round}","protocol":"tcp"}}"#);
+        assert!(is_range_probe_round(
+            ControlVerb::Unexpose,
+            release.as_bytes(),
+            &forwards
+        ));
+        forwards
+            .note_published(
+                ([127, 0, 64, 7], port),
+                LEASE,
+                port,
+                super::egress::IPPROTO_TCP,
+                boxes::core::switch_request::Applied::Row,
+            )
+            .expect("the ledger has room");
+        assert!(
+            !is_range_probe_round(ControlVerb::Unexpose, release.as_bytes(), &forwards),
+            "a release of a listener a box's publish holds is decided by its row"
+        );
     }
 
     /// The two accepted spellings are the daemon's own, and a `local`

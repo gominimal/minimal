@@ -1329,6 +1329,56 @@ impl BoxActor {
         }
     }
 
+    /// Unbinds the declared forward of `port` still bound at `from` once the
+    /// move's hand-over bound it at `to` (#2748). Without this the box keeps
+    /// a listener at the old address: the `127.0.0.1` interim is shared, and
+    /// the registry may give the port there to another box, whose bind would
+    /// meet it. The old forward is unbound only after the new one stands, so
+    /// the port is served the whole way through. A bind at `to` that failed
+    /// leaves the old forward as it is.
+    ///
+    /// On a VM-backed host the host refuses a declared port's withdrawal and
+    /// unbinds the box's declared forwards itself
+    /// ([`crate::net::policy::ControlChannel::host_unbinds_declared_forwards`]),
+    /// so nothing is asked there. An unbind that fails is logged, and the
+    /// spawn's end unbinds the forward as it would have.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn release_moved_declared(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+        port: u16,
+    ) {
+        if !self.has_live_host() || !self.live_ingress.holds_handed_at(to, port) {
+            return;
+        }
+        let stale = self.live_ingress.declared_at(from, port);
+        if stale.is_empty() {
+            return;
+        }
+        let control = self.switch_control().await;
+        if control.host_unbinds_declared_forwards() {
+            return;
+        }
+        for forwarder in stale {
+            match forwarder.unbind_moved(&control).await {
+                Ok(()) => tracing::info!(
+                    port,
+                    %from,
+                    %to,
+                    "unbound a declared port at the box's old address after its move"
+                ),
+                Err(error) => tracing::warn!(
+                    port,
+                    %from,
+                    %error,
+                    "unbinding a declared port at the box's old address failed; \
+                     it is unbound when the box's spawn ends"
+                ),
+            }
+        }
+    }
+
     /// Moves the forwards this box's `min net expose` bound at `from` to
     /// `to`, the address its publish moved to (#2748). The present landing
     /// moves a box off the `127.0.0.1` interim while it runs, and a runtime

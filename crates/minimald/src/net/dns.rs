@@ -637,8 +637,9 @@ struct OwnPublished {
 
 /// A box's publish moved to a new address (#2748): the present landing moved
 /// it off the `127.0.0.1` interim ([`HostnameRegistry::hand_over_moved_publish`]).
-/// Sent as data so the receiver can move the forwards the box's runtime
-/// `min net expose` bound at the old address.
+/// Sent as data so the receiver can bind the box's declared ports at the new
+/// address and move the forwards its runtime `min net expose` bound at the
+/// old one, while the box runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishMove {
     /// The session whose box moved.
@@ -647,14 +648,17 @@ pub struct PublishMove {
     pub from: Ipv4Addr,
     /// The address the box publishes at now.
     pub to: Ipv4Addr,
+    /// The declared ports the box holds at `to`, one hand-over each: a port
+    /// another box holds there is left out, since the box yields it.
+    pub hand_overs: Vec<PortHandOver>,
 }
 
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
 /// there took it — or among the stopped ones, when none is running. The
-/// present landing sends one too, to a box it moved off the `127.0.0.1`
-/// interim ([`HostnameRegistry::hand_over_moved_publish`]). Returned as data
+/// present landing makes one too, for a box it moved off the `127.0.0.1`
+/// interim, and sends it inside the move ([`PublishMove`]). Returned as data
 /// so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
@@ -980,8 +984,10 @@ impl HostnameRegistry {
 
     /// The box holding `port` at `address` of record (NET-129), declared or
     /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
-    /// also asks for a declared publish, cannot see a dynamic holder.
-    #[cfg(test)]
+    /// also asks for a declared publish, cannot see a dynamic holder, and
+    /// what the listen watcher reads before it moves a port to a new
+    /// address (#2748).
+    #[must_use]
     pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
         self.own_holders.get(&(address, port)).copied()
     }
@@ -999,21 +1005,21 @@ impl HostnameRegistry {
                 .is_some_and(|own| own.address == address && own.ports.contains(&port))
     }
 
-    /// Sends the box `session_id` one hand-over per declared port it holds
-    /// at the address it publishes at now (NET-123 §7.1), and returns them.
-    /// The present landing calls it for each box it moves off the
-    /// `127.0.0.1` interim (`from`): a box that runs has its forwards bound
-    /// at the interim, so the name would answer at an address no forward
-    /// listens on. The receiver binds each port's forward at the new address
-    /// while the box runs ([`Self::notify_hand_overs`]); a box that is not
-    /// running binds them there at its next attach. A port another box holds
-    /// at the address is not sent: the box yields it.
+    /// Sends the move of the box `session_id`'s publish from `from` to the
+    /// address it publishes at now (NET-123 §7.1, #2748), with one hand-over
+    /// per declared port it holds there, and returns the hand-overs. The
+    /// present landing calls it for each box it moves off the `127.0.0.1`
+    /// interim: a box that runs has its forwards bound at the interim, so
+    /// the name would answer at an address no forward listens on. A port
+    /// another box holds at the address is left out: the box yields it.
     ///
-    /// The box's runtime publications follow too. The move itself is sent
-    /// once ([`Self::notify_publish_moves`]), and its receiver moves the
-    /// forwards the box's `min net expose` bound at `from`. The listen
-    /// watcher reads the box's published address here on every poll, and
-    /// moves the ports it published itself.
+    /// The move goes to [`Self::notify_publish_moves`]'s receiver, never to
+    /// [`Self::notify_hand_overs`]'s. The receiver passes it on only to a
+    /// box whose actor runs, which binds each declared port at the new
+    /// address and moves the forwards its `min net expose` bound at `from`.
+    /// A box with no actor gets nothing and binds at the new address at its
+    /// next attach. The listen watcher reads the box's published address
+    /// here on every poll, and moves the ports it published itself.
     pub fn hand_over_moved_publish(
         &self,
         session_id: SessionId,
@@ -1022,33 +1028,28 @@ impl HostnameRegistry {
         let Some(own) = self.own_published.get(&session_id) else {
             return Vec::new();
         };
+        let hand_overs: Vec<PortHandOver> = own
+            .ports
+            .iter()
+            .filter(|&&port| self.holds_shared_port(session_id, own.address, port))
+            .map(|&port| PortHandOver {
+                holder: session_id,
+                address: own.address,
+                port,
+            })
+            .collect();
         if own.address != from
             && let Some(sender) = &self.publish_moves
         {
-            // A receiver that is gone moves nothing: the box's runtime
-            // forwards come down with its spawn.
+            // A receiver that is gone moves nothing: the box binds its
+            // declared ports at the new address at its next attach, and its
+            // runtime forwards come down with its spawn.
             drop(sender.send(PublishMove {
                 holder: session_id,
                 from,
                 to: own.address,
+                hand_overs: hand_overs.clone(),
             }));
-        }
-        let mut hand_overs = Vec::new();
-        for &port in &own.ports {
-            if !self.holds_shared_port(session_id, own.address, port) {
-                continue;
-            }
-            let hand_over = PortHandOver {
-                holder: session_id,
-                address: own.address,
-                port,
-            };
-            // A receiver that is gone binds nothing: the box's next attach
-            // binds the port at the address it publishes at.
-            if let Some(sender) = &self.hand_overs {
-                drop(sender.send(hand_over.clone()));
-            }
-            hand_overs.push(hand_over);
         }
         hand_overs
     }
