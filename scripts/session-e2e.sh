@@ -11760,7 +11760,9 @@ proof_published_proxy_routes_from_host() {
 # `bep serve` beside gvproxy on a production boot, and the proxy opens its
 # control socket under the real home. Records case $1 as NOT RUN and returns
 # 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
-# Keychain), without gvproxy (the daemon starts the proxy beside it) or
+# Keychain), without gvproxy (the daemon starts the proxy beside it),
+# without a bep binary (MINVMD_BEP_BIN, else the bep beside minvmd, as
+# rt_bep_bin resolves it; the macOS CI testbed ships none) or
 # without a GitHub sign-in a person made with `min auth login` (a case that
 # passes "no_sign_in" as $2 skips that check). Everywhere
 # else the proxy must come up, so a proxy that does not is a failure, never
@@ -11788,6 +11790,10 @@ bep_live_gate() {
   fi
   if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 1
+  fi
+  if ! rt_bep_bin >/dev/null 2>&1; then
+    not_run "$1" "no bep binary beside minvmd: set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
     return 1
   fi
   # A case that needs no GitHub sign-in passes "no_sign_in" as $2.
