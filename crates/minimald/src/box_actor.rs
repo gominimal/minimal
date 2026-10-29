@@ -839,10 +839,12 @@ impl BoxActor {
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
         let host_slot = HostSlot::default();
+        let stop_force = StopForce::default();
         let weak_self = WeakBoxHandle(
             sender.downgrade(),
             destroying.clone(),
             Arc::clone(&host_slot),
+            Arc::clone(&stop_force),
         );
         #[cfg(target_os = "linux")]
         let registers_name = conf.registers_name;
@@ -878,7 +880,7 @@ impl BoxActor {
             session_id = %actor.record.id(),
         );
         crate::traced::spawn_detached(root, actor.mainloop());
-        Ok(BoxHandle(sender, destroying, host_slot))
+        Ok(BoxHandle(sender, destroying, host_slot, stop_force))
     }
 
     /// Publishes the host this actor holds to the slot its handle reads
@@ -1179,18 +1181,22 @@ impl BoxActor {
                 //
                 // The stop runs inside the message loop on purpose: no
                 // attach, exec or second stop runs on the box while its
-                // processes end. Each one waits up to the grace period. A
-                // forced stop sent during a graceful one does not cut it
-                // short. A stop that waited answers with the first stop's
-                // ending (`BoxManagerHandle::stop_box_with_grace`).
+                // processes end. A forced stop sent during a graceful one
+                // sets the handle's force flag before it queues, and the
+                // graceful stop then sends SIGKILL at once (design: `--force`
+                // kills at once). A stop that waited answers with the first
+                // stop's ending (`BoxManagerHandle::stop_box_with_grace`).
                 let stopped = self.stop_box(force, grace).await;
+                // NET-128 fail-closed, as the `Stop` arm: the processes are
+                // dead whether or not the record write succeeded, so the
+                // name no longer answers for the box.
+                self.mark_name_stopped().await;
                 if stopped.is_err() {
                     // The record is not `stopped` yet. The actor keeps
                     // hosting the box, so a retried stop can finish it.
                     let _ = reply.send(stopped);
                     return ControlFlow::Continue(());
                 }
-                self.mark_name_stopped().await;
                 let _ = reply.send(stopped);
                 // The actor ends with the box, and evicts itself: no actor
                 // hosts a stopped box (#2393).
@@ -1679,6 +1685,11 @@ impl BoxHandle {
         grace: std::time::Duration,
     ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
         let (reply, recv) = oneshot::channel();
+        if force {
+            // Before the queue: a graceful stop that the actor runs now
+            // reads it in its grace period and sends SIGKILL at once.
+            self.3.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // A send error means the actor is gone: the recv fails as well.
         let _ = self
             .0

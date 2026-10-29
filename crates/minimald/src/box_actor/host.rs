@@ -1431,10 +1431,13 @@ pub(crate) struct StopOutcome {
 ///
 /// A graceful stop sends SIGTERM, waits up to `grace` for the box to have no
 /// process left, then sends SIGKILL to the processes still running. A forced
-/// stop sends SIGKILL at once. The ending stores the signal that the
-/// entrypoint ended after, unless the entrypoint exited with a status of its
-/// own. `processes` is `None` when the host did not name its container: the
-/// stop then signals nothing itself, and the caller's host kill ends the box.
+/// stop sends SIGKILL at once. A graceful stop that finds `forced` set, at
+/// its start or in its grace period, ends the grace and sends SIGKILL at
+/// once: a forced stop sent meanwhile sets it. The ending stores the signal
+/// that the entrypoint ended after, unless the entrypoint exited with a
+/// status of its own. `processes` is `None` when the host did not name its
+/// container: the stop then signals nothing itself, and the caller's host
+/// kill ends the box.
 ///
 /// In a real box the entrypoint is the init of the box's PID namespace. The
 /// kernel delivers SIGTERM from the daemon's namespace to that init only
@@ -1448,6 +1451,7 @@ pub(crate) async fn stop_box_processes(
     mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     force: bool,
     grace: std::time::Duration,
+    forced: &std::sync::atomic::AtomicBool,
 ) -> StopOutcome {
     use boxes::core::record::StopEnding;
 
@@ -1468,7 +1472,8 @@ pub(crate) async fn stop_box_processes(
     // `Some(Some(s))`: it ended after the signal `s`.
     let mut ended_after: Option<Option<i32>> = entrypoint.is_finished().then_some(None);
     let mut sent = Vec::new();
-    if force {
+    let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
+    if force || forced_now() {
         signal(libc::SIGKILL);
         sent.push(libc::SIGKILL);
     } else {
@@ -1483,6 +1488,13 @@ pub(crate) async fn stop_box_processes(
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if forced_now() {
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: a forced stop arrived; the grace period ends now"
+                );
                 break;
             }
             tokio::time::sleep(STOP_POLL).await;
@@ -1643,6 +1655,7 @@ impl BoxActor {
                     task,
                     force,
                     grace,
+                    &self.weak_self.3,
                 )
                 .await;
                 tracing::info!(
@@ -1665,6 +1678,11 @@ impl BoxActor {
                 boxes::core::record::StopEnding::AtDaemonStart
             }
         };
+        // The box is signalled: a forced stop that set the flag meanwhile
+        // has had its effect, and the next stop starts without it.
+        self.weak_self
+            .3
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         // The host is gone: this takes down what ran beside it, as every
         // other stop does.
         self.stop_running(false).await;

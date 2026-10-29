@@ -12613,6 +12613,7 @@ async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
         entrypoint,
         false,
         Duration::from_millis(500),
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await;
     assert!(
@@ -12698,6 +12699,7 @@ async fn stop_force_kills_at_once() {
         entrypoint,
         true,
         Duration::from_secs(60),
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await;
     assert!(
@@ -12706,6 +12708,56 @@ async fn stop_force_kills_at_once() {
         started.elapsed()
     );
     assert_eq!(outcome.sent, vec![libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}
+
+/// BOX-013: a forced stop that arrives while a graceful stop waits out its
+/// grace period ends the grace. The graceful stop sends SIGKILL at once, and
+/// the box does not wait the rest of the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forced_during_a_graceful_stop_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let forced = super::StopForce::default();
+
+    // The forced stop arrives inside the graceful stop's grace period.
+    let setter = std::sync::Arc::clone(&forced);
+    crate::traced::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(60),
+        &forced,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the graceful stop waited until the forced stop arrived: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a forced stop cuts the grace period short: {elapsed:?}"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
     assert_eq!(
         outcome.ending,
         StopEnding::Signalled {
@@ -12735,6 +12787,7 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
         entrypoint,
         false,
         Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await;
     assert_eq!(outcome.sent[0], libc::SIGTERM);
@@ -12840,6 +12893,81 @@ async fn stop_with_an_unwritable_record_refuses_launches_until_retried() {
         .unwrap()
         .expect("a stopped box keeps its record");
     assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
+/// NET-128 fail-closed: a stop that ends the box's processes and cannot
+/// write the `stopped` record still marks the box's name stopped. A
+/// shared-address name does not keep answering for a box with no process.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_box_with_an_unwritable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unwritbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged += 1;
+        }
+    }
+    assert_eq!(staged, 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unwritbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unwritbox".to_string(),
+            address: None,
+        },
+        "a failed record write still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unwritbox.min.internal"),
+        None,
+        "the proxy does not forward a box whose stop could not write its record"
+    );
 }
 
 /// BOX-013: the `stopped` record is the step a stop cannot skip. When the
