@@ -638,8 +638,10 @@ struct OwnPublished {
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
-/// there took it — or among the stopped ones, when none is running.
-/// Returned as data so the caller can bind the new holder's forward.
+/// there took it — or among the stopped ones, when none is running. The
+/// present landing sends one too, to a box it moved off the `127.0.0.1`
+/// interim ([`HostnameRegistry::hand_over_moved_publish`]). Returned as data
+/// so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
     /// The session whose box holds the port now.
@@ -962,6 +964,39 @@ impl HostnameRegistry {
                 .own_published
                 .get(&session_id)
                 .is_some_and(|own| own.address == address && own.ports.contains(&port))
+    }
+
+    /// Sends the box `session_id` one hand-over per declared port it holds
+    /// at the address it publishes at now (NET-123 §7.1), and returns them.
+    /// The present landing calls it for each box it moves off the
+    /// `127.0.0.1` interim: a box that runs has its forwards bound where its
+    /// attach bound them, at the interim, so the name would answer at an
+    /// address no forward listens on. The receiver binds each port's forward
+    /// at the new address while the box runs ([`Self::notify_hand_overs`]);
+    /// a box that is not running binds them there at its next attach. A port
+    /// another box holds at the address is not sent: the box yields it.
+    pub fn hand_over_moved_publish(&self, session_id: SessionId) -> Vec<PortHandOver> {
+        let Some(own) = self.own_published.get(&session_id) else {
+            return Vec::new();
+        };
+        let mut hand_overs = Vec::new();
+        for &port in &own.ports {
+            if !self.holds_shared_port(session_id, own.address, port) {
+                continue;
+            }
+            let hand_over = PortHandOver {
+                holder: session_id,
+                address: own.address,
+                port,
+            };
+            // A receiver that is gone binds nothing: the box's next attach
+            // binds the port at the address it publishes at.
+            if let Some(sender) = &self.hand_overs {
+                drop(sender.send(hand_over.clone()));
+            }
+            hand_overs.push(hand_over);
+        }
+        hand_overs
     }
 
     /// Sets the node's host loopback address once the answerer granted it —

@@ -1204,7 +1204,11 @@ impl BoxActor {
     /// it runs (NET-129): the port's holder was destroyed, moved off the
     /// address or stopped naming the port, and the registry elected this
     /// box. Its attach skipped the port while it yielded, so nothing is
-    /// bound for it until this, or until its next attach.
+    /// bound for it until this, or until its next attach. The present
+    /// landing sends the same hand-over to a box it moved off the
+    /// `127.0.0.1` interim (NET-123 §7.1): its attach bound the forward at
+    /// the interim, and this binds it at the address its name now answers
+    /// at.
     ///
     /// Nothing is asked for a box with no host running or whose spawn has
     /// ended: that box holds the port of record and its next attach binds

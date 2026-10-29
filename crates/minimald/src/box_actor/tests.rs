@@ -6635,6 +6635,124 @@ async fn an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late() 
     );
 }
 
+/// #2748, the fresh install on a VM-backed host: the daemon-start walk
+/// lands absent, so a handed box finalizes at the `127.0.0.1` interim and
+/// its running attach binds its forwards there. The host then gains the
+/// range, and the next session start's walk lands present. The landing
+/// moves the box's name to its own hand, and the box's forward follows it:
+/// the running box binds its declared port at the hand, toward its switch
+/// lease, so the name and the forward answer at one address.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    // The daemon-start walk's verdict on a host without the range.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 2);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 2);
+    let web = finalize_handed_own_ip_session(&mut client, "web", lease, handed).await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the absent verdict stands the handed box on the interim"
+    );
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // `min finalize-install` applies the range, and the next session start
+    // walks it again.
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the present landing moves the box's publish to its own hand"
+    );
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name survives the landing");
+    assert_eq!(address, handed, "the name answers at the hand");
+
+    let requests = await_served(&served, 1).await;
+    forwarder.abort();
+    let (line, body) = requests[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the landing binds the running box's forward at its hand: {requests:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &boxes::PortMapping {
+            external_port: 18080,
+            internal_port: 80,
+            proto: boxes::IpProto::Tcp,
+        },
+        handed,
+        lease,
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the forward listens where the name answers, toward the box's lease"
+    );
+}
+
 /// The wiring test for the hand's verdict gate (the `.filter(vouches_for)`
 /// and the bounded wait on the hand's read, §7.1): a handed reserved address
 /// finalizes to `published_own_address == 127.0.0.1` under an absent book —

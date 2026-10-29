@@ -1231,6 +1231,12 @@ pub(crate) fn draw_interim_upgrades(
 /// stopped box keeps its name, so the move applies to it with its stopped
 /// marker intact.
 ///
+/// A move also sends the box a hand-over for each port it publishes
+/// ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]). A box
+/// that runs has its forwards at the interim, where its attach bound them,
+/// so without the hand-over its name would answer at an address no forward
+/// listens on. Its actor binds the forwards at the new address.
+///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
 /// ([`crate::box_manager::BoxManager::init`]), never through the manager's
@@ -1273,6 +1279,10 @@ pub(crate) fn apply_interim_upgrade(
                 upgrade.ports.clone(),
             );
             reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
+            // The forwards follow the name (#2748): a box that runs bound
+            // them at the interim, so its actor binds each port again at the
+            // address the name now answers at.
+            reg.hand_over_moved_publish(upgrade.session);
             true
         };
         (applied, standing.is_none())
