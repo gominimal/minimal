@@ -1272,7 +1272,23 @@ impl BoxManagerHandle {
             .get_session(BoxKeyPredicate::Id(id))
             .await?
             .ok_or_else(unknown)?;
-        session.stop_box(force, grace).await
+        let stopped = session.stop_box(force, grace).await;
+        if stopped.is_err() {
+            // A stop that waited behind another stop of the same box finds
+            // the actor gone when the first one ends. The record then says
+            // how the box ended, and that is this stop's answer too.
+            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
+                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
+            {
+                tracing::info!(
+                    session_id = %id,
+                    ending = ?ending,
+                    "stop: an earlier stop ended the box; answering with its ending"
+                );
+                return Ok(ending);
+            }
+        }
+        stopped
     }
 }
 

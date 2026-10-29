@@ -1176,6 +1176,13 @@ impl BoxActor {
                 // BOX-013: a stop of the box itself. The record stays, set
                 // to `stopped`, and the name is held as a shutdown stop
                 // holds it.
+                //
+                // The stop runs inside the message loop on purpose: no
+                // attach, exec or second stop runs on the box while its
+                // processes end. Each one waits up to the grace period. A
+                // forced stop sent during a graceful one does not cut it
+                // short. A stop that waited answers with the first stop's
+                // ending (`BoxManagerHandle::stop_box_with_grace`).
                 let stopped = self.stop_box(force, grace).await;
                 if stopped.is_err() {
                     // The record is not `stopped` yet. The actor keeps

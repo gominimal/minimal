@@ -12734,9 +12734,86 @@ async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
     assert!(!exited.contains_key("signal"));
 }
 
-/// BOX-013: a container supervisor that already exited and was reaped has
-/// no readable namespace. Its pid can belong to an unrelated process by
-/// then, so the stop finds no process of the box and signals nothing.
+/// BOX-013: a stop that ends the processes and cannot write the `stopped`
+/// record keeps the box hosted. No launch starts new processes in it until a
+/// retried stop writes the record with the ending of the first stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_an_unwritable_record_refuses_launches_until_retried() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = Vec::new();
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged.push(tmp);
+        }
+    }
+    assert_eq!(staged.len(), 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+    host.closed().await;
+
+    let refused = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect_err("no launch while the stop's record is unwritten");
+    assert!(
+        refused
+            .to_string()
+            .contains("stopped state is not saved yet"),
+        "the refusal says why: {refused}"
+    );
+
+    for tmp in &staged {
+        std::fs::remove_dir(tmp).unwrap();
+    }
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the retried stop writes the record");
+    assert_eq!(
+        ending,
+        boxes::core::record::StopEnding::Signalled {
+            signal: libc::SIGTERM
+        },
+        "the retried stop keeps how the first stop ended the box"
+    );
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
 /// BOX-013: the `stopped` record is the step a stop cannot skip. When the
 /// `exited` event cannot be written, the stop still answers with its ending
 /// and the record still reads `stopped`.
@@ -12792,6 +12869,9 @@ async fn stop_with_a_failing_event_write_still_records_stopped() {
     assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
 }
 
+/// BOX-013: a container supervisor that already exited and was reaped has
+/// no readable namespace. Its pid can belong to an unrelated process by
+/// then, so the stop finds no process of the box and signals nothing.
 #[test]
 fn of_container_on_a_reaped_supervisor_signals_nothing() {
     let mut child = std::process::Command::new("/bin/true")

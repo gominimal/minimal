@@ -807,6 +807,10 @@ pub(super) fn place_box_processes(
 /// move several boxes' processes into one shared leaf, so no cgroup is the
 /// box's boundary on every host.
 ///
+/// [`BoxProcesses::signal`] reaches the namespace's init only for a signal
+/// the init handles, and for SIGKILL and SIGSTOP. The kernel drops any other
+/// signal that a process outside the namespace sends to its init.
+///
 /// A supervisor whose children share the daemon's own PID namespace (the
 /// test launcher's plain process) has no namespace to scan. The box is then
 /// the supervisor and its descendants.

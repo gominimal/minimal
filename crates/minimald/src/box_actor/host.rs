@@ -756,6 +756,19 @@ impl BoxActor {
         phase: LaunchPhase,
         for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
+        // BOX-013: a stop ended the box's processes and could not set its
+        // record to `stopped`. The record still says running, so no launch
+        // starts new processes in the box before the retried stop.
+        if let Some(ending) = self.unrecorded_stop {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                ending = ?ending,
+                "launch refused: a stop ended the box and its record is not stopped yet"
+            );
+            return Err(AttachError::LaunchRecordUnwritable(std::io::Error::other(
+                "a stop ended this session's processes, and its stopped state is not saved yet",
+            )));
+        }
         // Taken first, so a confirmation never outlives the launch it was
         // read for, whichever way that launch ends.
         let rejoins_row = std::mem::take(&mut self.relaunch_row_confirmed) && !for_hooks;
@@ -1422,6 +1435,13 @@ pub(crate) struct StopOutcome {
 /// entrypoint ended after, unless the entrypoint exited with a status of its
 /// own. `processes` is `None` when the host did not name its container: the
 /// stop then signals nothing itself, and the caller's host kill ends the box.
+///
+/// In a real box the entrypoint is the init of the box's PID namespace. The
+/// kernel delivers SIGTERM from the daemon's namespace to that init only
+/// when the init has a handler for it. An entrypoint without a SIGTERM
+/// handler, such as a plain shell, keeps running through the grace period.
+/// The SIGKILL then ends it, and the ending stores SIGKILL. BOX-013 asks for
+/// that order: SIGTERM, the grace period, then SIGKILL to what still runs.
 pub(crate) async fn stop_box_processes(
     box_id: boxes::SessionId,
     processes: Option<box_runtime::BoxProcesses>,
@@ -1594,8 +1614,9 @@ impl BoxActor {
         self.publish_host();
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
-            // record. This one writes how they ended then.
-            (Some(ending), _) => {
+            // record. This one writes how they ended then. `launch_host`
+            // refuses while that ending is unrecorded, so no host is here.
+            (Some(ending), None) => {
                 tracing::info!(
                     box_id = %box_id,
                     ending = ?ending,
@@ -1603,7 +1624,10 @@ impl BoxActor {
                 );
                 ending
             }
-            (None, Some((host, task))) => {
+            // A host is in the slot: whether or not an earlier stop left an
+            // unrecorded ending, its processes run now. This stop signals
+            // them, and the record keeps how they ended.
+            (_, Some((host, task))) => {
                 let container_pid = probe_host(host.get_attrs())
                     .await
                     .and_then(|attrs| attrs.container_pid);
