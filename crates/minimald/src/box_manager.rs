@@ -461,15 +461,6 @@ impl BoxManager {
         // them linger and confuse `min ls` / hold their names
         // hostage.
         reap_unresumable_records(&store).await?;
-        // BOX-154: no box process outlives the daemon that launched it, so
-        // every `running` record this start finds has none left.
-        let stopped = stop_orphaned_running_records(&store).await?;
-        if stopped > 0 {
-            tracing::info!(
-                stopped,
-                "restart: set running records with no process left to stopped"
-            );
-        }
 
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
@@ -1401,8 +1392,18 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
 /// box. A record marked to end with its run is left to the resume, which
 /// destroys it (NET-131, gominimal/inbox#731).
 ///
-/// [`BoxManager::init`] calls this beside [`reap_unresumable_records`]. The
-/// attach that names such a box resumes it (BOX-025).
+/// Not called at daemon start yet. An attach now resumes a stopped box
+/// (BOX-025), but a restart still brings every `running` box back and routes
+/// its name ([`BoxManager::resume_active_sessions`]), and the restart tests
+/// pin that. The flip at start must replace that behaviour in the same
+/// change, so it waits for a task that owns those tests.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called at daemon start once the restart stops running boxes (BOX-154)"
+    )
+)]
 pub(crate) async fn stop_orphaned_running_records(
     store: &crate::store::StoreHandle,
 ) -> Result<usize, std::io::Error> {
