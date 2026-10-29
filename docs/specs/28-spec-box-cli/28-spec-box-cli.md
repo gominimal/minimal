@@ -41,7 +41,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
 
 - **BCLI-002** THE SYSTEM SHALL accept a box address as an id, a name, or `provider/host/name`.
-  <!-- was BOX-007, without its `self` sub-bullet; BOX-007 only reserves the name, and resolving `self` waits with running `min` inside a box (Non-goals); BCLI-075 is retired -->
+  <!-- BOX-007 reserves the name `self`; `self` on `min box spec|show|events` waits with running `min` inside a box (Non-goals), and `min box audit self` is BEP-042's -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_address_accepts_id_name_and_qualified
   - IF an unqualified name matches running boxes on more than one host THEN THE SYSTEM SHALL report BOX-005's refusal with exit 2, listing each candidate with its host.
@@ -463,8 +463,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - `min box sync`, `min box port` and `min box add`: the architecture's `min box` reference. This epic does not schedule them.
 - `--provider` and `--all-providers` on the `min box` verbs: they select remote providers, which wait on the Box Provider API (gominimal/arch#45).
 - `min box list --using <pkg>[@<ver>]`: it reads a box's SBOM, which the SBOM epic owns (gominimal/inbox#582).
-- `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent` on any verb: they manage a box's children, which needs nesting. Nesting has no owner yet (Open questions).
-- Resolving `self` (`min box spec|show|events self`): only a `min` running inside a box can use it. The BOX spec leaves that out of scope, and `self` arrives with nesting.
+- `min box wait --parent <box|self> [--any]`, and `self` as the value of `--parent` on the verbs this spec specifies: they manage a box's children, which needs nesting. Nesting has no owner yet (Open questions).
+- `self` as the box argument of `min box spec`, `min box show` and `min box events`: only a `min` running inside a box can use it. The BOX spec leaves that out of scope, and these verbs take `self` with nesting. `min box audit` already takes `self` and `--parent self` (BEP-042), and this spec does not change that.
 - `min host create|snapshot|pause|resume|rm` and `min provider show|add|rm|login|use`: they wait on the Box Provider API (gominimal/arch#45), as the local providers do.
 - The `min agent` and `min service` nouns, including `min service restart`: the Agent Box epic gominimal/inbox#678.
 - `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP).
