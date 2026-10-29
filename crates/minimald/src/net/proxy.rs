@@ -4303,6 +4303,20 @@ mod tests {
             "expected a request from the node's address to route with no owner lookup, got: {routed}"
         );
 
+        // A resume starts the host launch before the host's loop clears the
+        // stopped mark. From the launch mark on, the box counts as live.
+        table.write().unwrap().begin_host_launch(host_box);
+        assert!(
+            table.read().unwrap().has_unleased_callers(),
+            "a launching host-address box turns the owner lookup on before mark_running"
+        );
+        let launching = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
+        assert!(
+            launching.contains("403 Forbidden"),
+            "expected the owner lookup to run for a launching box and refuse an unnamed owner, \
+             got: {launching}"
+        );
+
         table.write().unwrap().mark_running(host_box);
         assert!(
             table.read().unwrap().has_unleased_callers(),

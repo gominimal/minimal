@@ -829,6 +829,14 @@ impl BoxActor {
                 .expect("hostname registry lock poisoned")
                 .mark_held_ports_bound(record.id)
         });
+        // NET-070: a resumed box stays `stopped` until its host's loop calls
+        // `mark_running`, and the launch can start its processes before that.
+        // The launch mark counts the box as live from here, so the hostname
+        // proxy looks up who owns a connection from the node's address.
+        self.hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .begin_host_launch(record.id);
         let spawn = Box::pin(box_runtime::Host::spawn(
             launcher,
             box_runtime::HostParams {
@@ -870,6 +878,12 @@ impl BoxActor {
             None => (None, spawn.await),
         };
         let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            // A failed spawn reaches no host loop, so nothing else ends the
+            // launch mark (NET-070).
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .end_host_launch(record.id);
             AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
         })?;
         // The confirmation was a read, not a reservation: the VM host daemon

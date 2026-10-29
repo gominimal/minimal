@@ -864,6 +864,12 @@ pub struct HostnameRegistry {
     /// the node's own listener at that port keeps answering and the stopped
     /// box is not silently impersonated by it.
     stopped: HashSet<SessionId>,
+    /// Stopped boxes whose host launch has started and has not reached
+    /// [`Self::mark_running`] yet ([`Self::begin_host_launch`]). The launch
+    /// can start the box's processes before the host's loop clears `stopped`,
+    /// so [`Self::has_unleased_callers`] counts a box with this mark as live
+    /// (NET-070).
+    launching: HashSet<SessionId>,
     /// box name → the route a host-side proxy forwards its requests on.
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
@@ -928,6 +934,7 @@ impl HostnameRegistry {
             hand_overs: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
+            launching: HashSet::new(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
             own: HashMap::new(),
@@ -1191,11 +1198,12 @@ impl HostnameRegistry {
     /// the proxy does not look up who owns the connecting socket. A stopped
     /// box ([`Self::mark_stopped`]) is not live: it keeps its caller facts
     /// until destroy, but it runs nothing that can connect, so it does not
-    /// count until [`Self::mark_running`] (NET-070).
+    /// count until [`Self::begin_host_launch`] or [`Self::mark_running`]
+    /// (NET-070).
     #[must_use]
     pub fn has_unleased_callers(&self) -> bool {
         self.callers.keys().any(|id| {
-            !self.stopped.contains(id)
+            (!self.stopped.contains(id) || self.launching.contains(id))
                 && !self.own.contains_key(id)
                 && !self.by_lease.values().any(|v| v == id)
         })
@@ -1222,6 +1230,23 @@ impl HostnameRegistry {
     /// [`Self::forget_own_address`].
     pub fn begin_lease_attach(&mut self, session_id: SessionId) {
         self.attaching.insert(session_id);
+    }
+
+    /// Marks `session_id` as a box whose host launch has started (NET-070).
+    /// A resumed box can run processes before its host's loop calls
+    /// [`Self::mark_running`], so from this mark the box counts as live for
+    /// [`Self::has_unleased_callers`], stopped or not. The mark ends at
+    /// [`Self::mark_running`], at [`Self::mark_stopped`], at
+    /// [`Self::forget_own_address`] and at [`Self::end_host_launch`] when the
+    /// launch fails.
+    pub fn begin_host_launch(&mut self, session_id: SessionId) {
+        self.launching.insert(session_id);
+    }
+
+    /// Ends the launch mark [`Self::begin_host_launch`] set, for a launch
+    /// that failed (NET-070).
+    pub fn end_host_launch(&mut self, session_id: SessionId) {
+        self.launching.remove(&session_id);
     }
 
     /// Ends the attach mark [`Self::begin_lease_attach`] set, for an attach
@@ -1423,6 +1448,7 @@ impl HostnameRegistry {
         self.callers.remove(&session_id);
         self.host_net.remove(&session_id);
         self.attaching.remove(&session_id);
+        self.launching.remove(&session_id);
         self.stopped.remove(&session_id);
     }
 
@@ -1811,6 +1837,7 @@ impl HostnameRegistry {
     /// state every box is in from finalize, so a caller that never saw a stop
     /// changes nothing (NET-011).
     pub fn mark_running(&mut self, session_id: SessionId) {
+        self.launching.remove(&session_id);
         if self.stopped.remove(&session_id) {
             tracing::info!(
                 session_id = %session_id,
@@ -1830,6 +1857,7 @@ impl HostnameRegistry {
     pub fn mark_stopped(&mut self, session_id: SessionId) {
         // A stopped box has no attach in flight (NET-070).
         self.attaching.remove(&session_id);
+        self.launching.remove(&session_id);
         if self.stopped.insert(session_id) {
             tracing::info!(
                 session_id = %session_id,
