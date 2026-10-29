@@ -560,12 +560,11 @@ On macOS, a box opens at its name directly once `min finalize-install` has
 run. A port that the box publishes, by `--ingress` at activate or by
 `min net expose` inside the box, opens at `http://<box>.min.internal:<port>`
 in the default profile of Safari, Chrome or Firefox. A browser profile that
-sends its lookups over DNS-over-HTTPS does not ask this machine's resolver, so
-the name does not resolve there. Open the box through the hostname proxy from
-that profile. The box then stands at its own reserved local address, the
-address that its name resolves to. Before `min finalize-install` runs, the box stands at
-`127.0.0.1`, and the same URL opens through the hostname proxy at the
-`127.0.0.1:<port>` that the host line names. The hostname proxy keeps serving
+resolves names through DNS over HTTPS does not resolve box names. The box then
+stands at its own reserved local address, the address that its name resolves
+to. Before `min finalize-install` runs, the box stands at `127.0.0.1`, and
+the same URL opens through the hostname proxy at the `127.0.0.1:<port>` that
+the host line names. The hostname proxy keeps serving
 after the step, and it refuses a port that the box did not publish, the same
 as a direct connection.
 
