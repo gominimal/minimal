@@ -20,7 +20,7 @@
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -1230,7 +1230,14 @@ async fn probe_publish_surface_within(
     // so a second walk that overlapped the first would read the first's
     // bind as a refusal. The wait is outside the budget: a session-start
     // walk queued behind the daemon-start one still gets its whole walk.
-    let _turn = RANGE_WALK_TURN.lock().await;
+    let mut turn = RANGE_WALK_TURN.lock().await;
+    // The addresses at which an earlier walk on this channel may have left
+    // its own probe forward bound: an unexpose that failed, or a budget that
+    // expired between a round's expose and its unexpose. The forwarder
+    // answers `already running` from its own forward table, so a leftover
+    // probe forward would read as a held address, and so as bound, on every
+    // later walk, even after the host lost the address.
+    let held = turn.entry(format!("{control:?}")).or_default();
     let mut probe = ::switch::loopback::RangeProbe::failed_to_run();
     let hosts: Vec<Ipv4Addr> = ::switch::loopback::range_hosts().collect();
     let walk = tokio::time::timeout(budget, async {
@@ -1241,39 +1248,76 @@ async fn probe_publish_surface_within(
                 remote: format!("{}:1", Ipv4Addr::LOCALHOST),
                 protocol: "tcp".to_string(),
             };
-            match post_json_within(control, "/services/forwarder/expose", &expose, request).await {
+            // Marked before the expose, so a budget cut inside this round
+            // leaves the address marked for the next walk to release.
+            let leftover = !held.insert(*address);
+            let mut answer =
+                post_json_within(control, "/services/forwarder/expose", &expose, request).await;
+            if leftover
+                && answer
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::AddrInUse)
+            {
+                // The holder can be this walk's own earlier probe forward.
+                // Release it and ask again, so the round reads the host and
+                // not the leftover. Only a probe round binds this port at a
+                // marked address, so the release takes no box's forward.
+                match release_range_probe(control, &expose.local, request).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            local = %expose.local,
+                            "released a loopback range probe forward that an earlier walk left bound",
+                        );
+                        answer = post_json_within(
+                            control,
+                            "/services/forwarder/expose",
+                            &expose,
+                            request,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        // The leftover stays, so this round cannot vouch for
+                        // the address. Read it as the release's own failure.
+                        probe.first_failure.get_or_insert((*address, error.kind()));
+                        tracing::warn!(
+                            local = %expose.local,
+                            error = %error,
+                            "releasing a leftover loopback range probe forward failed, so the address does not count as bound",
+                        );
+                        continue;
+                    }
+                }
+            }
+            match answer {
                 Ok(()) => {
                     probe.bound += 1;
-                    let unexpose = UnexposeRequest {
-                        local: expose.local,
-                        protocol: expose.protocol,
-                    };
-                    if let Err(error) = post_json_within(
-                        control,
-                        "/services/forwarder/unexpose",
-                        &unexpose,
-                        request,
-                    )
-                    .await
-                    {
-                        // Best-effort, like teardown's: a probe round left
-                        // bound holds one obscure port at one address, while
-                        // a walk that stopped here would leave the range
-                        // unread — the worse leak by far.
-                        tracing::warn!(
-                            local = %unexpose.local,
-                            error = %error,
-                            "releasing the loopback range probe's forwarder bind failed",
-                        );
+                    match release_range_probe(control, &expose.local, request).await {
+                        Ok(()) => {
+                            held.remove(address);
+                        }
+                        Err(error) => {
+                            // Best-effort, like teardown's: a probe round left
+                            // bound holds one obscure port at one address, while
+                            // a walk that stopped here would leave the range
+                            // unread — the worse leak by far. The address stays
+                            // marked, so the next walk releases it first.
+                            tracing::warn!(
+                                local = %expose.local,
+                                error = %error,
+                                "releasing the loopback range probe's forwarder bind failed",
+                            );
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                    // Something already holds the probe port at this address:
-                    // a box's forward or a host_ip mirror on the same port.
-                    // The bind reached the address, so the address exists and
-                    // counts as bound (NET-123). Nothing of the probe's is
-                    // bound, so no unexpose runs: one would tear down the
-                    // holder's forward.
+                    // Something else already holds the probe port at this
+                    // address: a box's forward or a host_ip mirror on the same
+                    // port. The bind reached the address, so the address
+                    // exists and counts as bound (NET-123). Nothing of the
+                    // probe's is bound, so no unexpose runs: one would tear
+                    // down the holder's forward.
+                    held.remove(address);
                     probe.bound += 1;
                     tracing::debug!(
                         local = %expose.local,
@@ -1288,7 +1332,12 @@ async fn probe_publish_surface_within(
                     // error keeps its own kind (a timeout, a missing socket,
                     // a malformed reply), so a session-start walk can tell a
                     // fault of the channel from an answer about the range.
-                    let kind = if is_forwarder_refusal(&error) {
+                    let refused = is_forwarder_refusal(&error);
+                    if refused {
+                        // A refused bind holds nothing at the address.
+                        held.remove(address);
+                    }
+                    let kind = if refused {
                         io::ErrorKind::AddrNotAvailable
                     } else {
                         error.kind()
@@ -1326,6 +1375,20 @@ async fn probe_publish_surface_within(
             .get_or_insert((stuck, io::ErrorKind::TimedOut));
     }
     probe
+}
+
+/// Releases the range probe's forward at `local` (`POST
+/// /services/forwarder/unexpose`), within the walk's round bound.
+async fn release_range_probe(
+    control: &ControlChannel,
+    local: &str,
+    request: Duration,
+) -> io::Result<()> {
+    let unexpose = UnexposeRequest {
+        local: local.to_string(),
+        protocol: "tcp".to_string(),
+    };
+    post_json_within(control, "/services/forwarder/unexpose", &unexpose, request).await
 }
 
 /// A gvproxy DNS zone-add request body for `POST /services/dns/add`
@@ -1645,8 +1708,12 @@ const RANGE_PROBE_PORT: u16 = 21064;
 
 /// The turn every forwarder-conducted range walk in this process takes
 /// before its first round, so the daemon-start walk and the session-start
-/// walks never bind [`RANGE_PROBE_PORT`] at the same time.
-static RANGE_WALK_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// walks never bind [`RANGE_PROBE_PORT`] at the same time. It also keeps,
+/// per control channel, the addresses at which a walk may have left its own
+/// probe forward bound, so the next walk releases that forward before it
+/// reads the address.
+static RANGE_WALK_TURN: tokio::sync::Mutex<BTreeMap<String, BTreeSet<Ipv4Addr>>> =
+    tokio::sync::Mutex::const_new(BTreeMap::new());
 
 /// Upper bound on the whole forwarder-conducted range walk — the backstop for
 /// the one pathology the per-request [`GVPROXY_CONTROL_TIMEOUT`] cannot
@@ -2652,6 +2719,107 @@ mod tests {
             assert!(
                 !unexposed.contains(&box_held) && !unexposed.contains(&mirror_held),
                 "the walk never releases a forward it did not bind: {unexposed:?}"
+            );
+        }
+
+        /// A probe forward that an earlier walk left bound is released, not
+        /// counted. The first walk's unexpose fails at one address, so its
+        /// probe forward stays in the forwarder's table. The host then loses
+        /// that address. The forwarder still answers `already running` there
+        /// from its table, but the next walk releases its own leftover, asks
+        /// again, and reads the refusal: the range is absent.
+        #[tokio::test]
+        async fn a_probe_forward_left_by_an_earlier_walk_is_released_not_counted() {
+            use std::collections::BTreeSet;
+            use std::sync::{Arc, Mutex};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stuck = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 5));
+            // The forwarder's forward table, the addresses the host binds,
+            // and how many unexposes at the stuck address still fail.
+            let table: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+            let host_has_stuck = Arc::new(Mutex::new(true));
+            let failing_unexposes = Arc::new(Mutex::new(1u32));
+            let (table_s, host_s, failing_s, stuck_s) = (
+                table.clone(),
+                host_has_stuck.clone(),
+                failing_unexposes.clone(),
+                stuck.clone(),
+            );
+            let forwarder = crate::traced::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let body = read_request(&mut conn).await;
+                    let local = local_of(&body);
+                    let expose = String::from_utf8_lossy(&body).contains("\"remote\"");
+                    let said: Option<String> = {
+                        let mut table = table_s.lock().unwrap();
+                        if expose {
+                            if table.contains(&local) {
+                                Some("proxy already running".to_string())
+                            } else if local == stuck_s && !*host_s.lock().unwrap() {
+                                Some(format!(
+                                    "listen tcp {local}: bind: can't assign requested address"
+                                ))
+                            } else {
+                                table.insert(local.clone());
+                                None
+                            }
+                        } else {
+                            let mut failing = failing_s.lock().unwrap();
+                            if local == stuck_s && *failing > 0 {
+                                *failing -= 1;
+                                Some("unexpose failed".to_string())
+                            } else {
+                                table.remove(&local);
+                                None
+                            }
+                        }
+                    };
+                    let answer = match said {
+                        Some(said) => format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{said}",
+                            said.len()
+                        ),
+                        None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    };
+                    conn.write_all(answer.as_bytes())
+                        .await
+                        .expect("the fake forwarder must answer");
+                }
+            });
+            let control = ControlChannel::Unix(sock);
+
+            let first = probe_publish_surface(&control).await;
+            assert!(first.present(), "{}", first.summary());
+            assert!(
+                table.lock().unwrap().contains(&stuck),
+                "the failed unexpose left the probe forward bound"
+            );
+
+            *host_has_stuck.lock().unwrap() = false;
+            let second = probe_publish_surface(&control).await;
+            forwarder.abort();
+
+            assert!(
+                !second.present(),
+                "a leftover probe forward never vouches for an address the host lost: {}",
+                second.summary()
+            );
+            assert_eq!(
+                second.first_failure,
+                Some((
+                    Ipv4Addr::new(127, 0, 64, 5),
+                    io::ErrorKind::AddrNotAvailable
+                )),
+            );
+            assert!(
+                table.lock().unwrap().is_empty(),
+                "the second walk released its leftover"
             );
         }
 
