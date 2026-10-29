@@ -1016,6 +1016,24 @@ struct Published {
     refused: Vec<RefusedRow>,
 }
 
+/// What a connect the channel socket's own mode refused means: the
+/// socket is owner-only, so the host's DNS service is another account's.
+/// The service's uid gate says the same once a connect gets through.
+const FOREIGN_CHANNEL_CONNECT: &str = "the host's DNS service belongs to another account; \
+     hosts with more than one operator are not supported";
+
+/// A channel connect's error, with a refusal by the socket's mode (an
+/// owner-only socket another account holds) said as
+/// [`FOREIGN_CHANNEL_CONNECT`] rather than a bare `Permission denied`.
+/// The kind stays `PermissionDenied`, the kind the gate's refusal carries.
+fn foreign_channel_connect(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(io::ErrorKind::PermissionDenied, FOREIGN_CHANNEL_CONNECT)
+    } else {
+        error
+    }
+}
+
 /// Connects to the channel at `channel` and publishes `rows` over it: the
 /// hello with this node's id and protocol version, then the one publish
 /// the connection is held for. The error kinds the acquisition decides
@@ -1027,7 +1045,9 @@ async fn connect_and_publish(
     node: &str,
     rows: Vec<RegisteredRow>,
 ) -> io::Result<Published> {
-    let mut stream = tokio::net::UnixStream::connect(channel).await?;
+    let mut stream = tokio::net::UnixStream::connect(channel)
+        .await
+        .map_err(foreign_channel_connect)?;
     write_line(
         &mut stream,
         &Hello {
@@ -3210,6 +3230,28 @@ mod tests {
             classify_carve_out_target(target, &HolderFacts::of(&paths, &status, None).await),
             CarveOutHolder::ManagerHeld
         );
+    }
+
+    /// A channel socket whose mode refuses the connect itself (the
+    /// owner-only socket of another account's service) is said in a plain
+    /// sentence, the service gate's own, never a bare `Permission denied`.
+    #[tokio::test]
+    async fn a_connect_the_socket_mode_refuses_names_the_other_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if nix::unistd::geteuid().is_root() {
+            // Root connects through any mode; there is no refusal to see.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a tempdir for the channel");
+        let channel = dir.path().join("answerer.sock");
+        let _listener = tokio::net::UnixListener::bind(&channel).expect("the channel binds");
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o000))
+            .expect("the channel's mode is set");
+        let Err(refused) = connect_and_publish(&channel, "node-a", Vec::new()).await else {
+            panic!("a connect the socket's mode refuses never publishes");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
     }
 
     /// The recorded service bind is the installed unit's own

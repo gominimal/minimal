@@ -1531,10 +1531,9 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
 fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
-    // The channel is world-connectable (its mode grants the connect; this
-    // gate decides), so the refusals in flight are capped: past the cap a
-    // foreign peer is closed bare, and no peer can grow this service's
-    // threads or fds by connecting.
+    // The refusals in flight are capped: past the cap a foreign peer is
+    // closed bare, and no peer can grow this service's threads or fds
+    // by connecting, however connectable the socket's mode left it.
     if FOREIGN_REFUSALS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= FOREIGN_REFUSALS_MAX {
         FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         return;
@@ -1562,6 +1561,15 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) 
 
 /// The most foreign-peer refusals answered at once ([`refuse_foreign_peer`]).
 const FOREIGN_REFUSALS_MAX: usize = 4;
+
+/// How many foreign-peer warns the accept loop writes per second: a
+/// burst of foreign connects is one operator-readable line's worth of
+/// news, not one line each — the refusals themselves are never limited,
+/// only the warns.
+const FOREIGN_WARN_RATE_PER_SECOND: usize = 4;
+
+/// The window [`FOREIGN_WARN_RATE_PER_SECOND`] is counted over.
+const FOREIGN_WARN_WINDOW: Duration = Duration::from_secs(1);
 
 /// The foreign-peer refusals answering now.
 static FOREIGN_REFUSALS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -1765,6 +1773,10 @@ fn serve_channel(
         return;
     }
     let mut next: u64 = 0;
+    // The foreign-uid warns this loop wrote inside the current window:
+    // a connect storm is capped at a few lines a second, while every
+    // peer is still refused.
+    let mut foreign_warns: std::collections::VecDeque<Instant> = Default::default();
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -1789,8 +1801,9 @@ fn serve_channel(
                 // The uid gate, before any byte of the peer is read: a
                 // foreign process is refused on what it is, not on what
                 // it says, and the refusal is a warn naming its uid —
-                // the one a misconfigured unit's service user answers at
-                // a glance.
+                // rate-limited, since one line tells the operator as
+                // much as a storm of them — the one a misconfigured
+                // unit's service user answers at a glance.
                 match peer_uid(&stream) {
                     Ok(uid) if uid == expected_uid => {
                         let connection = next;
@@ -1815,13 +1828,24 @@ fn serve_channel(
                         }
                     }
                     Ok(uid) => {
-                        tracing::warn!(
-                            component = COMPONENT,
-                            peer_uid = uid,
-                            service_uid = expected_uid,
-                            "refused an answerer channel connection from a foreign uid; \
-                             only the uid this answerer serves may publish rows"
-                        );
+                        // The warn is rate-limited; the refusal never is.
+                        let now = Instant::now();
+                        while foreign_warns
+                            .front()
+                            .is_some_and(|at| now.duration_since(*at) >= FOREIGN_WARN_WINDOW)
+                        {
+                            foreign_warns.pop_front();
+                        }
+                        if foreign_warns.len() < FOREIGN_WARN_RATE_PER_SECOND {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                peer_uid = uid,
+                                service_uid = expected_uid,
+                                "refused an answerer channel connection from a foreign uid; \
+                                 only the uid this answerer serves may publish rows"
+                            );
+                            foreign_warns.push_back(now);
+                        }
                         refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
@@ -2264,6 +2288,25 @@ impl Drop for Registration {
     }
 }
 
+/// What a connect the channel socket's own mode refused means: the
+/// socket is owner-only, so the host's DNS service is another account's.
+/// The gate's refusal says the same once a connect gets through
+/// ([`refuse_foreign_peer`]).
+const FOREIGN_CHANNEL_CONNECT: &str = "the host's DNS service belongs to another \
+     account; hosts with more than one operator are not supported";
+
+/// A channel connect's error, with a refusal by the socket's mode (an
+/// owner-only socket another account holds) said as
+/// [`FOREIGN_CHANNEL_CONNECT`] rather than a bare `Permission denied`.
+/// The kind stays `PermissionDenied`, the kind the gate's refusal carries.
+fn foreign_channel_connect(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(io::ErrorKind::PermissionDenied, FOREIGN_CHANNEL_CONNECT)
+    } else {
+        error
+    }
+}
+
 /// One node's first publish: connect to the answerer channel, say the
 /// hello — the node's id, the protocol version this copy speaks — wait
 /// for the answerer's ack, then publish `rows` and wait for the ack that
@@ -2276,7 +2319,7 @@ impl Drop for Registration {
 /// error the loop surfaces, never a reason to host.
 fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
     let mut registration = Registration {
-        stream: UnixStream::connect(sock)?,
+        stream: UnixStream::connect(sock).map_err(foreign_channel_connect)?,
     };
     // The hello and its reply are bounded like a publish's: a service
     // manager starts a socket-activated answerer at the connect, so the
@@ -3889,6 +3932,38 @@ mod tests {
         }
     }
 
+    /// The tests that take [`FOREIGN_REFUSALS_IN_FLIGHT`]'s slots — every
+    /// test that drives the gate with a foreign uid, and the one that sets
+    /// the count by hand — run one at a time: the count is process-global,
+    /// so a parallel burst would close another test's peer bare, or a
+    /// hand-set count would underflow under a live refusal's release.
+    static REFUSAL_SLOTS: Mutex<()> = Mutex::new(());
+
+    /// A test's exclusive hold on the refusal slots: taken once every
+    /// slot is free, and released only once every refusal the test caused
+    /// has ended, so the next holder starts from a count of zero.
+    struct RefusalSlotsHeld(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    fn hold_refusal_slots() -> RefusalSlotsHeld {
+        let guard = REFUSAL_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        await_refusal_slots_free();
+        RefusalSlotsHeld(guard)
+    }
+
+    impl Drop for RefusalSlotsHeld {
+        fn drop(&mut self) {
+            await_refusal_slots_free();
+        }
+    }
+
+    /// Waits, bounded, for every refusal thread to release its slot.
+    fn await_refusal_slots_free() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while FOREIGN_REFUSALS_IN_FLIGHT.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Waits until some captured log line satisfies `matches`, failing the
     /// test on `what` when the deadline passes. A thread's logging races the
     /// fact that made its caller return: the connect line is written before
@@ -4752,6 +4827,7 @@ mod tests {
     /// answers at a glance.
     #[test]
     fn answerer_channel_refuses_foreign_uid() {
+        let _slots = hold_refusal_slots();
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
         let channel = dir.path().join(CHANNEL_SOCK_FILE);
         let listener = UnixListener::bind(&channel).expect("the channel binds");
@@ -4832,6 +4908,124 @@ mod tests {
             .expect("the gate's thread ends when its stop is set");
     }
 
+    /// A channel socket whose mode refuses the connect itself (the
+    /// owner-only socket of another account's service) is said in a plain
+    /// sentence, the gate's own, never a bare `Permission denied`.
+    #[test]
+    fn a_connect_the_socket_mode_refuses_names_the_other_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid only reads the process's own uid.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root connects through any mode; there is no refusal to see.
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let _listener = UnixListener::bind(&channel).expect("the channel binds");
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o000))
+            .expect("the channel's mode is set");
+        let Err(refused) = connect_and_publish(&channel, "vm-a", Vec::new()) else {
+            panic!("a connect the socket's mode refuses never publishes");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(refused.to_string(), FOREIGN_CHANNEL_CONNECT);
+    }
+
+    /// A burst of foreign connects is one line's worth of news: every
+    /// peer is refused, but the warns naming them are capped at a few
+    /// per second, so a connect storm cannot flood the service's log.
+    #[test]
+    fn foreign_refusal_warns_are_rate_limited() {
+        let _slots = hold_refusal_slots();
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        let registered = Arc::new(RegisteredTables::new());
+        let tables = Arc::clone(&registered);
+        // SAFETY: geteuid only reads the process's own uid; the xor flips
+        // the low bit, so this test's connects are foreign.
+        let expected_uid = unsafe { libc::geteuid() } ^ 1;
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-warn-rate".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                serve_channel(
+                    listener,
+                    registered,
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the gate's thread spawns");
+
+        // A burst inside one window: far more foreign connects than the
+        // warn rate. The connects are made in parallel so they are
+        // accepted back-to-back, inside the window, rather than one per
+        // accept-poll slice apart; past the in-flight cap the later ones
+        // are closed bare (that cap is the other test's proof), but none
+        // is served.
+        let connects = std::thread::scope(|scope| {
+            (0..(FOREIGN_WARN_RATE_PER_SECOND * 4))
+                .map(|_| {
+                    scope.spawn(|| {
+                        connect_and_publish(
+                            &channel,
+                            "vm-a",
+                            vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|joined| joined.join().expect("the connect's thread ends"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            connects.iter().all(|connect| connect.is_err()),
+            "every foreign peer of the burst is refused, none served"
+        );
+        assert!(tables.is_empty(), "none of the burst's rows were ever held");
+
+        // The warns are capped at the rate, and there were enough
+        // refusals to prove the cap bit: a rate's worth of lines per
+        // window, not one per peer. The scope joined every connect, and
+        // the accept loop writes each warn before the refusal it names,
+        // so by the time one warn is visible they have all been written.
+        await_log(
+            &buf,
+            |line| line.contains("refused an answerer channel connection from a foreign uid"),
+            "the gate never warned about the foreign peers",
+        );
+        let warns = buf
+            .contents()
+            .lines()
+            .filter(|line| {
+                line.contains("refused an answerer channel connection from a foreign uid")
+            })
+            .count();
+        // A loaded runner can spread the burst over a second window, so
+        // the bound is two windows' worth — still fewer lines than peers.
+        assert!(
+            (1..=FOREIGN_WARN_RATE_PER_SECOND * 2).contains(&warns),
+            "a burst is capped at the warn rate, not one line per peer: {warns}"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the gate's thread ends when its stop is set");
+    }
+
     /// A node whose hello reaches the channel after the connect is accepted
     /// is still served: the accepted connection blocks on its bounded hello
     /// read rather than inheriting the poll-mode listener's O_NONBLOCK (the
@@ -4890,6 +5084,7 @@ mod tests {
 
     #[test]
     fn foreign_refusals_past_the_cap_close_bare() {
+        let _slots = hold_refusal_slots();
         // Every refusal slot taken: the next foreign peer is closed without
         // a thread or a reply, and the count is left as it was.
         FOREIGN_REFUSALS_IN_FLIGHT.store(FOREIGN_REFUSALS_MAX, Ordering::SeqCst);

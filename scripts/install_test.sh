@@ -2250,7 +2250,7 @@ STUB
         OUT="$root/hc.$label"
         set +e
         env -i \
-            PATH="$hcbin:/usr/bin:/bin" \
+            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
@@ -2411,7 +2411,7 @@ STUB
     # ruleset tests read the same input in depth; this pins what the step
     # decided, at the layer the installer owns: the transaction replaces the
     # table rather than adding to it, the cohort's two identities, the
-    # answerer as the deny subtree's one destination, and the retarget that
+    # answerer as the deny subtree's one destination, and the steer that
     # makes the answerer the destination a deny-all box's lookups reach.
     want_ok "the step loaded one transaction, exactly once" \
         [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
@@ -2439,9 +2439,9 @@ originates is refused" \
         grep -q 'ct state established,related accept' "$nft_input"
     want_ok "the deny rule admits the answerer by address and port only" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
-    want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \
-        grep -q 'level 3 "minimald.slice/boxes/deny" ip daddr 127.0.0.1 udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the retarget runs at dstnat, before the filter chain decides" \
+    want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
+        grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
+    want_ok "the steer runs at dstnat, before the filter chain decides" \
         grep -q 'type nat hook output priority dstnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
@@ -2552,24 +2552,71 @@ originates is refused" \
     want_ok "the refusal names the conflicting rule itself" \
         grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
     want_ok "the refusal names the override it would take instead" \
-        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+        grep -q -- "Choose two contiguous bits that no rule above uses and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
     want_ok "the refusal dies before touching anything: the previous marker \
 still vouches for the table it loaded" \
         test -d "$tree/classifier-table"
     run_hc conflict_escaped "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x0000c000
+        --ct-mark-mask 0x03000000
     check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
     want_ok "the escape renders its own bits, both identities on them" \
-        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
     want_ok "the escape records the bits it chose" \
-        test -d "$tree/ct-mark-mask-0x0000c000"
+        test -d "$tree/ct-mark-mask-0x03000000"
     want_err "the escape left no record of the refused mask" \
         test -e "$tree/ct-mark-mask-0x30000000"
-    run_hc conflict_back "$root/mi-on" --user "$me" \
+    # --- With no --ct-mark-mask, the next install re-applies the mask the
+    # previous install recorded, so a re-run keeps the operator's bits
+    # rather than falling back to the default that conflicts.
+    : >"$nft_input"
+    run_hc conflict_recorded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "the next default-mask install refuses again"
+    check 0 "$rc" "an install with no mask re-applies the recorded mask over the conflict"
+    want_ok "the install says which recorded mask it uses" \
+        grep -q "using the ct-mark mask 0x03000000 that the previous install recorded" "$OUT"
+    want_ok "the install renders the recorded bits" \
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the recorded mask is still the one record" \
+        test -d "$tree/ct-mark-mask-0x03000000"
+    want_err "the install wrote no default-mask record" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    run_hc conflict_back "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x30000000
+    check 1 "$rc" "an explicit default-mask install refuses again"
     NFT_RULESET=
+
+    # --- A CONNMARK --restore-mark copies the connection mark into the
+    # packet mark and never writes the connection mark, so a restore with
+    # no mask is no conflict. A stand-in iptables-save serves the listing.
+    _iptdir="$root/hc-iptables-save"; mkdir -p "$_iptdir"
+    cat >"$_iptdir/iptables-save" <<'STUB'
+#!/bin/sh
+cat "$(dirname "$0")/listing"
+STUB
+    chmod 0755 "$_iptdir/iptables-save"
+    HC_PATH_PREFIX="$_iptdir"
+    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n' \
+        >"$_iptdir/listing"
+    run_hc restore_mark_nomask "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "a --restore-mark with no mask does not block the install"
+    unset HC_PATH_PREFIX
+
+    # --- A mask in a range a well-known component classes with is refused
+    # even when no loaded rule uses it yet: the component can start after
+    # the install. The refusal names the range and the component.
+    run_hc well_known_range "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 1 "$rc" "an install with a mask in kube-proxy's range exits 1"
+    want_ok "the refusal names the range and the component" \
+        grep -q "uses bits in 0x0000c000, the range kube-proxy marks connections with" "$OUT"
+    want_ok "the refusal names min finalize-install with another mask" \
+        grep -q -- "two contiguous bits outside 0x0000c000 and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
+    want_err "the refused mask is not recorded" \
+        test -e "$tree/ct-mark-mask-0x0000c000"
 
     # --- --ct-mark-mask is validated before anything is made: exactly two
     # contiguous set bits inside the 32 a connection mark holds, nothing
