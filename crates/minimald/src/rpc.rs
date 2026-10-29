@@ -6319,7 +6319,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        crate::traced::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let Ok((mut conn, _)) = listener.accept().await else {
                     return;
@@ -6342,7 +6342,9 @@ mod tests {
                         .and_then(|v| v.trim().parse().ok())
                         .unwrap_or(0);
                     if buf.len() >= end + 4 + len {
-                        break Some(String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned());
+                        break Some(
+                            String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned(),
+                        );
                     }
                 };
                 let Some(body) = body else { continue };

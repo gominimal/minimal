@@ -400,6 +400,10 @@ pub async fn apply_ingress(
     Ok(bound)
 }
 
+/// The OS's own text for a bind onto a port another process already holds,
+/// as it reaches [`apply_ingress`] inside the forwarder's refusal.
+const ADDRESS_IN_USE_BODY: &str = "address already in use";
+
 /// The body the forwarder answers an expose with when a forward is already
 /// bound at the listener, as an HTTP 500. On a VM-backed host the egress
 /// gate gives the same answer to a publish whose listener another box's row
@@ -932,7 +936,7 @@ pub async fn expose_dynamic(
 /// channel — reads absent, never present. The first failure's kind tells
 /// the two apart: `AddrNotAvailable` is a refusal the forwarder answered,
 /// and any other kind is a fault of the channel. The session-start walk
-/// keeps a present verdict over a fault (`RangeWalk` in `box_manager`).
+/// keeps a present verdict over a fault (`RangeWalk` in `sessions`).
 ///
 /// Why a second probe beside the local one: an own-address box's declared
 /// ports are bound by the **forwarder**, not by the daemon. On a native host
@@ -2368,7 +2372,7 @@ mod tests {
             let mirror_held = format!("{}:{RANGE_PROBE_PORT}", Ipv4Addr::new(127, 0, 64, 9));
             let (tx, mut asked) = mpsc::channel::<(String, String)>(1024);
             let (box_held_s, mirror_held_s) = (box_held.clone(), mirror_held.clone());
-            let forwarder = crate::traced::spawn(async move {
+            let forwarder = tokio::spawn(async move {
                 loop {
                     let Ok((mut conn, _)) = listener.accept().await else {
                         return;
@@ -2458,7 +2462,7 @@ mod tests {
                 failing_unexposes.clone(),
                 stuck.clone(),
             );
-            let forwarder = crate::traced::spawn(async move {
+            let forwarder = tokio::spawn(async move {
                 loop {
                     let Ok((mut conn, _)) = listener.accept().await else {
                         return;

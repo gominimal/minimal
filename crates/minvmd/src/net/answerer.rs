@@ -97,7 +97,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use minimald_rpc::ZoneAnswererStatus;
 use serde::{Deserialize, Serialize};
 
-use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
+use sessions::core::zone_answer::{self, ZoneRow, ZoneView};
 use switch::loopback::RangeProbe;
 
 use crate::box_registry::{BoxRegistry, is_host_answerable};

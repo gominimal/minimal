@@ -771,7 +771,7 @@ impl RangeWalk {
             .set_node_address(node);
     }
 
-    /// The daemon-start walk: spawned off `BoxManager::init`'s critical
+    /// The daemon-start walk: spawned off `Manager::init`'s critical
     /// path, it lands the first verdict the book opened pending on.
     pub(crate) async fn daemon_start(&self) {
         let mut last = self.last.lock().await;
