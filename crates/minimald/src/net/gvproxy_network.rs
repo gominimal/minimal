@@ -404,8 +404,17 @@ async fn finish_own_ip_attach(
             let yielded = own_address
                 .map(crate::net::provider::OwnAddressReporter::shared_port_collisions)
                 .unwrap_or_default();
-            match crate::net::policy::apply_ingress(
-                &control, published, lease_ip, ingress, gate, &yielded,
+            // A taken port's refusal names its holder (NET-144): the box
+            // whose publish stands at that address and port, or the host.
+            let registry = own_address.map(crate::net::provider::OwnAddressReporter::registry);
+            let holder_of = |port: u16| match &registry {
+                Some(registry) => {
+                    crate::net::policy::port_holder(registry, session_name, published, port)
+                }
+                None => minimald_rpc::PortHolder::Host,
+            };
+            match crate::net::policy::apply_ingress_naming_holders(
+                &control, published, lease_ip, ingress, gate, &yielded, &holder_of,
             )
             .await
             {
@@ -416,7 +425,10 @@ async fn finish_own_ip_attach(
                 // route reported, and the name finalize registered is
                 // withdrawn — a bind that failed never leaves a name standing
                 // for a port that refused (NET-121) — and no substitute
-                // address stands in for the port that could not bind.
+                // address stands in for the port that could not bind. A taken
+                // port comes back as the typed refusal, with the port and its
+                // holder, so the finalize that launched this attach can name
+                // both (NET-144).
                 Err(e) => {
                     drop(relay);
                     if let Some(own_address) = own_address {

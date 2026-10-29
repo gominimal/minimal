@@ -278,6 +278,12 @@ impl OwnAddressReporter {
             .published_own_address(self.session_id)
     }
 
+    /// The registry this reporter reports to, for the attach path's port
+    /// refusal to name the box that holds a declared port (NET-144).
+    pub(crate) fn registry(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
     /// The ports this box yields at a shared address, each with the box that
     /// holds it (NET-129, first-come): recorded when the box published, read
     /// here so the attach skips those forwards rather than failing on them.
