@@ -5897,7 +5897,9 @@ impl BoxRegistry {
                 .as_ref()
                 .and_then(|policy| policy.allow_dns_hosts.clone())
                 .unwrap_or_default(),
-            allow_subnets: policy.as_ref().and_then(|policy| policy.allow_subnets.clone()),
+            allow_subnets: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_subnets.clone()),
         };
         let mut resident = self
             .host_ip_boxes

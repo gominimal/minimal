@@ -4441,10 +4441,9 @@ async fn relay_frames_to_switch(
         // frameless and unpublishable for the rest of the VM's life, over a
         // shuttle close its control path rode out.
         let src = match admitted {
-            GateAdmit::Baseline
-            | GateAdmit::Row
-            | GateAdmit::ProxyLane
-            | GateAdmit::HostIpBox => summary.source(),
+            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane | GateAdmit::HostIpBox => {
+                summary.source()
+            }
         };
         if let Some(src) = src
             && src != baseline.node_addr()
@@ -7153,13 +7152,14 @@ mod tests {
         send_frame, unexpose_request, wait_for_log,
     };
     use super::{
-        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb,
-        DropLimiter, EgressGate, FrameSummary, GateAdmit, GateDrop, HOST_IP_BOXES_RULE, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
-        MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, PublishedForwards,
-        Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
-        UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE, UNREGISTERED_PUBLISH_RULE,
-        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
-        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
+        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter, EgressGate,
+        FrameSummary, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        HOST_IP_BOXES_RULE, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
+        PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
+        UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE,
+        UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
+        UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins, gate_verdict, max_frame,
+        render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{NodeBaselinePhase, NodePlaneBaseline};

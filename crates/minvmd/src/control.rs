@@ -4291,7 +4291,8 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
-                other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
+                other @ (BoxControlReply::RowStanding { .. }
+                | BoxControlReply::HostIpBox { .. }) => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }

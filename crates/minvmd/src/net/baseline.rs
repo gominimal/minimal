@@ -611,8 +611,8 @@ impl NodePlaneBaseline {
 mod tests {
     use super::{
         BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry,
-        DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT,
-        HOST_EXPOSURE_PORTS_ENV, NodeBaselinePhase, NodePlaneBaseline, baseline_endpoints_from_env,
+        DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT, HOST_EXPOSURE_PORTS_ENV,
+        NodeBaselinePhase, NodePlaneBaseline, baseline_endpoints_from_env,
         baseline_endpoints_from_raw, host_exposure_ports_from_raw,
     };
     use boxes::core::egress::{FrameVerdict, summarize, verdict};

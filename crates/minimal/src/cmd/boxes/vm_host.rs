@@ -688,9 +688,8 @@ mod tests {
                     return;
                 }
                 let mut writer = lines.into_inner();
-                let parsed = serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(
-                    line.trim(),
-                );
+                let parsed =
+                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim());
                 let answer = match parsed {
                     Ok(
                         request @ (minimald_rpc::BoxControlRequest::AdmitHostIpBox(_)
