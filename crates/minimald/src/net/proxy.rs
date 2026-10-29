@@ -4241,6 +4241,80 @@ mod tests {
         }
     }
 
+    /// A socket owner that can name no one: a request that reaches the
+    /// owner lookup with it is refused as unattributed.
+    fn unknown_socket_owner(
+        _peer: SocketAddrV4,
+        _local: SocketAddrV4,
+    ) -> crate::net::dns::ConnectingOwner {
+        crate::net::dns::ConnectingOwner::Unknown
+    }
+
+    /// NET-070: a stopped host-address box keeps its caller facts until
+    /// destroy, but it runs nothing that can connect. So it does not turn on
+    /// the owner lookup for connections from the node's address: a request
+    /// from there routes with no lookup, and a host-side client that closes
+    /// its socket early is not refused as unattributed. When the box runs
+    /// again, the lookup is on again.
+    #[tokio::test]
+    async fn proxy_stopped_host_address_box_needs_no_owner_lookup() {
+        let backend_port = spawn_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        reg.register_host_net(host_box, "hostbox");
+        reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
+        assert!(
+            reg.has_unleased_callers(),
+            "a running host-address box turns the owner lookup on"
+        );
+        reg.mark_stopped(host_box);
+        assert!(
+            !reg.has_unleased_callers(),
+            "a stopped host-address box does not turn the owner lookup on"
+        );
+        let table = Arc::new(RwLock::new(reg));
+        let router = Router::new(Arc::clone(&table), proxied_request_verdict)
+            .with_socket_owner(unknown_socket_owner);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        // The owner lookup answers Unknown for every socket, so a request
+        // that ran it is refused. This one routes: no lookup ran.
+        let routed = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected a request from the node's address to route with no owner lookup, got: {routed}"
+        );
+
+        table.write().unwrap().mark_running(host_box);
+        assert!(
+            table.read().unwrap().has_unleased_callers(),
+            "the host-address box runs again, so the owner lookup is on again"
+        );
+        let refused = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected the owner lookup to run again and refuse an unnamed owner, got: {refused}"
+        );
+    }
+
     /// NET-070's verify line: a request through the hostname proxy from a
     /// caller whose egress rules deny the target is refused — put to the same
     /// pure verdict the caller's own outbound frames meet on the relay,

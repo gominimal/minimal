@@ -1188,12 +1188,17 @@ impl HostnameRegistry {
     /// Whether any live session with caller facts holds no switch lease: a
     /// host-address box, or a box whose lease is not reported yet. While
     /// none does, no connection from the node's address can be a box's, so
-    /// the proxy does not look up who owns the connecting socket.
+    /// the proxy does not look up who owns the connecting socket. A stopped
+    /// box ([`Self::mark_stopped`]) is not live: it keeps its caller facts
+    /// until destroy, but it runs nothing that can connect, so it does not
+    /// count until [`Self::mark_running`] (NET-070).
     #[must_use]
     pub fn has_unleased_callers(&self) -> bool {
-        self.callers
-            .keys()
-            .any(|id| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id))
+        self.callers.keys().any(|id| {
+            !self.stopped.contains(id)
+                && !self.own.contains_key(id)
+                && !self.by_lease.values().any(|v| v == id)
+        })
     }
 
     /// Whether any own-address box is attaching and has not reported its
@@ -3047,14 +3052,16 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
 /// (NET-070), as [`connecting_box`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectingOwner {
-    /// A process in this box's classifier leaf holds the socket.
+    /// A process in this box's classifier leaf holds the socket, and no
+    /// holder runs in another box's leaf.
     Box(SessionId),
-    /// A process in no box's leaf holds the socket, as the developer's
-    /// browser does.
+    /// Every process that holds the socket runs in no box's leaf, as the
+    /// developer's browser does.
     NoBox,
-    /// The lookup found no holder: the socket is gone from the tables or
-    /// held by no process (the client closed it), or `/proc` hides the
-    /// holder or its cgroup from this process.
+    /// The lookup found no owner: the socket is gone from the tables or
+    /// held by no process (the client closed it), `/proc` hides a holder or
+    /// its cgroup from this process, a holder's pid stopped holding the
+    /// socket while it was read, or holders run in two boxes' leaves.
     Unknown,
     /// The peer's address is one this node does not hold, so no lookup ran.
     /// The peer is a client off the node, such as the host side of a VM's
@@ -3066,12 +3073,14 @@ pub enum ConnectingOwner {
 /// The box that owns the client end of a TCP connection to this host
 /// (NET-070): `peer` is the client's address and `local` the address it
 /// connected to, as the accepting side sees them. The kernel's socket tables
-/// give the client socket's inode, the process that holds a descriptor for
-/// it, and that process's cgroup. A host-address box's processes run in its
+/// give the client socket's inode, every process that holds a descriptor for
+/// it, and each one's cgroup. A host-address box's processes run in its
 /// classifier leaf, `boxes/<allow|deny>/<box id>`, and the leaf's name is the
-/// box's id. [`ConnectingOwner::NoBox`] when the holder runs in no box's
-/// leaf, and [`ConnectingOwner::Unknown`] when any step finds nothing, so a
-/// caller can refuse a connection it cannot attribute.
+/// box's id. The socket is the box's when any holder runs in its leaf
+/// ([`owner_of_holders`]). [`ConnectingOwner::NoBox`] when every holder runs
+/// in no box's leaf, and [`ConnectingOwner::Unknown`] when any step finds
+/// nothing or holders run in two boxes' leaves, so a caller can refuse a
+/// connection it cannot attribute.
 ///
 /// A peer whose address this node does not hold is [`ConnectingOwner::OffNode`]
 /// with no lookup. A host-address box shares the node's network namespace,
@@ -3087,15 +3096,19 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
     }
     #[cfg(target_os = "linux")]
     {
-        let holder = client_socket_inode(peer, local)
-            .and_then(socket_holder)
-            .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok());
-        match holder {
-            None => ConnectingOwner::Unknown,
-            Some(cgroup) => {
-                box_in_cgroup(&cgroup).map_or(ConnectingOwner::NoBox, ConnectingOwner::Box)
-            }
-        }
+        let Some(inode) = client_socket_inode(peer, local) else {
+            return ConnectingOwner::Unknown;
+        };
+        let Some(holders) = socket_holders(inode) else {
+            return ConnectingOwner::Unknown;
+        };
+        // Read each holder's cgroup, then check that the pid still holds the
+        // socket. A pid that exited and was reused between the two reads
+        // names another process's cgroup, so it counts as unreadable.
+        owner_of_holders(holders.into_iter().map(|pid| {
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+            holds_socket(pid, inode).then_some(cgroup)
+        }))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -3158,23 +3171,62 @@ fn socket_row_inode(table: &str, ours: &[String; 2], theirs: &[String; 2]) -> Op
     })
 }
 
-/// The first process that holds a descriptor for the socket `inode`.
+/// Every process that holds a descriptor for the socket `inode`, in `/proc`
+/// order. A socket can have several holders: a forked child keeps its
+/// parent's descriptors, and a descriptor can be passed over a Unix socket.
+/// `None` when `/proc` cannot be read.
 #[cfg(target_os = "linux")]
-fn socket_holder(inode: u64) -> Option<u32> {
-    let target = format!("socket:[{inode}]");
-    std::fs::read_dir("/proc")
+fn socket_holders(inode: u64) -> Option<Vec<u32>> {
+    let holders = std::fs::read_dir("/proc")
         .ok()?
         .flatten()
-        .find_map(|entry| {
-            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
-            let fds = std::fs::read_dir(entry.path().join("fd")).ok()?;
-            fds.flatten()
-                .any(|fd| {
-                    std::fs::read_link(fd.path())
-                        .is_ok_and(|link| link.as_os_str() == target.as_str())
-                })
-                .then_some(pid)
-        })
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| holds_socket(*pid, inode))
+        .collect();
+    Some(holders)
+}
+
+/// Whether process `pid` holds a descriptor for the socket `inode` now.
+#[cfg(target_os = "linux")]
+fn holds_socket(pid: u32, inode: u64) -> bool {
+    let target = format!("socket:[{inode}]");
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == target.as_str())
+    })
+}
+
+/// The owner of a socket from its holders' cgroups (NET-070). Each item is
+/// one holder's `/proc/<pid>/cgroup`, or `None` when that read failed or the
+/// pid no longer held the socket after it. The socket is a box's when any
+/// holder runs in that box's leaf, whatever other holders run outside every
+/// box: a process outside the boxes must not lift the box's gate by sharing
+/// its socket. [`ConnectingOwner::Unknown`] when there is no holder, when
+/// any holder cannot be read, or when holders run in two different boxes'
+/// leaves, so the proxy refuses the connection. [`ConnectingOwner::NoBox`]
+/// only when every holder runs outside every box.
+fn owner_of_holders(holders: impl IntoIterator<Item = Option<String>>) -> ConnectingOwner {
+    let mut owner = None;
+    let mut any = false;
+    for cgroup in holders {
+        any = true;
+        let Some(cgroup) = cgroup else {
+            return ConnectingOwner::Unknown;
+        };
+        if let Some(id) = box_in_cgroup(&cgroup) {
+            match owner {
+                Some(seen) if seen != id => return ConnectingOwner::Unknown,
+                _ => owner = Some(id),
+            }
+        }
+    }
+    match owner {
+        Some(id) => ConnectingOwner::Box(id),
+        None if any => ConnectingOwner::NoBox,
+        None => ConnectingOwner::Unknown,
+    }
 }
 
 /// The box whose classifier leaf a process's `/proc/<pid>/cgroup` names:
@@ -3313,6 +3365,42 @@ mod tests {
         }
     }
 
+    /// NET-070: a socket can have several holders. A holder in a box's leaf
+    /// makes the socket that box's, whatever holder outside every box shares
+    /// it and in whatever order `/proc` lists them. Holders in two boxes'
+    /// leaves, or a holder that cannot be read, make the owner unknown.
+    #[test]
+    fn owner_of_holders_prefers_a_box_holder_and_refuses_two_boxes() {
+        let a = "00000000-0000-0000-0000-0000000000aa";
+        let b = "00000000-0000-0000-0000-0000000000bb";
+        let in_box = |id: &str| Some(format!("0::/minimal/boxes/deny/{id}\n"));
+        let outside = || Some("0::/user.slice/user-1000.slice/session-1.scope\n".to_owned());
+        let box_a = ConnectingOwner::Box(SessionId::parse_str(a).unwrap());
+
+        assert_eq!(owner_of_holders([outside(), in_box(a)]), box_a);
+        assert_eq!(owner_of_holders([in_box(a), outside()]), box_a);
+        assert_eq!(owner_of_holders([in_box(a), in_box(a)]), box_a);
+        assert_eq!(
+            owner_of_holders([in_box(a), outside(), in_box(b)]),
+            ConnectingOwner::Unknown,
+            "holders in two boxes' leaves"
+        );
+        assert_eq!(
+            owner_of_holders([outside(), outside()]),
+            ConnectingOwner::NoBox
+        );
+        assert_eq!(
+            owner_of_holders([outside(), None]),
+            ConnectingOwner::Unknown,
+            "a holder whose cgroup read failed or whose pid was reused"
+        );
+        assert_eq!(
+            owner_of_holders(std::iter::empty()),
+            ConnectingOwner::Unknown,
+            "no holder"
+        );
+    }
+
     /// The socket table row of a connection's client end is the one whose
     /// local address is the peer and whose remote address is the proxy's,
     /// in the v4 table and in the v4-mapped spelling of the v6 table alike.
@@ -3353,7 +3441,8 @@ mod tests {
             panic!("an IPv4 connection");
         };
         let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
-        assert_eq!(socket_holder(inode), Some(std::process::id()));
+        assert!(holds_socket(std::process::id(), inode));
+        assert!(socket_holders(inode).is_some_and(|pids| pids.contains(&std::process::id())));
         // A test process runs in no box's leaf, so it is no box.
         assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
         drop(client);
