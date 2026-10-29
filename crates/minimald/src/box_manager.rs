@@ -1525,6 +1525,64 @@ impl BoxManagerHandle {
         }
         stopped
     }
+
+    /// The state and directories of the box `id` when the box is stopped
+    /// or exited, read from the store with no actor started (BOX-017).
+    /// Answers `None` for an id no record names, for a box being torn
+    /// down, and for a box that is not ended: that box has, or can get,
+    /// an actor through [`Self::get_session`].
+    ///
+    /// # Errors
+    ///
+    /// A store error, or `InvalidData` for a record whose state this
+    /// build cannot read.
+    pub(crate) async fn ended_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<EndedBox>, BoxManagerError> {
+        let Some(record) = self.get_record(BoxKeyPredicate::Id(id)).await? else {
+            return Ok(None);
+        };
+        let state = record
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if !matches!(
+            state,
+            boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)
+        ) {
+            return Ok(None);
+        }
+        // The events source is the store's object for the record, with no
+        // actor behind it. Its directories are the box's retained files.
+        let object = match self.box_events(id).await {
+            Ok(reader) => reader.object,
+            // Reaped between the two reads.
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        use boxes::store::BoxObject as _;
+        Ok(Some(EndedBox {
+            state,
+            paths: crate::box_actor::BoxPaths {
+                working: object.workspace_path(),
+                cache: object.cache_path(),
+                home: object.home_path(),
+                patches: object.patches_path(),
+                hooks: object.hooks_path(),
+            },
+        }))
+    }
+}
+
+/// A stopped or exited box, as [`BoxManagerHandle::ended_box`] reads it
+/// from the store.
+#[derive(Debug)]
+pub(crate) struct EndedBox {
+    /// How the box ended.
+    pub state: boxes::core::record::RecordState,
+    /// The box's retained directories.
+    pub paths: crate::box_actor::BoxPaths,
 }
 
 /// Per-session deadline for the host probes this manager makes — the

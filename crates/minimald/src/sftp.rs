@@ -695,28 +695,69 @@ pub(crate) async fn handle_sftp_subsystem(
         return Ok(());
     };
 
+    // The subsystem span records whether the box was ended (BOX-017).
+    let span = tracing::info_span!(
+        "sftp.subsystem",
+        %session_id,
+        ended = tracing::field::Empty,
+    );
+    tracing::Instrument::instrument(serve_box_files(s, channel, id, session, session_id), span)
+        .await
+}
+
+/// Opens the SFTP conversation on `channel` against the directories of the
+/// box `session_id`, under the caller's `sftp.subsystem` span.
+///
+/// A stopped or exited box is served from its retained directories, read
+/// from its record, with no actor started for it (BOX-017). Any other box
+/// is served through its actor, which the lookup starts when it is idle.
+async fn serve_box_files(
+    s: ServerStateHandle,
+    channel: russh::Channel<russh::server::Msg>,
+    id: ChannelId,
+    session: &mut Session,
+    session_id: SessionId,
+) -> Result<(), ConnectionError> {
     let mngr = s.sessions_manager().await;
-    let session_handle = match mngr.get_session(BoxKeyPredicate::Id(session_id)).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            tracing::warn!(%session_id, "sftp subsystem rejected: unknown session");
-            session.channel_failure(id)?;
-            return Ok(());
-        }
+    let ended = match mngr.ended_box(session_id).await {
+        Ok(ended) => ended,
         Err(e) => {
             tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: lookup failed");
             session.channel_failure(id)?;
             return Ok(());
         }
     };
-    let paths = match session_handle.paths().await {
-        Ok(paths) => paths,
-        // The actor died between resolve and this call (raced an
-        // abort/destroy) — to this channel the session no longer exists.
-        Err(e) => {
-            tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: session is gone");
-            session.channel_failure(id)?;
-            return Ok(());
+    tracing::Span::current().record("ended", ended.is_some());
+    let paths = if let Some(ended) = ended {
+        tracing::info!(
+            %session_id,
+            state = ended.state.name(),
+            "sftp: serving the retained files of an ended box, with no actor"
+        );
+        ended.paths
+    } else {
+        let session_handle = match mngr.get_session(BoxKeyPredicate::Id(session_id)).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                tracing::warn!(%session_id, "sftp subsystem rejected: unknown session");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: lookup failed");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+        };
+        match session_handle.paths().await {
+            Ok(paths) => paths,
+            // The actor died between resolve and this call (raced an
+            // abort/destroy) — to this channel the session no longer exists.
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: session is gone");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
         }
     };
 
@@ -818,6 +859,70 @@ mod tests {
             !tokio::fs::try_exists(paths.working.sub_path_unchecked("hello.txt").as_str())
                 .await
                 .unwrap()
+        );
+    }
+
+    /// BOX-017: a stopped box keeps its files on disk, and a copy out of
+    /// them is served from the retained filesystem with no actor started.
+    #[tokio::test]
+    async fn stopped_box_filesystem_served_by_cp() {
+        use boxes::core::record::RecordState;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload: &[u8] = b"kept after the stop";
+        {
+            let sftp = client.open_sftp(session_id).await;
+            write(&sftp, "kept.txt", payload).await;
+            write(&sftp, &format!("{}/tree.txt", env::WORKSPACE_ROOT), payload).await;
+        }
+
+        let mngr = server.state.sessions_manager().await;
+        mngr.stop_box_with_grace(session_id, false, std::time::Duration::from_secs(5))
+            .await
+            .expect("the stop succeeds");
+        // The actor evicts itself when the stop ends: no actor hosts a
+        // stopped box.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while mngr.running_count().await != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stopped box's actor did not end"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let sftp = client.open_sftp(session_id).await;
+        assert_eq!(sftp.read("kept.txt").await.unwrap(), payload);
+        assert_eq!(
+            sftp.read(&format!("{}/tree.txt", env::WORKSPACE_ROOT))
+                .await
+                .unwrap(),
+            payload
+        );
+        let listed: Vec<String> = sftp
+            .read_dir(env::WORKSPACE_ROOT)
+            .await
+            .unwrap()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(listed.contains(&"tree.txt".to_string()), "{listed:?}");
+
+        assert_eq!(
+            mngr.running_count().await,
+            0,
+            "serving the files started no actor for the stopped box"
+        );
+        let record = mngr
+            .get_record(BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("a stopped box keeps its record");
+        assert!(
+            matches!(record.state().unwrap(), RecordState::Stopped(_)),
+            "the box is still stopped"
         );
     }
 
