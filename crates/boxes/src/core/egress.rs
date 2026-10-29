@@ -123,8 +123,11 @@ pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
 /// The DSCP value a VM guest's classifier writes on every IPv4 packet of a
 /// connection a box's cgroup opened, so the host-side gate can tell a box's
 /// frame from the guest daemon's own when both leave from the node address.
-/// The guest clears the field on every other packet, so a process outside
-/// the boxes cohort cannot wear the value. It is in RFC 2474's pool 2
+/// The guest's table clears the field on every other packet, so an honest
+/// sender outside the boxes cohort never wears the value. Root in the guest
+/// can write any frame, the mark included, so the mark is no proof of a
+/// box: the host gate bounds a marked frame from the node address by the
+/// rules it decides the cohort's frames by. It is in RFC 2474's pool 2
 /// (`xxxx11`), the codepoints kept for local use.
 pub const BOX_COHORT_DSCP: u8 = 0b11_0111;
 

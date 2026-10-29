@@ -6247,18 +6247,6 @@ mod tests {
         );
     }
 
-    /// NET-079: the guest loads the installer's own render, not a second
-    /// spelling of it kept in step. The daemon compiles the installer in
-    /// from the one file — `include_str!`, never a copy staged anywhere a
-    /// box could reach — and asks it for `--print-ruleset`; the step's own
-    /// print mode renders the same table over the same mount facts, so the
-    /// two renders must agree byte for byte, or the guest's table and the
-    /// native host's would be two tables wearing one name. Pinned over both
-    /// spellings of the identities the render takes: the harness pair the
-    /// step's own tests render, and the guest's own collapsed pair, where
-    /// both identities are the one address an un-enrolled guest has
-    /// (NET-078) — an enrolled guest is handed the design §4.2 pair and
-    /// renders it the same way.
     /// The guest's table writes the sender's cgroup into every packet it
     /// sends: the boxes cohort's connections leave with the box mark, and
     /// every other packet with the field cleared, so the VM host's gate
@@ -6296,6 +6284,18 @@ mod tests {
         );
     }
 
+    /// NET-079: the guest loads the installer's own render, not a second
+    /// spelling of it kept in step. The daemon compiles the installer in
+    /// from the one file — `include_str!`, never a copy staged anywhere a
+    /// box could reach — and asks it for `--print-ruleset`; the step's own
+    /// print mode renders the same table over the same mount facts, so the
+    /// two renders must agree byte for byte, or the guest's table and the
+    /// native host's would be two tables wearing one name. Pinned over both
+    /// spellings of the identities the render takes: the harness pair the
+    /// step's own tests render, and the guest's own collapsed pair, where
+    /// both identities are the one address an un-enrolled guest has
+    /// (NET-078) — an enrolled guest is handed the design §4.2 pair and
+    /// renders it the same way.
     #[test]
     fn guest_table_is_the_installers_rendered_ruleset() {
         let mount = standin_mount();
