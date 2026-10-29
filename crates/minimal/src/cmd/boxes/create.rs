@@ -1626,6 +1626,18 @@ pub(crate) async fn activate_box(
         })
         .await?;
     let id = created.id;
+    // A `host_ip` box's egress, admitted on the VM host daemon before the
+    // box runs anything (NET-085): the host gate decides every frame the box
+    // sends from the node's own address by the admitted policies, and drops
+    // a box's frames that none admits. The guard retires it unless the
+    // session outlives this activation.
+    let mut host_ip_residency = HostIpResidency::admit(
+        control_sock.clone(),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+    )
+    .await;
     ActivationStep::ReportStart
         .run(async {
             // The registration's own half of the session-start output (T66): one line
@@ -2251,6 +2263,13 @@ pub(crate) async fn activate_box(
                 // unless the session finished first and was kept, or may
                 // have been.
                 let outcome = best_effort_destroy(&mut client, id, true).await;
+                // A session that is kept, or may be, keeps its egress: its
+                // destroy retires it.
+                if outcome != CleanupOutcome::Destroyed
+                    && let Some(residency) = host_ip_residency.as_mut()
+                {
+                    residency.keep();
+                }
                 if !settle_lease_after_cleanup(lease, outcome).await {
                     withdraw_box_row(
                         control_sock.clone(),
@@ -2286,6 +2305,9 @@ pub(crate) async fn activate_box(
     drop(interrupt_guard.take());
     if let Some(registration) = proxy_registration {
         registration.keep();
+    }
+    if let Some(residency) = host_ip_residency.as_mut() {
+        residency.keep();
     }
 
     // The `host_ip` interim: the box shares the node's own row, so its name

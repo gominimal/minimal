@@ -618,6 +618,50 @@ pub fn hold_box_name_beside(
     );
 }
 
+/// Admits (`resident`) or retires a `host_ip` box's egress policy at the
+/// VM host daemon whose control socket is `control_sock` (NET-085). A
+/// `host_ip` box leaves the VM from the node's own address, and the host
+/// gate decides its frames by the policies admitted here: a box whose
+/// policy is not admitted reaches nothing outside the VM. Keyed by the
+/// session `session_id`, so an unnamed box and a task box admit the same
+/// way. Blocking and best-effort: a failed exchange warns and returns
+/// `false`. A daemon that predates the verbs refuses them, and its gate
+/// predates the decision too.
+pub fn host_ip_box_at(
+    control_sock: &Path,
+    session_id: boxes::SessionId,
+    egress: Option<&boxes::EgressPolicy>,
+    resident: bool,
+) -> bool {
+    let (verb, operation) = if resident {
+        (
+            minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+                session_id,
+                egress: egress.cloned(),
+            }),
+            "admit",
+        )
+    } else {
+        (
+            minimald_rpc::BoxControlRequest::RetireHostIpBox(
+                minimald_rpc::RetireHostIpBoxRequest { session_id },
+            ),
+            "retire",
+        )
+    };
+    let failure = match host_control(control_sock, &verb) {
+        Ok((minimald_rpc::BoxControlReply::HostIpBox { .. }, _)) => return true,
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        session = %session_id,
+        operation,
+        "the host_ip box's egress {operation} could not be made ({failure})"
+    );
+    false
+}
+
 /// Withdraws a box's host row (T66) on the VM host daemon whose control
 /// socket is `control_sock`, once the session that registered it is gone:
 /// the creator presents the name and the pair the registration handed back,

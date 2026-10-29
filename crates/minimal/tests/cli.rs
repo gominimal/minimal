@@ -3076,20 +3076,20 @@ fn policy_shows_baseline_set() {
     // The posture is spelled beside the set, the way the daemon's start-up
     // line spells it. The shipped posture is in force: the set is what
     // bounds Minimal's own downloads in the VM. A frame from the node
-    // address that wears the box mark is still the node row's interim, so
-    // the line says the set can be bypassed, in the words a person reads,
-    // and names no design term.
+    // address that wears the box mark is decided by the resident host_ip
+    // boxes' rules, so no caveat rides beside the posture, and the line
+    // names no design term.
     assert!(
         text.contains(
             "destinations for Minimal's own downloads in this VM (not this box's rules): \
-             in force (a process with root in this VM can still bypass it)\n"
+             in force\n"
         ),
         "the helper's baseline set is shown beside the box's rules, headed by the \
          gate's in-force posture:\n{text}"
     );
     assert!(
-        !text.contains("interim"),
-        "the posture names no design term:\n{text}"
+        !text.contains("interim") && !text.contains("bypass"),
+        "the posture names no design term and no caveat:\n{text}"
     );
 
     // The rows are the enumeration the helper carries, one per category —
@@ -3116,7 +3116,7 @@ fn policy_shows_baseline_set() {
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
     assert_eq!(
         document["node_plane_baseline"]["phase"],
-        Value::String("in force (a process with root in this VM can still bypass it)".to_string()),
+        Value::String("in force".to_string()),
         "the JSON view carries the in-force posture:\n{document}"
     );
     let entries = document["node_plane_baseline"]["entries"]
