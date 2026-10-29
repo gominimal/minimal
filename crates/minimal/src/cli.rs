@@ -646,7 +646,7 @@ impl GlobalArgs {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 
-    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// Publish `--vm` as this process's VM name so every host dir the
     /// command resolves — socket, state dir, autospawn — names the same VM
     /// (NET-052). Called once at dispatch, before any path resolution; the
     /// default VM is untouched when the flag is absent (NET-053).
@@ -810,7 +810,7 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-/// Which daemon backend ("provider") hosts sessions.
+/// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
 /// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the

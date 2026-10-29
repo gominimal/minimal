@@ -415,7 +415,7 @@ fn arm_task_run_interrupt(
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     let control_sock = crate::vm_host_control_sock(
-        crate::daemon_provider_kind(global),
+        crate::daemon_host_kind(global),
         global.minimal_dir.as_deref(),
     );
     let task = tokio::spawn(async move {
@@ -923,7 +923,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     }
     release_task_name_hold(
         crate::vm_host_control_sock(
-            crate::daemon_provider_kind(global),
+            crate::daemon_host_kind(global),
             global.minimal_dir.as_deref(),
         ),
         id,

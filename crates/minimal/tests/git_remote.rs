@@ -6,6 +6,10 @@
 //! a minimald `TestServer` listening on the UDS at the default (XDG-derived)
 //! socket path.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use minimald::test_harness::{TestServer, create_configured_session};
 
 async fn run_git(cwd: &std::path::Path, args: &[&str]) {

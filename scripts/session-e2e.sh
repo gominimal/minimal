@@ -707,7 +707,7 @@ fi
 # (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
 # the cause. The proxy-source case below is where that stops being a
 # silent posture difference and becomes a failed proof. macOS resolves
-# the minvmd backend either way (`client_provider_kind` gates on the OS,
+# the minvmd backend either way (`client_host_kind` gates on the OS,
 # crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
 # without the flag — and both of its lanes arrive here with no
 # E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's
@@ -17518,16 +17518,37 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   else
     echo "relay-side warn line skipped (guest-side daemon log on VM lane — its count and fields are pinned by the native switch test)"
   fi
-  # What this host CAN observe is the consequence of a first-gate refusal:
-  # the frame never crossed the switch, so the VM host's gate never saw it
-  # and minvmd's log says nothing about it. That silence is the pin — a
-  # proxy-lane line in the host gate's log would mean the frame reached the
-  # host, the exception the relay no longer makes. The control above was
-  # reset through the same fabric, so the box and its path are live, and
-  # the absence below is the drop, not a dead fabric.
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # What this host CAN observe is the consequence of a first-gate refusal.
+  # The frame never crossed the switch, so the VM host's gate never saw it
+  # and minvmd never logs the gate's own drop line (its `rule_matched` field)
+  # for it. That silence is the pin: a gate drop line would mean the frame
+  # reached the host, the exception the relay no longer makes. The relay now
+  # reports its refusal over the guest door, so the host does see the relay's
+  # audit record, which minvmd::control logs with a `rule` field, never
+  # `rule_matched`. Its presence proves the relay refused and reported the
+  # frame. The control above was reset through the same fabric, so the box
+  # and its path are live, and the gate's silence is the drop, not a dead
+  # fabric.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the no-lane box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-cred-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-cred-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
 
@@ -17948,12 +17969,33 @@ proof_proxy_sees_boxes_by_address() {
     cred_case_log | grep -F -- 'connection delivered' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # The gate's own drop line carries `rule_matched`. The relay's refusal
+  # reaches the host as the audit record minvmd::control logs with a `rule`
+  # field, so match only the gate's field here, and expect the audit record
+  # for this box below.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the laneless box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+  psba_nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-psba-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      psba_nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$psba_nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-psba-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent, and the host audit log holds the relay's refusal"
 
   # The host process's leg: NET-132's IF-clause, end to end. A process
   # outside every box connects straight to the acceptor's own unix socket
@@ -22759,9 +22801,9 @@ exit" E2E_PTY_ANSWER=keep \
 # registration named (`minvmd status --row`), and the admission's own copy
 # lands in the VM host daemon's owner-only host audit (T84) — printed,
 # like every record this case asserts. The deny stance is decided inside
-# the box, so nothing crosses and nothing may exist on the host: no live
-# row, an empty runtime set, and no audit line at all, asserted all three
-# ways. The host's own probe at the published address must reach the
+# the box, so nothing is admitted on the host: no live row and an empty
+# runtime set. The decision still crosses the report door (NET-046), so the
+# host audit holds exactly one deny line for it. The host's own probe at the published address must reach the
 # in-box server and get its response (NET-044). The ask legs
 # (`eib_vm_ask_legs` above) are the host-attached human's. And the expose half of T61 lands on this lane: a
 # box created on the non-default VM (`min --vm alpha session activate`,
@@ -22807,8 +22849,8 @@ proof_expose_from_inside_box() {
   # the report door T94 opened: the guest daemon reports it, the host admits
   # the runtime port into the row, and the admission's own copy lands in the
   # host audit. The ask stays with `eib_vm_ask_legs` — the human attached on
-  # the host answers. The deny is decided inside the box, so nothing crosses
-  # and nothing may exist on the host. The two-VM leg at the end is the
+  # the host answers. The deny is decided inside the box, so nothing is
+  # admitted on the host, and its one audit line is reported there. The two-VM leg at the end is the
   # expose half of T61: a box on the non-default VM publishes there.
   if [ -n "${E2E_VM:-}" ]; then
     local eib_vm_sids=""
@@ -23051,9 +23093,10 @@ proof_expose_from_inside_box() {
       *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; fail ;;
     esac
     echo "deny box: refused with the deny the stance spells (NET-043)"
-    # Nothing crosses the report door — the guest decided deny — so nothing
-    # may exist on the host: no live row in the box's own listing, an empty
-    # runtime set in the host-held row, and no line at all in the host audit.
+    # The guest decided deny, so nothing is admitted on the host: no live row
+    # in the box's own listing and an empty runtime set in the host-held row.
+    # The decision itself still crosses the report door (NET-046), so the host
+    # audit holds exactly one expose_decision line for it.
     eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
       || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
     case "$eib_policy" in
@@ -23079,12 +23122,31 @@ proof_expose_from_inside_box() {
         fail
         ;;
     esac
-    if grep -qF "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null; then
-      echo "::error::the VM host daemon's host audit carries a line for $eib_deny_name — a deny decided in the box never crosses the report door, so the host must record nothing (T84)"
+    # The report is sent after the refusal, so poll briefly for its line.
+    eib_deny_lines=""
+    eib_deny_count=0
+    for _ in $(seq 1 20); do
+      eib_deny_lines="$(grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null \
+        | grep -F '"event":"expose_decision"' || true)"
+      eib_deny_count="$(printf '%s' "$eib_deny_lines" | grep -c . || true)"
+      [ "$eib_deny_count" -ge 1 ] && break
+      sleep 0.25
+    done
+    if [ "$eib_deny_count" -ne 1 ]; then
+      echo "::error::the VM host daemon's host audit carries $eib_deny_count expose_decision lines for $eib_deny_name — the deny decided in the box must reach the host as exactly one line (NET-046)"
       grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
       fail
     fi
-    echo "the deny recorded nothing: no live row, an empty runtime set in the host row, and no line in the host audit (NET-044, NET-046)"
+    case "$eib_deny_lines" in
+      *'"reported_by":"guest"'*'"decision":"deny"'*'"decided_by":"box-policy"'*'"outcome":"refused"'*) ;;
+      *)
+        echo "::error::the host audit's expose_decision line for $eib_deny_name is not a deny reported by the guest, decided by box-policy and refused (NET-046)"
+        echo "  $eib_deny_lines"
+        fail
+        ;;
+    esac
+    echo "host audit: $eib_deny_lines (the deny decided in the box, reported to the host, NET-046)"
+    echo "the deny admitted nothing: no live row and an empty runtime set in the host row, and the host audit holds the one deny line (NET-044, NET-046)"
 
     while IFS= read -r eib_vm_sid; do
       [ -n "$eib_vm_sid" ] && { mnl session destroy --force "$eib_vm_sid" >/dev/null 2>&1 || true; }
@@ -23287,7 +23349,7 @@ exit" E2E_PTY_ANSWER=keep \
       echo "two named VMs: the expose inside the box on $eib_two_vm published on $eib_two_vm, and the named VM is stopped again (NET-055, NET-058)"
     fi
 
-    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing recorded on the host, and every decision is a line in the VM host daemon's own audit"
+    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing admitted on the host and its deny recorded in the host audit, and every decision is a line in the VM host daemon's own audit"
     if [ -n "$eib_two_skip" ]; then
       echo "$eib_vm_ok; the two named VMs leg SKIPPED: $eib_two_skip)"
     else

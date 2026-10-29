@@ -7,6 +7,10 @@
 //! argv, so the proof is the spawn itself, not a VM boot: this runs on every
 //! lane that runs `-p minimal`, with no libkrun required.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -160,7 +164,7 @@ fn named_vm_reaches_autospawn() {
 }
 
 /// Without `--vm`, autospawn must behave exactly as before: no `--vm` in the
-/// spawned daemon's argv, and the state dir read is the bare provider dir
+/// spawned daemon's argv, and the state dir read is the bare host dir
 /// (NET-053 — the default VM's paths are unchanged).
 #[test]
 fn default_vm_autospawn_is_unchanged() {
