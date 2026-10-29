@@ -130,6 +130,12 @@ pub trait HostRoute: Send + Sync + 'static {
     /// connection from the node's address cannot be a box's, and the proxy
     /// does not look up who owns the connecting socket.
     fn has_unleased_callers(&self) -> bool;
+
+    /// Whether any live caller is an own-address box whose switch lease is
+    /// not reported yet. While one is, a peer at an address the node does
+    /// not hold can be that box, and the proxy refuses the peer as
+    /// unattributed.
+    fn has_unreported_lease_callers(&self) -> bool;
 }
 
 impl HostRoute for HostnameRegistry {
@@ -147,6 +153,10 @@ impl HostRoute for HostnameRegistry {
 
     fn has_unleased_callers(&self) -> bool {
         self.has_unleased_callers()
+    }
+
+    fn has_unreported_lease_callers(&self) -> bool {
+        self.has_unreported_lease_callers()
     }
 }
 
@@ -184,6 +194,13 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
         match self.read() {
             Ok(guard) => guard.has_unleased_callers(),
             Err(poisoned) => poisoned.into_inner().has_unleased_callers(),
+        }
+    }
+
+    fn has_unreported_lease_callers(&self) -> bool {
+        match self.read() {
+            Ok(guard) => guard.has_unreported_lease_callers(),
+            Err(poisoned) => poisoned.into_inner().has_unreported_lease_callers(),
         }
     }
 }
@@ -316,7 +333,10 @@ impl<T: HostRoute> Router<T> {
     /// caller facts for is [`CallerLookup::Unattributed`] too: an unknown box
     /// is denied by default (design §7.1). Only a socket that no box owns,
     /// or a peer at an address the node does not hold, is
-    /// [`CallerLookup::NoBox`].
+    /// [`CallerLookup::NoBox`]. The second holds only while no own-address
+    /// box waits for its lease report: such a box connects from a lease the
+    /// node does not hold, so while one is live an off-node peer is
+    /// [`CallerLookup::Unattributed`].
     async fn caller_for(&self, peer: SocketAddrV4, local: Option<SocketAddr>) -> CallerLookup {
         if let Some(caller) = self.caller_at(*peer.ip()) {
             return CallerLookup::Box(caller);
@@ -349,6 +369,17 @@ impl<T: HostRoute> Router<T> {
         let box_id = match found {
             super::dns::ConnectingOwner::Box(box_id) => box_id,
             super::dns::ConnectingOwner::NoBox => return CallerLookup::NoBox,
+            super::dns::ConnectingOwner::OffNode => {
+                if !self.table.has_unreported_lease_callers() {
+                    return CallerLookup::NoBox;
+                }
+                tracing::debug!(
+                    component = "dns-proxy",
+                    %peer,
+                    "a proxied connection from off the node can be a box whose lease is not reported yet"
+                );
+                return CallerLookup::Unattributed;
+            }
             super::dns::ConnectingOwner::Unknown => {
                 tracing::debug!(
                     component = "dns-proxy",
@@ -3910,6 +3941,7 @@ mod tests {
     const BROWSER_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 6);
     const UNATTRIBUTED_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 7);
     const UNREGISTERED_BOX_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 8);
+    const OFF_NODE_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 9);
     const HOST_BOX: &str = "00000000-0000-0000-0000-000000000011";
     const OPEN_HOST_BOX: &str = "00000000-0000-0000-0000-000000000012";
     const UNREGISTERED_BOX: &str = "00000000-0000-0000-0000-000000000013";
@@ -3921,7 +3953,8 @@ mod tests {
     /// The one from [`UNATTRIBUTED_ADDR`] has no owner the kernel can name, as
     /// a socket the client closed at once has none. The one from
     /// [`UNREGISTERED_BOX_ADDR`] is owned by a box with no caller facts in
-    /// the registry. Any other connection is owned by no box, as the
+    /// the registry. The one from [`OFF_NODE_ADDR`] comes from an address the
+    /// node does not hold. Any other connection is owned by no box, as the
     /// developer's browser's is.
     fn stub_socket_owner(
         peer: SocketAddrV4,
@@ -3942,8 +3975,72 @@ mod tests {
             UNREGISTERED_BOX_ADDR => {
                 ConnectingOwner::Box(SessionId::parse_str(UNREGISTERED_BOX).unwrap())
             }
+            OFF_NODE_ADDR => ConnectingOwner::OffNode,
             _ => ConnectingOwner::NoBox,
         }
+    }
+
+    /// NET-070, design §7.1: an own-address box registers its caller facts
+    /// at finalize and reports its switch lease only at the end of its
+    /// attach. In that window its connections come from a lease the node
+    /// does not hold, so the socket-owner lookup answers off the node. A
+    /// deny-all box's request to another box in that window is refused, not
+    /// left ungated. Once the lease is reported, an off-node peer is no box
+    /// again and its request routes.
+    #[tokio::test]
+    async fn proxy_unreported_lease_caller_refused() {
+        let backend_port = spawn_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let pending = SessionId::parse_str("00000000-0000-0000-0000-000000000014").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        // A host-address box keeps the socket-owner lookup running after the
+        // pending box reports its lease.
+        reg.register_host_net(host_box, "hostbox");
+        reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
+        // The own-address caller: caller facts, no reported lease.
+        reg.register_caller(pending, "pending", &deny_all, subnet, None);
+        assert!(reg.has_unreported_lease_callers());
+        let table = Arc::new(RwLock::new(reg));
+        let router = Router::new(Arc::clone(&table), proxied_request_verdict)
+            .with_socket_owner(stub_socket_owner);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let refused = proxy_get_from(proxy_addr, OFF_NODE_ADDR, "web.min.internal:18080").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected an off-node peer to be refused while a lease is unreported, got: {refused}"
+        );
+
+        table.write().unwrap().report_own_address(
+            pending,
+            "pending",
+            Ipv4Addr::new(10, 0, 2, 50),
+            BTreeMap::new(),
+        );
+        assert!(!table.read().unwrap().has_unreported_lease_callers());
+        let routed = proxy_get_from(proxy_addr, OFF_NODE_ADDR, "web.min.internal:18080").await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected an off-node peer to route once every lease is reported, got: {routed}"
+        );
     }
 
     /// NET-070 for a host-address caller: a host-address box holds no switch

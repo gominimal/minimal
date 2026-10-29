@@ -875,6 +875,11 @@ pub struct HostnameRegistry {
     /// Recorded by [`Self::register_caller`] at hostname registration, before
     /// the box has a lease, so the join is ready the moment it attaches.
     callers: HashMap<SessionId, CallerFacts>,
+    /// The sessions registered as `HostNet` boxes
+    /// ([`Self::register_host_net`]): they hold no switch lease by design, so
+    /// a caller fact without a lease is an unreported own-address lease only
+    /// for a session that is not in this set (NET-070).
+    host_net: HashSet<SessionId>,
     /// The lease-to-session map that names a caller (NET-070): the switch
     /// address a proxied request's peer resolves to a session with. Reserved
     /// switch addresses never appear in it — the switch hands a PTask a lease
@@ -921,6 +926,7 @@ impl HostnameRegistry {
             by_session: HashMap::new(),
             own: HashMap::new(),
             callers: HashMap::new(),
+            host_net: HashSet::new(),
             by_lease: HashMap::new(),
         }
     }
@@ -1050,6 +1056,7 @@ impl HostnameRegistry {
     /// connection to it is ungated, so the proxy gates nothing either
     /// (NET-071).
     pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
+        self.host_net.insert(session_id);
         self.register(
             session_id,
             session_name,
@@ -1180,6 +1187,22 @@ impl HostnameRegistry {
         self.callers
             .keys()
             .any(|id| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id))
+    }
+
+    /// Whether any live session with caller facts is an own-address box whose
+    /// switch lease is not reported yet: it is not a `HostNet` registration
+    /// and has no lease in the reported set. Such a box sits between
+    /// [`Self::register_caller`] at finalize and [`Self::report_own_address`]
+    /// at the end of its attach. Its connections come from a lease this node
+    /// does not hold, so [`connecting_box`] answers
+    /// [`ConnectingOwner::OffNode`] for them. While this is true, the proxy
+    /// cannot tell such a peer from a host-side client off the node, and it
+    /// refuses the peer as unattributed (NET-070, design §7.1).
+    #[must_use]
+    pub fn has_unreported_lease_callers(&self) -> bool {
+        self.callers
+            .keys()
+            .any(|id| !self.host_net.contains(id) && !self.own.contains_key(id))
     }
 
     /// The own-address publishes standing inside the reserved local range, as
@@ -1372,6 +1395,7 @@ impl HostnameRegistry {
             self.by_lease.remove(&own.lease);
         }
         self.callers.remove(&session_id);
+        self.host_net.remove(&session_id);
         self.stopped.remove(&session_id);
     }
 
@@ -3008,6 +3032,11 @@ pub enum ConnectingOwner {
     /// held by no process (the client closed it), or `/proc` hides the
     /// holder or its cgroup from this process.
     Unknown,
+    /// The peer's address is one this node does not hold, so no lookup ran.
+    /// The peer is a client off the node, such as the host side of a VM's
+    /// forwarded port, or an own-address box whose lease is not reported
+    /// yet. The caller decides which ([`HostnameRegistry::has_unreported_lease_callers`]).
+    OffNode,
 }
 
 /// The box that owns the client end of a TCP connection to this host
@@ -3020,7 +3049,7 @@ pub enum ConnectingOwner {
 /// leaf, and [`ConnectingOwner::Unknown`] when any step finds nothing, so a
 /// caller can refuse a connection it cannot attribute.
 ///
-/// A peer whose address this node does not hold is [`ConnectingOwner::NoBox`]
+/// A peer whose address this node does not hold is [`ConnectingOwner::OffNode`]
 /// with no lookup. A host-address box shares the node's network namespace,
 /// so it connects from an address the node holds. A client off the node,
 /// such as the host side of a VM's forwarded port that arrives through the
@@ -3030,7 +3059,7 @@ pub enum ConnectingOwner {
 #[must_use]
 pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
     if !node_holds_address(*peer.ip()) {
-        return ConnectingOwner::NoBox;
+        return ConnectingOwner::OffNode;
     }
     #[cfg(target_os = "linux")]
     {
@@ -3306,7 +3335,7 @@ mod tests {
         drop(client);
     }
 
-    /// A peer at an address this node does not hold is no box, with no
+    /// A peer at an address this node does not hold is off the node, with no
     /// socket lookup: a host-address box connects from the node's own
     /// addresses, and an off-node client, such as a VM host's forwarded
     /// request through the switch's gateway, is never in the node's tables
@@ -3318,7 +3347,7 @@ mod tests {
         let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7654);
         assert!(!node_holds_address(*peer.ip()));
         assert!(node_holds_address(Ipv4Addr::new(127, 0, 0, 4)));
-        assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
+        assert_eq!(connecting_box(peer, local), ConnectingOwner::OffNode);
     }
 
     /// A lease an attach path would report, with an `18080:8080` ingress
