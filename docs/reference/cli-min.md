@@ -556,6 +556,31 @@ to bind, the cause replaces the resolution and the box stays named:
 the same clause after it when it applies. A session
 start never prints or runs the privileged step.
 
+On macOS, a box opens at its name directly once `min finalize-install` has
+run. A port that the box publishes, by `--ingress` at activate or by
+`min net expose` inside the box, opens at `http://<box>.min.internal:<port>`
+in the default profile of Safari, Chrome or Firefox. A browser profile that
+resolves names through DNS over HTTPS does not resolve box names. The box then
+stands at its own reserved local address, the address that its name resolves
+to. Before `min finalize-install` runs, the box stands at `127.0.0.1`, and
+the same URL opens through the hostname proxy at the `127.0.0.1:<port>` that
+the host line names. The hostname proxy keeps serving
+after the step, and it refuses a port that the box did not publish, the same
+as a direct connection.
+
+An activation refuses a declared `--ingress` host port that something on this
+machine already holds, and leaves no box behind. The refusal names the port
+and its holder, and suggests the next port up:
+
+```
+Port 8080 is already in use on this machine by box web.
+Choose another host port in --ingress (for example --ingress 8081:8080) or in [network] ingress in minimal.toml.
+```
+
+When the holder is not a box, the first line ends with
+`by another program on this machine.` Before `min finalize-install` runs,
+every box shares `127.0.0.1`, so two boxes cannot declare the same host port.
+
 The script holds only what this host is missing from:
 
 - the AppArmor profile that allows user namespaces for the sandbox
