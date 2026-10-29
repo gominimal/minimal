@@ -1060,6 +1060,29 @@ fn serve_request(
             let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
+        // A `host_ip` box's policy changes no zone table, so it takes no
+        // ticket. Only the host's door serves it: the guest must never say
+        // what a marked frame may reach (NET-085).
+        (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
+            let resident = boxes.admit_host_ip_box(request.session_id, request.egress.as_ref());
+            write_reply(
+                stream,
+                &BoxControlReply::HostIpBox {
+                    session_id: request.session_id,
+                    resident,
+                },
+            )
+        }
+        (BoxControlRequest::RetireHostIpBox(request), ControlDoor::Host) => {
+            boxes.retire_host_ip_box(request.session_id);
+            write_reply(
+                stream,
+                &BoxControlReply::HostIpBox {
+                    session_id: request.session_id,
+                    resident: false,
+                },
+            )
+        }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers both host facts the CLI's
             // surfaces read (T93): the answerer's own state, always —
@@ -1438,6 +1461,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::Withdraw(_) => "withdraw",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
         BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
+        BoxControlRequest::AdmitHostIpBox(_) => "admit_host_ip_box",
+        BoxControlRequest::RetireHostIpBox(_) => "retire_host_ip_box",
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
@@ -3667,7 +3692,7 @@ mod tests {
                      reply for {port}/{proto:?}"
                 )
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
@@ -4146,7 +4171,7 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a withdrawal echoes the pair it went by, never a port report")
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
@@ -4266,7 +4291,7 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
-                other @ BoxControlReply::RowStanding { .. } => {
+                other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }
@@ -4340,7 +4365,7 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a repeat withdrawal echoes the pair, never a port report")
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {

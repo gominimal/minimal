@@ -33,9 +33,11 @@
 //! `MINVMD_BASELINE_CACHE`), every change is logged, and neither category is
 //! ever dropped from the enumeration by saying it.
 //!
-//! One path is not bounded yet: a frame from the node address that wears the
-//! box mark is decided by the node row's interim
-//! ([`BOX_MARKED_NODE_PHASE`]), and the posture says so.
+//! A frame from the node address that wears the box mark is not the node
+//! plane's: the gate decides it by the union of the resident `host_ip`
+//! boxes' rules, and drops it when no `host_ip` box is resident
+//! ([`crate::net::egress_gate`]). The set never decides a marked frame, and
+//! the node row never does either.
 
 use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use std::io;
@@ -147,58 +149,10 @@ impl NodeBaselinePhase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Announced => "announced (node row's allow-all interim)",
-            Self::InForce => match BOX_MARKED_NODE_PHASE {
-                BoxMarkedNodePhase::NodeRowInterim => {
-                    "in force (a process with root in this VM can still bypass it)"
-                }
-                BoxMarkedNodePhase::Bounded => "in force",
-            },
+            Self::InForce => "in force",
         }
     }
 }
-
-/// How the host-side gate decides a frame from the node address that wears
-/// the box mark (`boxes::core::egress::BOX_COHORT_DSCP`). The guest's table
-/// writes the mark for a host-address box's connections, and root in the
-/// guest can write it on any frame. So the mark says which rules an honest
-/// sender asks for, and never proves a box (NET-085).
-///
-/// The bound the design gives a marked frame is the union of the resident
-/// host-address boxes' rules (design §4.3 rule 2). The host does not hold
-/// those rules yet: a host-address box registers no row of its own, and the
-/// node row that carries its frames is the run path's allow-all interim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoxMarkedNodePhase {
-    /// The announced interim this build ships: the node row decides a marked
-    /// frame, so a process with root in the VM that writes the mark is not
-    /// bounded by the baseline set. The start-up line logs it, and the
-    /// posture the policy display spells says so.
-    NodeRowInterim,
-    /// The bound arm: a marked frame is decided by the baseline set, the way
-    /// an unmarked one is. Built today only by the tests that pin it
-    /// ([`NodePlaneBaseline::box_marked_bounded`]).
-    Bounded,
-}
-
-impl BoxMarkedNodePhase {
-    /// The phase as the gate's start-up line logs it, under
-    /// `box_marked_node_frames`.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NodeRowInterim => "node row (allow-all interim)",
-            Self::Bounded => "baseline set",
-        }
-    }
-}
-
-/// The phase this build ships for a marked frame from the node address: the
-/// node row's allow-all interim. The flip condition: the host-side creator
-/// registers each host-address box's compiled rules, so the gate can decide a
-/// marked frame by their union and drop it when no host-address box is
-/// resident. That change replaces [`BoxMarkedNodePhase::Bounded`]'s
-/// baseline-only decision with the union, and the posture drops its caveat.
-pub(crate) const BOX_MARKED_NODE_PHASE: BoxMarkedNodePhase = BoxMarkedNodePhase::NodeRowInterim;
 
 /// The phase this build ships: in force. The registry and cache entries name
 /// the hosts the daemon's own fetches go to, and the node plane's own lookups
@@ -382,9 +336,6 @@ pub struct NodePlaneBaseline {
     rules: EgressRules,
     /// The posture the gate decides the set under: the shipped constant.
     phase: NodeBaselinePhase,
-    /// How the gate decides a marked frame from the node address: the
-    /// shipped constant.
-    box_marked: BoxMarkedNodePhase,
     /// The configured host exposures over the alias, as inclusive port
     /// ranges: the ports the node plane reaches the host alias at, every
     /// other port refused through the alias. Empty unless the deployment
@@ -475,13 +426,6 @@ impl NodePlaneBaseline {
     #[must_use]
     pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
-    }
-
-    /// How the gate decides a frame from the node address that wears the box
-    /// mark: by the node row's interim, the shipped posture, or by this set.
-    #[must_use]
-    pub fn box_marked_phase(&self) -> BoxMarkedNodePhase {
-        self.box_marked
     }
 
     /// The host-name endpoints of every entry, each with the categories that
@@ -603,15 +547,6 @@ impl NodePlaneBaseline {
         self
     }
 
-    /// Pins the bound arm of the marked-frame phase
-    /// ([`BoxMarkedNodePhase::Bounded`]): a marked frame from the node
-    /// address is decided by this set. Kept so the tests can pin both arms.
-    #[cfg(test)]
-    pub(crate) fn box_marked_bounded(mut self) -> Self {
-        self.box_marked = BoxMarkedNodePhase::Bounded;
-        self
-    }
-
     /// Re-points one category's endpoints, rebuilds the compiled set, and
     /// logs the change with the endpoints before and after it. A category
     /// the enumeration does not carry is added rather than skipped, so
@@ -651,7 +586,6 @@ impl NodePlaneBaseline {
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
-            box_marked: BOX_MARKED_NODE_PHASE,
             host_exposure: Vec::new(),
         }
     }
@@ -677,7 +611,7 @@ impl NodePlaneBaseline {
 mod tests {
     use super::{
         BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry,
-        BoxMarkedNodePhase, DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT,
+        DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT,
         HOST_EXPOSURE_PORTS_ENV, NodeBaselinePhase, NodePlaneBaseline, baseline_endpoints_from_env,
         baseline_endpoints_from_raw, host_exposure_ports_from_raw,
     };
@@ -776,21 +710,10 @@ mod tests {
         // identity the set's verdict accepts.
         assert_eq!(baseline.node_addr(), SUBNET.daemon_ip().octets());
         // The shipped posture is in force: the set decides the node plane's
-        // unmarked frames. A marked frame is still the node row's interim, and
-        // the posture says so rather than claim the whole node address.
+        // own frames, and a marked frame is the resident `host_ip` boxes'
+        // to decide, never the node row's. The posture carries no caveat.
         assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
-        assert_eq!(
-            baseline.box_marked_phase(),
-            BoxMarkedNodePhase::NodeRowInterim
-        );
-        assert_eq!(
-            baseline.phase().as_str(),
-            "in force (a process with root in this VM can still bypass it)"
-        );
-        assert_eq!(
-            baseline.clone().box_marked_bounded().box_marked_phase(),
-            BoxMarkedNodePhase::Bounded
-        );
+        assert_eq!(baseline.phase().as_str(), "in force");
 
         // The deployment's spelling of an entry: host names and subnets,
         // whitespace trimmed, and a term that is neither skipped, so a typo

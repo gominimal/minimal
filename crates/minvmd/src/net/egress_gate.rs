@@ -175,7 +175,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{BoxMarkedNodePhase, NodeBaselinePhase, NodePlaneBaseline};
+use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
@@ -1093,8 +1093,6 @@ impl EgressGate {
             baseline = %baseline.render(),
             node_addr = %Ipv4Addr::from(baseline.node_addr()),
             node_baseline_phase = baseline.phase().as_str(),
-            box_marked_node_frames = baseline.box_marked_phase().as_str(),
-            box_marked_node_rule = BOX_MARKED_NODE_FRAME_RULE,
             "node-plane baseline set at the gate; each entry's addresses are pinned from the \
              node's own lookups",
         );
@@ -4401,6 +4399,15 @@ async fn relay_frames_to_switch(
                 limiter.warn_node_plane_unpinned(src, dst, dst_port);
                 continue;
             }
+            Err(GateDrop::HostIpUnbounded {
+                src,
+                dst,
+                dst_port,
+                resident,
+            }) => {
+                limiter.warn_host_ip_unbounded(src, dst, dst_port, resident);
+                continue;
+            }
             Err(GateDrop::Verdict(reason @ DropReason::UndeclaredSubnet { dst, .. })) => {
                 // The row's own rules refused the destination, and the line
                 // names it beside the source and the rule: the destination
@@ -4437,7 +4444,7 @@ async fn relay_frames_to_switch(
             GateAdmit::Baseline
             | GateAdmit::Row
             | GateAdmit::ProxyLane
-            | GateAdmit::BoxMarkedInterim => summary.source(),
+            | GateAdmit::HostIpBox => summary.source(),
         };
         if let Some(src) = src
             && src != baseline.node_addr()
@@ -4673,18 +4680,19 @@ enum GateAdmit {
     /// the row's own fact; nothing the guest says grants one, and nothing in
     /// it opens the address's other ports or protocols.
     ProxyLane,
-    /// The node row's allow-all interim admitted a frame from the node
-    /// address that wears the box mark ([`BOX_MARKED_NODE_FRAME_RULE`]). The
-    /// guest's table marks a host-address box's connections, and root in the
-    /// guest can mark any frame, so this admission is the one the baseline
-    /// set does not bound yet (NET-085).
-    BoxMarkedInterim,
+    /// A resident `host_ip` box's rules admitted a frame from the node
+    /// address that wears the box mark (NET-085, design §4.3 rule 2). The
+    /// guest's table marks a `host_ip` box's connections, and root in the
+    /// guest can mark any frame, so the mark only says which rules decide
+    /// the frame: the union of the resident `host_ip` boxes' rules, which
+    /// the host-side client registered ([`BoxTable::host_ip_boxes`]).
+    HostIpBox,
 }
 
-/// The name of the interim that decides a marked frame from the node address
-/// by the node row: the value a test asserts and a reader of the gate's
-/// start-up line finds beside `box_marked_node_frames`.
-pub(crate) const BOX_MARKED_NODE_FRAME_RULE: &str = "node-row-box-mark-interim";
+/// The rule a box-marked frame from the node address drops under when no
+/// resident `host_ip` box's rules admit it, or when no `host_ip` box is
+/// resident: the rate-limit key and the drop line's `rule_matched`.
+pub(crate) const HOST_IP_BOXES_RULE: &str = "egress-host-ip-boxes";
 
 /// How long a bare SYN the ingress leg delivered at a port no publish dials
 /// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
@@ -5337,7 +5345,8 @@ fn node_plane_verdict(
 /// set ([`NodePlaneBaseline`], the helper's enumeration of the categories
 /// the in-VM daemon's traffic may reach, NET-130), and a frame the guest's
 /// classifier marked as a box's (`BOX_COHORT_DSCP`, written from the
-/// sender's cgroup) is decided by the node row like any other row's. The
+/// sender's cgroup) is decided by the union of the resident `host_ip`
+/// boxes' rules ([`host_ip_verdict`]), never by the node row. The
 /// published namespace that holds any other source
 /// supplies the rules its frames are decided by, and an address neither
 /// covers is the phase's to decide — [`UnregisteredSourcePhase`] carries what
@@ -5482,25 +5491,121 @@ fn gate_verdict(
     // baseline set decides it, so a guest whose classifier never loaded
     // fails closed to the baseline.
     // The mark is no proof of a box: root in the guest can write it on any
-    // frame (NET-085). The design bounds a marked frame by the resident
-    // host-address boxes' rules, and the host does not hold them yet. So
-    // the marked-frame phase this build ships is an announced interim
-    // (`BOX_MARKED_NODE_PHASE`): the node row decides a marked frame, its
-    // admission is `GateAdmit::BoxMarkedInterim`, the start-up line logs the
-    // phase, and the posture says the set can be bypassed. The bound arm
-    // decides a marked frame by the baseline set, like an unmarked one.
+    // frame (NET-085). So a marked frame is decided by the union of the
+    // resident `host_ip` boxes' rules, which the host-side client
+    // registered, and dropped when no `host_ip` box is resident (design
+    // §4.3 rule 2). The node row never decides it. A process that writes
+    // the mark reaches only what a resident box's own rules admit.
     if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
-        if !summary.box_cohort_marked()
-            || baseline.box_marked_phase() == BoxMarkedNodePhase::Bounded
-        {
-            return node_plane_verdict(summary, l4, table, baseline, pins);
+        if summary.box_cohort_marked() {
+            return host_ip_verdict(summary, l4, table, baseline, pins, src);
         }
-        return row_verdict(summary, l4, table, baseline, pins, src).map(|admit| match admit {
-            GateAdmit::Row => GateAdmit::BoxMarkedInterim,
-            other => other,
-        });
+        return node_plane_verdict(summary, l4, table, baseline, pins);
     }
     row_verdict(summary, l4, table, baseline, pins, src)
+}
+
+/// The decision for a box-marked frame from the node address under the
+/// in-force baseline (NET-085, design §4.3 rule 2): admitted when one
+/// resident `host_ip` box's rules admit it, and dropped under
+/// [`HOST_IP_BOXES_RULE`] otherwise, and always when no `host_ip` box is
+/// resident.
+///
+/// Each resident box decides the frame the way a row decides its own: the
+/// infrastructure deny set first, with the box's own `allow_subnets` as the
+/// RFC 1918 allowance and the node's own block reach a `host_ip` box keeps,
+/// then the box's compiled rules, then the DNS admission table's pins for
+/// the names the resident boxes declared. The Box Egress Proxy's listener is
+/// decided by the node row's lane declaration, as it was for every frame the
+/// node row carried, because the proxy's attachment for the node address is
+/// the node row's.
+fn host_ip_verdict(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+    src: [u8; 4],
+) -> Result<GateAdmit, GateDrop> {
+    let dst = summary.destination();
+    let dst_port = summary.destination_port();
+    let unbounded = |resident: usize| GateDrop::HostIpUnbounded {
+        src,
+        dst: dst.unwrap_or_default(),
+        dst_port,
+        resident,
+    };
+    let resident = table.host_ip_boxes();
+    if resident.is_empty() {
+        return Err(unbounded(0));
+    }
+    if let Some(dst) = dst
+        && dst == table.subnet().box_egress_proxy_address().octets()
+    {
+        let declared = table
+            .by_source(src)
+            .is_some_and(|record| record.declares_credentialed_upstream());
+        let listener = egress::ProxyListener::at(dst);
+        if egress::proxy_lane_admits(declared, listener, summary) {
+            return Ok(GateAdmit::ProxyLane);
+        }
+        return Err(GateDrop::ProxyLane { src, dst, dst_port });
+    }
+    let transport_port = matches!(
+        summary.protocol(),
+        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
+    )
+    .then_some(dst_port);
+    let mut infrastructure = false;
+    for rules in &resident {
+        if let Some(dst) = dst
+            && infrastructure_destination(
+                dst,
+                transport_port,
+                table.subnet(),
+                rules.egress().allow_subnets(),
+                false,
+                baseline.host_exposure_ports(),
+            )
+        {
+            infrastructure = true;
+            continue;
+        }
+        match egress::verdict(summary, rules.egress()) {
+            FrameVerdict::Admit => return Ok(GateAdmit::HostIpBox),
+            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
+                if rules.resolves_names()
+                    && pins.admits_host_ip_frame(
+                        table,
+                        dst.unwrap_or_default(),
+                        l4,
+                        Instant::now(),
+                    ) =>
+            {
+                return Ok(GateAdmit::HostIpBox);
+            }
+            FrameVerdict::Drop(_) => {}
+        }
+    }
+    // Every resident box refused the frame. A destination every box's
+    // check put in the infrastructure set keeps that drop's own rule, so
+    // the line a host reads names the set rather than the boxes' rules.
+    if infrastructure
+        && let Some(dst) = dst
+        && resident.iter().all(|rules| {
+            infrastructure_destination(
+                dst,
+                transport_port,
+                table.subnet(),
+                rules.egress().allow_subnets(),
+                false,
+                baseline.host_exposure_ports(),
+            )
+        })
+    {
+        return Err(GateDrop::Infrastructure { src, dst, dst_port });
+    }
+    Err(unbounded(resident.len()))
 }
 
 /// The rest of [`gate_verdict`]'s order for a frame the node-plane arm did
@@ -5757,6 +5862,20 @@ enum GateDrop {
         /// The port the frame named there, `0` when it carried none.
         dst_port: u16,
     },
+    /// The frame wore the node's own address and the box mark, and no
+    /// resident `host_ip` box's rules admit it: the box mark is no proof of
+    /// a box, so nothing else may (NET-085, [`HOST_IP_BOXES_RULE`]).
+    HostIpUnbounded {
+        /// The node's own address, the source the frame wore.
+        src: [u8; 4],
+        /// The destination no resident box admits, `0.0.0.0` for a frame
+        /// with none.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+        /// How many `host_ip` boxes were resident: `0` when none was.
+        resident: usize,
+    },
 }
 
 impl GateDrop {
@@ -5771,6 +5890,7 @@ impl GateDrop {
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
             Self::ProxyLane { .. } => PROXY_LANE_RULE,
             Self::NodePlaneUnpinned { .. } => NODE_PLANE_UNPINNED_RULE,
+            Self::HostIpUnbounded { .. } => HOST_IP_BOXES_RULE,
         }
     }
 }
@@ -6040,6 +6160,57 @@ impl DropLimiter {
                     rule_matched = UNREGISTERED_LIVE_LEASE_RULE,
                     "dropped frames from more distinct live leases than the gate keeps a \
                      window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one box-marked frame from the node address
+    /// that no resident `host_ip` box admits ([`HOST_IP_BOXES_RULE`]): the
+    /// same rate limit every drop's line answers to, naming the address,
+    /// the destination, the port and how many `host_ip` boxes were
+    /// resident, so a bundle's reader can tell a frame no box admits from
+    /// one sent while no `host_ip` box ran. Returns whether a line was
+    /// written.
+    fn warn_host_ip_unbounded(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        resident: usize,
+    ) -> bool {
+        match self.should_warn_at(Some(src), HOST_IP_BOXES_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named if resident == 0 => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    resident_host_ip_boxes = resident,
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped a box-marked frame from the node address: no host_ip box is \
+                     resident, so no box's rules admit it",
+                );
+                true
+            }
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    resident_host_ip_boxes = resident,
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped a box-marked frame from the node address toward a destination \
+                     no resident host_ip box's rules admit",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped box-marked frames from more distinct source addresses than the \
+                     gate keeps a window per source for; one line per rule covers the rest",
                 );
                 true
             }
@@ -6982,8 +7153,8 @@ mod tests {
         send_frame, unexpose_request, wait_for_log,
     };
     use super::{
-        AcceptFailure, BOX_MARKED_NODE_FRAME_RULE, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb,
-        DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb,
+        DropLimiter, EgressGate, FrameSummary, GateAdmit, GateDrop, HOST_IP_BOXES_RULE, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
         MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, PublishedForwards,
         Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
         UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE, UNREGISTERED_PUBLISH_RULE,
@@ -14712,9 +14883,9 @@ mod tests {
             /// The row's declared credentialed lane admitted the frame at
             /// the proxy's address (NET-134): the admission no rules made.
             AdmittedByProxyLane,
-            /// The node row's interim admitted a box-marked frame from the
-            /// node address ([`BOX_MARKED_NODE_FRAME_RULE`]).
-            AdmittedByBoxMarkInterim,
+            /// A resident `host_ip` box's rules admitted a box-marked frame
+            /// from the node address.
+            AdmittedByHostIpBox,
             /// The gate dropped the frame, by the rule whose name the drop
             /// warning carries.
             Dropped(&'static str),
@@ -14762,7 +14933,7 @@ mod tests {
                     Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                     Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
                     Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
-                    Ok(GateAdmit::BoxMarkedInterim) => Verdict::AdmittedByBoxMarkInterim,
+                    Ok(GateAdmit::HostIpBox) => Verdict::AdmittedByHostIpBox,
                     Err(drop) => Verdict::Dropped(drop.rule()),
                 };
             Attempt {
@@ -14983,47 +15154,72 @@ mod tests {
                 // keeps the match exhaustive for the ones that will.
                 Verdict::AdmittedByNodeRow
                 | Verdict::AdmittedByProxyLane
-                | Verdict::AdmittedByBoxMarkInterim
+                | Verdict::AdmittedByHostIpBox
                 | Verdict::Dropped(_) => {}
             }
         }
 
         // The box-marked spoof (NET-085): root in the VM writes the box mark
-        // on a frame from the node address. The shipped marked-frame phase
-        // is the announced interim, so the node row admits it even to the
-        // outside, under the interim's own name: the one gap this bound has
-        // today, pinned so its flip is a visible change. The bound arm
-        // decides the same frame by the baseline set: the outside is the
-        // unpinned drop, and the pinned endpoint stays reachable.
-        let marked = |baseline: &NodePlaneBaseline, dst: [u8; 4], port: u16| {
+        // on a frame from the node address. The mark proves no box, so the
+        // union of the resident `host_ip` boxes' rules decides the frame,
+        // never the node row and never the baseline set. With no `host_ip`
+        // box resident, every marked frame drops, the pinned baseline
+        // endpoint included.
+        let marked = |dst: [u8; 4], port: u16| {
             let frame =
                 boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, dst, port)));
             assert!(frame.box_cohort_marked());
-            gate_verdict(&frame, None, &table, baseline, &pins, &ReplyTables::new())
+            gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new())
         };
-        assert_eq!(
-            baseline.box_marked_phase(),
-            crate::net::baseline::BoxMarkedNodePhase::NodeRowInterim
-        );
-        assert_eq!(
-            marked(&baseline, outside, 443),
-            Ok(GateAdmit::BoxMarkedInterim),
-            "the shipped interim admits a marked spoof under {BOX_MARKED_NODE_FRAME_RULE}"
-        );
-        let bounded = baseline.clone().box_marked_bounded();
-        assert_eq!(
-            marked(&bounded, outside, 443),
-            Err(GateDrop::NodePlaneUnpinned {
-                src: node,
-                dst: outside,
-                dst_port: 443,
+        let unbounded = |dst: [u8; 4], resident: usize| GateDrop::HostIpUnbounded {
+            src: node,
+            dst,
+            dst_port: 443,
+            resident,
+        };
+        for dst in [outside, baseline_endpoint] {
+            assert_eq!(
+                marked(dst, 443),
+                Err(unbounded(dst, 0)),
+                "a marked spoof to {} with no host_ip box resident drops under \
+                 {HOST_IP_BOXES_RULE}",
+                Ipv4Addr::from(dst),
+            );
+        }
+        // One `host_ip` box resident, admitting TCP to TEST-NET-2 alone: a
+        // marked frame there passes under the box's rules, and a marked
+        // spoof anywhere else drops, the outside and the baseline endpoint
+        // both.
+        let session = boxes::SessionId::mint();
+        let host_ip_reach = [198, 51, 100, 9];
+        assert!(registry.admit_host_ip_box(
+            session,
+            Some(&EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(vec!["198.51.100.0/24".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
             }),
-            "the bound arm refuses a marked spoof to an address no entry pinned"
-        );
+        ));
         assert_eq!(
-            marked(&bounded, baseline_endpoint, 443),
-            Ok(GateAdmit::Baseline),
-            "the bound arm keeps the pinned endpoint"
+            marked(host_ip_reach, 443),
+            Ok(GateAdmit::HostIpBox),
+            "a marked frame a resident host_ip box admits passes"
+        );
+        for dst in [outside, baseline_endpoint] {
+            assert_eq!(
+                marked(dst, 443),
+                Err(unbounded(dst, 1)),
+                "a marked spoof to {} that no resident host_ip box admits drops",
+                Ipv4Addr::from(dst),
+            );
+        }
+        // The box leaves: its reach goes with it.
+        assert!(registry.retire_host_ip_box(session));
+        assert_eq!(
+            marked(host_ip_reach, 443),
+            Err(unbounded(host_ip_reach, 0)),
+            "a retired host_ip box's rules admit nothing"
         );
 
         // The universal the table makes cheap, beside the membership loop
@@ -15377,15 +15573,15 @@ mod tests {
     }
 
     /// The node address carries two senders: the guest daemon and every
-    /// host-address box, the default network mode. The guest's classifier
-    /// writes the sender's cgroup into the frame as the box mark. Under the
-    /// announced interim this build ships, a marked frame at the node address
-    /// is decided by the node row, beside the box's own classifier leaf in
-    /// the guest, so a default session keeps its outbound network (NET-107).
-    /// Root in the guest can write the mark too, so the admission carries the
-    /// interim's own name and the escape test pins it as the open gap.
+    /// `host_ip` box, the default network mode. The guest's classifier
+    /// writes the sender's cgroup into the frame as the box mark. A marked
+    /// frame at the node address is decided by the resident `host_ip`
+    /// boxes' rules, which the host-side client registered, so a default
+    /// session keeps its outbound network (NET-107). Root in the guest can
+    /// write the mark too, so with no `host_ip` box resident the same frame
+    /// drops (NET-085).
     #[test]
-    fn box_marked_node_frame_decided_by_node_row_interim() {
+    fn box_marked_node_frame_decided_by_resident_host_ip_boxes() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(7654);
         let table = registry.table();
@@ -15397,18 +15593,28 @@ mod tests {
         let frame = box_cohort_frame(ipv4_frame(node, 6, outside, 443));
         let summary = boxes::core::egress::summarize(&frame);
         assert!(summary.box_cohort_marked());
+        let decide = |summary: &FrameSummary| {
+            gate_verdict(summary, None, &table, &baseline, &pins, &ReplyTables::new())
+        };
         assert_eq!(
-            gate_verdict(
-                &summary,
-                None,
-                &table,
-                &baseline,
-                &pins,
-                &ReplyTables::new()
-            ),
-            Ok(GateAdmit::BoxMarkedInterim),
-            "a marked frame at the node address is the node row's interim \
-             ({BOX_MARKED_NODE_FRAME_RULE}), not the baseline's"
+            decide(&summary),
+            Err(GateDrop::HostIpUnbounded {
+                src: node,
+                dst: outside,
+                dst_port: 443,
+                resident: 0,
+            }),
+            "with no host_ip box resident, a marked frame drops under {HOST_IP_BOXES_RULE}"
+        );
+        // A `host_ip` box with no `egress` section: the default leaves a box
+        // that shares the node's address allow-all, so its marked frame to
+        // the outside passes under its rules.
+        let session = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(session, None));
+        assert_eq!(
+            decide(&summary),
+            Ok(GateAdmit::HostIpBox),
+            "a marked frame at the node address is the resident host_ip boxes' to decide"
         );
         // The box's verdict still keeps the floors every row keeps: the
         // link-local metadata service and the switch's own ports stay
@@ -15624,22 +15830,26 @@ mod tests {
             gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline).await;
 
         // VM start says what the node plane may reach, one term per category,
-        // that the set is in force, and that a box-marked frame from the node
-        // address is still the node row's announced interim: the line a
-        // diagnostic bundle's daemon log tail carries.
+        // and that the set is in force: the line a diagnostic bundle's daemon
+        // log tail carries. No interim rides beside it: a box-marked frame
+        // from the node address is the resident host_ip boxes' to decide.
         wait_for_log(&h.log, "node-plane baseline set").await;
         let logged = h.log.contents();
         for term in [
             "registry=github.com",
             "cache=cache.minimal.dev",
-            "node_baseline_phase=\"in force (a process with root in this VM can still bypass it)\"",
-            "box_marked_node_frames=\"node row (allow-all interim)\"",
-            "box_marked_node_rule=\"node-row-box-mark-interim\"",
+            "node_baseline_phase=\"in force\"",
             "node_addr=100.64.255.253",
         ] {
             assert!(
                 logged.contains(term),
                 "the start-up line carries {term}, got: {logged}"
+            );
+        }
+        for gone in ["box_marked_node_frames", "can still bypass"] {
+            assert!(
+                !logged.contains(gone),
+                "the start-up line names no interim ({gone}), got: {logged}"
             );
         }
 

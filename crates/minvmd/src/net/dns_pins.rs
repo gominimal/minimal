@@ -1117,6 +1117,13 @@ struct Inner {
     /// `None` again for an announced baseline, whose node row decides the
     /// node plane instead.
     node_plane: Mutex<Option<Arc<NodePlaneNames>>>,
+    /// The resident `host_ip` boxes' entry (NET-085): built from the
+    /// registry's record of their declared names
+    /// ([`BoxTable::host_ip_cohort`]), fed by the node address's own
+    /// lookups, and read only for a box-marked frame. Kept apart from the
+    /// node row's entry, so a pin a box's name took never admits the node
+    /// plane's own frames, and a baseline pin never admits a box's.
+    host_ip: Mutex<Option<Arc<BoxPins>>>,
     /// How many frames the gate admitted because a live pin named the
     /// destination (the observability counter: what the host-side decision
     /// passed).
@@ -1139,6 +1146,7 @@ impl DnsPins {
                 boxes: Mutex::new(HashMap::new()),
                 refused: Mutex::new(HashMap::new()),
                 node_plane: Mutex::new(None),
+                host_ip: Mutex::new(None),
                 admitted_by_pin: AtomicU64::new(0),
                 refused_for_want_of_pin: AtomicU64::new(0),
             }),
@@ -1311,6 +1319,11 @@ impl DnsPins {
         if pkt.src.port() != DNS_PORT {
             return;
         }
+        if *pkt.dst.ip() == table.subnet().daemon_ip()
+            && let Some(entry) = self.host_ip_entry(table)
+        {
+            entry.observe(pkt, datagram, limiter, now);
+        }
         let Some(record) = table.by_source(pkt.dst.ip().octets()) else {
             return;
         };
@@ -1344,6 +1357,11 @@ impl DnsPins {
         {
             return;
         }
+        if *pkt.src.ip() == table.subnet().daemon_ip()
+            && let Some(entry) = self.host_ip_entry(table)
+        {
+            entry.record_query(pkt, datagram, now);
+        }
         let Some(record) = table.by_source(pkt.src.ip().octets()) else {
             return;
         };
@@ -1351,6 +1369,62 @@ impl DnsPins {
             return;
         };
         entry.record_query(pkt, datagram, now);
+    }
+
+    /// The resident `host_ip` boxes' entry, built from the registry's
+    /// record of their declared names on first sight and rebuilt when that
+    /// record changes: a box that leaves takes its names' pins with it.
+    /// `None` when no resident box declared a DNS host, or when the
+    /// record's resolver is not the plan's own.
+    fn host_ip_entry(&self, table: &BoxTable) -> Option<Arc<BoxPins>> {
+        let mut held = self
+            .inner
+            .host_ip
+            .lock()
+            .expect("the host_ip entry's lock is held only across this lookup");
+        let Some(record) = table.host_ip_cohort() else {
+            *held = None;
+            return None;
+        };
+        let plan_resolver = self.inner.subnet.dns_server().octets();
+        if record.egress().resolver() != plan_resolver {
+            *held = None;
+            drop(held);
+            self.refuse_resolver(&record, plan_resolver);
+            return None;
+        }
+        match held.as_ref() {
+            Some(entry) if Arc::ptr_eq(&entry.record, &record) => Some(Arc::clone(entry)),
+            _ => {
+                let entry = Arc::new(BoxPins::built(&record, self.inner.subnet, None));
+                *held = Some(Arc::clone(&entry));
+                Some(entry)
+            }
+        }
+    }
+
+    /// The pin arm for a box-marked frame from the node address (NET-085):
+    /// whether a live pin a resident `host_ip` box's declared name took
+    /// names `dst`, or the flow such a pin established still holds it.
+    /// Counted with every other pin decision.
+    pub(crate) fn admits_host_ip_frame(
+        &self,
+        table: &BoxTable,
+        dst: [u8; 4],
+        pkt: Option<&L4Packet>,
+        now: Instant,
+    ) -> bool {
+        let admitted = self
+            .host_ip_entry(table)
+            .is_some_and(|entry| entry.admits(dst, pkt, now));
+        if admitted {
+            self.inner.admitted_by_pin.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .refused_for_want_of_pin
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
     }
 
     /// The verdict's pin arm: whether the gate may lift the row's
