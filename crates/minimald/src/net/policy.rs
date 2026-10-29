@@ -336,9 +336,11 @@ impl PortForwarder {
 ///
 /// A host port another process already holds is a failure like any other
 /// refused bind (NET-121): the rollback below runs and the caller withdraws
-/// the name. Only the returned error differs. It names the port and says
-/// the port is in use on the host, in place of the forwarder's raw
-/// refusal, and its kind is [`io::ErrorKind::AddrInUse`].
+/// the name. Only the returned error differs. It carries a
+/// [`minimald_rpc::PortInUseRefusal`] in place of the forwarder's raw
+/// refusal, and its kind is [`io::ErrorKind::AddrInUse`]. The refusal names
+/// the port and its holder (NET-144). Here the holder is always the host.
+/// [`apply_ingress_naming_holders`] reads it from the hostname registry.
 ///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
@@ -357,6 +359,108 @@ pub async fn apply_ingress(
     gate: Option<&Arc<super::switch::SessionGate>>,
     yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
+    apply_ingress_naming_holders(
+        control,
+        published,
+        ptask_ip,
+        ingress,
+        gate,
+        yielded,
+        &|_| minimald_rpc::PortHolder::Host,
+    )
+    .await
+}
+
+/// [`apply_ingress`], with `holder_of` to name what holds a taken port
+/// (NET-144). The attach path passes [`port_holder`] over the hostname
+/// registry, so the refusal names the box whose publish stands at that
+/// address and port, or the host when none does.
+///
+/// # Errors
+///
+/// As [`apply_ingress`].
+pub async fn apply_ingress_naming_holders(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    ingress: &IngressPolicy,
+    gate: Option<&Arc<super::switch::BoxGate>>,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
+    apply_declared(
+        control,
+        control.host_unbinds_declared_forwards(),
+        published,
+        ptask_ip,
+        ingress,
+        gate,
+        yielded,
+        holder_of,
+    )
+    .await
+}
+
+/// Binds the declared forwards of a box on a VM-backed host when finalize
+/// publishes it, before the record goes `Active` (NET-121, NET-144, design
+/// §7.1: the bind succeeds before the name is published). On a VM-backed
+/// host the forwarder binds on the host OS, so the daemon cannot probe the
+/// ports itself ([`host_ports_in_use`]). It binds them, toward the
+/// `switch_address` the VM host handed the box, and a held port fails with
+/// the same typed refusal the native probe gives. A failure rolls back as
+/// [`apply_ingress`] does.
+///
+/// The bound forwards stay on the host. The box's first attach posts the
+/// same exposes again, and the host's switch answers each one that the
+/// listener is already bound, which the attach takes as bound. The host
+/// unbinds the forwards when it withdraws the box's row, as it does for
+/// every declared forward ([`release_declared_ingress`]).
+///
+/// # Errors
+///
+/// As [`apply_ingress`].
+pub async fn bind_declared_at_publish(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    switch_address: Ipv4Addr,
+    ingress: &IngressPolicy,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
+    apply_declared(
+        control,
+        control.host_unbinds_declared_forwards(),
+        published,
+        switch_address,
+        ingress,
+        None,
+        yielded,
+        holder_of,
+    )
+    .await
+}
+
+/// [`apply_ingress_naming_holders`], with `host_holds_listeners` read off the
+/// control channel ([`ControlChannel::host_unbinds_declared_forwards`]) by
+/// the caller, so a test can drive the VM-backed answers over a unix socket.
+/// Behind a VM host's gate a listener the switch already holds is the
+/// box's own forward, bound at publish ([`bind_declared_at_publish`]), or
+/// a publish the host keeps for the box until the holder's row is withdrawn
+/// ([`HandedBind::HeldByHost`]). Either way the forward is tracked as bound.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the public wrappers above fix the flag; a struct would be single-use ceremony"
+)]
+async fn apply_declared(
+    control: &ControlChannel,
+    host_holds_listeners: bool,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    ingress: &IngressPolicy,
+    gate: Option<&Arc<super::switch::BoxGate>>,
+    yielded: &[super::dns::SharedPortCollision],
+    holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
+) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
         if let Some(collision) = yielded
@@ -374,7 +478,18 @@ pub async fn apply_ingress(
             continue;
         }
         let req = expose_request(mapping, published, ptask_ip);
-        match post_json(control, "/services/forwarder/expose", &req).await {
+        let answer = match post_json(control, "/services/forwarder/expose", &req).await {
+            Err(e) if host_holds_listeners && is_already_running(&e) => {
+                tracing::debug!(
+                    port = mapping.external_port,
+                    local = %req.local,
+                    "the host already holds this declared forward for the box"
+                );
+                Ok(())
+            }
+            answer => answer,
+        };
+        match answer {
             Ok(()) => bound.push(PortForwarder {
                 mapping: ExposedMapping {
                     local: req.local,
@@ -398,7 +513,7 @@ pub async fn apply_ingress(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                release_declared_ingress(control, &bound).await;
+                release_declared(control, host_holds_listeners, &bound).await;
                 // A taken host port fails the apply like any other refusal:
                 // NET-121 (docs/specs/18-spec-box-networking, design §7.1)
                 // makes a failed bind a surfaced error, never a silent
@@ -406,7 +521,11 @@ pub async fn apply_ingress(
                 // its declared ports is missing. Only the error's words
                 // differ: they name the port and the way out.
                 if is_address_in_use(&e) {
-                    return Err(address_in_use_error(mapping.external_port));
+                    return Err(address_in_use_error(minimald_rpc::PortInUseRefusal {
+                        port: mapping.external_port,
+                        box_port: mapping.internal_port,
+                        holder: holder_of(mapping.external_port),
+                    }));
                 }
                 return Err(e);
             }
@@ -466,21 +585,51 @@ pub fn host_ports_in_use(
         .collect()
 }
 
-/// The error [`apply_ingress`] returns for a declared port another process
-/// already holds on the host, and the error a finalize returns when
-/// [`host_ports_in_use`] finds one. A person reads it at the failed
-/// activation or command, so
-/// it names the port and the next step; the forwarder's own refusal is in
-/// the warn line [`apply_ingress`] logs, not here.
-pub fn address_in_use_error(port: u16) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AddrInUse,
-        format!(
-            "host port {port} is already in use on the host, so the \
-             session cannot forward it. Free the port, or activate again \
-             with --ingress <other>:<internal>."
-        ),
-    )
+/// The error [`apply_ingress`] returns for a declared port that something
+/// else already holds on the host, and the error a finalize returns when it
+/// finds one before the box is active. A person reads it at the failed
+/// activation or command, so it names the port, its holder and the next step
+/// (NET-144). The forwarder's own refusal is in the warn line
+/// [`apply_ingress`] logs, not here. The kind is
+/// [`io::ErrorKind::AddrInUse`], and the payload is the typed refusal, which
+/// [`port_in_use_refusal`] reads back.
+pub fn address_in_use_error(refusal: minimald_rpc::PortInUseRefusal) -> io::Error {
+    io::Error::new(io::ErrorKind::AddrInUse, refusal)
+}
+
+/// The typed refusal inside `error`, when it is one [`address_in_use_error`]
+/// built or when its text carries one, as an error wrapped on its way up
+/// does.
+#[must_use]
+pub fn port_in_use_refusal(error: &io::Error) -> Option<minimald_rpc::PortInUseRefusal> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<minimald_rpc::PortInUseRefusal>())
+        .cloned()
+        .or_else(|| minimald_rpc::PortInUseRefusal::find_in(&error.to_string()))
+}
+
+/// What holds `port` at `address` (NET-144): the box whose publish stands
+/// there in the hostname registry, or the host when no box does. A holder
+/// named `own_name` is the box that asks, so it does not count: then the
+/// host holds the port.
+#[must_use]
+pub fn port_holder(
+    registry: &std::sync::RwLock<super::dns::HostnameRegistry>,
+    own_name: &str,
+    address: Ipv4Addr,
+    port: u16,
+) -> minimald_rpc::PortHolder {
+    registry
+        .read()
+        .expect("hostname registry lock poisoned")
+        .own_port_holder(address, port)
+        .map(|(_, name)| name)
+        .filter(|name| name != own_name)
+        .map_or(
+            minimald_rpc::PortHolder::Host,
+            minimald_rpc::PortHolder::Box,
+        )
 }
 
 /// The body the forwarder answers an expose with when a forward is already
@@ -626,7 +775,13 @@ pub async fn unexpose_forwarder(
 ///   their connections when it withdraws the box's row. Each forward still
 ///   gets one info line, so the log keeps NET-121's bind/unbind pair.
 pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
-    if !control.host_unbinds_declared_forwards() {
+    release_declared(control, control.host_unbinds_declared_forwards(), bound).await;
+}
+
+/// [`release_declared_ingress`], with `host_unbinds` read off the control
+/// channel by the caller.
+async fn release_declared(control: &ControlChannel, host_unbinds: bool, bound: &[PortForwarder]) {
+    if !host_unbinds {
         remove_ingress(control, bound).await;
         return;
     }
@@ -2725,8 +2880,8 @@ mod tests {
         use tokio::net::UnixListener;
 
         use super::super::{
-            ControlChannel, IngressPolicy, PortMapping, apply_ingress, host_ports_in_use,
-            is_address_in_use,
+            ControlChannel, IngressPolicy, PortMapping, apply_declared, apply_ingress,
+            host_ports_in_use, is_address_in_use, port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -2819,10 +2974,20 @@ mod tests {
 
             assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
             assert_eq!(
+                port_in_use_refusal(&err),
+                Some(minimald_rpc::PortInUseRefusal {
+                    port: 18999,
+                    box_port: 80,
+                    holder: minimald_rpc::PortHolder::Host,
+                }),
+                "the error carries the typed refusal for the finalize to read"
+            );
+            assert_eq!(
                 err.to_string(),
-                "host port 18999 is already in use on the host, so the session \
-                 cannot forward it. Free the port, or activate again with \
-                 --ingress <other>:<internal>.",
+                "Port 18999 is already in use on this machine by another \
+                 program on this machine.\nChoose another host port in --ingress (for \
+                 example --ingress 19000:80) or in [network] ingress in \
+                 minimal.toml.",
                 "the error names the taken port and the next step, and no \
                  forwarder internals"
             );
@@ -2834,6 +2999,90 @@ mod tests {
                 asked[2].contains("127.0.64.9:18080"),
                 "the rollback releases the forward that bound: {asked:?}"
             );
+        }
+
+        /// NET-144 on a VM-backed host, where the daemon cannot probe the
+        /// host's ports: finalize binds the declared forwards at publish, and
+        /// a port a program on the host holds fails that bind with the same
+        /// refusal text as the native probe. On a VM-backed host the host
+        /// unbinds the declared forwards, so the rollback asks the switch
+        /// for nothing: the forwarder sees exactly the one expose.
+        #[tokio::test]
+        async fn activation_refused_when_declared_port_is_held_on_a_vm_host_at_publish() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let forwarder = forwarder_answering_in_turn(sock.clone(), vec![IN_USE]);
+            let err = match apply_declared(
+                &ControlChannel::Unix(sock),
+                true,
+                PUBLISHED,
+                LEASE,
+                &ingress(&[18999]),
+                None,
+                &[],
+                &|_| minimald_rpc::PortHolder::Host,
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a held host port must fail the bind at publish"),
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            assert_eq!(
+                err.to_string(),
+                "Port 18999 is already in use on this machine by another \
+                 program on this machine.\nChoose another host port in --ingress (for \
+                 example --ingress 19000:80) or in [network] ingress in \
+                 minimal.toml.",
+                "the VM-backed refusal is the native refusal's text"
+            );
+            let asked = forwarder.await.expect("the fake forwarder ran");
+            assert_eq!(asked.len(), 1, "one expose and no rollback: {asked:?}");
+            assert!(
+                asked[0].contains("\"local\":\"127.0.64.9:18999\"")
+                    && asked[0].contains("\"remote\":\"100.64.128.10:80\""),
+                "the bind names the published address and the handed switch address: {asked:?}"
+            );
+        }
+
+        /// After the bind at publish, the box's first attach posts the same
+        /// expose, and the VM host's switch answers that the listener is
+        /// already bound. Behind a VM host's gate that answer is the box's
+        /// own forward, so the attach tracks it as bound. On a native host
+        /// the same answer still fails the apply.
+        #[tokio::test]
+        async fn activation_refused_when_declared_port_is_held_not_by_the_forward_bound_at_publish()
+        {
+            for host_holds_listeners in [true, false] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let sock = dir.path().join("gvproxy.sock");
+                let forwarder = forwarder_answering_in_turn(
+                    sock.clone(),
+                    vec![(500, "proxy already running\n"), (200, "")],
+                );
+                let applied = apply_declared(
+                    &ControlChannel::Unix(sock),
+                    host_holds_listeners,
+                    PUBLISHED,
+                    LEASE,
+                    &ingress(&[18080]),
+                    None,
+                    &[],
+                    &|_| minimald_rpc::PortHolder::Host,
+                )
+                .await;
+                if host_holds_listeners {
+                    let bound = applied.expect("the forward bound at publish is the box's own");
+                    assert_eq!(bound.len(), 1);
+                    assert_eq!(bound[0].local(), "127.0.64.9:18080");
+                } else {
+                    let Err(err) = applied else {
+                        panic!("on a native host a bound listener fails");
+                    };
+                    assert!(port_in_use_refusal(&err).is_none(), "got: {err}");
+                }
+                forwarder.abort();
+            }
         }
 
         /// The activation probe names exactly the TCP ports another process

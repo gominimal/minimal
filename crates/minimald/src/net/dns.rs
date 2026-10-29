@@ -1193,6 +1193,42 @@ impl HostnameRegistry {
             .unwrap_or_default()
     }
 
+    /// The box that holds `port` at `address`, with its box name (NET-144):
+    /// the holder the shared-port table records there, declared or dynamic.
+    /// The name is the box's registered session name, or its stable id when
+    /// nothing answers for it. `None` when no box holds the port there.
+    #[must_use]
+    pub fn own_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<(SessionId, String)> {
+        let holder = *self.own_holders.get(&(address, port))?;
+        let name = self
+            .by_session
+            .iter()
+            .find(|(_, registration)| registration.id == holder)
+            .map_or_else(|| holder.to_string(), |(name, _)| name.clone());
+        Some((holder, name))
+    }
+
+    /// The first declared port another box already holds where this box
+    /// publishes at the shared `127.0.0.1` fallback, with the holder's box
+    /// name (NET-144). Nobody chose to share the fallback, so a port another
+    /// box holds there is a refusal at activation, never a yielded port. A
+    /// box at any other address gets `None`: a host-address box that shares
+    /// its node's address keeps the shared-address rule (NET-129), and
+    /// yields the port. The registry does not know the range verdict, so
+    /// the finalize asks [`LoopbackLeaseBook::range_verdict`] whether the
+    /// box stays at the fallback before it refuses.
+    #[must_use]
+    pub fn fallback_port_refusal(&self, session_id: SessionId) -> Option<(u16, String)> {
+        let own = self.own_published.get(&session_id)?;
+        if own.address != Ipv4Addr::LOCALHOST {
+            return None;
+        }
+        own.ports.iter().find_map(|&port| {
+            let (holder, name) = self.own_port_holder(own.address, port)?;
+            (holder != session_id).then_some((port, name))
+        })
+    }
+
     /// Elects the next holder of each of `ports` at `address` that `leaving`
     /// held and no longer publishes there (NET-129): the lowest
     /// [`SessionId`] among the boxes still publishing the port at the
@@ -2067,6 +2103,17 @@ impl LoopbackLeaseBook {
         RangeVerdict::from_key(self.verdict.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    /// The verdict over the reserved range as it stands now, for a caller
+    /// outside the book (NET-144): a finalize refuses a port another box
+    /// holds at the `127.0.0.1` fallback only once a landed verdict keeps
+    /// the box there. Under [`RangeVerdict::Pending`] a box at the interim
+    /// moves to its hand when the verdict lands present, so its collision
+    /// there is not lasting.
+    #[must_use]
+    pub fn range_verdict(&self) -> RangeVerdict {
+        self.verdict()
+    }
+
     /// Applies the bind probe's verdict over the reserved local range, when
     /// the book opened before the probe that produced it could answer.
     ///
@@ -2088,6 +2135,24 @@ impl LoopbackLeaseBook {
         // every box standing on the interim), so the registration that
         // subscribes afterwards must still read the verdict that landed.
         self.verdict_landing.send_replace(verdict);
+    }
+
+    /// Waits, without a bound, for the verdict to land, and returns it. A
+    /// verdict already landed returns at once. When the book is dropped
+    /// before a landing, this returns [`RangeVerdict::Pending`]. The watcher
+    /// of a box finalized at the `127.0.0.1` fallback under a pending verdict
+    /// waits here (NET-144).
+    pub async fn await_landing(&self) -> RangeVerdict {
+        let mut landing = self.verdict_landing.subscribe();
+        loop {
+            let verdict = *landing.borrow_and_update();
+            if verdict != RangeVerdict::Pending {
+                return verdict;
+            }
+            if landing.changed().await.is_err() {
+                return RangeVerdict::Pending;
+            }
+        }
     }
 
     /// The daemon's one verdict deadline, as an instant: the moment the book
@@ -3173,6 +3238,43 @@ mod tests {
                 .is_empty(),
             "the same port on a different address is not a collision"
         );
+    }
+
+    /// NET-144: at the shared `127.0.0.1` fallback a port another box holds
+    /// is a refusal that names the holder's box name. At a node's shared
+    /// address the same collision stays a yielded port (NET-129).
+    #[test]
+    fn activation_refused_when_declared_port_is_held_at_the_fallback_only() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let ports = BTreeSet::from([8080u16]);
+        for (address, first, second) in [
+            (Ipv4Addr::LOCALHOST, id("1"), id("2")),
+            (node, id("3"), id("4")),
+        ] {
+            reg.publish_own_address(first, &format!("first-{first}"), address, ports.clone());
+            reg.register_own_ip(first, &format!("first-{first}"), ports.clone());
+            reg.publish_own_address(second, "second", address, ports.clone());
+            assert_eq!(
+                reg.fallback_port_refusal(first),
+                None,
+                "the holder is never refused"
+            );
+            if address == Ipv4Addr::LOCALHOST {
+                assert_eq!(
+                    reg.fallback_port_refusal(second),
+                    Some((8080, format!("first-{first}"))),
+                    "the fallback refuses and names the holder by its box name"
+                );
+            } else {
+                assert_eq!(
+                    reg.fallback_port_refusal(second),
+                    None,
+                    "a node's shared address keeps the yield"
+                );
+            }
+            reg.unpublish_own_address(second);
+        }
     }
 
     /// NET-129's shared address is first-come: the later box records the
