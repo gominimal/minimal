@@ -246,6 +246,131 @@ impl BoxManagerHandle {
     }
 }
 
+impl BoxManagerHandle {
+    /// Every retained box record on this host, in any state, in box id
+    /// order (BOX-158). With `project_root`, only the records whose
+    /// project root, as the create recorded it, is that one. A record that
+    /// predates the field has no project root and is never in a scoped
+    /// listing.
+    pub async fn list_boxes(
+        &self,
+        project_root: Option<&paths::HostAbsPath>,
+    ) -> Result<Vec<minimald_rpc::BoxListingEntry>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let scope = project_root.map_or_else(|| "host".to_string(), |root| root.to_string());
+        let span = tracing::info_span!(
+            "box.list",
+            scope = %scope,
+            count = tracing::field::Empty
+        );
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            let mut boxes: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
+                })
+                .map(box_listing_entry)
+                .collect();
+            boxes.sort_by_key(|entry| entry.box_id);
+            tracing::Span::current().record("count", boxes.len());
+            tracing::info!(scope = %scope, count = boxes.len(), "listed boxes");
+            Ok(boxes)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// One box record with its state, the identity the box runs under and
+    /// its live execs (BOX-159). `id` is the id a listing reports: it
+    /// resolves as a record's `box_id` first and as its `id` second, so
+    /// every id [`list_boxes`](Self::list_boxes) prints reads back here.
+    /// `None` for an id no retained record names. It starts no actor.
+    pub async fn show_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<minimald_rpc::ShowBoxResponse>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            // The listing reports `box_id` where a record has one (a VM
+            // guest's differs from its `id`), so that key wins.
+            let record = records
+                .iter()
+                .find(|record| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|record| record.id == id))
+                .cloned();
+            tracing::Span::current().record("found", record.is_some());
+            tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
+            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(&record),
+                // BOX-140: no host this daemon runs on is enrolled with a
+                // Gatehouse, so every box reports the identity none.
+                identity: minimald_rpc::BoxIdentity::None,
+                // BOX-149: the daemon does not give an exec an id yet, so
+                // this list is always empty, even when a process runs in
+                // the box. It fills when each exec has an id (BOX-149):
+                // https://github.com/gominimal/minimal/issues/2404 (T30).
+                live_execs: Vec::new(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// A record as a listing reports it (BOX-158): its identity fields and its
+/// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
+/// ending is not a row of the BOX-011 table reports its status with the
+/// stored `reason`, `exit_code` and `signal` as they are.
+fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+    let (state, reason, exit_code, signal) = match record.state() {
+        Ok(state) => (
+            state.name(),
+            state.reason().map(|reason| reason.name().to_string()),
+            state.exit_code(),
+            state.signal(),
+        ),
+        Err(_) => (
+            match record.status {
+                boxes::BoxState::Pending => "pending",
+                boxes::BoxState::Materializing => "materializing",
+                boxes::BoxState::Active => "running",
+                boxes::BoxState::Stopped => "stopped",
+                boxes::BoxState::Exited => "exited",
+            },
+            record
+                .reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string()),
+            record.exit_code,
+            record.signal,
+        ),
+    };
+    minimald_rpc::BoxListingEntry {
+        box_id: record.box_id.unwrap_or(record.id),
+        name: record.name.clone(),
+        box_type: record.box_type.clone(),
+        parent: record.parent,
+        project_root: record.project_root.clone(),
+        state: state.to_string(),
+        reason,
+        exit_code,
+        signal,
+    }
+}
+
 /// The bytes the daemon stores for a box's spec (BOX-068): the spec the
 /// client sent, serialized with its keys in order. A spec must be a JSON
 /// object whose `v` is a whole number, the spec's version.
@@ -273,6 +398,9 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
 
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
+    /// Every retained record, in any state (BOX-158). Read-only against
+    /// the store: it starts no actor and probes no host.
+    Records(Responder<Vec<boxes::Record>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -331,6 +459,7 @@ impl ManagerMessage {
     fn kind(&self) -> &'static str {
         match self {
             Self::List(..) => "List",
+            Self::Records(..) => "Records",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
             Self::GetSession(..) => "GetSession",
@@ -2266,6 +2395,25 @@ impl BoxManager {
                         }))
                         .await;
                     Ok(out)
+                })
+                .await;
+            }
+            // Gets every retained record, in any state.
+            ManagerMessage::Records(r) => {
+                // A record in teardown is gone here, as it is to `List`.
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if !tearing_down.contains(handle.id()) {
+                            records.push(handle.record().await?);
+                        }
+                    }
+                    Ok::<_, BoxManagerError>(records)
                 })
                 .await;
             }
