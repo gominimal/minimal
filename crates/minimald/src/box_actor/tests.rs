@@ -5449,6 +5449,56 @@ async fn restart_stops_running_record_and_attach_resumes_it() {
     assert_eq!(events[resumed].data["from"], "stopped");
 }
 
+/// BOX-154 with a destroy: a box the first daemon composed reads `stopped`
+/// after a restart, and no actor hosts it. Its destroy still runs its
+/// `on_destroy` hook from the stored composition, once, without a resume.
+/// Then its record goes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_destroy_runs_once_for_a_box_stopped_by_a_restart() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "restart-destroy-hook",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_destroy: Some(inline(format!("echo ran >> {}", marker.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let server = restart(server, client).await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(manager.resume_active_sessions().await.unwrap(), 0);
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
+    assert!(!marker.exists(), "no hook ran before the destroy");
+
+    destroy_session(&mut client, id).await;
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "ran\n",
+        "the destroy runs the stored on_destroy hook exactly once"
+    );
+    assert!(
+        manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the destroy"
+    );
+}
+
 /// A restarted daemon launches no host for a box it found `running`: the
 /// restart set the box `stopped` (BOX-154). An attach resumes the
 /// own-address box (BOX-025) with its network mode and its recorded

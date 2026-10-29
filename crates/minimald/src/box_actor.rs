@@ -952,9 +952,16 @@ impl BoxActor {
         } else {
             None
         };
-        let hook_failures: Vec<String> = self
-            .run_hooks_headless(crate::hooks::HookEvent::Destroy)
-            .await
+        // An ended box whose hook launch failed skips the hooks here, so
+        // the destroy does not wait on a second launch that also fails.
+        let hooks_can_run = hook_slot.is_none() || self.launch_ended_box_for_destroy_hooks().await;
+        let hook_outcomes = if hooks_can_run {
+            self.run_hooks_headless(crate::hooks::HookEvent::Destroy)
+                .await
+        } else {
+            Vec::new()
+        };
+        let hook_failures: Vec<String> = hook_outcomes
             .iter()
             .filter(|o| o.failed())
             .map(|o| {
@@ -983,6 +990,74 @@ impl BoxActor {
         self.deregister_hostname(true).await;
         let deleted = self.record.clone().delete().await;
         deleted.map(|()| hook_failures)
+    }
+
+    /// Mints the hook-only host for a stopped or exited box, so that its
+    /// destroy runs the `on_destroy` hooks from the stored composition.
+    ///
+    /// After a restart a composed box reads `stopped` (BOX-154). The
+    /// `Attached` launch that [`Self::run_hooks_headless`] makes is gated on
+    /// an `Active` record, so it refuses that box and its hooks never run.
+    /// This launch skips the gate, as the activation launch does. The box
+    /// was `Active` once, so its home is already materialized. The record
+    /// stays as it is: this is not a resume. The launch holds the shell at
+    /// its start gate, so the box's entrypoint does not start. The hooks
+    /// then join this host, with their usual environment and directory.
+    ///
+    /// Best effort and bounded, as every teardown hook launch is: a failure
+    /// is logged, and the destroy goes on without the hooks. Answers false
+    /// only then. A box that has not ended needs no launch here and answers
+    /// true.
+    async fn launch_ended_box_for_destroy_hooks(&mut self) -> bool {
+        let status = match self.record.record().await {
+            Ok(record) => record.status,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    %error,
+                    "destroy: reading the record before its hooks failed",
+                );
+                return true;
+            }
+        };
+        if !matches!(status, BoxState::Stopped | BoxState::Exited) {
+            return true;
+        }
+        let outcome = tokio::time::timeout(
+            HOOK_LAUNCH_TIMEOUT,
+            self.launch_host_for_hooks(LaunchPhase::Activating),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(
+                box_id = %self.record.id(),
+                ?status,
+                    "destroy: launched the ended box to run its on_destroy hooks",
+                );
+                true
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                box_id = %self.record.id(),
+                ?status,
+                %error,
+                    "destroy: launching the ended box for its on_destroy hooks failed; \
+                     skipping them",
+                );
+                false
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                box_id = %self.record.id(),
+                ?status,
+                timeout_secs = HOOK_LAUNCH_TIMEOUT.as_secs(),
+                    "destroy: launching the ended box for its on_destroy hooks timed out; \
+                     skipping them",
+                );
+                false
+            }
+        }
     }
 
     /// Marks the box's name stopped after a stop: the name stays held, and
