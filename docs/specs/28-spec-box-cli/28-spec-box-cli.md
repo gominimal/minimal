@@ -170,16 +170,18 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal type_show_matches_shipped_table_with_sources
 
-- **BCLI-021** WHEN `min box spec <entry>` runs THE SYSTEM SHALL render the expanded spec in the format `-o toml|json|yaml` names, with secrets as references only, naming beside each value the layer and type BOX-161 reports for it.
-  <!-- was BOX-066, without its validation sub-bullet, which stays in BOX -->
+- **BCLI-021** WHEN `min box spec <entry>` runs THE SYSTEM SHALL render the entry's expanded spec in the format `-o toml|json|yaml` names, with secrets as references only, naming beside each value the layer and type BOX-161 reports for it, and with the rows BEP-038 renders for an entry that declares a credentialed upstream.
+  <!-- `min box spec [path]` (BEP-038) renders a project's Box Egress Proxy rows; this spec adds the entry and box forms and `-o` on top of it, and keeps the path form -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_formats_secrets_as_refs
+  - WHEN `min box spec` runs with no argument, or with an argument that names an existing directory THE SYSTEM SHALL render BEP-038's rows for the project in that directory, else in the current project, as BEP-038 defines.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_spec_path_form_renders_bep_rows
   - WHEN `min box spec <entry>` runs with `--network` or `--ingress` THE SYSTEM SHALL pass the flag's value to BOX-064's command-line override layer exactly as BCLI-024 does, so the rendered spec is byte for byte the spec `min session start` or `min box start` with the same flags sends to the daemon.
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_entry_network_flags_match_start
 
-- **BCLI-022** WHEN `min box spec <box>` runs THE SYSTEM SHALL render the spec stored in that box's record.
-  <!-- was BOX-069 -->
+- **BCLI-022** WHEN `min box spec <box>` runs with an argument that names neither an existing directory nor an entry of the current project THE SYSTEM SHALL resolve the argument as a box address (BCLI-002) and render the spec stored in that box's record.
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_box_renders_stored_copy
 
@@ -502,6 +504,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **One provider per local deployment style, with hosts named after the instances.** Ruled on gominimal/arch#45 on 2026-10-27. It replaces this spec's earlier reading, one provider per daemon with one host of the same name. The `0..N` suffix is the state-directory convention, so it names hosts, not providers. `local` serves the native daemons on this machine, `local-minvmd` serves its VMs, and `local-box` serves the parent daemon of the box `min` runs in. `local-minvmd/local-minvmd0/<box>` is a box on the first VM, and `--provider local-minvmd --host local-minvmd0` names that VM. BCLI-046 no longer expires `local-minvmd`, so NET-049, NET-051 and TEL-034 already cite the right spelling. `local-box` exists only inside a box, which needs nesting (Non-goals), so BCLI-052 lists it only where it is present. A local host's endpoint is `unix:<path>` with port 0. The socket's file mode is its access control, as §3 of the Box Provider API states.
 
+**`min box spec` keeps its path form and adds the entry and box forms.** `min box spec [path]` renders the Box Egress Proxy rows for a project (BEP-038). This spec keeps that form unchanged and adds the architecture's `<entry>` and `<box>` forms and `-o` (BCLI-021, BCLI-022). One positional argument carries all three forms. A directory is read first, so every existing `min box spec <path>` call keeps its output. An argument that is not a directory names an entry of the current project, else a box. The entry form renders BEP-038's rows inside the expanded spec, so one command shows both the spec and the proxy's view of it.
+
 **`min host show` names the host-side socket only.** On the VM provider it is the host-side socket the client connects to (BCLI-048); adding the in-VM path was rejected as an in-VM fact the client never uses.
 
 **Stopping a VM host runs on the VM lane.** It exists only with the VM host daemon in the loop, so BCLI-049's test names the VM lane (NET-107) rather than `tier: none`, which would have left the VM path unverified.
@@ -534,3 +538,4 @@ The same NET-015 sub-bullet also cites `min session run`, which BCLI-066 refuses
 
 - [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
 - [NEEDS CLARIFICATION (LOW): the architecture's `min box run` wires stdio for any entry. It does not say whether it allocates a PTY for a `pty_enabled` entry, or what such a run does off a TTY. This spec specifies neither until gominimal/arch#127 rules.]
+- [NEEDS CLARIFICATION (LOW): `min box spec` reads a directory before an entry name (BCLI-021, BCLI-022), so an entry whose name matches a directory in the current directory cannot be named by its bare name. Either the path form moves to `--repo-dir` with a one-release alias, or the entry form takes a marker that a path cannot carry. This spec keeps the directory first until that is chosen.]
