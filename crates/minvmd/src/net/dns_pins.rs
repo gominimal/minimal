@@ -1966,6 +1966,64 @@ pub(crate) mod tests {
         observe(pins, table, node, name, answers, &DropLimiter::new(), now);
     }
 
+    /// NET-085: a resident `host_ip` box's declared names pin in an entry
+    /// of their own, fed by the node address's lookups. Its pins admit a
+    /// box-marked frame and never the node plane's own frames, a baseline
+    /// pin never admits a box-marked frame, and the box's retire takes its
+    /// pins with it.
+    #[test]
+    fn host_ip_box_names_pin_apart_from_the_node_plane() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        let session = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(
+            session,
+            Some(&EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                deny_subnets: None,
+            }),
+        ));
+        let site = Ipv4Addr::new(203, 0, 113, 50);
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "nothing is pinned before a lookup"
+        );
+        node_resolves(&pins, &table, &baseline, "example.com", &[site], now);
+        assert!(
+            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "the box's declared name pins its answer for a box-marked frame"
+        );
+        assert!(
+            !pins.admits_node_frame(&table, &baseline, site.octets(), None, now),
+            "a box's name never admits the node plane's own frames"
+        );
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &[cache],
+            now,
+        );
+        assert!(pins.admits_node_frame(&table, &baseline, cache.octets(), None, now));
+        assert!(
+            !pins.admits_host_ip_frame(&table, cache.octets(), None, now),
+            "a baseline pin never admits a box-marked frame"
+        );
+        assert!(registry.retire_host_ip_box(session));
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "a retired box's pins go with it"
+        );
+    }
+
     /// NET-130 and NET-085's node-plane half: the node plane's own lookups
     /// for a baseline entry pin the addresses they resolved to against that
     /// entry, and nothing else does. Before any lookup no address admits;
