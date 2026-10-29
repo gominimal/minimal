@@ -384,7 +384,7 @@ pub async fn apply_ingress_naming_holders(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::switch::SessionGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
@@ -457,7 +457,7 @@ async fn apply_declared(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-    gate: Option<&Arc<super::switch::BoxGate>>,
+    gate: Option<&Arc<super::switch::SessionGate>>,
     yielded: &[super::dns::SharedPortCollision],
     holder_of: &(dyn Fn(u16) -> minimald_rpc::PortHolder + Sync),
 ) -> io::Result<Vec<PortForwarder>> {
@@ -575,7 +575,7 @@ pub fn host_ports_in_use(
     ingress
         .port_mappings
         .iter()
-        .filter(|mapping| mapping.proto == boxes::IpProto::Tcp)
+        .filter(|mapping| mapping.proto == sessions::IpProto::Tcp)
         .map(|mapping| mapping.external_port)
         .filter(|port| !yielded.contains(port))
         .filter(|&port| {
@@ -2892,7 +2892,7 @@ mod tests {
             PortMapping {
                 external_port,
                 internal_port: 80,
-                proto: boxes::IpProto::Tcp,
+                proto: sessions::IpProto::Tcp,
             }
         }
 
@@ -2914,7 +2914,7 @@ mod tests {
             answers: Vec<(u16, &'static str)>,
         ) -> tokio::task::JoinHandle<Vec<String>> {
             let listener = UnixListener::bind(&path).unwrap();
-            crate::traced::spawn(async move {
+            tokio::spawn(async move {
                 let mut asked = Vec::new();
                 for (status, body) in answers {
                     let Ok((mut sock, _)) = listener.accept().await else {
@@ -3113,7 +3113,7 @@ mod tests {
                 "on a VM-backed host the forwarder binds on the host OS, so a \
                  bind in the guest proves nothing and the probe is skipped"
             );
-            declared.port_mappings[0].proto = boxes::IpProto::Udp;
+            declared.port_mappings[0].proto = sessions::IpProto::Udp;
             assert!(
                 host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
                 "a UDP mapping is not probed with a TCP bind"

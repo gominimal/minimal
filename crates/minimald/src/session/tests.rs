@@ -3493,9 +3493,8 @@ async fn create_handed_own_ip_session(
 }
 
 /// The finalize of a box whose declared port is held fails with the typed
-/// refusal (NET-144). Then the destroy the client's activate cleanup sends
-/// removes the box, which proves it never reached `Active`, and no record is
-/// left behind.
+/// refusal (NET-144). The box never reached `Active`, and the destroy the
+/// client's activate cleanup sends removes it, so no record is left behind.
 #[cfg(target_os = "linux")]
 async fn assert_refused_and_cleaned_up(
     client: &mut TestClient,
@@ -3526,13 +3525,19 @@ async fn assert_refused_and_cleaned_up(
         }
         Errorable::Ok(ok) => panic!("finalize must fail on a held port, got {ok:?}"),
     }
-    // `only_if_unfinalized` is the client's activate cleanup: it removes
-    // only a box that never reached `Active`.
+    // The refused box never reached `Active`.
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|entry| entry.id == id && entry.status != sessions::SessionStatus::Active),
+        "the refused box is listed and not active: {:?}",
+        listed.sessions
+    );
+    // The client's activate cleanup destroys the refused box.
     match client
-        .call::<DestroySession>(&DestroySessionRequest {
-            id,
-            only_if_unfinalized: true,
-        })
+        .call::<DestroySession>(&DestroySessionRequest { id })
         .await
     {
         Errorable::Ok(_) => {}

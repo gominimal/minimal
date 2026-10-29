@@ -2316,13 +2316,12 @@ impl Session {
     /// fields as a refused activation, and does not destroy the box. A box
     /// that moved off the fallback, or no longer publishes, is not reported.
     #[cfg(target_os = "linux")]
-    fn watch_fallback_landing(&self, record: &Record, ingress: &boxes::IngressPolicy) {
+    fn watch_fallback_landing(&self, record: &Record, ingress: &sessions::IngressPolicy) {
         let book = Arc::clone(&self.loopback);
         let hostnames = Arc::clone(&self.hostnames);
         let session = record.id;
         let mappings = ingress.port_mappings.clone();
-        crate::traced::spawn_detached(
-            tracing::info_span!(parent: None, "session.fallback_port_watch", session = %session),
+        drop(tokio::spawn(tracing::Instrument::instrument(
             async move {
                 if book.await_landing().await != crate::net::dns::RangeVerdict::Absent {
                     return;
@@ -2354,7 +2353,8 @@ impl Session {
                      port; the port is not bound for this box"
                 );
             },
-        );
+            tracing::info_span!(parent: None, "session.fallback_port_watch", session = %session),
+        )));
     }
 
     /// Compose this session's loadout from its project config and the
@@ -2806,7 +2806,7 @@ impl Session {
                 // run: their launch binds the forwards, and a taken port
                 // fails that apply with the same refusal.
                 #[cfg(target_os = "linux")]
-                if let (boxes::NetworkMode::OwnIp, Some(ingress)) =
+                if let (sessions::NetworkMode::OwnIp, Some(ingress)) =
                     (&record.network, record.policy.ingress.as_ref())
                 {
                     let (published, fallback_refusal) = {
@@ -2845,7 +2845,7 @@ impl Session {
                         && let Some(published) = published
                     {
                         let control = self.switch_control().await;
-                        let own_name = super::helpers::registry_name(&record);
+                        let own_name = registry_name(&record);
                         let holder_of = |port: u16| {
                             crate::net::policy::port_holder(
                                 &self.hostnames,
