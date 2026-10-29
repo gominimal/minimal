@@ -1284,6 +1284,45 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .await
 }
 
+/// `ListBoxes`: every retained box record on this host, in any state,
+/// optionally scoped to one project root (BOX-158).
+async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ListBoxes
+        .handle_channel(c, async |req: minimald_rpc::ListBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.list_boxes(req.project_root.as_ref()).await {
+                Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
+                Err(e) => Errorable::Err {
+                    error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ShowBox`: one box record with its state, identity and live execs
+/// (BOX-159).
+async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ShowBox
+        .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.show_box(req.id).await {
+                Ok(Some(reply)) => Errorable::Ok(reply),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box record could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
 async fn serve_destroy_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -2939,6 +2978,8 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
+        | minimald_rpc::ListBoxes::NAME
+        | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -3019,6 +3060,8 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
+        minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
