@@ -411,10 +411,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal setup_zed_unchanged
 
-- **BCLI-044** THE SYSTEM SHALL describe only the new grammar in the synced reference and concept docs, with one migration note listing the aliases and their removal release.
-  <!-- was BOX-110 -->
+- **BCLI-044** THE SYSTEM SHALL document every verb BCLI-026 and BCLI-030 name in the CLI reference, `docs/reference/cli-min.md`, and name an alias BCLI-042 or BCLI-046 accepts in that reference and in the sessions concept page, `docs/concepts/sessions.md`, only in one migration note that lists each alias with its replacement and its removal release.
+  <!-- the reference-reading test form NET-036 and NET-111 use; the justfile has no doc-check recipe -->
   tier:     T0
-  verify:   cargo nextest run -p minimal docs_describe_new_grammar_with_migration_note
+  verify:   cargo nextest run -p minimal cli_reference_documents_box_grammar_with_one_migration_note
 
 - **BCLI-046** THE SYSTEM SHALL name the well-known local providers `local`, `local-minvmd` and `local-box`, and name each of their hosts by its daemon instance (`local0..N`, `local-minvmd0..N`).
   <!-- was BOX-112; one provider per local deployment style, hosts carry the instance names: ruled on gominimal/arch#45, 2026-10-27 -->
@@ -437,8 +437,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-049** WHEN `min host stop <host>` runs THE SYSTEM SHALL stop each running box on that host as BOX-013 defines, then stop that daemon, and its VM where one exists.
   <!-- was BOX-115 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal host_stop_stops_boxes_then_daemon_and_vm
-  <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
+  verify:   ./scripts/session-e2e.sh host_stop_stops_boxes_then_daemon_and_vm
+  <!-- the session e2e the VM lanes run, as NET-049 and NET-107 are verified: the behaviour exists only with the VM host daemon in the loop -->
   - WHERE `--force` is given THE SYSTEM SHALL stop each running box with BOX-013's forced stop and then stop the daemon without waiting for its clean shutdown.
     tier:   T0
     verify: cargo nextest run -p minimal host_stop_force_forces_boxes_and_daemon
@@ -510,7 +510,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **`min host show` names the host-side socket only.** On the VM provider it is the host-side socket the client connects to (BCLI-048); adding the in-VM path was rejected as an in-VM fact the client never uses.
 
-**Stopping a VM host runs on the VM lane.** It exists only with the VM host daemon in the loop, so BCLI-049's test names the VM lane (NET-107) rather than `tier: none`, which would have left the VM path unverified.
+**Stopping a VM host runs on the VM lane.** It exists only with the VM host daemon in the loop. So BCLI-049's test is a case of `scripts/session-e2e.sh`, the session proof the VM lanes run, as NET-049 and NET-107 are.
 
 **Generality:** the grammar binds to the operations BOX defines, not to a daemon's internals, so a second client (the dash, a remote provider's client) drives the same operations without this grammar, and a second host is addressed by the same `provider/host/name`. The deliberate exceptions are BCLI-046 and BCLI-052, which name the well-known local providers because those names are the behaviour.
 
