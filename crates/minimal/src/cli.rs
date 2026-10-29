@@ -1108,6 +1108,14 @@ pub struct FinalizeInstallArgs {
     /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
+    /// The two contiguous connection-mark bits that egress enforcement uses, in hex (for example 0x0c000000). Use it when another firewall rule already uses the default bits. The boot service keeps the value
+    #[arg(
+        long,
+        value_name = "MASK",
+        value_parser = crate::cmd::parse_ct_mark_mask,
+        conflicts_with = "undo"
+    )]
+    pub ct_mark_mask: Option<u32>,
 }
 
 #[derive(Debug, Args)]

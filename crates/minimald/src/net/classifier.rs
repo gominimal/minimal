@@ -63,7 +63,9 @@
 //! boxes run unenforced like any host's and say so per launch, in the
 //! interim's words.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1362,6 +1364,43 @@ const REJECT_SET: [libc::c_int; 3] = [libc::EHOSTUNREACH, libc::EACCES, libc::EP
 /// (initial RTO, 1 s). Three seconds outlasts that retransmit with room.
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
+/// The transport one probe leg reaches its endpoint with. The reading at
+/// daemon start keeps the stream leg, a TCP connect, which pays the SYN
+/// retransmit described at [`PROBE_DEADLINE`] on a refusing table. The
+/// per-launch readings use the datagram leg, so a launch never waits that
+/// second: the filter's drop fails the leg's `send()` at once, with no
+/// retransmit to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leg {
+    /// A TCP connect to the endpoint's listener.
+    Stream,
+    /// One UDP datagram, sent on a connected socket to the endpoint's
+    /// bound socket.
+    Datagram,
+}
+
+impl Leg {
+    /// The leg's own spelling for the probe's log record.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Stream => "tcp",
+            Self::Datagram => "udp",
+        }
+    }
+}
+
+/// How long a datagram leg whose `send()` the filter refused waits for the
+/// rejection's ICMP error to land on its socket. The rejection is made in
+/// the same `send()`, so the error is there at once or never. When it is
+/// not there, the leg reports the `send()` errno itself (EPERM, a drop).
+const DATAGRAM_ERROR_WAIT_MS: libc::c_int = 50;
+
+/// How long a datagram leg whose `send()` went out waits for an ICMP error
+/// before it reads the datagram as admitted. Only a table that does not
+/// refuse, or a socket that is gone, gets here. A refusing table fails the
+/// `send()` itself, so the healthy per-launch reading never waits this.
+const DATAGRAM_SETTLE_MS: libc::c_int = 100;
+
 /// The migration file a child writes its own pid into: `cgroup.procs`, the
 /// file the kernel makes in every cgroup2 directory and the one a stand-in
 /// tree must carry for a probe child to place itself in.
@@ -1534,8 +1573,13 @@ impl Reading {
 /// child met. No capability beyond that: no `CAP_NET_ADMIN`, no root
 /// helper, and no byte written outside the leaf the probe names after
 /// itself and removes.
-pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> Reading {
-    for (family, addr) in endpoints {
+///
+/// `leg` names the transport. A datagram endpoint is a socket the caller
+/// holds bound for the whole reading, so it cannot be gone the way a
+/// listener can, and no control connect runs for it.
+pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)], leg: Leg) -> Reading {
+    let control = if leg == Leg::Stream { endpoints } else { &[] };
+    for (family, addr) in control {
         if let Err(cause) = TcpStream::connect(addr) {
             return Reading::Inconclusive {
                 because: format!(
@@ -1575,7 +1619,7 @@ pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> R
     let made_procs = !procs.exists() && std::fs::write(&procs, b"").is_ok();
     let observations = endpoints
         .iter()
-        .map(|(family, addr)| probe_family(&procs, *family, addr))
+        .map(|(family, addr)| probe_family(&procs, *family, addr, leg))
         .collect::<Vec<_>>();
     // The throwaway leaf is owed its removal even when a leg read nothing.
     if made_procs {
@@ -1606,7 +1650,7 @@ fn probe_leaf(root: &Path) -> PathBuf {
 /// report, and returns what the child's connect met. The child is killed
 /// and reaped at the deadline if it has not reported — no probe child
 /// outlives the decision it was forked for.
-fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Observed) {
+fn probe_family(procs: &Path, family: Family, addr: &SocketAddr, leg: Leg) -> (Family, Observed) {
     // Everything the child needs is prepared before the fork, the only
     // place allocation still may run: after the fork the child touches
     // nothing but raw syscalls, the same pre-exec discipline a sandbox's
@@ -1624,7 +1668,8 @@ fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Obs
     }
     // SAFETY: `fork(2)` runs in this (possibly multithreaded) process, and
     // the child runs only async-signal-safe calls between the fork and its
-    // `_exit` — open, write, close, getpid, socket, connect — so no
+    // `_exit` — open, write, close, getpid, socket, connect, send, poll,
+    // getsockopt — so no
     // allocator or lock can be held across the fork by the child itself,
     // in kind with the pre-exec closure this probe models.
     let pid = unsafe { libc::fork() };
@@ -1641,7 +1686,7 @@ fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Obs
         // child's whole report channel, and `probe_child` never returns.
         unsafe {
             libc::close(fds[0]);
-            probe_child(c_procs.as_ptr(), family, port, fds[1]);
+            probe_child(c_procs.as_ptr(), family, port, leg, fds[1]);
         }
     }
     // SAFETY: the write end is the child's, closed here so the read below
@@ -1721,6 +1766,7 @@ unsafe fn probe_child(
     c_procs: *const libc::c_char,
     family: Family,
     port: u16,
+    leg: Leg,
     report: libc::c_int,
 ) -> ! {
     // SAFETY: `open(2)` reads `c_procs`; the flags are the append the
@@ -1752,8 +1798,12 @@ unsafe fn probe_child(
         Family::V4 => libc::AF_INET,
         Family::V6 => libc::AF_INET6,
     };
+    let kind = match leg {
+        Leg::Stream => libc::SOCK_STREAM,
+        Leg::Datagram => libc::SOCK_DGRAM,
+    };
     // SAFETY: `socket(2)` makes the one descriptor this child connects with.
-    let socket = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let socket = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
     if socket == -1 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
         tell(report, 0, errno);
@@ -1806,17 +1856,73 @@ unsafe fn probe_child(
             }
         }
     };
+    let errno = if connected == 0 {
+        match leg {
+            Leg::Stream => 0,
+            Leg::Datagram => datagram_outcome(socket),
+        }
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+    };
     // SAFETY: the one descriptor this child made, done with either way.
     unsafe { libc::close(socket) };
-    if connected == 0 {
-        tell(report, 0, 0);
-        // SAFETY: the child ends here.
-        unsafe { libc::_exit(0) };
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
     tell(report, 0, errno);
     // SAFETY: the child ends here.
     unsafe { libc::_exit(0) };
+}
+
+/// The datagram leg's outcome on its connected UDP socket, raw syscalls
+/// only, as [`probe_child`] needs: 0 when the datagram went out and no
+/// error came back, else the errno that reads as what met it. A refusing
+/// table fails the `send()` itself (its drop reads as EPERM) and answers
+/// with an ICMP error, which the socket holds as its pending error:
+/// EHOSTUNREACH over IPv4 and EACCES over IPv6, the stream leg's own
+/// errnos. The pending error wins when it lands, so both legs report one
+/// errno for one refusal. A datagram that went out waits
+/// [`DATAGRAM_SETTLE_MS`] for an error, so a socket that is gone reads as
+/// ECONNREFUSED, as a stream leg to a dead listener does.
+fn datagram_outcome(socket: libc::c_int) -> libc::c_int {
+    let byte = [0u8; 1];
+    // SAFETY: `send(2)` reads the one byte above on the descriptor this
+    // child owns; MSG_NOSIGNAL keeps a failure from raising a signal.
+    let sent = unsafe { libc::send(socket, byte.as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+    let send_errno = if sent < 0 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+    } else {
+        0
+    };
+    let wait = if send_errno == 0 {
+        DATAGRAM_SETTLE_MS
+    } else {
+        DATAGRAM_ERROR_WAIT_MS
+    };
+    // `poll(2)` always reports POLLERR, so no event is asked for: the wait
+    // ends at the first pending error or at the bound.
+    let mut pfd = libc::pollfd {
+        fd: socket,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: `poll(2)` writes into `pfd` and reads the child's own socket.
+    unsafe { libc::poll(&mut pfd, 1, wait) };
+    let mut pending: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `getsockopt(2)` writes one int and its length into the two
+    // locals above, which outlive the call.
+    let read = unsafe {
+        libc::getsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut pending).cast(),
+            &raw mut len,
+        )
+    };
+    if read == 0 && pending != 0 {
+        pending
+    } else {
+        send_errno
+    }
 }
 
 /// Writes this process's own pid, decimal and newline-terminated, to `fd`
@@ -1888,6 +1994,41 @@ fn bind_probe_listener(family: Family) -> std::io::Result<TcpListener> {
     Err(std::io::Error::other(
         "the probe's port choice collided with the answerer's",
     ))
+}
+
+/// Binds one family's datagram endpoint on an ephemeral loopback port, the
+/// datagram leg's twin of [`bind_probe_listener`], with the same retry off
+/// the answerer's port: the carve-out admits UDP to that port.
+fn bind_datagram_endpoint(family: Family) -> std::io::Result<UdpSocket> {
+    for _ in 0..4 {
+        let socket = UdpSocket::bind(SocketAddr::new(family.loopback(), 0))?;
+        if socket.local_addr()?.port() != crate::net::answerer::ANSWERER_PORT {
+            return Ok(socket);
+        }
+    }
+    Err(std::io::Error::other(
+        "the probe's port choice collided with the answerer's",
+    ))
+}
+
+/// The datagram leg's endpoints, one per family this host's loopback can
+/// carry, with the same tolerance for a host without IPv6 loopback as
+/// [`bind_probe_listeners`].
+fn bind_datagram_endpoints() -> std::io::Result<Vec<(Family, UdpSocket)>> {
+    let mut sockets = Vec::new();
+    for family in [Family::V4, Family::V6] {
+        match bind_datagram_endpoint(family) {
+            Ok(socket) => sockets.push((family, socket)),
+            Err(cause)
+                if family == Family::V6
+                    && matches!(
+                        cause.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL)
+                    ) => {}
+            Err(cause) => return Err(cause),
+        }
+    }
+    Ok(sockets)
 }
 
 /// The probe's listeners, one per family this host's loopback can carry.
@@ -2471,6 +2612,12 @@ pub(crate) fn guest_table_listed(nft: &Path) -> Listing {
 static HELD_PROBE_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// The datagram endpoints the guest's per-launch readings send to, held
+/// for the daemon's life beside the listeners above and drained the same
+/// way, so a datagram leg is never sent to a port bound for one reading.
+static HELD_DATAGRAM_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Binds and holds the probe's listeners, one thread per family this host's
 /// loopback can carry: the endpoints it returns are the ones the guest's
 /// readings connect to, for as long as this daemon runs. Native readings
@@ -2480,6 +2627,13 @@ static HELD_PROBE_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
 /// a port the box never saw refused.
 pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
     let listeners = bind_probe_listeners()?;
+    // Every endpoint binds before any drain thread runs, so a failed
+    // datagram bind returns with no TCP listener served and none published.
+    let sockets = bind_datagram_endpoints()?;
+    let datagram_endpoints: Vec<(Family, SocketAddr)> = sockets
+        .iter()
+        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
     let endpoints: Vec<(Family, SocketAddr)> = listeners
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
@@ -2499,9 +2653,26 @@ pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
             ))
         })?;
     }
+    for (family, socket) in sockets {
+        let draining = std::thread::Builder::new()
+            .name(format!("minimald-classifier-probe-udp-{}", family.name()))
+            .spawn(move || {
+                let mut datagram = [0u8; 16];
+                while socket.recv(&mut datagram).is_ok() {}
+            });
+        draining.map_err(|cause| {
+            std::io::Error::other(format!(
+                "holding the probe's {} datagram endpoint: {cause}",
+                family.name()
+            ))
+        })?;
+    }
     *HELD_PROBE_ENDPOINTS
         .lock()
         .expect("the probe's listeners are only held by this daemon") = endpoints.clone();
+    *HELD_DATAGRAM_ENDPOINTS
+        .lock()
+        .expect("the probe's datagram endpoints are only held by this daemon") = datagram_endpoints;
     Ok(endpoints)
 }
 
@@ -2512,6 +2683,10 @@ pub(crate) fn clear_probe_listeners() {
     HELD_PROBE_ENDPOINTS
         .lock()
         .expect("the probe's listeners are only held by this daemon")
+        .clear();
+    HELD_DATAGRAM_ENDPOINTS
+        .lock()
+        .expect("the probe's datagram endpoints are only held by this daemon")
         .clear();
 }
 
@@ -2571,14 +2746,26 @@ pub fn boot_guest_classifier(
     let _ = load();
 }
 
-/// Reads the table's effect over the listeners this daemon holds: the
-/// guest's own reading, whose listener is its boot's, not one bound and
-/// dropped per probe — so the probe's evidence is about the table, never
-/// about whether a listener happened to be there.
+/// Reads the table's effect over the datagram endpoints this daemon holds:
+/// the guest's per-launch reading, with the datagram leg so a launch never
+/// waits a SYN retransmit, over endpoints its boot bound, not ones bound
+/// and dropped per probe — so the probe's evidence is about the table,
+/// never about whether an endpoint happened to be there.
 pub(crate) fn read_held_filter(root: &Path) -> Reading {
-    let endpoints = HELD_PROBE_ENDPOINTS
+    read_held_filter_with(root, Leg::Datagram)
+}
+
+/// [`read_held_filter`] with the leg named: the stream leg reads the held
+/// listeners (the daemon-start reading), the datagram leg the held
+/// datagram endpoints.
+fn read_held_filter_with(root: &Path, leg: Leg) -> Reading {
+    let held = match leg {
+        Leg::Stream => &HELD_PROBE_ENDPOINTS,
+        Leg::Datagram => &HELD_DATAGRAM_ENDPOINTS,
+    };
+    let endpoints = held
         .lock()
-        .expect("the probe's listeners are only held by this daemon")
+        .expect("the probe's endpoints are only held by this daemon")
         .clone();
     if endpoints.is_empty() {
         tracing::warn!(
@@ -2588,49 +2775,76 @@ pub(crate) fn read_held_filter(root: &Path) -> Reading {
             because: "the daemon holds no loopback listener for its effect probe".to_string(),
         };
     }
-    read_over(root, &endpoints, true)
+    read_over(root, &endpoints, true, leg)
 }
 
 /// Reads the table's effect on this host (NET-079, design §7.4): the probe,
-/// with its own listener — a destination the daemon holds on loopback, on
+/// with its own endpoint — a destination the daemon holds on loopback, on
 /// a port other than the answerer's, is the place a deny-all box's
 /// connections would be refused. The probe connects and waits, so an async
 /// caller runs it on the blocking pool; it logs one record per run, naming
-/// every family it read and what the leg there met, the errno included.
+/// the leg's transport, every family it read and what the leg there met,
+/// the errno included, and how long the reading took.
 ///
-/// The healthy refusal is the quiet case — a launch's own record already
-/// names its enforcement — while anything else is the state a person
-/// reading the log has to see: a control leg that did not connect, or a
-/// family that connected, timed out or failed with an errno outside the
-/// reject set, is the launch's own line to carry. The two lanes carry it
-/// at their own levels: a guest's reading is its boot's own product, and a
-/// launch that reads anything but a refusal is the one line a bundle
-/// carries of why that guest refuses every deny-all host-address box, so
-/// it is a warn there — while the native lane is T48's (#1805) and keeps
-/// the level it chose, an info a person reading a host they installed
-/// sees without being alarmed by the launch's own record beside it.
-fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)], guest: bool) -> Reading {
-    let reading = probe_effect(root, endpoints);
+/// Every reading logs its line, the healthy refusal at info, so each
+/// launch's probe and its duration are in the log. Anything else is the
+/// state a person reading the log has to see: a control leg that did not
+/// connect, or a family that connected, timed out or failed with an errno
+/// outside the reject set. The two lanes carry it at their own levels: a
+/// guest's reading is its boot's own product, and a launch that reads
+/// anything but a refusal is the one line a bundle carries of why that
+/// guest refuses every deny-all host-address box, so it is a warn there —
+/// while the native lane is T48's (#1805) and keeps the level it chose, an
+/// info a person reading a host they installed sees without being alarmed
+/// by the launch's own record beside it.
+fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)], guest: bool, leg: Leg) -> Reading {
+    let began = std::time::Instant::now();
+    let reading = probe_effect(root, endpoints, leg);
+    let elapsed_ms = began.elapsed().as_millis() as u64;
+    let leg = leg.name();
     if matches!(reading, Reading::Refused(_)) {
-        tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
+        tracing::info!(probe = %reading.record(), leg, elapsed_ms, "the classifier table refused the probe's connection out of a deny leaf");
     } else if guest {
-        tracing::warn!(probe = %reading.record(), "read the classifier table's effect on this host");
+        tracing::warn!(probe = %reading.record(), leg, elapsed_ms, "read the classifier table's effect on this host");
     } else {
-        tracing::info!(probe = %reading.record(), "read the classifier table's effect on this host");
+        tracing::info!(probe = %reading.record(), leg, elapsed_ms, "read the classifier table's effect on this host");
     }
     reading
 }
 
-/// Reads the table's effect with a listener of its own, held for the
-/// probe's whole duration — the native reading, whose host binds and drops
-/// per probe; a listener nothing holds is the dead-listener case the
-/// control leg exists to catch.
+/// Reads the table's effect with datagram endpoints of its own, held for
+/// the probe's whole duration — the native per-launch reading, whose host
+/// binds and drops per probe.
 ///
 /// The one probe surface outside the crate: the native lane's root harness
 /// proves the *loaded* table's effect with the daemon's own probe, over a
 /// scratch tree the installer laid out — the only artifact that can
 /// produce the reading. No other caller reads a reading directly.
+///
+/// It is the per-launch reading, so it reads with the datagram leg: a
+/// launch never waits the SYN retransmit a refused TCP connect pays. The
+/// daemon-start reading keeps the TCP leg ([`decide_now`]).
 pub fn read_filter(root: &Path) -> Reading {
+    let sockets = match bind_datagram_endpoints() {
+        Ok(sockets) => sockets,
+        Err(cause) => {
+            return Reading::Inconclusive {
+                because: format!("binding the probe's loopback datagram endpoint: {cause}"),
+            };
+        }
+    };
+    let endpoints: Vec<_> = sockets
+        .iter()
+        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
+    // The sockets stay bound until the reading is done: a datagram to a
+    // port nobody holds reads as ECONNREFUSED, never as the table.
+    read_over(root, &endpoints, false, Leg::Datagram)
+}
+
+/// The daemon-start reading: [`read_filter`]'s stream twin, with a TCP
+/// listener of its own held for the probe's duration.
+fn read_filter_at_start(root: &Path) -> Reading {
     let listeners = match bind_probe_listeners() {
         Ok(listeners) => listeners,
         Err(cause) => {
@@ -2643,7 +2857,7 @@ pub fn read_filter(root: &Path) -> Reading {
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
         .collect();
-    read_over(root, &endpoints, false)
+    read_over(root, &endpoints, false, Leg::Stream)
 }
 
 /// The check (NET-079, design §7.4): whether this host can decide a
@@ -2777,9 +2991,9 @@ pub(crate) fn decide_over(
 pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
     decide(root, mountinfo, guest, || {
         if guest {
-            read_held_filter(root)
+            read_held_filter_with(root, Leg::Stream)
         } else {
-            read_filter(root)
+            read_filter_at_start(root)
         }
     })
 }
@@ -5877,7 +6091,7 @@ mod tests {
             .expect("a loopback listener to point the probe at");
         let addr = listener.local_addr().expect("the dead listener's address");
         drop(listener);
-        match probe_effect(tree.path(), &[(Family::V4, addr)]) {
+        match probe_effect(tree.path(), &[(Family::V4, addr)], Leg::Stream) {
             Reading::Inconclusive { because } => assert!(
                 because.contains("the daemon's own connect"),
                 "the reading names the control leg that failed: {because}"
@@ -7527,7 +7741,7 @@ mod tests {
             drop(listener);
             addr
         };
-        match probe_effect(root, &[(Family::V4, stale)]) {
+        match probe_effect(root, &[(Family::V4, stale)], Leg::Stream) {
             Reading::Inconclusive { because } => assert!(
                 because.contains("the daemon's own connect"),
                 "the control leg is the failure the reading names: {because}"
@@ -8132,5 +8346,284 @@ mod tests {
         moves.spawn_in(60, &blocked);
         cohort.adopt_injected("plain", 60, &moves);
         assert_eq!(moves.where_is(60), homes[0]);
+    }
+
+    /// A stand-in `nft` and `iptables-save` in `dir`, for the install's
+    /// conflict scan: `nft list ruleset` prints `ruleset`, `iptables-save`
+    /// prints `legacy`, a JSON listing fails as it does over no table, and
+    /// a load reads its transaction and succeeds.
+    fn host_ruleset_tools(dir: &Path, ruleset: &str, legacy: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let listing = dir.join("ruleset");
+        let saved = dir.join("legacy");
+        std::fs::write(&listing, ruleset).expect("writing the stand-in ruleset");
+        std::fs::write(&saved, legacy).expect("writing the stand-in iptables-save listing");
+        let nft = dir.join("nft");
+        std::fs::write(
+            &nft,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1 $2\" = 'list ruleset' ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$1\" = -j ]; then exit 1; fi\n\
+                 cat >/dev/null\n\
+                 exit 0\n",
+                listing.display()
+            ),
+        )
+        .expect("writing the stand-in nft");
+        let save = dir.join("iptables-save");
+        std::fs::write(&save, format!("#!/bin/sh\ncat '{}'\n", saved.display()))
+            .expect("writing the stand-in iptables-save");
+        for tool in [nft, save] {
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+                .expect("the stand-in tool is executable");
+        }
+    }
+
+    /// The install's whole output, stdout and stderr, for the assertions.
+    fn said(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// NET-079: a rule that writes the connection mark with no mask writes
+    /// every bit of it, the bits this install classifies with among them,
+    /// whatever value it writes. The scan refuses it under every mask, and
+    /// names the rule with the table and chain it belongs to. A masked
+    /// writer of other bits is not refused.
+    #[test]
+    fn install_refuses_a_whole_mark_ct_writer() {
+        let whole_nft = "table inet wg_quick {\n\
+                         \tchain premangle {\n\
+                         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+                         \t\tmeta l4proto udp meta mark set ct mark\n\
+                         \t}\n\
+                         \tchain postmangle {\n\
+                         \t\ttype filter hook postrouting priority mangle; policy accept;\n\
+                         \t\tmeta l4proto udp meta mark 0x0000ca6c ct mark set meta mark\n\
+                         \t}\n\
+                         }\n";
+        for mask in [None, Some("0x0c000000")] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), whole_nft, "");
+            let flags: Vec<&str> = mask.map(|m| vec!["--ct-mark-mask", m]).unwrap_or_default();
+            let refused = run_install_with(&mount, &flags, tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success(),
+                "the install refuses a whole-mark ct writer under mask {mask:?}: {text}"
+            );
+            assert!(
+                text.contains("table inet wg_quick, chain postmangle: ")
+                    && text.contains("ct mark set meta mark"),
+                "the refusal names the rule and the table and chain it is in: {text}"
+            );
+            assert!(
+                text.contains("writes every bit of the connection mark"),
+                "the refusal says why no mask avoids it: {text}"
+            );
+            assert!(
+                text.contains("then run min finalize-install again."),
+                "the refusal names the command to run once the rule is changed: {text}"
+            );
+            assert!(
+                !text.contains("chain premangle"),
+                "a rule that only reads the ct mark is not a writer: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+
+        // iptables spells the same writer as a CONNMARK with no mask.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p tcp -j CONNMARK --set-mark 0x1\nCOMMIT\n",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(
+            !refused.status.success(),
+            "a CONNMARK with no mask is refused: {text}"
+        );
+        assert!(
+            text.contains("iptables table mangle, chain OUTPUT: ")
+                && text.contains("--set-mark 0x1"),
+            "the refusal names the iptables rule, its table and chain: {text}"
+        );
+
+        // A CONNMARK --restore-mark writes only the packet mark, never the
+        // connection mark, so a restore with no mask is no conflict.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n\
+             -A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n",
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "a --restore-mark with no mask does not block the install: {}",
+            said(&installed)
+        );
+
+        // A writer that keeps every bit but its own is no conflict.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\ttcp dport 9 ct mark set ct mark | 0x00000003\n\t}\n}\n",
+            "",
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "a masked writer of other bits does not block the install: {}",
+            said(&installed)
+        );
+    }
+
+    /// NET-079: `--ct-mark-mask` refuses a mask in a range a well-known
+    /// component classes with, naming the range and the component, and
+    /// names `min finalize-install --ct-mark-mask <mask>` for two other bits.
+    #[test]
+    fn install_refuses_a_well_known_mark_range() {
+        for (mask, component, range) in [
+            ("0x00030000", "Tailscale", "0x00ff0000"),
+            ("0x00c00000", "Tailscale", "0x00ff0000"),
+            ("0x0000c000", "kube-proxy", "0x0000c000"),
+            ("0x00006000", "kube-proxy", "0x0000c000"),
+        ] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), "", "");
+            let refused = run_install_with(&mount, &["--ct-mark-mask", mask], tools.path());
+            let text = said(&refused);
+            assert!(!refused.status.success(), "mask {mask} is refused: {text}");
+            assert!(
+                text.contains(&format!("--ct-mark-mask {mask} uses bits in {range}"))
+                    && text.contains(&format!("the range {component} marks connections with")),
+                "the refusal names the range and its component: {text}"
+            );
+            assert!(
+                text.contains("run: min finalize-install --ct-mark-mask <mask>")
+                    && !text.contains(&format!("{mask} --")),
+                "the refusal names min finalize-install with a placeholder for the mask: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), "", "");
+        let installed = run_install_with(&mount, &["--ct-mark-mask", "0x0c000000"], tools.path());
+        assert!(
+            installed.status.success(),
+            "a mask outside every well-known range installs: {}",
+            said(&installed)
+        );
+    }
+
+    /// NET-079: the table refuses every IPv6 connection a box of the
+    /// boxes subtree opens to anything but loopback, allow boxes included,
+    /// with the deny chain's own refusal: replies admitted, then the one
+    /// named counter both chains count in, the log line, and an active
+    /// reject.
+    #[test]
+    fn host_ip_box_ipv6_egress_refused() {
+        let ruleset = rendered_ruleset();
+        let boxes = format!("{}/{}", tree_root_name(), sandbox::classifier::BOXES_DIR);
+        assert!(
+            ruleset.contains(
+                "chain ipv6_out {\n        type filter hook output priority filter; policy accept;"
+            ),
+            "the IPv6 chain hooks output at the filter priority: {ruleset}"
+        );
+        let ipv6_out = chain_rules(&ruleset, "ipv6_out");
+        assert_eq!(
+            ipv6_out,
+            [format!(
+                "meta nfproto ipv6 oifname != \"lo\" socket cgroupv2 level {} \"{boxes}\" jump ipv6_refuse",
+                boxes.split('/').count()
+            )
+            .as_str()],
+            "the whole boxes subtree's non-loopback IPv6 goes to the refusal: {ipv6_out:?}"
+        );
+        let refuse = chain_rules(&ruleset, "ipv6_refuse");
+        assert_eq!(
+            refuse,
+            [
+                "ct state established,related ct direction reply accept",
+                "counter name \"refused\"",
+                "limit rate 1/second burst 4 packets log prefix \"minimal-classifier: refused \" level warn",
+                "reject with icmpx admin-prohibited",
+            ],
+            "the IPv6 refusal is the deny chain's refusal: {refuse:?}"
+        );
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        assert!(
+            deny_out.contains(&"counter name \"refused\""),
+            "the IPv4 refusal counts in the same counter: {deny_out:?}"
+        );
+        assert!(
+            ruleset.contains("    counter refused {"),
+            "the table declares the counter both chains count in: {ruleset}"
+        );
+    }
+
+    /// The per-launch reading does not wait a SYN retransmit: its leg is a
+    /// datagram, so an error comes back at once, where a refused TCP
+    /// connect only fails at the first retransmit, a second later. A
+    /// datagram to an endpoint nobody holds reads its ICMP error well
+    /// inside that second, and the per-launch reading over a stand-in tree
+    /// ends inside it too.
+    #[test]
+    fn per_launch_probe_returns_without_tcp_retransmit_wait() {
+        let retransmit = Duration::from_secs(1);
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        installed_cohort(tree.path());
+        let dead = {
+            let socket = UdpSocket::bind(SocketAddr::new(Family::V4.loopback(), 0))
+                .expect("a loopback datagram endpoint to point the probe at");
+            socket.local_addr().expect("the dead endpoint's address")
+        };
+        let began = std::time::Instant::now();
+        let reading = probe_effect(tree.path(), &[(Family::V4, dead)], Leg::Datagram);
+        let elapsed = began.elapsed();
+        assert_eq!(
+            reading.legs(),
+            [(Family::V4, Observed::Refused(libc::ECONNREFUSED))],
+            "the datagram leg reads the error that came back: {}",
+            reading.record()
+        );
+        assert!(
+            elapsed < retransmit,
+            "the datagram leg reads its error without a retransmit wait: {elapsed:?}"
+        );
+
+        let began = std::time::Instant::now();
+        let reading = read_filter(tree.path());
+        let elapsed = began.elapsed();
+        assert!(
+            reading.legs().contains(&(Family::V4, Observed::Connected)),
+            "behind no table the per-launch reading's datagram goes out: {}",
+            reading.record()
+        );
+        assert!(
+            elapsed < retransmit,
+            "the per-launch reading ends inside one retransmit: {elapsed:?}"
+        );
     }
 }
