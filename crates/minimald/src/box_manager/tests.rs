@@ -3485,6 +3485,241 @@ async fn retained_session_survives_restart_then_lists_reads_and_resumes() {
     assert_eq!(listed(&mut client, left).await.state, "stopped");
 }
 
+/// A create request with no name of its own, as a client that names its
+/// box through the spec sends it.
+fn unnamed_config() -> minimald_rpc::BoxConfig {
+    let mut config = sample_config();
+    config.name = None;
+    config
+}
+
+/// The JSON spec of a `[tasks.<entry>]` box, with `name` as its
+/// `[box] name` when set.
+fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+    spec.pty_enabled = false;
+    spec.entry = entry.to_string();
+    spec.name = name.map(str::to_string);
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// The name the record of box `id` carries.
+async fn record_name(mngr: &BoxManagerHandle, id: SessionId) -> Option<String> {
+    mngr.get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the created record is filed")
+        .name
+}
+
+/// BOX-163: a box takes the spec's `[box] name`, else its entry's name.
+/// A request with no spec keeps the name it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_names_box_from_box_name_else_entry() {
+    let (_state, _cache, mngr) = manager().await;
+
+    let named = mngr
+        .create_box_with_spec(
+            unnamed_config(),
+            Some(task_spec("lint", Some("dev"))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, named).await.as_deref(), Some("dev"));
+
+    let entry = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("lint", None)), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        record_name(&mngr, entry).await.as_deref(),
+        Some("lint"),
+        "no `[box] name`: the entry's name"
+    );
+
+    // The spec's `[box] name` comes before a name the request sends.
+    let mut config = unnamed_config();
+    config.name = Some("given".to_string());
+    let over = mngr
+        .create_box_with_spec(config, Some(task_spec("other", Some("web"))), None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, over).await.as_deref(), Some("web"));
+
+    let mut config = unnamed_config();
+    config.name = Some("legacy".to_string());
+    let legacy = mngr
+        .create_box_with_spec(config, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_name(&mngr, legacy).await.as_deref(), Some("legacy"));
+}
+
+/// BOX-163: a create that asks for no fresh instance, under a name a
+/// running box holds, is refused with exit 2, naming the holder, and
+/// files nothing. A stopped holder blocks nothing (BOX-004).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let holder = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .await
+        .unwrap();
+
+    for asked in ["dev", "DEV"] {
+        let err = mngr
+            .create_box_with_spec(
+                unnamed_config(),
+                Some(task_spec("lint", Some(asked))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{err}");
+        let refusal = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<HeldNameRefusal>())
+            .unwrap_or_else(|| panic!("the refusal names the holder: {err}"));
+        assert_eq!(
+            refusal,
+            &HeldNameRefusal {
+                name: asked.to_string(),
+                holder,
+                holder_name: "dev".to_string(),
+            }
+        );
+        assert_eq!(refusal.exit_code(), 2);
+        let text = err.to_string();
+        assert!(text.contains(&holder.to_string()), "{text}");
+        assert!(text.contains("`dev`"), "{text}");
+        assert!(
+            minimal_client_collision(&text),
+            "a client still reads the refusal as a name collision: {text}"
+        );
+    }
+    let listed = mngr.list_boxes(None).await.unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "a refused create files nothing: {listed:?}"
+    );
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(
+            |line| line.contains("refused a create: a running box holds its name")
+                && line.contains(&holder.to_string())
+                && line.contains("exit_code=2")
+        ),
+        "the daemon log names the holder and the exit code:\n{logged}"
+    );
+
+    // A stopped box keeps its name and leaves it free for a new box.
+    set_record_state(
+        state.path(),
+        holder,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+    let reuse = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .await
+        .expect("a stopped holder leaves the name free");
+    assert_ne!(reuse, holder);
+    assert_eq!(record_name(&mngr, reuse).await.as_deref(), Some("dev"));
+}
+
+/// The match `min` makes on a create's error to tell a name collision
+/// apart (`minimal_client::box_name::is_name_collision`).
+fn minimal_client_collision(error: &str) -> bool {
+    error.contains("already exists")
+}
+
+/// BOX-163: a fresh instance is named `<name>-<n>`, with the smallest `n`
+/// no retained record on the host uses, whether or not a running box
+/// holds `<name>`. A stopped record keeps its suffix used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_instance_creation_named_smallest_unused_suffix() {
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let fresh = |entry: &'static str| {
+        let mngr = mngr.clone();
+        async move {
+            let id = mngr
+                .create_fresh_box_with_spec(
+                    unnamed_config(),
+                    Some(task_spec(entry, None)),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            record_name(&mngr, id).await.unwrap()
+        }
+    };
+
+    // A running `dev` holds the name: a fresh run is not refused.
+    let dev = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .await
+        .unwrap();
+    assert_eq!(fresh("dev").await, "dev-1");
+    assert_eq!(fresh("dev").await, "dev-2");
+
+    // A gap is filled first, and a stopped record still uses its suffix.
+    let three = mngr
+        .create_box_with_spec(
+            unnamed_config(),
+            Some(task_spec("lint", Some("Dev-4"))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    set_record_state(
+        state.path(),
+        three,
+        boxes::core::record::RecordState::Stopped(boxes::core::record::StopEnding::AtDaemonStart),
+    )
+    .await;
+    assert_eq!(fresh("dev").await, "dev-3");
+    assert_eq!(
+        fresh("dev").await,
+        "dev-5",
+        "a stopped `Dev-4` keeps 4 used"
+    );
+
+    // With no box of the name at all, a fresh run still takes a suffix.
+    assert_eq!(fresh("web").await, "web-1");
+    assert_eq!(record_name(&mngr, dev).await.as_deref(), Some("dev"));
+
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("named a fresh box")
+            && line.contains("dev-5")
+            && line.contains("suffix=5")),
+        "the daemon log names the suffix:\n{logged}"
+    );
+}
+
+/// The suffix rule alone (BOX-163): ASCII case is folded, and only the
+/// plain spelling of `n` uses it.
+#[test]
+fn fresh_instance_name_skips_used_suffixes() {
+    assert_eq!(fresh_instance_name("dev", []), ("dev-1".to_string(), 1));
+    assert_eq!(
+        fresh_instance_name(
+            "dev",
+            ["dev", "DEV-1", "dev-2", "dev-04", "dev-x", "devs-3"]
+        ),
+        ("dev-3".to_string(), 3)
+    );
+}
+
 /// A stand-in for the VM host daemon's report door at `door`: it answers
 /// each mint ask with the next reply in `replies` and hands the ask it read
 /// to the returned receiver.

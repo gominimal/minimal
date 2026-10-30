@@ -46,6 +46,9 @@ pub struct BoxSpec {
     pub v: u32,
     /// The Box Type's name: `session` or `task`. Serialized as `box.type`.
     pub box_type: String,
+    /// The box's own name, when the spec sets one. Serialized as
+    /// `box.name`, and left out when unset. [`Self::box_name`] reads it.
+    pub name: Option<String>,
     /// The entry the box comes from: a task's name, or
     /// [`DEFAULT_SESSION_ENTRY`] for a session.
     pub entry: String,
@@ -154,6 +157,7 @@ impl BoxSpec {
         Self {
             v: BOX_SPEC_VERSION,
             box_type: box_type.to_string(),
+            name: None,
             entry: entry.to_string(),
             packages,
             pty_enabled,
@@ -163,6 +167,13 @@ impl BoxSpec {
                 policy: flags.policy,
             },
         }
+    }
+
+    /// The name a box created from this spec takes (BOX-163): the spec's
+    /// `[box] name`, else the entry's name.
+    #[must_use]
+    pub fn box_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.entry)
     }
 }
 
@@ -190,6 +201,8 @@ struct SpecDoc {
 struct DocBox {
     #[serde(rename = "type")]
     box_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -255,6 +268,7 @@ impl From<BoxSpec> for SpecDoc {
             hooks_enabled: spec.hooks_enabled,
             box_table: DocBox {
                 box_type: spec.box_type,
+                name: spec.name,
             },
             io: DocIo {
                 pty_enabled: spec.pty_enabled,
@@ -275,6 +289,7 @@ impl From<SpecDoc> for BoxSpec {
         Self {
             v: doc.v,
             box_type: doc.box_table.box_type,
+            name: doc.box_table.name,
             entry: doc.entry,
             packages: doc.install.packages,
             pty_enabled: doc.io.pty_enabled,
@@ -326,6 +341,7 @@ mod tests {
             BoxSpec {
                 v: BOX_SPEC_VERSION,
                 box_type: "session".to_string(),
+                name: None,
                 entry: "default".to_string(),
                 packages: vec!["git".to_string(), "ripgrep".to_string()],
                 pty_enabled: true,
@@ -397,5 +413,33 @@ mod tests {
             assert_eq!(value["network"]["mode"].as_str(), Some(word), "{text}");
             assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
         }
+    }
+
+    // BOX-163: a box takes the spec's `[box] name`, else the entry's name.
+    #[test]
+    fn spec_names_box_from_box_name_else_entry() {
+        let task: crate::Task = toml::from_str(r#"exec = ["cargo", "test"]"#).unwrap();
+        let mut spec = BoxSpec::for_task("lint", &task, SpecFlags::default())
+            .expect("a task that is not interactive has a spec");
+        assert_eq!(spec.name, None, "the interim builder sets no name");
+        assert_eq!(spec.box_name(), "lint", "no `[box] name`: the entry's name");
+
+        let session = BoxSpec::for_session(None, SpecFlags::default());
+        assert_eq!(session.box_name(), DEFAULT_SESSION_ENTRY);
+
+        // An unset name is left out of the bytes, so a v0 spec stored
+        // before the key existed reads back the same.
+        let text = toml::to_string(&spec).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert!(value["box"].get("name").is_none(), "{text}");
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
+
+        spec.name = Some("dev".to_string());
+        assert_eq!(spec.box_name(), "dev", "`[box] name` comes first");
+        let text = toml::to_string(&spec).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["box"]["name"].as_str(), Some("dev"), "{text}");
+        assert_eq!(value["entry"].as_str(), Some("lint"), "{text}");
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
     }
 }

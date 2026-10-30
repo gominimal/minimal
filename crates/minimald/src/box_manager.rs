@@ -236,6 +236,131 @@ struct CreateSessionMsg {
 struct CreateBoxMsg {
     create: CreateSessionMsg,
     spec: Option<serde_json_lenient::Value>,
+    /// Whether the create asks for a fresh instance (BOX-163): the box is
+    /// named `<name>-<n>` and never refused for a held name.
+    fresh: bool,
+}
+
+/// The refusal of a create whose name a running box holds (BOX-163). It
+/// names the holder, as a rename's refusal does (BOX-010). The message
+/// keeps the words "already exists", because a client re-mints an
+/// autogen name on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldNameRefusal {
+    /// The name the create asked for.
+    pub(crate) name: String,
+    /// The running box that holds it.
+    pub(crate) holder: SessionId,
+    /// The holder's name, with the case it was given.
+    pub(crate) holder_name: String,
+}
+
+impl HeldNameRefusal {
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        boxes::box_name::REFUSAL_EXIT_CODE
+    }
+}
+
+impl std::fmt::Display for HeldNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            holder,
+            holder_name,
+        } = self;
+        write!(
+            f,
+            "A running session named `{holder_name}` ({holder}) already exists, so a new \
+             box cannot take the name `{name}`. Rename it with \
+             `min session rename {holder} <new-name>`, or choose another name."
+        )
+    }
+}
+
+impl std::error::Error for HeldNameRefusal {}
+
+/// Where a new box's name came from (BOX-163), for the create's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameSource {
+    /// The spec's `[box] name`.
+    SpecName,
+    /// The request's name, from a client that sends one beside the spec.
+    Request,
+    /// The spec's entry.
+    Entry,
+    /// No name at all: no spec and no name on the request.
+    None,
+}
+
+impl NameSource {
+    fn word(self) -> &'static str {
+        match self {
+            Self::SpecName => "spec box name",
+            Self::Request => "request name",
+            Self::Entry => "entry",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The name a create gives its box (BOX-163): the expanded spec's
+/// `[box] name`, else the entry's name. A spec the daemon cannot read as a
+/// v0 spec names nothing.
+///
+/// Interim: a name on the request goes ahead of the entry. `min` sends
+/// one for `--name`, and today also for its minted `<dir>-<hex>` names.
+/// `--name` keeps this step. The step stops putting a minted name ahead
+/// of the entry when the client sends a request name only for `--name`,
+/// never a minted `<dir>-<hex>` name. That change is
+/// <https://github.com/gominimal/minimal/issues/2762>.
+fn creation_name(
+    requested: Option<&str>,
+    spec: Option<&serde_json_lenient::Value>,
+) -> (Option<String>, NameSource) {
+    let spec = spec.and_then(|value| {
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
+    });
+    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
+        return (Some(name), NameSource::SpecName);
+    }
+    if let Some(name) = requested {
+        return (Some(name.to_string()), NameSource::Request);
+    }
+    match spec {
+        Some(spec) => (Some(spec.box_name().to_string()), NameSource::Entry),
+        None => (None, NameSource::None),
+    }
+}
+
+/// The name of a fresh instance of `base` (BOX-163): `<base>-<n>`, with
+/// the smallest positive `n` that no name in `retained` uses under ASCII
+/// case. Answers the name and its `n`.
+fn fresh_instance_name<'a>(
+    base: &str,
+    retained: impl IntoIterator<Item = &'a str>,
+) -> (String, usize) {
+    let prefix = format!("{base}-");
+    let used: std::collections::BTreeSet<usize> = retained
+        .into_iter()
+        .filter_map(|name| {
+            let head = name.get(..prefix.len())?;
+            if !head.eq_ignore_ascii_case(&prefix) {
+                return None;
+            }
+            let tail = &name[prefix.len()..];
+            // `dev-01` is not `dev-1`: only the plain spelling of `n`
+            // counts as using it.
+            if tail.starts_with('0') {
+                return None;
+            }
+            tail.parse::<usize>().ok()
+        })
+        .collect();
+    let n = (1..)
+        .find(|n| !used.contains(n))
+        .expect("a finite set leaves a positive integer unused");
+    (format!("{base}-{n}"), n)
 }
 
 impl BoxManagerHandle {
@@ -247,6 +372,34 @@ impl BoxManagerHandle {
         &self,
         config: minimald_rpc::BoxConfig,
         spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        self.send_create_box(config, spec, false, username, creator)
+            .await
+    }
+
+    /// [`Self::create_box_with_spec`] for a create that asks for a fresh
+    /// instance (BOX-163). The box is named `<name>-<n>`, with the smallest
+    /// `n` no retained record on this host uses, whether or not a running
+    /// box holds `<name>`. No request field asks for one yet, so only an
+    /// in-process caller reaches this.
+    pub async fn create_fresh_box_with_spec(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        self.send_create_box(config, spec, true, username, creator)
+            .await
+    }
+
+    async fn send_create_box(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -262,6 +415,7 @@ impl BoxManagerHandle {
                     responder: send,
                 },
                 spec,
+                fresh,
             })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -2459,12 +2613,16 @@ impl BoxManager {
             box_type = tracing::field::Empty,
             parent = tracing::field::Empty,
             spec_bytes = tracing::field::Empty,
+            name_given = tracing::field::Empty,
+            name = tracing::field::Empty,
+            fresh,
         )
     )]
     async fn create_session(
         &mut self,
-        config: minimald_rpc::BoxConfig,
+        mut config: minimald_rpc::BoxConfig,
         spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -2506,6 +2664,46 @@ impl BoxManager {
             );
             return Err(refusal);
         }
+        // BOX-163: the box takes the spec's `[box] name`, else its entry's
+        // name. The span keeps the name the request gave, so a refusal
+        // reads against what the client asked for.
+        let span = tracing::Span::current();
+        span.record(
+            "name_given",
+            config
+                .name
+                .as_deref()
+                .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        );
+        let (name, source) = creation_name(config.name.as_deref(), spec.as_ref());
+        let name = match name {
+            Some(base) if fresh => {
+                let retained = self.retained_names().await?;
+                let (name, n) = fresh_instance_name(&base, retained.iter().map(String::as_str));
+                tracing::info!(
+                    base = %base,
+                    name = %name,
+                    suffix = n,
+                    retained = retained.len(),
+                    "named a fresh box with the smallest suffix no retained record uses"
+                );
+                Some(name)
+            }
+            name => name,
+        };
+        if config.name != name {
+            tracing::info!(
+                name_given = ?config.name,
+                name = ?name,
+                source = source.word(),
+                "named the box from its spec"
+            );
+        }
+        span.record(
+            "name",
+            name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        );
+        config.name = name;
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -2626,8 +2824,16 @@ impl BoxManager {
                             ),
                         ));
                     }
-                    None => create(retry).await?,
-                    Some(false) => return Err(e),
+                    None => match create(retry).await {
+                        Ok(handle) => handle,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(self.held_name_refusal(&name, e).await);
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    // BOX-163: a running box holds the name, so the create
+                    // is refused, naming the holder, and files nothing.
+                    Some(false) => return Err(self.held_name_refusal(&name, e).await),
                 }
             }
             Err(e) => return Err(e),
@@ -2726,6 +2932,76 @@ impl BoxManager {
                 Err(e)
             }
         }
+    }
+
+    /// The name of every retained record on this host, in any state, for
+    /// a fresh instance's suffix (BOX-163). A record removed since the
+    /// listing is skipped. A record that cannot be read fails the create:
+    /// its name can be the suffix this create would take.
+    async fn retained_names(&self) -> Result<Vec<String>, BoxManagerError> {
+        let mut names = Vec::new();
+        for handle in self.store.handles().await? {
+            match handle.record().await {
+                Ok(record) => names.extend(record.name),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %handle.id(),
+                        %error,
+                        "create: could not read a record while picking a fresh name's suffix",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// The refusal of a create whose name `name` a running box holds
+    /// (BOX-163), naming the holder, with exit code 2 in the log. `store`
+    /// is the store's own refusal, answered as it is when the holder is
+    /// gone by the time this reads the records.
+    async fn held_name_refusal(&self, name: &str, store: std::io::Error) -> BoxManagerError {
+        let holder = match self.store.handles().await {
+            Ok(handles) => {
+                let mut found = None;
+                for handle in handles {
+                    let Ok(record) = handle.record().await else {
+                        continue;
+                    };
+                    if boxes::box_name::holds_name(record.status)
+                        && let Some(held) = record.name
+                        && held.eq_ignore_ascii_case(name)
+                    {
+                        found = Some((*handle.id(), held));
+                        break;
+                    }
+                }
+                found
+            }
+            Err(_) => None,
+        };
+        let Some((holder, holder_name)) = holder else {
+            tracing::info!(
+                name,
+                error = %store,
+                "refused a create whose name a running box holds; the holder is gone since"
+            );
+            return store;
+        };
+        let refusal = HeldNameRefusal {
+            name: name.to_string(),
+            holder,
+            holder_name,
+        };
+        tracing::info!(
+            name,
+            holder = %refusal.holder,
+            holder_name = %refusal.holder_name,
+            exit_code = refusal.exit_code(),
+            "refused a create: a running box holds its name"
+        );
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, refusal)
     }
 
     /// Handles a specific message recieved by the manager.
@@ -2953,7 +3229,9 @@ impl BoxManager {
                     creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, None, username, creator).await;
+                let created = self
+                    .create_session(config, None, false, username, creator)
+                    .await;
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -2966,8 +3244,11 @@ impl BoxManager {
                             responder,
                         },
                     spec,
+                    fresh,
                 } = *msg;
-                let created = self.create_session(config, spec, username, creator).await;
+                let created = self
+                    .create_session(config, spec, fresh, username, creator)
+                    .await;
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: tears down its running host and actor (if
