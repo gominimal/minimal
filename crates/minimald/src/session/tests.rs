@@ -3492,6 +3492,248 @@ async fn create_handed_own_ip_session(
     id
 }
 
+/// The finalize of a box whose declared port is held fails with the typed
+/// refusal (NET-144). The box never reached `Active`, and the destroy the
+/// client's activate cleanup sends removes it, so no record is left behind.
+#[cfg(target_os = "linux")]
+async fn assert_refused_and_cleaned_up(
+    client: &mut TestClient,
+    id: SessionId,
+    expected: minimald_rpc::PortInUseRefusal,
+) {
+    use minimald_rpc::{
+        DestroySession, DestroySessionRequest, Errorable, FinalizeSession, FinalizeSessionRequest,
+        ListSessions,
+    };
+    let reply = client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        })
+        .await;
+    match reply {
+        Errorable::Err { error } => {
+            assert_eq!(
+                minimald_rpc::PortInUseRefusal::find_in(&error),
+                Some(expected.clone()),
+                "the refusal names the port and its holder, got: {error}"
+            );
+            assert!(
+                error.contains(&expected.to_string()),
+                "the daemon's text is the refusal's own text, got: {error}"
+            );
+        }
+        Errorable::Ok(ok) => panic!("finalize must fail on a held port, got {ok:?}"),
+    }
+    // The refused box never reached `Active`.
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|entry| entry.id == id && entry.status != sessions::SessionStatus::Active),
+        "the refused box is listed and not active: {:?}",
+        listed.sessions
+    );
+    // The client's activate cleanup destroys the refused box.
+    match client
+        .call::<DestroySession>(&DestroySessionRequest { id })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the activate cleanup's destroy failed: {error}"),
+    }
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed.sessions.iter().all(|entry| entry.id != id),
+        "a refused activation leaves no record: {:?}",
+        listed.sessions
+    );
+}
+
+/// NET-121, NET-144, design §7.1: a declared TCP host port that a program
+/// outside Minimal already holds at the box's published address fails the
+/// finalize. The refusal names the port and the host as its holder, and
+/// the box leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
+    let capture = crate::test_harness::captured_log();
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    // Another process holds the declared host port at the handed address.
+    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+    assert_refused_and_cleaned_up(
+        &mut client,
+        id,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Host,
+        },
+    )
+    .await;
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={id}"))
+            && line.contains("port=18080")
+            && line.contains("127.0.64.77")
+            && line.contains("holder=host")),
+        "one warn line names the session, port, address and holder, got: {logged}"
+    );
+}
+
+/// NET-144: at the shared `127.0.0.1` fallback a declared port that another
+/// box already holds fails the second box's activation, naming the box that
+/// holds it, where before the second box yielded the port. The first box
+/// keeps the port, and the second leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fallback() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    // No reserved range on this host: every box publishes at `127.0.0.1`.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let first = create_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 78),
+        std::net::Ipv4Addr::new(127, 0, 64, 78),
+    )
+    .await;
+    finalize_session(&mut client, first).await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 79),
+        std::net::Ipv4Addr::new(127, 0, 64, 79),
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(first),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the first box publishes at the fallback"
+    );
+    assert_refused_and_cleaned_up(
+        &mut client,
+        second,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Box("first".to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .own_port_holder(std::net::Ipv4Addr::LOCALHOST, 18080)
+            .map(|(holder, _)| holder),
+        Some(first),
+        "the first box keeps the port"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={second}"))
+            && line.contains("holder=box:first")),
+        "the warn line names the holding box, got: {logged}"
+    );
+}
+
+/// NET-144, under a pending range verdict: a second box at the `127.0.0.1`
+/// interim yields the declared port the first box holds there, because a
+/// present landing moves both to their own addresses. When the verdict
+/// lands absent, the second box stays at the fallback with the port unbound,
+/// and the daemon log reports it with the port and the holder. The first
+/// box, which holds the port, is not reported.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict_lands_absent() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    // The bound is shrunk so both finalizes publish at the interim.
+    manager.reset_hand_verdict_deadline(100);
+    let mut client = server.connect().await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 81),
+        std::net::Ipv4Addr::new(127, 0, 64, 81),
+    )
+    .await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 82),
+        std::net::Ipv4Addr::new(127, 0, 64, 82),
+    )
+    .await;
+    let finalized = finalize_session(&mut client, second).await;
+    assert!(
+        finalized
+            .shared_port_collisions
+            .iter()
+            .any(|collision| collision.port == 18080 && collision.held_by.starts_with("first")),
+        "under the pending verdict the second box yields the port: {finalized:?}"
+    );
+    let registry = manager.hostnames();
+    for id in [first, second] {
+        assert_eq!(
+            registry
+                .read()
+                .expect("registry lock")
+                .published_own_address(id),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "both boxes stand at the interim while the verdict walks"
+        );
+    }
+    let reported = |logged: &str, id: SessionId| {
+        logged.lines().any(|line| {
+            line.contains("host-port-in-use")
+                && line.contains("127.0.0.1 fallback")
+                && line.contains(&format!("session={id}"))
+        })
+    };
+    assert!(
+        !reported(&capture.contents(), second),
+        "nothing is reported while the verdict is pending"
+    );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reported(&capture.contents(), second) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains("127.0.0.1 fallback")
+            && line.contains(&format!("session={second}"))
+            && line.contains("port=18080")
+            && line.contains("address=127.0.0.1")
+            && line.contains("holder=box:first")),
+        "the absent landing reports the held port, the address and the holder, got: {logged}"
+    );
+    assert!(
+        !reported(&logged, first),
+        "the box that holds the port is not reported: {logged}"
+    );
+}
+
 /// Waits until a registration is parked on the range verdict, so the
 /// landing a test makes next provably answers a waiter rather than a
 /// registration that has not yet begun to wait (NET-123 §7.1).
