@@ -879,6 +879,11 @@ impl Flow {
         );
         match result {
             Ok(()) => {
+                // The connection span names the reference as the audit
+                // record does, and never the value (BEP-028). It is set
+                // only for an injection that happened.
+                span.record("store", admit.store.as_str());
+                span.record("identifier", identifier.as_str());
                 span.record("substitution", "substituted");
                 span.record("cohort_attributed", admit.cohort_attributed);
                 self.record(
@@ -2407,6 +2412,93 @@ mod tests {
         let records = Arc::new(Mutex::new(Vec::<Decision>::new()));
         let audit: Arc<dyn AuditWriter> = records.clone();
         (records, audit)
+    }
+
+    /// Runs `f` under a debug subscriber that also logs span closes. Gives
+    /// what it logged.
+    fn logged_spans(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    // BEP-028, T29: a redeemed store reference's `box_connection` span
+    // carries the store and the identifier, as the audit record names them,
+    // and never the stored value. A request with no reference leaves them
+    // empty.
+    #[test]
+    fn store_reference_span_names_store_and_identifier_not_value() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-span-secret");
+        let (records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let mut sent = None;
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            sent = Some(send_store(
+                &flow,
+                &format!("Authorization: Bearer {sealed}"),
+            ));
+        });
+        let (upstream, end) = sent.expect("the request ran");
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(upstream.contains("sk-span-secret"), "{upstream}");
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(close.contains(r#"store="keychain""#), "{close}");
+        assert!(close.contains(r#"identifier="keychain:openai""#), "{close}");
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records[0].identifier.as_deref(), Some("keychain:openai"));
+        assert!(!log.contains("sk-span-secret"), "{log}");
+        assert!(!log.contains(&sealed), "{log}");
+
+        // No reference: the span has no store and no identifier.
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let _ = send_store(&flow, "Accept: */*");
+        });
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(!close.contains("store="), "{close}");
+        assert!(!close.contains("identifier="), "{close}");
+
+        // A refused reference: nothing was injected, so the span has no
+        // store and no identifier, and says the substitution was refused.
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let (_, end) = send_store(&flow, &format!("x-api-key: {sealed}"));
+            assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{end:?}");
+        });
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(!close.contains("store="), "{close}");
+        assert!(!close.contains("identifier="), "{close}");
+        assert!(close.contains("refused"), "{close}");
     }
 
     // BEP-032: an admitted store reference reaches the rule's upstream with

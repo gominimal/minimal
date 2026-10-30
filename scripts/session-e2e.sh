@@ -441,6 +441,7 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+SR_ID="" # the store-reference proof's Keychain item; removed on teardown
 R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
 R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
@@ -1063,6 +1064,11 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  # The store-reference proof's Keychain item is in the developer's real
+  # Keychain, not under $WORK. Its rule is in $XDG_CONFIG_HOME, which the
+  # `rm -rf "$WORK"` below removes. `min secret rm` uses only the host store
+  # and starts no daemon, so it runs after the stop above.
+  [ -n "$SR_ID" ] && mnl secret rm "$SR_ID" </dev/null >/dev/null 2>&1
   [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
   # The round-three walk's planted audit segment: a proxy start refuses a
   # log that holds it, so a run that died with it in place must not keep it.
@@ -11758,8 +11764,11 @@ proof_published_proxy_routes_from_host() {
 # `bep serve` beside gvproxy on a production boot, and the proxy opens its
 # control socket under the real home. Records case $1 as NOT RUN and returns
 # 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
-# Keychain), without gvproxy (the daemon starts the proxy beside it) or
-# without a GitHub sign-in a person made with `min auth login`. Everywhere
+# Keychain), without gvproxy (the daemon starts the proxy beside it), or
+# without a GitHub sign-in a person made with `min auth login`. A case that
+# passes "no_sign_in" as $2 skips the sign-in check, and is NOT RUN without
+# a bep binary in its place (MINVMD_BEP_BIN, else the bep beside minvmd, as
+# rt_bep_bin resolves it; the macOS CI testbed ships none). Everywhere
 # else the proxy must come up, so a proxy that does not is a failure, never
 # NOT RUN.
 #
@@ -11787,10 +11796,21 @@ bep_live_gate() {
     not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
     return 1
   fi
-  lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
-  if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
-    not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
-    return 1
+  # A case that needs no GitHub sign-in passes "no_sign_in" as $2. Such a
+  # case can reach a lane that ships no bep binary, so only that case turns
+  # a missing binary into NOT RUN. For a signed-in case a missing binary
+  # stays a failure.
+  if [ "${2:-}" = no_sign_in ]; then
+    if ! rt_bep_bin >/dev/null 2>&1; then
+      not_run "$1" "no bep binary beside minvmd: set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+      return 1
+    fi
+  else
+    lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+    if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
+      not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+      return 1
+    fi
   fi
   if [ "$BEP_LIVE_DAEMON" != 1 ]; then
     unset MINVMD_BEP_STUB
@@ -12357,6 +12377,337 @@ proof_bep_first_slice_end_to_end() {
   fs_cleanup
   rm -f "${WORK:?}/${fs_case:?}".*
   echo "Box Egress Proxy first slice OK (spec, gh, clone and push of $fs_repo, a copied value refused on the host and in a second box, both boxes audited)"
+  echo "::endgroup::"
+}
+
+# Keychain secret by reference, end to end (BEP-032, BEP-033, BEP-050,
+# BEP-079, BEP-063, BEP-038, BEP-042). With the Box Egress Proxy running:
+#   1. `min secret set` stores a fresh random value under a fresh identifier
+#      from standard input, and writes its rule from --upstream and --header
+#      to the user-level config.toml. It prints the identifier, never the
+#      value, and `min secret list` names the identifier and no value.
+#   2. A box spec references the identifier as a broker grant scope.
+#      `min box spec` shows the reference with its registered upstream.
+#   3. The box sends its sealed value in the rule's header to an HTTPS echo
+#      service, E2E_BEP_STORE_ECHO_URL (default https://httpbin.org/headers).
+#      The default is a public third-party service that this repository does
+#      not control: it sees the request, and the case depends on it. The
+#      value it receives is a fresh random throwaway, never a real secret.
+#      Set E2E_BEP_STORE_ECHO_URL to an echo service you run to avoid it.
+#      The service answers with the headers it received. The box hashes the
+#      echoed header in a pipe and prints only the hash, so the echo is
+#      written to no file and no variable the box exports. The host compares
+#      the hash with the hash of the stored value: the upstream received the
+#      value, not the sealed value.
+#   4. The value is nowhere in the box: not in its environment and not in a
+#      file. The box searches for the value's shape (a fixed prefix and 32
+#      hex digits), so the search itself does not carry the value in.
+#   5. `min box audit` shows the admitted injection for the upstream by
+#      store and identifier, and neither the audit nor bep.log holds the
+#      value.
+# The case needs no GitHub sign-in. The value is never printed: the
+# transcript names only its length. The case removes the item at the end.
+bep_store_jsonl_check() { # $1 = the jsonl file, $2 = the upstream authority, $3 = the store, $4 = the identifier
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+path, upstream, store, ident = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+want = store + ":" + ident
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+hits = [r for r in records
+        if r.get("kind") == "decision" and r.get("decision") == "admit"
+        and r.get("upstream") == upstream
+        and r.get("identifier") == want]
+if not hits:
+    seen = sorted({"%s %s %s" % (r.get("decision"), r.get("upstream"), r.get("identifier"))
+                   for r in records if r.get("kind") == "decision"})
+    print("no admit record for %s names %s (decisions: %s)" % (upstream, want, "; ".join(seen) or "none"))
+    sys.exit(1)
+print("%d admitted injection(s) for %s, by %s" % (
+    len(hits), upstream, ", ".join(sorted({r.get("identifier") for r in hits}))))
+PY
+}
+
+proof_bep_store_reference_end_to_end() {
+  echo "::group::Box Egress Proxy: a Keychain secret by reference reaches its upstream and never enters the box"
+  local sr_case=bep_store_reference_end_to_end
+  local sr_url="${E2E_BEP_STORE_ECHO_URL:-https://httpbin.org/headers}"
+  local sr_host sr_id sr_value sr_out sr_spec sr_got sr_want sr_hits sr_scan sr_audit
+  local sr_name=e2e-bep-store-ref sr_header=X-Minimal-E2E-Probe sr_header_lc=x-minimal-e2e-probe
+  sr_host="${sr_url#https://}"
+  sr_host="${sr_host%%/*}"
+  if [ "$sr_host" = "$sr_url" ] || [ -z "$sr_host" ] || [[ "$sr_host" == *:* ]]; then
+    echo "::error::E2E_BEP_STORE_ECHO_URL is '$sr_url', not an https:// URL on port 443"
+    fail
+  fi
+  bep_live_gate "$sr_case" no_sign_in || { echo "::endgroup::"; return 0; }
+
+  sr_id="e2e-store-ref-$(date +%s)-$$"
+  sr_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID="" SR_ID="$sr_id"
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$SR_ID" ] && mnl secret rm "$SR_ID" </dev/null >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    # The proxy's connection spans name the box, the authority and the
+    # outcome of each request, never a value. On a redeemed store reference
+    # the `box_connection` span also carries `store` and `identifier`, as the
+    # audit record in step 5 does.
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | grep -vF -- "$sr_value" | tail -20 || true
+    sr_cleanup
+    rm -f "${WORK:?}/${sr_case:?}".*
+    fail
+  }
+
+  # 1. `min secret set`, with the value on standard input and the rule from
+  # the flags (BEP-050, BEP-079), then `min secret list` (BEP-052).
+  if ! sr_out="$(printf '%s' "$sr_value" | mnl secret set "$sr_id" \
+    --upstream "$sr_host" --header "$sr_header" --yes 2>"$WORK/$sr_case.set.err")"; then
+    echo "::error::'min secret set $sr_id --upstream $sr_host --header $sr_header' failed"
+    grep -vF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if printf '%s\n' "$sr_out" | grep -qF -- "$sr_value" \
+    || grep -qF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null; then
+    echo "::error::'min secret set' printed the value it stored"
+    sr_fail
+  fi
+  if ! printf '%s\n' "$sr_out" | grep -qF -- "$sr_id"; then
+    echo "::error::'min secret set' did not print the identifier $sr_id"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    sr_fail
+  fi
+  if ! grep -qF -- "$sr_id" "$XDG_CONFIG_HOME/minimal/config.toml" 2>/dev/null; then
+    echo "::error::'min secret set' wrote no rule for $sr_id to $XDG_CONFIG_HOME/minimal/config.toml"
+    sr_fail
+  fi
+  if ! sr_out="$(mnl secret list </dev/null 2>"$WORK/$sr_case.list.err")"; then
+    echo "::error::'min secret list' failed"
+    cat "$WORK/$sr_case.list.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if printf '%s\n' "$sr_out" | grep -qF -- "$sr_value"; then
+    echo "::error::'min secret list' printed the stored value"
+    sr_fail
+  fi
+  if ! printf '%s\n' "$sr_out" | grep -F -- "$sr_id" | grep -qF -- "$sr_host"; then
+    echo "::error::'min secret list' has no row for $sr_id with the upstream $sr_host"
+    echo "--- min secret list ---"; printf '%s\n' "$sr_out"
+    sr_fail
+  fi
+  echo "min secret set: stored $sr_id (${#sr_value} characters) with its rule for $sr_host, and printed no value"
+
+  # `bep serve` re-certifies the published root only at the next CONNECT,
+  # not when the registration changes. No CONNECT runs between
+  # `min secret set` and the activate in step 2, so that box would read the
+  # old root from the identity file and keep it. Stop the proxy, and let the
+  # restarted daemon pair start one that publishes a root with the new rule.
+  # minvmd does not restart a `bep serve` that exits.
+  # https://github.com/gominimal/minimal/issues/2746 removes this block.
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock" sr_pids
+  # r3_proxy_pids selects this run's proxy by its listener socket, so a
+  # proxy from another checkout or a person's own proxy is not stopped.
+  sr_pids="$(r3_proxy_pids)"
+  if [ -n "$sr_pids" ]; then
+    # shellcheck disable=SC2086
+    kill -TERM $sr_pids 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      [ -n "$(r3_proxy_pids)" ] || break
+      sleep 0.5
+    done
+    sr_pids="$(r3_proxy_pids)"
+    # shellcheck disable=SC2086
+    [ -n "$sr_pids" ] && kill -KILL $sr_pids 2>/dev/null
+    for _ in $(seq 1 20); do
+      bep_control_live "$sr_control" || break
+      sleep 0.5
+    done
+    if bep_control_live "$sr_control"; then
+      echo "::error::the proxy still answers on $sr_control after its process was stopped"
+      sr_fail
+    fi
+  fi
+  # The gate at the start of this case passed, so the proxy must come back
+  # here. Restart the daemon pair directly, not through bep_live_gate, so a
+  # failure is one failure and never also a NOT RUN row.
+  local sr_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  unset MINVMD_BEP_STUB
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! mnl ls >/dev/null 2>"$WORK/$sr_case.restart.err"; then
+    echo "::error::the daemon did not start again for $sr_case"
+    cat "$WORK/$sr_case.restart.err" 2>/dev/null || true
+    sr_fail
+  fi
+  for _ in $(seq 1 60); do
+    bep_control_live "$sr_control" && break
+    sleep 1
+  done
+  if ! bep_control_live "$sr_control"; then
+    echo "::error::the Box Egress Proxy is not serving: nothing answers on $sr_control 60 s after the VM host daemon started again"
+    echo "--- $sr_log (tail) ---"; tail -40 "$sr_log" 2>/dev/null || echo "(absent)"
+    sr_fail
+  fi
+  BEP_LIVE_DAEMON=1
+  echo "the proxy restarted with the rule for $sr_host"
+
+  # 2. The box spec references the identifier (BEP-032), and `min box spec`
+  # shows the reference with its upstream (BEP-038).
+  # Interim spelling: BEP-032 and Gatehouse 6.10 write a store reference as
+  # `source = "store"` with `store` and `id`. GrantSource in
+  # crates/boxes/src/core/bep.rs refuses `store` today, so this seed writes
+  # the identifier as a broker scope. When GrantSource accepts `store`, this
+  # seed writes `source = "store"`, `store = "keychain"` and `id`
+  # (https://github.com/gominimal/minimal/issues/2656).
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlstore.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
+    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "broker"\nscopes = ["%s"]\n' "$sr_id"
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+    echo "::error::'min box spec' of the store-reference project failed"
+    cat "$WORK/$sr_case.spec.err" 2>/dev/null || true
+    sr_fail
+  fi
+  sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r')"
+  if ! printf '%s\n' "$sr_spec" | grep -Eq -- "^store  $sr_id  E2E_STORE_KEY  upstream .*$sr_host"; then
+    echo "::error::'min box spec' has no line 'store  $sr_id  E2E_STORE_KEY  upstream $sr_host'"
+    echo "--- min box spec ---"; printf '%s\n' "$sr_spec"
+    sr_fail
+  fi
+  echo "min box spec: store $sr_id for E2E_STORE_KEY, upstream $sr_host"
+
+  # 3. The box, headless, with egress to the upstream only (BEP-036).
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream --allow-dns-hosts "$sr_host" \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the store-reference box failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+
+  # The box prints one word and the hash of the echoed header: "absent" when
+  # the echo has no such header, "sealed" when the upstream got the sealed
+  # value, and "other" for anything else. The echo stays in the pipe.
+  # shellcheck disable=SC2016 # expanded inside the box
+  if ! sr_out="$(mnl session exec "$SR_SID" sh -c '
+      command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
+      r="$(curl -fsS --max-time 60 -H "'"$sr_header"': $E2E_STORE_KEY" "'"$sr_url"'")" || exit 7
+      v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
+        | grep -o "\"'"$sr_header_lc"'\": *\"[^\"]*\"" | head -n1 \
+        | sed "s/^[^:]*: *\"//; s/\"\$//")"
+      r=""
+      if [ -z "$v" ]; then w=absent
+      elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
+      else w=other; fi
+      printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
+    ' </dev/null 2>"$WORK/$sr_case.request.err")"; then
+    echo "::error::the request from the box to $sr_url failed"
+    cat "$WORK/$sr_case.request.err" 2>/dev/null || true
+    sr_fail
+  fi
+  sr_got="$(printf '%s\n' "$sr_out" | tr -d '\r' | tail -n1)"
+  sr_want="other $(printf '%s' "$sr_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  case "$sr_got" in
+    "$sr_want") ;;
+    absent*)
+      echo "::error::$sr_host received no $sr_header header from the box"
+      sr_fail
+      ;;
+    sealed*)
+      echo "::error::$sr_host received the box's sealed value in $sr_header, not the stored value: the proxy did not inject it"
+      sr_fail
+      ;;
+    *)
+      echo "::error::$sr_host received a $sr_header value that is not the stored value (box answered '${sr_got%% *}')"
+      sr_fail
+      ;;
+  esac
+  echo "request from the box: $sr_host received the stored value in $sr_header"
+
+  # 4. The value is nowhere in the box: its environment holds the sealed
+  # value only, and no file holds the value.
+  if ! mnl session exec "$SR_SID" sh -c 'env' >"$WORK/$sr_case.env" 2>"$WORK/$sr_case.env.err"; then
+    echo "::error::'min session exec' in the store-reference box failed"
+    cat "$WORK/$sr_case.env.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$WORK/$sr_case.env"; then
+    echo "::error::the environment of the store-reference box holds the stored value"
+    sr_fail
+  fi
+  sr_out="$(sed -n 's/^E2E_STORE_KEY=//p' "$WORK/$sr_case.env" | tr -d '\r' | head -n1)"
+  rm -f "${WORK:?}/${sr_case:?}.env"
+  if ! [[ "$sr_out" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the E2E_STORE_KEY value of the store-reference box is not a sealed value (${#sr_out} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
+    sr_fail
+  fi
+  # grep exits 2 when it cannot read a file, even after it lists matches.
+  # So the host keeps the match list whatever the exit status, and fails on
+  # a match first. grep's own errors name paths only, never file content.
+  # shellcheck disable=SC2016 # $? and $s expand in the box's shell
+  sr_hits="$(mnl session exec "$SR_SID" sh -c \
+    'timeout 600 grep -rlIE "mne2e[0-9a-f]{32}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev; s=$?; [ "$s" -le 1 ] || exit "$s"' \
+    </dev/null 2>"$WORK/$sr_case.scan.err")"
+  sr_scan=$?
+  sr_hits="$(printf '%s\n' "$sr_hits" | tr -d '\r' | sed '/^$/d')"
+  if [ -n "$sr_hits" ]; then
+    echo "::error::files in the store-reference box hold a value of the stored value's shape:"
+    printf '%s\n' "$sr_hits"
+    sr_fail
+  fi
+  if [ "$sr_scan" -ne 0 ]; then
+    echo "::error::the file search in the store-reference box did not finish (exit $sr_scan)"
+    echo "--- search errors (tail) ---"
+    tail -n 20 "$WORK/$sr_case.scan.err" 2>/dev/null || true
+    sr_fail
+  fi
+  echo "store-reference box: E2E_STORE_KEY holds a sealed value (${#sr_out} characters), and no file or variable holds the stored value"
+
+  # 5. `min box audit` shows the injection by store and identifier (BEP-042),
+  # and no host record holds the value (BEP-033).
+  if ! mnl box audit "$sr_name" -o jsonl </dev/null \
+    >"$WORK/$sr_case.audit" 2>"$WORK/$sr_case.audit.err"; then
+    echo "::error::'min box audit $sr_name' failed"
+    cat "$WORK/$sr_case.audit.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$WORK/$sr_case.audit"; then
+    echo "::error::'min box audit $sr_name' holds the stored value"
+    sr_fail
+  fi
+  if ! sr_audit="$(bep_store_jsonl_check "$WORK/$sr_case.audit" "$sr_host:443" keychain "$sr_id")"; then
+    echo "::error::'min box audit $sr_name': $sr_audit"
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+    echo "::error::bep.log holds the stored value"
+    sr_fail
+  fi
+  echo "min box audit $sr_name: $sr_audit"
+
+  sr_cleanup
+  SR_SID="" SR_ID=""
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Keychain secret by reference OK ($sr_id set with its rule, referenced in a box spec, received by $sr_host, absent from the box, audited)"
   echo "::endgroup::"
 }
 
@@ -26976,6 +27327,7 @@ case "${1:-}" in
     proof_bep_git_and_gh_against_private_repo
     proof_bep_git_credential_helper_sends_header
     proof_bep_first_slice_end_to_end
+    proof_bep_store_reference_end_to_end
     proof_bep_signing_rotation_keeps_running_box_working
     proof_bep_proxy_env_and_no_proxy_are_set
     proof_bep_proxy_env_sets_node_use_env_proxy
@@ -27055,6 +27407,7 @@ case "${1:-}" in
     | bep_git_and_gh_against_private_repo \
     | bep_git_credential_helper_sends_header \
     | bep_first_slice_end_to_end \
+    | bep_store_reference_end_to_end \
     | bep_signing_rotation_keeps_running_box_working \
     | bep_proxy_env_and_no_proxy_are_set \
     | bep_proxy_env_sets_node_use_env_proxy \
@@ -27116,7 +27469,7 @@ case "${1:-}" in
     echo "         bep_second_box_needs_no_sign_in"
     echo "         bep_box_env_holds_sealed_value_only"
     echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
-    echo "         bep_first_slice_end_to_end"
+    echo "         bep_first_slice_end_to_end bep_store_reference_end_to_end"
     echo "         bep_signing_rotation_keeps_running_box_working"
     echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
     echo "         bep_root_ca_present_in_box_trust_store"

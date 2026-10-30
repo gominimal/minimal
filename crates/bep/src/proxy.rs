@@ -344,6 +344,28 @@ impl fmt::Debug for Proxy {
     }
 }
 
+/// The `box_connection` span of one box connection. It carries the box id,
+/// the authority the box asked for, the upstream's validation outcome, the
+/// last substitution decision, whether an admission was cohort-attributed,
+/// and the outcome. When a store reference is redeemed it also carries the
+/// `store` and the `identifier`, with the names the audit record uses
+/// (BEP-028, Gatehouse 6.10). It never carries a credential or a stored
+/// value.
+pub(crate) fn connection_span(box_id: &str, source: &dyn std::fmt::Display) -> tracing::Span {
+    tracing::info_span!(
+        "box_connection",
+        box_id = %box_id,
+        source = %source,
+        authority = tracing::field::Empty,
+        upstream_tls = tracing::field::Empty,
+        substitution = tracing::field::Empty,
+        cohort_attributed = tracing::field::Empty,
+        store = tracing::field::Empty,
+        identifier = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+}
+
 impl Proxy {
     /// A proxy that admits `admission`, issues leaves from `leaves`, and
     /// validates upstreams against `upstream_roots`. The interception root
@@ -399,26 +421,13 @@ impl Proxy {
         self
     }
 
-    /// Serves one admitted box connection. The span carries the box id, the
-    /// authority the box asked for, the upstream's validation outcome, the
-    /// last substitution decision, whether an admission was
-    /// cohort-attributed, and the outcome. It never carries a
-    /// credential.
+    /// Serves one admitted box connection, in [`connection_span`].
     pub async fn serve<S>(&self, delivery: Delivery, stream: S)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let box_id = delivery.box_id_text();
-        let span = tracing::info_span!(
-            "box_connection",
-            box_id = %box_id,
-            source = %delivery.source,
-            authority = tracing::field::Empty,
-            upstream_tls = tracing::field::Empty,
-            substitution = tracing::field::Empty,
-            cohort_attributed = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
+        let span = connection_span(&box_id, &delivery.source);
         async {
             let outcome = self.serve_inner(&box_id, stream).await;
             tracing::Span::current().record("outcome", outcome.word());
