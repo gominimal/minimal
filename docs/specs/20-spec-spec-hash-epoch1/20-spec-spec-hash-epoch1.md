@@ -116,10 +116,10 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p graph epoch1_injectivity_bounded
   property: for all canonical a, b: a != b implies encode(a) != encode(b)
   harness:  kani_epoch1_injectivity_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2), unwind 9 (the
-    8-byte string loop; a 3-element list loop needs 4). The bound is the
-    starting point. The codec PR measures the harness and records the
-    bound it ran at
+    (3 elements per list, 8 bytes per string, depth 2), unwind 33 (the
+    32-byte edge-key loop, as EPOCH-013's member keys; strings and lists
+    need less). The bound is the starting point. The codec PR measures the
+    harness and records the bound it ran at
 
 - **EPOCH-002** WHEN a permutation reorders a spec's edges, or an edge is
   listed more than once, THE SYSTEM SHALL produce an identical encoding.
@@ -135,7 +135,8 @@ build-infra operator. Release manager.
   property: for all bounded specs x: decode(encode(x)) == canon(x), and
     canon(canon(x)) == canon(x)
   harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2), unwind 9
+    (3 elements per list, 8 bytes per string, depth 2), unwind 33 (the
+    32-byte edge-key loop)
 
 - **EPOCH-004** THE SYSTEM SHALL encode every collision-witness pair of
   the epoch-0 defect catalog to distinct outputs.
@@ -191,13 +192,16 @@ build-infra operator. Release manager.
     reader does not know, THEN THE SYSTEM SHALL refuse the whole file.
     tier:   T2
     verify: cargo nextest run -p rcache index_of_mixed_or_unknown_epoch_is_refused
-    property: for all records r: decode(r) succeeds only when flags(r) is
-      a known epoch, and fails at the flags field before the key bytes
-    harness: the index reader's existing harness
-      `nonzero_flags_always_rejected` (`crates/rcache/src/index_file.rs`),
-      which today proves that any non-zero flags value fails at the flags
-      field, becomes `unknown_epoch_always_rejected` over the same record
-      shape and keeps its unwind bound
+    property: for all files f: read(f) succeeds only when every record's
+      flags is one known epoch and all records share it; a record whose
+      flags is not a known epoch fails at the flags field before the key
+      bytes
+    harness: kani_index_file_one_epoch_or_refused, exhaustive over files of
+      two records with symbolic flags (one epoch accepted; two known epochs
+      refused; an unknown epoch refused at the flags field), unwind 3 (the
+      two-record loop). The index reader's existing one-record harness
+      `nonzero_flags_always_rejected` (`crates/rcache/src/index_file.rs`)
+      becomes `unknown_epoch_always_rejected` and covers the per-record half
 
 - **EPOCH-010** THE SYSTEM SHALL exclude a spec's `tests` from its canonical
   form.
@@ -220,10 +224,11 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p rcache epoch_follows_pinned_index
   property: for all pins p whose index holds a record, specs s:
     lookup_key(p, s) == hash(epoch(index(p)), encode_epoch(index(p))(s))
-  - IF a lookup reads several indexes as one (an upstream with sideloads,
-    or a per-commit snapshot with the root index as its fallback) AND two
-    of them declare different epochs THEN THE SYSTEM SHALL refuse the
-    lookup and name both indexes.
+  - IF a lookup reads several indexes as one (an upstream with its
+    sideloads) AND two of them declare different epochs THEN THE SYSTEM
+    SHALL refuse the lookup and name both indexes. A per-commit snapshot
+    and the root index it falls back to are the next rule's case, not this
+    one's: that pair is never read as one when the epochs differ.
     tier:   T0
     verify: cargo nextest run -p rcache union_of_two_epochs_is_refused
   - WHILE a per-commit snapshot and the root index it falls back to declare
