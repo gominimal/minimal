@@ -723,10 +723,10 @@ async fn create_registering<C: Send>(
             .as_ref()
             .map(|registration| registration.task_addresses.clone())
             .unwrap_or_default();
-        config.box_id = row
-            .registration
-            .as_ref()
-            .and_then(|registration| registration.box_id);
+        // The id the VM host daemon minted stays on the row, for the
+        // withdrawal. The create relays none: the in-VM daemon takes the
+        // id from the VM host daemon alone (BOX-002).
+        config.box_id = None;
         let error = match create(client, config.clone()).await {
             Ok(Errorable::Ok(created)) => return Ok((created, row)),
             Ok(Errorable::Err { error }) => error,
@@ -948,6 +948,7 @@ mod tests {
             }),
             "the create carries the handed addresses"
         );
+        assert_eq!(config.box_id, None, "the create relays no box id");
         let registration = row.registration.as_ref().expect("the row is the create's");
         assert_eq!(registration.box_id, Some(box_id));
         assert!(

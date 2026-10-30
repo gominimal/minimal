@@ -774,18 +774,20 @@ fn mint_grants(
     })
 }
 
-/// Mints the box's GitHub grants for the box id `request` carries, and puts
+/// Mints the box's GitHub grants for the box id `box_id` the registration
+/// handed back, and puts
 /// each grant's sealed value on the request for the box's launches to place
 /// (BEP-005, BEP-007), with the proxy's root certificate (BEP-072). Does nothing for a box with no GitHub grant. No box
 /// exists yet, so a failure only withdraws the row the box's registration
 /// bought (T66).
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
+    registered_id: Option<minimald_rpc::BoxId>,
     github_grants: &[String],
     control_sock: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::mint::ProxyRegistration>, anyhow::Error> {
     let grants = github_grants.to_vec();
-    let box_id = request.config.box_id.map(|box_id| box_id.to_string());
+    let box_id = registered_id.map(|box_id| box_id.to_string());
     let egress = request
         .config
         .policy
@@ -816,7 +818,7 @@ async fn mint_into_request(
                 control_sock,
                 request.config.name.as_deref(),
                 request.config.box_addresses,
-                request.config.box_id,
+                registered_id,
             )
             .await;
             Err(error)
@@ -1443,32 +1445,27 @@ pub(crate) async fn activate_box(
             .await?;
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
-            request.config.box_addresses = registered
-                .as_ref()
-                .map(|registration| registration.addresses);
-            request.config.task_addresses = registered
-                .as_ref()
-                .map(|registration| registration.task_addresses.clone())
-                .unwrap_or_default();
-            request.config.box_id = registered
-                .as_ref()
-                .and_then(|registration| registration.box_id);
+            // The id stays here: the create relays none (BOX-002).
+            carry_registration(&mut request.config, registered.as_ref());
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
     // Gatehouse §6.2: a GitHub grant box with no box id or no stance has no
     // proxy to serve its grant. It is refused before the create, and the
     // row the registration bought is withdrawn (T66).
+    let registered_id = registered
+        .as_ref()
+        .and_then(|registration| registration.box_id);
     if let Err(refused) = grant_box_facts(
         &github_grants,
-        request.config.box_id.map(|box_id| box_id.to_string()),
+        registered_id.map(|box_id| box_id.to_string()),
         request.config.network,
     ) {
         withdraw_box_row(
             control_sock.clone(),
             request.config.name.as_deref(),
             request.config.box_addresses,
-            request.config.box_id,
+            registered_id,
         )
         .await;
         return Err(refused.into());
@@ -1487,6 +1484,7 @@ pub(crate) async fn activate_box(
     let mut proxy_registration = ActivationStep::MintGrants
         .run(mint_into_request(
             &mut request,
+            registered_id,
             &github_grants,
             control_sock.clone(),
         ))
@@ -1502,6 +1500,14 @@ pub(crate) async fn activate_box(
     let created = ActivationStep::CreateSession
         .run(async {
             let created = loop {
+                // The id the VM host daemon minted stays with this client. The
+                // create request carries none (BOX-002).
+                tracing::info!(
+                    registered_box_id = ?registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                    "creating the box with no box id on the request; the client keeps the registered id"
+                );
                 let resp = client.oneshot_rpc::<CreateSession>(request.clone()).await;
                 let resp = match resp {
                     Ok(resp) => resp,
@@ -1566,21 +1572,15 @@ pub(crate) async fn activate_box(
                                 || autogen_session_name(&utf8_path, &random_hex4()),
                             )
                             .await?;
-                            request.config.box_addresses = registered
-                                .as_ref()
-                                .map(|registration| registration.addresses);
-                            request.config.task_addresses = registered
-                                .as_ref()
-                                .map(|registration| registration.task_addresses.clone())
-                                .unwrap_or_default();
-                            request.config.box_id = registered
-                                .as_ref()
-                                .and_then(|registration| registration.box_id);
+                            carry_registration(&mut request.config, registered.as_ref());
                             // The sealed values name the abandoned id, so the
                             // new one gets its own (BEP-007). The replaced
                             // registration forgets the old id at the proxy.
                             proxy_registration = mint_into_request(
                                 &mut request,
+                                registered
+                                    .as_ref()
+                                    .and_then(|registration| registration.box_id),
                                 &github_grants,
                                 control_sock.clone(),
                             )
