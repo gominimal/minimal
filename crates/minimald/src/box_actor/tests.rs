@@ -3328,8 +3328,34 @@ async fn own_ip_default_deny_all() {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// The running test's [`declared_port`], drawn once per test thread.
-    static DECLARED_PORT: u16 = port_of(&listening_socket());
+    /// The running test's [`declared_port`], leased once per test thread.
+    /// The lease's lock file is held until the thread ends.
+    static DECLARED_PORT: (u16, std::fs::File) = lease_declared_port();
+}
+
+/// The ports [`declared_port`] leases from. The band sits below the kernel's
+/// ephemeral range (32768 and up on Linux), so no other process's `bind(0)`
+/// or outbound `connect` is handed one between the lease and the finalize's
+/// probe, and no fixed port in the tree falls inside it.
+const DECLARED_PORTS: std::ops::Range<u16> = 23_000..24_000;
+
+/// Leases a port from [`DECLARED_PORTS`]: the first one whose lock file this
+/// process can lock, among every test process on the host, and that nothing
+/// already listens on at `127.0.0.1`. The port itself stays unbound, because
+/// the finalize under test must find it free.
+fn lease_declared_port() -> (u16, std::fs::File) {
+    let dir = std::env::temp_dir().join("minimald-test-ports");
+    std::fs::create_dir_all(&dir).expect("create the port lease directory");
+    for port in DECLARED_PORTS {
+        let lock = std::fs::File::create(dir.join(format!("{port}.lock")))
+            .expect("open a port lease file");
+        if lock.try_lock().is_ok()
+            && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+        {
+            return (port, lock);
+        }
+    }
+    panic!("every port in {DECLARED_PORTS:?} is leased or in use");
 }
 
 /// The host port every own-address box of the running test declares, in
@@ -3337,11 +3363,11 @@ thread_local! {
 /// something else holds at the box's published address (NET-144), and
 /// nextest runs tests side by side on one host: two tests declaring one
 /// fixed port at `127.0.0.1` can refuse each other's box. So each test
-/// draws its own free port, and every box within the test shares it, which
-/// the collision tests need. The test body runs on the test's own thread,
-/// so a thread-local is one port per test.
+/// leases its own port, and every box within the test shares it, which the
+/// collision tests need. The test body runs on the test's own thread, so a
+/// thread-local is one port per test.
 fn declared_port() -> u16 {
-    DECLARED_PORT.with(|port| *port)
+    DECLARED_PORT.with(|(port, _)| *port)
 }
 
 /// An own-address session's config: a box that declares one published port —
