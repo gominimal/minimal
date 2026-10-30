@@ -832,6 +832,22 @@ pub struct RowStandingRequest {
     pub box_id: Option<BoxId>,
 }
 
+/// The in-VM daemon's ask for the id of a box it is about to create
+/// ([`BoxControlRequest::MintBoxId`], BOX-002). The VM host daemon mints
+/// every box id on an un-enrolled host and hands it to the in-VM daemon,
+/// so the in-VM daemon never mints one and never takes one from its
+/// client. Answered with [`BoxControlReply::BoxIdMinted`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MintBoxIdRequest {
+    /// The switch address the box's registration handed it, when the box
+    /// has one. The VM host daemon answers with the id it minted for the
+    /// row at that address, so the box's record and its host row name one
+    /// id. `None` for a box with no row: the VM host daemon mints a fresh
+    /// id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_address: Option<std::net::Ipv4Addr>,
+}
+
 /// A name to hold in the host's zone without a row behind it
 /// ([`BoxControlRequest::HoldBoxName`]): the interim a `host_ip` box's
 /// name answers NODATA — the box exists, no address to tell — instead
@@ -1425,6 +1441,10 @@ pub enum BoxControlRequest {
     /// steered name with the proxy's address only while the answer is
     /// `true`, and SERVFAIL otherwise.
     ProxyListening,
+    /// The in-VM daemon's ask for the id of a box it is about to create
+    /// ([`MintBoxIdRequest`], BOX-002): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::BoxIdMinted`].
+    MintBoxId(MintBoxIdRequest),
     /// The in-VM daemon's report of one dynamic ingress decision
     /// ([`ExposeDecisionReport`], NET-046): carried on the daemon's own
     /// control channel, appended to the host's audit log, and answered with
@@ -1818,6 +1838,15 @@ pub enum BoxControlReply {
     Audited {
         /// Whether a record was written.
         audited: bool,
+    },
+    /// The mint verb's answer (BOX-002): the id the VM host daemon minted
+    /// for the box the in-VM daemon is about to create. `minted_box_id` is
+    /// required — the marker that keeps this document from decoding as any
+    /// other reply.
+    BoxIdMinted {
+        /// The box's id. The in-VM daemon files the box's record under it.
+        #[serde(with = "boxes::box_id_hex")]
+        minted_box_id: BoxId,
     },
 }
 
@@ -3434,6 +3463,41 @@ mod box_listing_tests {
             ShowBox::NAME,
             constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox")
         );
+    }
+}
+
+#[cfg(test)]
+mod mint_box_id_tests {
+    use super::*;
+
+    /// BOX-002: the mint verb and its answer survive the wire, the answer
+    /// decodes as itself among the untagged replies, and an ask with no
+    /// switch address spells none.
+    #[test]
+    fn mint_box_id_request_and_reply_round_trip() {
+        for request in [
+            BoxControlRequest::MintBoxId(MintBoxIdRequest::default()),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+            }),
+        ] {
+            let line = serde_json_lenient::to_string(&request).unwrap();
+            assert!(line.contains(r#""verb":"mint_box_id""#), "{line}");
+            let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+            assert_eq!(back, request);
+        }
+        let bare = serde_json_lenient::to_string(&BoxControlRequest::MintBoxId(
+            MintBoxIdRequest::default(),
+        ))
+        .unwrap();
+        assert!(!bare.contains("switch_address"), "{bare}");
+
+        let reply = BoxControlReply::BoxIdMinted {
+            minted_box_id: BoxId::mint(),
+        };
+        let line = serde_json_lenient::to_string(&reply).unwrap();
+        let back: BoxControlReply = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(back, reply);
     }
 }
 

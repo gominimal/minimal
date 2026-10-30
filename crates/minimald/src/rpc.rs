@@ -994,6 +994,7 @@ async fn serve_answerer_control(
                 | BoxControlRequest::ResumeBox(_)
                 | BoxControlRequest::RowStanding(_)
                 | BoxControlRequest::ProxyListening
+                | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
                 | BoxControlRequest::ReportRefusedEgress(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \

@@ -3484,3 +3484,154 @@ async fn retained_session_survives_restart_then_lists_reads_and_resumes() {
     assert_eq!(resumed.name.as_deref(), Some("kept-session"));
     assert_eq!(listed(&mut client, left).await.state, "stopped");
 }
+
+/// A stand-in for the VM host daemon's report door at `door`: it answers
+/// each mint ask with the next reply in `replies` and hands the ask it read
+/// to the returned receiver.
+fn mint_door(
+    door: &std::path::Path,
+    replies: Vec<minimald_rpc::BoxControlReply>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
+    let (asks_tx, asks) = tokio::sync::mpsc::unbounded_channel();
+    let task = crate::traced::spawn(async move {
+        for reply in replies {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .expect("read the ask");
+            let ask = serde_json_lenient::from_str(line.trim()).expect("the ask parses");
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the test may drop its receiver once it has its answer"
+            )]
+            let _ = asks_tx.send(ask);
+            let mut out = serde_json_lenient::to_string(&reply).unwrap();
+            out.push('\n');
+            write
+                .write_all(out.as_bytes())
+                .await
+                .expect("write the reply");
+        }
+    });
+    (task, asks)
+}
+
+/// The control socket of the switch [`manager_over`] hands its manager:
+/// the key a stand-in report door is seeded under.
+fn manager_switch_control(state: &std::path::Path) -> std::path::PathBuf {
+    crate::net::SwitchClient::new("/nonexistent/gvproxy", state.join("gvproxy")).control_socket()
+}
+
+/// BOX-002: on a VM guest a create files the box under the id the VM host
+/// daemon mints, and never under the id the request carries. A box with a
+/// row asks for its row's id by the switch address its registration
+/// handed. A mint the VM host daemon refuses refuses the create and leaves
+/// no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let rowless = SessionId::mint();
+    let rowed = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: rowless,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: rowed,
+            },
+            minimald_rpc::BoxControlReply::Error {
+                error: "the VM host daemon holds no box registration at 100.64.0.9".to_string(),
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    // A box with no row: the VM host daemon mints a fresh id.
+    let client = SessionId::mint();
+    let mut config = sample_config();
+    config.box_id = Some(client);
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, rowless, "the box takes the VM host daemon's id");
+    assert_eq!(
+        asks.recv().await.unwrap(),
+        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+            switch_address: None
+        }),
+    );
+    let shown = mngr.show_box(id).await.unwrap().expect("the box is filed");
+    assert_eq!(shown.record.box_id, rowless);
+    assert!(
+        mngr.show_box(client).await.unwrap().is_none(),
+        "no box is filed under the request's id"
+    );
+
+    // A box with a row: the ask names its switch address, and the record
+    // names the row's id as its own id and as its row id.
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 0, 8);
+    let mut config = sample_config();
+    config.name = Some("rowed".to_string());
+    config.box_id = Some(client);
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address,
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, rowed);
+    assert_eq!(
+        asks.recv().await.unwrap(),
+        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+            switch_address: Some(switch_address)
+        }),
+    );
+    let handle = session(&mngr, id).await;
+    let record = handle.record().await.unwrap();
+    assert_eq!((record.id, record.box_id), (rowed, Some(rowed)));
+
+    // A refused mint refuses the create.
+    let mut config = sample_config();
+    config.name = Some("refused".to_string());
+    config.box_id = Some(client);
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 9),
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let err = mngr.create_session(config, None).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the VM host daemon gave the new session no id: the VM host daemon holds no box \
+         registration at 100.64.0.9. No session was created."
+    );
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
+/// BOX-001: on a native host the store mints the id, and the id the
+/// request carries names nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_create_ignores_a_client_supplied_box_id() {
+    let (_state, _cache, mngr) = manager().await;
+    let client = SessionId::mint();
+    let mut config = sample_config();
+    config.box_id = Some(client);
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_ne!(id, client);
+    let record = session(&mngr, id).await.record().await.unwrap();
+    assert_eq!(record.box_id, None, "a native box has no row id");
+    assert!(mngr.show_box(client).await.unwrap().is_none());
+}

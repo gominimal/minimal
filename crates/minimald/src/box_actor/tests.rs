@@ -3424,6 +3424,82 @@ fn own_ip_handed_session_req(
 /// The box id every handed session in these tests was registered as.
 const HANDED_BOX_ID: minimald_rpc::BoxId = minimald_rpc::BoxId::from_bytes([0x42; 16]);
 
+/// The control socket of `server`'s switch: the key a stand-in report
+/// door is seeded under. Read before any box exists, so a fixture can seed
+/// the door that hands a box its id at the create.
+async fn daemon_switch_control(server: &TestServer) -> std::path::PathBuf {
+    server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("gvproxy")
+        .join(server.state.daemon_id().await)
+        .join("gvproxy-api.sock")
+        .into_std_path_buf()
+}
+
+/// A stand-in VM host report door at `server`'s switch, and a handed
+/// own-address box finalized with its id handed over it (BOX-002). The door
+/// answers the create's mint with [`HANDED_BOX_ID`], the id the box's
+/// registration minted, so the record and the host row name one id. The
+/// door is unseeded again before the finalize, so the box publishes the
+/// way a native-shaped test box does. Returns the box's id, the switch
+/// control socket and the door, which a test seeds again to drive its
+/// row reads.
+async fn finalize_door_handed_own_ip_session(
+    server: &TestServer,
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> (
+    SessionId,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+        tokio::sync::mpsc::UnboundedSender<minimald_rpc::BoxControlReply>,
+    ),
+) {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let sock = daemon_switch_control(server).await;
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: HANDED_BOX_ID,
+        })
+        .expect("the report door stand-in lives");
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    let id = client
+        .call::<CreateSession>(&own_ip_handed_session_req(name, switch, loopback))
+        .await
+        .unwrap()
+        .id;
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    assert_eq!(id, HANDED_BOX_ID, "the box takes the VM host daemon's id");
+    assert_eq!(
+        reads.recv().await.expect("the report door stand-in lives"),
+        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+            switch_address: Some(switch),
+        }),
+        "the create asks for its row's id by its switch address"
+    );
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(client, id).await;
+    (id, sock, door_sock, (door, reads, replies))
+}
+
 /// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
 /// and returns its id. No attach ever happens along the way: the box is
 /// finalised and its name registered while no client has connected — the
@@ -4452,7 +4528,8 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
     let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 28);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_handed_own_ip_session(
+    let (id, sock, door_sock, (door, mut reads, replies)) = finalize_door_handed_own_ip_session(
+        &server,
         &mut client,
         "exec-resumed",
         switch_address,
@@ -4469,15 +4546,17 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
         .ensure_host("tester".to_string())
         .await
         .expect("the box's first launch binds its row");
-    let sock = handle
-        .net_switch()
-        .await
-        .unwrap()
-        .lock()
-        .await
-        .control_socket();
-    let door_sock = sock.with_file_name("row-door.sock");
-    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    assert_eq!(
+        sock,
+        handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket(),
+        "the door was seeded at the box's switch"
+    );
     crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
 
     host.kill(false).await.expect("the box's host ends");
@@ -4542,7 +4621,8 @@ async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
     let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 31);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_handed_own_ip_session(
+    let (id, sock, door_sock, (door, mut reads, replies)) = finalize_door_handed_own_ip_session(
+        &server,
         &mut client,
         "exec-row-expired",
         switch_address,
@@ -4559,15 +4639,17 @@ async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
         .ensure_host("tester".to_string())
         .await
         .expect("the box's first launch binds its row");
-    let sock = handle
-        .net_switch()
-        .await
-        .unwrap()
-        .lock()
-        .await
-        .control_socket();
-    let door_sock = sock.with_file_name("row-door.sock");
-    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    assert_eq!(
+        sock,
+        handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket(),
+        "the door was seeded at the box's switch"
+    );
     crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
 
     host.kill(false).await.expect("the box's host ends");
@@ -4692,7 +4774,8 @@ async fn ensure_host_reuses_a_relaunched_host_without_the_report_door() {
     let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 29);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_handed_own_ip_session(
+    let (id, sock, door_sock, (door, _reads, replies)) = finalize_door_handed_own_ip_session(
+        &server,
         &mut client,
         "exec-rejoined",
         switch_address,
@@ -4709,15 +4792,17 @@ async fn ensure_host_reuses_a_relaunched_host_without_the_report_door() {
         .ensure_host("tester".to_string())
         .await
         .expect("the box's first launch binds its row");
-    let sock = handle
-        .net_switch()
-        .await
-        .unwrap()
-        .lock()
-        .await
-        .control_socket();
-    let door_sock = sock.with_file_name("row-door.sock");
-    let (door, _reads, replies) = fake_report_door(&door_sock).await;
+    assert_eq!(
+        sock,
+        handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket(),
+        "the door was seeded at the box's switch"
+    );
     crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
 
     host.kill(false).await.expect("the box's host ends");

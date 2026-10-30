@@ -27,6 +27,7 @@ enum StoreMessage {
     Handles(oneshot::Sender<Result<Vec<BoxRecordHandle>, std::io::Error>>),
     Create(
         Box<Record>,
+        Option<SessionId>,
         oneshot::Sender<Result<BoxRecordHandle, std::io::Error>>,
     ),
     Find(
@@ -123,16 +124,33 @@ impl Store {
     /// record carries is overwritten: a client never names a box's id. A
     /// minted id that a retained record already names refuses the
     /// creation and leaves the store unchanged (BEP-070).
-    fn create(&mut self, mut record: Record) -> Result<DiskBoxKey, std::io::Error> {
-        let id = (self.mint)();
+    ///
+    /// `handed` is the id the VM host daemon minted for the box (BOX-002).
+    /// The store files the record under it in place of its own mint, with
+    /// the same refusal.
+    fn create(
+        &mut self,
+        mut record: Record,
+        handed: Option<SessionId>,
+    ) -> Result<DiskBoxKey, std::io::Error> {
+        let id = handed.unwrap_or_else(self.mint);
         if self.store.find_by_id(&id)?.is_some() {
             tracing::warn!(
                 box_id = %id,
+                handed = handed.is_some(),
                 "refused a create: the minted box id is already held by a retained record"
             );
+            // A fresh mint differs on the next run. The VM host daemon
+            // hands a box with a row the same id again, so a retry does
+            // not help there.
+            let next = if handed.is_some() {
+                ""
+            } else {
+                " Run the command again."
+            };
             return Err(std::io::Error::other(format!(
                 "the new session's id {id} is already in use by another session. \
-                 No session was created. Run the command again."
+                 No session was created.{next}"
             )));
         }
         record.id = id;
@@ -157,8 +175,8 @@ impl Store {
             StoreMessage::Handles(r) => {
                 let _ = r.send(Ok(self.store.keys().map(|k| self.handle_for(k)).collect()));
             }
-            StoreMessage::Create(record, r) => {
-                let created = self.create(*record);
+            StoreMessage::Create(record, handed, r) => {
+                let created = self.create(*record, handed);
                 let _ = r.send(created.map(|k| self.handle_for(k)));
             }
             StoreMessage::Find(pred, r) => {
@@ -233,7 +251,25 @@ impl StoreHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(StoreMessage::Create(Box::new(record), send))
+            .send(StoreMessage::Create(Box::new(record), None, send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// [`Self::create`] under `id`, the id the VM host daemon minted for
+    /// the box (BOX-002), in place of the store's own mint. The record's
+    /// `id` is ignored the same way, and an `id` that a retained record
+    /// already names refuses the creation the same way.
+    pub async fn create_under(
+        &self,
+        record: Record,
+        id: SessionId,
+    ) -> Result<BoxRecordHandle, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(StoreMessage::Create(Box::new(record), Some(id), send))
             .await;
         recv.await.expect("corresponding store is dead")
     }

@@ -1039,6 +1039,14 @@ fn serve_request(
             };
             write_reply(stream, &reply)
         }
+        // BOX-002: the in-VM daemon asks for the id of the box it is about
+        // to create, and files the box's record under the answer. No
+        // ticket: the answer changes no row, no liveness and no
+        // attribution. A box with a row takes the id its registration
+        // minted, so the record and the row name one id.
+        (BoxControlRequest::MintBoxId(request), ControlDoor::GuestReports) => {
+            write_reply(stream, &mint_box_id_reply(boxes, &request))
+        }
         // A read of the host's own proxy, like the row read: no ticket.
         // The proxy runs on the host, so the in-VM daemon asks here before
         // its DNS gate answers a steered name with the proxy's address
@@ -1142,6 +1150,49 @@ fn serve_request(
         // the wrong door is a client built against another posture, not a
         // frame to drop silently.
         (request, door) => refused_wrong_door(stream, &request, door),
+    }
+}
+
+/// The mint verb's answer (BOX-002): the id of the box the in-VM daemon
+/// is about to create. A request that names a switch address takes the id
+/// the box's registration minted for its row there, so the record and the
+/// row name one id. A request that names none takes a fresh mint. A named
+/// address that holds no box row is refused: the box's registration is
+/// gone, and a fresh id would name a box no row stands for.
+fn mint_box_id_reply(
+    boxes: &BoxRegistry,
+    request: &minimald_rpc::MintBoxIdRequest,
+) -> BoxControlReply {
+    let (box_id, source) = match request.switch_address {
+        None => (crate::bep_attach::mint_record_box_id(), "fresh"),
+        Some(switch_address) => {
+            let row_id = boxes
+                .table()
+                .by_source(switch_address.octets())
+                .filter(|record| !record.is_task_row())
+                .map(|record| minimald_rpc::BoxId::from_bytes(record.box_id()));
+            let Some(box_id) = row_id else {
+                tracing::warn!(
+                    %switch_address,
+                    "refused a box id mint: no box row stands at the switch address"
+                );
+                return BoxControlReply::Error {
+                    error: format!(
+                        "the VM host daemon holds no box registration at {switch_address}"
+                    ),
+                };
+            };
+            (box_id, "registration")
+        }
+    };
+    tracing::info!(
+        box_id = %box_id,
+        switch_address = ?request.switch_address,
+        source,
+        "minted the box id for an in-VM create"
+    );
+    BoxControlReply::BoxIdMinted {
+        minted_box_id: box_id,
     }
 }
 
@@ -1450,6 +1501,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::MintBoxId(_) => "mint_box_id",
         BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
         BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
     }
@@ -3670,7 +3722,9 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -4149,7 +4203,9 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -4270,7 +4326,8 @@ mod tests {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }
-                | BoxControlReply::Audited { .. }) => {
+                | BoxControlReply::Audited { .. }
+                | BoxControlReply::BoxIdMinted { .. }) => {
                     panic!(
                         "a box verb is never answered with a proxy-listening read, got {other:?}"
                     )
@@ -4343,7 +4400,9 @@ mod tests {
             other @ BoxControlReply::RowStanding { .. } => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ (BoxControlReply::ProxyListening { .. } | BoxControlReply::Audited { .. }) => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -5303,6 +5362,74 @@ mod tests {
         assert!(!row.was_attributed(), "the read attributes nothing");
         assert!(!row.is_detached(), "the read detaches nothing");
         assert_eq!(registry.live_switch_addrs(), 1, "the read frees nothing");
+    }
+
+    /// BOX-002: the guest door mints the id of a box the in-VM daemon is
+    /// about to create. A box with a row takes the id its registration
+    /// minted. A box with no row takes a fresh UUIDv7. An address that
+    /// holds no row is refused, and the host socket does not serve the
+    /// verb.
+    #[test]
+    fn guest_door_mints_the_box_id_for_an_in_vm_create() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let mint = |switch_address| {
+            control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest { switch_address }),
+            )
+            .expect("the mint is answered")
+        };
+        assert_eq!(
+            mint(Some(web.switch_address)),
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: web.box_id
+            },
+            "a box with a row takes its registration's id"
+        );
+        let fresh = |reply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("expected a minted id, got {other:?}"),
+        };
+        let first = fresh(mint(None));
+        let second = fresh(mint(None));
+        assert_eq!(AsRef::<uuid::Uuid>::as_ref(&first).get_version_num(), 7);
+        assert_ne!(first, second, "each fresh mint is a new id");
+        assert_ne!(first, web.box_id);
+        match mint(Some(Ipv4Addr::new(100, 64, 0, 200))) {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("holds no box registration at 100.64.0.200"),
+                "{error}"
+            ),
+            other => panic!("an address with no row is refused, got {other:?}"),
+        }
+        match control(
+            &sock_path,
+            &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest::default()),
+        )
+        .expect("the host socket answers")
+        {
+            BoxControlReply::Error { error } => assert!(error.contains("mint_box_id"), "{error}"),
+            other => panic!("the host socket refuses the mint, got {other:?}"),
+        }
     }
 
     /// NET-138: a resume of a row that stands is answered from the row
