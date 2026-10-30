@@ -144,6 +144,9 @@ pub trait Loader {
     ///   the requested name, and `InvalidInput` for the reserved name
     ///   `self`. A stopped or exited session's name is free. Renaming to
     ///   the session's current name is a no-op and records no event.
+    ///
+    /// A failure to write the renamed event after the new name is saved is
+    /// logged, and the rename still returns `Ok`.
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
 
     /// Deletes the session with the given key, dropping its index entries and
@@ -1439,13 +1442,23 @@ impl Loader for DiskLoader {
         // carries both names, and is keyed on the box's id like every other.
         let mut event = BoxEvent::for_record(&record, crate::events::BoxEventType::Renamed);
         event.data = crate::box_name::renamed_event_data(old_name.as_deref(), &new_name);
-        object.append_event(&event)?;
-        tracing::info!(
-            box_id = %record.id,
-            old_name = ?old_name,
-            new_name = %new_name,
-            "renamed a box",
-        );
+        // The new name is already saved. A failed event write does not undo
+        // it, so the rename still succeeds, as on the actor path.
+        match object.append_event(&event) {
+            Ok(()) => tracing::info!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
         Ok(())
     }
 
