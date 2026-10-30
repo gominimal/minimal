@@ -3327,35 +3327,45 @@ async fn own_ip_default_deny_all() {
 // (NET-010 to NET-013)
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// The running test's [`declared_port`], leased once per test thread.
-    /// The lease's lock file is held until the thread ends.
-    static DECLARED_PORT: (u16, std::fs::File) = lease_declared_port();
-}
+/// The running test's [`declared_port`] and the lock file that holds its
+/// lease. nextest runs each test in a process of its own, so one lease per
+/// process is one port per test, whichever thread asks for it: the test's
+/// own thread or a task it spawned onto a runtime worker. The lock is
+/// released when the process exits.
+static DECLARED_PORT: std::sync::OnceLock<(u16, std::fs::File)> = std::sync::OnceLock::new();
 
 /// The ports [`declared_port`] leases from. The band sits below the kernel's
-/// ephemeral range (32768 and up on Linux), so no other process's `bind(0)`
-/// or outbound `connect` is handed one between the lease and the finalize's
-/// probe, and no fixed port in the tree falls inside it.
+/// default ephemeral range (`net.ipv4.ip_local_port_range` starts at 32768),
+/// so no other process's `bind(0)` or outbound `connect` is handed one
+/// between the lease and the finalize's probe, and no fixed port in the tree
+/// falls inside it. A host that widens the ephemeral range down into this
+/// band loses that guarantee.
 const DECLARED_PORTS: std::ops::Range<u16> = 23_000..24_000;
 
 /// Leases a port from [`DECLARED_PORTS`]: the first one whose lock file this
-/// process can lock, among every test process on the host, and that nothing
-/// already listens on at `127.0.0.1`. The port itself stays unbound, because
-/// the finalize under test must find it free.
+/// process can lock, among every test process the same user runs on the
+/// host, and that nothing already listens on at `127.0.0.1`. The lock files
+/// live in a directory of the user's own, so another user's run cannot leave
+/// files this one cannot open; a file that still cannot be opened counts as
+/// leased. The probe checks `127.0.0.1` only: a listener on `0.0.0.0` also
+/// fails it, but one bound to a specific `127.0.64.x` address does not. The
+/// port itself stays unbound, because the finalize under test must find it
+/// free.
 fn lease_declared_port() -> (u16, std::fs::File) {
-    let dir = std::env::temp_dir().join("minimald-test-ports");
-    std::fs::create_dir_all(&dir).expect("create the port lease directory");
+    let dir = std::env::temp_dir().join(format!("minimald-test-ports-{}", nix::unistd::getuid()));
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("create the port lease directory {dir:?}: {e}"));
     for port in DECLARED_PORTS {
-        let lock = std::fs::File::create(dir.join(format!("{port}.lock")))
-            .expect("open a port lease file");
+        let Ok(lock) = std::fs::File::create(dir.join(format!("{port}.lock"))) else {
+            continue;
+        };
         if lock.try_lock().is_ok()
             && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
         {
             return (port, lock);
         }
     }
-    panic!("every port in {DECLARED_PORTS:?} is leased or in use");
+    panic!("every port in {DECLARED_PORTS:?} is leased, in use, or has no lease file in {dir:?}");
 }
 
 /// The host port every own-address box of the running test declares, in
@@ -3364,10 +3374,9 @@ fn lease_declared_port() -> (u16, std::fs::File) {
 /// nextest runs tests side by side on one host: two tests declaring one
 /// fixed port at `127.0.0.1` can refuse each other's box. So each test
 /// leases its own port, and every box within the test shares it, which the
-/// collision tests need. The test body runs on the test's own thread, so a
-/// thread-local is one port per test.
+/// collision tests need.
 fn declared_port() -> u16 {
-    DECLARED_PORT.with(|(port, _)| *port)
+    DECLARED_PORT.get_or_init(lease_declared_port).0
 }
 
 /// An own-address session's config: a box that declares one published port —
