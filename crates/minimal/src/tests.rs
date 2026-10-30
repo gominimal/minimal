@@ -359,6 +359,9 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
             // A unit test's request, never sent: it checks the list's scope.
             "cmd/boxes/list.rs::box_list_and_show_render_retained_records = asserts nothing",
+            // A unit test's config, never sent: it checks that the create
+            // relays no box id (BOX-002).
+            "cmd/boxes/vm_host.rs::activation_relays_no_box_id = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             // A unit test's request, never sent: it checks the project root.
