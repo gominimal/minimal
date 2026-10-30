@@ -1181,11 +1181,11 @@ fn mint_box_id_reply(
                 };
             };
             // A row's id goes to one create only. The address comes from
-            // the in-VM daemon's client, so a second ask for a row is a
-            // create that names another box's address. Every client
-            // registers a fresh row for each create and withdraws it when
-            // the create fails, so a real create never asks twice.
-            if !claim_row_box_id(boxes, box_id) {
+            // the in-VM daemon's client, so an ask from another create is
+            // one that names another box's address. The in-VM daemon sends
+            // one token on every retry of a create, so a retry after a lost
+            // or late reply gets the same id. Another token is refused.
+            if !claim_row_box_id(boxes, box_id, request.create_token.as_deref()) {
                 tracing::warn!(
                     %switch_address,
                     %box_id,
@@ -1209,16 +1209,20 @@ fn mint_box_id_reply(
     }
 }
 
-/// The row ids that already went to an in-VM create (BOX-002). Each id is
-/// a UUIDv7 that one registration minted, so one set serves every
-/// registry in the process.
-static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<std::collections::BTreeSet<minimald_rpc::BoxId>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// The row ids that already went to an in-VM create (BOX-002), each with
+/// the token of the create that took it. Each id is a UUIDv7 that one
+/// registration minted, so one map serves every registry in the process.
+static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<
+    std::collections::BTreeMap<minimald_rpc::BoxId, Option<String>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Claims `box_id`, a row's id, for one in-VM create: `false` when an
-/// earlier create took it. The set keeps only ids whose row still stands,
-/// so it never outgrows the table.
-fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId) -> bool {
+/// Claims `box_id`, a row's id, for the in-VM create that `token` names.
+/// `true` for the first ask, and for a repeat ask that carries the same
+/// token: a retry of one create. `false` when another create took the id,
+/// or when the ask or the claim carries no token, because then nothing
+/// proves the two asks are one create. The map keeps only ids whose row
+/// still stands, so it never outgrows the table.
+fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Option<&str>) -> bool {
     let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
         .table()
         .rows()
@@ -1228,8 +1232,16 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId) -> bool {
     let mut claimed = CLAIMED_ROW_BOX_IDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    claimed.retain(|id| standing.contains(id));
-    claimed.insert(box_id)
+    claimed.retain(|id, _| standing.contains(id));
+    match claimed.entry(box_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(token.map(str::to_owned));
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            token.is_some() && entry.get().as_deref() == token
+        }
+    }
 }
 
 /// Register a box in its door's apply order and build the reply: the one
@@ -5402,9 +5414,10 @@ mod tests {
 
     /// BOX-002: the guest door mints the id of a box the in-VM daemon is
     /// about to create. A box with a row takes the id its registration
-    /// minted. A box with no row takes a fresh UUIDv7. An address that
-    /// holds no row is refused, and the host socket does not serve the
-    /// verb.
+    /// minted, and a retry of the same create gets it again. Another
+    /// create's ask for that row is refused. A box with no row takes a
+    /// fresh UUIDv7. An address that holds no row is refused, and the host
+    /// socket does not serve the verb.
     #[test]
     fn guest_door_mints_the_box_id_for_an_in_vm_create() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -5427,25 +5440,38 @@ mod tests {
             .expect("the registration is answered"),
         );
         let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
-        let mint = |switch_address| {
+        let ask = |switch_address, token: Option<&str>| {
             control(
                 &guest,
-                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest { switch_address }),
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address,
+                    create_token: token.map(str::to_owned),
+                }),
             )
             .expect("the mint is answered")
         };
+        let mint = |switch_address| ask(switch_address, None);
         assert_eq!(
-            mint(Some(web.switch_address)),
+            ask(Some(web.switch_address), Some("create-a")),
             BoxControlReply::BoxIdMinted {
                 minted_box_id: web.box_id
             },
             "a box with a row takes its registration's id"
         );
-        match mint(Some(web.switch_address)) {
-            BoxControlReply::Error { error } => {
-                assert!(error.contains("already has a session"), "{error}");
+        assert_eq!(
+            ask(Some(web.switch_address), Some("create-a")),
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: web.box_id
+            },
+            "a retry of the same create gets the same id"
+        );
+        for other_create in [Some("create-b"), None] {
+            match ask(Some(web.switch_address), other_create) {
+                BoxControlReply::Error { error } => {
+                    assert!(error.contains("already has a session"), "{error}");
+                }
+                other => panic!("a row's id goes to one create only, got {other:?}"),
             }
-            other => panic!("a row's id goes to one create only, got {other:?}"),
         }
         let fresh = |reply| match reply {
             BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,

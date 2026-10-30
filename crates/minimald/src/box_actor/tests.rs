@@ -3547,13 +3547,17 @@ async fn finalize_door_handed_own_ip_session(
         .id;
     crate::net::listeners::clear_vm_report_door_for_tests(&sock);
     assert_eq!(id, HANDED_BOX_ID, "the box takes the VM host daemon's id");
-    assert_eq!(
-        reads.recv().await.expect("the report door stand-in lives"),
-        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
-            switch_address: Some(switch),
-        }),
-        "the create asks for its row's id by its switch address"
-    );
+    match reads.recv().await.expect("the report door stand-in lives") {
+        minimald_rpc::BoxControlRequest::MintBoxId(ask) => {
+            assert_eq!(
+                ask.switch_address,
+                Some(switch),
+                "the create asks for its row's id by its switch address"
+            );
+            assert!(ask.create_token.is_some(), "the create sends its token");
+        }
+        other => panic!("expected a mint ask, got {other:?}"),
+    }
     crate::test_harness::unwrap_ready(
         client
             .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {

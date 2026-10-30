@@ -430,7 +430,10 @@ pub(crate) async fn host_row_standing(
 /// this daemon's own store mints the id. An error when the door refused
 /// the ask or did not answer within [`REPORT_DEADLINE`] over its attempts:
 /// the caller refuses the create, because no other source may name the
-/// box's id. A retry is safe: each ask mints or reads, and changes nothing.
+/// box's id. A row's id goes to one create only. Each call is one create:
+/// it makes one token and sends it on every attempt, so a retry of the same
+/// create after a lost or late reply gets the same id. Another create that
+/// asks for a claimed row is refused, and that create fails closed.
 pub(crate) async fn mint_box_id(
     control: &ControlChannel,
     switch_address: Option<Ipv4Addr>,
@@ -438,6 +441,7 @@ pub(crate) async fn mint_box_id(
     let channel = box_report_channel(control)?;
     let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
         switch_address,
+        create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
     });
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");

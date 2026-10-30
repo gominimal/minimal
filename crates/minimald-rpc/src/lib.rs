@@ -846,6 +846,12 @@ pub struct MintBoxIdRequest {
     /// id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_address: Option<std::net::Ipv4Addr>,
+    /// One token per create, the same on every retry of that create. The
+    /// VM host daemon gives a row's id to one create only: a repeat ask
+    /// with the same token gets the same id, and an ask with another token
+    /// (or none) for a claimed row is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_token: Option<String>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -3479,6 +3485,7 @@ mod mint_box_id_tests {
             BoxControlRequest::MintBoxId(MintBoxIdRequest::default()),
             BoxControlRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+                create_token: Some("create-1".to_string()),
             }),
         ] {
             let line = serde_json_lenient::to_string(&request).unwrap();
@@ -3491,6 +3498,7 @@ mod mint_box_id_tests {
         ))
         .unwrap();
         assert!(!bare.contains("switch_address"), "{bare}");
+        assert!(!bare.contains("create_token"), "{bare}");
 
         let reply = BoxControlReply::BoxIdMinted {
             minted_box_id: BoxId::mint(),

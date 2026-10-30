@@ -3495,6 +3495,30 @@ fn mint_door(
     tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
 ) {
+    mint_door_dropping(door, replies.into_iter().map(Some).collect())
+}
+
+/// The mint ask `ask` carries: a create's token is fresh each time, so a
+/// test reads the ask's fields, never the whole ask.
+fn mint_ask(ask: minimald_rpc::BoxControlRequest) -> minimald_rpc::MintBoxIdRequest {
+    match ask {
+        minimald_rpc::BoxControlRequest::MintBoxId(request) => {
+            assert!(request.create_token.is_some(), "every create sends a token");
+            request
+        }
+        other => panic!("expected a mint ask, got {other:?}"),
+    }
+}
+
+/// [`mint_door`], where a `None` reply reads the ask and closes the
+/// connection without an answer: a reply lost on its way to the guest.
+fn mint_door_dropping(
+    door: &std::path::Path,
+    replies: Vec<Option<minimald_rpc::BoxControlReply>>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     let listener = tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
     let (asks_tx, asks) = tokio::sync::mpsc::unbounded_channel();
@@ -3515,6 +3539,9 @@ fn mint_door(
                 reason = "the test may drop its receiver once it has its answer"
             )]
             let _ = asks_tx.send(ask);
+            let Some(reply) = reply else {
+                continue;
+            };
             let mut out = serde_json_lenient::to_string(&reply).unwrap();
             out.push('\n');
             write
@@ -3566,12 +3593,7 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
     config.box_id = Some(client);
     let id = mngr.create_session(config, None).await.unwrap();
     assert_eq!(id, rowless, "the box takes the VM host daemon's id");
-    assert_eq!(
-        asks.recv().await.unwrap(),
-        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
-            switch_address: None
-        }),
-    );
+    assert_eq!(mint_ask(asks.recv().await.unwrap()).switch_address, None);
     let shown = mngr.show_box(id).await.unwrap().expect("the box is filed");
     assert_eq!(shown.record.box_id, rowless);
     assert!(
@@ -3592,10 +3614,8 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
     let id = mngr.create_session(config, None).await.unwrap();
     assert_eq!(id, rowed);
     assert_eq!(
-        asks.recv().await.unwrap(),
-        minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
-            switch_address: Some(switch_address)
-        }),
+        mint_ask(asks.recv().await.unwrap()).switch_address,
+        Some(switch_address)
     );
     let handle = session(&mngr, id).await;
     let record = handle.record().await.unwrap();
@@ -3619,6 +3639,68 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
 
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     door_task.abort();
+}
+
+/// BOX-002: a create whose mint reply is lost asks again with the same
+/// token, so the VM host daemon can give the retry the id it already
+/// gave that create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id_and_retries_with_one_token() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let minted = SessionId::mint();
+    let (door_task, mut asks) = mint_door_dropping(
+        &door,
+        vec![
+            None,
+            Some(minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: minted,
+            }),
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 0, 8);
+    let mut config = sample_config();
+    config.name = Some("retried".to_string());
+    config.box_id = Some(SessionId::mint());
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address,
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, minted, "the retry takes the minted id");
+    let first = mint_ask(asks.recv().await.unwrap());
+    let retry = mint_ask(asks.recv().await.unwrap());
+    assert_eq!(first.switch_address, Some(switch_address));
+    assert_eq!(retry, first, "a retry of one create sends the same token");
+
+    // The next create sends another token.
+    let (door_task_2, mut asks_2) = {
+        crate::net::listeners::clear_vm_report_door_for_tests(&control);
+        door_task.abort();
+        let door = state.path().join("vm-host-door-2.sock");
+        let served = mint_door(
+            &door,
+            vec![minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: SessionId::mint(),
+            }],
+        );
+        crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+        served
+    };
+    let mut config = sample_config();
+    config.name = Some("next".to_string());
+    mngr.create_session(config, None).await.unwrap();
+    let next = mint_ask(asks_2.recv().await.unwrap());
+    assert_ne!(
+        next.create_token, first.create_token,
+        "each create has its own token"
+    );
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task_2.abort();
 }
 
 /// BOX-001: on a native host the store mints the id, and the id the
