@@ -6018,6 +6018,10 @@ fn host_ip_verdict(
     )
     .then_some(dst_port);
     let mut infrastructure = false;
+    // Whether a name-resolving box left the frame to the pins. The pins are
+    // one shared cohort entry, so the gate asks them once, after the loop,
+    // and the frame counts once.
+    let mut ask_pins = false;
     for rules in &resident {
         if let Some(dst) = dst
             && infrastructure_destination(
@@ -6034,19 +6038,14 @@ fn host_ip_verdict(
         }
         match egress::verdict(summary, rules.egress()) {
             FrameVerdict::Admit => return Ok(GateAdmit::HostIpBox),
-            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
-                if rules.resolves_names()
-                    && pins.admits_host_ip_frame(
-                        table,
-                        dst.unwrap_or_default(),
-                        l4,
-                        Instant::now(),
-                    ) =>
-            {
-                return Ok(GateAdmit::HostIpBox);
+            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. }) if rules.resolves_names() => {
+                ask_pins = true;
             }
             FrameVerdict::Drop(_) => {}
         }
+    }
+    if ask_pins && pins.admits_host_ip_frame(table, dst.unwrap_or_default(), l4, Instant::now()) {
+        return Ok(GateAdmit::HostIpBox);
     }
     // Every resident box refused the frame. A destination every box's
     // check put in the infrastructure set keeps that drop's own rule, so

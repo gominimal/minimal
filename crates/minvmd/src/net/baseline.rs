@@ -214,12 +214,22 @@ fn baseline_endpoints_from_env(var: &str) -> Option<Vec<String>> {
 /// trimmed, empty terms skipped. A term with a `/` must be an IPv4 subnet,
 /// and any other term must be a host name of letters, digits, `-` and `.`.
 /// A term that is neither is skipped with a warning that names it, so a typo
-/// narrows the set and never widens it.
+/// narrows the set and never widens it. A bare IPv4 address is not a host
+/// name: it is skipped with a warning that names its `/32` subnet form.
 fn baseline_endpoints_from_raw(var: &str, raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|term| !term.is_empty())
         .filter(|term| {
+            if term.parse::<std::net::Ipv4Addr>().is_ok() {
+                tracing::warn!(
+                    variable = var,
+                    term = %term,
+                    "skipped a node-plane baseline endpoint that is a bare IPv4 address; \
+                     write it as the subnet {term}/32",
+                );
+                return false;
+            }
             let valid = if term.contains('/') {
                 Ipv4Cidr::parse(term).is_some()
             } else {
@@ -717,12 +727,13 @@ mod tests {
 
         // The deployment's spelling of an entry: host names and subnets,
         // whitespace trimmed, and a term that is neither skipped, so a typo
-        // narrows the set and never widens it. Set and empty, the category
+        // narrows the set and never widens it. A bare address is skipped
+        // too: its subnet form is `/32`. Set and empty, the category
         // is carried with no endpoint.
         assert_eq!(
             baseline_endpoints_from_raw(
                 BASELINE_REGISTRY_ENV,
-                " pkgs.example.com , 203.0.113.0/24,,bad name,10.0.0.0/99,a..b "
+                " pkgs.example.com , 203.0.113.0/24,,bad name,10.0.0.0/99,a..b,203.0.113.9 "
             ),
             vec!["pkgs.example.com".to_string(), "203.0.113.0/24".to_string()]
         );

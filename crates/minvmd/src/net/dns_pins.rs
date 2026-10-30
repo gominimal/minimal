@@ -2060,6 +2060,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// NET-085: an attach re-admits its `host_ip` box with the rules the set
+    /// already holds. That changes nothing: the cohort record stays the same
+    /// `Arc`, so a pin another resident box took under it stays.
+    #[test]
+    fn host_ip_readmit_with_equal_rules_keeps_the_cohort_pins() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        let policy = |host: &str| EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec![host.to_string()]),
+            deny_subnets: None,
+        };
+        let box_a = boxes::SessionId::mint();
+        let box_b = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        assert!(registry.admit_host_ip_box(box_b, Some(&policy("b.example.com"))));
+        let site = Ipv4Addr::new(203, 0, 113, 60);
+        host_ip_resolves(&pins, &table, "b.example.com", &[site], now);
+        assert!(pins.admits_host_ip_frame(&table, site.octets(), None, now));
+        let before = table.host_ip_cohort().expect("both boxes declare a name");
+
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        let after = table.host_ip_cohort().expect("both boxes declare a name");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a re-admit with equal rules keeps the cohort record"
+        );
+        assert!(
+            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "a re-admit with equal rules keeps the other box's pin"
+        );
+
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("c.example.com"))));
+        let changed = table.host_ip_cohort().expect("both boxes declare a name");
+        assert!(
+            !Arc::ptr_eq(&before, &changed),
+            "a re-admit with other rules rebuilds the cohort record"
+        );
+    }
+
     /// NET-085: the node address's lookups split by the query frame's mark,
     /// the same way its frames split. A marked query for a baseline name
     /// never pins for the node plane, and an unmarked query for a name a

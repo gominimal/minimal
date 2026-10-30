@@ -5867,8 +5867,17 @@ impl BoxRegistry {
     /// session's policy, filled under this registry's egress default the
     /// way the guest daemon fills it, and compiled with the node's own
     /// address as its lease, the one source a `host_ip` box's frames carry.
-    /// A second admit for the same session replaces the first. Returns
-    /// `true`: the gate holds the box's rules once this returns.
+    /// A second admit for the same session with rules equal to the held
+    /// ones changes nothing and logs nothing: the cohort record, and so
+    /// every resident box's pins and flows, stay. A second admit with other
+    /// rules replaces the first. Returns `true`: the gate holds the box's
+    /// rules once this returns.
+    ///
+    /// A real change of the resident set rebuilds the cohort record: a
+    /// box admitted with new or changed rules, or a box retired
+    /// ([`Self::retire_host_ip_box`]). The pin table then starts a new
+    /// entry, so every resident box's name pins and retained flows go, and
+    /// each box gets them back when it resolves its names again.
     ///
     /// The policy is the host-side client's, carried over the host's
     /// control socket, never anything the guest says. One info line names
@@ -5927,6 +5936,16 @@ impl BoxRegistry {
             .host_ip_boxes
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
+        if resident
+            .boxes
+            .get(&session_id)
+            .is_some_and(|held| **held == rules)
+        {
+            // An attach re-admits with the rules the set already holds. The
+            // cohort record stays the same `Arc`, so the pins and flows every
+            // resident box took under it stay too.
+            return true;
+        }
         resident.boxes.insert(session_id, Arc::new(rules));
         resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         let count = resident.boxes.len();
@@ -5970,7 +5989,7 @@ impl BoxRegistry {
 /// ([`BoxRegistry::admit_host_ip_box`], NET-085): the rules a box-marked
 /// frame from the node address is decided by, beside every other resident
 /// box's.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HostIpBoxRules {
     session_id: boxes::SessionId,
     egress: EgressRules,
