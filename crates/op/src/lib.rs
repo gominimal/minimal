@@ -48,7 +48,7 @@ pub use notices::{NoticeFile, SourceNotices};
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;
-pub use specs::{SpecBuild, SpecBuildResult};
+pub use specs::{BuildNetwork, SpecBuild, SpecBuildResult};
 
 mod oci_image;
 
