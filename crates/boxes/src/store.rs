@@ -11,6 +11,7 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
+    box_name::NamedBox,
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
     events::{BoxEvent, DecodedEvents, decode_lines},
 };
@@ -106,9 +107,12 @@ pub trait Loader {
     /// the store does not enforce state-machine transitions (e.g.
     /// `Pending` → `Active`), that policy belongs in higher layers.
     ///
-    /// If `record.name` differs from the on-disk name, the name
-    /// index is remapped; a name collision with a *different* session
-    /// surfaces as `AlreadyExists`.
+    /// If `record.name` differs from the on-disk name, the index's alias
+    /// for the id is replaced. A name is shared by any number of records,
+    /// and held by at most one running one (BOX-004): a new name that a
+    /// *different* running session holds, or a record that starts running
+    /// again while another running session holds its name, surfaces as
+    /// `AlreadyExists`.
     ///
     /// # Errors
     ///
@@ -116,14 +120,18 @@ pub trait Loader {
     /// - `NotFound` if `key` is stale — its short is no longer in the
     ///   index (e.g. the session was deleted after the caller obtained
     ///   the key). Prevents silent resurrection of removed sessions.
-    /// - `AlreadyExists` if `record.name` is taken by a different session.
+    /// - `AlreadyExists` if `record.name` is held by a different running
+    ///   session, as above.
+    /// - `InvalidInput` if `record.name` changes to `self` or to an
+    ///   invalid name.
     /// - Other I/O errors from writing the record or flushing the index.
     fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error>;
 
-    /// Renames the session with the given key.
-    ///
-    /// Sugar for `get` → mutate `name` → [`Self::save`]; see `save`
-    /// for the underlying write semantics.
+    /// Renames the session with the given key (BOX-010): `get` → mutate
+    /// `name` → [`Self::save`], then a `renamed` event that carries the
+    /// old and new names. Only the alias changes: the id, the spec, the
+    /// filesystem and the earlier events stay as they were. See `save` for
+    /// the underlying write semantics.
     ///
     /// # Errors
     ///
@@ -132,9 +140,13 @@ pub trait Loader {
     /// - `NotFound` if `key` is stale (same as [`Self::save`]); the
     ///   internal `get` may also surface `NotFound` when the record
     ///   file is gone.
-    /// - `AlreadyExists` if a *different* session already has the
-    ///   requested name; renaming to the session's current name is a
-    ///   no-op.
+    /// - `AlreadyExists` if a *running* session other than this one holds
+    ///   the requested name, and `InvalidInput` for the reserved name
+    ///   `self`. A stopped or exited session's name is free. Renaming to
+    ///   the session's current name is a no-op and records no event.
+    ///
+    /// A failure to write the renamed event after the new name is saved is
+    /// logged, and the rename still returns `Ok`.
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
 
     /// Deletes the session with the given key, dropping its index entries and
@@ -447,25 +459,37 @@ impl BoxObject for DiskBox {
     }
 }
 
+/// The store's index. Every map in it is keyed on the box's short
+/// directory name or on its id, never on its name (BOX-143): a name is an
+/// alias that many retained records can share (BOX-004).
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct Index {
     short_to_id: BTreeMap<String, SessionId>,
-    name_to_id: BTreeMap<String, SessionId>,
+    /// Each named box's current alias, keyed on its id. An index written
+    /// before names were shared carries a `name_to_id` map instead, which
+    /// is ignored: the first open rebuilds this map from the records.
+    #[serde(default)]
+    names: BTreeMap<SessionId, String>,
 }
 
 impl Index {
     pub fn insert(&mut self, short: String, id: SessionId, name: Option<String>) {
         self.short_to_id.insert(short, id);
-        if let Some(name) = name {
-            self.name_to_id.insert(name, id);
-        }
+        self.set_name(id, name);
     }
 
-    /// Removes a session's entries from both the short and name indexes.
-    pub fn remove(&mut self, short: &str, name: Option<&str>) {
-        self.short_to_id.remove(short);
-        if let Some(name) = name {
-            self.name_to_id.remove(name);
+    /// Sets or clears the alias of the box `id`.
+    fn set_name(&mut self, id: SessionId, name: Option<String>) {
+        match name {
+            Some(name) => self.names.insert(id, name),
+            None => self.names.remove(&id),
+        };
+    }
+
+    /// Removes a session's entries from both the short and name maps.
+    pub fn remove(&mut self, short: &str) {
+        if let Some(id) = self.short_to_id.remove(short) {
+            self.names.remove(&id);
         }
     }
 
@@ -474,38 +498,13 @@ impl Index {
         self.short_to_id.iter()
     }
 
-    /// Returns the session ID corresponding to the given session name, if known.
-    pub fn find_by_name<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
-        self.name_to_id.get(name.as_ref())
-    }
-
-    /// Returns the session ID whose name folds to `name` under ASCII
-    /// case-insensitivity, if any. Session names are unique under the same
-    /// fold the box hostname uses, so a name that differs from an existing
-    /// one only by letter case is a collision.
-    pub fn find_by_name_folded<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
-        let name = name.as_ref();
-        self.name_to_id
+    /// The ids of the boxes whose alias folds to `name` under ASCII case,
+    /// as hostnames do.
+    fn ids_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = SessionId> + 'a {
+        self.names
             .iter()
-            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-            .map(|(_, id)| id)
-    }
-
-    /// Returns the session ID whose name folds to `name`, only when exactly
-    /// one indexed name does. Sessions written before names were made unique
-    /// under case folding can still sit side by side on disk (`Case-R` and
-    /// `case-r`); a lookup that folds to both is ambiguous and resolves to
-    /// neither rather than picking one.
-    fn find_by_name_folded_unique(&self, name: &str) -> Option<&SessionId> {
-        let mut matches = self
-            .name_to_id
-            .iter()
-            .filter(|(existing, _)| existing.eq_ignore_ascii_case(name))
-            .map(|(_, id)| id);
-        match (matches.next(), matches.next()) {
-            (Some(id), None) => Some(id),
-            _ => None,
-        }
+            .filter(move |(_, alias)| alias.eq_ignore_ascii_case(name))
+            .map(|(id, _)| *id)
     }
 
     /// Returns the session ID corresponding to the given short name, if known.
@@ -523,10 +522,7 @@ impl Index {
 
     /// Returns the name corresponding to the given session ID, if it has one.
     pub fn name_by_id(&self, id: &SessionId) -> Option<&String> {
-        self.name_to_id
-            .iter()
-            .find(|(_name, iter_id)| *iter_id == id)
-            .map(|(name, _)| name)
+        self.names.get(id)
     }
 }
 
@@ -763,10 +759,9 @@ impl DiskLoader {
                 continue;
             }
             if record.id != indexed_id {
+                self.index.names.remove(&indexed_id);
                 self.index.short_to_id.insert(short.clone(), record.id);
-                if let Some(name) = &record.name {
-                    self.index.name_to_id.insert(name.clone(), record.id);
-                }
+                self.index.set_name(record.id, record.name.clone());
                 *changed = true;
             }
             tracing::info!(
@@ -861,9 +856,8 @@ impl DiskLoader {
             // An index entry may linger if delete crashed before flushing
             // the index. The record is gone, so look up the name from the
             // current in-memory index.
-            if let Some(id) = self.index.short_to_id.get(&short).copied() {
-                let name = self.index.name_by_id(&id).cloned();
-                self.index.remove(&short, name.as_deref());
+            if self.index.short_to_id.contains_key(&short) {
+                self.index.remove(&short);
                 *changed = true;
             }
         }
@@ -896,8 +890,7 @@ impl DiskLoader {
                         id = %id,
                         "dropping dangling index entry (record.json missing or unparseable)",
                     );
-                    let name = self.index.name_by_id(&id).cloned();
-                    self.index.remove(&short, name.as_deref());
+                    self.index.remove(&short);
                     *changed = true;
                 }
                 ReconcileFix::Skip { reason } => {
@@ -918,12 +911,7 @@ impl DiskLoader {
                         new_name = ?new_name,
                         "reconciling index entry's name with record.json (rename-crash recovery)",
                     );
-                    if let Some(old) = &old_name {
-                        self.index.name_to_id.remove(old);
-                    }
-                    if let Some(new) = new_name {
-                        self.index.name_to_id.insert(new, id);
-                    }
+                    self.index.set_name(id, new_name);
                     *changed = true;
                 }
             }
@@ -931,8 +919,9 @@ impl DiskLoader {
     }
 
     /// Pass C: re-index orphan records (record.json present, no index
-    /// entry, not already reaped). Orphans whose `name` collides with
-    /// an existing index entry are skipped and logged.
+    /// entry, not already reaped). A running orphan whose `name` a running
+    /// indexed box holds is skipped and logged (BOX-004). A stopped or
+    /// exited orphan shares its name with any other record.
     fn heal_reindex_orphans(
         &mut self,
         session_dirs: &[(String, std::path::PathBuf)],
@@ -968,15 +957,32 @@ impl DiskLoader {
                 continue;
             }
             if let Some(name) = &record.name
-                && self.index.find_by_name_folded(name).is_some()
+                && crate::box_name::holds_name(record.status)
             {
-                tracing::warn!(
-                    short = %short,
-                    name = %name,
-                    "orphan record's name collides with an existing index entry; \
-                     leaving orphan unindexed for manual triage",
-                );
-                continue;
+                match self.running_holder(name, None) {
+                    Ok(None) => {}
+                    Ok(Some(holder)) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            holder = %holder.id,
+                            holder_name = %holder.name,
+                            "orphan record's name is held by a running box; \
+                             leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            error = %e,
+                            "could not check whether a running box holds the orphan \
+                             record's name; leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                }
             }
             tracing::info!(
                 short = %short,
@@ -1067,6 +1073,96 @@ impl DiskLoader {
             )),
         }
     }
+
+    /// Reads the record filed under `short`.
+    fn read_record(&self, short: &str) -> Result<Record, std::io::Error> {
+        let record_file = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(short)
+            .join("record.json");
+        Ok(serde_json_lenient::from_reader(std::fs::File::open(
+            record_file,
+        )?)?)
+    }
+
+    /// The name facts of every indexed box whose alias folds to `name`,
+    /// read from their records. The index finds the ids, and the records
+    /// give each box's current name and state. A record that is gone
+    /// since the index listed it belongs to no box and is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Any other error reading one of the records: a record that cannot
+    /// be read can belong to a running box that holds the name.
+    pub fn boxes_named(&self, name: &str) -> Result<Vec<NamedBox>, std::io::Error> {
+        let mut found = Vec::new();
+        for id in self.index.ids_named(name) {
+            let Some(short) = self.index.short_by_id(&id) else {
+                continue;
+            };
+            let record = match self.read_record(short) {
+                Ok(record) => record,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %id,
+                        name,
+                        error = %e,
+                        "could not read a box record while matching a name",
+                    );
+                    return Err(e);
+                }
+            };
+            if let Some(named) = NamedBox::from_record(&record) {
+                found.push(named);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The running box other than `except` that holds a name folding to
+    /// `name` (BOX-004), or `None`.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`Self::boxes_named`].
+    pub fn running_holder(
+        &self,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Result<Option<NamedBox>, std::io::Error> {
+        let named = self.boxes_named(name)?;
+        let holder = crate::box_name::running_holder(&named, name, except).cloned();
+        if let Some(holder) = &holder {
+            tracing::debug!(
+                name,
+                holder = %holder.id,
+                candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                "a running box holds the name",
+            );
+        }
+        Ok(holder)
+    }
+}
+
+/// The refusal of a creation or resume whose name a running box holds.
+fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
+    tracing::info!(
+        name,
+        holder = %holder.id,
+        holder_name = %holder.name,
+        "refused a name: a running box holds it",
+    );
+    std::io::Error::new(
+        AlreadyExists,
+        format!(
+            "a running session named `{}` already exists (session names are \
+             case-insensitive)",
+            holder.name
+        ),
+    )
 }
 
 /// Session names that collide with infrastructure names once the daemon
@@ -1172,18 +1268,12 @@ impl DiskLoader {
         }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            if let Some(existing_id) = self.index.find_by_name_folded(name) {
-                let existing = self
-                    .index
-                    .name_by_id(existing_id)
-                    .map_or(name.as_str(), String::as_str);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "a session named `{existing}` already exists \
-                         (session names are case-insensitive)"
-                    ),
-                ));
+            // BOX-004: only a running box holds a name. A stopped or exited
+            // box keeps its name and leaves it free for this one.
+            if crate::box_name::holds_name(record.status)
+                && let Some(holder) = self.running_holder(name, None)?
+            {
+                return Err(held_name_error(name, &holder));
             }
         }
 
@@ -1235,14 +1325,14 @@ impl Loader for DiskLoader {
             session_id: *id,
         }))
     }
+    /// BOX-005: the running box of that name, else the most recently
+    /// created box of that name, else `None`. The answer is the box's key,
+    /// so a caller holds the id, not the name.
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
         let name = name.as_ref();
-        let uuid = self
-            .index
-            .find_by_name(name)
-            .or_else(|| self.index.find_by_name_folded_unique(name));
-        match uuid {
-            Some(uuid) => self.find_by_id(uuid),
+        let named = self.boxes_named(name)?;
+        match crate::box_name::resolve_on_host(&named, name) {
+            Some(id) => self.find_by_id(&id),
             None => Ok(None),
         }
     }
@@ -1292,33 +1382,39 @@ impl Loader for DiskLoader {
         let old_name = self.index.name_by_id(&id).cloned();
         let new_name = record.name.clone();
 
-        // Validate a newly-assigned name at the character level before the
-        // uniqueness check. Gate on an actual change so re-saving an unchanged
-        // record (e.g. a status promotion) never re-validates a name.
         if old_name != new_name
             && let Some(name) = &new_name
         {
+            // BOX-010: a new name is refused when it is `self` or a running
+            // box on this host holds it, whatever state this box is in.
+            // Same-id same-name is a no-op, not a collision.
+            let named = self.boxes_named(name)?;
+            crate::box_name::check_rename(&named, id, name).map_err(|refusal| {
+                tracing::info!(
+                    box_id = %id,
+                    name,
+                    candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                    %refusal,
+                    "refused a new name for a box",
+                );
+                std::io::Error::from(refusal)
+            })?;
+            // Validate a newly-assigned name at the character level. Gate on
+            // an actual change so re-saving an unchanged record (e.g. a
+            // status promotion) never re-validates a name.
             validate_session_name(name)?;
-        }
-
-        // Collision check: if the new name folds to a *different*
-        // session's name, refuse. Same-id same-name is a no-op, not a
-        // collision.
-        if let Some(name) = &new_name
-            && let Some(other_id) = self.index.find_by_name_folded(name).copied()
-            && other_id != id
+        } else if let Some(name) = &new_name
+            && crate::box_name::holds_name(record.status)
+            && self.index.ids_named(name).any(|other| other != id)
+            && !self
+                .read_record(&short)
+                .is_ok_and(|old| crate::box_name::holds_name(old.status))
         {
-            let existing = self
-                .index
-                .name_by_id(&other_id)
-                .map_or(name.as_str(), String::as_str);
-            return Err(std::io::Error::new(
-                AlreadyExists,
-                format!(
-                    "a session named `{existing}` already exists \
-                     (session names are case-insensitive)"
-                ),
-            ));
+            // BOX-004, BOX-025: a box that starts running again takes its
+            // name back only when no other running box holds it.
+            if let Some(holder) = self.running_holder(name, Some(id))? {
+                return Err(held_name_error(name, &holder));
+            }
         }
 
         // Atomic record write (temp + renameat2).
@@ -1326,12 +1422,7 @@ impl Loader for DiskLoader {
 
         // Only mutate the in-memory index after the on-disk write succeeds.
         if old_name != new_name {
-            if let Some(old) = &old_name {
-                self.index.name_to_id.remove(old);
-            }
-            if let Some(new) = new_name {
-                self.index.name_to_id.insert(new, id);
-            }
+            self.index.set_name(id, new_name);
             self.flush_index()?;
         }
 
@@ -1339,9 +1430,36 @@ impl Loader for DiskLoader {
     }
 
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
-        let mut record = self.get(key)?.record;
-        record.name = Some(new_name);
-        self.save(key, &record)
+        let object = self.get(key)?;
+        let old_name = object.record.name.clone();
+        if old_name.as_deref() == Some(new_name.as_str()) {
+            return Ok(());
+        }
+        let mut record = object.record.clone();
+        record.name = Some(new_name.clone());
+        self.save(key, &record)?;
+        // BOX-010: the rename changed the alias and nothing else. The event
+        // carries both names, and is keyed on the box's id like every other.
+        let mut event = BoxEvent::for_record(&record, crate::events::BoxEventType::Renamed);
+        event.data = crate::box_name::renamed_event_data(old_name.as_deref(), &new_name);
+        // The new name is already saved. A failed event write does not undo
+        // it, so the rename still succeeds, as on the actor path.
+        match object.append_event(&event) {
+            Ok(()) => tracing::info!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
+        Ok(())
     }
 
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
@@ -1350,11 +1468,6 @@ impl Loader for DiskLoader {
         // deindex and `remove_dir_all` the *unrelated* session that inherited
         // the short. `live_short` returns `NotFound` in that case.
         let short = self.live_short(key)?;
-        // Discover the name index entry from the index itself, not by reading
-        // the record: index cleanup must not depend on the on-disk tree still
-        // existing, or a half-deleted session (dir gone, index entries left)
-        // could never be scrubbed.
-        let name = self.index.name_by_id(key.id()).cloned();
 
         let sessions_root = self.minimal_dir.as_utf8_path().join("sessions");
         let session_dir = sessions_root.join(&short);
@@ -1376,7 +1489,10 @@ impl Loader for DiskLoader {
         // index is the source of truth for `keys()`, so removing it first means
         // a crash mid-delete can only ever orphan a directory (invisible and
         // harmless), never leave a key pointing at a removed tree.
-        self.index.remove(&short, name.as_deref());
+        // Index cleanup reads only the index, not the record, so a
+        // half-deleted session (dir gone, index entries left) can still be
+        // scrubbed.
+        self.index.remove(&short);
         self.flush_index()?;
 
         match std::fs::remove_dir_all(&session_dir) {
@@ -1986,12 +2102,16 @@ mod tests {
         let mut lower = sample_record();
         lower.name = Some("Case-X".to_string());
         let lower_key = loader.create(lower).unwrap();
-        // Plant the legacy case-only duplicate the create path now refuses.
-        loader.index.name_to_id.remove("Case-X");
+        // Plant the legacy case-only duplicate the create path now refuses,
+        // in the record and in the index.
+        let mut planted = loader.get(&lower_key).unwrap().record;
+        planted.name = Some("case-r".to_string());
+        loader
+            .write_record(&short_of(&lower_key), &planted)
+            .unwrap();
         loader
             .index
-            .name_to_id
-            .insert("case-r".to_string(), lower_key.session_id);
+            .set_name(lower_key.session_id, Some("case-r".to_string()));
 
         assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
         assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
@@ -3657,5 +3777,527 @@ mod tests {
             loader.store_delta_baseline(&key, b"{}").unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    // ---- Box names: one name, many records (BOX-004, BOX-005, BOX-010,
+    // BOX-143) ----
+
+    use crate::core::record::{ExitEnding, RecordState, StopEnding};
+    use proptest::prelude::*;
+
+    /// A running record named `name`.
+    fn named(name: &str) -> Record {
+        let mut record = sample_record();
+        record.name = Some(name.to_string());
+        record.set_state(RecordState::Running);
+        record
+    }
+
+    /// Puts the box at `key` in `state` through the store.
+    fn set_state(loader: &mut DiskLoader, key: &DiskBoxKey, state: RecordState) {
+        let mut record = loader.get(key).unwrap().record;
+        record.set_state(state);
+        loader.save(key, &record).unwrap();
+    }
+
+    fn stopped() -> RecordState {
+        RecordState::Stopped(StopEnding::Signalled { signal: 15 })
+    }
+
+    fn exited() -> RecordState {
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    }
+
+    /// Every retained record of the store, read through it.
+    fn all_records(loader: &DiskLoader) -> Vec<(DiskBoxKey, Record)> {
+        loader
+            .keys()
+            .map(|key| {
+                let record = loader.get(&key).unwrap().record;
+                (key, record)
+            })
+            .collect()
+    }
+
+    /// The events of the box at `key`, in file order.
+    fn events_of(loader: &DiskLoader, key: &DiskBoxKey) -> Vec<BoxEvent> {
+        loader.get(key).unwrap().read_events_from(0).unwrap().events
+    }
+
+    /// BOX-004: no two running records share a name under ASCII case.
+    fn assert_running_names_unique(loader: &DiskLoader) {
+        let running: Vec<String> = all_records(loader)
+            .into_iter()
+            .filter(|(_, r)| crate::box_name::holds_name(r.status))
+            .filter_map(|(_, r)| r.name.map(|n| n.to_ascii_lowercase()))
+            .collect();
+        let unique: BTreeSet<&String> = running.iter().collect();
+        assert_eq!(unique.len(), running.len(), "running names: {running:?}");
+    }
+
+    /// One operation on one host's boxes. A box is picked by its position
+    /// among the retained records, modulo their count.
+    #[derive(Debug, Clone)]
+    enum NameOp {
+        Create { name: usize, fresh: bool },
+        Stop(usize),
+        Exit(usize),
+        Resume(usize),
+        Rename(usize, usize),
+        Reap(usize),
+    }
+
+    /// Names that collide under ASCII case, plus the reserved `self`,
+    /// which only a rename asks for.
+    const NAME_POOL: [&str; 4] = ["dev", "Dev", "web", "self"];
+
+    fn name_op() -> impl Strategy<Value = NameOp> {
+        prop_oneof![
+            (0..3usize, any::<bool>()).prop_map(|(name, fresh)| NameOp::Create { name, fresh }),
+            any::<usize>().prop_map(NameOp::Stop),
+            any::<usize>().prop_map(NameOp::Exit),
+            any::<usize>().prop_map(NameOp::Resume),
+            (any::<usize>(), 0..NAME_POOL.len()).prop_map(|(i, n)| NameOp::Rename(i, n)),
+            any::<usize>().prop_map(NameOp::Reap),
+        ]
+    }
+
+    /// The running record other than `except` whose name folds to `name`.
+    fn model_holder(
+        loader: &DiskLoader,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Option<SessionId> {
+        all_records(loader)
+            .into_iter()
+            .find(|(key, r)| {
+                Some(*key.id()) != except
+                    && crate::box_name::holds_name(r.status)
+                    && r.name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .map(|(key, _)| *key.id())
+    }
+
+    /// Applies `op`, and checks its outcome against what BOX-004, BOX-010
+    /// and BOX-163 allow.
+    fn apply_name_op(loader: &mut DiskLoader, op: &NameOp) {
+        let retained = all_records(loader);
+        let pick = |i: usize| retained.get(i % retained.len().max(1)).cloned();
+        match *op {
+            NameOp::Create { name, fresh } => {
+                let base = NAME_POOL[name];
+                let name = if fresh {
+                    // BOX-163: the smallest `n` no retained record uses.
+                    let n = (1..=retained.len() + 1)
+                        .find(|n| {
+                            !retained.iter().any(|(_, r)| {
+                                r.name.as_deref().is_some_and(|got| {
+                                    got.eq_ignore_ascii_case(&format!("{base}-{n}"))
+                                })
+                            })
+                        })
+                        .unwrap();
+                    format!("{base}-{n}")
+                } else {
+                    base.to_string()
+                };
+                let holder = model_holder(loader, &name, None);
+                let got = loader.create(named(&name));
+                match holder {
+                    Some(_) => assert_eq!(
+                        got.unwrap_err().kind(),
+                        ErrorKind::AlreadyExists,
+                        "a running box holds `{name}`"
+                    ),
+                    None => {
+                        got.unwrap_or_else(|e| panic!("`{name}` is free: {e}"));
+                    }
+                }
+            }
+            NameOp::Stop(i) | NameOp::Exit(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if crate::box_name::holds_name(record.status) {
+                    let state = if matches!(op, NameOp::Stop(_)) {
+                        stopped()
+                    } else {
+                        exited()
+                    };
+                    set_state(loader, &key, state);
+                }
+            }
+            NameOp::Resume(i) => {
+                let Some((key, mut record)) = pick(i) else {
+                    return;
+                };
+                if crate::box_name::holds_name(record.status) {
+                    return;
+                }
+                let name = record.name.clone().unwrap();
+                let holder = model_holder(loader, &name, Some(*key.id()));
+                record.set_state(RecordState::Running);
+                let got = loader.save(&key, &record);
+                assert_eq!(
+                    got.is_err(),
+                    holder.is_some(),
+                    "resume of `{name}`: {got:?}"
+                );
+            }
+            NameOp::Rename(i, n) => {
+                let Some((key, record)) = pick(i) else { return };
+                let new_name = NAME_POOL[n];
+                let refused = new_name == "self"
+                    || (record.name.as_deref() != Some(new_name)
+                        && model_holder(loader, new_name, Some(*key.id())).is_some());
+                let got = loader.rename(&key, new_name.to_string());
+                assert_eq!(got.is_err(), refused, "rename to `{new_name}`: {got:?}");
+            }
+            NameOp::Reap(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if !crate::box_name::holds_name(record.status) {
+                    loader.delete(&key).unwrap();
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// BOX-004: over every sequence of create, stop, exit, resume,
+        /// rename and reap on one host, no two running boxes share a name,
+        /// and a name held only by a stopped or exited box is reusable.
+        #[test]
+        fn name_unique_among_running_on_host_reusable_after_stop(
+            ops in prop::collection::vec(name_op(), 1..24),
+        ) {
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            for op in &ops {
+                apply_name_op(&mut loader, op);
+                assert_running_names_unique(&loader);
+            }
+            // The invariant holds for the index a later start reads.
+            drop(loader);
+            let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            assert_running_names_unique(&loader);
+        }
+    }
+
+    /// BOX-004 by example: a stopped or exited box keeps its name, and a
+    /// new box reuses it. Resuming the first while the second runs is
+    /// refused.
+    #[test]
+    fn name_unique_among_running_on_host_reusable_after_stop_by_example() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let first = loader.create(named("dev")).unwrap();
+        assert_eq!(
+            loader.create(named("DEV")).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        set_state(&mut loader, &first, stopped());
+        let second = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &second, exited());
+        let third = loader.create(named("dev")).unwrap();
+        for key in [&first, &second, &third] {
+            assert_eq!(loader.get(key).unwrap().record.name.as_deref(), Some("dev"));
+        }
+        let mut resumed = loader.get(&first).unwrap().record;
+        resumed.set_state(RecordState::Running);
+        let err = loader.save(&first, &resumed).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.get(&first).unwrap().record.status, BoxState::Stopped);
+    }
+
+    /// BOX-005, the task's proof: two boxes named `dev` are retained, and
+    /// the running one answers. With none running, the latest answers.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), None);
+
+        let older = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &older, stopped());
+        let newer = loader.create(named("dev")).unwrap();
+        // The newer box runs: it answers.
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // Only the older box runs: it answers, though it is not the latest.
+        set_state(&mut loader, &newer, exited());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("DEV").unwrap(), Some(older.clone()));
+
+        // None runs: the most recently created answers.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // A stopped `Dev` does not hide a running `dev`: case folds
+        // first, and the running box answers for either case.
+        let upper = loader.create(named("Dev")).unwrap();
+        set_state(&mut loader, &upper, stopped());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+
+        // None runs: the exact case breaks the tie, then the latest wins.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(upper));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // The answer survives a restart, which rebuilds the index.
+        drop(loader);
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer));
+    }
+
+    /// An index written before names were shared keyed its names on the
+    /// name. A start reads it, drops that map, and rebuilds the names from
+    /// the records.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest_after_a_legacy_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(named("dev")).unwrap();
+        drop(loader);
+        let index_file = root.as_utf8_path().join("sessions/index.json");
+        let legacy = format!(
+            r#"{{"short_to_id":{{"{}":"{}"}},"name_to_id":{{"dev":"{}"}}}}"#,
+            short_of(&key),
+            key.id(),
+            key.id()
+        );
+        std::fs::write(&index_file, legacy).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(key));
+        let rewritten = std::fs::read_to_string(&index_file).unwrap();
+        assert!(!rewritten.contains("name_to_id"), "{rewritten}");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-010: a successful rename leaves the id, the spec and the
+        /// filesystem path as they were, keeps every earlier event, and
+        /// appends exactly one `renamed` event with the old and new names.
+        #[test]
+        fn rename_changes_only_alias_and_records_event(
+            names in prop::collection::vec(0..3usize, 1..8),
+            stop_first in any::<bool>(),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            let key = loader.create(named("start")).unwrap();
+            let object = loader.get(&key).unwrap();
+            object.store_spec(br#"{"box":{"name":"start"}}"#).unwrap();
+            object
+                .append_event(&BoxEvent::for_record(
+                    object.record(),
+                    crate::events::BoxEventType::Created,
+                ))
+                .unwrap();
+            if stop_first {
+                set_state(&mut loader, &key, stopped());
+            }
+            for n in names {
+                let before = loader.get(&key).unwrap();
+                let events_before = events_of(&loader, &key);
+                let new_name = pool[n];
+                loader.rename(&key, new_name.to_string()).unwrap();
+                let after = loader.get(&key).unwrap();
+                let events_after = events_of(&loader, &key);
+
+                prop_assert_eq!(after.record().id, before.record().id);
+                prop_assert_eq!(after.key(), before.key());
+                prop_assert_eq!(after.load_spec().unwrap(), before.load_spec().unwrap());
+                prop_assert_eq!(after.workspace_path(), before.workspace_path());
+                prop_assert_eq!(after.record().name.as_deref(), Some(new_name));
+                let mut unaliased = after.record().clone();
+                unaliased.name.clone_from(&before.record().name);
+                prop_assert_eq!(&unaliased, before.record());
+
+                prop_assert_eq!(&events_after[..events_before.len()], &events_before[..]);
+                let added = &events_after[events_before.len()..];
+                if before.record().name.as_deref() == Some(new_name) {
+                    // A rename to the current name changes nothing.
+                    prop_assert!(added.is_empty());
+                } else {
+                    prop_assert_eq!(added.len(), 1);
+                    prop_assert_eq!(added[0].kind, crate::events::BoxEventType::Renamed);
+                    prop_assert_eq!(added[0].box_id, *key.id());
+                    prop_assert_eq!(
+                        &added[0].data,
+                        &crate::box_name::renamed_event_data(
+                            before.record().name.as_deref(),
+                            new_name,
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    /// BOX-010: a rename to a name a running box on the host holds, or to
+    /// `self`, is refused with exit 2, naming the holder or `self`. The
+    /// box, its name and its events stay as they were. A name only a
+    /// stopped box keeps is free.
+    #[test]
+    fn rename_to_running_held_name_or_self_refused_exit2_names_holder() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let holder = loader.create(named("dev")).unwrap();
+        let renamed = loader.create(named("web")).unwrap();
+        let retained = loader.create(named("api")).unwrap();
+        set_state(&mut loader, &retained, stopped());
+        let records_before = all_records(&loader);
+        let events_before = events_of(&loader, &renamed);
+
+        // Held by a running box, under any case, and whatever state the
+        // renamed box is in.
+        for (state, new_name) in [(RecordState::Running, "dev"), (stopped(), "DEV")] {
+            set_state(&mut loader, &renamed, state);
+            let err = loader.rename(&renamed, new_name.to_string()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal.exit_code(), 2);
+            assert_eq!(
+                refusal,
+                &crate::box_name::RenameRefusal::HeldByRunning {
+                    name: new_name.to_string(),
+                    holder: *holder.id(),
+                    holder_name: "dev".to_string(),
+                }
+            );
+            let text = err.to_string();
+            assert!(text.contains(&holder.id().to_string()), "{text}");
+            assert!(text.contains("`dev`"), "{text}");
+        }
+        set_state(&mut loader, &renamed, RecordState::Running);
+
+        // `self`, in any case.
+        for reserved in ["self", "SELF"] {
+            let err = loader.rename(&renamed, reserved.to_string()).unwrap_err();
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal, &crate::box_name::RenameRefusal::Reserved);
+            assert_eq!(refusal.exit_code(), 2);
+            assert!(err.to_string().contains("`self`"), "{err}");
+        }
+
+        // Nothing changed: every record and the renamed box's events.
+        assert_eq!(all_records(&loader), records_before);
+        assert_eq!(events_of(&loader, &renamed), events_before);
+
+        // A name only a stopped box keeps is free.
+        loader.rename(&renamed, "api".to_string()).unwrap();
+        assert_eq!(loader.find_by_name("api").unwrap(), Some(renamed));
+    }
+
+    /// One operation on box ids for `nothing_keys_on_box_name`.
+    #[derive(Debug, Clone)]
+    enum KeyOp {
+        Create(usize),
+        Rename(usize, usize),
+        Stop(usize),
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-143: every record, event and index entry is keyed on the box
+        /// id. An id-addressed read gives the same box before and after any
+        /// rename, and a name lookup finds a box only by its current alias.
+        #[test]
+        fn nothing_keys_on_box_name(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    (0..3usize).prop_map(KeyOp::Create),
+                    (any::<usize>(), 0..3usize).prop_map(|(i, n)| KeyOp::Rename(i, n)),
+                    any::<usize>().prop_map(KeyOp::Stop),
+                ],
+                1..16,
+            ),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let root = loader_dir(&tmp);
+            let mut loader = DiskLoader::new(root.clone()).unwrap();
+            // Every box ever created, by id, with its directory.
+            let mut boxes: Vec<(DiskBoxKey, DaemonAbsPath)> = Vec::new();
+            for op in ops {
+                match op {
+                    KeyOp::Create(n) => {
+                        let Ok(key) = loader.create(named(pool[n])) else { continue };
+                        let object = loader.get(&key).unwrap();
+                        object
+                            .append_event(&BoxEvent::for_record(
+                                object.record(),
+                                crate::events::BoxEventType::Created,
+                            ))
+                            .unwrap();
+                        boxes.push((key, object.workspace_path()));
+                    }
+                    KeyOp::Rename(i, n) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        let _ = loader.rename(&key, pool[n].to_string());
+                    }
+                    KeyOp::Stop(i) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        set_state(&mut loader, &key, stopped());
+                    }
+                    KeyOp::Rename(..) | KeyOp::Stop(_) => {}
+                }
+                for (key, workspace) in &boxes {
+                    // Id-addressed reads give this box, whatever its name.
+                    prop_assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key.clone()));
+                    let object = loader.get(key).unwrap();
+                    prop_assert_eq!(&object.record().id, key.id());
+                    prop_assert_eq!(&object.workspace_path(), workspace);
+                    for event in events_of(&loader, key) {
+                        prop_assert_eq!(&event.box_id, key.id());
+                    }
+                    // A name lookup finds a box only under its current alias.
+                    let current = object.record().name.clone().unwrap();
+                    for name in pool {
+                        if let Some(found) = loader.find_by_name(name).unwrap() {
+                            let alias = loader.get(&found).unwrap().record.name.unwrap();
+                            prop_assert!(alias.eq_ignore_ascii_case(name));
+                            if &found == key {
+                                prop_assert!(current.eq_ignore_ascii_case(name));
+                            }
+                        }
+                    }
+                }
+            }
+            // The index on disk keys every map on a short or a box id. A store
+            // that never filed a box has written no index.
+            let Ok(bytes) = std::fs::read(root.as_utf8_path().join("sessions/index.json")) else {
+                prop_assert!(boxes.is_empty());
+                return Ok(());
+            };
+            let index: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).unwrap();
+            let maps = index.as_object().unwrap();
+            for (field, map) in maps {
+                for map_key in map.as_object().unwrap().keys() {
+                    prop_assert!(
+                        is_valid_short(map_key) || SessionId::parse_str(map_key).is_ok(),
+                        "index map `{}` is keyed on `{}`",
+                        field,
+                        map_key
+                    );
+                }
+            }
+        }
     }
 }

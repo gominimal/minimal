@@ -60,6 +60,28 @@ impl From<BoxKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type BoxManagerError = std::io::Error;
 
+/// A create refused because the VM host daemon gave the box no id
+/// (BOX-002). It rides inside a [`BoxManagerError`], so the `CreateSession`
+/// handler can tell it apart and answer the client with its text, in place
+/// of dropping the channel as it does for an internal failure.
+#[derive(Debug)]
+pub(crate) struct BoxIdNotMinted(String);
+
+impl std::fmt::Display for BoxIdNotMinted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoxIdNotMinted {}
+
+impl BoxIdNotMinted {
+    /// Whether `error` is a create refused for want of a minted id.
+    pub(crate) fn is(error: &BoxManagerError) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
 /// NET-079's observability, for the create path's half of the refusal: how
 /// many creates this daemon has refused because a host-address box's
 /// declaration named rules the classifier cannot enforce while the host
@@ -2500,14 +2522,59 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             tracing::Span::current().record("spec_bytes", bytes.len());
         }
-        // Allocate the record up front: `store.create` assigns the id and
-        // catches a name collision (`AlreadyExists`) before any actor exists.
-        // On a VM guest the box id is the one the VM host handed in
-        // `config.box_id`, and the in-VM store still mints the record key
-        // (https://github.com/gominimal/minimal/issues/2397 files the
-        // record under the handed id). Elsewhere the
-        // record key is the box id.
-        let handed_box_id = config.box_id;
+        // BOX-001, BOX-002: a client never names a box's id, so the id the
+        // request carries is dropped here. On a VM guest the VM host daemon
+        // mints the id and this daemon files the record under it. A box
+        // with a row takes the id its registration minted, so the record
+        // and the row name one id. On a native host the store mints it.
+        let mut config = config;
+        let client_box_id = config.box_id.take();
+        let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
+        let control = crate::box_actor::switch_control_of(&self.net_switch).await;
+        let minted = match crate::net::listeners::mint_box_id(&control, switch_address).await {
+            None => None,
+            Some(Ok(minted)) => Some(minted),
+            Some(Err(error)) => {
+                tracing::warn!(
+                    session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                    ?switch_address,
+                    %error,
+                    "refused a create: the VM host daemon handed no box id"
+                );
+                // A typed refusal, so the client gets this text as the
+                // create's reply and never a closed channel. A refusal
+                // names a row the client registered: the client withdraws
+                // that row on a failed create and registers a fresh one on
+                // the next run, so a re-run gets a new id. A VM that never
+                // answered gives no such promise, so that text stops.
+                let cause = error.to_string();
+                let cause = cause.trim_end_matches('.');
+                let next = if error.kind() == std::io::ErrorKind::TimedOut {
+                    ""
+                } else {
+                    " Run the command again."
+                };
+                return Err(BoxManagerError::other(BoxIdNotMinted(format!(
+                    "No session was created. The VM gave the new session no id: {cause}.{next}"
+                ))));
+            }
+        };
+        if let Some(minted) = minted {
+            tracing::info!(
+                box_id = %minted,
+                ?switch_address,
+                client_box_id = ?client_box_id,
+                "took the box id the VM host daemon minted; the request's box id is ignored"
+            );
+        } else if let Some(client_box_id) = client_box_id {
+            tracing::info!(
+                %client_box_id,
+                "ignored the box id the request carried; the store mints the box id"
+            );
+        }
+        // The record's row id is the minted id, and only for a box with a
+        // row: a box with no row has no row id.
+        config.box_id = minted.filter(|_| switch_address.is_some());
         // BOX-001, BOX-140: no caller reaches this daemon from inside a box
         // (a host with no nesting carries no per-box caller identity), so
         // every box created here has no parent. A parent comes from the
@@ -2525,7 +2592,17 @@ impl BoxManager {
         let project_root = record.project_root.clone();
         let name = record.name.clone();
         let retry = record.clone();
-        let handle = match self.store.create(record).await {
+        let store = self.store.clone();
+        let create = |record| {
+            let store = store.clone();
+            async move {
+                match minted {
+                    Some(id) => store.create_under(record, id).await,
+                    None => store.create(record).await,
+                }
+            }
+        };
+        let handle = match create(record).await {
             Ok(handle) => handle,
             // The name may be held by a session whose destroy is still
             // running (its record outlives its actor by the length of the
@@ -2549,14 +2626,14 @@ impl BoxManager {
                             ),
                         ));
                     }
-                    None => self.store.create(retry).await?,
+                    None => create(retry).await?,
                     Some(false) => return Err(e),
                 }
             }
             Err(e) => return Err(e),
         };
         let session_id = *handle.id();
-        let box_id = handed_box_id.unwrap_or(session_id);
+        let box_id = session_id;
         let parent_field = parent.map_or_else(|| "none".to_string(), |p: SessionId| p.to_string());
         let span = tracing::Span::current();
         span.record("box_id", tracing::field::display(box_id));
