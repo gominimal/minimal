@@ -2444,6 +2444,73 @@ async fn rename_session_republishes_minimal_session_name() {
     );
 }
 
+/// BOX-010 through the actor: a rename writes exactly one `renamed` event
+/// with the old and new names, keyed on the box's id. A rename to a name a
+/// running box holds, or to `self`, is refused, names the holder or
+/// `self`, and writes no event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_through_the_actor_writes_one_renamed_event() {
+    use boxes::events::BoxEventType;
+    use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest, RenameSessionResponse};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let holder = create_configured_session(&mut client, "rename-holder", "/uwu").await;
+    let id = create_configured_session(&mut client, "rename-box", "/uwu").await;
+    let before = event_kinds(&server, id).await;
+
+    let resp = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id,
+            new_name: "rename-new".to_string(),
+        })
+        .await;
+    assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+
+    let after = event_kinds(&server, id).await;
+    assert_eq!(&after[..before.len()], &before[..], "earlier events stay");
+    let added = &after[before.len()..];
+    assert_eq!(added.len(), 1, "one event per rename: {added:?}");
+    assert_eq!(added[0].kind, BoxEventType::Renamed);
+    assert_eq!(added[0].box_id, id);
+    assert_eq!(added[0].data["old_name"], "rename-box");
+    assert_eq!(added[0].data["new_name"], "rename-new");
+    let record = read_record(&server, id).await;
+    assert_eq!(record.id, id);
+    assert_eq!(record.name.as_deref(), Some("rename-new"));
+
+    // Refused: a name the running holder has, under any case, and `self`.
+    for (new_name, named) in [
+        ("rename-holder", holder.to_string()),
+        ("RENAME-HOLDER", holder.to_string()),
+        ("self", "`self`".to_string()),
+    ] {
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id,
+                new_name: new_name.to_string(),
+            })
+            .await;
+        let Errorable::Err { error } = resp else {
+            panic!("a rename to `{new_name}` must be refused: {resp:?}");
+        };
+        assert!(error.contains(&named), "`{named}` missing from: {error}");
+    }
+    assert_eq!(
+        event_kinds(&server, id).await,
+        after,
+        "a refusal writes no event"
+    );
+    assert_eq!(
+        read_record(&server, id).await.name.as_deref(),
+        Some("rename-new")
+    );
+    assert_eq!(
+        read_record(&server, holder).await.name.as_deref(),
+        Some("rename-holder")
+    );
+}
+
 /// Regression: a session shell minted headlessly — by the activation
 /// hooks, with no terminal anywhere in the picture — used to keep that
 /// terminal-less environment for the session's whole life, because
