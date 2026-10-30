@@ -738,16 +738,26 @@ impl BoxActor {
             Ok(()) => self.record_renamed(&record, &new_name).await,
             Err(error) => {
                 // The store logged the holder and the candidates it read.
-                let refusal = error
+                // Any other error (record write, index flush) is a failure,
+                // not a refusal.
+                match error
                     .get_ref()
-                    .and_then(|e| e.downcast_ref::<boxes::box_name::RenameRefusal>());
-                tracing::info!(
-                    box_id = %record.id,
-                    new_name = %new_name,
-                    exit_code = refusal.map(boxes::box_name::RenameRefusal::exit_code),
-                    %error,
-                    "rename refused",
-                );
+                    .and_then(|e| e.downcast_ref::<boxes::box_name::RenameRefusal>())
+                {
+                    Some(refusal) => tracing::info!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        exit_code = refusal.exit_code(),
+                        %error,
+                        "rename refused",
+                    ),
+                    None => tracing::warn!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        %error,
+                        "rename failed",
+                    ),
+                }
             }
         }
 
