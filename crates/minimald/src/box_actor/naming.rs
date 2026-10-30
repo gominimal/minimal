@@ -675,9 +675,28 @@ impl BoxActor {
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
     /// the PTask hostname so `<new>.min.internal` routes and the old name
-    /// stops (R3.6).
+    /// stops (R3.6), and records a `renamed` event with both names
+    /// (BOX-010).
+    ///
+    /// A rename to `self`, or to a name a running box on this host holds,
+    /// is refused and changes nothing: the store makes the holder check,
+    /// and its refusal names the holder. The refusal's `exit_code()` is 2,
+    /// but this method returns an `io::Error`, so the code reaches only the
+    /// daemon log. The RPC reply and `min rename` do not carry it yet.
     pub(super) async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
+
+        // BOX-010: `self` is refused before the route is touched.
+        if let Err(refusal) = boxes::box_name::check_rename(&[], record.id, &new_name) {
+            tracing::info!(
+                box_id = %record.id,
+                new_name = %new_name,
+                exit_code = refusal.exit_code(),
+                %refusal,
+                "rename refused",
+            );
+            return Err(refusal.into());
+        }
 
         // Renaming to the name the session already has is an error, not a
         // no-op: `save` deliberately treats same-id same-name as a no-op (a
@@ -715,6 +734,33 @@ impl BoxActor {
         )
         .await;
 
+        match &written {
+            Ok(()) => self.record_renamed(&record, &new_name).await,
+            Err(error) => {
+                // The store logged the holder and the candidates it read.
+                // Any other error (record write, index flush) is a failure,
+                // not a refusal.
+                match error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<boxes::box_name::RenameRefusal>())
+                {
+                    Some(refusal) => tracing::info!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        exit_code = refusal.exit_code(),
+                        %error,
+                        "rename refused",
+                    ),
+                    None => tracing::warn!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        %error,
+                        "rename failed",
+                    ),
+                }
+            }
+        }
+
         // Forward the new name to the running host so the shell's
         // `$MINIMAL_SESSION_NAME` is republished through the per-attach
         // environment channel. Best-effort: the record-side rename has
@@ -729,5 +775,41 @@ impl BoxActor {
         }
 
         written
+    }
+
+    /// Writes the `renamed` event of a rename that the store accepted
+    /// (BOX-010): the box's id, its parent, and its old and new names. The
+    /// record already carries the new name, so a missing event is logged
+    /// and does not undo the rename.
+    async fn record_renamed(&self, before: &Record, new_name: &str) {
+        let object = match self.record.object().await {
+            Ok(object) => object,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %before.id,
+                    %error,
+                    "rename: could not open the box to write the renamed event",
+                );
+                return;
+            }
+        };
+        let data = boxes::box_name::renamed_event_data(before.name.as_deref(), new_name);
+        match crate::box_manager::write_box_event(
+            &object,
+            boxes::events::BoxEventType::Renamed,
+            data,
+        ) {
+            Ok(_) => tracing::info!(
+                box_id = %before.id,
+                old_name = ?before.name,
+                new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %before.id,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
     }
 }
