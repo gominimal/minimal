@@ -54,13 +54,10 @@ pub(crate) fn find_listed_box(
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(target))
     };
-    for named in [
-        newest_named(listing.iter().filter(exact)),
-        newest_named(listing.iter().filter(folded)),
-    ] {
-        if let Some(id) = named {
-            return Ok(id);
-        }
+    let named = newest_named(listing.iter().filter(exact))
+        .or_else(|| newest_named(listing.iter().filter(folded)));
+    if let Some(id) = named {
+        return Ok(id);
     }
     if is_id_prefix(target) {
         let start = target.replace('-', "").to_ascii_lowercase();
