@@ -427,7 +427,7 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimal ls_shows_vm_per_box
   <!-- S7b/AC1; prose 37; state-driven -->
 
-- **NET-058** WHILE two VMs run, WHEN attach or `min net expose` names a box THE SYSTEM SHALL resolve the VM from the box name without a global flag.
+- **NET-058** WHILE two VMs run, WHEN attach, exec, a task run, `min net forward` or `min net expose` names a box THE SYSTEM SHALL resolve the VM from the box name without a global flag.
   tier:     T0
   verify:   cargo nextest run -p minimal box_name_resolves_vm_without_flag
   <!-- S7b/AC1; prose 37; state+event -->
