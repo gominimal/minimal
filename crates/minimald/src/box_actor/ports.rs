@@ -1204,7 +1204,11 @@ impl BoxActor {
     /// it runs (NET-129): the port's holder was destroyed, moved off the
     /// address or stopped naming the port, and the registry elected this
     /// box. Its attach skipped the port while it yielded, so nothing is
-    /// bound for it until this, or until its next attach.
+    /// bound for it until this, or until its next attach. The present
+    /// landing sends the same hand-over to a box it moved off the
+    /// `127.0.0.1` interim (NET-123 §7.1): its attach bound the forward at
+    /// the interim, and this binds it at the address its name now answers
+    /// at.
     ///
     /// Nothing is asked for a box with no host running or whose spawn has
     /// ended: that box holds the port of record and its next attach binds
@@ -1321,6 +1325,181 @@ impl BoxActor {
                 %error,
                 "the hand-over could not record the shared-address port it bound; \
                  a daemon restart may hand it to another box"
+            );
+        }
+    }
+
+    /// Unbinds the declared forward of `port` still bound at `from` once the
+    /// move's hand-over bound it at `to` (#2748). Without this the box keeps
+    /// a listener at the old address: the `127.0.0.1` interim is shared, and
+    /// the registry may give the port there to another box, whose bind would
+    /// meet it. The old forward is unbound only after the new one stands, so
+    /// the port is served the whole way through. A bind at `to` that failed
+    /// leaves the old forward as it is.
+    ///
+    /// On a VM-backed host the host refuses a declared port's withdrawal and
+    /// unbinds the box's declared forwards itself
+    /// ([`crate::net::policy::ControlChannel::host_unbinds_declared_forwards`]),
+    /// so nothing is asked there. An unbind that fails is logged, and the
+    /// spawn's end unbinds the forward as it would have.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn release_moved_declared(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+        port: u16,
+    ) {
+        if !self.has_live_host() || !self.live_ingress.holds_handed_at(to, port) {
+            return;
+        }
+        let stale = self.live_ingress.declared_at(from, port);
+        if stale.is_empty() {
+            return;
+        }
+        let control = self.switch_control().await;
+        if control.host_unbinds_declared_forwards() {
+            return;
+        }
+        for forwarder in stale {
+            match forwarder.unbind_moved(&control).await {
+                Ok(()) => tracing::info!(
+                    port,
+                    %from,
+                    %to,
+                    "unbound a declared port at the box's old address after its move"
+                ),
+                Err(error) => tracing::warn!(
+                    port,
+                    %from,
+                    %error,
+                    "unbinding a declared port at the box's old address failed; \
+                     it is unbound when the box's spawn ends"
+                ),
+            }
+        }
+    }
+
+    /// Moves the forwards this box's `min net expose` bound at `from` to
+    /// `to`, the address its publish moved to (#2748). The present landing
+    /// moves a box off the `127.0.0.1` interim while it runs, and a runtime
+    /// publish binds at the address the box published at when it was asked,
+    /// so without this the name would answer at `to` while the exposed port
+    /// listens at `from`.
+    ///
+    /// Each forward is bound at `to` first, toward the same lease, and only
+    /// then is the one at `from` unbound, so the port is served the whole
+    /// way through. The box's gate and the VM host daemon's row name the port,
+    /// not the address, so neither changes. A bind that fails is logged and
+    /// leaves the forward at `from`. An unbind that fails keeps the old
+    /// forward for the box's stop or its spawn's end to unbind.
+    ///
+    /// Nothing is moved for a box with no host running or whose spawn has
+    /// ended, or when the registry no longer publishes the box at `to`,
+    /// since the move is read after other changes may have landed.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn move_exposed_ports(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+    ) {
+        if !self.has_live_host() || self.live_ingress.is_detached() {
+            return;
+        }
+        let moving = self.live_ingress.bound_at(from);
+        if moving.is_empty() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        let switch_address = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if registry.published_own_address(record.id) != Some(to) {
+                return;
+            }
+            match record.box_addresses {
+                Some(addresses) => Some(addresses.switch_address),
+                None => registry.own_lease(record.id),
+            }
+        };
+        let Some(switch_address) = switch_address else {
+            return;
+        };
+        let session_name = record
+            .name
+            .as_deref()
+            .unwrap_or(crate::rpc::ANONYMOUS_SESSION);
+        let control = self.switch_control().await;
+        for (port, proto) in moving {
+            let forwarder = match crate::net::policy::expose_dynamic(
+                &control,
+                to,
+                switch_address,
+                port,
+                proto,
+                None,
+            )
+            .await
+            {
+                Ok(forwarder) => forwarder,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.id,
+                        session_name,
+                        port,
+                        %from,
+                        %to,
+                        %error,
+                        owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                        "binding an exposed port at the box's new address failed; \
+                         it stays at the old address until the box stops"
+                    );
+                    continue;
+                }
+            };
+            let mapping = minimald_rpc::LiveMapping {
+                local: forwarder.local().to_string(),
+                internal_port: forwarder.internal_port(),
+                proto,
+                pending: None,
+            };
+            let moved = crate::net::provider::LiveIngressForward { forwarder, mapping };
+            let old = match self.live_ingress.rebind(from, moved) {
+                Ok(old) => old,
+                Err(moved) => {
+                    // The spawn ended, or the port was withdrawn, while the
+                    // bind was in flight: the new forward comes down here.
+                    crate::net::policy::remove_ingress(&control, &[moved.forwarder]).await;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                crate::net::policy::unexpose_forwarder(&control, &old.forwarder).await
+            {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name,
+                    port,
+                    %from,
+                    %error,
+                    "unbinding an exposed port at the box's old address failed; \
+                     it is unbound again when the box stops"
+                );
+                if let Err(stale) = self.live_ingress.retire(old.forwarder) {
+                    crate::net::policy::remove_ingress(&control, &[stale]).await;
+                }
+            }
+            tracing::info!(
+                session_id = %record.id,
+                session_name,
+                port,
+                %from,
+                %to,
+                owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                "moved an exposed port to the box's new address"
             );
         }
     }

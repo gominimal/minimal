@@ -3275,3 +3275,212 @@ async fn show_box_finds_a_box_by_the_id_list_prints() {
         .expect("the record id still finds the box");
     assert_eq!(by_record_id.record.box_id, box_id);
 }
+
+/// Creates an `Active` box through the whole create flow a client drives,
+/// with `verb` as the creating verb and `spec` as the expanded spec the
+/// create sends (BOX-068).
+#[cfg(target_os = "linux")]
+async fn create_box_by_verb(
+    client: &mut crate::test_harness::TestClient,
+    name: &str,
+    verb: minimald_rpc::CreatingVerb,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let mut req = create_session_req(name, "/uwu");
+    req.config.creating_verb = verb;
+    req.spec = spec;
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// Attaches to `id`, sends a line and waits for the shell to echo it.
+/// Panics with what the channel carried when it closes first.
+#[cfg(target_os = "linux")]
+async fn attach_until_echo(client: &mut crate::test_harness::TestClient, id: SessionId) {
+    use russh::ChannelMsg;
+
+    let mut channel = client.open_shell(id).await;
+    let _ = channel.data_bytes(b"hello\n".to_vec()).await;
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                out.extend_from_slice(&data);
+                if String::from_utf8_lossy(&out).contains("got:hello") {
+                    return;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!(
+                "the attach to {id} closed before its shell answered: {:?}",
+                String::from_utf8_lossy(&out)
+            ),
+        }
+    }
+}
+
+/// The listing entry for `id` in a `ListBoxes` reply over the socket.
+#[cfg(target_os = "linux")]
+async fn listed(
+    client: &mut crate::test_harness::TestClient,
+    id: SessionId,
+) -> minimald_rpc::BoxListingEntry {
+    use minimald_rpc::{Errorable, ListBoxes, ListBoxesRequest};
+
+    match client.call::<ListBoxes>(&ListBoxesRequest::default()).await {
+        Errorable::Ok(listing) => listing
+            .boxes
+            .into_iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}")),
+        Errorable::Err { error } => panic!("ListBoxes failed: {error}"),
+    }
+}
+
+/// The first slice, end to end over the daemon socket (BOX-001, BOX-003,
+/// BOX-011, BOX-013, BOX-154, BOX-158, BOX-159, BOX-068, BOX-025). A
+/// session box is stopped and retained, and a task box is left running.
+/// After a daemon restart, the listing holds both, with the type of the
+/// creating verb, no parent, and the `stopped` state. The daemon log
+/// names the record the restart set stopped. A read returns the stopped
+/// box's ending. An attach resumes it from its stored spec under the same
+/// id, and the listing then reads it `running`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_session_survives_restart_then_lists_reads_and_resumes() {
+    use crate::test_harness::TestServer;
+    use minimald_rpc::{CreatingVerb, Errorable, ShowBox, ShowBoxRequest, StopBox, StopBoxRequest};
+
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = true;
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    let kept = create_box_by_verb(
+        &mut client,
+        "kept-session",
+        CreatingVerb::Session,
+        Some(spec.clone()),
+    )
+    .await;
+    let left = create_box_by_verb(&mut client, "left-task", CreatingVerb::Task, None).await;
+
+    // Before the restart, both boxes run under ids the daemon minted.
+    assert_ne!(kept, left);
+    assert_eq!(listed(&mut client, kept).await.state, "running");
+    assert_eq!(listed(&mut client, left).await.state, "running");
+
+    // The session box runs a shell, then a stop ends it and keeps its
+    // record (BOX-013, BOX-018).
+    attach_until_echo(&mut client, kept).await;
+    match client
+        .call::<StopBox>(&StopBoxRequest {
+            id: kept,
+            force: true,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    let stopped = listed(&mut client, kept).await;
+    assert_eq!(stopped.state, "stopped", "{stopped:?}");
+    assert_eq!(stopped.reason.as_deref(), Some("stopped"));
+
+    // The restart: every process of the first daemon's boxes is gone.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    let server = TestServer::new_in(server.into_state_dir()).await;
+    let mut client = server.connect().await;
+
+    // The listing holds both records, with the creating verb's type, no
+    // parent and the `stopped` state (BOX-158, BOX-001, BOX-011).
+    let kept_entry = listed(&mut client, kept).await;
+    assert_eq!(kept_entry.name.as_deref(), Some("kept-session"));
+    assert_eq!(
+        kept_entry.box_type.as_deref(),
+        Some(boxes::SESSION_BOX_TYPE)
+    );
+    assert_eq!(kept_entry.parent, None, "a box created outside any box");
+    assert_eq!(kept_entry.state, "stopped", "{kept_entry:?}");
+    assert_eq!(kept_entry.reason.as_deref(), Some("stopped"));
+
+    let left_entry = listed(&mut client, left).await;
+    assert_eq!(left_entry.name.as_deref(), Some("left-task"));
+    assert_eq!(left_entry.box_type.as_deref(), Some(boxes::TASK_BOX_TYPE));
+    assert_eq!(left_entry.parent, None);
+    // BOX-154: the restart set the running box stopped, with no signal.
+    assert_eq!(left_entry.state, "stopped", "{left_entry:?}");
+    assert_eq!(left_entry.reason.as_deref(), Some("stopped"));
+    assert_eq!((left_entry.exit_code, left_entry.signal), (None, None));
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line.contains(&left.to_string())
+            && line.contains("restart: set a running record with no process left to stopped")),
+        "the daemon log names the record the restart set stopped:\n{logged}"
+    );
+
+    // A read returns the same record, its identity and its live execs
+    // (BOX-159).
+    let shown = match client.call::<ShowBox>(&ShowBoxRequest { id: kept }).await {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+    };
+    assert_eq!(shown.record, kept_entry);
+    assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
+    assert!(shown.live_execs.is_empty(), "{:?}", shown.live_execs);
+
+    // The record kept the spec its create sent (BOX-068).
+    let reader = server
+        .state
+        .sessions_manager()
+        .await
+        .box_events(kept)
+        .await
+        .unwrap();
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&reader.object.load_spec().unwrap().expect("a stored spec"))
+            .unwrap();
+    assert_eq!(stored, spec);
+
+    // An attach resumes the stopped box from that spec, under the same id
+    // (BOX-025). The other box stays stopped.
+    attach_until_echo(&mut client, kept).await;
+    let resumed = listed(&mut client, kept).await;
+    assert_eq!(resumed.state, "running", "{resumed:?}");
+    assert_eq!(resumed.name.as_deref(), Some("kept-session"));
+    assert_eq!(listed(&mut client, left).await.state, "stopped");
+}
