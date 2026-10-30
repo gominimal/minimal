@@ -84,7 +84,9 @@ async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
 
     // A loop that accepted the kill but never resolves — models the
     // mainloop parked mid-`step()`.
-    let mut task = crate::traced::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+    let mut task = crate::traced::spawn(std::future::pending::<
+        Result<crate::box_runtime::HostExit, std::io::Error>,
+    >());
 
     // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
     // the deadline that returns this call. Reaching GIVE_UP would mean the
@@ -3478,21 +3480,20 @@ async fn create_handed_own_ip_session(
     id
 }
 
-/// NET-121, design §7.1: a declared TCP host port that another process
-/// already holds at the box's published address fails the finalize. The
-/// error names the port and the next step, and the box never reaches
-/// `Active`.
+/// The finalize of a box whose declared port is held fails with the typed
+/// refusal (NET-144). Then the destroy the client's activate cleanup sends
+/// removes the box, which proves it never reached `Active`, and no record is
+/// left behind.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_fails_on_a_taken_declared_host_port() {
-    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
-    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
-    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
-    // Another process holds the declared host port at the handed address.
-    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
-    let server = TestServer::new().await;
-    let mut client = server.connect().await;
-    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+async fn assert_refused_and_cleaned_up(
+    client: &mut TestClient,
+    id: SessionId,
+    expected: minimald_rpc::PortInUseRefusal,
+) {
+    use minimald_rpc::{
+        DestroySession, DestroySessionRequest, Errorable, FinalizeSession, FinalizeSessionRequest,
+        ListSessions,
+    };
     let reply = client
         .call::<FinalizeSession>(&FinalizeSessionRequest {
             session_id: id,
@@ -3500,13 +3501,220 @@ async fn finalize_fails_on_a_taken_declared_host_port() {
         })
         .await;
     match reply {
-        Errorable::Err { error } => assert!(
-            error.contains("host port 18080 is already in use")
-                && error.contains("--ingress <other>:<internal>"),
-            "the error must name the port and the next step, got: {error}"
-        ),
-        Errorable::Ok(ok) => panic!("finalize must fail on a taken host port, got {ok:?}"),
+        Errorable::Err { error } => {
+            assert_eq!(
+                minimald_rpc::PortInUseRefusal::find_in(&error),
+                Some(expected.clone()),
+                "the refusal names the port and its holder, got: {error}"
+            );
+            assert!(
+                error.contains(&expected.to_string()),
+                "the daemon's text is the refusal's own text, got: {error}"
+            );
+        }
+        Errorable::Ok(ok) => panic!("finalize must fail on a held port, got {ok:?}"),
     }
+    // `only_if_unfinalized` is the client's activate cleanup: it removes
+    // only a box that never reached `Active`.
+    match client
+        .call::<DestroySession>(&DestroySessionRequest {
+            id,
+            only_if_unfinalized: true,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("the activate cleanup's destroy failed: {error}"),
+    }
+    let listed = client.call::<ListSessions>(&()).await;
+    assert!(
+        listed.sessions.iter().all(|entry| entry.id != id),
+        "a refused activation leaves no record: {:?}",
+        listed.sessions
+    );
+}
+
+/// NET-121, NET-144, design §7.1: a declared TCP host port that a program
+/// outside Minimal already holds at the box's published address fails the
+/// finalize. The refusal names the port and the host as its holder, and
+/// the box leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
+    let capture = crate::test_harness::captured_log();
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    // Another process holds the declared host port at the handed address.
+    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
+    assert_refused_and_cleaned_up(
+        &mut client,
+        id,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Host,
+        },
+    )
+    .await;
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={id}"))
+            && line.contains("port=18080")
+            && line.contains("127.0.64.77")
+            && line.contains("holder=host")),
+        "one warn line names the session, port, address and holder, got: {logged}"
+    );
+}
+
+/// NET-144: at the shared `127.0.0.1` fallback a declared port that another
+/// box already holds fails the second box's activation, naming the box that
+/// holds it, where before the second box yielded the port. The first box
+/// keeps the port, and the second leaves no record.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fallback() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    // No reserved range on this host: every box publishes at `127.0.0.1`.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let first = create_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 78),
+        std::net::Ipv4Addr::new(127, 0, 64, 78),
+    )
+    .await;
+    finalize_session(&mut client, first).await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 79),
+        std::net::Ipv4Addr::new(127, 0, 64, 79),
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(first),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the first box publishes at the fallback"
+    );
+    assert_refused_and_cleaned_up(
+        &mut client,
+        second,
+        minimald_rpc::PortInUseRefusal {
+            port: 18080,
+            box_port: 80,
+            holder: minimald_rpc::PortHolder::Box("first".to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .own_port_holder(std::net::Ipv4Addr::LOCALHOST, 18080)
+            .map(|(holder, _)| holder),
+        Some(first),
+        "the first box keeps the port"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains(&format!("session={second}"))
+            && line.contains("holder=box:first")),
+        "the warn line names the holding box, got: {logged}"
+    );
+}
+
+/// NET-144, under a pending range verdict: a second box at the `127.0.0.1`
+/// interim yields the declared port the first box holds there, because a
+/// present landing moves both to their own addresses. When the verdict
+/// lands absent, the second box stays at the fallback with the port unbound,
+/// and the daemon log reports it with the port and the holder. The first
+/// box, which holds the port, is not reported.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict_lands_absent() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    // The bound is shrunk so both finalizes publish at the interim.
+    manager.reset_hand_verdict_deadline(100);
+    let mut client = server.connect().await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 81),
+        std::net::Ipv4Addr::new(127, 0, 64, 81),
+    )
+    .await;
+    let second = create_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 82),
+        std::net::Ipv4Addr::new(127, 0, 64, 82),
+    )
+    .await;
+    let finalized = finalize_session(&mut client, second).await;
+    assert!(
+        finalized
+            .shared_port_collisions
+            .iter()
+            .any(|collision| collision.port == 18080 && collision.held_by.starts_with("first")),
+        "under the pending verdict the second box yields the port: {finalized:?}"
+    );
+    let registry = manager.hostnames();
+    for id in [first, second] {
+        assert_eq!(
+            registry
+                .read()
+                .expect("registry lock")
+                .published_own_address(id),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "both boxes stand at the interim while the verdict walks"
+        );
+    }
+    let reported = |logged: &str, id: SessionId| {
+        logged.lines().any(|line| {
+            line.contains("host-port-in-use")
+                && line.contains("127.0.0.1 fallback")
+                && line.contains(&format!("session={id}"))
+        })
+    };
+    assert!(
+        !reported(&capture.contents(), second),
+        "nothing is reported while the verdict is pending"
+    );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reported(&capture.contents(), second) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("host-port-in-use")
+            && line.contains("127.0.0.1 fallback")
+            && line.contains(&format!("session={second}"))
+            && line.contains("port=18080")
+            && line.contains("address=127.0.0.1")
+            && line.contains("holder=box:first")),
+        "the absent landing reports the held port, the address and the holder, got: {logged}"
+    );
+    assert!(
+        !reported(&logged, first),
+        "the box that holds the port is not reported: {logged}"
+    );
 }
 
 /// Waits until a registration is parked on the range verdict, so the
@@ -3688,20 +3896,35 @@ async fn a_box_nobody_handed_an_address_publishes_at_the_answerers_grant() {
 /// NET-129's sub-requirement (report, don't translate) covers the boxes that
 /// *do* share an address; this is the case the shared-address mode exists to
 /// avoid.
+///
+/// The boxes are created after the range lands the way a microVM daemon
+/// lands it once `min finalize-install` ran: the daemon-start walk found the
+/// range absent, and the first create's session-start walk finds it present.
+/// A stand-in walk stands in for the host forwarder's binds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_box_gets_own_loopback_address() {
     let alpha_handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let beta_handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.install_range_walk_standin(|| {
+        let hosts = ::switch::loopback::range_hosts().count();
+        crate::net::loopback::RangeProbe {
+            bound: hosts,
+            probed: hosts,
+            first_failure: None,
+        }
+    });
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
     let mut client = server.connect().await;
-    let _alpha = finalize_handed_own_ip_session(
+    let alpha = finalize_handed_own_ip_session(
         &mut client,
         "alpha",
         std::net::Ipv4Addr::new(100, 64, 128, 9),
         alpha_handed,
     )
     .await;
-    let _beta = finalize_handed_own_ip_session(
+    let beta = finalize_handed_own_ip_session(
         &mut client,
         "beta",
         std::net::Ipv4Addr::new(100, 64, 128, 10),
@@ -3730,6 +3953,19 @@ async fn each_box_gets_own_loopback_address() {
     // number each box asked for — no translation, no remap around the pair.
     let registry = server.state.sessions_manager().await.hostnames();
     let routes = registry.read().expect("registry lock");
+    // Each box stands at its own hand, not the interim: the publish is the
+    // address the attach path binds the box's forwards at.
+    for (name, id, handed, address) in [
+        ("alpha", alpha, alpha_handed, alpha_address),
+        ("beta", beta, beta_handed, beta_address),
+    ] {
+        assert_eq!(
+            routes.published_own_address(id),
+            Some(handed),
+            "{name}'s forwards bind at the address it was handed, after the range landed"
+        );
+        assert_eq!(address, handed, "{name}'s name answers at its own address");
+    }
     for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
         let route = routes
             .resolve(&format!("{name}.min.internal"))
@@ -5065,17 +5301,19 @@ async fn restart(server: TestServer, client: TestClient) -> TestServer {
     TestServer::new_in(server.into_state_dir()).await
 }
 
-/// A restarted daemon routes the names of the active sessions it restored
-/// as soon as it resumes them, with no RPC naming either session first.
-/// Resuming is idempotent: a second resume starts nothing, and an RPC that
-/// names a resumed session finds its actor instead of registering again.
+/// A restarted daemon does not route the names of the boxes it found
+/// `running`: its start set each one `stopped` (BOX-154), and the resume at
+/// start brings none back. An attach resumes a box (BOX-025), and its name
+/// routes again from then on. The other box stays stopped and unrouted.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
+async fn a_restarted_daemon_routes_a_restored_name_once_an_attach_resumes_it() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let alpha = create_configured_session(&mut client, "restored-alpha", "/uwu").await;
-    create_configured_session(&mut client, "restored-beta", "/uwu").await;
+    let beta = create_configured_session(&mut client, "restored-beta", "/uwu").await;
     assert_eq!(
         route_owner(&server, "restored-alpha.min.internal").await,
         Some("restored-alpha".to_owned()),
@@ -5083,62 +5321,193 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
     );
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
-    assert_eq!(
-        route_owner(&server, "restored-alpha.min.internal").await,
-        None,
-        "before the resume the restored session's name is unregistered"
-    );
-
-    let resumed = manager.enqueue_resume_active_sessions().await;
-    assert_eq!(
-        manager.running_count().await,
-        2,
-        "a message sent after the enqueue returns is served after the resume"
-    );
-    assert_eq!(
-        resumed.await.unwrap(),
-        2,
-        "both active sessions are resumed"
-    );
-    for name in ["restored-alpha", "restored-beta"] {
-        assert_eq!(
-            route_owner(&server, &format!("{name}.min.internal")).await,
-            Some(name.to_owned()),
-            "{name}'s name routes after the resume, with no RPC naming it"
-        );
-    }
-
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
         0,
-        "a second resume starts nothing"
+        "the restart brings no box back"
     );
-    manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(alpha))
+    assert_eq!(manager.running_count().await, 0);
+    for id in [alpha, beta] {
+        assert_eq!(
+            read_record(&server, id).await.state().unwrap(),
+            RecordState::Stopped(StopEnding::AtDaemonStart)
+        );
+    }
+    for name in ["restored-alpha", "restored-beta"] {
+        assert_eq!(
+            route_owner(&server, &format!("{name}.min.internal")).await,
+            None,
+            "{name}'s name does not route while the box is stopped"
+        );
+    }
+
+    attach_and_echo(&mut client, alpha)
         .await
-        .unwrap()
-        .expect("the resumed session resolves");
+        .expect("an attach resumes the stopped box");
     assert_eq!(
-        manager.running_count().await,
-        2,
-        "an RPC naming a resumed session reuses its actor"
+        read_record(&server, alpha).await.state().unwrap(),
+        RecordState::Running
     );
     assert_eq!(
         route_owner(&server, "restored-alpha.min.internal").await,
         Some("restored-alpha".to_owned()),
-        "the name still routes to its own session"
+        "the resumed box's name routes to its own session"
+    );
+    assert_eq!(
+        read_record(&server, beta).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        "the box nobody attached to stays stopped"
     );
 }
 
-/// A restarted daemon's resume launches the host of a restored own-address
-/// box — no RPC, no exec, no attach — so the box's declared ingress is
-/// bound and its name keeps answering without a client. A `HostNet` box
-/// gets no such launch: it owns no declared ingress and publishes no
-/// address, so its restored actor alone is the whole box, as before.
+/// BOX-154 and BOX-025 across a daemon restart: a `running` record whose
+/// box has no process left reads `stopped` after the restart, with no exit
+/// code and no signal, and with an `exited` event that says so. An attach
+/// then resumes the box with its files, its id and its name.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
+async fn restart_stops_running_record_and_attach_resumes_it() {
+    use boxes::core::record::{RecordState, StopEnding};
+    use boxes::events::BoxEventType;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("restart-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let paths = session_paths(&server, id).await;
+    let kept = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    // The restart: every process of the first daemon's boxes is gone.
+    let server = restart(server, client).await;
+    let mut client = server.connect().await;
+    assert_eq!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .resume_active_sessions()
+            .await
+            .unwrap(),
+        0,
+        "the restart brings no box back"
+    );
+
+    let record = read_record(&server, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
+    assert_eq!(record.status, boxes::BoxState::Stopped);
+    assert_eq!((record.exit_code, record.signal), (None, None));
+    let events = event_kinds(&server, id).await;
+    let exited = events
+        .iter()
+        .rposition(|e| e.kind == BoxEventType::Exited)
+        .expect("the restart records an exited event");
+    assert_eq!(events[exited].data["reason"], "stopped");
+    assert!(
+        !events[exited].data.contains_key("signal"),
+        "{:?}",
+        events[exited].data
+    );
+    assert!(
+        !events[exited].data.contains_key("exit_code"),
+        "{:?}",
+        events[exited].data
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach resumes the box the restart stopped");
+    let record = read_record(&server, id).await;
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(record.id, id, "the box keeps its id");
+    assert_eq!(record.name.as_deref(), Some("restart-box"), "and its name");
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        "still here",
+        "and its files"
+    );
+    let events = event_kinds(&server, id).await;
+    let resumed = events
+        .iter()
+        .rposition(|e| e.kind == BoxEventType::Resumed)
+        .expect("the resume records a resumed event");
+    assert!(exited < resumed);
+    assert_eq!(events[resumed].data["from"], "stopped");
+}
+
+/// BOX-154 with a destroy: a box the first daemon composed reads `stopped`
+/// after a restart, and no actor hosts it. Its destroy still runs its
+/// `on_destroy` hook from the stored composition, once, without a resume.
+/// Then its record goes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_destroy_runs_once_for_a_box_stopped_by_a_restart() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("destroyed");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "restart-destroy-hook",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_destroy: Some(inline(format!("echo ran >> {}", marker.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let server = restart(server, client).await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(manager.resume_active_sessions().await.unwrap(), 0);
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
+    assert!(!marker.exists(), "no hook ran before the destroy");
+
+    destroy_session(&mut client, id).await;
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "ran\n",
+        "the destroy runs the stored on_destroy hook exactly once"
+    );
+    assert!(
+        manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the destroy"
+    );
+}
+
+/// A restarted daemon launches no host for a box it found `running`: the
+/// restart set the box `stopped` (BOX-154). An attach resumes the
+/// own-address box (BOX-025) with its network mode and its recorded
+/// address, and the registry publishes it at that address again.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_resumes_an_own_ip_box_on_attach_with_its_address() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -5149,107 +5518,108 @@ async fn a_restarted_daemon_launches_a_restored_own_ip_boxs_host_on_resume() {
         handed,
     )
     .await;
-    create_configured_session(&mut client, "restored-hostnet", "/uwu").await;
+    let before = read_record(&server, web).await;
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both active sessions are resumed"
+        0,
+        "the restart brings no box back"
+    );
+    assert_eq!(manager.running_count().await, 0, "and launches no host");
+    assert_eq!(
+        read_record(&server, web).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
     );
 
-    let web = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+    attach_and_echo(&mut client, web)
         .await
-        .unwrap()
-        .expect("the own-address box's session resolves");
-    for _ in 0..100 {
-        if web.get_attrs().await.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        web.get_attrs().await.is_some(),
-        "the resumed own-address box holds a host no client asked for"
+        .expect("an attach resumes the own-address box");
+    let record = read_record(&server, web).await;
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(record.network, boxes::NetworkMode::OwnIp);
+    assert_eq!(
+        record.box_addresses, before.box_addresses,
+        "the box keeps its recorded address"
     );
-
-    let hostnet = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Name(
-            "restored-hostnet".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .expect("the host-network box's session resolves");
-    // Held for a settle rather than read once: a launch wrongly spawned
-    // for it would be in flight alongside the own-address box's.
-    for _ in 0..20 {
-        assert!(
-            hostnet.get_attrs().await.is_none(),
-            "a resumed host-network box launches no host"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the registry publishes the box at its address again"
+    );
 }
 
-/// One restored session whose actor cannot start costs only its own name:
-/// the resume logs it and goes on, and the other session still routes.
+/// One restored box whose resume fails costs only itself. The restart set
+/// both boxes `stopped` (BOX-154). The attach to the broken one fails and
+/// leaves it stopped. The attach to the healthy one resumes it, and its
+/// name routes.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_session_that_fails_to_resume_does_not_stop_the_others() {
-    let capture = crate::test_harness::captured_log();
+    use boxes::core::record::{RecordState, StopEnding};
+
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let broken = create_configured_session(&mut client, "resume-broken", "/uwu").await;
-    create_configured_session(&mut client, "resume-healthy", "/uwu").await;
+    let healthy = create_configured_session(&mut client, "resume-healthy", "/uwu").await;
     let home = session_paths(&server, broken).await.home;
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     // A file where the session's home directory belongs: the actor's
     // bring-up cannot create its directories, so it fails to start.
     std::fs::remove_dir_all(home.as_utf8_path()).unwrap();
     std::fs::write(home.as_utf8_path(), b"not a directory").unwrap();
 
-    let manager = server.state.sessions_manager().await;
+    attach_and_echo(&mut client, broken)
+        .await
+        .expect_err("the broken box reaches no shell");
     assert_eq!(
-        manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only the healthy session is resumed"
-    );
-    assert_eq!(
-        route_owner(&server, "resume-healthy.min.internal").await,
-        Some("resume-healthy".to_owned()),
-        "the healthy session's name routes"
+        read_record(&server, broken).await.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        "the broken box stays stopped"
     );
     assert_eq!(
         route_owner(&server, "resume-broken.min.internal").await,
         None,
         "the broken session's name stays unregistered"
     );
-    let logged = capture.contents();
-    assert!(
-        logged
-            .lines()
-            .any(|line| line.contains("could not start the session's actor")
-                && line.contains("session_name=\"resume-broken\"")),
-        "the failed resume is logged naming the session, got: {logged}"
+
+    attach_and_echo(&mut client, healthy)
+        .await
+        .expect("the healthy box resumes");
+    assert_eq!(
+        read_record(&server, healthy).await.state().unwrap(),
+        RecordState::Running
+    );
+    assert_eq!(
+        route_owner(&server, "resume-healthy.min.internal").await,
+        Some("resume-healthy".to_owned()),
+        "the healthy session's name routes"
     );
 }
 
 /// Two restored sessions whose box names fold to one hostname (two unnamed
-/// sessions whose project directories' basenames differ only in case): the
-/// resume routes the name for one of them and skips the other with a
-/// collision warning, rather than letting the second registration take the
-/// route over.
+/// sessions whose project directories' basenames differ only in case). The
+/// restart sets both `stopped` (BOX-154). The first attach resumes its box
+/// and routes the name. The second attach is refused with exit status 2
+/// (BOX-025), so the name does not move.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_hostname_collision_is_logged_and_skipped() {
+async fn a_restored_hostname_collision_is_refused_on_resume() {
+    use boxes::core::record::{RecordState, StopEnding};
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    let mut ids = Vec::new();
     for project in ["/x/FoldApp", "/y/foldapp"] {
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = None;
@@ -5273,50 +5643,65 @@ async fn a_restored_hostname_collision_is_logged_and_skipped() {
             Errorable::Ok(_) => {}
             Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
         }
+        ids.push(id);
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only one of the colliding sessions is resumed"
+        0,
+        "the restart brings neither box back"
     );
-    let owner = route_owner(&server, "foldapp.min.internal")
+
+    attach_and_echo(&mut client, ids[0])
         .await
-        .expect("the folded name routes for one of the sessions");
-    assert!(
-        owner == "FoldApp" || owner == "foldapp",
-        "the name routes to one of the colliding sessions, got {owner}"
+        .expect("the first attach resumes its box");
+    assert_eq!(
+        route_owner(&server, "foldapp.min.internal").await,
+        Some("FoldApp".to_owned()),
+        "the name routes for the resumed box"
+    );
+    assert_resume_refused(
+        &server,
+        &mut client,
+        ids[1],
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        &["The running session `FoldApp` holds the name `foldapp`"],
+        2,
+    )
+    .await;
+    assert_eq!(
+        route_owner(&server, "foldapp.min.internal").await,
+        Some("FoldApp".to_owned()),
+        "the refused resume does not move the name"
     );
     let logged = capture.contents();
     assert!(
         logged
             .lines()
-            .any(|line| line.contains("hostname-collision")
-                && line.contains("resume:")
-                && line.contains(&format!("owner=\"{owner}\""))),
-        "the skipped session is logged as a collision, got: {logged}"
+            .any(|line| line.contains("resume: a running box holds the name")
+                && line.contains("holder=FoldApp")),
+        "the refusal is logged naming the holder, got: {logged}"
     );
 }
-
-/// Two restored sessions that share one registry name *outright* — two
-/// unnamed sessions whose project directories share a basename, the pair
-/// the store's name-uniqueness check never sees, since it only runs for
-/// assigned names. The check keys on the session id, not the name: an
-/// owner carrying the same name string is not this session, so the resume
-/// routes the name for one of them, skips the other with a collision
-/// warning, and never lets the second registration take the first's
-/// route over — which would move the name with no warning at all, both
-/// registrations being under the same name.
+/// Two restored sessions that share one registry name outright: two unnamed
+/// sessions whose project directories share a basename, the pair the
+/// store's name-uniqueness check never sees. The restart sets both
+/// `stopped` (BOX-154). The first attach resumes its box and routes the
+/// name. The second attach is refused with exit status 2 (BOX-025), so the
+/// name does not move.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() {
+async fn a_restored_session_sharing_another_sessions_registry_name_is_refused_on_resume() {
+    use boxes::core::record::{RecordState, StopEnding};
     use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
 
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    let mut ids = Vec::new();
     for project in ["/a/twins", "/b/twins"] {
         let mut request = crate::test_harness::create_session_req("unused", project);
         request.config.name = None;
@@ -5340,34 +5725,47 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() 
             Errorable::Ok(_) => {}
             Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
         }
+        ids.push(id);
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        1,
-        "only one of the name-sharing sessions is resumed"
+        0,
+        "the restart brings neither box back"
     );
-    assert_eq!(
-        manager.running_count().await,
-        1,
-        "the skipped session never starts an actor, so its registration \
-         cannot take the resumed one's route over"
-    );
+
+    attach_and_echo(&mut client, ids[0])
+        .await
+        .expect("the first attach resumes its box");
     assert_eq!(
         route_owner(&server, "twins.min.internal").await,
         Some("twins".to_owned()),
-        "the shared name routes for the one resumed session"
+        "the name routes for the resumed box"
+    );
+    assert_resume_refused(
+        &server,
+        &mut client,
+        ids[1],
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+        &["The running session `twins` holds the name `twins`"],
+        2,
+    )
+    .await;
+    assert_eq!(
+        route_owner(&server, "twins.min.internal").await,
+        Some("twins".to_owned()),
+        "the refused resume does not move the name"
     );
     let logged = capture.contents();
     assert!(
         logged
             .lines()
-            .any(|line| line.contains("hostname-collision")
-                && line.contains("resume:")
-                && line.contains("owner=\"twins\"")),
-        "the skipped session is logged as a collision, got: {logged}"
+            .any(|line| line.contains("resume: a running box holds the name")
+                && line.contains("holder=twins")),
+        "the refusal is logged naming the holder, got: {logged}"
     );
 }
 
@@ -6399,6 +6797,890 @@ async fn an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late() 
     );
 }
 
+/// #2748, the fresh install on a VM-backed host: the daemon-start walk
+/// lands absent, so a handed box finalizes at the `127.0.0.1` interim and
+/// its running attach binds its forwards there. The host then gains the
+/// range, and the next session start's walk lands present. The landing
+/// moves the box's name to its own hand, and the box's forward follows it:
+/// the running box binds its declared port at the hand, toward its switch
+/// lease, so the name and the forward answer at one address. Once that bind
+/// stands, the forward its attach bound at the interim is unbound, so no
+/// listener is left on the shared interim for another box's bind to meet.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_moves_a_running_interim_boxs_forward_to_its_hand() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    // The daemon-start walk's verdict on a host without the range.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 2);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 2);
+    let web = finalize_handed_own_ip_session(&mut client, "web", lease, handed).await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the absent verdict stands the handed box on the interim"
+    );
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock.clone(), 200).await;
+    let mapping = boxes::PortMapping {
+        external_port: 18080,
+        internal_port: 80,
+        proto: boxes::IpProto::Tcp,
+    };
+    // The declared forward the box's attach bound at the interim, as the
+    // attach shares it with the box's actor. The mock launch binds none.
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let control = crate::net::policy::ControlChannel::Unix(sock);
+    let Ok(crate::net::policy::HandedBind::Bound(attached)) =
+        crate::net::policy::bind_handed_port(&control, interim, lease, &mapping, None).await
+    else {
+        panic!("the stand-in binds the attach's forward");
+    };
+    let (ingress, _) = handle.ingress_cells().await.expect("the actor answers");
+    ingress.record_attached(std::slice::from_ref(&attached));
+
+    // `min finalize-install` applies the range, and the next session start
+    // walks it again.
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the present landing moves the box's publish to its own hand"
+    );
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name survives the landing");
+    assert_eq!(address, handed, "the name answers at the hand");
+
+    // The attach's bind, the hand's bind, then the interim's unbind.
+    let requests = await_served(&served, 3).await;
+    forwarder.abort();
+    let (line, body) = requests[1]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the landing binds the running box's forward at its hand: {requests:?}"
+    );
+    let declared = crate::net::policy::expose_request(&mapping, handed, lease);
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the forward listens where the name answers, toward the box's lease"
+    );
+    assert!(
+        requests[2].starts_with("POST /services/forwarder/unexpose ")
+            && requests[2].contains(&format!("\"local\":\"{interim}:18080\"")),
+        "the forward at the interim is unbound after the hand's bind stands: {requests:?}"
+    );
+    assert!(
+        attached.is_revoked(),
+        "the attach's teardown asks nothing more of the forward unbound here"
+    );
+}
+
+/// #2748, a declared port whose bind at the hand fails: the landing moves the
+/// box's name to its hand, but the switch refuses the declared port's bind
+/// there. The forward the attach bound at the interim is the only one that
+/// serves the port, so it stays bound: it is unbound only once the bind at
+/// the hand stands.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_port_whose_bind_at_the_hand_fails_keeps_its_interim_forward() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 8);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 8);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let web = finalize_handed_own_ip_session(&mut client, "web", lease, handed).await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch binds everything at the interim and nothing at the hand.
+    let refused_at = format!("\"local\":\"{handed}:");
+    let (forwarder, served) =
+        deciding_forwarder(sock.clone(), move |request| !request.contains(&refused_at)).await;
+    let mapping = boxes::PortMapping {
+        external_port: 18080,
+        internal_port: 80,
+        proto: boxes::IpProto::Tcp,
+    };
+    let control = crate::net::policy::ControlChannel::Unix(sock);
+    let Ok(crate::net::policy::HandedBind::Bound(attached)) =
+        crate::net::policy::bind_handed_port(&control, interim, lease, &mapping, None).await
+    else {
+        panic!("the stand-in binds the attach's forward");
+    };
+    let (ingress, _) = handle.ingress_cells().await.expect("the actor answers");
+    ingress.record_attached(std::slice::from_ref(&attached));
+
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    // The actor asked for the port at the hand, and the switch refused it.
+    soon(|| {
+        served_naming(&served, handed, 18080)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    // The move's handling ends in the actor's own turn: a round trip to it
+    // after the refused bind is after the release would have been asked.
+    handle.live_ingress().await.expect("the actor answers");
+    forwarder.abort();
+    assert!(
+        served_naming(&served, interim, 18080)
+            .iter()
+            .all(|request| !request.starts_with("POST /services/forwarder/unexpose ")),
+        "the forward at the interim is not unbound while no bind at the hand stands: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !attached.is_revoked(),
+        "the attach's forward at the interim still serves the port"
+    );
+}
+
+/// #2748, the runtime publications: a handed box standing on the
+/// `127.0.0.1` interim publishes one port with `min net expose` and one by
+/// listening on it, and both forwards bind at the interim. When the range
+/// lands present and the box's name moves to its hand, both forwards move
+/// with it: each is bound at the hand toward the box's lease and unbound at
+/// the interim, the listed rows name the hand, and the listened port's hold
+/// of record moves to the hand. The box declares no port, so no declared
+/// hand-over is what moves them.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_its_hand() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    // One port the box listens on, and a free one it exposes.
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let exposed = port_of(&listening_socket());
+    let range = (listened.min(exposed), listened.max(exposed));
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 3);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 3);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        lease,
+        handed,
+        Some(boxes::DynamicIngress::Allow),
+        Some(range),
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(interim),
+        "the absent verdict stands the handed box on the interim"
+    );
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock.clone(), 200).await;
+    let gate = Arc::new(crate::net::switch::BoxGate::for_session(
+        "web".to_string(),
+        lease,
+        &listen_policy_over(range),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::box_actor::listen_plan_seam::seed(
+        web,
+        crate::box_actor::listen_plan_seam::Seeded {
+            lease,
+            published: interim,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate,
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    handle
+        .expose_dynamic(exposed)
+        .await
+        .expect("a port in the box's range is exposed");
+    let at = |address: std::net::Ipv4Addr, port: u16| format!("{address}:{port}");
+    listed_once(&handle, |rows| {
+        rows.exposed
+            .iter()
+            .any(|row| row.local == at(interim, exposed))
+            && rows
+                .listened
+                .iter()
+                .any(|row| row.local == at(interim, listened))
+    })
+    .await;
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(web),
+        "the listened port is held at the interim"
+    );
+
+    // `min finalize-install` applies the range, and the next session start
+    // walks it again.
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+
+    let rows = listed_once(&handle, |rows| {
+        rows.exposed
+            .iter()
+            .any(|row| row.local == at(handed, exposed))
+            && rows
+                .listened
+                .iter()
+                .any(|row| row.local == at(handed, listened))
+    })
+    .await;
+    assert!(
+        rows.exposed
+            .iter()
+            .chain(&rows.listened)
+            .all(|row| !row.local.starts_with("127.0.0.1:")),
+        "no row names the interim after the move: {rows:?}"
+    );
+    for port in [exposed, listened] {
+        soon(|| {
+            served_naming(&served, interim, port)
+                .iter()
+                .any(|request| request.starts_with("POST /services/forwarder/unexpose "))
+        })
+        .await;
+        let moved = served_naming(&served, handed, port);
+        assert!(
+            moved.iter().any(
+                |request| request.starts_with("POST /services/forwarder/expose ")
+                    && request.contains(&format!("\"remote\":\"{lease}:{port}\""))
+            ),
+            "the port is bound at the hand toward the box's lease: {moved:?}"
+        );
+    }
+    {
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.shared_port_holder(handed, listened),
+            Some(web),
+            "the listened port is held where the box serves it now"
+        );
+        assert_eq!(
+            registry.shared_port_holder(interim, listened),
+            None,
+            "the interim hold is released"
+        );
+    }
+    forwarder.abort();
+    drop(listener);
+}
+
+/// #2748, a listen-published port whose move fails: the box's name moved to
+/// its hand, but the switch refuses the port's bind there, so the forward and
+/// the box's hold of record stay at the `127.0.0.1` interim. A box that
+/// publishes the port at the interim then yields to that hold. When the
+/// listener closes, the hold is released where the forward was bound, and
+/// the port passes to the box that was waiting on it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listen_port_whose_move_failed_releases_its_hold_where_it_was_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let installed = Arc::new(AtomicBool::new(false));
+    {
+        let installed = Arc::clone(&installed);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if installed.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: 0,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 1),
+                        std::io::ErrorKind::AddrNotAvailable,
+                    )),
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let mut client = server.connect().await;
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 4);
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 4);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        lease,
+        handed,
+        Some(boxes::DynamicIngress::Allow),
+        Some((listened, listened)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch binds everything at the interim and nothing at the hand.
+    let refused_at = format!("\"local\":\"{handed}:");
+    let (forwarder, served) =
+        deciding_forwarder(sock.clone(), move |request| !request.contains(&refused_at)).await;
+    crate::box_actor::listen_plan_seam::seed(
+        web,
+        crate::box_actor::listen_plan_seam::Seeded {
+            lease,
+            published: interim,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: Arc::new(crate::net::switch::BoxGate::for_session(
+                "web".to_string(),
+                lease,
+                &listen_policy_over((listened, listened)),
+                crate::net::SwitchSubnet::default(),
+                None,
+            )),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let at_interim = format!("{interim}:{listened}");
+    listed_once(&handle, |rows| {
+        rows.listened.iter().any(|row| row.local == at_interim)
+    })
+    .await;
+
+    installed.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    // The watcher asked for the port at the hand, and the switch refused it.
+    soon(|| {
+        served_naming(&served, handed, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    let registry = manager.hostnames();
+    {
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.shared_port_holder(interim, listened),
+            Some(web),
+            "the hold stays where the forward is still bound"
+        );
+        assert_eq!(
+            registry.shared_port_holder(handed, listened),
+            None,
+            "nothing is held at the hand while no forward is bound there"
+        );
+    }
+    let rows = handle.live_ingress().await.expect("the actor answers");
+    assert!(
+        rows.listened.iter().any(|row| row.local == at_interim),
+        "the row names where the forward is still bound: {rows:?}"
+    );
+
+    // Another box publishes the port at the interim and yields to the hold.
+    let waiting = SessionId::parse_str("00000000-0000-0000-0000-0000000000db").unwrap();
+    registry
+        .write()
+        .expect("registry lock")
+        .publish_own_address(
+            waiting,
+            "db",
+            interim,
+            std::collections::BTreeSet::from([listened]),
+        );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(web),
+        "the waiting box yields to the box serving the port"
+    );
+
+    // The listener closes: the forward comes down at the interim, and the
+    // hold there passes to the waiting box.
+    drop(listener);
+    soon(|| {
+        served_naming(&served, interim, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/unexpose "))
+    })
+    .await;
+    soon(|| {
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened)
+            == Some(waiting)
+    })
+    .await;
+    forwarder.abort();
+}
+
+/// #2748, a listen port whose new address another box holds: an absent
+/// landing moves a box at its range address onto the shared `127.0.0.1`
+/// interim, where a box with no forward behind it, such as a stopped one,
+/// declared the port first. The listening port does not move there: the
+/// other box keeps the port of record, and the forward stays at the old
+/// address. Once that box gives the port up, the next poll moves it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listen_port_does_not_move_onto_a_port_another_box_holds() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    let listener = listening_socket();
+    let listened = port_of(&listener);
+    let interim = std::net::Ipv4Addr::LOCALHOST;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 6);
+    let (handle, _gate, served, _gate_sender, web) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "web",
+        true,
+        std::net::Ipv4Addr::new(100, 64, 128, 6),
+        handed,
+        (listened, listened),
+        Vec::new(),
+    )
+    .await;
+    let at_hand = format!("{handed}:{listened}");
+    listed_once(&handle, |rows| {
+        rows.listened.iter().any(|row| row.local == at_hand)
+    })
+    .await;
+    // Another box declared the port at the interim and binds nothing there.
+    let registry = manager.hostnames();
+    let other = SessionId::parse_str("00000000-0000-0000-0000-0000000000db").unwrap();
+    registry
+        .write()
+        .expect("registry lock")
+        .publish_own_address(
+            other,
+            "db",
+            interim,
+            std::collections::BTreeSet::from([listened]),
+        );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(interim),
+        "the absent landing moves the box onto the interim"
+    );
+    // A few of the watcher's polls.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        served_naming(&served, interim, listened).is_empty(),
+        "the listening port is not bound where another box holds it"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened),
+        Some(other),
+        "the other box keeps the port of record"
+    );
+    let rows = handle.live_ingress().await.expect("the actor answers");
+    assert!(
+        rows.listened.iter().any(|row| row.local == at_hand),
+        "the row names where the forward is still bound: {rows:?}"
+    );
+
+    // The other box gives the port up, and the port follows the box.
+    let (_, hand_overs) = registry
+        .write()
+        .expect("registry lock")
+        .unpublish_own_address(other);
+    assert!(hand_overs.is_empty(), "no box waits on the port");
+    soon(|| {
+        served_naming(&served, interim, listened)
+            .iter()
+            .any(|request| request.starts_with("POST /services/forwarder/expose "))
+    })
+    .await;
+    soon(|| {
+        registry
+            .read()
+            .expect("registry lock")
+            .shared_port_holder(interim, listened)
+            == Some(web)
+    })
+    .await;
+    drop(listener);
+}
+
+/// #2748: a range walk that ends inconclusive, as one whose probe round the
+/// VM host's gate kept contended past the walk's budget does, never replaces
+/// a present verdict. Every box keeps its range address, so a guest that
+/// holds a probe round cannot move the host's boxes back to the interim.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contended_walk_never_replaces_a_present_verdict() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    let contended = Arc::new(AtomicBool::new(false));
+    {
+        let contended = Arc::clone(&contended);
+        manager.install_range_walk_standin(move || {
+            let hosts = ::switch::loopback::range_hosts().count();
+            if contended.load(Ordering::SeqCst) {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts - 1,
+                    probed: hosts,
+                    first_failure: Some((
+                        std::net::Ipv4Addr::new(127, 0, 64, 5),
+                        std::io::ErrorKind::TimedOut,
+                    )),
+                }
+            } else {
+                crate::net::loopback::RangeProbe {
+                    bound: hosts,
+                    probed: hosts,
+                    first_failure: None,
+                }
+            }
+        });
+    }
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 7);
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 7),
+        handed,
+    )
+    .await;
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the present verdict publishes the box at its hand"
+    );
+
+    contended.store(true, Ordering::SeqCst);
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 0, "an inconclusive walk moves nothing");
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "the box keeps its range address over an inconclusive walk"
+    );
+}
+
+/// #2748, a box with no actor: the present landing moves every box standing
+/// on the `127.0.0.1` interim, stopped ones included, and the move of a
+/// box's publish is passed only to a live actor, with the hand-over for
+/// each port the box declares. A box whose actor is not running has no
+/// forward to move, so the landing starts none for it, not even for the
+/// port it declares, and its next attach binds at the new address.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_present_landing_starts_no_actor_for_a_box_without_one() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 5);
+    // The box declares port 18080.
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 5),
+        handed,
+    )
+    .await;
+    let declared = std::collections::BTreeSet::from([18080u16]);
+    // A restarted daemon that has not resumed the box: its record stands,
+    // and no actor runs for it.
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    manager.install_range_walk_standin(|| {
+        let hosts = ::switch::loopback::range_hosts().count();
+        crate::net::loopback::RangeProbe {
+            bound: hosts,
+            probed: hosts,
+            first_failure: None,
+        }
+    });
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    // The box stands on the interim with its hand, as a box that published
+    // under the absent verdict does.
+    {
+        let registry = manager.hostnames();
+        let mut registry = registry.write().expect("registry lock");
+        registry.record_own_hand(web, handed);
+        registry.publish_own_address(web, "web", std::net::Ipv4Addr::LOCALHOST, declared.clone());
+        registry.register_own_ip(web, "web", declared.clone());
+    }
+    assert_eq!(
+        manager.running_count().await,
+        0,
+        "no actor runs for the box"
+    );
+
+    let answer = manager
+        .session_start_range_walk()
+        .await
+        .expect("the daemon walks the range through the forwarder");
+    assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
+    {
+        let registry = manager.hostnames();
+        let registry = registry.read().expect("registry lock");
+        assert_eq!(
+            registry.published_own_address(web),
+            Some(handed),
+            "the box's publish moves to its hand"
+        );
+        assert!(
+            registry.holds_shared_port(web, handed, 18080),
+            "the box holds its declared port at the hand, so the move made its hand-over"
+        );
+    }
+    // The move is passed on off the landing's task: give it the time an
+    // actor's start would take, then read that none started.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        manager.running_count().await,
+        0,
+        "the landing starts no actor for a box without one"
+    );
+}
+
+/// A stand-in for the host gvproxy that answers each request 200 when
+/// `accept` takes it and 500 when it does not, recording every request as
+/// [`fake_forwarder`] does — so a test can have the switch refuse binds at
+/// one address for as long as it runs, however often they are asked.
+#[cfg(target_os = "linux")]
+async fn deciding_forwarder(
+    sock: std::path::PathBuf,
+    accept: impl Fn(&str) -> bool + Send + 'static,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let server = crate::traced::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            let answer = if accept(&request) {
+                "200 OK"
+            } else {
+                "500 Internal Server Error"
+            };
+            recorded.lock().expect("served lock").push(request);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(format!("HTTP/1.1 {answer}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await;
+        }
+    });
+    (server, served)
+}
+
 /// The wiring test for the hand's verdict gate (the `.filter(vouches_for)`
 /// and the bounded wait on the hand's read, §7.1): a handed reserved address
 /// finalizes to `published_own_address == 127.0.0.1` under an absent book —
@@ -6798,58 +8080,36 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     );
 }
 
-/// NET-129 at daemon start: a shared-address port goes to the box created
-/// earliest among the boxes publishing it, whatever order the store lists
-/// them in. The store lists its records by the last five hex digits of
-/// each id, which are random, so the pair this test restarts with is chosen
-/// to list the newer box first — the order that hands it the port unless
-/// the resume sorts by id.
+/// NET-129 after a daemon restart: the restart sets both boxes `stopped`
+/// (BOX-154), and the resume at start brings neither back, so neither holds
+/// the shared-address port. Each attach resumes its box (BOX-025) with its
+/// address and its declared port. Resumed in creation order, the box created
+/// earliest holds the port again and the newer box yields to it.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_address_holder_same_in_any_resume_order() {
+async fn shared_address_holder_kept_when_boxes_resume_in_creation_order() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let store_key = |id: SessionId| {
-        let id = id.to_string();
-        id[id.len() - 5..].to_owned()
-    };
-
-    // Keep two boxes on the port, replacing the older one until the newer
-    // box's store key sorts first. Destroying the older box hands the port
-    // to the one left, so the older of the pair always holds it.
-    let mut older = (
-        finalize_handed_own_ip_session(
-            &mut client,
-            "box-0",
-            std::net::Ipv4Addr::new(100, 64, 128, 9),
-            shared,
-        )
-        .await,
-        "box-0".to_owned(),
-    );
-    let mut newer = None;
-    for n in 1..=32u8 {
-        let name = format!("box-{n}");
-        let id = finalize_handed_own_ip_session(
-            &mut client,
-            &name,
-            std::net::Ipv4Addr::new(100, 64, 128, 9 + n),
-            shared,
-        )
-        .await;
-        if store_key(id) < store_key(older.0) {
-            newer = Some(id);
-            break;
-        }
-        destroy_session(&mut client, older.0).await;
-        older = (id, name);
-    }
-    let newer = newer.expect("some newer box's store key sorts before an older box's");
-    let (older, older_name) = older;
+    let older = finalize_handed_own_ip_session(
+        &mut client,
+        "box-0",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let newer = finalize_handed_own_ip_session(
+        &mut client,
+        "box-1",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
     let held_by_older = vec![crate::net::dns::SharedPortCollision {
         port: 18080,
-        other: format!("{older_name}.min.internal"),
+        other: "box-0.min.internal".to_owned(),
     }];
     {
         let registry = server.state.sessions_manager().await.hostnames();
@@ -6859,12 +8119,24 @@ async fn shared_address_holder_same_in_any_resume_order() {
     }
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both boxes are resumed"
+        0,
+        "the restart brings neither box back"
     );
+    for id in [older, newer] {
+        assert_eq!(
+            read_record(&server, id).await.state().unwrap(),
+            RecordState::Stopped(StopEnding::AtDaemonStart)
+        );
+    }
+    for id in [older, newer] {
+        attach_and_echo(&mut client, id)
+            .await
+            .expect("an attach resumes the box");
+    }
     let registry = manager.hostnames();
     let routes = registry.read().expect("registry lock");
     assert!(
@@ -6874,7 +8146,7 @@ async fn shared_address_holder_same_in_any_resume_order() {
     assert_eq!(
         routes.shared_port_collisions(newer),
         held_by_older,
-        "and the newer box yields to it, though the store lists it first"
+        "and the newer box yields to it"
     );
 }
 
@@ -6882,10 +8154,18 @@ async fn shared_address_holder_same_in_any_resume_order() {
 /// creation order: a box's id is minted at create and it publishes at
 /// finalize, so a box created later can finalize first and hold the port.
 /// Once that box has launched — bound the port's forward — it holds the
-/// port after a restart too, though the resume starts the older box first.
+/// port after a restart too. The restart sets both boxes `stopped`
+/// (BOX-154), and the box that bound the port keeps it on its record. Each
+/// box publishes again when an RPC that names it brings it up, the older
+/// one first, and the newer box takes the port back at its own publish. The
+/// older box then resumes on its attach and still yields. The newer box's
+/// own attach waits for its client to restore its row (NET-138), which this
+/// harness does not do.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart() {
+    use boxes::core::record::{RecordState, StopEnding};
+
     let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
@@ -6924,24 +8204,37 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     drop(channel);
 
     let server = restart(server, client).await;
+    let mut client = server.connect().await;
     let manager = server.state.sessions_manager().await;
     assert_eq!(
         manager.resume_active_sessions().await.unwrap(),
-        2,
-        "both boxes are resumed"
+        0,
+        "the restart brings neither box back"
     );
-    let record = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(newer))
-        .await
-        .unwrap()
-        .expect("the box resolves")
-        .record()
-        .await
-        .expect("the record reads back");
+    let record = read_record(&server, newer).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Stopped(StopEnding::AtDaemonStart)
+    );
     assert_eq!(
         record.bound_ports,
         std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
-        "the launch recorded the port it bound on the box's record"
+        "the stopped box keeps the port it bound on its record"
+    );
+
+    for id in [older, newer] {
+        manager
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+    }
+    attach_and_echo(&mut client, older)
+        .await
+        .expect("an attach resumes the older box");
+    assert_eq!(
+        read_record(&server, older).await.state().unwrap(),
+        RecordState::Running
     );
     let registry = manager.hostnames();
     let routes = registry.read().expect("registry lock");
@@ -6952,7 +8245,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     assert_eq!(
         routes.shared_port_collisions(older),
         held_by_newer,
-        "and the older box still yields to it, though it is resumed first"
+        "and the older box still yields to it, though it resumed first"
     );
 }
 
@@ -8994,6 +10287,38 @@ async fn expose_deny_typed_error() {
             refused[0]
         );
     }
+}
+
+/// NET-070: the session actor registers a host-address box's caller facts
+/// through the production path, so the hostname proxy can decide the box's
+/// requests from the node's address by its egress rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_address_box_registers_its_caller_facts() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // The harness default: a host-address box.
+    let id = create_configured_session(&mut client, "hostcaller", "/uwu").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the host-address box resolves");
+    let record = handle.record().await.expect("the record reads");
+    assert_eq!(record.network, boxes::NetworkMode::HostNet);
+
+    let registry = manager.hostnames();
+    let registry = registry.read().expect("registry lock");
+    assert!(
+        registry.has_unleased_callers(),
+        "a host-address box is a caller with no switch lease"
+    );
+    assert!(
+        registry
+            .caller_owning(record.id, std::net::Ipv4Addr::LOCALHOST)
+            .is_some(),
+        "the proxy can name the host-address box by the socket it owns"
+    );
 }
 
 /// A host-address box is answered before its stance is read: its record can
@@ -12297,5 +13622,1158 @@ fn grant_box_git_credential_helper_answers_for_grant_hosts() {
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+/// Spawns a stand-in box: `/bin/sh` sets `trap`, then loops on `sleep`.
+/// It answers once the shell set the trap and started its first `sleep`, so
+/// a stop never reaches a shell that still has the default SIGTERM action.
+fn spawn_stand_in_box(trap: &str) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "{trap}; sleep 0.05 & echo ready; wait; while :; do sleep 0.05; done"
+        ))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in box");
+    let stdout = child.stdout.take().expect("the stand-in box's stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read the stand-in box's ready line");
+    assert_eq!(line.trim(), "ready", "the stand-in box set its trap");
+    child
+}
+
+/// A stand-in host loop for `child`: it reaps the child and reports the end
+/// as `hakoniwa` does. A signalled child has no exit status of its own and
+/// carries the container's 125.
+fn stand_in_entrypoint(
+    child: std::process::Child,
+) -> tokio::task::JoinHandle<Result<crate::box_runtime::HostExit, std::io::Error>> {
+    crate::traced::spawn_blocking(move || {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = child;
+        let status = child.wait()?;
+        let reason = match status.code() {
+            Some(code) => crate::box_runtime::ExitReason {
+                code,
+                exit_code: Some(code),
+                reason: format!("process(stand-in) exited with code {code}"),
+            },
+            None => crate::box_runtime::ExitReason {
+                code: 125,
+                exit_code: None,
+                reason: format!(
+                    "container received signal {}",
+                    status.signal().unwrap_or_default()
+                ),
+            },
+        };
+        Ok(crate::box_runtime::HostExit {
+            code: reason.code,
+            reason: Some(reason),
+        })
+    })
+}
+
+/// BOX-013: a stop sends SIGTERM to every process in the box, waits the
+/// grace period, sends SIGKILL to those still running, and the record ends
+/// `stopped` with an `exited` event that carries `reason = "stopped"` and
+/// the signal that ended the entrypoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_sends_term_then_kill_and_records_exited_stopped_with_signal() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    // A box that ignores SIGTERM: the grace runs out and SIGKILL ends it.
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    assert!(
+        !processes.pids().is_empty(),
+        "the stand-in box should be running"
+    );
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_millis(500),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "a graceful stop waits the grace period before SIGKILL"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(outcome.unfinished.is_none());
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the stop"
+    );
+
+    // Through the daemon: the mock shell ends on SIGTERM, and the record
+    // and its events keep that signal.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+    assert!(host.is_alive());
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    assert_eq!(
+        ending,
+        StopEnding::Signalled {
+            signal: libc::SIGTERM
+        }
+    );
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+    assert_eq!(record.signal, Some(libc::SIGTERM));
+    assert_eq!(record.exit_code, None);
+
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the stop records an exited event");
+    assert_eq!(exited.data["reason"], "stopped");
+    assert_eq!(exited.data["signal"], libc::SIGTERM);
+    assert!(!exited.data.contains_key("exit_code"));
+}
+
+/// BOX-013: a forced stop kills every process in the box at once, without
+/// the grace period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_force_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        true,
+        Duration::from_secs(60),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a forced stop does not wait the grace period: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}
+
+/// BOX-013: a forced stop that arrives while a graceful stop waits out its
+/// grace period ends the grace. The graceful stop sends SIGKILL at once, and
+/// the box does not wait the rest of the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forced_during_a_graceful_stop_kills_at_once() {
+    use boxes::core::record::StopEnding;
+
+    let child = spawn_stand_in_box("trap '' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+    let forced = super::StopForce::default();
+
+    // The forced stop arrives inside the graceful stop's grace period.
+    let setter = std::sync::Arc::clone(&forced);
+    crate::traced::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        setter.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(60),
+        &forced,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the graceful stop waited until the forced stop arrived: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a forced stop cuts the grace period short: {elapsed:?}"
+    );
+    assert_eq!(outcome.sent, vec![libc::SIGTERM, libc::SIGKILL]);
+    assert_eq!(
+        outcome.ending,
+        StopEnding::Signalled {
+            signal: libc::SIGKILL
+        }
+    );
+    assert!(
+        processes.pids().is_empty(),
+        "no process of the box outlives the forced stop"
+    );
+}
+
+/// BOX-013: an entrypoint that exits 125 on SIGTERM inside the grace period
+/// keeps its own exit status. `hakoniwa` reports 125 for a signalled
+/// container as well, so only the reaped reason tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_records_an_entrypoint_exit_125_as_its_exit_code() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let child = spawn_stand_in_box("trap 'exit 125' TERM");
+    let processes = crate::box_runtime::BoxProcesses::of_container(child.id());
+    let entrypoint = stand_in_entrypoint(child);
+
+    let outcome = super::stop_box_processes(
+        SessionId::mint(),
+        Some(processes),
+        entrypoint,
+        false,
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(outcome.sent[0], libc::SIGTERM);
+    let ending = outcome.ending;
+    assert_eq!(ending, StopEnding::ExitedFirst { exit_code: 125 });
+    assert!(outcome.unfinished.is_none());
+
+    // The record and the event the stop writes for this ending.
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let mut record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("the box has a record");
+    record.set_state(RecordState::Stopped(ending));
+    assert_eq!(record.exit_code, Some(125));
+    assert_eq!(record.signal, None);
+
+    let exited = super::stopped_event_data(ending);
+    assert_eq!(exited["reason"], "stopped");
+    assert_eq!(exited["exit_code"], 125);
+    assert!(!exited.contains_key("signal"));
+}
+
+/// BOX-013: a stop that ends the processes and cannot write the `stopped`
+/// record keeps the box hosted. No launch starts new processes in it until a
+/// retried stop writes the record with the ending of the first stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_an_unwritable_record_refuses_launches_until_retried() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = Vec::new();
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged.push(tmp);
+        }
+    }
+    assert_eq!(staged.len(), 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+    host.closed().await;
+
+    let refused = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect_err("no launch while the stop's record is unwritten");
+    assert!(
+        refused
+            .to_string()
+            .contains("stopped state is not saved yet"),
+        "the refusal says why: {refused}"
+    );
+
+    for tmp in &staged {
+        std::fs::remove_dir(tmp).unwrap();
+    }
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("the retried stop writes the record");
+    assert_eq!(
+        ending,
+        boxes::core::record::StopEnding::Signalled {
+            signal: libc::SIGTERM
+        },
+        "the retried stop keeps how the first stop ended the box"
+    );
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
+/// NET-128 fail-closed: a stop that ends the box's processes and cannot
+/// write the `stopped` record still marks the box's name stopped. A
+/// shared-address name does not keep answering for a box with no process.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_box_with_an_unwritable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unwritbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // A directory where the record's staging file belongs: every record
+    // write fails, and record reads still work.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut staged = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if dir.is_dir() {
+            let tmp = dir.join("record.json.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::create_dir(&tmp).unwrap();
+            staged += 1;
+        }
+    }
+    assert_eq!(staged, 1, "the server holds one box");
+
+    handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect_err("a stop that cannot write the record fails");
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unwritbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unwritbox".to_string(),
+            address: None,
+        },
+        "a failed record write still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unwritbox.min.internal"),
+        None,
+        "the proxy does not forward a box whose stop could not write its record"
+    );
+}
+
+/// BOX-013: the `stopped` record is the step a stop cannot skip. When the
+/// `exited` event cannot be written, the stop still answers with its ending
+/// and the record still reads `stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_a_failing_event_write_still_records_stopped() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+
+    // A directory where the events file belongs: every append fails.
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    let mut broken = 0;
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let events = dir.join("events.jsonl");
+        let _ = std::fs::remove_file(&events);
+        std::fs::create_dir(&events).unwrap();
+        broken += 1;
+    }
+    assert_eq!(broken, 1, "the server holds one box");
+
+    let ending = handle
+        .stop_box(false, Duration::from_secs(5))
+        .await
+        .expect("a failed event write does not fail the stop");
+    host.closed().await;
+
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("a stopped box keeps its record");
+    assert_eq!(record.state().unwrap(), RecordState::Stopped(ending));
+}
+
+/// BOX-013: a container supervisor that already exited and was reaped has
+/// no readable namespace. Its pid can belong to an unrelated process by
+/// then, so the stop finds no process of the box and signals nothing.
+#[test]
+fn of_container_on_a_reaped_supervisor_signals_nothing() {
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn the stand-in supervisor");
+    let pid = child.id();
+    child.wait().expect("reap the stand-in supervisor");
+
+    for root in [pid, u32::try_from(i32::MAX).unwrap()] {
+        let processes = crate::box_runtime::BoxProcesses::of_container(root);
+        assert!(
+            processes.pids().is_empty(),
+            "a supervisor with no readable namespace has no processes"
+        );
+        // Signal 0 checks delivery and sends nothing, so a reused pid is safe.
+        assert_eq!(processes.signal(0), 0, "no process is signalled");
+    }
+}
+
+/// BOX-013: a pid in the daemon's own namespace that is not the daemon's
+/// child is not a supervisor the daemon spawned. A reaped supervisor's pid
+/// can be reused by such a process, so the stop signals nothing.
+#[test]
+fn of_container_on_a_pid_the_daemon_did_not_spawn_signals_nothing() {
+    use std::io::BufRead as _;
+
+    // The shell's background `sleep` is a grandchild: its parent is the shell.
+    let mut shell = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the stand-in shell");
+    let mut line = String::new();
+    std::io::BufReader::new(shell.stdout.take().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("read the grandchild's pid");
+    let grandchild: u32 = line.trim().parse().expect("a pid");
+
+    let processes = crate::box_runtime::BoxProcesses::of_container(grandchild);
+    assert!(
+        processes.pids().is_empty(),
+        "a process the daemon did not spawn is not the box's supervisor"
+    );
+    assert_eq!(processes.signal(0), 0, "no process is signalled");
+
+    // The grandchild is still alive: the stop did not reach it.
+    // SAFETY: `kill` reads no memory of ours.
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(grandchild).unwrap(), 0) },
+        0
+    );
+    // SAFETY: as above. This ends the stand-in before the shell is reaped.
+    unsafe { libc::kill(i32::try_from(grandchild).unwrap(), libc::SIGKILL) };
+    shell.wait().expect("reap the stand-in shell");
+}
+
+/// A session spec as a create sends it (BOX-068), with `pty_enabled` as
+/// given and every other setting at its default.
+fn resume_spec(pty_enabled: bool) -> serde_json_lenient::Value {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.pty_enabled = pty_enabled;
+    serde_json_lenient::to_value(&spec).expect("a spec serializes")
+}
+
+/// Creates an `Active` session through the whole create flow. Its create
+/// carries `spec`, and `name: None` creates an unnamed session.
+async fn create_session_with_spec(
+    client: &mut TestClient,
+    name: Option<&str>,
+    project: &str,
+    spec: Option<serde_json_lenient::Value>,
+) -> SessionId {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let mut req = create_session_req(name.unwrap_or("unnamed"), project);
+    if name.is_none() {
+        req.config.name = None;
+    }
+    req.spec = spec;
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// Stops the box `id` through the daemon (BOX-013), and waits until the
+/// manager no longer holds its actor, so the next attach brings one up
+/// from the stopped record.
+async fn stop_through_daemon(
+    server: &TestServer,
+    id: SessionId,
+) -> boxes::core::record::StopEnding {
+    let manager = server.state.sessions_manager().await;
+    let before = manager.running_count().await;
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the session resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let ending = manager
+        .stop_box_with_grace(id, true, Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while manager.running_count().await >= before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stopped box's actor was not evicted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ending
+}
+
+/// The directory that holds the record of `id`.
+async fn record_dir(server: &TestServer, id: SessionId) -> std::path::PathBuf {
+    let sessions = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .join("sessions");
+    for entry in std::fs::read_dir(&sessions).unwrap() {
+        let dir = entry.unwrap().path();
+        let Ok(bytes) = std::fs::read(dir.join("record.json")) else {
+            continue;
+        };
+        let record: boxes::Record = serde_json_lenient::from_slice(&bytes).unwrap();
+        if record.id == id {
+            return dir;
+        }
+    }
+    panic!("no record directory holds {id}");
+}
+
+/// Changes the record of `id` on disk, as a change made while the box ran
+/// or an ending this build has no path for leaves it. The store reads the
+/// record from disk on every read.
+async fn rewrite_record(
+    server: &TestServer,
+    id: SessionId,
+    change: impl FnOnce(&mut boxes::Record),
+) {
+    let path = record_dir(server, id).await.join("record.json");
+    let mut record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    change(&mut record);
+    std::fs::write(&path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+}
+
+/// Overwrites the spec stored beside the record of `id`.
+async fn rewrite_spec(server: &TestServer, id: SessionId, spec: &serde_json_lenient::Value) {
+    let path = record_dir(server, id).await.join("spec.json");
+    std::fs::write(path, serde_json_lenient::to_vec(spec).unwrap()).unwrap();
+}
+
+/// Attaches to `id` and sends a line. `Ok` when the shell echoes it, and
+/// `Err` with what the channel carried when it closes first, and the
+/// `ChannelMsg::ExitStatus` it saw, if any.
+async fn attach_and_echo(
+    client: &mut TestClient,
+    id: SessionId,
+) -> Result<(), (String, Option<u32>)> {
+    let mut channel = client.open_shell(id).await;
+    let _ = channel.data_bytes(b"hello\n".to_vec()).await;
+    let mut out = Vec::new();
+    let mut exit_status = None;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                out.extend_from_slice(&data);
+                if String::from_utf8_lossy(&out).contains("got:hello") {
+                    return Ok(());
+                }
+            }
+            Ok(Some(ChannelMsg::ExitStatus { exit_status: code })) => exit_status = Some(code),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                return Err((String::from_utf8_lossy(&out).into_owned(), exit_status));
+            }
+        }
+    }
+}
+
+async fn read_record(server: &TestServer, id: SessionId) -> boxes::Record {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box keeps its record")
+}
+
+async fn event_kinds(server: &TestServer, id: SessionId) -> Vec<boxes::events::BoxEvent> {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .box_events(id)
+        .await
+        .unwrap()
+        .read_new()
+        .unwrap()
+}
+
+/// BOX-025: an attach to a stopped PTY box starts it again from the spec
+/// stored at its creation, from its retained files, under the same id and
+/// name, and records a `resumed` event. A change made to the record's
+/// settings while the box ran does not carry into the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_restarts_from_stored_spec_same_id_and_name() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let paths = session_paths(&server, id).await;
+    let kept = std::path::Path::new(paths.working.as_str()).join("kept.txt");
+    std::fs::write(&kept, "still here").unwrap();
+    // A change while the box runs: the stored spec has hooks on.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
+
+    let ending = stop_through_daemon(&server, id).await;
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending)
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an attach to a stopped PTY box resumes it");
+
+    let record = read_record(&server, id).await;
+    assert_eq!(record.id, id, "the box keeps its id");
+    assert_eq!(
+        record.name.as_deref(),
+        Some("resume-box"),
+        "the box keeps its name"
+    );
+    assert_eq!(record.state().unwrap(), RecordState::Running);
+    assert_eq!(
+        (record.reason.is_none(), record.exit_code, record.signal),
+        (true, None, None)
+    );
+    assert!(
+        record.hooks_enabled,
+        "the box restarts from its stored spec, not the record's change"
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "still here");
+
+    let events = event_kinds(&server, id).await;
+    let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+    let exited = kinds
+        .iter()
+        .position(|k| *k == boxes::events::BoxEventType::Exited)
+        .expect("the stop records an exited event");
+    let resumed = kinds
+        .iter()
+        .position(|k| *k == boxes::events::BoxEventType::Resumed)
+        .expect("the resume records a resumed event");
+    assert!(exited < resumed, "{kinds:?}");
+    assert_eq!(events[resumed].box_id, id);
+    assert_eq!(events[resumed].data["from"], "stopped");
+}
+
+/// BOX-025: a resume whose launch fails writes back the record it read,
+/// byte for byte, and records no `resumed` event, so the box never reads
+/// as running with no processes and keeps the settings it had. The next
+/// attach resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_launch_failure_keeps_stopped_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("resume-fails"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    // A setting the stored spec changes on resume: the stored spec has
+    // hooks on.
+    rewrite_record(&server, id, |record| record.hooks_enabled = false).await;
+    let ending = stop_through_daemon(&server, id).await;
+    let record_path = record_dir(&server, id).await.join("record.json");
+    let before = std::fs::read(&record_path).unwrap();
+    assert!(!read_record(&server, id).await.hooks_enabled);
+
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostDiedBeforeAttach);
+    attach_and_echo(&mut client, id)
+        .await
+        .expect_err("the attach whose launch fails reaches no shell");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Stopped(ending),
+        "a failed launch leaves the box stopped"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&record_path).unwrap()),
+        String::from_utf8_lossy(&before),
+        "a failed launch leaves the record as it was"
+    );
+    assert!(
+        !event_kinds(&server, id)
+            .await
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Resumed),
+        "a failed launch records no resumed event"
+    );
+
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the next attach resumes the box");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+}
+
+/// BOX-030: a PTY box resumes from `stopped` and from `exited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_box_resumes_from_stopped_and_exited() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("pty-box"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+
+    stop_through_daemon(&server, id).await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("a stopped PTY box resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    // No path in this build ends a box `exited`, so the record is set so
+    // after a stop.
+    stop_through_daemon(&server, id).await;
+    rewrite_record(&server, id, |record| {
+        record.set_state(RecordState::Exited(ExitEnding::Exit { exit_code: 3 }));
+    })
+    .await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("an exited PTY box resumes");
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    let froms: Vec<_> = event_kinds(&server, id)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == boxes::events::BoxEventType::Resumed)
+        .map(|e| e.data["from"].clone())
+        .collect();
+    assert_eq!(froms, ["stopped", "exited"]);
+}
+
+/// Asserts that the resume of `id` was refused: the attach closed with
+/// `words`, no shell and the exit status `code`, the record is still
+/// `state`, and no `resumed` event was written.
+async fn assert_resume_refused(
+    server: &TestServer,
+    client: &mut TestClient,
+    id: SessionId,
+    state: boxes::core::record::RecordState,
+    words: &[&str],
+    code: u32,
+) {
+    let (out, exit_status) = attach_and_echo(client, id)
+        .await
+        .expect_err("the resume is refused");
+    assert_eq!(exit_status, Some(code), "{out:?}");
+    for word in words {
+        assert!(out.contains(word), "{word:?} not in {out:?}");
+    }
+    assert!(out.contains("cannot resume"), "{out:?}");
+    assert_eq!(read_record(server, id).await.state().unwrap(), state);
+    assert!(
+        event_kinds(server, id)
+            .await
+            .iter()
+            .all(|e| e.kind != boxes::events::BoxEventType::Resumed),
+        "a refused resume writes no resumed event"
+    );
+}
+
+/// BOX-025: a resume whose stored spec this daemon cannot start from is
+/// refused with the kind a create of that spec gives, and the box stays
+/// stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_unsatisfiable_spec_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("old-spec"),
+        "/uwu",
+        Some(resume_spec(true)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    let mut spec = resume_spec(true);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, id, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `old-spec`",
+            "version 99",
+            "min session destroy old-spec",
+        ],
+        3,
+    )
+    .await;
+
+    // A spec that does not parse is refused the same way.
+    rewrite_spec(
+        &server,
+        id,
+        &serde_json_lenient::json!({"v": 0, "io": {"pty_enabled": true}}),
+    )
+    .await;
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["cannot be read"],
+        3,
+    )
+    .await;
+}
+
+/// BOX-025: a resume is refused while a running box holds the box's name,
+/// naming that box, and the name check comes before the spec check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_when_name_held_by_running_box() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let stopped =
+        create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
+    let ending = stop_through_daemon(&server, stopped).await;
+    // An unnamed box answers to its project directory's name.
+    let holder = create_session_with_spec(&mut client, None, "/b/proj", None).await;
+    assert_eq!(
+        read_record(&server, holder).await.state().unwrap(),
+        RecordState::Running
+    );
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = resume_spec(true);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, stopped, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        stopped,
+        RecordState::Stopped(ending),
+        &[
+            "The running session `proj` holds the name `proj`",
+            &format!("min session rename {holder} <new-name>"),
+        ],
+        2,
+    )
+    .await;
+}
+
+/// BOX-025, BOX-005: two stopped boxes that share a name resume at once.
+/// Each has its own actor, so the name check claims the name in the
+/// manager. Exactly one box runs. The other is refused with exit status 2
+/// and keeps its `stopped` record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_concurrent_same_name_runs_exactly_one() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut boxes_ = Vec::new();
+    // Unnamed boxes answer to their project directory's name, a pair the
+    // store's name-uniqueness check never sees.
+    for project in ["/a/pair", "/b/pair"] {
+        let id =
+            create_session_with_spec(&mut client, None, project, Some(resume_spec(true))).await;
+        let ending = stop_through_daemon(&server, id).await;
+        boxes_.push((id, ending));
+    }
+    let mut first = server.connect().await;
+    let mut second = server.connect().await;
+    let (a, b) = tokio::join!(
+        attach_and_echo(&mut first, boxes_[0].0),
+        attach_and_echo(&mut second, boxes_[1].0),
+    );
+
+    let (ran, refused, out) = match (a, b) {
+        (Ok(()), Err(out)) => (boxes_[0], boxes_[1], out),
+        (Err(out), Ok(())) => (boxes_[1], boxes_[0], out),
+        other => panic!("exactly one resume must run: {other:?}"),
+    };
+    let (text, exit_status) = out;
+    assert_eq!(exit_status, Some(2), "{text:?}");
+    assert!(text.contains("cannot resume"), "{text:?}");
+    assert_eq!(
+        read_record(&server, ran.0).await.state().unwrap(),
+        RecordState::Running
+    );
+    assert_eq!(
+        read_record(&server, refused.0).await.state().unwrap(),
+        RecordState::Stopped(refused.1)
+    );
+    assert!(
+        event_kinds(&server, refused.0)
+            .await
+            .iter()
+            .all(|e| e.kind != boxes::events::BoxEventType::Resumed),
+        "a refused resume writes no resumed event"
+    );
+}
+
+/// BOX-025: a record the name check cannot read can belong to a running
+/// box that holds the name, so the resume is refused and the box stays
+/// stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_when_another_record_is_unreadable() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let stopped =
+        create_session_with_spec(&mut client, Some("proj"), "/a/x", Some(resume_spec(true))).await;
+    let ending = stop_through_daemon(&server, stopped).await;
+    let other = create_session_with_spec(&mut client, Some("other"), "/b/y", None).await;
+    let path = record_dir(&server, other).await.join("record.json");
+    std::fs::write(&path, b"not a record").unwrap();
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        stopped,
+        boxes::core::record::RecordState::Stopped(ending),
+        &[&format!("The record of session `{other}` cannot be read")],
+        2,
+    )
+    .await;
+}
+
+/// BOX-030: a resume of a box whose spec does not set `pty_enabled` is
+/// refused, and the box stays stopped. The terminal check comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_non_pty_box_refuses_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_session_with_spec(
+        &mut client,
+        Some("no-pty"),
+        "/uwu",
+        Some(resume_spec(false)),
+    )
+    .await;
+    let ending = stop_through_daemon(&server, id).await;
+    // Also unsatisfiable, so the refusal shows which check decides.
+    let mut spec = resume_spec(false);
+    spec["v"] = 99.into();
+    rewrite_spec(&server, id, &spec).await;
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &["session `no-pty`", "runs without a terminal"],
+        2,
+    )
+    .await;
+}
+
+/// BOX-027: a resume runs no lifecycle hook but `on_attach`, on the attach
+/// that resumes the box. The box's `on_activate` ran once, at activation,
+/// and does not run again when the box resumes. The resume itself runs
+/// no hook. The `on_attach` run is the attach's own, and the mock launcher
+/// cannot show it (see the note above
+/// `destroy_runs_its_destroy_hooks_against_a_live_host`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_runs_only_on_attach_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-hooks",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&activated).unwrap(), "ran\n");
+
+    stop_through_daemon(&server, id).await;
+    attach_and_echo(&mut client, id)
+        .await
+        .expect("the stopped box resumes");
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\n",
+        "on_activate ran again on resume"
     );
 }

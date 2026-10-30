@@ -98,6 +98,17 @@ impl RangeProbe {
     }
 }
 
+/// The host port the forwarder-conducted range probe binds at each address
+/// of the reserved local range (NET-123): fixed and deliberately obscure, so
+/// no box's declaration is likely to name it. Shared by the guest daemon that
+/// walks the range and the host-side egress gate that admits each round.
+pub const RANGE_PROBE_PORT: u16 = 21064;
+
+/// The `remote` every round of the forwarder-conducted range probe names: a
+/// placeholder, never dialed, since the probe accepts no connection. The
+/// host-side egress gate admits a round by this exact spelling.
+pub const RANGE_PROBE_REMOTE: &str = "127.0.0.1:1";
+
 /// Every usable address in the reserved local range: host part 1..=254. The
 /// `.0` and `.255` spellings of a /24 are the network and broadcast forms,
 /// and the step that installs the range installs exactly these 254 aliases —

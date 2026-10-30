@@ -2179,6 +2179,112 @@ pub struct SharedPortCollision {
     pub held_by: String,
 }
 
+/// What holds a declared host port that an activation refused (NET-144).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortHolder {
+    /// Another box on this machine holds the port. Carries its box name.
+    Box(String),
+    /// No box in this daemon's hostname registry holds the port, so
+    /// another program on this machine does. That program can be this
+    /// daemon's own proxy or a box of another daemon on the machine.
+    Host,
+}
+
+impl PortHolder {
+    /// The holder as the daemon log names it: `box:<name>` or `host`.
+    #[must_use]
+    pub fn log_label(&self) -> String {
+        match self {
+            Self::Box(name) => format!("box:{name}"),
+            Self::Host => "host".to_string(),
+        }
+    }
+}
+
+/// An activation refused because a declared ingress host port is already in
+/// use on this machine (NET-144): the port, the box port the declaration
+/// maps it to, and what holds it.
+///
+/// The refusal travels as the daemon's error text, which is exactly this
+/// type's [`std::fmt::Display`]. The client reads it back with
+/// [`Self::find_in`], so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortInUseRefusal {
+    /// The host port the declaration names.
+    pub port: u16,
+    /// The box port the declaration maps the host port to.
+    pub box_port: u16,
+    /// What holds the host port.
+    pub holder: PortHolder,
+}
+
+/// The middle of the refusal's first line, after `Port <port>`.
+const PORT_IN_USE_MIDDLE: &str = " is already in use on this machine by ";
+/// The holder clause when no box holds the port.
+const PORT_IN_USE_HOST: &str = "another program on this machine.";
+/// The refusal's second line, up to the suggested host port.
+const PORT_IN_USE_REMEDY: &str = "\nChoose another host port in --ingress (for example --ingress ";
+/// The refusal's second line, after the suggested mapping.
+const PORT_IN_USE_REMEDY_END: &str = ") or in [network] ingress in minimal.toml.";
+
+impl PortInUseRefusal {
+    /// The host port the remedy suggests: the next port up, or the one
+    /// below when the refused port is the highest.
+    #[must_use]
+    pub fn suggested_port(&self) -> u16 {
+        self.port
+            .checked_add(1)
+            .unwrap_or_else(|| self.port.saturating_sub(1))
+    }
+
+    /// The refusal inside `error`, if it carries one. The daemon's text can
+    /// arrive inside other context, so the search does not need it to open
+    /// the string.
+    #[must_use]
+    pub fn find_in(error: &str) -> Option<Self> {
+        error
+            .match_indices("Port ")
+            .find_map(|(at, _)| Self::parse_at(&error[at + "Port ".len()..]))
+    }
+
+    fn parse_at(text: &str) -> Option<Self> {
+        let digits = text.find(|c: char| !c.is_ascii_digit())?;
+        let port: u16 = text[..digits].parse().ok()?;
+        let rest = text[digits..].strip_prefix(PORT_IN_USE_MIDDLE)?;
+        let remedy = rest.find(PORT_IN_USE_REMEDY)?;
+        let holder = match &rest[..remedy] {
+            PORT_IN_USE_HOST => PortHolder::Host,
+            clause => PortHolder::Box(clause.strip_prefix("box ")?.strip_suffix('.')?.to_string()),
+        };
+        let mapping = &rest[remedy + PORT_IN_USE_REMEDY.len()..];
+        let end = mapping.find(PORT_IN_USE_REMEDY_END)?;
+        let (_, box_port) = mapping[..end].split_once(':')?;
+        Some(Self {
+            port,
+            box_port: box_port.parse().ok()?,
+            holder,
+        })
+    }
+}
+
+impl std::fmt::Display for PortInUseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Port {}{PORT_IN_USE_MIDDLE}", self.port)?;
+        match &self.holder {
+            PortHolder::Box(name) => write!(f, "box {name}.")?,
+            PortHolder::Host => f.write_str(PORT_IN_USE_HOST)?,
+        }
+        write!(
+            f,
+            "{PORT_IN_USE_REMEDY}{}:{}{PORT_IN_USE_REMEDY_END}",
+            self.suggested_port(),
+            self.box_port
+        )
+    }
+}
+
+impl std::error::Error for PortInUseRefusal {}
+
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
 /// when it is `false`, so the common success payload is unchanged for
 /// clients that predate the field.
@@ -2225,6 +2331,155 @@ impl OneshotSshRpc for RenameSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RenameSession");
     type Request<'a> = RenameSessionRequest;
     type Response = Errorable<RenameSessionResponse>;
+}
+
+/// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
+///
+/// The daemon sends SIGTERM to every process in the box, waits its grace
+/// period, sends SIGKILL to those still running, sets the record to
+/// `stopped` and records an `exited` event. With `force`, it sends SIGKILL
+/// to every process at once. The record, its events and the box's
+/// filesystem stay until the box is reaped.
+pub struct StopBox;
+
+/// The request for a [`StopBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxRequest {
+    /// The box to stop.
+    pub id: SessionId,
+    /// Kill every process in the box at once, with no grace period.
+    /// Absent, as from a client that does not send it, the stop is the
+    /// graceful one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`StopBox`] RPC: how the stopped box ended, as its
+/// record now stores it (BOX-011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxResponse {
+    /// The entrypoint's exit status, when it exited before a signal ended
+    /// it.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended the entrypoint, when a signal
+    /// of the stop ended it.
+    #[serde(default)]
+    pub signal: Option<i32>,
+}
+
+impl OneshotSshRpc for StopBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox");
+    type Request<'a> = StopBoxRequest;
+    type Response = Errorable<StopBoxResponse>;
+}
+
+/// An RPC to list the box records this host keeps, in any state
+/// (BOX-158).
+pub struct ListBoxes;
+
+/// The request for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesRequest {
+    /// List only the boxes whose project root is this one. Absent, the
+    /// listing holds every box on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// One box record in a [`ListBoxes`] or [`ShowBox`] reply (BOX-158,
+/// BOX-159): who the box is and the state its record is in (BOX-011).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxListingEntry {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// The box's name, when it has one.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The box's type, `None` for a record that predates the field.
+    #[serde(default)]
+    pub box_type: Option<String>,
+    /// The box that created this one, `None` for a box created outside
+    /// any box.
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    /// The root of the project the box came from, `None` for a record
+    /// that predates the field.
+    #[serde(default)]
+    pub project_root: Option<paths::HostAbsPath>,
+    /// The record's state as BOX-011 spells it: `pending`,
+    /// `materializing`, `running`, `stopped` or `exited`.
+    pub state: String,
+    /// Why a `stopped` or `exited` box ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The entrypoint's exit status, where BOX-011 gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended a stopped box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+}
+
+/// The response for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesResponse {
+    /// Every retained record in the listing's scope, in box id order.
+    #[serde(default)]
+    pub boxes: Vec<BoxListingEntry>,
+}
+
+impl OneshotSshRpc for ListBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes");
+    type Request<'a> = ListBoxesRequest;
+    type Response = Errorable<ListBoxesResponse>;
+}
+
+/// An RPC to read one box record (BOX-159).
+pub struct ShowBox;
+
+/// The request for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxRequest {
+    /// The box to read.
+    pub id: SessionId,
+}
+
+/// The identity a box runs under, as the host reports it (BOX-140).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoxIdentity {
+    /// The box has no per-box identity, because the host is not
+    /// enrolled with a Gatehouse. It serialises as `{"kind":"none"}`.
+    #[default]
+    None,
+    /// An identity this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The response for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxResponse {
+    /// The record, with its state.
+    pub record: BoxListingEntry,
+    /// The identity the box runs under.
+    #[serde(default)]
+    pub identity: BoxIdentity,
+    /// The exec id of each exec running in the box now.
+    ///
+    /// The daemon does not give an exec an id yet (BOX-149), so this
+    /// list is always empty. An empty list does not mean that no process
+    /// runs in the box. The list fills when each exec has an id:
+    /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
+    #[serde(default)]
+    pub live_execs: Vec<String>,
+}
+
+impl OneshotSshRpc for ShowBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
+    type Request<'a> = ShowBoxRequest;
+    type Response = Errorable<ShowBoxResponse>;
 }
 
 /// An RPC to destroy an existing session.
@@ -3045,6 +3300,140 @@ mod read_events_tests {
             );
             assert_eq!(back, update);
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_box_tests {
+    use super::*;
+
+    /// BOX-013: the stop request and its response survive the wire, and a
+    /// request without `force` reads as the graceful stop.
+    #[test]
+    fn stop_box_request_round_trips() {
+        let id = SessionId::mint();
+        for force in [false, true] {
+            let req = StopBoxRequest { id, force };
+            let bytes = serde_json_lenient::to_vec(&req).unwrap();
+            let back: StopBoxRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare = format!(r#"{{"id":"{id}"}}"#);
+        let back: StopBoxRequest = serde_json_lenient::from_str(&bare).unwrap();
+        assert!(!back.force, "a request without force is the graceful stop");
+
+        let responses = [
+            StopBoxResponse {
+                exit_code: None,
+                signal: Some(15),
+            },
+            StopBoxResponse {
+                exit_code: Some(0),
+                signal: None,
+            },
+            StopBoxResponse::default(),
+        ];
+        for response in responses {
+            let wire: Errorable<StopBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<StopBoxResponse> = serde_json_lenient::from_slice(&bytes).unwrap();
+            match back {
+                Errorable::Ok(back) => assert_eq!(back, response),
+                Errorable::Err { error } => panic!("the response read back as an error: {error}"),
+            }
+        }
+        assert_eq!(
+            StopBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox")
+        );
+    }
+}
+
+#[cfg(test)]
+mod box_listing_tests {
+    use super::*;
+
+    fn entry(state: &str) -> BoxListingEntry {
+        BoxListingEntry {
+            box_id: SessionId::mint(),
+            name: Some("web".to_string()),
+            box_type: Some("session".to_string()),
+            parent: None,
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+            state: state.to_string(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+        }
+    }
+
+    /// BOX-158, BOX-159: a listing reply and a read reply keep each box's
+    /// state, its ending and its parent across the wire.
+    #[test]
+    fn box_listing_reply_carries_state_and_parent() {
+        let running = entry("running");
+        let mut stopped = entry("stopped");
+        stopped.parent = Some(running.box_id);
+        stopped.reason = Some("stopped".to_string());
+        stopped.signal = Some(15);
+        let mut exited = entry("exited");
+        exited.reason = Some("oom".to_string());
+        exited.exit_code = Some(137);
+        let listing = ListBoxesResponse {
+            boxes: vec![running.clone(), stopped.clone(), exited],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(listing.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ListBoxesResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => {
+                assert_eq!(back, listing);
+                assert_eq!(back.boxes[1].state, "stopped");
+                assert_eq!(back.boxes[1].parent, Some(running.box_id));
+                assert_eq!(back.boxes[0].parent, None);
+            }
+            Errorable::Err { error } => panic!("the listing read back as an error: {error}"),
+        }
+
+        // An unscoped request is the bare object, and a scoped one keeps
+        // its project root.
+        let bare: ListBoxesRequest = serde_json_lenient::from_str("{}").unwrap();
+        assert_eq!(bare.project_root, None);
+        let scoped = ListBoxesRequest {
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+        };
+        let bytes = serde_json_lenient::to_vec(&scoped).unwrap();
+        assert_eq!(
+            serde_json_lenient::from_slice::<ListBoxesRequest>(&bytes).unwrap(),
+            scoped
+        );
+
+        let show = ShowBoxResponse {
+            record: stopped,
+            identity: BoxIdentity::None,
+            live_execs: vec!["exec-1".to_string()],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => assert_eq!(back, show),
+            Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
+        }
+        // The identity none serialises with the name BOX-140 reports.
+        assert_eq!(
+            serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),
+            r#"{"kind":"none"}"#
+        );
+        // An identity a newer daemon reports reads as unknown, not as a
+        // failed reply.
+        let newer: BoxIdentity = serde_json_lenient::from_str(r#"{"kind":"enrolled"}"#).unwrap();
+        assert_eq!(newer, BoxIdentity::Unknown);
+
+        assert_eq!(
+            ListBoxes::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes")
+        );
+        assert_eq!(
+            ShowBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox")
+        );
     }
 }
 

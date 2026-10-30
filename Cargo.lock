@@ -692,7 +692,6 @@ dependencies = [
  "client-config",
  "common",
  "globset",
- "hex",
  "indoc",
  "nutype",
  "paths",

@@ -24,6 +24,7 @@ mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]
 mod box_verbs;
+mod doctor;
 mod finalize_install;
 mod list;
 mod net;
@@ -242,12 +243,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
+            BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Doctor) => doctor::cmd_doctor(),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,

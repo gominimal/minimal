@@ -194,6 +194,17 @@ const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// came up while the node idled is found within half a minute.
 const PORT_RECHECK: Duration = Duration::from_secs(30);
 
+/// How long a node that finds the answerer port held waits for the holder's
+/// interim channel before it names the port as held with no channel
+/// (minimal#2629): two VM host daemons that start together race, and the
+/// one that loses the port's bind can look for the channel before the
+/// winner has bound it. The winner binds the channel right after the port,
+/// so the bound only has to cover that gap on a loaded host; a holder with
+/// no channel at all (a native daemon, a foreign process) is named after
+/// it. It is also how long the control socket's status read keeps saying
+/// `starting` for a node whose first publish has not been acknowledged.
+const HOLDER_CHANNEL_WAIT: Duration = Duration::from_secs(3);
+
 /// The machine-global channel socket the installed answerer service's unit
 /// holds (NET-122's host service): one per host, whatever any node's state
 /// dir — on Linux under the socket unit's own `RuntimeDirectory`, on macOS
@@ -2577,6 +2588,15 @@ pub struct AnswererStatus(Arc<AnswererShared>);
 #[derive(Debug)]
 struct AnswererShared {
     status: Mutex<ZoneAnswererStatus>,
+    /// Whether the status is a verdict the status read may report: set by
+    /// the node's first acknowledged publish (or its hosting), or by the
+    /// acquisition when it gives up on a first publish past its bound.
+    /// Until then the read reports `starting`, so a registration still in
+    /// flight never reads as a failure.
+    settled: AtomicBool,
+    /// When the acquisition began its first publish: the start of the
+    /// bound past which an error it surfaces settles the status.
+    acquiring_since: Mutex<Option<Instant>>,
     hosting: AtomicBool,
     commands: Mutex<Option<std::sync::mpsc::Sender<HandoverCommand>>>,
 }
@@ -2789,6 +2809,8 @@ impl AnswererStatus {
     pub fn starting() -> Self {
         Self(Arc::new(AnswererShared {
             status: Mutex::new(ZoneAnswererStatus::Starting),
+            settled: AtomicBool::new(false),
+            acquiring_since: Mutex::new(None),
             hosting: AtomicBool::new(false),
             commands: Mutex::new(None),
         }))
@@ -2807,11 +2829,67 @@ impl AnswererStatus {
     /// The acquisition loop's own writer: called at every pass, with the
     /// state that pass left the machine's answerer in.
     pub(crate) fn set(&self, status: ZoneAnswererStatus) {
+        // A publish the answerer acknowledged, or this daemon holding the
+        // port, settles the status for good.
+        let acknowledged = matches!(
+            status,
+            ZoneAnswererStatus::Holder { .. }
+                | ZoneAnswererStatus::Registered { .. }
+                | ZoneAnswererStatus::ManagerHeld { .. }
+        );
         *self
             .0
             .status
             .lock()
             .expect("the answerer status lock is never held across a panic") = status;
+        if acknowledged {
+            self.settle();
+        }
+    }
+
+    /// Lets the status read report the state the loop last wrote, before
+    /// any publish was acknowledged: the acquisition gave up on its first
+    /// publish past its bound, so the state it wrote is a verdict.
+    pub(crate) fn settle(&self) {
+        self.0.settled.store(true, Ordering::SeqCst);
+    }
+
+    /// Marks the start of the acquisition's first publish.
+    fn begin_acquiring(&self) {
+        *self
+            .0
+            .acquiring_since
+            .lock()
+            .expect("the answerer status lock is never held across a panic") = Some(Instant::now());
+    }
+
+    /// Settles the status when the first publish has been in flight for
+    /// [`HOLDER_CHANNEL_WAIT`] or longer: an error surfaced inside the bound
+    /// can still be a channel that is starting, an error past it is a
+    /// verdict.
+    fn settle_past_bound(&self) {
+        let since = *self
+            .0
+            .acquiring_since
+            .lock()
+            .expect("the answerer status lock is never held across a panic");
+        if since.is_none_or(|since| since.elapsed() >= HOLDER_CHANNEL_WAIT) {
+            self.settle();
+        }
+    }
+
+    /// The state the control socket's status read reports: `starting` until
+    /// the node's first publish is acknowledged or the acquisition gives up
+    /// on it, then the state the loop last wrote. An activation that reads
+    /// it while the node's registration is still in flight is told nothing,
+    /// never a failure.
+    #[must_use]
+    pub fn reported(&self) -> ZoneAnswererStatus {
+        if self.0.settled.load(Ordering::SeqCst) {
+            self.get()
+        } else {
+            ZoneAnswererStatus::Starting
+        }
     }
 
     /// Marks whether this daemon hosts the interim (or is inside a release
@@ -3090,6 +3168,26 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     acquire(registry, port, &paths, crate::state::vm_name(), &status);
 }
 
+/// [`acquire_loop_at`] as the node `node`, for the tests that run two
+/// nodes at once and must tell them apart.
+#[cfg(test)]
+fn acquire_loop_as(
+    registry: BoxRegistry,
+    port: u16,
+    channel: PathBuf,
+    node: &str,
+    status: AnswererStatus,
+) {
+    private_test_dir(&channel);
+    let paths = ChannelPaths {
+        global: channel.with_file_name("no-global-channel.sock"),
+        marker: channel.with_file_name("no-install-marker"),
+        interim: channel,
+        release_window: RELEASE_WINDOW,
+    };
+    acquire(registry, port, &paths, node, &status);
+}
+
 /// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
 /// row that must be re-published), the held connection's end (the
 /// answerer's side went), or the cadence bound.
@@ -3215,6 +3313,7 @@ fn serve_over_channel(registration: &mut Registration, command: HandoverCommand)
 /// unrelated later failure warns on its own.
 fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &str) {
     status.set(ZoneAnswererStatus::PortHeldNoChannel { port });
+    status.settle_past_bound();
     if *erroring {
         tracing::debug!(
             component = COMPONENT,
@@ -3282,6 +3381,7 @@ fn acquire(
     // the window before the answerer is decided.
     let mut pings = registry.subscribe_table_pings();
     let commands = status.attach_commands();
+    status.begin_acquiring();
     let mut held: Option<Registration> = None;
     // The once-only start info line: the first publish that lands says
     // which answerer the rows went to, whatever the passes before it
@@ -3453,20 +3553,144 @@ fn acquire(
             // interim channel), so nothing here can answer or allocate. A
             // loud error naming the port, the holder and the remedy — every
             // box registration fails with it until the port frees.
+            //
+            // Unless the holder is a node that started beside this one and
+            // won the port's bind: it binds its interim channel right
+            // after the port, so wait a bounded window for that channel
+            // and register into it (minimal#2629) before naming the port
+            // as held with no channel.
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                let why = channelless_holder_error(port, hook_port_holder(port));
-                surface_error(status, port, &mut erroring, &why);
-                wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                match await_holder_channel(
+                    &registry,
+                    &paths.interim,
+                    node,
+                    &mut pings,
+                    &commands,
+                    HOLDER_CHANNEL_WAIT,
+                ) {
+                    Ok((published, queued)) => {
+                        retry = CHANNEL_RETRY;
+                        erroring = false;
+                        held_status = registered_status(&published.holder, port);
+                        status.set(held_status.clone());
+                        warn_refused(node, published.refused);
+                        if !published_once {
+                            published_once = true;
+                            announce_publish(&published.holder, port, &paths.interim, node);
+                        }
+                        let mut registration = published.registration;
+                        let mut alive = true;
+                        for command in queued {
+                            if alive {
+                                alive = serve_over_channel(&mut registration, command);
+                            } else {
+                                refuse_command(command, NO_ANSWERER);
+                            }
+                        }
+                        if !alive {
+                            surface_error(
+                                status,
+                                port,
+                                &mut erroring,
+                                "the answerer channel failed while serving a box address \
+                                 request",
+                            );
+                            continue;
+                        }
+                        held = wait_out_wake(
+                            &mut pings,
+                            &commands,
+                            registration,
+                            status,
+                            port,
+                            &mut erroring,
+                        );
+                    }
+                    Err((queued, last)) => {
+                        let why = channelless_holder_error(port, hook_port_holder(port));
+                        for command in queued {
+                            refuse_command(command, &why);
+                        }
+                        // The node gave up on the holder's channel: the
+                        // state below is a verdict, not a registration in
+                        // flight.
+                        status.settle();
+                        surface_error(
+                            status,
+                            port,
+                            &mut erroring,
+                            &format!(
+                                "{why} (waited {} s for an answerer channel at {} beside the \
+                                 port; last attempt: {last})",
+                                HOLDER_CHANNEL_WAIT.as_secs(),
+                                paths.interim.display()
+                            ),
+                        );
+                        wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                    }
+                }
             }
             Err(error) => {
                 let why = format!(
                     "could not listen on 127.0.0.1:{port}, which box names are answered on: \
                      {error}; free the port, then try again"
                 );
+                status.settle();
                 surface_error(status, port, &mut erroring, &why);
                 wait_refusing(&pings, &commands, PORT_RECHECK, &why);
             }
         }
+    }
+}
+
+/// Waits up to `bound` for the interim channel of the node that holds the
+/// answerer port, and publishes this table into it once it answers. The
+/// node that won the port's bind binds that channel right after it, so a
+/// node that lost the bind to a node starting beside it registers here
+/// instead of naming the port as held with no channel.
+///
+/// Box address requests that arrive inside the window are queued, never
+/// refused: they are returned with the publish, for the caller to serve
+/// over the new connection, or with the last attempt's error when the
+/// window runs out. A handover request is a no-op here, since this node
+/// hosts nothing.
+fn await_holder_channel(
+    registry: &BoxRegistry,
+    channel: &Path,
+    node: &str,
+    pings: &mut std::sync::mpsc::Receiver<()>,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    bound: Duration,
+) -> Result<(Published, Vec<HandoverCommand>), (Vec<HandoverCommand>, io::Error)> {
+    let deadline = Instant::now() + bound;
+    let mut queued = Vec::new();
+    loop {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                command @ (HandoverCommand::Allocate { .. }
+                | HandoverCommand::ReleaseAddress { .. }) => queued.push(command),
+                other => refuse_command(other, NO_ANSWERER),
+            }
+        }
+        // The publish carries the whole table as it stands now, so a
+        // change pinged before it is in it.
+        while pings.try_recv().is_ok() {}
+        let error = match connect_and_publish(channel, node, zone_rows(registry)) {
+            Ok(published) => return Ok((published, queued)),
+            Err(error) => error,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((queued, error));
+        }
+        tracing::debug!(
+            component = COMPONENT,
+            node = %node,
+            channel = %channel.display(),
+            %error,
+            "the answerer port is held and the holder's channel did not answer yet; waiting"
+        );
+        std::thread::sleep(remaining.min(CHANNEL_RETRY));
     }
 }
 
@@ -3544,6 +3768,7 @@ fn host_interim(
             component = COMPONENT,
             listener = %addr,
             port,
+            node = %node,
             channel = %paths.interim.display(),
             status = "serving",
             "no answerer service is installed and no interim channel answers; this \
@@ -4851,6 +5076,124 @@ mod tests {
             .map(|(_, row)| row.address)
             .collect();
         assert_eq!(held, vec![Some(live)], "the zone answers the live box");
+    }
+
+    // NET-027 (minimal#2629): a second VM host daemon that finds the
+    // answerer port held waits for the holder's channel and registers into
+    // it, and two daemons that start together end with exactly one holder.
+    #[test]
+    fn second_vm_registers_into_the_running_holder() {
+        // ── the race, held open: the port is bound and the holder's channel
+        // is not yet, the window a losing node used to read as a port held
+        // with no channel.
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let hold = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the hold binds loopback");
+        let port = hold.local_addr().expect("the hold names its port").port();
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        let node_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-late-channel".to_string())
+            .spawn(move || acquire_loop_as(registry, port, node_channel, "vm-second", status))
+            .expect("the node's thread spawns");
+        let channel_at = Instant::now() + HOLDER_CHANNEL_WAIT / 3;
+        while Instant::now() < channel_at {
+            assert_eq!(
+                probe.get(),
+                ZoneAnswererStatus::Starting,
+                "a node waiting on the holder's channel names no failure"
+            );
+            assert_eq!(probe.reported(), ZoneAnswererStatus::Starting);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let tables = Arc::new(RegisteredTables::new());
+        hold_channel(
+            &channel,
+            Arc::clone(&tables),
+            None,
+            // SAFETY: geteuid only reads the process's own uid.
+            unsafe { libc::geteuid() },
+        )
+        .expect("the holder's channel binds beside the port");
+        assert_eq!(
+            await_status(|| probe.reported(), "the node never registered"),
+            ZoneAnswererStatus::Registered { port },
+            "the node registers into the holder's channel once it answers"
+        );
+        let rows: Vec<_> = tables.rows().into_iter().map(|(_, row)| row).collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "web.min.internal" && row.address == Some(web)),
+            "the node's box rows are held by the holder: {rows:?}"
+        );
+        drop(hold);
+
+        // ── two daemons started together: exactly one holds the port, the
+        // other registers into it, and both daemons' box names answer.
+        for round in 0..3 {
+            let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+            let channel = dir.path().join(CHANNEL_SOCK_FILE);
+            let free = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds");
+            let port = free.local_addr().expect("the probe names its port").port();
+            drop(free);
+            let (first, first_web) = web_registry();
+            let second = BoxRegistry::new(SUBNET);
+            second.register_node_namespace(7654);
+            let second_web = Ipv4Addr::new(127, 0, 64, 11);
+            second.register(BoxRegistration::new(
+                "peer",
+                Ipv4Addr::new(100, 64, 0, 11),
+                second_web,
+            ));
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let mut probes = Vec::new();
+            for (node, registry) in [("vm-default", first), ("vm-named", second)] {
+                let status = AnswererStatus::starting();
+                probes.push(status.clone());
+                let start = Arc::clone(&start);
+                let channel = channel.clone();
+                std::thread::Builder::new()
+                    .name(format!("test-zone-{node}"))
+                    .spawn(move || {
+                        start.wait();
+                        acquire_loop_as(registry, port, channel, node, status);
+                    })
+                    .expect("the node's thread spawns");
+            }
+            let states: Vec<_> = probes
+                .iter()
+                .map(|probe| await_status(|| probe.reported(), "a node never settled"))
+                .collect();
+            let holders = states
+                .iter()
+                .filter(|state| **state == ZoneAnswererStatus::Holder { port })
+                .count();
+            let registered = states
+                .iter()
+                .filter(|state| **state == ZoneAnswererStatus::Registered { port })
+                .count();
+            assert_eq!(
+                (holders, registered),
+                (1, 1),
+                "round {round}: exactly one node holds the port and the other registers: \
+                 {states:?}"
+            );
+            for (name, address) in [
+                ("web.min.internal.", first_web),
+                ("peer.min.internal.", second_web),
+            ] {
+                let reply = await_answer(
+                    || {
+                        query(port, name, RecordType::A)
+                            .filter(|reply| reply.metadata.response_code == ResponseCode::NoError)
+                    },
+                    "a node's box name never answered",
+                );
+                assert_eq!(a_answer(&reply), address, "round {round}: {name}");
+            }
+        }
     }
 
     /// A port held by a process with no channel — a native minimald, a

@@ -97,6 +97,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host for problems: today, that no record of the audit log
+    /// was changed or removed
+    ///
+    /// Exits 0 when the audit log verifies or audit files are missing, and 6
+    /// when a record was changed or removed.
+    // BEP-049: whole-log verification of the audit chain is a `min doctor`
+    // check, never a `min box audit` flag.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
@@ -418,6 +426,30 @@ pub enum BoxCommand {
     /// admitted or refused, each secret minted for the box, and the box's
     /// revocation. A removed box's records stay readable by its id
     Audit(BoxAuditArgs),
+    /// List the boxes of the current project, in any state: their id,
+    /// name, type, parent, project and state, with how a stopped or exited
+    /// box ended. `--all` lists every box on this host
+    List(BoxListArgs),
+    /// Show one box: its id, name, type, parent, project, state, how it
+    /// ended and the identity it runs under
+    Show(BoxShowArgs),
+}
+
+// BOX-158 (BCLI-001): `min box list [--all]`.
+#[derive(Debug, Args)]
+pub struct BoxListArgs {
+    /// List every box on this host, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+}
+
+// BOX-159 (BCLI-003): `min box show <box>`.
+#[derive(Debug, Args)]
+pub struct BoxShowArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
@@ -1100,6 +1132,14 @@ pub struct FinalizeInstallArgs {
     /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
+    /// The two contiguous connection-mark bits that egress enforcement uses, in hex (for example 0x0c000000). Use it when another firewall rule already uses the default bits. The boot service keeps the value
+    #[arg(
+        long,
+        value_name = "MASK",
+        value_parser = crate::cmd::parse_ct_mark_mask,
+        conflicts_with = "undo"
+    )]
+    pub ct_mark_mask: Option<u32>,
 }
 
 #[derive(Debug, Args)]

@@ -243,6 +243,12 @@
 #                                    own state, one `min ls` listing both,
 #                                    box names resolving to their VM, both
 #                                    routing at once, stop one leaves the other
+#   macos_box_opens_by_name_and_proxy
+#                                    NET-010/069/123/144 on macOS: a declared
+#                                    and a runtime port open at the box's
+#                                    address, at its name and through the
+#                                    hostname proxy; a second box on the
+#                                    same port is refused at activate
 #   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
 #                                    half: a hostname-only allowlist runs a
 #                                    real toolchain against github.com and
@@ -445,6 +451,9 @@ TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
 TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
 TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
 TWO_VM_HOLD_PID="" # the non-minimal port holder it starts; killed on teardown
+MACOS_OPEN_SEED_A_DIR="" # the macOS name-and-proxy proof's box A seed; removed on teardown
+MACOS_OPEN_SEED_B_DIR="" # its refused box B seed; removed on teardown
+MACOS_OPEN_HOLD_PID="" # its range-address port holder; killed on teardown
 DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
 DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
@@ -1072,6 +1081,11 @@ teardown() {
   if [ -n "$TWO_VM_HOLD_PID" ]; then
     kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   fi
+  if [ -n "$MACOS_OPEN_HOLD_PID" ]; then
+    kill "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+  fi
+  [ -n "$MACOS_OPEN_SEED_A_DIR" ] && rm -rf "$MACOS_OPEN_SEED_A_DIR"
+  [ -n "$MACOS_OPEN_SEED_B_DIR" ] && rm -rf "$MACOS_OPEN_SEED_B_DIR"
   [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
   [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
   [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
@@ -2134,13 +2148,8 @@ proof_own_ip_egress_declared_and_enforced() {
 
     # ---- the disallowed NAME, its own assertion ----------------------------
     # example.org is outside `allow_dns_hosts`, so its connection must not
-    # complete. Whether it is refused FAST at resolution (the design outcome:
-    # the resolver refuses a non-matching name) or TIMES OUT with no reset
-    # (the current relay leaves the name unpinned and drops the SYN) is NOT
-    # asserted either way — reconciling those two is the dns_gate work's, not
-    # this proof's — but the observed outcome is printed, with the curl error
-    # and the elapsed time, so the transcript names which behaviour this
-    # build has.
+    # complete. Its relay answers the name REFUSED (NET-141), so curl must
+    # fail at resolution, inside 5000 ms, before any connection is tried.
     name_deny_start_ms="$(now_ms)"
     mnl session exec "$declare_sid" \
       "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.org" \
@@ -2154,13 +2163,16 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-name.err" 2>/dev/null || true
       fail
     fi
-    name_outcome="fast refusal"
+    name_outcome="not a resolver refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-name.err" 2>/dev/null; then
-      name_outcome="fast resolver refusal"
-    elif [ "$name_elapsed_ms" -ge 6000 ]; then
-      name_outcome="timeout with no reset"
+      name_outcome="resolver refusal"
     fi
     echo "disallowed-name GET https://example.org -> rc=$name_rc status=${name_status:-<none>} elapsed=${name_elapsed_ms}ms ($name_outcome) curl: ${name_err:-<none>}"
+    if [ "$name_outcome" != "resolver refusal" ] || [ "$name_elapsed_ms" -ge 5000 ]; then
+      echo "::error::NET-141: the partial-allow-list box's GET https://example.org did not fail fast at resolution (want 'could not resolve' inside 5000 ms, got $name_outcome in ${name_elapsed_ms}ms) — its relay refuses every name the list does not match"
+      cat "$WORK/egress-deny-name.err" 2>/dev/null || true
+      fail
+    fi
   else
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
@@ -4578,10 +4590,11 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 # record in the daemon's log per exposed mapping (host, port, session).
 #
 # Gating, decided by where the proof's pieces actually run:
-#   * Native Linux only. A VM lane's daemon runs in the guest while the pair
-#     this proof installs lives host-side (macOS is always VM-backed), so
-#     there is no fresh-install story to drive there — those lanes'
-#     own-address boxes are the proxy proof's own-address half.
+#   * The install half is native Linux only. A VM lane's daemon runs in the
+#     guest while the pair this proof installs lives host-side. On the macOS
+#     lane the case runs fresh_install_range_lands_on_macos instead: the
+#     range that `min finalize-install` applies lands on the running VM. A
+#     Linux VM lane skips.
 #   * The box needs a TUN device: its session program opens /dev/net/tun for
 #     its in-namespace tap, and a host that is itself a sandbox (the
 #     agent-runtime boxes this harness runs on) has none and cannot mknod one,
@@ -4621,6 +4634,11 @@ local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
 local fi_host fi_host2 fi_pkg_log
 local fi_lane_minimald fi_restore_profile
+if [ -n "$E2E_VM" ] && [ "$(uname -s)" = Darwin ]; then
+  # The macOS lane's half: the range lands on a running VM (NET-010/NET-123).
+  fresh_install_range_lands_on_macos
+  return $?
+fi
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
   return 0
@@ -5033,6 +5051,173 @@ else
 fi
 echo "fresh-install loopback publish OK (installed pair, shipped switch, host-loopback answer, logged expose)"
 echo "::endgroup::"
+}
+
+# The fresh-install case on the macOS lane (NET-010, NET-040, NET-123): the
+# VM is already up, and its daemon walked the host's loopback at its start.
+# The case runs the script `min finalize-install` runs, which applies the
+# reserved local range to lo0. Then, WITHOUT a VM restart, a new own-IP box
+# with `--ingress 8080:8080` must publish at its own 127.0.64.N address: the
+# session start walks the range again, finds it present, and the box's name
+# answers there. Two facts are asserted:
+#   * `http://<name>.min.internal:8080` returns the in-box server's response,
+#     through the resolver file the same script wrote;
+#   * the box's own range address (the zone answerer's A record for its name)
+#     returns the same response at port 8080.
+# That `min ls` names the address belongs to T110 (#2696), which adds it.
+# The host is restored on every exit: the range unit, its aliases, the
+# resolver file and the answerer service go (range_teardown_unit,
+# answerer_service_teardown — the teardown repeats both if the case dies).
+fresh_install_range_lands_on_macos() {
+  local frm_name="e2e-fi-range" frm_port=8080 frm_marker="FRESH_INSTALL_RANGE_OK"
+  local frm_seed="" frm_sid="" frm_setup="" frm_cmd="" frm_ready="" frm_aliases=0
+  local frm_ans_port="" frm_addr="" frm_status="" frm_body="" frm_rc=0 frm_url=""
+  echo "::group::fresh install publishes an own-IP ingress at the box's range address on macOS"
+  if ! command -v launchctl >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+    echo "fresh-install range publish on macOS SKIPPED (needs launchctl and passwordless sudo to run the script min finalize-install runs)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "fresh-install range publish on macOS SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box publishes a port)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 0 ]; then
+    echo "::error::lo0 already carries addresses of 127.0.64.0/24 before the case ran min finalize-install; the case proves the range landing on a running VM, so it needs a host without the range"
+    fail
+  fi
+
+  # A box before the range: the VM's daemon read the range absent, so the
+  # walk this case proves is the one a later session start makes.
+  frm_setup="$WORK/fi-range-finalize-install.out"
+  mnl finalize-install --show --script >"$frm_setup" 2>"$frm_setup.note" || true
+  frm_cmd="$(setup_script_from "$frm_setup")"
+  case "$frm_cmd" in
+    '#!/bin/sh'*) ;;
+    *)
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$frm_cmd')"
+      cat "$frm_setup" "$frm_setup.note" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  if [ -f /etc/resolver/min.internal ]; then
+    RANGE_RESOLVER_BEFORE="$WORK/fi-range-resolver.before"
+    cp /etc/resolver/min.internal "$RANGE_RESOLVER_BEFORE"
+  fi
+  # Record every undo before the run, so a half-failed script still leaves
+  # the teardown its targets.
+  RANGE_INSTALLED=yes
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$frm_cmd")"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$frm_setup" >"$WORK/fi-range-cmd.out" 2>"$WORK/fi-range-cmd.err"; then
+    echo "::error::the script min finalize-install runs did not run"
+    cat "$WORK/fi-range-cmd.out" "$WORK/fi-range-cmd.err" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 40); do
+    frm_aliases="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+    [ "$frm_aliases" = 254 ] && break
+    sleep 0.25
+  done
+  if [ "$frm_aliases" != 254 ]; then
+    echo "::error::the script applied $frm_aliases of 254 range addresses to lo0"
+    fail
+  fi
+  echo "min finalize-install applied the range: 254 of 254 addresses on lo0; the VM keeps running"
+
+  # The new box, on the VM that read the range absent at its start.
+  frm_seed="$(hook_mktemp /tmp/mnlfr.XXXXXX)"
+  hook_seed_preamble > "$frm_seed/minimal.toml"
+  mkdir "$frm_seed/.git"
+  frm_sid="$(cd "$frm_seed" && mnl session activate . --no-prompt \
+    --name "$frm_name" --network own_ip --ingress "$frm_port:$frm_port" \
+    2>"$WORK/fi-range-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $frm_port:$frm_port' failed after min finalize-install"
+    cat "$WORK/fi-range-activate.err" 2>/dev/null || true
+    fail
+  }
+  frm_sid="$(printf '%s\n' "$frm_sid" | tail -n1 | tr -d '\r')"
+  mnl session exec "$frm_sid" \
+    "body=$frm_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/fr200" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not write the box's responder response"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  mnl session exec "$frm_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$frm_port,reuseaddr,fork SYSTEM:\"cat /home/fr200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not start the box's responder"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$frm_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$frm_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      frm_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$frm_ready" ] || {
+    echo "::error::the box's responder never answered inside its own box"
+    fail
+  }
+
+  # The box's own address: the zone answerer's A record for its name.
+  for _ in $(seq 1 40); do
+    frm_ans_port="$(mnl ls 2>/dev/null \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' \
+      | head -n1)"
+    [ -n "$frm_ans_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$frm_ans_port" ]; then
+    echo "::error::'min ls' carries no DNS SERVICE line after min finalize-install, so the box's address cannot be asked for"
+    mnl ls 2>&1 | head -40 || true
+    fail
+  fi
+  frm_addr="$(zone_answerer_a "$frm_ans_port" "$frm_name.min.internal" 2>"$WORK/fi-range-ans.err")" || true
+  case "$frm_addr" in
+    127.0.64.*) ;;
+    *)
+      echo "::error::$frm_name.min.internal answers ${frm_addr:-nothing}, not an address of 127.0.64.0/24: the session start did not land the range on the running VM (NET-123's re-walk), so the box stands at the 127.0.0.1 interim"
+      cat "$WORK/fi-range-ans.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  echo "the zone answers $frm_name.min.internal with $frm_addr, an address of the range"
+
+  # Both URLs, with every proxy variable stripped: no client needs setup.
+  for frm_url in "http://$frm_name.min.internal:$frm_port/" "http://$frm_addr:$frm_port/"; do
+    frm_status=""; frm_body=""
+    for _ in $(seq 1 20); do
+      env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+        curl -sS --max-time 8 -o "$WORK/fi-range.body" -w 'HTTP:%{http_code}' \
+        "$frm_url" >"$WORK/fi-range.out" 2>"$WORK/fi-range.err"
+      frm_rc=$?
+      frm_status="$(cat "$WORK/fi-range.out" 2>/dev/null)"
+      frm_body="$(cat "$WORK/fi-range.body" 2>/dev/null || true)"
+      [ "$frm_rc" -eq 0 ] && [ "$frm_status" = "HTTP:200" ] \
+        && [[ "$frm_body" == *"$frm_marker"* ]] && break
+      sleep 0.5
+    done
+    echo "GET $frm_url -> ${frm_status:-<none>} ${frm_body:-<no body>} (curl exit $frm_rc)"
+    if [ "$frm_rc" -ne 0 ] || [ "$frm_status" != "HTTP:200" ] \
+       || [[ "$frm_body" != *"$frm_marker"* ]]; then
+      echo "::error::GET $frm_url did not return the in-box server's response"
+      cat "$WORK/fi-range.err" 2>/dev/null || true
+      fail
+    fi
+  done
+
+  mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
+  range_teardown_unit
+  answerer_service_teardown
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
+  echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
@@ -20107,18 +20292,17 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # On a Linux VM lane the record is the guest's, so the listener is read
   # from the host's own socket table: /proc/net/tcp spells an IPv4 socket's
   # local address as the address' four octets in little-endian order with the
-  # port in big-endian hex — 127.64.0.14:18086 reads `0E00407F:46A6` — so
-  # the match pins the port, the LISTEN state, and the loopback half of
-  # either spelling the publish surface can bind a box's port at: `127.64.0.x`,
-  # the reserved local range a granted publish answers on (NET-010), or
-  # `127.0.0.1`, the interim a publish stands at where the surface's range
-  # verdict read the range absent (NET-123). The KVM lane lands absent: the
-  # range walk rides the same shuttle the publishes do, and the host gate
-  # refuses every one of its probe rounds — the probe's `remote` is a
-  # placeholder, so no registered row holds the address its publish is keyed
-  # at — so the interim is that lane's own answer, not a broken publish.
-  # The reserved-range arm is tried first and stays for a lane whose verdict
-  # lands present, and the marker the dial below demands keeps either
+  # port in big-endian hex — 127.0.64.14:18086 reads `0E40007F:46A6`, the
+  # third octet in characters 3-4 and the second in 5-6 — so the match pins
+  # the port, the LISTEN state, and the loopback half of either spelling the
+  # publish surface can bind a box's port at: `127.0.64.x`, the reserved
+  # local range a granted publish answers on (NET-010), or `127.0.0.1`, the
+  # interim a publish stands at where the surface's range verdict read the
+  # range absent (NET-123). The KVM lane lands present: the range walk rides
+  # the same shuttle the publishes do, and the host gate admits its probe
+  # rounds (#2748), so the reserved-range arm is that lane's answer. The
+  # interim arm stays for a lane whose verdict lands absent, and the marker
+  # the dial below demands keeps either
   # spelling honest: a stray host listener at the same port does not carry
   # this box's answer. A macOS VM host has neither a readable record nor
   # /proc, so that leg names itself skipped there.
@@ -20147,7 +20331,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
     da_row=""
     for _ in $(seq 1 40); do
       da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
-        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
          && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
       if [ -z "$da_row" ]; then
         da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
@@ -20612,7 +20796,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       po_row=""
       for _ in $(seq 1 40); do
         po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
-          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
            && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
         if [ -z "$po_row" ]; then
           po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
@@ -26478,6 +26662,254 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# A box's ports open by name on macOS, end to end (NET-010, NET-069,
+# NET-123, NET-144). One own-address box declares one port at activate and
+# publishes a second port at runtime with `min net expose`. Each port must
+# open at the box's address, at http://<name>.min.internal:<port>, and through
+# the hostname proxy that `min ls` names. A second box that declares the same
+# port must then be refused at activate, with no box left behind.
+#
+# The case runs on the host as it finds it, and says which state that is:
+#   * With the reserved range on lo0 (`min finalize-install` ran), the box
+#     stands at its own 127.0.64.N address. The second box gets an address of
+#     its own, so the case holds the port on every other range address with a
+#     plain listener. The second box's bind then fails, and the refusal names
+#     another program as the holder.
+#   * Without the range, the box stands at the 127.0.0.1 interim, which is
+#     shared. The second box collides with the first, and the refusal names
+#     the first box.
+#   * The name leg needs /etc/resolver/min.internal, which the same script
+#     writes. Without it the leg is NOT RUN, and the address and proxy legs
+#     still run.
+#
+# Observability: every leg prints its URL and its status, so a failed run
+# names the leg. Diagnostics: `fail` writes the `min bug` bundle, whose
+# daemon log carries the session-start range probe, the proxy's route lines
+# and the activation refusal line.
+proof_macos_box_opens_by_name_and_proxy() {
+  local mo_case="macos_box_opens_by_name_and_proxy"
+  local mo_name_a="e2e-mac-open-a" mo_name_b="e2e-mac-open-b"
+  # This case's own band, clear of every band the other proofs fix.
+  local mo_declared=18190 mo_runtime=18191
+  local mo_marker_d="MACOS_OPEN_DECLARED_OK" mo_marker_r="MACOS_OPEN_RUNTIME_OK"
+  local mo_sid_a="" mo_sid_b="" mo_range="" mo_ans_port="" mo_addr=""
+  local mo_proxy_port="" mo_ls="" mo_port="" mo_marker="" mo_ready=""
+  local mo_status="" mo_body="" mo_rc=0 mo_err="" mo_want_holder=""
+  local mo_expose_rc=0 mo_holder_addrs=""
+
+  echo "::group::a macOS box opens by name and through the hostname proxy, and a held port refuses the activation (NET-010, NET-069, NET-123, NET-144)"
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "$mo_case SKIPPED (macOS lane only: this host is $(uname -s), and the Linux lanes prove the native path)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "$mo_case SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box publishes a port)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The host's state, as found.
+  if [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" = 254 ]; then
+    mo_range=present
+    echo "host: lo0 carries the reserved range (min finalize-install ran), so the box stands at its own address"
+  else
+    mo_range=absent
+    echo "host: lo0 does not carry the reserved range, so the box stands at the 127.0.0.1 interim"
+  fi
+
+  # Box A: one declared port, and a dynamic range that admits the runtime one.
+  MACOS_OPEN_SEED_A_DIR="$(hook_mktemp /tmp/mnlmoa.XXXXXX)"
+  hook_seed_preamble > "$MACOS_OPEN_SEED_A_DIR/minimal.toml"
+  mkdir "$MACOS_OPEN_SEED_A_DIR/.git"
+  mo_sid_a="$(cd "$MACOS_OPEN_SEED_A_DIR" && mnl session activate . --no-prompt \
+    --name "$mo_name_a" --network own_ip --ingress "$mo_declared:$mo_declared" \
+    --dynamic-ingress allow --dynamic-range "$mo_runtime-$mo_runtime" \
+    2>"$WORK/mo-activate-a.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $mo_declared:$mo_declared' failed for the first box"
+    cat "$WORK/mo-activate-a.err" 2>/dev/null || true
+    fail
+  }
+  mo_sid_a="$(printf '%s\n' "$mo_sid_a" | tail -n1 | tr -d '\r')"
+  echo "box A: $mo_sid_a ($mo_name_a, declared $mo_declared, dynamic ingress allow over $mo_runtime)"
+
+  # One responder per port, each with its own page.
+  for mo_port in "$mo_declared" "$mo_runtime"; do
+    if [ "$mo_port" = "$mo_declared" ]; then mo_marker="$mo_marker_d"; else mo_marker="$mo_marker_r"; fi
+    if ! { mnl session exec "$mo_sid_a" \
+        "body=$mo_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/mo$mo_port" \
+        >/dev/null 2>"$WORK/mo-responder.err" \
+      && mnl session exec "$mo_sid_a" \
+        "nohup /usr/bin/socat TCP-LISTEN:$mo_port,reuseaddr,fork SYSTEM:\"cat /home/mo$mo_port\" >/dev/null 2>&1 &" \
+        >/dev/null 2>>"$WORK/mo-responder.err"; }; then
+      echo "::error::could not start the box's responder on port $mo_port"
+      cat "$WORK/mo-responder.err" 2>/dev/null || true
+      fail
+    fi
+    mo_ready=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$mo_sid_a" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$mo_port/" \
+        2>/dev/null || true)" = "200" ]; then
+        mo_ready=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$mo_ready" ] || { echo "::error::the box's responder on port $mo_port never answered inside the box"; fail; }
+  done
+
+  # The runtime port: published from inside the box.
+  mnl session exec "$mo_sid_a" "/usr/bin/min net expose $mo_runtime" \
+    >"$WORK/mo-expose.out" 2>"$WORK/mo-expose.err"
+  mo_expose_rc=$?
+  echo "expose: min net expose $mo_runtime in box A -> exit $mo_expose_rc: $(tr '\n' ' ' < "$WORK/mo-expose.out" 2>/dev/null)$(tr '\n' ' ' < "$WORK/mo-expose.err" 2>/dev/null)"
+  if [ "$mo_expose_rc" -ne 0 ]; then
+    echo "::error::'min net expose $mo_runtime' inside box A did not publish an in-range port"
+    fail
+  fi
+
+  # The box's address (the zone's A record for its name) and the proxy port.
+  for _ in $(seq 1 40); do
+    mo_ls="$(mnl ls 2>/dev/null || true)"
+    mo_ans_port="$(printf '%s\n' "$mo_ls" \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' | head -n1)"
+    mo_proxy_port="$(printf '%s\n' "$mo_ls" \
+      | sed -En 's/^HOSTNAME PROXY: .*listening on 127\.0\.0\.1:([0-9]+).*/\1/p' | head -n1)"
+    [ -n "$mo_ans_port" ] && [ -n "$mo_proxy_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$mo_ans_port" ] || [ -z "$mo_proxy_port" ]; then
+    echo "::error::'min ls' names no DNS SERVICE port or no HOSTNAME PROXY port (got '${mo_ans_port:-<none>}' and '${mo_proxy_port:-<none>}')"
+    printf '%s\n' "$mo_ls" | head -40
+    fail
+  fi
+  mo_addr="$(zone_answerer_a "$mo_ans_port" "$mo_name_a.min.internal" 2>"$WORK/mo-ans.err")" || true
+  case "$mo_range:$mo_addr" in
+    present:127.0.64.*|absent:127.0.0.1) ;;
+    *)
+      echo "::error::$mo_name_a.min.internal answers '${mo_addr:-nothing}', but the range is $mo_range on this host (want a 127.0.64.N address when present, 127.0.0.1 when absent)"
+      cat "$WORK/mo-ans.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  echo "zone: $mo_name_a.min.internal answers $mo_addr; hostname proxy: 127.0.0.1:$mo_proxy_port"
+
+  # One GET, retried while the publish settles. $1: the leg. $2: the URL.
+  # $3: the page. $4: a proxy URL, or "" for a direct request.
+  mo_get() {
+    local leg="$1" url="$2" want="$3" via="$4"
+    for _ in $(seq 1 20); do
+      if [ -n "$via" ]; then
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          curl -sS --max-time 8 -x "$via" -o "$WORK/mo.body" -w 'HTTP:%{http_code}' \
+          "$url" >"$WORK/mo.out" 2>"$WORK/mo.err"
+      else
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          curl -sS --max-time 8 -o "$WORK/mo.body" -w 'HTTP:%{http_code}' \
+          "$url" >"$WORK/mo.out" 2>"$WORK/mo.err"
+      fi
+      mo_rc=$?
+      mo_status="$(cat "$WORK/mo.out" 2>/dev/null)"
+      mo_body="$(cat "$WORK/mo.body" 2>/dev/null || true)"
+      [ "$mo_rc" -eq 0 ] && [ "$mo_status" = "HTTP:200" ] && [[ "$mo_body" == *"$want"* ]] && break
+      sleep 0.5
+    done
+    echo "$leg: GET $url${via:+ via $via} -> ${mo_status:-<none>} ${mo_body:-<no body>} (curl exit $mo_rc)"
+    if [ "$mo_rc" -ne 0 ] || [ "$mo_status" != "HTTP:200" ] || [[ "$mo_body" != *"$want"* ]]; then
+      echo "::error::$leg: GET $url${via:+ via $via} did not return the in-box server's page '$want'"
+      cat "$WORK/mo.err" 2>/dev/null || true
+      fail
+    fi
+  }
+
+  for mo_port in "$mo_declared" "$mo_runtime"; do
+    if [ "$mo_port" = "$mo_declared" ]; then mo_marker="$mo_marker_d"; else mo_marker="$mo_marker_r"; fi
+    mo_get "address leg :$mo_port" "http://$mo_addr:$mo_port/" "$mo_marker" ""
+    if [ -f /etc/resolver/min.internal ]; then
+      mo_get "name leg :$mo_port" "http://$mo_name_a.min.internal:$mo_port/" "$mo_marker" ""
+    else
+      not_run "${mo_case}_name_leg_$mo_port" "no /etc/resolver/min.internal on this host: min finalize-install did not run, so this host's resolver does not ask the box zone"
+    fi
+    mo_get "proxy leg :$mo_port" "http://$mo_name_a.min.internal:$mo_port/" "$mo_marker" \
+      "http://127.0.0.1:$mo_proxy_port"
+  done
+
+  # Box B declares the same port. Under the range the case holds that port
+  # at every other range address, so box B's own address is held too.
+  if [ "$mo_range" = present ]; then
+    mo_holder_addrs="$(ifconfig lo0 2>/dev/null | sed -n 's/^[[:space:]]*inet \(127\.0\.64\.[0-9]*\) .*/\1/p' \
+      | grep -vxF -- "$mo_addr" | tr '\n' ' ')"
+    # One address per word, so the list splits on purpose.
+    # shellcheck disable=SC2086
+    python3 -c 'import socket,sys,time
+held = []
+for addr in sys.argv[2:]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((addr, int(sys.argv[1])))
+        s.listen(1)
+        held.append(s)
+    except OSError as e:
+        print("skipped %s: %s" % (addr, e), file=sys.stderr)
+print("held %d" % len(held), flush=True)
+while True:
+    time.sleep(3600)' "$mo_declared" $mo_holder_addrs \
+      >"$WORK/mo-hold.out" 2>"$WORK/mo-hold.err" &
+    MACOS_OPEN_HOLD_PID=$!
+    for _ in $(seq 1 40); do
+      grep -q '^held' "$WORK/mo-hold.out" 2>/dev/null && break
+      kill -0 "$MACOS_OPEN_HOLD_PID" 2>/dev/null || break
+      sleep 0.25
+    done
+    if ! grep -q '^held [1-9]' "$WORK/mo-hold.out" 2>/dev/null; then
+      echo "::error::could not hold port $mo_declared on the other range addresses with a plain listener"
+      cat "$WORK/mo-hold.err" 2>/dev/null || true
+      fail
+    fi
+    echo "holder: a plain listener holds port $mo_declared at $(sed -n 's/^held //p' "$WORK/mo-hold.out") range addresses other than $mo_addr"
+    mo_want_holder="another program on this machine."
+  else
+    mo_want_holder="box $mo_name_a."
+  fi
+  MACOS_OPEN_SEED_B_DIR="$(hook_mktemp /tmp/mnlmob.XXXXXX)"
+  hook_seed_preamble > "$MACOS_OPEN_SEED_B_DIR/minimal.toml"
+  mkdir "$MACOS_OPEN_SEED_B_DIR/.git"
+  if mo_sid_b="$(cd "$MACOS_OPEN_SEED_B_DIR" && mnl session activate . --no-prompt \
+      --name "$mo_name_b" --network own_ip --ingress "$mo_declared:$mo_declared" \
+      2>"$WORK/mo-activate-b.err")"; then
+    echo "::error::the second box's activate with --ingress $mo_declared:$mo_declared succeeded while that port is held ($mo_sid_b)"
+    mnl session destroy --force "$(printf '%s\n' "$mo_sid_b" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
+    fail
+  fi
+  mo_err="$(cat "$WORK/mo-activate-b.err" 2>/dev/null || true)"
+  echo "refusal: min session activate --ingress $mo_declared:$mo_declared for box B -> $(printf '%s\n' "$mo_err" | tr '\n' ' ')"
+  if [[ "$mo_err" != *"Port $mo_declared is already in use on this machine by $mo_want_holder"* ]] \
+     || [[ "$mo_err" != *"--ingress"* ]]; then
+    echo "::error::the refusal does not name port $mo_declared, its holder ($mo_want_holder) and the --ingress remedy"
+    fail
+  fi
+  mo_ls="$(mnl ls 2>/dev/null || true)"
+  if [[ "$mo_ls" == *"$mo_name_b"* ]]; then
+    echo "::error::the refused activation left box $mo_name_b behind in 'min ls'"
+    printf '%s\n' "$mo_ls" | head -40
+    fail
+  fi
+  echo "the refused activation left no box behind"
+
+  if [ -n "$MACOS_OPEN_HOLD_PID" ]; then
+    kill "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+    wait "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+    MACOS_OPEN_HOLD_PID=""
+  fi
+  mnl session destroy --force "$mo_sid_a" >/dev/null 2>&1 || true
+  rm -rf "$MACOS_OPEN_SEED_A_DIR" "$MACOS_OPEN_SEED_B_DIR"
+  MACOS_OPEN_SEED_A_DIR=""
+  MACOS_OPEN_SEED_B_DIR=""
+  echo "$mo_case OK (range $mo_range: the declared and the runtime port open at $mo_addr, by name where the resolver file exists, and through the hostname proxy; a second box on port $mo_declared is refused and left nothing behind)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -26537,6 +26969,7 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
+    proof_macos_box_opens_by_name_and_proxy
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
     proof_bep_box_env_holds_sealed_value_only
@@ -26606,6 +27039,7 @@ case "${1:-}" in
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | macos_box_opens_by_name_and_proxy \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | unpublished_port_refused_on_vm_host \
     | proxy_sees_each_vm_box_by_its_switch_address \
@@ -26669,7 +27103,7 @@ case "${1:-}" in
     echo "         expose_from_inside_box"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
-    echo "         two_named_vms_on_one_machine"
+    echo "         two_named_vms_on_one_machine macos_box_opens_by_name_and_proxy"
     echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"

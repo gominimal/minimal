@@ -353,7 +353,7 @@ pub async fn cmd_finalize_install(
     if args.undo {
         return cmd_finalize_install_undo(args.show);
     }
-    let plan = plan_for_this_host(global).await;
+    let plan = plan_for_this_host(global, args.ct_mark_mask).await;
     if args.json {
         println!("{}", plan.json());
         if plan.exit_code() != 0 {
@@ -418,6 +418,22 @@ pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) 
 pub(crate) fn undo_flags_refusal(args: &FinalizeInstallArgs) -> Option<&'static str> {
     (args.undo && args.show && !args.script)
         .then_some("--undo takes --show only with --script: `min finalize-install --undo --show --script` prints the removal script")
+}
+
+/// `--ct-mark-mask`'s value: a 0x-prefixed hex value naming exactly two
+/// contiguous bits of the 32-bit connection mark, the shape the install
+/// step itself requires. The step also refuses the ranges well-known
+/// components use, and names them, so that check stays in one place.
+pub(crate) fn parse_ct_mark_mask(value: &str) -> Result<u32, String> {
+    let bits = value
+        .strip_prefix("0x")
+        .filter(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .ok_or("use a 0x-prefixed hex value of at most 32 bits, such as 0x0c000000")?;
+    if bits == 0 || bits >> bits.trailing_zeros() != 0b11 {
+        return Err("name exactly two contiguous bits, such as 0x0c000000".to_string());
+    }
+    Ok(bits)
 }
 
 /// `min finalize-install --undo`: remove everything the step installs on
@@ -502,10 +518,11 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
 }
 
 /// Every item this host has, probed in the order the summary lists them.
-async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
+/// `ct_mark_mask` is `--ct-mark-mask`, the bits the classifier step uses.
+async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Plan {
     // The names item sits after the user-namespace profile, ahead of the
     // `kvm` group or the classifier tree and its QUIC block helper.
-    let mut items = other_items_for_this_host(global);
+    let mut items = other_items_for_this_host(global, ct_mark_mask);
     let at = items
         .iter()
         .take_while(|item| item.id == "userns-profile")
@@ -522,7 +539,7 @@ async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
-fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
+fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Vec<Item> {
     let mut items = Vec::new();
     #[cfg(target_os = "linux")]
     {
@@ -535,11 +552,11 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
             // names subcommands minvmd does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
-            items.extend(linux::classifier_items_on_this_host(global));
+            items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = global;
+    let _ = (global, ct_mark_mask);
     items
 }
 
@@ -551,7 +568,7 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
 /// holds). Every item is Linux-only, so a macOS host reads `false`.
 pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
     crate::resolver::HostInstall {
-        other_items_unfinished: other_items_for_this_host(global)
+        other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
             .any(|item| item.state != ItemState::Done),
     }
@@ -594,10 +611,12 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
                     crate::resolver::range_text()
                 )
             } else {
+                // The boot unit is part of the step: without it the
+                // setting is gone after the next restart.
                 format!(
                     "configures this machine's DNS (systemd-resolved) to send \
                      *.{zone} lookups to Minimal's DNS service on \
-                     127.0.0.1:{port}{}",
+                     127.0.0.1:{port} at every boot{}",
                     if install.is_some() {
                         " and installs that service"
                     } else {
@@ -985,6 +1004,14 @@ pub(crate) mod linux {
         /// the daemon agree on what installed means. A marker without its
         /// record is a step that did not finish.
         pub(crate) table_present: bool,
+        /// The mask in that record, when the table is present: the bits
+        /// the loaded table classifies with. The step's block passes it
+        /// on when `--ct-mark-mask` does not name one, so a refresh and
+        /// the boot unit keep the operator's earlier choice.
+        pub(crate) recorded_mask: Option<u32>,
+        /// `--ct-mark-mask`: the bits this run installs with. A table
+        /// loaded with other bits is not done.
+        pub(crate) requested_mask: Option<u32>,
         /// The copy at [`CLASSIFIER_PROGRAM_PATH`] reads as
         /// [`CLASSIFIER_SCRIPT`] byte for byte: the copy outlives an
         /// upgrade of this binary and the units run it, so one that differs
@@ -1038,7 +1065,14 @@ pub(crate) mod linux {
                     .to_string(),
             );
         }
-        if facts.table_present && facts.copy_current && facts.units_enabled != Some(false) {
+        let mask_matches = facts
+            .requested_mask
+            .is_none_or(|mask| Some(mask) == facts.recorded_mask);
+        if facts.table_present
+            && mask_matches
+            && facts.copy_current
+            && facts.units_enabled != Some(false)
+        {
             return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
         }
         let cause = match facts.mount {
@@ -1086,24 +1120,37 @@ pub(crate) mod linux {
                             "deny-all egress is not enforced for boxes that share this \
                              machine's address: the step that enforces it is not \
                              installed, or did not finish"
+                                .to_string()
+                        } else if !mask_matches {
+                            format!(
+                                "egress enforcement uses the connection-mark bits {}, and \
+                                 --ct-mark-mask asks for {}",
+                                mask_hex(facts.recorded_mask),
+                                mask_hex(facts.requested_mask),
+                            )
                         } else if !facts.copy_current {
                             "the installed copy of the step that enforces deny-all egress \
                              is missing or out of date, so this version of min's step is \
                              not what runs at boot or at daemon start"
+                                .to_string()
                         } else {
                             "the step that enforces deny-all egress is installed but its \
                              systemd units are missing or not enabled, so a daemon restart \
                              can leave deny-all boxes refused, and a reboot can leave \
                              deny-all egress not enforced"
-                        }
-                        .to_string(),
+                                .to_string()
+                        },
                         format!(
                             "installs the cgroup tree and packet filter that enforce \
                              deny-all egress for {operator}'s daemon, and systemd units \
                              that restore them at boot and place the daemon under them on \
                              every daemon start"
                         ),
-                        classifier_steps(operator, socket),
+                        classifier_steps(
+                            operator,
+                            socket,
+                            facts.requested_mask.or(facts.recorded_mask),
+                        ),
                     );
                 }
             }
@@ -1117,7 +1164,15 @@ pub(crate) mod linux {
     /// oneshot that re-runs the step, and the placement pair: a path unit
     /// on the daemon's socket and the oneshot it starts — enabled, and the
     /// placement run once for the daemon that may already be listening.
-    fn classifier_steps(operator: &str, socket: &str) -> String {
+    ///
+    /// `mask`, when there is one, is passed to the step as
+    /// `--ct-mark-mask` both now and in the boot unit: the mask's record
+    /// lives in cgroupfs, which a reboot empties, so the unit is what keeps
+    /// the operator's bits across one.
+    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>) -> String {
+        let mask = mask
+            .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
+            .unwrap_or_default();
         format!(
             "# The egress classifier: its privileged step, from a root-owned copy of the\n\
              # bytes this binary carries, with no source identity (an un-enrolled host\n\
@@ -1128,7 +1183,7 @@ pub(crate) mod linux {
              {CLASSIFIER_SCRIPT_HEREDOC}\n\
              chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n\
              mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n\
-             {CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
+             {CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
              # The record marks the tree as this step's, so --undo removes it; one\n\
              # installed another way is left alone.\n\
              mkdir -p /var/lib/minimal\n\
@@ -1151,7 +1206,7 @@ pub(crate) mod linux {
              \n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
+             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
              \n\
              [Install]\n\
              WantedBy=multi-user.target\n\
@@ -1192,31 +1247,35 @@ pub(crate) mod linux {
     /// table classifies with (the step writes both in one install). A
     /// marker alone, a record that does not parse, or two that disagree
     /// is a step that did not finish, and reads as not installed.
-    pub(crate) fn table_present(root: &std::path::Path) -> bool {
+    ///
+    /// The mask is the one the record names, and `None` reads as not
+    /// installed.
+    pub(crate) fn recorded_mask(root: &std::path::Path) -> Option<u32> {
         if !root.join("classifier-table").is_dir() {
-            return false;
+            return None;
         }
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return false;
-        };
+        let entries = std::fs::read_dir(root).ok()?;
         let mut mask = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(value) = name.to_str().and_then(|n| n.strip_prefix("ct-mark-mask-")) else {
                 continue;
             };
-            let Some(bits) = value
+            let bits = value
                 .strip_prefix("0x")
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-            else {
-                return false;
-            };
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())?;
             if mask.is_some_and(|other| other != bits) {
-                return false;
+                return None;
             }
             mask = Some(bits);
         }
-        mask.is_some()
+        mask
+    }
+
+    /// A mask as the step spells it, or the step's default when there is
+    /// none.
+    fn mask_hex(mask: Option<u32>) -> String {
+        mask.map_or_else(|| "0x30000000".to_string(), |bits| format!("0x{bits:08x}"))
     }
 
     /// The QUIC block helper's facts: whether the helper and its sudoers
@@ -1281,9 +1340,12 @@ pub(crate) mod linux {
 
     /// The classifier item and the QUIC block helper item over this host's
     /// reads, in that order.
-    pub(crate) fn classifier_items_on_this_host(global: &GlobalArgs) -> [Item; 2] {
+    pub(crate) fn classifier_items_on_this_host(
+        global: &GlobalArgs,
+        ct_mark_mask: Option<u32>,
+    ) -> [Item; 2] {
         use std::os::unix::fs::MetadataExt as _;
-        let (facts, operator, socket) = classifier_facts_on_this_host(global);
+        let (facts, operator, socket) = classifier_facts_on_this_host(global, ct_mark_mask);
         // Root-owned and writable by root alone: not a symlink, no group or
         // other write bit, and the same of the directory that holds it.
         let root_only = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
@@ -1352,7 +1414,10 @@ pub(crate) mod linux {
     /// systemctl, the tree's owner, this process's uid and account, the
     /// cgroup2 mount, and the native daemon's socket path for this
     /// `--minimal-dir`.
-    fn classifier_facts_on_this_host(global: &GlobalArgs) -> (ClassifierFacts, String, String) {
+    fn classifier_facts_on_this_host(
+        global: &GlobalArgs,
+        ct_mark_mask: Option<u32>,
+    ) -> (ClassifierFacts, String, String) {
         use std::os::unix::fs::MetadataExt as _;
         let root = std::path::Path::new(CLASSIFIER_TREE_ROOT);
         let copy_current = std::fs::read(CLASSIFIER_PROGRAM_PATH)
@@ -1380,12 +1445,15 @@ pub(crate) mod linux {
             .map(|meta| meta.uid())
             .filter(|uid| *uid != me);
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let recorded = recorded_mask(root);
         let socket = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         (
             ClassifierFacts {
-                table_present: table_present(root),
+                table_present: recorded.is_some(),
+                recorded_mask: recorded,
+                requested_mask: ct_mark_mask,
                 copy_current,
                 units_enabled,
                 other_owner,
@@ -2183,6 +2251,7 @@ mod tests {
             script,
             json: false,
             undo,
+            ct_mark_mask: None,
         };
         assert!(undo_flags_refusal(&args(true, false, true)).is_some());
         assert_eq!(undo_flags_refusal(&args(true, true, true)), None);
@@ -2384,7 +2453,7 @@ mod tests {
              reserves the box IPs (127.0.64.0/24) on this machine's loopback at every boot"
         } else {
             "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups \
-             to Minimal's DNS service on 127.0.0.1:15353"
+             to Minimal's DNS service on 127.0.0.1:15353 at every boot"
         };
         assert_eq!(missing.step.as_deref(), Some(expected_step));
         assert!(NAMES_LABEL.contains(crate::resolver::ZONE), "{NAMES_LABEL}");
@@ -2440,7 +2509,7 @@ mod tests {
             );
         } else {
             assert!(
-                step.ends_with("on 127.0.0.1:15353 and installs that service"),
+                step.ends_with("on 127.0.0.1:15353 at every boot and installs that service"),
                 "{step}"
             );
         }
@@ -2632,25 +2701,30 @@ mod tests {
     /// disagree is not installed; one record, or two that agree, is.
     #[test]
     fn classifier_table_presence_needs_the_marker_and_one_mask_record() {
-        use linux::table_present;
+        use linux::recorded_mask;
         let root = tempfile::tempdir().expect("a temp dir");
         let root = root.path();
-        assert!(!table_present(root), "an empty root");
+        assert_eq!(recorded_mask(root), None, "an empty root");
         std::fs::create_dir(root.join("classifier-table")).unwrap();
-        assert!(
-            !table_present(root),
+        assert_eq!(
+            recorded_mask(root),
+            None,
             "the marker alone is a step that did not finish"
         );
         std::fs::create_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
-        assert!(!table_present(root), "a record that does not parse");
+        assert_eq!(recorded_mask(root), None, "a record that does not parse");
         std::fs::remove_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
         std::fs::create_dir(root.join("ct-mark-mask-0x30000000")).unwrap();
-        assert!(table_present(root), "the marker and one record");
+        assert_eq!(
+            recorded_mask(root),
+            Some(0x3000_0000),
+            "the marker and one record"
+        );
         std::fs::create_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
-        assert!(!table_present(root), "two records that disagree");
+        assert_eq!(recorded_mask(root), None, "two records that disagree");
         std::fs::remove_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
         std::fs::remove_dir(root.join("classifier-table")).unwrap();
-        assert!(!table_present(root), "a record without the marker");
+        assert_eq!(recorded_mask(root), None, "a record without the marker");
     }
 
     /// BEP-018 (#2607): the QUIC block helper item is done when the helper
@@ -2676,6 +2750,8 @@ mod tests {
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let classifier = ClassifierFacts {
             table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            requested_mask: None,
             copy_current: true,
             units_enabled: Some(true),
             other_owner: None,
@@ -2770,6 +2846,7 @@ mod tests {
         // With the classifier missing as well, a run carries its step once.
         let bare = ClassifierFacts {
             table_present: false,
+            recorded_mask: None,
             ..classifier
         };
         let plan = Plan {
@@ -2825,6 +2902,8 @@ mod tests {
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let installed = ClassifierFacts {
             table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            requested_mask: None,
             copy_current: true,
             units_enabled: Some(true),
             other_owner: None,
@@ -2833,6 +2912,7 @@ mod tests {
         };
         let bare = ClassifierFacts {
             table_present: false,
+            recorded_mask: None,
             copy_current: false,
             units_enabled: Some(false),
             ..installed
@@ -3028,6 +3108,82 @@ mod tests {
     /// oneshot that re-runs it plus a path unit on the daemon's socket whose
     /// oneshot runs the step's `--place-listener` — so a daemon restart is
     /// placed by the manager, never by a per-restart `--pid`.
+    /// The boot unit and a refresh re-apply the mask the loaded table
+    /// records, since a reboot empties the cgroupfs record. A
+    /// `--ct-mark-mask` that differs from the record re-runs the step
+    /// with the new bits, and one that matches leaves the item done.
+    #[test]
+    fn classifier_boot_unit_reapplies_a_recorded_mask() {
+        use crate::resolver::CLASSIFIER_PROGRAM_PATH;
+        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let installed = ClassifierFacts {
+            table_present: true,
+            recorded_mask: Some(0x0c00_0000),
+            requested_mask: None,
+            copy_current: true,
+            units_enabled: Some(true),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+        };
+        let stale = classifier_item_over(
+            &ClassifierFacts {
+                copy_current: false,
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        let script = stale.script.expect("a stale copy carries the block");
+        assert!(
+            script.contains(&format!(
+                "\n{CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
+            )),
+            "the refresh runs the step with the recorded mask: {script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
+            )),
+            "the boot unit carries the recorded mask: {script}"
+        );
+
+        let same = ClassifierFacts {
+            requested_mask: Some(0x0c00_0000),
+            ..installed
+        };
+        assert_eq!(
+            classifier_item_over(&same, "alice", sock).state,
+            ItemState::Done,
+            "a requested mask the table already uses is done"
+        );
+
+        let other = classifier_item_over(
+            &ClassifierFacts {
+                requested_mask: Some(0x0300_0000),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert_eq!(other.state, ItemState::Missing);
+        assert_eq!(
+            other.today.as_deref(),
+            Some(
+                "egress enforcement uses the connection-mark bits 0x0c000000, and \
+                 --ct-mark-mask asks for 0x03000000"
+            )
+        );
+        let script = other.script.expect("a new mask carries the block");
+        assert!(
+            script.contains(&format!(
+                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x03000000\n"
+            )),
+            "the boot unit carries the requested mask: {script}"
+        );
+    }
+
     #[test]
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
@@ -3040,6 +3196,8 @@ mod tests {
         let item = classifier_item_over(
             &ClassifierFacts {
                 table_present: false,
+                recorded_mask: None,
+                requested_mask: None,
                 copy_current: false,
                 units_enabled: Some(false),
                 other_owner: None,

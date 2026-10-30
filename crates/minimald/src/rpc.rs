@@ -490,11 +490,23 @@ async fn serve_create_session(
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
-                    // naming advisory again (NET-122). NET-018 reads the
+                    // naming advisory again (NET-122). On a VM-backed daemon
+                    // the guest's own `lo` always carries the range, so the
+                    // forwarder walks the host's loopback instead, and the
+                    // flag is the host's verdict. NET-018 reads the
                     // answerer's half straight off the state, not off this
-                    // probe: the range the probe covers is the guest's on a
-                    // VM-backed host, so it is not the reply's fact to read.
-                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
+                    // probe.
+                    #[cfg(target_os = "linux")]
+                    let walked = mngr
+                        .session_start_range_walk()
+                        .await
+                        .map(|answer| session_start_range_walk_line(&id, &answer));
+                    #[cfg(not(target_os = "linux"))]
+                    let walked: Option<bool> = None;
+                    let interim_loopback = match walked {
+                        Some(interim) => interim,
+                        None => session_start_loopback_probe(&id).await.interim(),
+                    };
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -672,6 +684,40 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
         "session-start loopback probe picked the publish surface"
     );
     probe
+}
+
+/// The session-start line of a VM-backed daemon (NET-123): the same record
+/// [`session_start_loopback_probe`] writes, over the forwarder's walk of the
+/// host's loopback, with whether this start walked and how many boxes the
+/// landing moved off the `127.0.0.1` interim. Returns the reply's interim
+/// flag.
+#[cfg(target_os = "linux")]
+fn session_start_range_walk_line(
+    session_id: &SessionId,
+    answer: &crate::box_manager::RangeWalkAnswer,
+) -> bool {
+    let probe = &answer.probe;
+    // A walk that got no answer over a present verdict keeps that verdict,
+    // so the box publishes in the range and the surface is the range's.
+    let interim = probe.interim() && !answer.kept_present;
+    let surface = if answer.kept_present {
+        "reserved-range"
+    } else {
+        probe.surface()
+    };
+    tracing::info!(
+        session_id = %session_id,
+        via = "forwarder",
+        walked = answer.walked,
+        moved_off_interim = answer.moved,
+        verdict_kept = answer.kept_present,
+        probe = %probe.summary(),
+        surface = %surface,
+        first_failure = ?probe.first_failure,
+        interim_loopback = interim,
+        "session-start loopback probe picked the publish surface"
+    );
+    interim
 }
 
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
@@ -1205,6 +1251,74 @@ async fn serve_rename_session(
                     error: e.to_string(),
                 }),
             }
+        })
+        .await
+}
+
+/// `StopBox`: stops the running box and keeps its record (BOX-013,
+/// BOX-018). Answers how the box ended, as the record now stores it.
+async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::StopBox
+        .handle_channel(c, async |req: minimald_rpc::StopBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.stop_box(req.id, req.force).await {
+                Ok(ending) => {
+                    let state = boxes::core::record::RecordState::Stopped(ending);
+                    tracing::info!(
+                        session_id = %req.id,
+                        force = req.force,
+                        exit_code = state.exit_code(),
+                        signal = state.signal(),
+                        "session stopped"
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::StopBoxResponse {
+                        exit_code: state.exit_code(),
+                        signal: state.signal(),
+                    }))
+                }
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
+/// `ListBoxes`: every retained box record on this host, in any state,
+/// optionally scoped to one project root (BOX-158).
+async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ListBoxes
+        .handle_channel(c, async |req: minimald_rpc::ListBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.list_boxes(req.project_root.as_ref()).await {
+                Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
+                Err(e) => Errorable::Err {
+                    error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ShowBox`: one box record with its state, identity and live execs
+/// (BOX-159).
+async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ShowBox
+        .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.show_box(req.id).await {
+                Ok(Some(reply)) => Errorable::Ok(reply),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box record could not be read: {e}"),
+                },
+            })
         })
         .await
 }
@@ -2863,6 +2977,9 @@ pub async fn handle_ssh_rpc(
         | FinalizeSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | minimald_rpc::StopBox::NAME
+        | minimald_rpc::ListBoxes::NAME
+        | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -2942,6 +3059,9 @@ pub async fn handle_ssh_rpc(
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
+        minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),

@@ -57,6 +57,16 @@ pub(crate) use launcher::*;
 #[cfg(test)]
 pub(crate) use mock::*;
 
+/// What a host loop returns when it ends: the portable exit code, and the
+/// reaped [`ExitReason`] when the backend accounted for the end.
+#[derive(Debug, Clone)]
+pub(crate) struct HostExit {
+    /// The portable exit code, as [`BoxProcess::try_wait`] reports it.
+    pub(crate) code: i32,
+    /// How the process ended. `None` when the backend gave no account.
+    pub(crate) reason: Option<ExitReason>,
+}
+
 /// The state of the session process.
 ///
 /// Generic over the [`BoxProcess`] it supervises and the [`BoxLauncher`]
@@ -823,18 +833,25 @@ pub(crate) struct NameMarker {
     registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
     /// The stable id of the session whose box's name is marked.
     session_id: boxes::SessionId,
+    /// The host launch this marker's host belongs to
+    /// ([`crate::net::dns::HostnameRegistry::begin_host_launch`]). The stop
+    /// mark carries it, so a replaced host cannot mark a newer host's box
+    /// stopped (NET-070).
+    launch: u64,
 }
 
 #[cfg(target_os = "linux")]
 impl NameMarker {
-    /// Marks one session's box name, in one registry.
+    /// Marks one session's box name, in one registry, for one host launch.
     pub(crate) fn new(
         registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
         session_id: boxes::SessionId,
+        launch: u64,
     ) -> Self {
         Self {
             registry,
             session_id,
+            launch,
         }
     }
 
@@ -852,11 +869,12 @@ impl NameMarker {
     /// box is never mistaken for one that never existed — but a name it
     /// shares with the node answers NODATA until a host runs again, so the
     /// node's own listener at that port is not spoken for by a dead box.
+    /// A host that a newer launch replaced changes nothing here.
     pub(crate) fn mark_stopped(&self) {
         self.registry
             .write()
             .expect("hostname registry lock poisoned")
-            .mark_stopped(self.session_id);
+            .mark_host_stopped(self.session_id, self.launch);
     }
 }
 
@@ -1117,7 +1135,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     ) -> Result<
         (
             HostHandle,
-            JoinHandle<Result<i32, std::io::Error>>,
+            JoinHandle<Result<HostExit, std::io::Error>>,
             Option<HostIpEnforcement>,
         ),
         std::io::Error,
@@ -1139,7 +1157,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             session_id = %host.session_id,
             session = %host.session_name,
         );
-        let task = crate::traced::spawn_detached(root, host.mainloop());
+        let task = crate::traced::spawn_detached(root, host.run());
         Ok((handle, task, host_ip_enforcement))
     }
 
@@ -1233,6 +1251,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             )
         });
 
+        // Read before the process moves into the host: a stop signals the
+        // box's processes from it (BOX-013).
+        let container_pid = process.container_pid();
+
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
 
@@ -1269,6 +1291,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             // declared-and-enforced attribute).
             attrs: HostAttrs {
                 host_ip_enforcement,
+                container_pid: Some(container_pid),
                 ..HostAttrs::default()
             },
 
@@ -1325,7 +1348,17 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         Ok((host, handle))
     }
 
-    pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
+    /// Runs [`Self::run`] and returns only the exit code.
+    #[cfg(test)]
+    pub async fn mainloop(self) -> Result<i32, std::io::Error> {
+        self.run().await.map(|exit| exit.code)
+    }
+
+    /// Runs the host loop until the process ends, and returns the reaped
+    /// [`ExitReason`] beside the exit code. Only the reason can tell an
+    /// entrypoint that exited 125 from a container that a signal ended,
+    /// because `hakoniwa` reports 125 for both.
+    pub(crate) async fn run(mut self) -> Result<HostExit, std::io::Error> {
         // The box's host is running from here: its name answers at its
         // address (NET-128) — the state it was in from finalize (NET-011), so
         // this mark only speaks where a previous host's exit had stopped it.
@@ -1369,9 +1402,12 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     // prompt at all.
                     self.notify_remote_teardown(TeardownCause {
                         pty_err: None,
-                        exit,
+                        exit: exit.clone(),
                     });
-                    break Ok(exit_code);
+                    break Ok(HostExit {
+                        code: exit_code,
+                        reason: exit,
+                    });
                 }
                 Ok(None) => {}
                 // Previously silent: a `wait` that fails ends the session
@@ -1450,10 +1486,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 if let Some(e) = pending {
                     self.notify_remote_teardown(TeardownCause {
                         pty_err: Some(e),
-                        exit,
+                        exit: exit.clone(),
                     });
                 }
-                break code;
+                break code.map(|code| HostExit { code, reason: exit });
             }
         };
 

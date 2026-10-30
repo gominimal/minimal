@@ -246,6 +246,131 @@ impl BoxManagerHandle {
     }
 }
 
+impl BoxManagerHandle {
+    /// Every retained box record on this host, in any state, in box id
+    /// order (BOX-158). With `project_root`, only the records whose
+    /// project root, as the create recorded it, is that one. A record that
+    /// predates the field has no project root and is never in a scoped
+    /// listing.
+    pub async fn list_boxes(
+        &self,
+        project_root: Option<&paths::HostAbsPath>,
+    ) -> Result<Vec<minimald_rpc::BoxListingEntry>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let scope = project_root.map_or_else(|| "host".to_string(), |root| root.to_string());
+        let span = tracing::info_span!(
+            "box.list",
+            scope = %scope,
+            count = tracing::field::Empty
+        );
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            let mut boxes: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
+                })
+                .map(box_listing_entry)
+                .collect();
+            boxes.sort_by_key(|entry| entry.box_id);
+            tracing::Span::current().record("count", boxes.len());
+            tracing::info!(scope = %scope, count = boxes.len(), "listed boxes");
+            Ok(boxes)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// One box record with its state, the identity the box runs under and
+    /// its live execs (BOX-159). `id` is the id a listing reports: it
+    /// resolves as a record's `box_id` first and as its `id` second, so
+    /// every id [`list_boxes`](Self::list_boxes) prints reads back here.
+    /// `None` for an id no retained record names. It starts no actor.
+    pub async fn show_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<minimald_rpc::ShowBoxResponse>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            // The listing reports `box_id` where a record has one (a VM
+            // guest's differs from its `id`), so that key wins.
+            let record = records
+                .iter()
+                .find(|record| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|record| record.id == id))
+                .cloned();
+            tracing::Span::current().record("found", record.is_some());
+            tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
+            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(&record),
+                // BOX-140: no host this daemon runs on is enrolled with a
+                // Gatehouse, so every box reports the identity none.
+                identity: minimald_rpc::BoxIdentity::None,
+                // BOX-149: the daemon does not give an exec an id yet, so
+                // this list is always empty, even when a process runs in
+                // the box. It fills when each exec has an id (BOX-149):
+                // https://github.com/gominimal/minimal/issues/2404 (T30).
+                live_execs: Vec::new(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// A record as a listing reports it (BOX-158): its identity fields and its
+/// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
+/// ending is not a row of the BOX-011 table reports its status with the
+/// stored `reason`, `exit_code` and `signal` as they are.
+fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+    let (state, reason, exit_code, signal) = match record.state() {
+        Ok(state) => (
+            state.name(),
+            state.reason().map(|reason| reason.name().to_string()),
+            state.exit_code(),
+            state.signal(),
+        ),
+        Err(_) => (
+            match record.status {
+                boxes::BoxState::Pending => "pending",
+                boxes::BoxState::Materializing => "materializing",
+                boxes::BoxState::Active => "running",
+                boxes::BoxState::Stopped => "stopped",
+                boxes::BoxState::Exited => "exited",
+            },
+            record
+                .reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string()),
+            record.exit_code,
+            record.signal,
+        ),
+    };
+    minimald_rpc::BoxListingEntry {
+        box_id: record.box_id.unwrap_or(record.id),
+        name: record.name.clone(),
+        box_type: record.box_type.clone(),
+        parent: record.parent,
+        project_root: record.project_root.clone(),
+        state: state.to_string(),
+        reason,
+        exit_code,
+        signal,
+    }
+}
+
 /// The bytes the daemon stores for a box's spec (BOX-068): the spec the
 /// client sent, serialized with its keys in order. A spec must be a JSON
 /// object whose `v` is a whole number, the spec's version.
@@ -273,12 +398,30 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
 
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
+    /// Every retained record, in any state (BOX-158). Read-only against
+    /// the store: it starts no actor and probes no host.
+    Records(Responder<Vec<boxes::Record>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
     /// retained record names.
     EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
+    /// The record and the on-disk object of the box `id`, read under one
+    /// teardown check (BOX-017). `None` for an id no record names, and
+    /// for a box being torn down, as to [`GetRecord`](Self::GetRecord).
+    /// It never starts an actor.
+    EndedSource(
+        SessionId,
+        Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
+    ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
+    /// The handle of the session's live actor, if it has one. Read-only
+    /// against the `running` map: unlike [`GetSession`](Self::GetSession)
+    /// it never starts an actor, so a stopped box stays without one. Linux
+    /// only, like the publish-move receiver that asks it: on macOS minimald
+    /// runs inside the Linux guest.
+    #[cfg(target_os = "linux")]
+    GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
@@ -319,6 +462,14 @@ enum ManagerMessage {
     /// actors it started.
     #[cfg(target_os = "linux")]
     ResumeActive(Responder<usize>),
+    /// The box, other than the one named by the id, that holds the name a
+    /// resume asks for (BOX-025), or `None`. A `None` claims the name for
+    /// the id until [`Self::ReleaseNameClaim`]. Read from the store and the
+    /// claims alone, so it never waits on an actor.
+    RunningNameHolder(SessionId, String, Responder<Option<NameHolder>>),
+    /// Fire-and-forget: drop the name claim of a resume that ended, as
+    /// refused or as running (BOX-025). A no-op for an id with no claim.
+    ReleaseNameClaim(SessionId),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
@@ -331,9 +482,13 @@ impl ManagerMessage {
     fn kind(&self) -> &'static str {
         match self {
             Self::List(..) => "List",
+            Self::Records(..) => "Records",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
+            Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
+            #[cfg(target_os = "linux")]
+            Self::GetRunning(..) => "GetRunning",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
@@ -349,6 +504,8 @@ impl ManagerMessage {
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
             Self::ResumeActive(..) => "ResumeActive",
+            Self::RunningNameHolder(..) => "RunningNameHolder",
+            Self::ReleaseNameClaim(..) => "ReleaseNameClaim",
             Self::Evict(..) => "Evict",
         }
     }
@@ -380,6 +537,12 @@ pub struct BoxManager {
     /// bring-up or a second destroy in that window starts no second actor and
     /// runs no `on_destroy` hook twice. A task removes its id as it ends.
     tearing_down: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    /// The names that resumes in flight claimed, keyed by the resuming box
+    /// (BOX-025). Each box has its own actor, so two stopped boxes that
+    /// share a name can resume at once. The name check claims the name, and
+    /// a later check for that name finds the claim, so at most one of them
+    /// writes `running`. The resume releases its claim when it ends.
+    name_claims: BTreeMap<SessionId, String>,
     /// The teardown tasks, joined by `Shutdown` before the state volume is
     /// quiesced: a hook still running or a record delete still in flight
     /// would otherwise race the unmount.
@@ -457,6 +620,19 @@ impl BoxManager {
         // hostage.
         reap_unresumable_records(&store).await?;
 
+        // BOX-154: no box process outlives the daemon that launched it, so
+        // every record still `running` here has no process left. Set each
+        // to `stopped` with no code and no signal. An attach resumes it
+        // from its stored spec (BOX-025), and the restart's resume below
+        // no longer brings it back.
+        let stopped = stop_orphaned_running_records(&store).await?;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "restart: set running records with no process left to stopped"
+            );
+        }
+
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
@@ -489,6 +665,8 @@ impl BoxManager {
         // (NET-129: "one allocated address per VM node") — the address its
         // host-address boxes answer at. A native node's address is the host
         // loopback itself, which it already owns.
+        #[cfg(target_os = "linux")]
+        let range_walk: Arc<std::sync::OnceLock<Arc<RangeWalk>>> = Arc::default();
         #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
             // This daemon's start, on the record's own clock: the stamp the
@@ -654,70 +832,26 @@ impl BoxManager {
                 // each box under the registry's write lock before it
                 // publishes, and releases a grant drawn for a box whose
                 // publish is gone.
-                let book = Arc::clone(&loopback);
-                let registry = Arc::clone(&hostnames);
+                //
+                // The same walk runs again at each session start
+                // ([`RangeWalk::session_start`]), so a host that gains the
+                // range after this daemon started publishes its next box in
+                // the range, and a host that loses it moves its boxes to the
+                // interim. The walk lets one walk
+                // run at a time, so the session-start walk never overlaps
+                // this one on the forwarder.
+                let walk = Arc::new(RangeWalk::new(
+                    RangeWalkSource::Forwarder(crate::net::policy::ControlChannel::Vsock {
+                        cid,
+                        port,
+                    }),
+                    Arc::clone(&loopback),
+                    Arc::clone(&hostnames),
+                ));
+                // The cell is new and empty here, so the set cannot fail.
+                let _ = range_walk.set(Arc::clone(&walk));
                 crate::traced::spawn(async move {
-                    let probe = crate::net::policy::probe_publish_surface(
-                        &crate::net::policy::ControlChannel::Vsock { cid, port },
-                    )
-                    .await;
-                    tracing::info!(
-                        via = "forwarder",
-                        surface = probe.surface(),
-                        interim = probe.interim(),
-                        first_failure = ?probe.first_failure,
-                        "the daemon-start range probe walked the forwarder's loopback \
-                         and picked the publish surface",
-                    );
-                    land_range_verdict(
-                        &book,
-                        &registry,
-                        if probe.present() {
-                            crate::net::dns::RangeVerdict::Present
-                        } else {
-                            crate::net::dns::RangeVerdict::Absent
-                        },
-                    );
-                    if !probe.present() {
-                        tracing::warn!(
-                            first_failure = ?probe.first_failure,
-                            "the reserved local range is absent on the publish surface; \
-                             publishing boxes on the 127.0.0.1 interim",
-                        );
-                        return;
-                    }
-                    let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
-                        crate::net::dns::LoopbackGrant::Granted(address) => address,
-                        crate::net::dns::LoopbackGrant::RecordUnavailable => {
-                            // The shutdown shape: a daemon that went down
-                            // mid-walk has closed its book, and the grant that
-                            // comes back is the closed book's, not a fault on
-                            // the host — the manager stops every session
-                            // before it closes, so there is nothing left to
-                            // publish an interim for either. An unreadable
-                            // record lands here too, said at the same level:
-                            // neither is a verdict about this host's range.
-                            tracing::debug!(
-                                grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
-                                "the node's own loopback address was not granted — \
-                                 the book was closed for shutdown, or its record could \
-                                 not be read or written",
-                            );
-                            return;
-                        }
-                        other => {
-                            tracing::warn!(
-                                grant = ?other,
-                                "the node's own loopback address was not granted; \
-                                 publishing host-address boxes on the 127.0.0.1 interim",
-                            );
-                            return;
-                        }
-                    };
-                    registry
-                        .write()
-                        .expect("hostname registry lock poisoned")
-                        .set_node_address(node);
+                    walk.daemon_start().await;
                 });
             }
             (hostnames, loopback)
@@ -728,6 +862,8 @@ impl BoxManager {
             in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(target_os = "linux")]
+            range_walk,
             #[cfg(all(test, target_os = "linux"))]
             loopback: Arc::clone(&loopback),
         };
@@ -768,11 +904,44 @@ impl BoxManager {
                 },
             );
         }
+        // #2748: each move of a box's publish is passed to that box's
+        // session, which binds its declared ports at the new address and
+        // moves the forwards its `min net expose` bound at the old one, if
+        // the box is running. Off the registry's lock, like the hand-overs
+        // above. Only a live actor is asked: the landing moves stopped boxes
+        // too, and a box with no actor has no forward to move, so none is
+        // started for it. Its next attach binds at the new address.
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
+            hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .notify_publish_moves(sender);
+            let manager = weak_self.clone();
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "sessions.publish_moves"),
+                async move {
+                    while let Some(moved) = moves.recv().await {
+                        let Some(manager) = manager.upgrade() else {
+                            return;
+                        };
+                        if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
+                            let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
+                            holder
+                                .publish_moved(moved.from, moved.to, ports.collect())
+                                .await;
+                        }
+                    }
+                },
+            );
+        }
         let mngr = Self {
             in_shutdown,
             receiver,
             running,
             tearing_down: Arc::default(),
+            name_claims: BTreeMap::new(),
             teardowns: tokio::task::JoinSet::new(),
             store,
             weak_self,
@@ -795,6 +964,260 @@ impl BoxManager {
             mngr.mainloop(),
         );
         Ok(handle)
+    }
+}
+
+/// What asks whether the host binds the reserved local range, for a daemon
+/// whose publish surface is the host's loopback, not its own.
+#[cfg(target_os = "linux")]
+pub(crate) enum RangeWalkSource {
+    /// The host forwarder, asked over the control channel the publishes
+    /// ride ([`crate::net::policy::probe_publish_surface`]).
+    Forwarder(crate::net::policy::ControlChannel),
+    /// A test's stand-in for the forwarder's binds: no Linux host can make
+    /// the range absent, and no harness daemon has a host forwarder.
+    #[cfg(test)]
+    StandIn(Arc<dyn Fn() -> crate::net::loopback::RangeProbe + Send + Sync>),
+}
+
+/// The answer a session-start range walk gives the create handler.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct RangeWalkAnswer {
+    /// The probe the verdict rests on: this walk's, or the concurrent
+    /// walk's when this call took that walk's answer.
+    pub(crate) probe: crate::net::loopback::RangeProbe,
+    /// Whether this session start walked the range. `false` only when a
+    /// walk that ended while this one waited for its turn gave the answer.
+    pub(crate) walked: bool,
+    /// How many boxes the landing moved off the `127.0.0.1` interim onto
+    /// their range addresses.
+    pub(crate) moved: usize,
+    /// Whether this walk was a fault of the channel over a landed present
+    /// verdict, so the verdict stayed present and `probe` is the failed
+    /// walk's, not the verdict's.
+    pub(crate) kept_present: bool,
+}
+
+/// Whether a probe that did not bind the whole range rests on a refusal
+/// the forwarder answered, recorded as `AddrNotAvailable`, rather than on
+/// a fault of the channel.
+#[cfg(target_os = "linux")]
+fn range_probe_refused(probe: &crate::net::loopback::RangeProbe) -> bool {
+    matches!(
+        probe.first_failure,
+        Some((_, std::io::ErrorKind::AddrNotAvailable))
+    )
+}
+
+/// The forwarder-conducted walk of the reserved local range (NET-123) and
+/// the landing of its verdict, shared by the daemon-start walk and every
+/// session-start walk of a microVM daemon.
+///
+/// One walk runs at a time: the walks share one probe port on one
+/// forwarder, and a session start that waits behind a walk takes that
+/// walk's answer, not a second walk of its own.
+#[cfg(target_os = "linux")]
+pub(crate) struct RangeWalk {
+    source: RangeWalkSource,
+    book: Arc<crate::net::dns::LoopbackLeaseBook>,
+    registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// How many walks ended, read before a caller waits for its turn.
+    walks: std::sync::atomic::AtomicU64,
+    /// The turn, and the last walk's probe.
+    last: Mutex<Option<crate::net::loopback::RangeProbe>>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RangeWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match &self.source {
+            RangeWalkSource::Forwarder(_) => "forwarder",
+            #[cfg(test)]
+            RangeWalkSource::StandIn(_) => "stand-in",
+        };
+        f.debug_struct("RangeWalk")
+            .field("source", &source)
+            .field(
+                "walks",
+                &self.walks.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RangeWalk {
+    pub(crate) fn new(
+        source: RangeWalkSource,
+        book: Arc<crate::net::dns::LoopbackLeaseBook>,
+        registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    ) -> Self {
+        Self {
+            source,
+            book,
+            registry,
+            walks: std::sync::atomic::AtomicU64::new(0),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Asks the source to bind the whole range once.
+    async fn probe(&self) -> crate::net::loopback::RangeProbe {
+        match &self.source {
+            RangeWalkSource::Forwarder(control) => {
+                crate::net::policy::probe_publish_surface(control).await
+            }
+            #[cfg(test)]
+            RangeWalkSource::StandIn(walk) => walk(),
+        }
+    }
+
+    /// Walks the range and lands the verdict. The caller holds the turn.
+    ///
+    /// A walk that neither bound the whole range nor got a refusal from the
+    /// forwarder (a timeout, a missing socket, a malformed reply) is a fault
+    /// of the channel, not a fact about the host's loopback. Over a landed
+    /// present verdict such a walk lands nothing: the verdict stays present
+    /// and every box keeps its range address. The returned flag says so.
+    /// Over a pending or absent verdict the walk lands absent as before,
+    /// because the interim is what the surface can promise without an answer.
+    async fn walk_and_land(&self) -> (crate::net::loopback::RangeProbe, usize, bool) {
+        let probe = self.probe().await;
+        if !probe.present() && !range_probe_refused(&probe) && self.present_landed() {
+            tracing::warn!(
+                probe = %probe.summary(),
+                first_failure = ?probe.first_failure,
+                action = "loopback-range-walk-inconclusive",
+                "the range walk got no answer from the forwarder; \
+                 the present verdict stays and every box keeps its address",
+            );
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return (probe, 0, true);
+        }
+        let moved = land_range_verdict(
+            &self.book,
+            &self.registry,
+            if probe.present() {
+                crate::net::dns::RangeVerdict::Present
+            } else {
+                crate::net::dns::RangeVerdict::Absent
+            },
+        );
+        if probe.present() {
+            self.grant_node_address();
+        }
+        self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        (probe, moved, false)
+    }
+
+    /// Whether the book holds a landed present verdict: it vouches for an
+    /// address inside the reserved range only then.
+    fn present_landed(&self) -> bool {
+        ::switch::loopback::range_hosts()
+            .next()
+            .is_some_and(|host| self.book.vouches_for(host))
+    }
+
+    /// Hands the node its own loopback address once the range is present
+    /// (NET-129). The grant is idempotent by namespace, so a later present
+    /// landing asks again at no cost.
+    fn grant_node_address(&self) {
+        let node = match self.book.grant(crate::net::dns::LeaseNamespace::Node) {
+            crate::net::dns::LoopbackGrant::Granted(address) => address,
+            crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                // The shutdown shape: a daemon that went down mid-walk has
+                // closed its book, and the grant that comes back is the
+                // closed book's, not a fault on the host — the manager stops
+                // every session before it closes, so there is nothing left
+                // to publish an interim for either. An unreadable record
+                // lands here too, said at the same level: neither is a
+                // verdict about this host's range.
+                tracing::debug!(
+                    grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
+                    "the node's own loopback address was not granted — \
+                     the book was closed for shutdown, or its record could \
+                     not be read or written",
+                );
+                return;
+            }
+            other => {
+                tracing::warn!(
+                    grant = ?other,
+                    "the node's own loopback address was not granted; \
+                     publishing host-address boxes on the 127.0.0.1 interim",
+                );
+                return;
+            }
+        };
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .set_node_address(node);
+    }
+
+    /// The daemon-start walk: spawned off `BoxManager::init`'s critical
+    /// path, it lands the first verdict the book opened pending on.
+    pub(crate) async fn daemon_start(&self) {
+        let mut last = self.last.lock().await;
+        let (probe, _, _) = self.walk_and_land().await;
+        tracing::info!(
+            via = "forwarder",
+            surface = probe.surface(),
+            interim = probe.interim(),
+            first_failure = ?probe.first_failure,
+            "the daemon-start range probe walked the forwarder's loopback \
+             and picked the publish surface",
+        );
+        if !probe.present() {
+            tracing::warn!(
+                first_failure = ?probe.first_failure,
+                "the reserved local range is absent on the publish surface; \
+                 publishing boxes on the 127.0.0.1 interim",
+            );
+        }
+        *last = Some(probe);
+    }
+
+    /// The session-start walk: walks the range again at every session
+    /// start, whatever verdict landed last, and lands what it finds. The
+    /// range can go away under a running VM, so a present verdict is
+    /// bind-probed again too: a present-to-absent walk lands the absent
+    /// arm, which moves every box in the range onto the `127.0.0.1`
+    /// interim. Only a refusal the forwarder answered lands that arm over a
+    /// present verdict. A walk that got no answer keeps the verdict
+    /// ([`Self::walk_and_land`]). A walk that ended while this call waited for its turn gives
+    /// this call its answer.
+    pub(crate) async fn session_start(&self) -> RangeWalkAnswer {
+        let seen = self.walks.load(std::sync::atomic::Ordering::Acquire);
+        let mut last = self.last.lock().await;
+        let ended_while_waiting = self.walks.load(std::sync::atomic::Ordering::Acquire) != seen;
+        if let Some(probe) = last.as_ref().filter(|_| ended_while_waiting) {
+            return RangeWalkAnswer {
+                probe: probe.clone(),
+                walked: false,
+                moved: 0,
+                kept_present: false,
+            };
+        }
+        let (probe, moved, kept_present) = self.walk_and_land().await;
+        if kept_present {
+            // The verdict did not move, so the last walk's probe stays the
+            // one a waiting session start takes as its answer.
+            return RangeWalkAnswer {
+                probe,
+                walked: true,
+                moved,
+                kept_present,
+            };
+        }
+        *last = Some(probe.clone());
+        RangeWalkAnswer {
+            probe,
+            walked: true,
+            moved,
+            kept_present,
+        }
     }
 }
 
@@ -822,7 +1245,7 @@ pub(crate) struct InterimUpgrade {
 }
 
 /// Lands a range verdict the way the deferred walk lands it
-/// ([`crate::box_manager::BoxManager::init`]'s spawned probe): the state moves
+/// ([`RangeWalk`]'s daemon-start and session-start walks): the state moves
 /// first, then the arm that follows it runs over the publishes the old
 /// verdict left standing — the one moment a verdict's landing has effects
 /// beside the atomic it sets, and the reason the walk cannot simply store
@@ -834,7 +1257,9 @@ pub(crate) struct InterimUpgrade {
 /// destroy. The landing is the one moment the daemon holds both facts — the
 /// verdict and every publish it contradicts — so it re-publishes each such
 /// box at the interim, name and route with it, and the box's attach binds
-/// where the surface listens instead of failing until destroy. The arm is
+/// where the surface listens instead of failing until destroy. The node's
+/// own address moves to the interim too when it stands in the range, so
+/// the names of host-address boxes stop answering at it. The arm is
 /// a belt behind the pending window's gate: no production path publishes a
 /// reserved-range address under anything but a landed present verdict — a
 /// hand waits for one or stands at the interim, and a resumed box the
@@ -868,19 +1293,21 @@ pub(crate) struct InterimUpgrade {
 /// the verdict under the registry's write lock before it publishes — its
 /// ask by the verdict's own arm, and each sweep only re-publishes what
 /// still stands.
+///
+/// Returns how many boxes the present arm moved off the interim, for the
+/// session-start walk's log line. The other arms return `0`.
 #[cfg(target_os = "linux")]
 fn land_range_verdict(
     book: &crate::net::dns::LoopbackLeaseBook,
     registry: &RwLock<crate::net::dns::HostnameRegistry>,
     verdict: crate::net::dns::RangeVerdict,
-) {
+) -> usize {
     book.set_range_verdict(verdict);
     match verdict {
-        crate::net::dns::RangeVerdict::Present => {
-            for upgrade in draw_interim_upgrades(book, registry) {
-                apply_interim_upgrade(book, registry, &upgrade);
-            }
-        }
+        crate::net::dns::RangeVerdict::Present => draw_interim_upgrades(book, registry)
+            .iter()
+            .filter(|upgrade| apply_interim_upgrade(book, registry, upgrade))
+            .count(),
         crate::net::dns::RangeVerdict::Absent => {
             // The boxes the window published at reserved-range addresses:
             // the surface cannot bind what they hold, and their attach
@@ -902,10 +1329,27 @@ fn land_range_verdict(
                 reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
                 reg.register_own_ip(session, &name, ports);
             }
+            // The node's own address a present landing granted: host-address
+            // boxes route at it, and the surface cannot bind it now. The
+            // node's lease stays in the book, so the next present landing
+            // grants the same address back.
+            let node = reg.node_address();
+            if ::switch::loopback::range_hosts().any(|host| host == node) {
+                tracing::warn!(
+                    from = %node,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-node",
+                    "the node's own loopback address stood inside the reserved \
+                     local range; the range is absent on the publish surface, \
+                     so the node's names move to the 127.0.0.1 interim",
+                );
+                reg.set_node_address(Ipv4Addr::LOCALHOST);
+            }
+            0
         }
         // The state a book opens on and the state a test re-opens it in:
         // nothing has been published under it to sweep.
-        crate::net::dns::RangeVerdict::Pending => {}
+        crate::net::dns::RangeVerdict::Pending => 0,
     }
 }
 
@@ -996,6 +1440,16 @@ pub(crate) fn draw_interim_upgrades(
 /// stopped box keeps its name, so the move applies to it with its stopped
 /// marker intact.
 ///
+/// A move also sends the move itself, with a hand-over for each port the box
+/// declares ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]).
+/// A box that runs has its forwards at the interim, where its attach,
+/// its `min net expose` and its listen watcher bound them, so without these
+/// its name would answer at an address no forward listens on. Its actor
+/// binds the declared forwards and moves the exposed ones to the new
+/// address. Its listen watcher reads the new address on its next poll and
+/// moves the ports it published. A box with no actor running gets nothing:
+/// none is started for it, and its next attach binds at the new address.
+///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
 /// ([`crate::box_manager::BoxManager::init`]), never through the manager's
@@ -1038,6 +1492,11 @@ pub(crate) fn apply_interim_upgrade(
                 upgrade.ports.clone(),
             );
             reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
+            // The forwards follow the name (#2748): a box that runs bound
+            // them at the interim, so its actor binds each port again at the
+            // address the name now answers at, and moves the ports its
+            // `min net expose` published there.
+            reg.hand_over_moved_publish(upgrade.session, Ipv4Addr::LOCALHOST);
             true
         };
         (applied, standing.is_none())
@@ -1140,6 +1599,273 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
         }
     }
     Ok(())
+}
+
+/// BOX-154: sets every record the daemon finds `running` at its start, with
+/// no process left in the box, to `stopped` with no exit code and no signal,
+/// and records an `exited` event with that reason and no signal. No signal
+/// of this daemon ended such a box. Answers how many records it set.
+///
+/// Every box process dies with the daemon that launched it (the container
+/// arms `PR_SET_PDEATHSIG`), so a starting daemon finds no process in any
+/// box. A record marked to end with its run is left to the resume, which
+/// destroys it (NET-131, gominimal/inbox#731).
+///
+/// [`BoxManager::init`] calls this before the restart's resume
+/// ([`BoxManager::resume_active_sessions`]), so that resume finds no
+/// orphaned `running` record to bring back.
+pub(crate) async fn stop_orphaned_running_records(
+    store: &crate::store::StoreHandle,
+) -> Result<usize, std::io::Error> {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let mut stopped = 0;
+    for handle in store.handles().await? {
+        let mut record = match handle.record().await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %handle.id(),
+                    %error,
+                    "restart: could not read the record; its state is left as it is",
+                );
+                continue;
+            }
+        };
+        if record.ends_with_run || !matches!(record.state(), Ok(RecordState::Running)) {
+            continue;
+        }
+        let ending = StopEnding::AtDaemonStart;
+        record.set_state(RecordState::Stopped(ending));
+        handle.write(record).await?;
+        let object = handle.object().await?;
+        write_box_event(
+            &object,
+            BoxEventType::Exited,
+            crate::box_actor::stopped_event_data(ending),
+        )?;
+        tracing::info!(
+            session_id = %handle.id(),
+            "restart: set a running record with no process left to stopped, with no signal",
+        );
+        stopped += 1;
+    }
+    Ok(stopped)
+}
+
+/// The data of the `resumed` event a resume records (BOX-025): the state
+/// the box resumed from, `stopped` or `exited`.
+pub(crate) fn resumed_event_data(from: &boxes::core::record::RecordState) -> EventData {
+    let mut data = EventData::new();
+    data.insert("from".to_string(), from.name().into());
+    data
+}
+
+/// The box that holds a name a resume asks for (BOX-025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameHolder {
+    /// The name the box answers to.
+    pub(crate) name: String,
+    /// The box's id.
+    pub(crate) id: SessionId,
+    /// `true` when the box does not run yet, and its own resume claimed the
+    /// name. `false` when its record reads `running`.
+    pub(crate) resuming: bool,
+}
+
+impl BoxManagerHandle {
+    /// The box other than `id` that holds the name `name`, for a resume's
+    /// name check (BOX-025), or `None`. A `None` claims the name for `id`,
+    /// so a concurrent resume of another box with that name finds it held.
+    /// The caller must release the claim with [`Self::release_name_claim`]
+    /// once the resume writes `running` or is refused. The manager reads
+    /// only the store and its claims to answer.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's error.
+    pub(crate) async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::RunningNameHolder(id, name, send))
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ))
+        })
+    }
+
+    /// Drops the name claim that [`Self::running_name_holder`] made for `id`.
+    /// A no-op when `id` holds no claim or the manager is gone.
+    pub(crate) async fn release_name_claim(&self, id: SessionId) {
+        // A send error means the manager is gone, and its claims with it.
+        let _ = self.sender.send(ManagerMessage::ReleaseNameClaim(id)).await;
+    }
+
+    /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
+    /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
+    /// how the box ended.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is not running, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the stop itself ended on.
+    pub async fn stop_box(
+        &self,
+        id: SessionId,
+        force: bool,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        self.stop_box_with_grace(id, force, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::stop_box`] with the grace period `grace`.
+    pub(crate) async fn stop_box_with_grace(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let unknown = || {
+            std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            )
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        match record.state() {
+            Ok(boxes::core::record::RecordState::Running) => {}
+            Ok(state) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "session `{}` is {}, not running, so there is nothing to stop",
+                        id.as_ref(),
+                        state.name()
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+            }
+        }
+        tracing::info!(session_id = %id, force, "stop: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        let stopped = session.stop_box(force, grace).await;
+        if stopped.is_err() {
+            // A stop that waited behind another stop of the same box finds
+            // the actor gone when the first one ends. The record then says
+            // how the box ended, and that is this stop's answer too.
+            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
+                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
+            {
+                tracing::info!(
+                    session_id = %id,
+                    ending = ?ending,
+                    "stop: an earlier stop ended the box; answering with its ending"
+                );
+                return Ok(ending);
+            }
+        }
+        stopped
+    }
+
+    /// The state and directories of the box `id` when the box is stopped
+    /// or exited, read from the store with no actor started (BOX-017).
+    /// Answers `None` for an id no record names, for a box being torn
+    /// down, and for a box that is not ended: that box has, or can get,
+    /// an actor through [`Self::get_session`].
+    ///
+    /// # Errors
+    ///
+    /// A store error, or `InvalidData` for a record whose state this
+    /// build cannot read.
+    pub(crate) async fn ended_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<EndedBox>, BoxManagerError> {
+        // One manager message reads the record and the object, so a delete
+        // cannot start between the two reads.
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EndedSource(id, send))
+            .await;
+        let Some((record, object)) = recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        else {
+            return Ok(None);
+        };
+        let state = record
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if !matches!(
+            state,
+            boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)
+        ) {
+            return Ok(None);
+        }
+        // The object is the store's object for the record, with no actor
+        // behind it. Its directories are the box's retained files.
+        use boxes::store::BoxObject as _;
+        Ok(Some(EndedBox {
+            state,
+            paths: crate::box_actor::BoxPaths {
+                working: object.workspace_path(),
+                cache: object.cache_path(),
+                home: object.home_path(),
+                patches: object.patches_path(),
+                hooks: object.hooks_path(),
+            },
+        }))
+    }
+}
+
+/// A stopped or exited box, as [`BoxManagerHandle::ended_box`] reads it
+/// from the store.
+#[derive(Debug)]
+pub(crate) struct EndedBox {
+    /// How the box ended.
+    pub state: boxes::core::record::RecordState,
+    /// The box's retained directories.
+    pub paths: crate::box_actor::BoxPaths,
 }
 
 /// Per-session deadline for the host probes this manager makes — the
@@ -1261,7 +1987,14 @@ impl BoxManager {
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
-    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// (`HostNet`, `OwnIp`) and has no actor yet.
+    ///
+    /// A restart no longer relaunches a box whose processes are gone
+    /// (BOX-154): [`BoxManager::init`] already set each such record to
+    /// `stopped`, so this resume skips it, and the box's next attach resumes
+    /// it from its stored spec (BOX-025). What this resume still finds
+    /// `Active` is a record whose box is still live, plus a run's box, which
+    /// it destroys (NET-131). A session's name is
     /// registered when its actor starts ([`BoxActor::run`]), and a restarted
     /// daemon otherwise starts an actor only when an RPC first names the
     /// session, so until then the name of a session `min ls` lists as active
@@ -1504,6 +2237,90 @@ impl BoxManager {
             tracing::info!(resumed, "resumed active sessions so their names route");
         }
         Ok(resumed)
+    }
+
+    /// The running box other than `id` whose name is `name` (BOX-025): the
+    /// name its route answers to, as [`crate::box_actor::registry_name`]
+    /// gives it, compared without ASCII case as hostnames are. Answers that
+    /// box's name and id, or `None`. A box being torn down holds no name. A
+    /// record that cannot be read can belong to a running box that holds the
+    /// name, so it fails the check, and the resume is refused.
+    async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: &str,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for handle in self.store.handles().await? {
+            let other = *handle.id();
+            if other == id || tearing_down.contains(&other) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                // A record removed since the listing belongs to no box.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %other,
+                        %error,
+                        "resume: could not read a record while checking the name",
+                    );
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "The record of session `{other}` cannot be read, so its name is \
+                             not known: {error}."
+                        ),
+                    ));
+                }
+            };
+            if matches!(
+                record.state(),
+                Ok(boxes::core::record::RecordState::Running)
+            ) {
+                let held = crate::box_actor::registry_name(&record);
+                if held.eq_ignore_ascii_case(name) {
+                    return Ok(Some(NameHolder {
+                        name: held,
+                        id: other,
+                        resuming: false,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`Self::running_name_holder`], then the claims of the resumes in
+    /// flight (BOX-025). When neither holds `name`, `id` claims it. The
+    /// manager loop runs one message at a time, so of two checks for one
+    /// name, the later one sees the claim of the earlier one.
+    async fn claim_name(
+        &mut self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        if let Some(holder) = self.running_name_holder(id, &name).await? {
+            return Ok(Some(holder));
+        }
+        let claimed = self
+            .name_claims
+            .iter()
+            .find(|(other, held)| **other != id && held.eq_ignore_ascii_case(&name));
+        if let Some((other, held)) = claimed {
+            return Ok(Some(NameHolder {
+                name: held.clone(),
+                id: *other,
+                resuming: true,
+            }));
+        }
+        self.name_claims.insert(id, name);
+        Ok(None)
     }
 
     /// The manager's half of a teardown: the box's actor in `running`, or one
@@ -1884,6 +2701,25 @@ impl BoxManager {
                 })
                 .await;
             }
+            // Gets every retained record, in any state.
+            ManagerMessage::Records(r) => {
+                // A record in teardown is gone here, as it is to `List`.
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if !tearing_down.contains(handle.id()) {
+                            records.push(handle.record().await?);
+                        }
+                    }
+                    Ok::<_, BoxManagerError>(records)
+                })
+                .await;
+            }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 let tearing_down = self
@@ -1912,9 +2748,34 @@ impl BoxManager {
                 })
                 .await;
             }
+            ManagerMessage::EndedSource(id, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            // Gone, as to `GetRecord`: a delete that has
+                            // started hands out no paths of the box.
+                            Some(handle) if tearing_down.contains(handle.id()) => None,
+                            Some(handle) => Some((handle.record().await?, handle.object().await?)),
+                            None => None,
+                        },
+                    )
+                })
+                .await;
+            }
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
+            }
+            ManagerMessage::RunningNameHolder(id, name, r) => {
+                r.handle(self.claim_name(id, name)).await;
+            }
+            ManagerMessage::ReleaseNameClaim(id) => {
+                self.name_claims.remove(&id);
             }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
@@ -1947,6 +2808,12 @@ impl BoxManager {
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
+            }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::GetRunning(id, r) => {
+                let running = self.running.get(&id).cloned();
+                r.handle(async move { Ok::<_, BoxManagerError>(running) })
+                    .await;
             }
             // Snapshot a running session's screen without starting its
             // actor. A name resolves through the store to its id, then the
@@ -2359,6 +3226,8 @@ impl BoxManager {
             // reused, so a stale evict can't remove a fresh actor.
             ManagerMessage::Evict(id) => {
                 self.running.remove(&id);
+                // An actor that ended mid-resume holds its claim no more.
+                self.name_claims.remove(&id);
             }
         }
     }
@@ -2776,6 +3645,162 @@ mod create_stamp_tests {
         assert_eq!(
             record(&mngr, id).await.project_root,
             Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
+        );
+    }
+}
+
+/// [`BoxManagerHandle::ended_box`] against a delete in flight (BOX-017).
+#[cfg(test)]
+mod ended_box_tests {
+    use super::*;
+    use boxes::wire::primitives::{
+        WireHookScript, WireLifecycleHook, WireProvenancedHook, WireSource,
+    };
+    use boxes::wire::request::WireContribution;
+    use tempfile::TempDir;
+
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// A manager over fresh state and cache directories, its boxes on the
+    /// mock launcher.
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = BoxManager::init(
+            daemon_abs(state.path()),
+            daemon_abs(cache.path()),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap();
+        (state, cache, mngr)
+    }
+
+    fn config(name: &str) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new("/proj").unwrap(),
+            network: boxes::NetworkMode::default(),
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            ends_with_run: false,
+            attrs: Default::default(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    /// Creates the box `name` and activates it with the `on_destroy` hook
+    /// `body`.
+    async fn active_box(mngr: &BoxManagerHandle, name: &str, body: String) -> SessionId {
+        let id = mngr.create_session(config(name), None).await.unwrap();
+        let handle = mngr
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the new box resolves");
+        let contribution = WireContribution {
+            lifecycle_hooks: vec![WireProvenancedHook {
+                hook: WireLifecycleHook {
+                    on_destroy: Some(WireHookScript::Inline {
+                        body,
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(
+            handle
+                .configure_loadout(contribution)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        handle.finalize().await.unwrap();
+        id
+    }
+
+    /// A delete that has started hides the box from `ended_box`, as it
+    /// does from every other read: the read hands out no paths of a box
+    /// that the delete is about to remove.
+    ///
+    /// The delete message goes into the manager's mailbox ahead of the
+    /// read, with no wait for its answer. The mailbox is served in order,
+    /// one message at a time, and the delete puts the box in the
+    /// tearing-down set before the manager takes the next message. So the
+    /// read lands after the delete has started: inside its window, or
+    /// after it removed the record. A stopped box's delete has no hook
+    /// that a test can hold open, because no actor hosts an ended box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ended_box_refuses_a_box_whose_delete_has_started() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = active_box(&mngr, "ended", "true".to_string()).await;
+        mngr.stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+            .await
+            .expect("the stop succeeds");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while mngr.running_count().await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stopped box's actor did not end");
+        let ended = mngr
+            .ended_box(id)
+            .await
+            .unwrap()
+            .expect("a stopped box with no delete in flight is served");
+        assert!(
+            std::path::Path::new(ended.paths.working.as_str()).exists(),
+            "the stopped box keeps its files"
+        );
+
+        let (send, deleted) = Responder::channel();
+        mngr.sender
+            .send(ManagerMessage::DeleteSession(id, false, send))
+            .await
+            .expect("the manager takes the delete");
+        assert!(
+            mngr.ended_box(id).await.unwrap().is_none(),
+            "a box whose delete has started hands out no paths"
+        );
+
+        deleted
+            .await
+            .expect("the manager answers the delete")
+            .expect("the delete succeeds");
+        assert!(mngr.ended_box(id).await.unwrap().is_none());
+        assert!(
+            mngr.get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the delete removed the record"
         );
     }
 }
