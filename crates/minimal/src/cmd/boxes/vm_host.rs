@@ -520,7 +520,10 @@ impl HostIpResidency {
     }
 
     /// Keeps the admitted policy: the session stays, so its destroy retires
-    /// it ([`release_held_box_name`]).
+    /// it ([`release_held_box_name`]). The policy also stays while the box
+    /// is `stopped` or `exited`, so the gate's union can include a box with
+    /// no live process until its destroy.
+    /// <https://github.com/gominimal/minimal/issues/2747> owns this case.
     pub(crate) fn keep(&mut self) {
         self.kept = true;
     }
