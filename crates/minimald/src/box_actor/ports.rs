@@ -474,13 +474,14 @@ impl BoxActor {
                 // A VM host recorded the yes in the row before the publish
                 // ran, so a publish refused before its bind gives the port
                 // back there, leaving no partial mapping — unless the port
-                // stands published already, whose admission the row's entry
-                // is.
+                // stands published already, by either surface, whose
+                // admission the row's entry is.
                 if ask.host_ask.is_some()
                     && let Err(crate::net::policy::ExposeFailure::Refused(refusal)) = &published
                     && !matches!(
                         refusal,
                         crate::net::policy::ExposeRefusal::AlreadyPublished { .. }
+                            | crate::net::policy::ExposeRefusal::ListenPublished { .. }
                     )
                     && let Some(addresses) = ask.record.box_addresses
                 {
@@ -707,6 +708,28 @@ impl BoxActor {
                     Some(refusal.to_string()),
                 )
             }
+            // The box's own listening process published the port already:
+            // the request is answered as the goal met, so its line and its
+            // record say the port is published, and name the listener's
+            // publication as the one standing — never one this request made.
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::ListenPublished { .. },
+            )) => {
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "published already",
+                    reason = %refusal,
+                    owner = %crate::net::listeners::PublicationOwner::Listen.as_str(),
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::Published,
+                    Some(refusal.to_string()),
+                )
+            }
             Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
                 // A port outside the box's range says so in the outcome, so
                 // the log tail tells it apart from a stance refusal.
@@ -774,6 +797,8 @@ impl BoxActor {
         };
         // A refusal is recorded best-effort: it already refused, and a record
         // that cannot be written must not undo it — that would open the port.
+        // So is a port the box's listener published already: the
+        // publication is the listener's, and this request has none to undo.
         if !recorded {
             let reason = because.map(str::to_string).or(reason);
             crate::audit::append(
@@ -1032,6 +1057,25 @@ impl BoxActor {
         {
             Ok(reservation) => reservation,
             Err(held) => {
+                // The box's own listening process published the port
+                // already, and the publication stands listed and admitted:
+                // what the request asks for is true, so it is answered as
+                // such, with the address the port answers at. Nothing is
+                // reserved, reported or bound for it, and the publication
+                // stays the listener's, to be withdrawn when the listener
+                // closes (NET-017). A pending listen reservation, or one
+                // committed unlisted because its record was refused, is not
+                // reachable yet, so it stays the refusal below.
+                if let Some(local) = self
+                    .publications
+                    .listen_row(port)
+                    .and_then(|row| row.local.parse().ok())
+                {
+                    return Err(ExposeFailure::Refused(ExposeRefusal::ListenPublished {
+                        port,
+                        local,
+                    }));
+                }
                 return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished {
                     port,
                     owner: held.owner,

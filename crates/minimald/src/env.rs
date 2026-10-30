@@ -2358,9 +2358,10 @@ impl BoxChannel {
                     // and `min session rename` has moved on from it by the
                     // time a later request lands. The record's network mode
                     // decides which way forward is open. A host-address
-                    // box's port needs no exposing at all, which is the goal
-                    // met rather than an error, so it is a plain message and
-                    // the helper exits 0.
+                    // box's port needs no exposing at all, and a port the
+                    // box's own listening process has published already is
+                    // published: each is the goal met rather than an error,
+                    // so it is a plain message and the helper exits 0.
                     crate::net::policy::ExposeFailure::Refused(refusal) => {
                         let (box_name, network) = match session.record().await {
                             Ok(record) => (
@@ -2373,6 +2374,7 @@ impl BoxChannel {
                         if matches!(
                             refusal,
                             crate::net::policy::ExposeRefusal::NeedsNoExposing { .. }
+                                | crate::net::policy::ExposeRefusal::ListenPublished { .. }
                         ) {
                             format!("msg:{text}")
                         } else {
@@ -4193,6 +4195,40 @@ exit $rc
                  already answers at web.min.internal:3001 (and localhost:3001)"
             ],
         );
+    }
+
+    /// A port the box's own listening process published already is the goal
+    /// met, not a refusal: the reply says where the port answers and that
+    /// the publication lasts while the process listens, as a plain `msg:`
+    /// line, so the helper exits 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_on_a_listen_published_port_is_a_plain_message() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let manager = server.state.sessions_manager().await;
+        let listener = crate::box_actor::tests::listening_socket();
+        let port = crate::box_actor::tests::port_of(&listener);
+        let loopback = std::net::Ipv4Addr::new(127, 0, 64, 86);
+        let (handle, gate, _served) = crate::box_actor::tests::box_with_listen_plan(
+            &mut client,
+            &manager,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 86),
+            loopback,
+            (port, port),
+        )
+        .await;
+        crate::box_actor::tests::soon(|| gate.admits_tcp(port)).await;
+        assert_eq!(
+            expose_reply(&handle, "web", port).await,
+            vec![format!(
+                "msg:port {port} is published already at {loopback}:{port}, because a \
+                 process in this box is listening on it. It is unpublished when that \
+                 process stops listening on it."
+            )],
+        );
+        handle.stop().await;
+        drop(listener);
     }
 
     /// NET-043's host-side-only boundary: the dynamic ingress stance and

@@ -932,6 +932,13 @@ pub enum ExposeRefusal {
         owner: super::listeners::PublicationOwner,
         pending: bool,
     },
+    /// The port is published already for this box by its own listening
+    /// process (NET-016): the publication stands, its gate admits the port,
+    /// and it is listed at `local`. The request's goal is met, not refused,
+    /// so the in-box caller hears this as a plain message and exits 0. The
+    /// request publishes nothing of its own: the publication stays the
+    /// listener's, and it is withdrawn when the listener closes (NET-017).
+    ListenPublished { port: u16, local: SocketAddr },
     /// The box shares the host's network (`host_ip`), so the port already
     /// answers on the host and there is nothing to publish. The request's
     /// goal is met, not refused, so the in-box caller hears this as a plain
@@ -995,6 +1002,11 @@ impl ExposeRefusal {
             // The same words for an allow-stance and an ask-stance box: the
             // range refused the port before any prompt (NET-047).
             Self::OutOfRange { .. } => format!("{self}. Nothing was published."),
+            // The listener's publication is the one standing, so the
+            // caller hears how long it lasts: it is not the request's own.
+            Self::ListenPublished { .. } => {
+                format!("{self}. It is unpublished when that process stops listening on it.")
+            }
             _ => self.to_string(),
         }
     }
@@ -1051,6 +1063,11 @@ impl fmt::Display for ExposeRefusal {
                 };
                 write!(f, "port {port} {state} by this box ({})", owner.as_str())
             }
+            Self::ListenPublished { port, local } => write!(
+                f,
+                "port {port} is published already at {local}, because a process in this box \
+                 is listening on it"
+            ),
             Self::NeedsNoExposing { port, .. } => write!(
                 f,
                 "port {port} needs no exposing: this box shares the host's network"
@@ -2142,6 +2159,18 @@ mod tests {
             }
             .for_caller("web", NetworkMode::OwnIp, 3001),
             "port 3001 is being published by this box (listen)"
+        );
+        // A port the box's own listener published is the goal met: the
+        // line says where it answers, and that the publication is the
+        // listener's, which goes when the listener does.
+        assert_eq!(
+            ExposeRefusal::ListenPublished {
+                port: 3001,
+                local: SocketAddr::from(([127, 0, 64, 9], 3001)),
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is published already at 127.0.64.9:3001, because a process in this \
+             box is listening on it. It is unpublished when that process stops listening on it."
         );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(
