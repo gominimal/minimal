@@ -3612,8 +3612,8 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
     let err = mngr.create_session(config, None).await.unwrap_err();
     assert_eq!(
         err.to_string(),
-        "No session was created. minvmd, which runs this VM, did not give the new session \
-         an id: no box is registered at 100.64.0.9."
+        "No session was created. The VM gave the new session no id: no box is registered \
+         at 100.64.0.9. Run the command again."
     );
     assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
 
@@ -3706,12 +3706,10 @@ async fn guest_create_ignores_a_client_supplied_box_id_and_replies_when_no_door_
     let reply = client.call::<CreateSession>(&request).await;
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     match reply {
-        Errorable::Err { error } => assert!(
-            error.starts_with(
-                "No session was created. minvmd, which runs this VM, did not give the new \
-                 session an id: it did not answer ("
-            ),
-            "{error}"
+        Errorable::Err { error } => assert_eq!(
+            error,
+            "No session was created. The VM gave the new session no id: it did not answer \
+             in time."
         ),
         Errorable::Ok(created) => panic!("a create with no minted id was filed as {}", created.id),
     }

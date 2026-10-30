@@ -1180,6 +1180,21 @@ fn mint_box_id_reply(
                     error: format!("no box is registered at {switch_address}"),
                 };
             };
+            // A row's id goes to one create only. The address comes from
+            // the in-VM daemon's client, so a second ask for a row is a
+            // create that names another box's address. Every client
+            // registers a fresh row for each create and withdraws it when
+            // the create fails, so a real create never asks twice.
+            if !claim_row_box_id(boxes, box_id) {
+                tracing::warn!(
+                    %switch_address,
+                    %box_id,
+                    "refused a box id mint: the row's id already went to an in-VM create"
+                );
+                return BoxControlReply::Error {
+                    error: format!("the box registered at {switch_address} already has a session"),
+                };
+            }
             (box_id, "registration")
         }
     };
@@ -1192,6 +1207,29 @@ fn mint_box_id_reply(
     BoxControlReply::BoxIdMinted {
         minted_box_id: box_id,
     }
+}
+
+/// The row ids that already went to an in-VM create (BOX-002). Each id is
+/// a UUIDv7 that one registration minted, so one set serves every
+/// registry in the process.
+static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<std::collections::BTreeSet<minimald_rpc::BoxId>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Claims `box_id`, a row's id, for one in-VM create: `false` when an
+/// earlier create took it. The set keeps only ids whose row still stands,
+/// so it never outgrows the table.
+fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId) -> bool {
+    let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
+        .table()
+        .rows()
+        .iter()
+        .map(|record| minimald_rpc::BoxId::from_bytes(record.box_id()))
+        .collect();
+    let mut claimed = CLAIMED_ROW_BOX_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    claimed.retain(|id| standing.contains(id));
+    claimed.insert(box_id)
 }
 
 /// Register a box in its door's apply order and build the reply: the one
@@ -5403,6 +5441,12 @@ mod tests {
             },
             "a box with a row takes its registration's id"
         );
+        match mint(Some(web.switch_address)) {
+            BoxControlReply::Error { error } => {
+                assert!(error.contains("already has a session"), "{error}");
+            }
+            other => panic!("a row's id goes to one create only, got {other:?}"),
+        }
         let fresh = |reply| match reply {
             BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
             other => panic!("expected a minted id, got {other:?}"),

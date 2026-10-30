@@ -2542,10 +2542,20 @@ impl BoxManager {
                     "refused a create: the VM host daemon handed no box id"
                 );
                 // A typed refusal, so the client gets this text as the
-                // create's reply and never a closed channel.
+                // create's reply and never a closed channel. A refusal
+                // names a row the client registered: the client withdraws
+                // that row on a failed create and registers a fresh one on
+                // the next run, so a re-run gets a new id. A VM that never
+                // answered gives no such promise, so that text stops.
+                let cause = error.to_string();
+                let cause = cause.trim_end_matches('.');
+                let next = if error.kind() == std::io::ErrorKind::TimedOut {
+                    ""
+                } else {
+                    " Run the command again."
+                };
                 return Err(BoxManagerError::other(BoxIdNotMinted(format!(
-                    "No session was created. minvmd, which runs this VM, did not give \
-                     the new session an id: {error}."
+                    "No session was created. The VM gave the new session no id: {cause}.{next}"
                 ))));
             }
         };

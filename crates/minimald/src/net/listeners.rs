@@ -477,9 +477,11 @@ pub(crate) async fn mint_box_id(
     // binds none. The caller refuses the create with this text as its
     // reply, so it names what happened in the words the client reads.
     tracing::warn!(?switch_address, error = %last, "the box id mint was never answered");
+    // The kind marks "no answer" for the caller, whatever the transport
+    // said. The transport's error goes to the log above, not to the client.
     Some(Err(io::Error::new(
-        last.kind(),
-        format!("it did not answer ({last})"),
+        io::ErrorKind::TimedOut,
+        "it did not answer in time",
     )))
 }
 

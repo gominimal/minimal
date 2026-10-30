@@ -140,17 +140,13 @@ impl Store {
                 handed = handed.is_some(),
                 "refused a create: the minted box id is already held by a retained record"
             );
-            // A fresh mint differs on the next run. The VM host daemon
-            // hands a box with a row the same id again, so a retry does
-            // not help there.
-            let next = if handed.is_some() {
-                ""
-            } else {
-                " Run the command again."
-            };
+            // A re-run gets a new id. A fresh mint differs on the next
+            // run. A handed id is the id of a row the client registered:
+            // the client withdraws that row on a failed create and
+            // registers a fresh one, with a fresh id, on the next run.
             return Err(std::io::Error::other(format!(
                 "the new session's id {id} is already in use by another session. \
-                 No session was created.{next}"
+                 No session was created. Run the command again."
             )));
         }
         record.id = id;

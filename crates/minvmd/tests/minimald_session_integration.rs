@@ -197,6 +197,51 @@ impl Guest {
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
     }
+
+    /// The `box_id` of every `minted the box id for an in-VM create`
+    /// record in the detached supervisor's `minvmd.log*` files, found
+    /// anywhere under the isolated state dir. The files hold one JSON
+    /// object per line.
+    fn minted_box_ids(&self) -> Vec<String> {
+        const MINT_RECORD: &str = "minted the box id for an in-VM create";
+        let mut ids = Vec::new();
+        let mut dirs = vec![self.state.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let is_log = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("minvmd.log"));
+                if !is_log {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                for line in text.lines().filter(|line| line.contains(MINT_RECORD)) {
+                    let Ok(record) =
+                        serde_json_lenient::from_str::<serde_json_lenient::Value>(line)
+                    else {
+                        continue;
+                    };
+                    let box_id = record
+                        .get("box_id")
+                        .or_else(|| record.get("fields").and_then(|f| f.get("box_id")))
+                        .and_then(|v| v.as_str());
+                    if let Some(box_id) = box_id {
+                        ids.push(box_id.to_string());
+                    }
+                }
+            }
+        }
+        ids
+    }
 }
 
 // --- Full session: russh client → CreateSession → exec → stdout ---
@@ -307,6 +352,22 @@ async fn vm_host_mints_box_id_before_in_vm_create() {
         7,
         "the VM host daemon mints a UUIDv7"
     );
+    // A UUIDv7 the in-VM store minted passes both asserts above. The
+    // supervisor's own log record proves that the VM host daemon minted
+    // this id, outside the VM.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let minted = guest.minted_box_ids();
+        if minted.iter().any(|minted| minted == &id.to_string()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "minimald_session_integration: the supervisor's minvmd.log has no \
+             mint record for box {id}; it minted {minted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Open a russh client over the bridge UDS, authenticate, create a session,
