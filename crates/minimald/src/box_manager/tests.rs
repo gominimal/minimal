@@ -3719,3 +3719,317 @@ fn fresh_instance_name_skips_used_suffixes() {
         ("dev-3".to_string(), 3)
     );
 }
+
+/// A stand-in for the VM host daemon's report door at `door`: it answers
+/// each mint ask with the next reply in `replies` and hands the ask it read
+/// to the returned receiver.
+fn mint_door(
+    door: &std::path::Path,
+    replies: Vec<minimald_rpc::BoxControlReply>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) {
+    mint_door_dropping(door, replies.into_iter().map(Some).collect())
+}
+
+/// The mint ask `ask` carries: a create's token is fresh each time, so a
+/// test reads the ask's fields, never the whole ask.
+fn mint_ask(ask: minimald_rpc::BoxControlRequest) -> minimald_rpc::MintBoxIdRequest {
+    match ask {
+        minimald_rpc::BoxControlRequest::MintBoxId(request) => {
+            assert!(request.create_token.is_some(), "every create sends a token");
+            request
+        }
+        other => panic!("expected a mint ask, got {other:?}"),
+    }
+}
+
+/// [`mint_door`], where a `None` reply reads the ask and closes the
+/// connection without an answer: a reply lost on its way to the guest.
+fn mint_door_dropping(
+    door: &std::path::Path,
+    replies: Vec<Option<minimald_rpc::BoxControlReply>>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
+    let (asks_tx, asks) = tokio::sync::mpsc::unbounded_channel();
+    let task = crate::traced::spawn(async move {
+        for reply in replies {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .expect("read the ask");
+            let ask = serde_json_lenient::from_str(line.trim()).expect("the ask parses");
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the test may drop its receiver once it has its answer"
+            )]
+            let _ = asks_tx.send(ask);
+            let Some(reply) = reply else {
+                continue;
+            };
+            let mut out = serde_json_lenient::to_string(&reply).unwrap();
+            out.push('\n');
+            write
+                .write_all(out.as_bytes())
+                .await
+                .expect("write the reply");
+        }
+    });
+    (task, asks)
+}
+
+/// The control socket of the switch [`manager_over`] hands its manager:
+/// the key a stand-in report door is seeded under.
+fn manager_switch_control(state: &std::path::Path) -> std::path::PathBuf {
+    crate::net::SwitchClient::new("/nonexistent/gvproxy", state.join("gvproxy")).control_socket()
+}
+
+/// BOX-002: on a VM guest a create files the box under the id the VM host
+/// daemon mints, and never under the id the request carries. A box with a
+/// row asks for its row's id by the switch address its registration
+/// handed. A mint the VM host daemon refuses refuses the create and leaves
+/// no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let rowless = SessionId::mint();
+    let rowed = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: rowless,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: rowed,
+            },
+            minimald_rpc::BoxControlReply::Error {
+                error: "no box is registered at 100.64.0.9".to_string(),
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    // A box with no row: the VM host daemon mints a fresh id.
+    let client = SessionId::mint();
+    let mut config = sample_config();
+    config.box_id = Some(client);
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, rowless, "the box takes the VM host daemon's id");
+    assert_eq!(mint_ask(asks.recv().await.unwrap()).switch_address, None);
+    let shown = mngr.show_box(id).await.unwrap().expect("the box is filed");
+    assert_eq!(shown.record.box_id, rowless);
+    assert!(
+        mngr.show_box(client).await.unwrap().is_none(),
+        "no box is filed under the request's id"
+    );
+
+    // A box with a row: the ask names its switch address, and the record
+    // names the row's id as its own id and as its row id.
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 0, 8);
+    let mut config = sample_config();
+    config.name = Some("rowed".to_string());
+    config.box_id = Some(client);
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address,
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, rowed);
+    assert_eq!(
+        mint_ask(asks.recv().await.unwrap()).switch_address,
+        Some(switch_address)
+    );
+    let handle = session(&mngr, id).await;
+    let record = handle.record().await.unwrap();
+    assert_eq!((record.id, record.box_id), (rowed, Some(rowed)));
+
+    // A refused mint refuses the create.
+    let mut config = sample_config();
+    config.name = Some("refused".to_string());
+    config.box_id = Some(client);
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 9),
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let err = mngr.create_session(config, None).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "No session was created. The VM gave the new session no id: no box is registered \
+         at 100.64.0.9. Run the command again."
+    );
+    assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
+/// BOX-002: a create whose mint reply is lost asks again with the same
+/// token, so the VM host daemon can give the retry the id it already
+/// gave that create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id_and_retries_with_one_token() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let minted = SessionId::mint();
+    let (door_task, mut asks) = mint_door_dropping(
+        &door,
+        vec![
+            None,
+            Some(minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: minted,
+            }),
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 0, 8);
+    let mut config = sample_config();
+    config.name = Some("retried".to_string());
+    config.box_id = Some(SessionId::mint());
+    config.box_addresses = Some(boxes::BoxAddresses {
+        switch_address,
+        loopback_address: std::net::Ipv4Addr::LOCALHOST,
+    });
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_eq!(id, minted, "the retry takes the minted id");
+    let first = mint_ask(asks.recv().await.unwrap());
+    let retry = mint_ask(asks.recv().await.unwrap());
+    assert_eq!(first.switch_address, Some(switch_address));
+    assert_eq!(retry, first, "a retry of one create sends the same token");
+
+    // The next create sends another token.
+    let (door_task_2, mut asks_2) = {
+        crate::net::listeners::clear_vm_report_door_for_tests(&control);
+        door_task.abort();
+        let door = state.path().join("vm-host-door-2.sock");
+        let served = mint_door(
+            &door,
+            vec![minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: SessionId::mint(),
+            }],
+        );
+        crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+        served
+    };
+    let mut config = sample_config();
+    config.name = Some("next".to_string());
+    mngr.create_session(config, None).await.unwrap();
+    let next = mint_ask(asks_2.recv().await.unwrap());
+    assert_ne!(
+        next.create_token, first.create_token,
+        "each create has its own token"
+    );
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task_2.abort();
+}
+
+/// BOX-001: on a native host the store mints the id, and the id the
+/// request carries names nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_create_ignores_a_client_supplied_box_id() {
+    let (_state, _cache, mngr) = manager().await;
+    let client = SessionId::mint();
+    let mut config = sample_config();
+    config.box_id = Some(client);
+    let id = mngr.create_session(config, None).await.unwrap();
+    assert_ne!(id, client);
+    let record = session(&mngr, id).await.record().await.unwrap();
+    assert_eq!(record.box_id, None, "a native box has no row id");
+    assert!(mngr.show_box(client).await.unwrap().is_none());
+}
+
+/// The switch control socket of `server`'s daemon, whose state dir is
+/// `state`: the key a stand-in report door is seeded under for a create
+/// that comes in over the socket.
+async fn server_switch_control(
+    server: &crate::test_harness::TestServer,
+    state: &std::path::Path,
+) -> std::path::PathBuf {
+    let daemon_id = server.state.daemon_id().await;
+    crate::net::SwitchClient::new(
+        "/nonexistent/gvproxy",
+        state.join("gvproxy").join(daemon_id),
+    )
+    .control_socket()
+}
+
+/// BOX-002: a create over the socket on a VM guest whose report door
+/// serves the mint gets a reply that names the minted id, and never the
+/// id the request carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id_and_replies_with_the_minted_id() {
+    use minimald_rpc::{CreateSession, Errorable};
+    let temp = TempDir::new().unwrap();
+    let state = temp.path().to_path_buf();
+    let server = crate::test_harness::TestServer::new_in(temp).await;
+    let control = server_switch_control(&server, &state).await;
+    let door = state.join("vm-host-door.sock");
+    let minted = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![minimald_rpc::BoxControlReply::BoxIdMinted {
+            minted_box_id: minted,
+        }],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let mut client = server.connect().await;
+    let mut request = crate::test_harness::create_session_req("served", "/uwu");
+    request.config.box_id = Some(SessionId::mint());
+    let reply = client.call::<CreateSession>(&request).await;
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+    match reply {
+        Errorable::Ok(created) => assert_eq!(created.id, minted, "the box takes the minted id"),
+        Errorable::Err { error } => panic!("the create was refused: {error}"),
+    }
+    assert!(matches!(
+        asks.recv().await,
+        Some(minimald_rpc::BoxControlRequest::MintBoxId(_))
+    ));
+}
+
+/// BOX-002: a create over the socket on a VM guest whose report door is
+/// absent (a bare `minvmd boot` binds none) gets a refusal as its reply,
+/// never a closed channel, and leaves no box behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_create_ignores_a_client_supplied_box_id_and_replies_when_no_door_answers() {
+    use minimald_rpc::{CreateSession, Errorable};
+    let temp = TempDir::new().unwrap();
+    let state = temp.path().to_path_buf();
+    let server = crate::test_harness::TestServer::new_in(temp).await;
+    let control = server_switch_control(&server, &state).await;
+    let door = state.join("no-door-here.sock");
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let mut client = server.connect().await;
+    let mut request = crate::test_harness::create_session_req("doorless", "/uwu");
+    request.config.box_id = Some(SessionId::mint());
+    let reply = client.call::<CreateSession>(&request).await;
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    match reply {
+        Errorable::Err { error } => assert_eq!(
+            error,
+            "No session was created. The VM gave the new session no id: it did not answer \
+             in time."
+        ),
+        Errorable::Ok(created) => panic!("a create with no minted id was filed as {}", created.id),
+    }
+    let manager = server.state.sessions_manager().await;
+    assert!(manager.list_boxes(None).await.unwrap().is_empty());
+}

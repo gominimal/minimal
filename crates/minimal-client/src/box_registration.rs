@@ -326,6 +326,12 @@ pub async fn register_box_with_vm_host(
                  read; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::BoxIdMinted { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with a minted box id; \
+                 the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::Audited { .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with an audit report's \

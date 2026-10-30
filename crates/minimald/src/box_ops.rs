@@ -392,6 +392,118 @@ enum Op {
     },
 }
 
+/// Where a box's package builds run (NET-155): the box they run for, and
+/// its classifier leaf or its own network. A host-address box placed in a
+/// leaf builds in that leaf. An own-address box has no leaf, and its builds
+/// attach to a network of its own. A box with neither has no per-box egress
+/// enforcement, and its builds run in the daemon's own cgroup.
+#[derive(Debug, Clone)]
+pub(crate) struct BuildPlacement {
+    /// The box's name, as `min ls` shows it.
+    pub box_name: String,
+    /// The box's classifier leaf, if its launch placed it in one.
+    pub leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The own-address box's network, which its builds attach to.
+    pub network: Option<op::BuildNetwork>,
+}
+
+impl BuildPlacement {
+    /// Whether the box's egress rules admit no destination, so a build
+    /// that could not reach one was refused by the rules.
+    pub(crate) fn denies_all(&self) -> bool {
+        crate::env::build_denies_all(self.leaf.as_ref(), self.network.as_ref())
+    }
+}
+
+/// How many output lines of one package build [`BuildTap`] keeps.
+const TAP_LINES: usize = 64;
+
+/// Watches the events of a box's build side-op (NET-155). It logs each
+/// package build as it starts, and it keeps the last lines of each build's
+/// output, so a build the box's egress rules refused can name what it could
+/// not reach.
+#[derive(Debug, Default)]
+pub(crate) struct BuildTap {
+    builds: std::collections::HashMap<usize, (String, std::collections::VecDeque<String>)>,
+}
+
+impl BuildTap {
+    /// Records one build event.
+    pub(crate) fn observe(&mut self, event: &BuildEvent, placement: &BuildPlacement) {
+        match &event.inner {
+            orchestrator::BuildEventInner::Start { name, .. } => {
+                match &placement.leaf {
+                    Some(leaf) => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = %leaf.dir().display(),
+                        "starting a package build for a box in the box's classifier leaf",
+                    ),
+                    None if placement.network.is_some() => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = "none",
+                        "starting a package build for a box on the box's own network, \
+                         under the box's egress rules",
+                    ),
+                    None => tracing::info!(
+                        box_name = %placement.box_name,
+                        package = %name,
+                        leaf = "none",
+                        "starting a package build for a box in the daemon's own cgroup, \
+                         with no per-box egress enforcement, because the box has none",
+                    ),
+                }
+                self.builds
+                    .insert(event.idx, (name.clone(), Default::default()));
+            }
+            orchestrator::BuildEventInner::Log { line, .. } => {
+                if let Some((_, lines)) = self.builds.get_mut(&event.idx) {
+                    if lines.len() == TAP_LINES {
+                        lines.pop_front();
+                    }
+                    lines.push_back(line.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The refusal to report, if the box's egress rules refused a
+    /// destination that the failed package build tried to reach.
+    ///
+    /// `failure` is the error the build returned. Only a build that the
+    /// error names as failed is read, so a package that printed a failed
+    /// download and still built is never blamed for another package's
+    /// failure. When the error names no build, nothing is reported.
+    pub(crate) fn refusal(&self, placement: &BuildPlacement, failure: &str) -> Option<String> {
+        let mut builds: Vec<_> = self
+            .builds
+            .iter()
+            .filter(|(_, (package, _))| failure.contains(&format!("`{package}` failed to build")))
+            .collect();
+        builds.sort_by_key(|(idx, _)| **idx);
+        builds.into_iter().find_map(|(_, (package, lines))| {
+            crate::env::egress_refusal(
+                placement.denies_all(),
+                package,
+                &placement.box_name,
+                lines.iter().map(String::as_str),
+            )
+        })
+    }
+
+    /// The error to report for a failed build. A build the box's egress
+    /// rules refused names the destination and the box before the build's
+    /// own error. Any other failure is the build's own error, unchanged.
+    pub(crate) fn failure(&self, placement: &BuildPlacement, failure: String) -> String {
+        match self.refusal(placement, &failure) {
+            Some(refusal) => format!("{refusal}\n{failure}"),
+            None => failure,
+        }
+    }
+}
+
 /// Session side-operation.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -448,11 +560,19 @@ impl SideOp {
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
+        placement: BuildPlacement,
         buffer: usize,
     ) -> Result<(Self, mpsc::Receiver<BuildUpdate>), std::io::Error> {
         let (tx, rx) = mpsc::channel(buffer);
-        let sop =
-            Self::new_build(session, rebuild, pkgs, ctx, vec![BuildSink::Structured(tx)]).await?;
+        let sop = Self::new_build(
+            session,
+            rebuild,
+            pkgs,
+            ctx,
+            placement,
+            vec![BuildSink::Structured(tx)],
+        )
+        .await?;
         Ok((sop, rx))
     }
 
@@ -462,8 +582,15 @@ impl SideOp {
         rebuild: bool,
         pkgs: Vec<String>,
         ctx: Context,
+        placement: BuildPlacement,
         sinks: Vec<BuildSink>,
     ) -> Result<Self, std::io::Error> {
+        // NET-155: every package build of this op runs in the box's leaf.
+        let ctx = match (&placement.leaf, &placement.network) {
+            (Some(leaf), _) => ctx.with_classifier_leaf(leaf.clone()),
+            (None, Some(network)) => ctx.with_box_network(network.clone()),
+            (None, None) => ctx,
+        };
         // `graph_from_all_packages` is CPU-heavy, run on blocking pool.
         let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
@@ -493,12 +620,15 @@ impl SideOp {
                 // Pump task: drain the log channel until the build drops its
                 // sender (on completion or cancellation).
                 let pump = crate::traced::spawn(async move {
+                    let mut tap = BuildTap::default();
                     while let Some(event) = log_rx.next().await {
+                        tap.observe(&event, &placement);
                         let inner = pump_inner.lock().await;
                         for sink in &inner.sinks {
                             let _ = sink.try_send(BuildUpdate::Event(event.clone()));
                         }
                     }
+                    (tap, placement)
                 });
 
                 // Do the build. Reduce its `!Send` error (`mctx::Error` holds
@@ -514,7 +644,7 @@ impl SideOp {
                         Some(e.to_string())
                     }
                 };
-                let _ = pump.await;
+                let tap = pump.await.ok();
 
                 // Classify the terminal outcome. A build that returned `Ok` is
                 // a success even if the token was cancelled afterwards (e.g. a
@@ -524,7 +654,12 @@ impl SideOp {
                 let outcome = match build_err {
                     None => BuildOutcome::Success,
                     Some(_) if cancel_flag.is_cancelled() => BuildOutcome::Cancelled,
-                    Some(msg) => BuildOutcome::Failed(msg),
+                    // NET-155: a build the box's rules refused names the
+                    // destination and the box before the build's own error.
+                    Some(msg) => BuildOutcome::Failed(match &tap {
+                        Some((tap, placement)) => tap.failure(placement, msg),
+                        None => msg,
+                    }),
                 };
 
                 finish(&build_inner, BuildUpdate::Finished(outcome)).await;
@@ -700,11 +835,18 @@ impl SideOp {
         session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
+        placement: BuildPlacement,
         buffer: usize,
     ) -> Result<(Self, mpsc::Receiver<MaterializeUpdate>), std::io::Error> {
         let (tx, rx) = mpsc::channel(buffer);
-        let sop = Self::new_materialize(session, opts, ctx, vec![MaterializeSink::Structured(tx)])
-            .await?;
+        let sop = Self::new_materialize(
+            session,
+            opts,
+            ctx,
+            placement,
+            vec![MaterializeSink::Structured(tx)],
+        )
+        .await?;
         Ok((sop, rx))
     }
 
@@ -712,11 +854,13 @@ impl SideOp {
     /// The output is resolved here, before the op spawns, so a bad name or arch
     /// errors to the caller rather than through a channel it has yet to be
     /// handed. The cancel token stops the package build only: assembly is not
-    /// interruptible.
+    /// interruptible. `placement` is the box's placement, which the caller
+    /// already applied to `ctx`: the run reads it to name a refusal.
     async fn new_materialize(
         session: WeakBoxHandle,
         opts: MaterializeOpts,
         ctx: Context,
+        placement: BuildPlacement,
         sinks: Vec<MaterializeSink>,
     ) -> Result<Self, std::io::Error> {
         let output = ctx
@@ -763,8 +907,19 @@ impl SideOp {
             crate::traced::spawn(async move {
                 let mut ctx = ctx;
 
+                // NET-155: tap the package builds' output, so a build the
+                // box's egress rules refused names the destination and the
+                // box, as the build side-op's does.
+                let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded::<BuildEvent>();
+                let tap = crate::traced::spawn(async move {
+                    let mut tap = BuildTap::default();
+                    while let Some(event) = log_rx.next().await {
+                        tap.observe(&event, &placement);
+                    }
+                    (tap, placement)
+                });
                 let build_err = match ctx
-                    .build_graph_with_cancel(&graph, false, None, build_cancel)
+                    .build_graph_with_cancel(&graph, false, Some(log_tx), build_cancel)
                     .await
                 {
                     Ok(()) => None,
@@ -773,10 +928,14 @@ impl SideOp {
                         Some(e.to_string())
                     }
                 };
+                let tap = tap.await.ok();
                 if let Some(msg) = build_err {
                     let outcome = match cancel_flag.is_cancelled() {
                         true => MaterializeOutcome::Cancelled,
-                        false => MaterializeOutcome::Failed(msg),
+                        false => MaterializeOutcome::Failed(match &tap {
+                            Some((tap, placement)) => tap.failure(placement, msg),
+                            None => msg,
+                        }),
                     };
                     finish(&op_inner, MaterializeUpdate::Finished(outcome)).await;
                     return;

@@ -48,6 +48,67 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
+
+    /// The classifier leaf of the box this build runs for, if any (NET-155).
+    /// When set, the build's sandbox runs in that leaf, so the box's egress
+    /// verdict decides every connection the build makes. When `None`, the
+    /// build runs in the cgroup of its caller, as the caller's own traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+
+    /// The network of the box this build runs for, if the box has a network
+    /// namespace of its own and no classifier leaf (NET-155): an own-address
+    /// box. A build that needs the network attaches to it, so the box's egress
+    /// verdict decides every connection the build makes. A build that needs
+    /// no network stays in its empty namespace. `None` keeps the plan below.
+    pub box_network: Option<BuildNetwork>,
+}
+
+/// Makes the network a package build attaches to when it runs for a box with
+/// a network namespace of its own (NET-155). Each build gets a network of its
+/// own, because a network holds the reservation of one sandbox at a time and
+/// the dependency builds of one box can run at the same time.
+#[derive(Clone)]
+pub struct BuildNetwork {
+    make: std::sync::Arc<dyn Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync>,
+    denies_all: bool,
+}
+
+impl BuildNetwork {
+    /// A build network that `make` makes again for each build.
+    pub fn new(
+        make: impl Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            make: std::sync::Arc::new(make),
+            denies_all: false,
+        }
+    }
+
+    /// Records whether the egress rules of the network admit no destination,
+    /// so the caller that reads a failed build can name the refusal.
+    #[must_use]
+    pub fn with_denies_all(mut self, denies_all: bool) -> Self {
+        self.denies_all = denies_all;
+        self
+    }
+
+    /// Whether the egress rules of the network admit no destination.
+    pub fn denies_all(&self) -> bool {
+        self.denies_all
+    }
+
+    /// A new network for one build.
+    pub fn network(&self) -> std::sync::Arc<dyn sandbox::Network> {
+        (self.make)()
+    }
+}
+
+impl std::fmt::Debug for BuildNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildNetwork")
+            .field("denies_all", &self.denies_all)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -281,6 +342,55 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     }
 }
 
+impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
+    /// The sandbox configuration this build runs in. A build placed for a box
+    /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
+    /// box's leaf and not the leaf of the process that starts it.
+    fn sandbox_config(
+        &self,
+        build: &BuildSpec,
+        inputs: Vec<SandboxMapped>,
+        rootfs: HashSet<SandboxMapped>,
+        needs_dns: bool,
+        needs_internet: bool,
+        daemon_id: Option<&String>,
+    ) -> sandbox::config::Config {
+        let mut config = sandbox::config::Config::new(&build.name)
+            .with_isolated_wd(inputs.into_iter())
+            .with_rootfs(rootfs.into_iter())
+            .with_dns(needs_dns)
+            // A build that needs neither DNS nor the internet runs in an empty
+            // network namespace; anything else shares the host's. Said as a plan
+            // rather than as a mode: a build is not a PTask and has never had
+            // one, and the sandbox layer acts on plans.
+            .with_plan(if !needs_dns && !needs_internet {
+                sandbox::NetPlan::isolated()
+            } else {
+                sandbox::NetPlan::host()
+            });
+        if let Some(a) = &build.build_args {
+            config = config.with_build_args(a.iter());
+        }
+        if let Some(w) = self.cpu_weight {
+            config = config.with_cpu_weight(w);
+        }
+        if let Some(id) = daemon_id {
+            config = config.with_daemon_id(id.clone());
+        }
+        if let Some(leaf) = &self.classifier_leaf {
+            config = config.with_classifier_leaf(leaf.clone());
+        }
+        // NET-155: a build that needs the network, for an own-address box,
+        // runs on that box's network and under its egress verdict.
+        if let Some(network) = &self.box_network
+            && (needs_dns || needs_internet)
+        {
+            config = config.with_network(network.network());
+        }
+        config
+    }
+}
+
 impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
     type Result = SpecBuildResult;
 
@@ -315,28 +425,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let channel = ();
 
-        let mut config = sandbox::config::Config::new(&build.name)
-            .with_isolated_wd(inputs.into_iter())
-            .with_rootfs(rootfs.into_iter())
-            .with_dns(needs_dns)
-            // A build that needs neither DNS nor the internet runs in an empty
-            // network namespace; anything else shares the host's. Said as a plan
-            // rather than as a mode: a build is not a PTask and has never had
-            // one, and the sandbox layer acts on plans.
-            .with_plan(if !needs_dns && !needs_internet {
-                sandbox::NetPlan::isolated()
-            } else {
-                sandbox::NetPlan::host()
-            });
-        if let Some(a) = &build.build_args {
-            config = config.with_build_args(a.iter());
-        }
-        if let Some(w) = self.cpu_weight {
-            config = config.with_cpu_weight(w);
-        }
-        if let Some(id) = &opts.daemon_id {
-            config = config.with_daemon_id(id.clone());
-        }
+        let config = self.sandbox_config(
+            build,
+            inputs,
+            rootfs,
+            needs_dns,
+            needs_internet,
+            opts.daemon_id.as_ref(),
+        );
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
@@ -496,6 +592,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -609,6 +707,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -621,5 +721,53 @@ mod tests {
         let op = OpTracker::new_root();
         let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
         assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
+    }
+
+    /// NET-155: a spec build placed for a box runs its sandbox in that box's
+    /// classifier leaf. A build with no placement names no leaf, so its
+    /// sandbox stays in the cgroup of the process that starts it.
+    #[test]
+    fn spec_build_runs_in_the_given_classifier_leaf() {
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, ..} = import "minimal.ncl" in
+            {
+                name = "downloads-at-build",
+                build_deps = [],
+                cmd = "curl https://example.invalid/",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let fetcher = UnusedFetcher;
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Deny,
+        );
+
+        let mut placed = spec_build(&bsr, &fetcher);
+        placed.classifier_leaf = Some(leaf.clone());
+        let config = placed.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, Some(leaf));
+
+        let unplaced = spec_build(&bsr, &fetcher);
+        let config = unplaced.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, None);
+        assert!(config.network.is_none());
+
+        // An own-address box has no leaf. Its build runs on the box's own
+        // network when the build needs the network, and in an empty
+        // namespace when it does not.
+        let mut on_box_network = spec_build(&bsr, &fetcher);
+        on_box_network.box_network = Some(BuildNetwork::new(|| {
+            std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
+        }));
+        let config =
+            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, None);
+        assert!(config.network.is_some());
+        let config =
+            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), false, false, None);
+        assert!(config.network.is_none());
     }
 }

@@ -279,7 +279,7 @@ pub(crate) fn task_network(
 /// and a host that cannot be asked, read as no row: fail-closed. A box the
 /// host registered nothing for (a native host, a `host_ip` or `none` box)
 /// asks nothing.
-async fn ensure_task_rows_stand(
+pub(crate) async fn ensure_task_rows_stand(
     record: &boxes::Record,
     switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
 ) -> io::Result<()> {
@@ -365,6 +365,29 @@ fn parse_task_args(
         .map_err(|e| e.to_string())
 }
 
+/// Refuses the package builds of a task (NET-155) when the box's launch
+/// placed it in a classifier leaf (`enforcement` is
+/// [`boxes::HostIpEnforcement::PerBox`]) and the task's context has no leaf.
+/// Such a build would run outside the box's egress verdict. A box that was
+/// never placed builds in the daemon's own cgroup, as before.
+pub(crate) fn task_build_refusal(
+    enforcement: Option<boxes::HostIpEnforcement>,
+    box_name: &str,
+    has_leaf: bool,
+) -> io::Result<()> {
+    if enforcement == Some(boxes::HostIpEnforcement::PerBox) && !has_leaf {
+        tracing::warn!(
+            box_name = %box_name,
+            "refusing a task's package builds for a placed box whose classifier leaf is missing",
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            crate::box_actor::placed_box_build_refusal(box_name),
+        ));
+    }
+    Ok(())
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -402,6 +425,20 @@ async fn task_producer(
             // sandbox path's tail so the bridge sees a clean end-of-stream.
             let _ = req_rx.recv().await;
             return Ok(());
+        }
+
+        // NET-155: a task's package builds run in the box's leaf. A box
+        // whose launch placed it in a leaf never builds outside it, so a
+        // placed box whose leaf is gone has its task refused here. The
+        // context lookup does not refuse, because a relaunch uses it too.
+        {
+            let record = session.record().await?;
+            let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+            task_build_refusal(
+                record.host_ip_enforcement,
+                &box_name,
+                ctx.classifier_leaf().is_some(),
+            )?;
         }
 
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,

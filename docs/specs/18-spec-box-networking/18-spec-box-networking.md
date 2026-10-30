@@ -629,6 +629,12 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald daemon_fetch_survives_cohort_deny
   <!-- S9b/AC2; prose 50; state-driven; un-enrolled, the node-plane set is NET-130's -->
 
+- **NET-155** WHEN `minimald` runs a package build for a box that has a classifier leaf THE SYSTEM SHALL run the build in that leaf.
+  tier:     T0
+  verify:   cargo nextest run -p minimald box_package_build_under_box_egress_verdict
+  - IF `minimald` runs a package build for a box that its launch placed in a classifier leaf and that leaf is missing, THEN THE SYSTEM SHALL refuse the build.
+  <!-- event-driven, with an unwanted-behaviour sub-requirement; the box's egress verdict then decides every connection the build opens, the same as for the box's own processes (NET-079). A build in a deny leaf that cannot reach a destination outside the box zone fails, and its error names the destination and the box (`box_package_build_refusal_names_destination_and_box`); a box-zone name is not subject to egress rules, so a failure to reach one is reported as the build reported it. The live proof is `package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`, run by `just test-root-integration`. A placed box whose leaf is gone, a stopped box among them, never builds in the daemon's cgroup. Scope: an own-address box has no classifier leaf. Its build runs on a network of the box's own, at a task address of the box, under the box's egress rules, so its verdict decides the build's connections as well. A host-address box with `host_ip_enforcement = none` has no per-box enforcement. Its build runs in the daemon's own cgroup with no per-box enforcement either, and the daemon's build log line says so. -->
+
 - **NET-081** WHERE the host is VM-backed THE SYSTEM SHALL apply per-box source-addressed egress rules derived from the expanded box specs outside the VM.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_side_rules_applied_outside_vm
