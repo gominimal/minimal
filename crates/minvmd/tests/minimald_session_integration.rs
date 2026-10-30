@@ -212,6 +212,50 @@ async fn minimald_exec_over_bridge() {
     assert_eq!(exit, Some(0), "expected exit status 0, got {exit:?}");
 }
 
+/// BOX-002: the VM host daemon mints the id of a box before the in-VM
+/// daemon creates it, and the box carries that id. The create request
+/// carries a box id of its own, and the box does not take it: the id that
+/// comes back is a fresh UUIDv7, never the request's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun >=1.19, kernel, rootfs, initramfs"]
+async fn vm_host_mints_box_id_before_in_vm_create() {
+    if !e2e_enabled() {
+        return;
+    }
+    let guest = Guest::boot();
+    let client_box_id = boxes::BoxId::mint();
+
+    // Retry the create to absorb the post-READY startup race.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut result = Err("not attempted".to_string());
+    for attempt in 1..=6 {
+        result = async {
+            let handle = connect_bridge(&guest.sock_path).await?;
+            let mut req = e2e_session_request()?;
+            req.config.box_id = Some(client_box_id);
+            create_session(&handle, &req).await
+        }
+        .await;
+        if result.is_ok() {
+            break;
+        }
+        eprintln!("create attempt {attempt}: {result:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let id = result.unwrap_or_else(|e| panic!("minimald_session_integration: {e}"));
+    eprintln!("minimald_session_integration: created box {id}");
+    assert_ne!(
+        id, client_box_id,
+        "the box never takes the id its create request carried"
+    );
+    assert_eq!(
+        AsRef::<uuid::Uuid>::as_ref(&id).get_version_num(),
+        7,
+        "the VM host daemon mints a UUIDv7"
+    );
+}
+
 /// Open a russh client over the bridge UDS, authenticate, create a session,
 /// optionally upload a `minimal.toml` into its workspace over SFTP, then exec
 /// `command` in it. Returns `(stdout, exit_status)`.
@@ -220,94 +264,14 @@ async fn run_session_exec(
     mfile: Option<&str>,
     command: &str,
 ) -> Result<(String, Option<u32>), String> {
-    use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
+    use minimald_rpc::OneshotSshRpc;
     use russh::ChannelMsg;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Connect (retry briefly in case the guest vsock listener is not yet up).
-    let stream = {
-        let mut conn = None;
-        let mut last_err = None;
-        for _ in 0..20 {
-            match tokio::net::UnixStream::connect(sock_path).await {
-                Ok(s) => {
-                    conn = Some(s);
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        conn.ok_or_else(|| format!("connect to bridge UDS: {}", last_err.unwrap()))?
-    };
-
-    let config = Arc::new(russh::client::Config::default());
-    let mut handle = russh::client::connect_stream(config, stream, ClientHandler)
-        .await
-        .map_err(|e| format!("ssh connect: {e}"))?;
-
-    let auth = handle
-        .authenticate_none("minvmd-e2e")
-        .await
-        .map_err(|e| format!("authenticate_none: {e}"))?;
-    if !auth.success() {
-        return Err("auth_none rejected".into());
-    }
-
+    let handle = connect_bridge(sock_path).await?;
     // CreateSession: open a channel, request the subsystem, write the JSON
     // request, half-close, read the JSON response.
-    let session_id = {
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("open CreateSession channel: {e}"))?;
-        channel
-            .request_subsystem(false, CreateSession::NAME)
-            .await
-            .map_err(|e| format!("request_subsystem: {e}"))?;
-
-        // Unique name per invocation — minimald dedups sessions by
-        // name, so the outer retry loop would otherwise collide on
-        // `AlreadyExists` after any prior attempt persisted a record.
-        // Matches the convention in `crates/minvmd/examples/exec.rs`.
-        let uniq = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        // Hooks stay on, the serde default and what every non-`--no-hooks`
-        // activation sends; this session only runs an exec, so it declares
-        // no hooks either way. No version assertion: the guest daemon is
-        // built from this same tree by the harness, so there is no skew to
-        // assert against, and the gate has its own tests.
-        let req = CreateSessionRequest::new(
-            format!("minvmd-e2e-{uniq:x}"),
-            paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
-            boxes::NetworkMode::default(),
-            Default::default(),
-        );
-        let body =
-            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
-
-        let mut rpc = channel.into_stream();
-        rpc.write_all(&body)
-            .await
-            .map_err(|e| format!("write request: {e}"))?;
-        rpc.shutdown()
-            .await
-            .map_err(|e| format!("shutdown write half: {e}"))?;
-        let mut resp_buf = Vec::with_capacity(256);
-        rpc.read_to_end(&mut resp_buf)
-            .await
-            .map_err(|e| format!("read response: {e}"))?;
-        let resp: <CreateSession as OneshotSshRpc>::Response =
-            serde_json_lenient::from_slice(&resp_buf)
-                .map_err(|e| format!("decode response: {e}"))?;
-        resp.ok()
-            .ok_or_else(|| "CreateSession returned an error".to_string())?
-            .id
-    };
+    let session_id = create_session(&handle, &e2e_session_request()?).await?;
 
     // Upload the project's `minimal.toml` into the session workspace over
     // SFTP (the subsystem presents the session's working tree at
@@ -465,4 +429,104 @@ async fn run_session_exec(
     }
 
     Ok((String::from_utf8_lossy(&stdout).into_owned(), exit_status))
+}
+
+/// Open a russh client over the bridge UDS and authenticate.
+async fn connect_bridge(sock_path: &Path) -> Result<russh::client::Handle<ClientHandler>, String> {
+    // Connect (retry briefly in case the guest vsock listener is not yet up).
+    let stream = {
+        let mut conn = None;
+        let mut last_err = None;
+        for _ in 0..20 {
+            match tokio::net::UnixStream::connect(sock_path).await {
+                Ok(s) => {
+                    conn = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        conn.ok_or_else(|| format!("connect to bridge UDS: {}", last_err.unwrap()))?
+    };
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut handle = russh::client::connect_stream(config, stream, ClientHandler)
+        .await
+        .map_err(|e| format!("ssh connect: {e}"))?;
+
+    let auth = handle
+        .authenticate_none("minvmd-e2e")
+        .await
+        .map_err(|e| format!("authenticate_none: {e}"))?;
+    if !auth.success() {
+        return Err("auth_none rejected".into());
+    }
+
+    Ok(handle)
+}
+
+/// A session request under a name unique to this invocation.
+fn e2e_session_request() -> Result<minimald_rpc::CreateSessionRequest, String> {
+    // Unique name per invocation — minimald dedups sessions by
+    // name, so the outer retry loop would otherwise collide on
+    // `AlreadyExists` after any prior attempt persisted a record.
+    // Matches the convention in `crates/minvmd/examples/exec.rs`.
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Hooks stay on, the serde default and what every non-`--no-hooks`
+    // activation sends; this session only runs an exec, so it declares
+    // no hooks either way. No version assertion: the guest daemon is
+    // built from this same tree by the harness, so there is no skew to
+    // assert against, and the gate has its own tests.
+    let req = minimald_rpc::CreateSessionRequest::new(
+        format!("minvmd-e2e-{uniq:x}"),
+        paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+        boxes::NetworkMode::default(),
+        Default::default(),
+    );
+    Ok(req)
+}
+
+/// Create a session over `handle` with `req`: open a channel, request the
+/// subsystem, write the JSON request, half-close, read the JSON response.
+async fn create_session(
+    handle: &russh::client::Handle<ClientHandler>,
+    req: &minimald_rpc::CreateSessionRequest,
+) -> Result<boxes::SessionId, String> {
+    use minimald_rpc::{CreateSession, OneshotSshRpc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open CreateSession channel: {e}"))?;
+    channel
+        .request_subsystem(false, CreateSession::NAME)
+        .await
+        .map_err(|e| format!("request_subsystem: {e}"))?;
+
+    let body = serde_json_lenient::to_vec(req).map_err(|e| format!("serialize request: {e}"))?;
+
+    let mut rpc = channel.into_stream();
+    rpc.write_all(&body)
+        .await
+        .map_err(|e| format!("write request: {e}"))?;
+    rpc.shutdown()
+        .await
+        .map_err(|e| format!("shutdown write half: {e}"))?;
+    let mut resp_buf = Vec::with_capacity(256);
+    rpc.read_to_end(&mut resp_buf)
+        .await
+        .map_err(|e| format!("read response: {e}"))?;
+    let resp: <CreateSession as OneshotSshRpc>::Response =
+        serde_json_lenient::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+    Ok(resp
+        .ok()
+        .ok_or_else(|| "CreateSession returned an error".to_string())?
+        .id)
 }
