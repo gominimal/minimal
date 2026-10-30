@@ -14,6 +14,11 @@
 //! graph or sandbox, so the guest needs no network. Requires libkrun >= 1.19.0
 //! on the host.
 //!
+//! Each test boots the VM under its supervisor (`minvmd run --detach`), which
+//! holds the box table and the guest report door. The in-VM daemon takes
+//! every box id from that door (BOX-002), so a bare `minvmd boot` creates no
+//! session.
+//!
 //! Gates:
 //! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
@@ -25,12 +30,10 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serial_test::serial;
 use tempfile::TempDir;
@@ -52,7 +55,15 @@ fn minvmd_bin() -> std::ffi::OsString {
     std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
 }
 
-const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
+/// `run --detach`'s own wait for the host socket, and the guest READY
+/// wait pinned beside it: a cold boot can spend 40-70 s before pid-1.
+const DETACH_TIMEOUT_SECS: &str = "150";
+
+/// How long `status --json` may take to report Running after the detach.
+const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The cap on one `minvmd` subcommand: above `run --detach`'s own timeout.
+const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Env var the server reads to scope an exec to a session
 /// (mirrors `minimald::MINIMAL_SESSION_ID_ENV`).
@@ -78,71 +89,113 @@ fn e2e_enabled() -> bool {
     true
 }
 
-/// A booted minimald guest VM, torn down on drop.
+/// A booted minimald guest VM under its supervisor, stopped on drop.
 struct Guest {
-    child: Child,
     sock_path: PathBuf,
-    _state: TempDir,
+    state: TempDir,
 }
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        common::kill_group(&mut self.child);
+        // Panic-safe teardown: a failed assertion must not leak the detached
+        // supervisor whose state dir the `TempDir` then unlinks. Bounded, so
+        // a wedged daemon cannot hang the teardown either.
+        let _ = minvmd(self.state.path(), &["stop"]);
     }
 }
 
+/// Run one `minvmd` subcommand against the isolated state dir, bounded by
+/// [`SUBPROC_TIMEOUT`]: a subprocess that overruns it is a wedged daemon,
+/// killed so the test fails instead of hanging CI.
+fn minvmd(state: &Path, args: &[&str]) -> Output {
+    let mut child = Command::new(minvmd_bin())
+        .args(args)
+        // HOME too, so no `dirs` fallback reaches the real state dir.
+        .env("HOME", state)
+        .env("XDG_STATE_HOME", state)
+        // `--timeout` bounds only the detach poll. The VMM parent's guest
+        // READY wait reads this env, and a cold boot can overrun its
+        // default, so pin it here.
+        .env("MINVMD_READY_TIMEOUT_SECS", DETACH_TIMEOUT_SECS)
+        // Off the terminal, or libkrun's console setup stops the group.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning minvmd");
+    let deadline = Instant::now() + SUBPROC_TIMEOUT;
+    loop {
+        if child.try_wait().expect("polling minvmd").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("minvmd {args:?} did not exit within {SUBPROC_TIMEOUT:?} (wedged daemon?)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collecting minvmd output")
+}
+
 impl Guest {
-    /// Boots `minvmd boot --foreground` with minimald as the guest init and
-    /// blocks until the `vm-up` (READY) line. Panics on boot timeout.
+    /// Boots the supervised VM with minimald as the guest init
+    /// (`minvmd run --detach`) and polls `status --json` until Running.
+    ///
+    /// The supervisor, not a bare `minvmd boot`, because only the
+    /// supervisor holds the box table and binds the guest report door: the
+    /// VM host daemon that mints every box id (BOX-002). A bare boot has no
+    /// door, so the in-VM daemon refuses every create there.
     fn boot() -> Guest {
         let state = short_state_dir();
-        let sock_path = state
-            .path()
-            .join("minimal/providers/local-minvmd0/ssh.sock");
-
-        let exe = minvmd_bin();
-        let mut child = Command::new(exe)
-            .args(["boot", "--foreground"])
-            // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
-            // the caller); the rootfs stays generic.
-            .env("XDG_STATE_HOME", state.path())
-            // Its own process group, so teardown reaches the VMM child too;
-            // stdin off the terminal, or libkrun's console setup stops the group.
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawning minvmd boot --foreground");
-
-        let stdout = child.stdout.take().expect("child stdout");
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim() == "vm-up" {
-                    let _ = tx.send(true);
-                    return;
-                }
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
+        let guest = Guest {
+            sock_path: host_dir.join("ssh.sock"),
+            state,
+        };
+        // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
+        // the caller); the rootfs stays generic.
+        let run = minvmd(
+            guest.state.path(),
+            &["run", "--detach", "--timeout", DETACH_TIMEOUT_SECS],
+        );
+        assert!(
+            run.status.success(),
+            "minimald_session_integration: minvmd run --detach failed: {}\n--- run.log ---\n{}\n\
+             are MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
+             (and libkrun >= 1.19.0)?",
+            String::from_utf8_lossy(&run.stderr),
+            guest.run_log(),
+        );
+        let deadline = Instant::now() + RUNNING_TIMEOUT;
+        loop {
+            let status = minvmd(guest.state.path(), &["status", "--json"]);
+            let status: serde_json_lenient::Value = serde_json_lenient::from_slice(&status.stdout)
+                .unwrap_or(serde_json_lenient::Value::Null);
+            if status.get("state").is_some_and(|s| s == "running")
+                && status.get("vmm_pid").is_some_and(|p| p.is_number())
+            {
+                break;
             }
-            let _ = tx.send(false);
-        });
-
-        if !rx.recv_timeout(BOOT_TIMEOUT).unwrap_or(false) {
-            common::kill_group(&mut child);
-            panic!(
-                "minimald_session_integration: no 'vm-up' within {} s; are \
-                 MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
-                 (and libkrun >= 1.19.0)?",
-                BOOT_TIMEOUT.as_secs(),
+            assert!(
+                Instant::now() < deadline,
+                "minimald_session_integration: VM never reached Running within \
+                 {RUNNING_TIMEOUT:?}; last status: {status}\n--- run.log ---\n{}",
+                guest.run_log(),
             );
+            std::thread::sleep(Duration::from_millis(200));
         }
+        guest
+    }
 
-        Guest {
-            child,
-            sock_path,
-            _state: state,
-        }
+    /// The detached supervisor's stderr (boot-failure diagnosis), for panics.
+    fn run_log(&self) -> String {
+        let path = self
+            .state
+            .path()
+            .join("minimal/providers/local-minvmd0/run.log");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
     }
 }
 
