@@ -311,7 +311,26 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
+/// Symlinked directories are followed, as the callers that read a build's
+/// outputs by their declared layout expect (`lib64 -> lib`); a scan over
+/// untrusted output takes [`match_files_for_glob_no_follow`] instead.
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
+    match_files_for_glob_with(dir, glob, true)
+}
+
+/// [`match_files_for_glob`] that does not descend into a symlinked directory:
+/// a loop in an output (`a -> .`) or a link out of it is not walked, while a
+/// symlinked file still matches. For the scans that read whatever a build
+/// produced.
+pub fn match_files_for_glob_no_follow(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
+    match_files_for_glob_with(dir, glob, false)
+}
+
+fn match_files_for_glob_with(
+    dir: &Path,
+    glob: &str,
+    follow_symlinked_dirs: bool,
+) -> Result<Vec<PathBuf>, GlobError> {
     let mut results = Vec::new();
 
     let matcher = globset::GlobBuilder::new(glob)
@@ -325,6 +344,7 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
         dir: &Path,
         root_dir: &Path,
         matcher: &globset::GlobMatcher,
+        follow: bool,
         results: &mut Vec<PathBuf>,
     ) -> Result<(), GlobError> {
         let entries = std::fs::read_dir(dir)?;
@@ -334,19 +354,52 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
 
             let path = entry.path();
             let subset = path.strip_prefix(root_dir).unwrap();
+            // a symlinked directory is a directory only to the walk that follows links
+            let descend = if follow {
+                path.is_dir()
+            } else {
+                entry.file_type()?.is_dir()
+            };
             if path.is_file() && matcher.is_match(subset) {
                 results.push(path);
-            } else if path.is_dir() {
+            } else if descend {
                 // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, results)?;
+                walk_dir(&path, root_dir, matcher, follow, results)?;
             }
         }
 
         Ok(())
     }
 
-    walk_dir(dir, dir, &matcher, &mut results)?;
+    walk_dir(dir, dir, &matcher, follow_symlinked_dirs, &mut results)?;
     Ok(results)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+
+    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
+    /// the kernel's link limit, matching the same file at every level; the
+    /// no-follow walk returns each file once, ignores the loop, and still
+    /// matches a symlinked file.
+    #[test]
+    fn the_no_follow_walk_ignores_a_symlink_loop() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("bin")).unwrap();
+        std::fs::write(t.path().join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(".", t.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("bin/x", t.path().join("y")).unwrap();
+        let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
+        got.sort();
+        assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
+        let following = match_files_for_glob(t.path(), "**/*").unwrap();
+        assert!(
+            following.len() > got.len(),
+            "the following walk matched {} paths: the loop walked",
+            following.len()
+        );
+    }
 }
 
 pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
