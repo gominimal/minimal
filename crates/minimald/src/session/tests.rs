@@ -8811,6 +8811,38 @@ async fn expose_deny_typed_error() {
     }
 }
 
+/// NET-070: the session actor registers a host-address box's caller facts
+/// through the production path, so the hostname proxy can decide the box's
+/// requests from the node's address by its egress rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_address_box_registers_its_caller_facts() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // The harness default: a host-address box.
+    let id = create_configured_session(&mut client, "hostcaller", "/uwu").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the host-address box resolves");
+    let record = handle.record().await.expect("the record reads");
+    assert_eq!(record.network, sessions::NetworkMode::HostNet);
+
+    let registry = manager.hostnames();
+    let registry = registry.read().expect("registry lock");
+    assert!(
+        registry.has_unleased_callers(),
+        "a host-address box is a caller with no switch lease"
+    );
+    assert!(
+        registry
+            .caller_owning(record.id, std::net::Ipv4Addr::LOCALHOST)
+            .is_some(),
+        "the proxy can name the host-address box by the socket it owns"
+    );
+}
+
 /// A host-address box is answered before its stance is read: its record can
 /// carry no `dynamic_ingress`, so the stance check alone would deny every
 /// request — true of the setting, and wrong about the port, which already

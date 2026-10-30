@@ -1616,6 +1616,17 @@ impl Session {
                     .write()
                     .expect("hostname registry lock poisoned");
                 reg.register_host_net(record.id, &name);
+                // NET-070: the hostname proxy decides a host-address box's
+                // request by its own egress rules. The box holds no switch
+                // lease, so the proxy finds these facts by the box that owns
+                // the connecting socket (`caller_owning`).
+                reg.register_caller(
+                    record.id,
+                    &name,
+                    &record.policy,
+                    subnet,
+                    hostname_proxy_port,
+                );
             }
             _ => {}
         }
@@ -4657,6 +4668,17 @@ impl Session {
                 .expect("hostname registry lock poisoned")
                 .mark_held_ports_bound(record.id)
         });
+        // NET-070: a resumed box stays `stopped` until its host's loop calls
+        // `mark_running`, and the launch can start its processes before that.
+        // The launch mark counts the box as live from here, so the hostname
+        // proxy looks up who owns a connection from the node's address.
+        // The launch number guards the stop mark: a host loop that this
+        // launch replaces cannot mark this launch's box stopped.
+        let host_launch = self
+            .hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .begin_host_launch(record.id);
         let spawn = Box::pin(session_host::Host::spawn(
             launcher,
             session_host::HostParams {
@@ -4686,6 +4708,7 @@ impl Session {
                 name_marker: Some(session_host::NameMarker::new(
                     Arc::clone(&self.hostnames),
                     record.id,
+                    host_launch,
                 )),
             },
         ));
@@ -4698,6 +4721,12 @@ impl Session {
             None => (None, spawn.await),
         };
         let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            // A failed spawn reaches no host loop, so nothing else ends the
+            // launch mark (NET-070).
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .end_host_launch(record.id);
             AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
         })?;
         // The confirmation was a read, not a reservation: the VM host daemon
