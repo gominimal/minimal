@@ -443,10 +443,18 @@ async fn serve_create_session(
             // beside the record before the box starts.
             let spec = req.spec.take();
             let has_spec = spec.is_some();
-            Ok(match mngr
-                .create_box_with_spec(req.config, spec, ssh_username, creator)
-                .await
-            {
+            // BOX-163: a fresh instance is named `<name>-<n>` and is never
+            // refused for a held name. Any other create takes `<name>`, and
+            // a running box that holds it refuses the create.
+            let fresh_instance = req.fresh_instance;
+            let created = if fresh_instance {
+                mngr.create_fresh_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            } else {
+                mngr.create_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            };
+            Ok(match created {
                 Ok(id) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
@@ -462,6 +470,7 @@ async fn serve_create_session(
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
                         egress_deny_subnets = egress_counts.deny_subnets,
                         spec_stored = has_spec,
+                        fresh_instance,
                         "session created"
                     );
                     // NET-079's observability: one info line per create
@@ -533,8 +542,23 @@ async fn serve_create_session(
                             .map(|enforcement| enforcement.machine_str().to_string()),
                     })
                 }
+                // BOX-163: a running box holds the name. The reply names the
+                // holder, so the client can say who holds it and exit 2.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: "A session with that name already exists".to_string(),
+                    error: match held_name_refusal(&e) {
+                        Some(refusal) => {
+                            tracing::info!(
+                                name = %refusal.name,
+                                holder = %refusal.holder,
+                                holder_name = %refusal.holder_name,
+                                fresh_instance,
+                                "create refused: a running box holds the name; \
+                                 the reply names the holder"
+                            );
+                            refusal.to_string()
+                        }
+                        None => "A session with that name already exists".to_string(),
+                    },
                 },
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
@@ -1221,6 +1245,19 @@ async fn serve_finalize_session(
             })
         })
         .await
+}
+
+/// The wire refusal of a create whose name a running box holds
+/// (BOX-163), when the manager's `AlreadyExists` carries its holder.
+fn held_name_refusal(error: &std::io::Error) -> Option<minimald_rpc::HeldNameRefusal> {
+    let refusal = error
+        .get_ref()?
+        .downcast_ref::<crate::box_manager::HeldNameRefusal>()?;
+    Some(minimald_rpc::HeldNameRefusal {
+        name: refusal.name.clone(),
+        holder: refusal.holder,
+        holder_name: refusal.holder_name.clone(),
+    })
 }
 
 /// `RenameSession`: resolves the session's actor (spinning it up from
@@ -3218,5 +3255,106 @@ mod trace_tests {
         assert_eq!(actors.len(), 1, "{actors:?}");
         assert!(!actors[0].closed, "the actor lives on");
         assert!(actors[0].parent.is_none(), "the actor's span is a root");
+    }
+}
+
+/// BOX-163 over the wire: what a `CreateSession` reply says when a running
+/// box holds the name, and how a fresh instance is named.
+#[cfg(test)]
+mod create_naming_tests {
+    use boxes::SessionId;
+    use minimald_rpc::{CreateSession, CreateSessionRequest, Errorable, HeldNameRefusal};
+
+    use crate::box_manager::BoxKeyPredicate;
+    use crate::test_harness::{TestClient, TestServer, create_session_req};
+
+    /// A create with no name on the request and a task spec whose entry is
+    /// `entry`, so the daemon names the box from the entry.
+    fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
+        let mut request = create_session_req("unused", "/tmp");
+        request.config.name = None;
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+        spec.pty_enabled = false;
+        spec.entry = entry.to_string();
+        request.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+        request.fresh_instance = fresh_instance;
+        request
+    }
+
+    async fn create(client: &mut TestClient, request: &CreateSessionRequest) -> SessionId {
+        match client.call::<CreateSession>(request).await {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
+        }
+    }
+
+    async fn name_of(server: &TestServer, id: SessionId) -> Option<String> {
+        server
+            .state
+            .sessions_manager()
+            .await
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the created record is filed")
+            .name
+    }
+
+    /// A create under a name a running box holds is refused, and the
+    /// reply names the holder for the client to print and exit 2 on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_reply_names_the_holder_of_a_held_name() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let holder = create(&mut client, &entry_req("dev", false)).await;
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("dev"));
+
+        let error = match client
+            .call::<CreateSession>(&create_session_req("dev", "/tmp"))
+            .await
+        {
+            Errorable::Err { error } => error,
+            Errorable::Ok(created) => panic!("a held name is not refused: {created:?}"),
+        };
+        let refusal = HeldNameRefusal::from_error(&error)
+            .unwrap_or_else(|| panic!("the reply names the holder: {error}"));
+        assert_eq!(
+            refusal,
+            HeldNameRefusal {
+                name: "dev".to_string(),
+                holder,
+                holder_name: "dev".to_string(),
+            }
+        );
+        assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
+        assert!(error.contains(&holder.to_string()), "{error}");
+        assert!(
+            error.contains(&format!("min session rename {holder} <new-name>")),
+            "the refusal names the next step: {error}"
+        );
+        assert_eq!(
+            HeldNameRefusal::from_error("A session with that name already exists"),
+            None,
+            "any other error is not a held-name refusal"
+        );
+    }
+
+    /// A fresh instance takes `<name>-<n>`, with the smallest `n` that no
+    /// retained record uses, while a running box holds `<name>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_takes_the_smallest_unused_suffix() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let dev = create(&mut client, &entry_req("dev", false)).await;
+        let first = create(&mut client, &entry_req("dev", true)).await;
+        let second = create(&mut client, &entry_req("dev", true)).await;
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("dev-2"));
+
+        // A fresh instance with no running holder still takes a suffix.
+        let web = create(&mut client, &entry_req("web", true)).await;
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
     }
 }

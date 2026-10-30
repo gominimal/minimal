@@ -1889,7 +1889,75 @@ pub struct CreateSessionRequest {
     /// task (#2411). The daemon then files a record with no stored spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json_lenient::Value>,
+    /// Whether the create asks for a fresh instance (BOX-163). The daemon
+    /// names the box `<name>-<n>`, with the smallest `n` that no retained
+    /// record on the host uses, and never refuses it for a held name.
+    /// `false`, the default, names the box `<name>` and refuses the create
+    /// when a running box holds that name ([`HeldNameRefusal`]). A daemon
+    /// that predates the field reads every create as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_instance: bool,
 }
+
+/// The refusal of a [`CreateSession`] whose name a running box on the host
+/// holds (BOX-163). It names the holder, as a rename's refusal does
+/// (BOX-010). The daemon sends its [`Display`](std::fmt::Display) text as
+/// the reply's error, and a client reads the holder back with
+/// [`Self::from_error`], so one definition spells and parses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNameRefusal {
+    /// The name the create asked for.
+    pub name: String,
+    /// The running box that holds the name.
+    pub holder: SessionId,
+    /// The holder's name, with the case it was given.
+    pub holder_name: String,
+}
+
+impl HeldNameRefusal {
+    /// The exit code a client ends with on this refusal (BOX-163, as
+    /// BOX-010 for a rename).
+    pub const EXIT_CODE: u8 = 2;
+
+    const HEAD: &'static str = "Cannot create a session named `";
+    const TAKEN: &'static str = "`: the running session `";
+    const HOLDS: &'static str = ") holds that name.";
+
+    /// The refusal a create reply's `error` carries, or `None` when the
+    /// error is any other failure.
+    pub fn from_error(error: &str) -> Option<Self> {
+        let rest = error.strip_prefix(Self::HEAD)?;
+        let (name, rest) = rest.split_once(Self::TAKEN)?;
+        let (holder_name, rest) = rest.split_once("` (")?;
+        let (holder, _) = rest.split_once(Self::HOLDS)?;
+        Some(Self {
+            name: name.to_string(),
+            holder: SessionId::parse_str(holder).ok()?,
+            holder_name: holder_name.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for HeldNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            holder,
+            holder_name,
+        } = self;
+        write!(
+            f,
+            "{head}{name}{taken}{holder_name}` ({holder}{holds} \
+             Rename that session with `min session rename {holder} <new-name>`, \
+             or choose another name.",
+            head = Self::HEAD,
+            taken = Self::TAKEN,
+            holds = Self::HOLDS,
+        )
+    }
+}
+
+impl std::error::Error for HeldNameRefusal {}
 
 impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
@@ -1897,7 +1965,7 @@ impl CreateSessionRequest {
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, not ended with a run, no attrs, no sealed
     /// deliveries, no root certificate, the session verb, no project root,
-    /// no version assertion, and no spec.
+    /// no version assertion, no spec, and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1923,6 +1991,7 @@ impl CreateSessionRequest {
             },
             must_match_version: None,
             spec: None,
+            fresh_instance: false,
         }
     }
 }
