@@ -5061,12 +5061,12 @@ echo "::endgroup::"
 # reserved local range to lo0. Then, WITHOUT a VM restart, a new own-IP box
 # with `--ingress 8080:8080` must publish at its own 127.0.64.N address: the
 # session start walks the range again, finds it present, and the box's name
-# answers there. Three facts are asserted:
+# answers there. Two facts are asserted:
 #   * `http://<name>.min.internal:8080` returns the in-box server's response,
 #     through the resolver file the same script wrote;
 #   * the box's own range address (the zone answerer's A record for its name)
-#     returns the same response at port 8080;
-#   * `min ls` names that address.
+#     returns the same response at port 8080.
+# That `min ls` names the address belongs to T110 (#2696), which adds it.
 # The host is restored on every exit: the range unit, its aliases, the
 # resolver file and the answerer service go (range_teardown_unit,
 # answerer_service_teardown — the teardown repeats both if the case dies).
@@ -5215,18 +5215,10 @@ fresh_install_range_lands_on_macos() {
     fi
   done
 
-  # `min ls` names the address the box answers at.
-  if ! mnl ls 2>/dev/null | grep -qF -- "$frm_addr"; then
-    echo "::error::'min ls' does not name $frm_addr, the address $frm_name.min.internal answers at"
-    mnl ls 2>&1 | head -40 || true
-    fail
-  fi
-  echo "'min ls' names $frm_addr"
-
   mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
   range_teardown_unit
   answerer_service_teardown
-  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls names the address, host restored)"
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
   echo "::endgroup::"
 }
 
