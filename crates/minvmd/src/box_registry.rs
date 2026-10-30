@@ -4135,11 +4135,26 @@ impl BoxRegistry {
         // new epoch finds them ([`BoxTable::carry`]).
         self.row_epoch.fetch_add(1, Ordering::Release);
         let created = creation.is_some();
-        if let Some(creation) = creation {
+        // BOX-004: a registration under a dormant creation's name takes the
+        // name over. The creation it replaces ends here, so nothing can
+        // resume it, and its reserved addresses go back.
+        let replaced = creation.and_then(|creation| {
+            let id = creation.id();
             self.creations()
-                .insert(canonical_box_name(&creation.name), creation);
-        }
+                .insert(canonical_box_name(&creation.name), creation)
+                .filter(|old| old.id() != id && !old.standing)
+        });
         drop(rows);
+        if let Some(old) = &replaced {
+            tracing::info!(
+                box = %old.name,
+                replaced = %crate::bep_attach::BoxIdText(&old.id()),
+                by = %crate::bep_attach::BoxIdText(&record.box_id()),
+                "a new box took over a stopped box's name; the stopped box's creation ended \
+                 and its addresses went back"
+            );
+            self.give_back_creation_addrs(old);
+        }
         if created {
             self.persist();
         }
@@ -4696,30 +4711,22 @@ impl BoxRegistry {
         }
     }
 
-    /// The name a live row or a kept creation holds that `name` folds to,
-    /// in its own spelling, or `None` when none folds to it. The answerer
-    /// allocates a published address by the name's canonical form
-    /// ([`canonical_box_name`]), so two live rows
-    /// under folded-equal names would share one address; this is the check
-    /// that keeps the live set one row per folded name. A dormant creation
-    /// holds its name too ([`Creation`]): its creator may still resume it,
-    /// and a registration under the name would replace it.
+    /// The name a live row holds that `name` folds to, in its own
+    /// spelling, or `None` when none folds to it. The answerer allocates a
+    /// published address by the name's canonical form
+    /// ([`canonical_box_name`]), so two live rows under folded-equal names
+    /// would share one address; this is the check that keeps the live set
+    /// one row per folded name. A dormant creation holds no name (BOX-004):
+    /// its box stopped, and a registration under the name takes the name
+    /// over and ends the creation ([`Self::try_register`]).
     fn held_name_for(&self, name: &str) -> Option<String> {
         let asked = canonical_box_name(name);
-        let rows = self
-            .rows
+        self.rows
             .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let live = rows
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .values()
             .find(|record| canonical_box_name(record.name()) == asked)
-            .map(|record| record.name().to_string());
-        drop(rows);
-        live.or_else(|| {
-            self.creations()
-                .get(&asked)
-                .map(|creation| creation.name.clone())
-        })
+            .map(|record| record.name().to_string())
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -8059,36 +8066,81 @@ mod tests {
         );
     }
 
-    /// NET-138: a dormant creation holds its name — a registration under
-    /// it, in any spelling that folds to it, is refused rather than taking
-    /// the name its creator may still resume — until its creator destroys
-    /// it.
+    /// BOX-004: a dormant creation is a stopped box, and it holds no name.
+    /// A registration under the name, in any spelling that folds to it,
+    /// takes the name over: it gets a row of its own under a new id, the
+    /// stopped box's creation ends, and its creator can no longer resume
+    /// or withdraw anything under the name. A later zone hold of the name
+    /// takes over the stopped box's hold too.
     #[test]
-    fn a_dormant_creation_holds_its_name() {
+    fn reuse_of_a_stopped_name_takes_over_its_hold() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
+        let stopped = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let reused = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
         let web = registry
             .register_client_box(client_spec("web"))
             .expect("the plan has an address for the box");
+        assert!(registry.hold_box_name("web", Some(stopped)));
         assert!(registry.withdraw(web.switch_addr()).is_some());
         assert!(registry.row_by_name("web").is_none(), "the row is gone");
-        for asked in ["web", "WEB"] {
-            assert_eq!(
-                registry
-                    .register_client_box(client_spec(asked))
-                    .map(|row| row.box_id()),
-                Err(AllocationError::NameAlreadyHeld {
-                    held: "web".to_string()
-                }),
-                "{asked} folds to the dormant creation's name"
-            );
-        }
+        assert!(
+            registry.live_box_ids().contains(&box_id_hex(web.box_id())),
+            "the dormant creation is kept"
+        );
+
+        let new = registry
+            .register_client_box(client_spec("WEB"))
+            .expect("a stopped box's name is free for a new box");
+        assert_ne!(new.box_id(), web.box_id(), "the new box has its own id");
+        assert_eq!(
+            registry
+                .row_by_name("web")
+                .expect("the new box's row stands")
+                .box_id(),
+            new.box_id()
+        );
+        assert!(
+            !registry.live_box_ids().contains(&box_id_hex(web.box_id())),
+            "the stopped box's creation ended"
+        );
+        assert!(
+            registry
+                .resumable(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                )
+                .is_err(),
+            "nothing resumes the stopped box's creation"
+        );
         assert_eq!(
             registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
-            Ok(None)
+            Ok(None),
+            "the stopped box's pair withdraws nothing"
         );
-        registry
-            .register_client_box(client_spec("web"))
-            .expect("a destroyed creation holds no name");
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "the new box's row is untouched"
+        );
+        assert!(
+            log.contents()
+                .contains("a new box took over a stopped box's name"),
+            "the log says the name was taken over: {}",
+            log.contents()
+        );
+
+        assert!(
+            !registry.hold_box_name("WEB", Some(reused)),
+            "the new box's hold takes the stopped box's hold over"
+        );
+        assert!(
+            registry.release_held_name("web", Some(reused)),
+            "the hold is the new box's now"
+        );
     }
 
     /// NET-138: a resume naming the box's id finds its creation whatever the
