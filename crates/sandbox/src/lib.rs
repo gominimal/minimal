@@ -181,6 +181,7 @@ impl<C: Channel> Sandbox<C> {
     /// share one: a container's commands wait at the gate its own call
     /// returned, and releasing one gate starts no other container's program.
     #[cfg(target_os = "linux")]
+    #[tracing::instrument(level = "info", skip_all, err)]
     pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
         use std::os::fd::FromRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
@@ -233,6 +234,7 @@ impl<C: Channel> Sandbox<C> {
     }
 
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
+    #[tracing::instrument(level = "info", skip_all, err)]
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
         let rootfs = base_dir.join("rootfs");
