@@ -246,6 +246,11 @@ jobs:
               # 143), and minvmd last, demanding the static libkrun the step
               # above staged so a stub build can never ship. See the script's
               # header for the full rationale and its env knobs.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: scripts/dist-build.sh x86_64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
@@ -380,6 +385,11 @@ jobs:
               # one cargo invocation per package so the fat-LTO links run one
               # at a time — recollapsing them is what got this job SIGTERMed
               # (exit 143) on the 16 GB runner.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: scripts/dist-build.sh aarch64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
@@ -500,6 +510,11 @@ jobs:
               # Separate cargo invocation from minvmd above, so its default
               # `libkrun` feature can't unify into the CLI (which opts out via
               # default-features = false). Gated next.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: cargo build --release --locked -p minimal --bin min
             - name: Verify minimal links only system libraries
               # The CLI calls no libkrun (it spawns minvmd as a subprocess), so

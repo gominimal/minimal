@@ -716,11 +716,20 @@ impl BoxActor {
                             (false, _) => {
                                 let yielded: Vec<u16> =
                                     yielded_ports.iter().map(|c| c.port).collect();
-                                if let Some(&port) = crate::net::policy::host_ports_in_use(
-                                    &control, published, ingress, &yielded,
-                                )
-                                .first()
-                                {
+                                // The probe binds each port and pauses between
+                                // binds of a held one, so on the blocking pool.
+                                let in_use = {
+                                    let control = control.clone();
+                                    let ingress = ingress.clone();
+                                    crate::traced::spawn_blocking(move || {
+                                        crate::net::policy::host_ports_in_use(
+                                            &control, published, &ingress, &yielded,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(std::io::Error::other)?
+                                };
+                                if let Some(&port) = in_use.first() {
                                     refusal = Some(minimald_rpc::PortInUseRefusal {
                                         port,
                                         box_port: box_port(port),
