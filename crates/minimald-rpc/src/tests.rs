@@ -530,6 +530,7 @@ fn create_session_request_round_trips() {
         },
         must_match_version: Some("0.6.0".into()),
         spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
+        fresh_instance: true,
     };
     assert_eq!(round_trip(&req), req);
 }
@@ -566,6 +567,7 @@ fn create_request_constructor_round_trips() {
             },
             must_match_version: None,
             spec: None,
+            fresh_instance: false,
         }
     );
     assert_eq!(round_trip(&req), req);
