@@ -578,11 +578,35 @@ pub fn host_ports_in_use(
         .filter(|mapping| mapping.proto == boxes::IpProto::Tcp)
         .map(|mapping| mapping.external_port)
         .filter(|port| !yielded.contains(port))
-        .filter(|&port| {
-            std::net::TcpListener::bind((published, port))
-                .is_err_and(|e| e.kind() == io::ErrorKind::AddrInUse)
-        })
+        .filter(|&port| port_held_at(published, port))
         .collect()
+}
+
+/// How many times [`port_held_at`] binds a port before it reports the port
+/// held.
+const PORT_HELD_BINDS: u32 = 3;
+
+/// The pause between two binds of [`port_held_at`].
+const PORT_HELD_RETRY: Duration = Duration::from_millis(20);
+
+/// Whether another process holds `port` at `address`: every one of
+/// [`PORT_HELD_BINDS`] binds, [`PORT_HELD_RETRY`] apart, fails with
+/// `EADDRINUSE`. A single failed bind is not enough, because a parallel
+/// probe of the same port holds it for the moment of its own bind. A real
+/// holder fails every bind. The first bind that succeeds, or fails for any
+/// other reason, ends the probe at once, so a free port costs no pause.
+fn port_held_at(address: Ipv4Addr, port: u16) -> bool {
+    for bind in 1..=PORT_HELD_BINDS {
+        match std::net::TcpListener::bind((address, port)) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                if bind < PORT_HELD_BINDS {
+                    std::thread::sleep(PORT_HELD_RETRY);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The error [`apply_ingress`] returns for a declared port that something
@@ -3263,8 +3287,9 @@ mod tests {
         use tokio::net::UnixListener;
 
         use super::super::{
-            ControlChannel, IngressPolicy, PortMapping, apply_declared, apply_ingress,
-            host_ports_in_use, is_address_in_use, port_in_use_refusal,
+            ControlChannel, IngressPolicy, PORT_HELD_BINDS, PORT_HELD_RETRY, PortMapping,
+            apply_declared, apply_ingress, host_ports_in_use, is_address_in_use,
+            port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -3501,6 +3526,40 @@ mod tests {
                 host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
                 "a UDP mapping is not probed with a TCP bind"
             );
+        }
+
+        /// A port held only for a moment, as a parallel probe of the same
+        /// port holds it, is not reported: the probe binds again before it
+        /// names the port. A port held across every bind still is.
+        #[test]
+        fn a_port_held_only_for_a_moment_is_not_reported() {
+            let native = ControlChannel::Unix("/nonexistent/gvproxy.sock".into());
+            let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = held.local_addr().unwrap().port();
+            let declared = ingress(&[port]);
+
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(PORT_HELD_RETRY / 4);
+                drop(held);
+            });
+            assert!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
+                "a port released within the retry window is not held by another program"
+            );
+            releaser.join().unwrap();
+
+            let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]),
+                [port],
+                "a port held across every bind is still reported"
+            );
+            assert!(
+                started.elapsed() >= PORT_HELD_RETRY * (PORT_HELD_BINDS - 1),
+                "the probe binds again before it names a held port"
+            );
+            drop(held);
         }
 
         /// Only the OS's own words get the taken-port error: any other
