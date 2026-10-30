@@ -5059,12 +5059,12 @@ echo "::endgroup::"
 # reserved local range to lo0. Then, WITHOUT a VM restart, a new own-IP box
 # with `--ingress 8080:8080` must publish at its own 127.0.64.N address: the
 # session start walks the range again, finds it present, and the box's name
-# answers there. Three facts are asserted:
+# answers there. Two facts are asserted:
 #   * `http://<name>.min.internal:8080` returns the in-box server's response,
 #     through the resolver file the same script wrote;
 #   * the box's own range address (the zone answerer's A record for its name)
-#     returns the same response at port 8080;
-#   * `min ls` names that address.
+#     returns the same response at port 8080.
+# That `min ls` names the address belongs to T110 (#2696), which adds it.
 # The host is restored on every exit: the range unit, its aliases, the
 # resolver file and the answerer service go (range_teardown_unit,
 # answerer_service_teardown — the teardown repeats both if the case dies).
@@ -5213,18 +5213,10 @@ fresh_install_range_lands_on_macos() {
     fi
   done
 
-  # `min ls` names the address the box answers at.
-  if ! mnl ls 2>/dev/null | grep -qF -- "$frm_addr"; then
-    echo "::error::'min ls' does not name $frm_addr, the address $frm_name.min.internal answers at"
-    mnl ls 2>&1 | head -40 || true
-    fail
-  fi
-  echo "'min ls' names $frm_addr"
-
   mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
   range_teardown_unit
   answerer_service_teardown
-  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls names the address, host restored)"
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
   echo "::endgroup::"
 }
 
@@ -20300,18 +20292,17 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # On a Linux VM lane the record is the guest's, so the listener is read
   # from the host's own socket table: /proc/net/tcp spells an IPv4 socket's
   # local address as the address' four octets in little-endian order with the
-  # port in big-endian hex — 127.64.0.14:18086 reads `0E00407F:46A6` — so
-  # the match pins the port, the LISTEN state, and the loopback half of
-  # either spelling the publish surface can bind a box's port at: `127.64.0.x`,
-  # the reserved local range a granted publish answers on (NET-010), or
-  # `127.0.0.1`, the interim a publish stands at where the surface's range
-  # verdict read the range absent (NET-123). The KVM lane lands absent: the
-  # range walk rides the same shuttle the publishes do, and the host gate
-  # refuses every one of its probe rounds — the probe's `remote` is a
-  # placeholder, so no registered row holds the address its publish is keyed
-  # at — so the interim is that lane's own answer, not a broken publish.
-  # The reserved-range arm is tried first and stays for a lane whose verdict
-  # lands present, and the marker the dial below demands keeps either
+  # port in big-endian hex — 127.0.64.14:18086 reads `0E40007F:46A6`, the
+  # third octet in characters 3-4 and the second in 5-6 — so the match pins
+  # the port, the LISTEN state, and the loopback half of either spelling the
+  # publish surface can bind a box's port at: `127.0.64.x`, the reserved
+  # local range a granted publish answers on (NET-010), or `127.0.0.1`, the
+  # interim a publish stands at where the surface's range verdict read the
+  # range absent (NET-123). The KVM lane lands present: the range walk rides
+  # the same shuttle the publishes do, and the host gate admits its probe
+  # rounds (#2748), so the reserved-range arm is that lane's answer. The
+  # interim arm stays for a lane whose verdict lands absent, and the marker
+  # the dial below demands keeps either
   # spelling honest: a stray host listener at the same port does not carry
   # this box's answer. A macOS VM host has neither a readable record nor
   # /proc, so that leg names itself skipped there.
@@ -20340,7 +20331,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
     da_row=""
     for _ in $(seq 1 40); do
       da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
-        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
          && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
       if [ -z "$da_row" ]; then
         da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
@@ -20805,7 +20796,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       po_row=""
       for _ in $(seq 1 40); do
         po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
-          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
            && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
         if [ -z "$po_row" ]; then
           po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \

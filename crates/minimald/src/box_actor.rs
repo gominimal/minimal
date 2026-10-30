@@ -363,6 +363,19 @@ enum BoxMessage {
         address: std::net::Ipv4Addr,
         port: u16,
     },
+    /// The box's publish moved from `from` to `to` (#2748): bind each of
+    /// `ports`, the declared ports it holds at `to`, and unbind their
+    /// forwards at `from`, then move the forwards its `min net expose`
+    /// bound at `from`, if the box is running, so they listen where its
+    /// name answers. Sent by the sessions manager for each move the name
+    /// registry makes, to a box whose actor runs. Linux only, as the
+    /// registry's hand-overs are: on macOS minimald runs inside the Linux guest.
+    #[cfg(target_os = "linux")]
+    PublishMoved {
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+        ports: Vec<u16>,
+    },
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044), by the surface that published them — what the
     /// `GetLiveIngress` RPC serves. Empty for a box that published none.
@@ -1720,6 +1733,14 @@ impl BoxActor {
             #[cfg(target_os = "linux")]
             BoxMessage::BindHandedPort { address, port } => {
                 self.bind_handed_port(address, port).await;
+            }
+            #[cfg(target_os = "linux")]
+            BoxMessage::PublishMoved { from, to, ports } => {
+                for port in ports {
+                    self.bind_handed_port(to, port).await;
+                    self.release_moved_declared(from, to, port).await;
+                }
+                self.move_exposed_ports(from, to).await;
             }
             BoxMessage::LiveIngress(r) => {
                 #[expect(

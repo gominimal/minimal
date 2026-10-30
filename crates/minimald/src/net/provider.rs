@@ -68,6 +68,15 @@ struct RuntimeIngressState {
     /// They deliver to the spawn's lease as its attach's own forwards do,
     /// and come down with it the same way.
     handed: Vec<crate::net::policy::PortForwarder>,
+    /// Runtime forwards a move of the box's publish left behind at the old
+    /// address because their unbind failed (#2748). Nothing lists them, and
+    /// they come down with the spawn or the box's stop as the live ones do.
+    retired: Vec<crate::net::policy::PortForwarder>,
+    /// Clones of the declared forwards this spawn's attach bound (NET-121),
+    /// so a move of the box's publish can unbind the one at the old address
+    /// (#2748). A clone shares its forwarder's revoked mark, so the attach's
+    /// teardown skips one unbound here. The attach's guard still owns them.
+    attached: Vec<crate::net::policy::PortForwarder>,
 }
 
 /// The ports a box published at runtime with its own `min net expose`
@@ -154,7 +163,45 @@ impl RuntimeIngress {
     /// The box stopped: takes the forwards bound at a hand-over, for the
     /// session actor to release as declared forwards are.
     pub(crate) fn take_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
-        std::mem::take(&mut self.state().handed)
+        let mut state = self.state();
+        state.attached.clear();
+        std::mem::take(&mut state.handed)
+    }
+
+    /// Keeps clones of the declared forwards a spawn's attach bound, for a
+    /// move of the box's publish to unbind the old one (#2748).
+    pub(crate) fn record_attached(&self, forwarders: &[crate::net::policy::PortForwarder]) {
+        self.state().attached = forwarders.to_vec();
+    }
+
+    /// The declared forwards still bound at `address:port`, the attach's and
+    /// the hand-overs' alike: what a move of the box's publish off `address`
+    /// unbinds once the port's forward stands at the new address (#2748).
+    pub(crate) fn declared_at(
+        &self,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Vec<crate::net::policy::PortForwarder> {
+        let host = address.to_string();
+        let state = self.state();
+        state
+            .attached
+            .iter()
+            .chain(&state.handed)
+            .filter(|forwarder| !forwarder.is_revoked())
+            .filter(|forwarder| forwarder.host_port() == Some((host.as_str(), port)))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a declared forward for `port` bound at a hand-over stands at
+    /// `address`.
+    pub(crate) fn holds_handed_at(&self, address: std::net::Ipv4Addr, port: u16) -> bool {
+        let host = address.to_string();
+        self.state()
+            .handed
+            .iter()
+            .any(|forwarder| forwarder.host_port() == Some((host.as_str(), port)))
     }
 
     /// The spawn ended: takes the forwards bound at a hand-over, for the
@@ -163,6 +210,7 @@ impl RuntimeIngress {
     pub(crate) fn detach_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
         let mut state = self.state();
         state.detached = true;
+        state.attached.clear();
         std::mem::take(&mut state.handed)
     }
 
@@ -176,10 +224,74 @@ impl RuntimeIngress {
     pub(crate) fn detach(&self) -> Vec<crate::net::policy::PortForwarder> {
         let mut state = self.state();
         state.detached = true;
+        let retired = std::mem::take(&mut state.retired);
         std::mem::take(&mut state.forwards)
             .into_iter()
             .map(|live| live.forwarder)
+            .chain(retired)
             .collect()
+    }
+
+    /// The internal port and protocol of each runtime forward bound at
+    /// `address`: the forwards a move of the box's publish off `address`
+    /// must bind again at the new one (#2748).
+    pub(crate) fn bound_at(&self, address: std::net::Ipv4Addr) -> Vec<(u16, boxes::IpProto)> {
+        let host = address.to_string();
+        self.state()
+            .forwards
+            .iter()
+            .filter(|live| {
+                live.forwarder
+                    .host_port()
+                    .is_some_and(|(bound, _)| bound == host)
+            })
+            .map(|live| (live.mapping.internal_port, live.mapping.proto))
+            .collect()
+    }
+
+    /// Puts `moved`, bound at the box's new address, in the place of the
+    /// forward for the same port bound at `from` (#2748), and returns the
+    /// old forward for the caller to unbind. The row keeps what it said
+    /// about the port's admission: the gate names the port, not the
+    /// address, so a move changes neither. Refused, handing `moved` back
+    /// for the caller to unbind, when the spawn has ended or no forward for
+    /// the port stands at `from` any more.
+    pub(crate) fn rebind(
+        &self,
+        from: std::net::Ipv4Addr,
+        mut moved: LiveIngressForward,
+    ) -> Result<LiveIngressForward, LiveIngressForward> {
+        let host = from.to_string();
+        let mut state = self.state();
+        if state.detached {
+            return Err(moved);
+        }
+        let Some(standing) = state.forwards.iter_mut().find(|live| {
+            live.mapping.internal_port == moved.mapping.internal_port
+                && live
+                    .forwarder
+                    .host_port()
+                    .is_some_and(|(bound, _)| bound == host)
+        }) else {
+            return Err(moved);
+        };
+        moved.mapping.pending = standing.mapping.pending;
+        Ok(std::mem::replace(standing, moved))
+    }
+
+    /// Keeps a forward a move left behind because its unbind failed
+    /// (#2748), so the spawn's end or the box's stop unbinds it. Refused,
+    /// handing it back, when the spawn has ended.
+    pub(crate) fn retire(
+        &self,
+        forwarder: crate::net::policy::PortForwarder,
+    ) -> Result<(), crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(forwarder);
+        }
+        state.retired.push(forwarder);
+        Ok(())
     }
 
     /// Takes the one runtime forward published for `port`, for the session
@@ -201,9 +313,12 @@ impl RuntimeIngress {
     /// The box stopped: takes every runtime forward for the session actor to
     /// unbind.
     pub(crate) fn take_all(&self) -> Vec<crate::net::policy::PortForwarder> {
-        std::mem::take(&mut self.state().forwards)
+        let mut state = self.state();
+        let retired = std::mem::take(&mut state.retired);
+        std::mem::take(&mut state.forwards)
             .into_iter()
             .map(|live| live.forwarder)
+            .chain(retired)
             .collect()
     }
 }

@@ -423,7 +423,16 @@ enum Target {
     /// an `OwnIp` box's published-loopback forwarder, where the requested
     /// port is the published external one and `address` is the host loopback
     /// address a creator handed the box's own ports to publish at (NET-010).
-    Loopback { address: Ipv4Addr },
+    /// `dial` is where the proxy connects for it when that is not `address`:
+    /// on a VM node `address` is the node's address on the *host* loopback,
+    /// where the host's forwarder mirrors the guest's listeners (NET-129).
+    /// The proxy runs in the guest beside those listeners, so it dials them
+    /// at the guest's own `127.0.0.1` wherever the node's address moves
+    /// (#2748). `None` dials `address`.
+    Loopback {
+        address: Ipv4Addr,
+        dial: Option<Ipv4Addr>,
+    },
     /// An `OwnIp` box at its lease on the switch (a VM host): the daemon is on
     /// the switch, so a request reaches the box itself instead of the guest
     /// loopback. `ports` is the box's ingress declaration as an
@@ -446,7 +455,10 @@ impl Route {
         declared: Option<BTreeSet<u16>>,
     ) -> Self {
         Self {
-            target: Target::Loopback { address },
+            target: Target::Loopback {
+                address,
+                dial: None,
+            },
             session: session.into(),
             declared,
             runtime: BTreeSet::new(),
@@ -533,7 +545,9 @@ impl Route {
     pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
         let source = self.source(port)?;
         match (&self.target, source) {
-            (Target::Loopback { address }, _) => Some(SocketAddr::new(IpAddr::V4(*address), port)),
+            (Target::Loopback { address, dial }, _) => {
+                Some(SocketAddr::new(IpAddr::V4(dial.unwrap_or(*address)), port))
+            }
             (Target::Lease { lease, ports }, RouteSource::Declared | RouteSource::Ungated) => {
                 let internal = ports.get(&port).copied()?;
                 Some(SocketAddr::new(IpAddr::V4(*lease), internal))
@@ -560,7 +574,7 @@ impl Route {
     #[must_use]
     pub fn address(&self) -> Ipv4Addr {
         match &self.target {
-            Target::Loopback { address } => *address,
+            Target::Loopback { address, .. } => *address,
             Target::Lease { lease, .. } => *lease,
         }
     }
@@ -572,7 +586,7 @@ impl Route {
     /// host-loopback fact and never carries the node's address, and a box's
     /// own granted address is not the node's either.
     pub(crate) fn repoint(&mut self, from: Ipv4Addr, to: Ipv4Addr) {
-        if let Target::Loopback { address } = &mut self.target
+        if let Target::Loopback { address, .. } = &mut self.target
             && *address == from
         {
             *address = to;
@@ -635,11 +649,31 @@ struct OwnPublished {
     ports: BTreeSet<u16>,
 }
 
+/// A box's publish moved to a new address (#2748): the present landing moved
+/// it off the `127.0.0.1` interim ([`HostnameRegistry::hand_over_moved_publish`]).
+/// Sent as data so the receiver can bind the box's declared ports at the new
+/// address and move the forwards its runtime `min net expose` bound at the
+/// old one, while the box runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishMove {
+    /// The session whose box moved.
+    pub holder: SessionId,
+    /// The address the box published at before the move.
+    pub from: Ipv4Addr,
+    /// The address the box publishes at now.
+    pub to: Ipv4Addr,
+    /// The declared ports the box holds at `to`, one hand-over each: a port
+    /// another box holds there is left out, since the box yields it.
+    pub hand_overs: Vec<PortHandOver>,
+}
+
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
-/// there took it — or among the stopped ones, when none is running.
-/// Returned as data so the caller can bind the new holder's forward.
+/// there took it — or among the stopped ones, when none is running. The
+/// present landing makes one too, for a box it moved off the `127.0.0.1`
+/// interim, and sends it inside the move ([`PublishMove`]). Returned as data
+/// so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
     /// The session whose box holds the port now.
@@ -844,6 +878,12 @@ pub struct HostnameRegistry {
     /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
     /// change of record alone, bound at the new holder's next attach.
     hand_overs: Option<tokio::sync::mpsc::UnboundedSender<PortHandOver>>,
+    /// Where each move of a box's publish is sent
+    /// ([`Self::hand_over_moved_publish`]), for the sessions manager to move
+    /// the forwards the box's `min net expose` bound while its box runs
+    /// ([`Self::notify_publish_moves`]). `None` leaves those forwards where
+    /// they are until the box's spawn ends.
+    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<PublishMove>>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
     /// whether the publish lands at it or at the `127.0.0.1` interim — a
@@ -940,6 +980,7 @@ impl HostnameRegistry {
             own_holders: HashMap::new(),
             own_bound: HashMap::new(),
             hand_overs: None,
+            publish_moves: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
             launching: HashSet::new(),
@@ -974,10 +1015,24 @@ impl HostnameRegistry {
         self.hand_overs = Some(sender);
     }
 
+    /// Sends every move of a box's publish from here on to `sender`
+    /// (#2748): the receiver moves the forwards the box's runtime
+    /// `min net expose` bound at the old address, if its box is running.
+    /// The send never waits, so the registry's lock is held no longer for
+    /// it.
+    pub fn notify_publish_moves(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<PublishMove>,
+    ) {
+        self.publish_moves = Some(sender);
+    }
+
     /// The box holding `port` at `address` of record (NET-129), declared or
     /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
-    /// also asks for a declared publish, cannot see a dynamic holder.
-    #[cfg(test)]
+    /// also asks for a declared publish, cannot see a dynamic holder, and
+    /// what the listen watcher reads before it moves a port to a new
+    /// address (#2748).
+    #[must_use]
     pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
         self.own_holders.get(&(address, port)).copied()
     }
@@ -993,6 +1048,55 @@ impl HostnameRegistry {
                 .own_published
                 .get(&session_id)
                 .is_some_and(|own| own.address == address && own.ports.contains(&port))
+    }
+
+    /// Sends the move of the box `session_id`'s publish from `from` to the
+    /// address it publishes at now (NET-123 §7.1, #2748), with one hand-over
+    /// per declared port it holds there, and returns the hand-overs. The
+    /// present landing calls it for each box it moves off the `127.0.0.1`
+    /// interim: a box that runs has its forwards bound at the interim, so
+    /// the name would answer at an address no forward listens on. A port
+    /// another box holds at the address is left out: the box yields it.
+    ///
+    /// The move goes to [`Self::notify_publish_moves`]'s receiver, never to
+    /// [`Self::notify_hand_overs`]'s. The receiver passes it on only to a
+    /// box whose actor runs, which binds each declared port at the new
+    /// address and moves the forwards its `min net expose` bound at `from`.
+    /// A box with no actor gets nothing and binds at the new address at its
+    /// next attach. The listen watcher reads the box's published address
+    /// here on every poll, and moves the ports it published itself.
+    pub fn hand_over_moved_publish(
+        &self,
+        session_id: SessionId,
+        from: Ipv4Addr,
+    ) -> Vec<PortHandOver> {
+        let Some(own) = self.own_published.get(&session_id) else {
+            return Vec::new();
+        };
+        let hand_overs: Vec<PortHandOver> = own
+            .ports
+            .iter()
+            .filter(|&&port| self.holds_shared_port(session_id, own.address, port))
+            .map(|&port| PortHandOver {
+                holder: session_id,
+                address: own.address,
+                port,
+            })
+            .collect();
+        if own.address != from
+            && let Some(sender) = &self.publish_moves
+        {
+            // A receiver that is gone moves nothing: the box binds its
+            // declared ports at the new address at its next attach, and its
+            // runtime forwards come down with its spawn.
+            drop(sender.send(PublishMove {
+                holder: session_id,
+                from,
+                to: own.address,
+                hand_overs: hand_overs.clone(),
+            }));
+        }
+        hand_overs
     }
 
     /// Sets the node's host loopback address once the answerer granted it —
@@ -1079,13 +1183,20 @@ impl HostnameRegistry {
     /// rejects one on every network mode but `own_ip` — and a direct
     /// connection to it is ungated, so the proxy gates nothing either
     /// (NET-071).
+    ///
+    /// On a VM node (`on_switch`) the name answers at the node's host-side
+    /// address, where the host mirrors the guest's listeners, and the proxy,
+    /// which runs in the guest, dials those listeners at the guest's own
+    /// `127.0.0.1` (#2748).
     pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
         self.host_net.insert(session_id);
-        self.register(
-            session_id,
-            session_name,
-            Route::loopback(session_name, self.node, None),
-        )
+        let mut route = Route::loopback(session_name, self.node, None);
+        if self.on_switch
+            && let Target::Loopback { dial, .. } = &mut route.target
+        {
+            *dial = Some(Ipv4Addr::LOCALHOST);
+        }
+        self.register(session_id, session_name, route)
     }
 
     /// Registers an `OwnIp` PTask's box name at the address its declaration
@@ -3822,7 +3933,9 @@ mod tests {
         );
 
         // A VM node: the node holds one allocated address of its own, and its
-        // host-address boxes answer at it.
+        // host-address boxes answer at it. The host's forwarder mirrors the
+        // guest's listeners there, and the proxy, in the guest beside them,
+        // dials them at the guest's own loopback (#2748).
         let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut vm = HostnameRegistry::new("dev", true).with_node_address(node);
         vm.register_host_net(id("2"), "web");
@@ -3838,13 +3951,18 @@ mod tests {
             .resolve("web.min.internal:8080")
             .expect("a host-address box's name routes");
         assert_eq!(
+            route.address(),
+            node,
+            "the route answers at the node's address"
+        );
+        assert_eq!(
             route.upstream(8080),
-            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
-            "the box's own port number at the node's allocated address"
+            Some(SocketAddr::new(loopback_addr(), 8080)),
+            "the proxy dials the box's own port number on the guest's loopback"
         );
         assert_eq!(
             route.upstream(9090),
-            Some(SocketAddr::new(IpAddr::V4(node), 9090)),
+            Some(SocketAddr::new(loopback_addr(), 9090)),
             "a host-address route gates no port, so no port is translated"
         );
     }
@@ -3885,8 +4003,10 @@ mod tests {
             reg.resolve("shared.min.internal:8080")
                 .expect("a host-address box's name routes")
                 .upstream(8080),
-            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
-            "the proxy forwards a host-address box at the granted address too"
+            Some(SocketAddr::new(loopback_addr(), 8080)),
+            "the proxy, in the guest, still dials the host-address box on the guest's \
+             own loopback: the granted address is the host's, where its forwarder \
+             mirrors the guest's listeners (#2748)"
         );
         assert_eq!(
             reg.resolve("handed.min.internal:18080")
