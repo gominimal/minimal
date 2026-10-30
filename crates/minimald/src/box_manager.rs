@@ -60,6 +60,28 @@ impl From<BoxKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type BoxManagerError = std::io::Error;
 
+/// A create refused because the VM host daemon gave the box no id
+/// (BOX-002). It rides inside a [`BoxManagerError`], so the `CreateSession`
+/// handler can tell it apart and answer the client with its text, in place
+/// of dropping the channel as it does for an internal failure.
+#[derive(Debug)]
+pub(crate) struct BoxIdNotMinted(String);
+
+impl std::fmt::Display for BoxIdNotMinted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoxIdNotMinted {}
+
+impl BoxIdNotMinted {
+    /// Whether `error` is a create refused for want of a minted id.
+    pub(crate) fn is(error: &BoxManagerError) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
 /// NET-079's observability, for the create path's half of the refusal: how
 /// many creates this daemon has refused because a host-address box's
 /// declaration named rules the classifier cannot enforce while the host
@@ -2519,10 +2541,12 @@ impl BoxManager {
                     %error,
                     "refused a create: the VM host daemon handed no box id"
                 );
-                return Err(BoxManagerError::other(format!(
-                    "the VM host daemon gave the new session no id: {error}. \
-                     No session was created."
-                )));
+                // A typed refusal, so the client gets this text as the
+                // create's reply and never a closed channel.
+                return Err(BoxManagerError::other(BoxIdNotMinted(format!(
+                    "No session was created. minvmd, which runs this VM, did not give \
+                     the new session an id: {error}."
+                ))));
             }
         };
         if let Some(minted) = minted {

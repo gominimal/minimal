@@ -549,6 +549,12 @@ async fn serve_create_session(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
+                // BOX-002: a create minvmd gave no id is refused with a
+                // reply. The internal arm below closes the channel, and the
+                // client then reads an empty reply with no cause in it.
+                Err(e) if crate::box_manager::BoxIdNotMinted::is(&e) => Errorable::Err {
+                    error: e.to_string(),
+                },
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
             })
         })

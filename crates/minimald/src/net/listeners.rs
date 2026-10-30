@@ -440,10 +440,7 @@ pub(crate) async fn mint_box_id(
         switch_address,
     });
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
-    let mut last = io::Error::new(
-        io::ErrorKind::TimedOut,
-        "the VM host daemon did not answer before its deadline",
-    );
+    let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
     for attempt in 1..=REPORT_ATTEMPTS {
         let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
         match report_exchange(&channel, &request, bound).await {
@@ -476,7 +473,14 @@ pub(crate) async fn mint_box_id(
             tokio::time::sleep(REPORT_BACKOFF).await;
         }
     }
-    Some(Err(last))
+    // No door, or a door that never answered: the bare `minvmd boot` path
+    // binds none. The caller refuses the create with this text as its
+    // reply, so it names what happened in the words the client reads.
+    tracing::warn!(?switch_address, error = %last, "the box id mint was never answered");
+    Some(Err(io::Error::new(
+        last.kind(),
+        format!("it did not answer ({last})"),
+    )))
 }
 
 /// Whether the Box Egress Proxy's listener is live on the host (BEP-062):

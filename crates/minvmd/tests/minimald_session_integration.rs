@@ -578,8 +578,10 @@ async fn create_session(
         .map_err(|e| format!("read response: {e}"))?;
     let resp: <CreateSession as OneshotSshRpc>::Response =
         serde_json_lenient::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-    Ok(resp
-        .ok()
-        .ok_or_else(|| "CreateSession returned an error".to_string())?
-        .id)
+    // The refusal's own text, so a failed attempt names its cause (a create
+    // minvmd gave no id is refused with a reply, BOX-002).
+    match resp {
+        minimald_rpc::Errorable::Ok(created) => Ok(created.id),
+        minimald_rpc::Errorable::Err { error } => Err(format!("CreateSession refused: {error}")),
+    }
 }

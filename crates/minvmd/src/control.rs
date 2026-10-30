@@ -1177,9 +1177,7 @@ fn mint_box_id_reply(
                     "refused a box id mint: no box row stands at the switch address"
                 );
                 return BoxControlReply::Error {
-                    error: format!(
-                        "the VM host daemon holds no box registration at {switch_address}"
-                    ),
+                    error: format!("no box is registered at {switch_address}"),
                 };
             };
             (box_id, "registration")
@@ -5416,7 +5414,7 @@ mod tests {
         assert_ne!(first, web.box_id);
         match mint(Some(Ipv4Addr::new(100, 64, 0, 200))) {
             BoxControlReply::Error { error } => assert!(
-                error.contains("holds no box registration at 100.64.0.200"),
+                error.contains("no box is registered at 100.64.0.200"),
                 "{error}"
             ),
             other => panic!("an address with no row is refused, got {other:?}"),
