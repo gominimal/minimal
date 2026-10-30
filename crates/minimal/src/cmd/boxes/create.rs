@@ -2,8 +2,9 @@
 //! checks to the start line.
 
 use super::*;
+use minimal_client::box_name::{request_name, retry_as_fresh_instance};
 use minimal_client::box_registration::{
-    CleanupOutcome, register_box_reminting_autogen, settle_lease_after_cleanup,
+    CleanupOutcome, register_box_for_activation, settle_lease_after_cleanup,
 };
 
 /// The session-start line for a box the activation registered with the VM
@@ -1001,6 +1002,62 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// The name the daemon gives the box `request` creates, when the create
+/// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
+/// request's name, else the spec's entry. `None` for a request with no spec
+/// and no name.
+pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
+    let spec = request.spec.as_ref().and_then(|value| {
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
+    });
+    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
+        return Some(name);
+    }
+    if let Some(name) = request.config.name.clone() {
+        return Some(name);
+    }
+    spec.map(|spec| spec.box_name().to_string())
+}
+
+/// The name the daemon gave box `id`, read off its record. `None` when the
+/// read fails or the box has no name: the caller keeps the name it had.
+pub(crate) async fn daemon_box_name(
+    client: &mut minimal_client::Client,
+    id: boxes::SessionId,
+) -> Option<String> {
+    match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Id(
+            id,
+        ))
+        .await
+    {
+        Ok(reply) => reply.record.and_then(|record| record.name),
+        Err(error) => {
+            tracing::warn!(session_id = %id, %error, "could not read the name the daemon gave the box");
+            None
+        }
+    }
+}
+
+/// The error a refused create ends the command with. A held name ends it
+/// with exit 2, naming the holder (BOX-163). Any other refusal is the
+/// daemon's text as it is.
+pub(crate) fn create_refusal(error: String) -> anyhow::Error {
+    match minimal_client::box_name::held_name_refusal(&error) {
+        Some(refusal) => {
+            tracing::info!(
+                name = %refusal.name,
+                holder = %refusal.holder,
+                holder_name = %refusal.holder_name,
+                exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+                "the create was refused: a running box holds the name"
+            );
+            anyhow::Error::new(refusal)
+        }
+        None => anyhow::anyhow!("{error}"),
+    }
+}
+
 /// Puts the spec of a session box from `dir` on the create request
 /// (BOX-068): the project's `[session]` table, with the request's network
 /// mode, policy and hooks choice as the flags. A project with no
@@ -1209,16 +1266,12 @@ pub(crate) async fn activate_box(
         .run(async { ensure_daemon(global) })
         .await?;
 
-    // A session with no `--name` still deserves a typable handle, so mint
-    // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
-    // picker, and the create announcement fall back to a bare short id. A
-    // user-supplied name is passed through untouched — including a collision,
-    // which must surface as an error rather than be silently suffixed.
-    let autogen = args.name.is_none();
-    let session_name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
+    // BOX-163: the request carries a name only for `--name`. With none,
+    // the daemon names the box from its spec's entry, and a held entry name
+    // makes the create a fresh instance, `<name>-<n>`, below. A `--name`
+    // that a running box holds ends the command with exit 2, naming the
+    // holder. The client invents no name.
+    let typed_name = args.name.is_some();
 
     let network: boxes::NetworkMode = args.network.into();
 
@@ -1228,7 +1281,8 @@ pub(crate) async fn activate_box(
     // fallible client-side step, so a loadout, policy, or hook failure
     // between here and there never strands a row on the host.
     let mut request =
-        minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
+        minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
+    request.config.name = request_name(args.name.as_deref());
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -1421,28 +1475,31 @@ pub(crate) async fn activate_box(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_host_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    // An autogen name can collide with a live box's row the same way it
-    // can with a session (the row stays live until its session's destroy):
-    // the registration's refusal re-mints it within the same budget the
-    // create's collision retry below spends.
-    let mut attempts = 0u32;
+    // The row is registered under the name the daemon will give the box
+    // (BOX-163): `--name`, else the spec's. A live row that holds it
+    // refuses the registration, and the refusal ends the activation.
+    let mut box_name = created_box_name(&request);
+    tracing::info!(
+        requested_name = ?request.config.name,
+        box_name = ?box_name,
+        name_source = if typed_name { "--name" } else { "entry" },
+        "creating the box under the name the daemon gives it"
+    );
     let mut registered = ActivationStep::RegisterBox
         .run(async {
-            let registered = register_box_reminting_autogen(
-                kind,
-                global.minimal_dir.as_deref(),
-                request.config.network,
-                request
-                    .config
-                    .name
-                    .as_mut()
-                    .expect("the session name is minted before the create"),
-                &request.config.policy,
-                autogen,
-                &mut attempts,
-                || autogen_session_name(&utf8_path, &random_hex4()),
-            )
-            .await?;
+            let registered = match box_name.as_deref() {
+                Some(name) => {
+                    register_box_for_activation(
+                        kind,
+                        global.minimal_dir.as_deref(),
+                        request.config.network,
+                        name,
+                        &request.config.policy,
+                    )
+                    .await?
+                }
+                None => None,
+            };
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
             // The id stays here: the create relays none (BOX-002).
@@ -1463,7 +1520,7 @@ pub(crate) async fn activate_box(
     ) {
         withdraw_box_row(
             control_sock.clone(),
-            request.config.name.as_deref(),
+            box_name.as_deref(),
             request.config.box_addresses,
             registered_id,
         )
@@ -1475,13 +1532,12 @@ pub(crate) async fn activate_box(
     // id the registration handed, before the create, so the create request
     // carries each sealed value for every launch of the box to place in its
     // grant's environment variable. A failure withdraws the row the
-    // registration bought (T66). An autogen collision below re-registers
-    // under a new id, and mints again for it.
+    // registration bought (T66).
     // The proxy's hold on the box: dropped by a later step's failure, it
     // forgets the box's declared egress there. It is kept once the session
     // is active. A Ctrl-C exits the process with no drop, so it leaves the
     // box at the proxy until the box's destroy forgets it (#2277).
-    let mut proxy_registration = ActivationStep::MintGrants
+    let proxy_registration = ActivationStep::MintGrants
         .run(mint_into_request(
             &mut request,
             registered_id,
@@ -1491,12 +1547,12 @@ pub(crate) async fn activate_box(
         .await?;
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
-    // An autogen name can (rarely) collide with an existing session built
-    // from the same directory; on the daemon's already-exists rejection,
-    // re-mint the hex suffix and retry a bounded number of times. A
-    // user-supplied name never retries — its collision, and any other failure
-    // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    // `attempts` carries over from the registration's own collision retry.
+    // BOX-163: a box the person did not name takes its entry's name. When a
+    // running box holds that name, the create runs again as a fresh
+    // instance, and the daemon names it `<name>-<n>`. A `--name` that a
+    // running box holds ends the command with exit 2, naming the holder. A
+    // box with a VM host row keeps the name its row holds, so it does not
+    // run again under another one.
     let created = ActivationStep::CreateSession
         .run(async {
             let created = loop {
@@ -1506,6 +1562,8 @@ pub(crate) async fn activate_box(
                     registered_box_id = ?registered
                         .as_ref()
                         .and_then(|registration| registration.box_id),
+                    requested_name = ?request.config.name,
+                    fresh_instance = request.fresh_instance,
                     "creating the box with no box id on the request; the client keeps the registered id"
                 );
                 let resp = client.oneshot_rpc::<CreateSession>(request.clone()).await;
@@ -1517,7 +1575,7 @@ pub(crate) async fn activate_box(
                     Err(error) => {
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -1530,75 +1588,29 @@ pub(crate) async fn activate_box(
                 match resp {
                     minimald_rpc::Errorable::Ok(r) => break r,
                     minimald_rpc::Errorable::Err { error } => {
-                        if should_retry_autogen(autogen, attempts, &error) {
-                            attempts += 1;
-                            // The row the first attempt bought is this attempt's to
-                            // leave behind: its creator withdraws it before
-                            // re-registering under the re-minted name (T66) — it was
-                            // bought for a session this create never made.
-                            withdraw_box_row(
-                                control_sock.clone(),
-                                request.config.name.as_deref(),
-                                request.config.box_addresses,
-                                registered
-                                    .as_ref()
-                                    .and_then(|registration| registration.box_id),
-                            )
-                            .await;
-                            // The abandoned row's lease goes with it, uncommitted.
-                            drop(registered.take());
-                            request.config.name =
-                                Some(autogen_session_name(&utf8_path, &random_hex4()));
-                            // A registered box's row carries the name it was
-                            // registered under (T66), so the re-mint re-registers;
-                            // the abandoned row is withdrawn above, by its id, which
-                            // returns its addresses to the host's hand-out books,
-                            // and the retry leaves no row behind. The re-registration can itself fail —
-                            // the plan can be exhausted by then — and that failure
-                            // ends the retry loop the same way the first one would
-                            // have, with its cause. The first registration's id is
-                            // discarded with its row: ids are never freed or
-                            // reused, so the re-registration is a new creation, and
-                            // the host mints it a new id, which replaces the record
-                            // (NET-133).
-                            registered = register_box_reminting_autogen(
-                                kind,
-                                global.minimal_dir.as_deref(),
-                                request.config.network,
-                                request.config.name.as_mut().expect("just re-minted"),
-                                &request.config.policy,
-                                autogen,
-                                &mut attempts,
-                                || autogen_session_name(&utf8_path, &random_hex4()),
-                            )
-                            .await?;
-                            carry_registration(&mut request.config, registered.as_ref());
-                            // The sealed values name the abandoned id, so the
-                            // new one gets its own (BEP-007). The replaced
-                            // registration forgets the old id at the proxy.
-                            proxy_registration = mint_into_request(
-                                &mut request,
-                                registered
-                                    .as_ref()
-                                    .and_then(|registration| registration.box_id),
-                                &github_grants,
-                                control_sock.clone(),
-                            )
-                            .await?;
+                        if registered.is_none()
+                            && retry_as_fresh_instance(typed_name, request.fresh_instance, &error)
+                        {
+                            tracing::info!(
+                                box_name = ?box_name,
+                                %error,
+                                "the entry's name is held; creating a fresh instance"
+                            );
+                            request.fresh_instance = true;
                             continue;
                         }
-                        // A create failure that is not a retryable autogen collision
-                        // abandons the activation and its row the same way.
+                        // Any other create failure abandons the activation and
+                        // its row the same way.
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
                         )
                         .await;
-                        bail!("{error}");
+                        return Err(create_refusal(error));
                     }
                 }
             };
@@ -1613,7 +1625,7 @@ pub(crate) async fn activate_box(
                 // row; the withdrawal rides out with the error (T66).
                 withdraw_box_row(
                     control_sock.clone(),
-                    request.config.name.as_deref(),
+                    box_name.as_deref(),
                     request.config.box_addresses,
                     registered
                         .as_ref()
@@ -1626,6 +1638,17 @@ pub(crate) async fn activate_box(
         })
         .await?;
     let id = created.id;
+    // BOX-163: the daemon named the box. Read the name back for the start
+    // lines, the name hold and the cleanup below.
+    if let Some(name) = daemon_box_name(&mut client, id).await {
+        tracing::info!(
+            session_id = %id,
+            box_name = %name,
+            fresh_instance = request.fresh_instance,
+            "the daemon named the box"
+        );
+        box_name = Some(name);
+    }
     ActivationStep::ReportStart
         .run(async {
             // The registration's own half of the session-start output (T66): one line
@@ -1644,7 +1667,7 @@ pub(crate) async fn activate_box(
                     "{}",
                     box_registered_start_line(
                         hostname_proxy_vm(kind),
-                        request.config.name.as_deref().unwrap_or("-"),
+                        box_name.as_deref().unwrap_or("-"),
                         addresses,
                     )
                 );
@@ -1870,7 +1893,7 @@ pub(crate) async fn activate_box(
             };
             if let Some(surface) = surface {
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
-                let box_name = request.config.name.as_deref().unwrap_or("-");
+                let box_name = box_name.as_deref().unwrap_or("-");
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
@@ -1982,7 +2005,7 @@ pub(crate) async fn activate_box(
                         // the row its registration bought goes with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2023,7 +2046,7 @@ pub(crate) async fn activate_box(
                 Err(error) => {
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2045,7 +2068,7 @@ pub(crate) async fn activate_box(
                     // The session cannot compose and is abandoned with its row (T66).
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2089,7 +2112,7 @@ pub(crate) async fn activate_box(
                                 // the path failed after registering.
                                 withdraw_box_row(
                                     control_sock.clone(),
-                                    request.config.name.as_deref(),
+                                    box_name.as_deref(),
                                     request.config.box_addresses,
                                     registered
                                         .as_ref()
@@ -2110,7 +2133,7 @@ pub(crate) async fn activate_box(
                         // path failed after registering.
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2135,7 +2158,7 @@ pub(crate) async fn activate_box(
                         // its row (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2189,7 +2212,7 @@ pub(crate) async fn activate_box(
                         // withdrawn with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2254,7 +2277,7 @@ pub(crate) async fn activate_box(
                 if !settle_lease_after_cleanup(lease, outcome).await {
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2267,7 +2290,7 @@ pub(crate) async fn activate_box(
                 if outcome == CleanupOutcome::Kept
                     && kind == paths::HostKind::Minvmd
                     && request.config.network == boxes::NetworkMode::HostNet
-                    && let Some(name) = request.config.name.as_deref()
+                    && let Some(name) = box_name.as_deref()
                 {
                     hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
                 }
@@ -2320,7 +2343,7 @@ pub(crate) async fn activate_box(
         .run(async {
             if kind == paths::HostKind::Minvmd
                 && request.config.network == boxes::NetworkMode::HostNet
-                && let Some(name) = request.config.name.as_deref()
+                && let Some(name) = box_name.as_deref()
             {
                 hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
             }
@@ -2338,7 +2361,7 @@ pub(crate) async fn activate_box(
         if should_announce_box(global) {
             eprintln!(
                 "Created session {}",
-                box_announce_label(&id, request.config.name.as_deref())
+                box_announce_label(&id, box_name.as_deref())
             );
         }
         let attach_args = AttachArgs {

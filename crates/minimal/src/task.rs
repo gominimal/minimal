@@ -93,14 +93,6 @@ fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Pat
         .unwrap_or_default()
 }
 
-/// Mint the ephemeral session name `task-<task>-<hex>`: the task name is
-/// reduced to the session-name alphabet by the same sanitizer the activate
-/// autogen path uses, and the caller supplies the hex so a collision retry
-/// can re-mint with fresh entropy.
-fn task_box_name(task: &str, hex: &str) -> String {
-    format!("task-{}-{hex}", crate::sanitize_name_component(task))
-}
-
 /// The hidden top-level `min run` muscle-memory catch: always errors, naming
 /// the canonical host spelling and the in-box form.
 pub fn cmd_run(args: &RunArgs) -> Result<(), anyhow::Error> {
@@ -661,11 +653,16 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `--keep` session is attachable later, so its hooks behave like any
     // other session's. The constructor turns them on.
     let mut request = minimald_rpc::CreateSessionRequest::new(
-        task_box_name(&args.task, &crate::random_hex4()),
+        String::new(),
         abs_path.clone(),
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
+    // BOX-163: every task run is a fresh instance. The daemon names the box
+    // `<task>-<n>` from the spec's entry, with the smallest `n` no retained
+    // box uses. The client invents no name.
+    request.config.name = None;
+    request.fresh_instance = true;
     // The box ends with this run unless `--keep` retains it: marked at
     // create, so a daemon restart before or during the run destroys it
     // rather than resuming it (NET-131).
@@ -681,6 +678,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
     {
         crate::put_spec(&mut request, &spec)?;
+    } else {
+        // With no spec to name it, the request carries the entry's name.
+        request.config.name = Some(args.task.clone());
     }
 
     // Upload per the normal activate rules: tarball sync (the default), the
@@ -729,36 +729,31 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let mut client = crate::connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
-    // The minted name can (rarely) collide; retry with fresh entropy on the
-    // daemon's already-exists rejection, within the activate autogen budget.
-    let mut attempts = 0u32;
-    let created = loop {
-        let resp = client
-            .oneshot_rpc::<CreateSession>(request.clone())
-            .await
-            .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
-        match resp {
-            minimald_rpc::Errorable::Ok(r) => break r,
-            minimald_rpc::Errorable::Err { error } => {
-                if crate::should_retry_autogen(true, attempts, &error) {
-                    attempts += 1;
-                    request.config.name = Some(task_box_name(&args.task, &crate::random_hex4()));
-                    continue;
-                }
-                bail!("{error}");
-            }
-        }
+    tracing::info!(
+        task = %args.task,
+        requested_name = ?request.config.name,
+        fresh_instance = request.fresh_instance,
+        "creating the task box as a fresh instance"
+    );
+    let resp = client
+        .oneshot_rpc::<CreateSession>(request.clone())
+        .await
+        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
+    let created = match resp {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => return Err(crate::create_refusal(error)),
     };
     // A daemon too old to know the field ignored it and echoes no version;
     // that silence is the skew. Caught here, before the upload and the
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    let session_name = request
-        .config
-        .name
-        .clone()
-        .expect("the task session is always named");
+    // The daemon named the box `<task>-<n>`. A box whose name cannot be read
+    // back goes by its id.
+    let session_name = crate::daemon_box_name(&mut client, id)
+        .await
+        .unwrap_or_else(|| id.to_string());
+    tracing::info!(session_id = %id, box_name = %session_name, "the daemon named the task box");
 
     // Until the session is Active, a Ctrl-C must abort the half-built
     // session exactly as during an activate.
@@ -962,15 +957,6 @@ pub(crate) async fn release_task_name_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The minted session name is `task-<task>-<hex>`, with the task name
-    /// pushed through the same sanitizer as the activate autogen so it
-    /// always clears `validate_session_name`.
-    #[test]
-    fn task_box_name_sanitizes_the_task_stem() {
-        assert_eq!(task_box_name("build", "9c1e"), "task-build-9c1e");
-        assert_eq!(task_box_name("My Task!", "4f2a"), "task-mytask-4f2a");
-    }
 
     /// The hidden `min run` redirect names both canonical forms — the host
     /// `min task run <task>` and the in-box

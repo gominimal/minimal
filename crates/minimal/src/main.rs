@@ -194,7 +194,9 @@ async fn run() -> ExitCode {
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
-/// codes ("Exit codes"): 3 when the activation refused the box spec
+/// codes ("Exit codes"): 2 when a running box holds the name a create
+/// asked for (`minimald_rpc::HeldNameRefusal`), 3 when the activation
+/// refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
@@ -207,6 +209,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BOX-163: a create under a name a running box holds.
+    if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
+        return minimald_rpc::HeldNameRefusal::EXIT_CODE;
     }
     // An invalid project `minimal.toml` refuses the activation with exit 3.
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {

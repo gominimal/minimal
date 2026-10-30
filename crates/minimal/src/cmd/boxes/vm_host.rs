@@ -10,8 +10,7 @@ pub(crate) use minimal_client::box_registration::withdraw_box_row;
 use minimal_client::box_registration::{BOX_CONTROL_TIMEOUT, control_request_with_vm_host};
 #[cfg(test)]
 use minimal_client::box_registration::{
-    register_box_for_activation, register_box_reminting_autogen, register_box_with_vm_host,
-    resume_box_row,
+    register_box_for_activation, register_box_with_vm_host, resume_box_row,
 };
 
 /// The host kind this invocation's daemon connection resolves through:
@@ -1239,15 +1238,12 @@ mod tests {
         assert!(config.task_addresses.is_empty());
     }
 
-    /// The VM host daemon refuses a registration whose name folds to a
-    /// live row's, and that refusal reads as a name collision: an autogen
-    /// name re-mints and registers again under the fresh name, within the
-    /// shared budget, while a user-supplied name surfaces the refusal —
-    /// naming the held spelling — unchanged. Driven against the real
-    /// control server so a rewording of the daemon's refusal cannot
-    /// silently break the retry.
+    /// BOX-163: the VM host daemon refuses a registration whose name folds
+    /// to a live row's. The client mints no other name, so the refusal
+    /// surfaces, naming the held spelling. Driven against the real control
+    /// server.
     #[tokio::test]
-    async fn autogen_registration_reminted_on_a_held_name() {
+    async fn registration_under_a_held_name_is_refused() {
         let policy = boxes::BoxPolicy {
             egress: None,
             ingress: None,
@@ -1268,74 +1264,33 @@ mod tests {
         .expect("the control server binds its socket");
         let minimal_dir = Some(dir.path());
 
-        let mut held = "Proj-9c1e".to_string();
-        let mut attempts = 0u32;
         // Bound for the test's life: the registration's lease holds the
         // row, and dropping it would withdraw the row.
-        let _held_box = register_box_reminting_autogen(
+        let _held_box = register_box_for_activation(
             paths::HostKind::Minvmd,
             minimal_dir,
             NetworkMode::OwnIp,
-            &mut held,
+            "Proj",
             &policy,
-            true,
-            &mut attempts,
-            || unreachable!("a free name registers on the first try"),
         )
         .await
         .expect("the first box registers")
         .expect("an own-address box on a VM-backed host registers");
-        assert_eq!(attempts, 0);
 
-        // An autogen name folding to the live row's re-mints and registers.
-        let mut name = "proj-9c1e".to_string();
-        let registered = register_box_reminting_autogen(
+        let refused = register_box_for_activation(
             paths::HostKind::Minvmd,
             minimal_dir,
             NetworkMode::OwnIp,
-            &mut name,
+            "PROJ",
             &policy,
-            true,
-            &mut attempts,
-            || "proj-77aa".to_string(),
         )
         .await
-        .expect("the held autogen name is re-minted, not fatal")
-        .expect("the re-minted name registers");
-        assert_eq!(
-            name, "proj-77aa",
-            "the activation carries the re-minted name"
-        );
-        assert_eq!(attempts, 1, "the re-mint spent one attempt of the budget");
-        assert_eq!(
-            registry
-                .row_by_name("proj-77aa")
-                .expect("the re-minted name holds a row")
-                .switch_addr(),
-            registered.addresses.switch_address,
-        );
-
-        // A user-supplied name never re-mints: the refusal surfaces, naming
-        // the spelling the live row holds.
-        let mut user = "PROJ-9C1E".to_string();
-        let refused = register_box_reminting_autogen(
-            paths::HostKind::Minvmd,
-            minimal_dir,
-            NetworkMode::OwnIp,
-            &mut user,
-            &policy,
-            false,
-            &mut 0,
-            || unreachable!("a user-supplied name is never re-minted"),
-        )
-        .await
-        .expect_err("a user-supplied held name is refused");
+        .expect_err("a held name is refused");
         let refused = format!("{refused:#}");
         assert!(
-            refused.contains("a box named Proj-9c1e already exists"),
+            refused.contains("a box named Proj already exists"),
             "the refusal names the held spelling: {refused}"
         );
-        assert_eq!(user, "PROJ-9C1E", "the user's name is left as given");
     }
 
     /// Against the real control server: a registration the activation
@@ -1638,7 +1593,7 @@ mod tests {
     /// release request naming it — while a session with a row releases
     /// nothing (its row's withdrawal is its whole debt), and a failed
     /// activation's withdrawal of a row-less box sends nothing at all: the
-    /// name may be a live session's (an autogen collision), so only the
+    /// name may be a live session's (a held name), so only the
     /// destroy of the session that held it may release it. The hold itself
     /// is the hold verb, and the marker reply is quiet.
     #[tokio::test]

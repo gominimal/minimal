@@ -381,7 +381,7 @@ pub async fn register_box_with_vm_host(
 /// registration — withdraws nothing and says nothing. In particular it
 /// never releases a held `host_ip` name: an activation that failed holds
 /// none (the hold is made only once the session is active), and the name
-/// may be a live session's — an autogen collision is exactly that — so
+/// may be a live session's — a refused held name is exactly that — so
 /// only the destroy of the session that held it releases it. A withdrawal
 /// that cannot be made — no control socket, a daemon that predates the
 /// verb and refuses the line, the deadline — leaves the row published and
@@ -524,6 +524,11 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
 /// and its declared egress decided by no row the host gate (NET-081) reads,
 /// so the session does not start half-admitted. The error is the one line
 /// session start owes this failure.
+///
+/// `name` is the name the daemon will give the box (BOX-163): the one the
+/// person typed, else the spec's. The client mints none. A registration
+/// under a name a live row holds is refused, and the refusal ends the
+/// activation. Nothing re-registers it under another name.
 pub async fn register_box_for_activation(
     kind: paths::HostKind,
     minimal_dir: Option<&Path>,
@@ -696,96 +701,6 @@ async fn register_box_at(
              {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
              unregistered"
         ))),
-    }
-}
-
-/// [`register_box_for_activation`] for an activation whose session name may
-/// be autogen. The VM host daemon refuses a registration whose name folds
-/// to one a live row already holds; for an autogen `name` that refusal is a
-/// name collision like the create's, so the name is re-minted with `remint`
-/// and registered again, within the bounded budget
-/// ([`crate::box_name::should_retry_autogen`]) the `CreateSession`
-/// collision retry spends — `attempts` is shared with
-/// it. A refused registration publishes no row, so nothing is withdrawn
-/// between attempts. A user-supplied name, any other failure, and a spent
-/// budget surface the error unchanged. The refusal is matched across the
-/// whole error chain: the daemon's reason is its innermost cause.
-#[allow(clippy::too_many_arguments)]
-pub async fn register_box_reminting_autogen(
-    kind: paths::HostKind,
-    minimal_dir: Option<&Path>,
-    network: boxes::NetworkMode,
-    name: &mut String,
-    policy: &boxes::BoxPolicy,
-    autogen: bool,
-    attempts: &mut u32,
-    remint: impl FnMut() -> String,
-) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    let target = VmHost::Kind { kind, minimal_dir };
-    reminting_autogen(target, network, name, policy, autogen, attempts, remint).await
-}
-
-/// [`register_box_beside`] for a dashboard create whose session name may be
-/// autogen, re-minting a held autogen name exactly as
-/// [`register_box_reminting_autogen`] does for the CLI's activation.
-pub async fn register_box_beside_reminting_autogen(
-    ssh_sock: &Path,
-    network: boxes::NetworkMode,
-    name: &mut String,
-    policy: &boxes::BoxPolicy,
-    autogen: bool,
-    attempts: &mut u32,
-    remint: impl FnMut() -> String,
-) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    let target = VmHost::Beside(ssh_sock);
-    reminting_autogen(target, network, name, policy, autogen, attempts, remint).await
-}
-
-/// Where a registration finds the VM host daemon's control socket: by the
-/// host kind the CLI's daemon connection resolves through
-/// ([`register_box_for_activation`]), or beside the ssh socket a dashboard
-/// already holds ([`register_box_beside`]).
-#[derive(Clone, Copy)]
-enum VmHost<'a> {
-    Kind {
-        kind: paths::HostKind,
-        minimal_dir: Option<&'a Path>,
-    },
-    Beside(&'a Path),
-}
-
-/// The re-mint loop both registrations share: register under `name` on
-/// `target`, and on a refusal that reads as an autogen name collision
-/// within the budget, re-mint the name and register again.
-async fn reminting_autogen(
-    target: VmHost<'_>,
-    network: boxes::NetworkMode,
-    name: &mut String,
-    policy: &boxes::BoxPolicy,
-    autogen: bool,
-    attempts: &mut u32,
-    mut remint: impl FnMut() -> String,
-) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    loop {
-        let registered = match target {
-            VmHost::Kind { kind, minimal_dir } => {
-                register_box_for_activation(kind, minimal_dir, network, name, policy).await
-            }
-            VmHost::Beside(ssh_sock) => register_box_beside(ssh_sock, network, name, policy).await,
-        };
-        match registered {
-            Err(error)
-                if crate::box_name::should_retry_autogen(
-                    autogen,
-                    *attempts,
-                    &format!("{error:#}"),
-                ) =>
-            {
-                *attempts += 1;
-                *name = remint();
-            }
-            registered => return registered,
-        }
     }
 }
 
