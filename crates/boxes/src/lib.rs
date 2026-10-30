@@ -1783,18 +1783,27 @@ pub mod box_name {
         }
     }
 
-    /// The records `name` addresses: the exact matches when there are
-    /// any, else the matches under ASCII case folding.
+    /// The records `name` addresses: every record whose name folds to
+    /// `name` under ASCII case. A running holder blocks its name under
+    /// case folding (see [`running_holder`]), so resolution folds case
+    /// first and uses the exact case only to break a tie.
     #[must_use]
     pub fn candidates<'a>(boxes: &'a [NamedBox], name: &str) -> Vec<&'a NamedBox> {
-        let exact: Vec<&NamedBox> = boxes.iter().filter(|b| b.name == name).collect();
-        if !exact.is_empty() {
-            return exact;
-        }
         boxes
             .iter()
             .filter(|b| b.name.eq_ignore_ascii_case(name))
             .collect()
+    }
+
+    /// The records of `found` whose name is `name` in its exact case,
+    /// when there are any, else all of `found`.
+    fn prefer_exact<'a>(found: &[&'a NamedBox], name: &str) -> Vec<&'a NamedBox> {
+        let exact: Vec<&NamedBox> = found.iter().copied().filter(|b| b.name == name).collect();
+        if exact.is_empty() {
+            found.to_vec()
+        } else {
+            exact
+        }
     }
 
     /// The running box on this host, other than `except`, whose name
@@ -1820,18 +1829,27 @@ pub mod box_name {
 
     /// Resolves an unqualified name against one host (BOX-005): the
     /// running box of that name, else the most recently created box of
-    /// that name, else `None`. Two running boxes of one name are a store
-    /// that broke BOX-004, and resolve to neither.
+    /// that name, else `None`. Names match under ASCII case folding, so
+    /// a running `dev` answers for `Dev` even when a stopped `Dev`
+    /// exists. The exact case breaks a tie only: among the boxes that
+    /// do not run, the latest exact match wins over a folded one. Two
+    /// running boxes of one name are a store that broke BOX-004. They
+    /// resolve to the one in the exact case, else to neither.
     #[must_use]
     pub fn resolve_on_host(boxes: &[NamedBox], name: &str) -> Option<BoxId> {
         let found = candidates(boxes, name);
-        let mut running = found.iter().filter(|b| b.is_running());
-        match (running.next(), running.next()) {
-            (Some(one), None) => return Some(one.id),
-            (Some(_), Some(_)) => return None,
-            (None, _) => {}
+        let running: Vec<&NamedBox> = found.iter().copied().filter(|b| b.is_running()).collect();
+        match running.as_slice() {
+            [] => {}
+            [one] => return Some(one.id),
+            _ => {
+                return match prefer_exact(&running, name).as_slice() {
+                    [one] if one.name == name => Some(one.id),
+                    _ => None,
+                };
+            }
         }
-        latest(found).map(|b| b.id)
+        latest(prefer_exact(&found, name)).map(|b| b.id)
     }
 
     /// One box a name matched on one host, as a refusal lists it.
@@ -3422,17 +3440,19 @@ mod tests {
                 store in host_store(),
                 asked in prop_oneof![Just("dev"), Just("Dev"), Just("DEV"), Just("web"), Just("api")],
             ) {
-                let exact: Vec<&NamedBox> = store.iter().filter(|b| b.name == asked).collect();
-                let matched: Vec<&NamedBox> = if exact.is_empty() {
-                    store.iter().filter(|b| b.name.eq_ignore_ascii_case(asked)).collect()
-                } else {
-                    exact
-                };
+                // Case folds first: a running box of the folded name
+                // answers whatever the case of the stopped ones.
+                let folded: Vec<&NamedBox> =
+                    store.iter().filter(|b| b.name.eq_ignore_ascii_case(asked)).collect();
                 let running: Vec<&NamedBox> =
-                    matched.iter().copied().filter(|b| b.is_running()).collect();
+                    folded.iter().copied().filter(|b| b.is_running()).collect();
+                let exact: Vec<&NamedBox> =
+                    folded.iter().copied().filter(|b| b.name == asked).collect();
                 let want = match running.as_slice() {
                     [one] => Some(one.id),
-                    _ => matched.iter().map(|b| b.id).max(),
+                    // The exact case breaks the tie among retained boxes.
+                    _ if !exact.is_empty() => exact.iter().map(|b| b.id).max(),
+                    _ => folded.iter().map(|b| b.id).max(),
                 };
                 prop_assert_eq!(resolve_on_host(&store, asked), want);
             }

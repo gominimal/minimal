@@ -4022,6 +4022,19 @@ mod tests {
         set_state(&mut loader, &older, stopped());
         assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
 
+        // A stopped `Dev` does not hide a running `dev`: case folds
+        // first, and the running box answers for either case.
+        let upper = loader.create(named("Dev")).unwrap();
+        set_state(&mut loader, &upper, stopped());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+
+        // None runs: the exact case breaks the tie, then the latest wins.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(upper));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
         // The answer survives a restart, which rebuilds the index.
         drop(loader);
         let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
