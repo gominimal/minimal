@@ -191,6 +191,43 @@ pub struct Route {
     /// proxy's verdict and the relay's port gate stays the one derivation
     /// ([`super::switch::declared_ingress_ports`]).
     declared: Option<BTreeSet<u16>>,
+    /// The ports the target published at runtime (NET-044, NET-016): the
+    /// ports a `min net expose` decided `allow` and the ports a listener
+    /// published, read from the box's own relay gate when the name is
+    /// resolved ([`HostnameRegistry::resolve`]). The same set the gate admits
+    /// a direct connection on beside the declared ports, so the proxy's
+    /// verdict and the direct connection's read one published set
+    /// (NET-069, NET-071). Empty for a host-address box, whose route gates
+    /// nothing, and for a box with no live relay. A runtime port is the
+    /// same number outside and inside the box: an expose and a listen
+    /// publication both bind `port` to `port`.
+    runtime: BTreeSet<u16>,
+}
+
+/// Why a [`Route`] carries a port: what the proxy's per-request line names
+/// as the route source, and what a refusal line names when it carries none
+/// (NET-069).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSource {
+    /// The target's ingress declaration publishes the port.
+    Declared,
+    /// The target published the port at runtime: an expose or a listener.
+    Runtime,
+    /// The target is a host-address box, whose direct connections no gate
+    /// filters, so the route carries every port.
+    Ungated,
+}
+
+impl RouteSource {
+    /// The value the proxy's log lines carry in their `route_source` field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Runtime => "runtime",
+            Self::Ungated => "ungated",
+        }
+    }
 }
 
 /// The upstream a [`Route`] forwards to.
@@ -227,6 +264,7 @@ impl Route {
             target: Target::Loopback { address },
             session: session.into(),
             declared,
+            runtime: BTreeSet::new(),
         }
     }
 
@@ -247,6 +285,40 @@ impl Route {
             },
             session: session.into(),
             declared: Some(declared_keys(&ports)),
+            runtime: BTreeSet::new(),
+        }
+    }
+
+    /// This route with `runtime` as the ports its target published at
+    /// runtime (see [`Route::runtime`]). A host-address route gates no port,
+    /// so it keeps no runtime set: every port is open on it already.
+    #[must_use]
+    pub(crate) fn with_runtime(mut self, runtime: BTreeSet<u16>) -> Self {
+        if self.declared.is_some() {
+            self.runtime = runtime;
+        }
+        self
+    }
+
+    /// The ports the target published at runtime, as this route carries them
+    /// (see [`Route::runtime`]).
+    #[must_use]
+    pub fn runtime_ports(&self) -> &BTreeSet<u16> {
+        &self.runtime
+    }
+
+    /// Why this route carries `port`, or `None` when it does not: the
+    /// declaration publishes it, the target published it at runtime, or the
+    /// target is a host-address box that gates nothing. A declared port wins
+    /// over a runtime one with the same number, because the declared mapping
+    /// is the forward bound at that port.
+    #[must_use]
+    pub fn source(&self, port: u16) -> Option<RouteSource> {
+        match &self.declared {
+            None => Some(RouteSource::Ungated),
+            Some(declared) if declared.contains(&port) => Some(RouteSource::Declared),
+            Some(_) if self.runtime.contains(&port) => Some(RouteSource::Runtime),
+            Some(_) => None,
         }
     }
 
@@ -268,18 +340,21 @@ impl Route {
     /// forwards any port: its direct connections are ungated, so its proxied
     /// requests are too — while an own-address route with an empty set is a
     /// deny-all gate, the posture of a box that declared no ingress (NET-071).
+    /// A port the target published at runtime ([`Route::runtime_ports`]) is
+    /// carried too, at the same number: on a lease route the box's own port,
+    /// on a loopback route the forward the publish bound at the box's
+    /// published address (NET-044, NET-016).
     #[must_use]
     pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
-        if let Some(declared) = self.declared_ports()
-            && !declared.contains(&port)
-        {
-            return None;
-        }
-        match &self.target {
-            Target::Loopback { address } => Some(SocketAddr::new(IpAddr::V4(*address), port)),
-            Target::Lease { lease, ports } => {
+        let source = self.source(port)?;
+        match (&self.target, source) {
+            (Target::Loopback { address }, _) => Some(SocketAddr::new(IpAddr::V4(*address), port)),
+            (Target::Lease { lease, ports }, RouteSource::Declared | RouteSource::Ungated) => {
                 let internal = ports.get(&port).copied()?;
                 Some(SocketAddr::new(IpAddr::V4(*lease), internal))
+            }
+            (Target::Lease { lease, .. }, RouteSource::Runtime) => {
+                Some(SocketAddr::new(IpAddr::V4(*lease), port))
             }
         }
     }
@@ -1506,7 +1581,33 @@ impl HostnameRegistry {
         // the node's shared address keeps its name held, but nothing may be
         // forwarded there — the node's own listener at that port would answer
         // for the dead box.
-        route.filter(|route| !self.stopped_on_shared_address(route))
+        route
+            .filter(|route| !self.stopped_on_shared_address(route))
+            .map(|route| {
+                let runtime = self.runtime_published(&route);
+                route.with_runtime(runtime)
+            })
+    }
+
+    /// The ports `route`'s box published at runtime, read from its live relay
+    /// gate (NET-044, NET-016, NET-069): the ports a `min net expose` decided
+    /// `allow` and the ports a listener published — the set the gate admits
+    /// a direct connection on beside the declared ports. Read at resolve
+    /// time, so a publish is reachable through the proxy from the moment its
+    /// gate admits it, and a withdrawal is refused from the moment the gate
+    /// drops it, without a second copy of the set to keep in step. Empty for
+    /// a host-address route (it gates nothing), for a box that has reported
+    /// no lease, and for a box whose relay is gone.
+    fn runtime_published(&self, route: &Route) -> BTreeSet<u16> {
+        if route.declared_ports().is_none() {
+            return BTreeSet::new();
+        }
+        self.by_session
+            .get(route.session())
+            .and_then(|registration| self.own.get(&registration.id))
+            .and_then(|own| super::switch::live_gate(own.lease))
+            .map(|gate| gate.runtime_published_tcp())
+            .unwrap_or_default()
     }
 
     /// Whether `route`'s box is stopped while publishing on the node's shared
