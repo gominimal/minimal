@@ -364,6 +364,22 @@ Live execs: exec-1
         assert_eq!(find_listed_box(&ended, "reused").unwrap(), newer.box_id);
         let with_live = [older, live.clone(), latest];
         assert_eq!(find_listed_box(&with_live, "reused").unwrap(), live.box_id);
+        // The daemon treats names that differ only in case as one name, so
+        // a running `Dev` holds the name `dev` over a stopped `dev`.
+        let stopped_dev = entry(
+            "0199e0e0-0000-7000-8000-00000000000a",
+            Some("dev"),
+            "session",
+            "stopped",
+        );
+        let running_dev = entry(
+            "0199e0e0-0000-7000-8000-00000000000b",
+            Some("Dev"),
+            "session",
+            "running",
+        );
+        let cased = [running_dev.clone(), stopped_dev];
+        assert_eq!(find_listed_box(&cased, "dev").unwrap(), running_dev.box_id);
         // An id that is not listed still goes to the daemon, which answers
         // for it.
         let unlisted = "0199e0ff-0000-7000-8000-000000000009";

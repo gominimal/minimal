@@ -34,8 +34,8 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 }
 
 /// The id of the box `target` names in `listing`: a full id as given,
-/// else the box with that name, else the box with that name ignoring
-/// ASCII case, else the one box whose id starts with it. The id start is
+/// else the box with that name compared without ASCII case, as the daemon
+/// compares names, else the one box whose id starts with it. The id start is
 /// compared without dashes and ignoring case, as `min session attach`
 /// compares it. Several boxes can hold one name over time, so a name
 /// resolves to the running box that holds it, else to the most recent
@@ -47,16 +47,13 @@ pub(crate) fn find_listed_box(
     if let Ok(id) = boxes::SessionId::parse_str(target) {
         return Ok(id);
     }
-    let exact = |entry: &&minimald_rpc::BoxListingEntry| entry.name.as_deref() == Some(target);
     let folded = |entry: &&minimald_rpc::BoxListingEntry| {
         entry
             .name
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(target))
     };
-    let named = newest_named(listing.iter().filter(exact))
-        .or_else(|| newest_named(listing.iter().filter(folded)));
-    if let Some(id) = named {
+    if let Some(id) = newest_named(listing.iter().filter(folded)) {
         return Ok(id);
     }
     if is_id_prefix(target) {
