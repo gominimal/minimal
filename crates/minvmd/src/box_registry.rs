@@ -998,13 +998,16 @@ pub struct ClientBoxSpec {
 /// new registration takes its name; a row withdrawn at the end of its
 /// detach grace or its resume bound leaves the creation **dormant**
 /// (`standing: false`) for its creator to resume
-/// ([`BoxRegistry::resume_client_box`]). A creation, standing or dormant,
+/// ([`BoxRegistry::resume_client_box`]). A new registration under a
+/// dormant creation's name takes the name (BOX-004) and leaves the dormant
+/// creation **superseded** ([`Creations`]): still kept, still resumable by
+/// its box id once no live row holds the name. A creation, standing or dormant,
 /// keeps its addresses reserved: its switch and task addresses stay out of
 /// the hand-out book — taken again from a fresh book at reload — and its
 /// published loopback address stays the answerer's
 /// link for its name, so a resume finds every address its box was created
-/// with. Its creator's withdrawal releases them all. There is at most one
-/// creation per box name.
+/// with. Its creator's withdrawal releases them all. At most one creation
+/// per box name is the name's own; the others under it are superseded.
 ///
 /// The file format: one JSON object per creation in
 /// [`RegistryFile::boxes`], its fields named as here.
@@ -1068,8 +1071,51 @@ impl Creation {
     }
 }
 
+/// The client boxes' creations ([`Creation`]) a registry keeps. Each name
+/// has at most one creation of its own, keyed by the name's
+/// [`canonical_box_name`] form: the map this derefs to. `superseded`
+/// holds the dormant creations whose name a newer registration took
+/// (BOX-004). Each keeps its addresses and its box id, so its creator can
+/// resume it by that id once no live row holds the name, or withdraw it.
+#[derive(Debug, Default)]
+struct Creations {
+    by_name: BTreeMap<String, Creation>,
+    superseded: Vec<Creation>,
+}
+
+impl Creations {
+    /// Every kept creation: each name's own, then the superseded ones.
+    fn all(&self) -> impl Iterator<Item = &Creation> {
+        self.by_name.values().chain(self.superseded.iter())
+    }
+
+    /// Whether any kept creation, superseded ones included, is under the
+    /// name whose canonical form is `key`.
+    fn holds_name(&self, key: &str) -> bool {
+        self.by_name.contains_key(key)
+            || self
+                .superseded
+                .iter()
+                .any(|creation| canonical_box_name(&creation.name) == key)
+    }
+}
+
+impl std::ops::Deref for Creations {
+    type Target = BTreeMap<String, Creation>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
+    }
+}
+
+impl std::ops::DerefMut for Creations {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.by_name
+    }
+}
+
 /// The persisted registry ([`REGISTRY_FILE`]): its format version, then
-/// every creation the registry keeps.
+/// every creation the registry keeps, superseded ones included.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
@@ -1729,8 +1775,7 @@ impl Drop for RegistrationClaim {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResumeError {
     /// The registry keeps no creation under the name: the box was never
-    /// registered on this host, its creator withdrew it, or a newer
-    /// registration took the name.
+    /// registered on this host, or its creator withdrew it.
     #[error("no box {name:?} is registered on this host to resume")]
     NoCreation {
         /// The name the resume presented.
@@ -2913,7 +2958,7 @@ pub struct BoxRegistry {
     /// inside the row lock when both are held — a creation is inserted,
     /// ended, and marked dormant under the same write of the row lock
     /// that publishes or removes its row — and never the other way round.
-    creations: Arc<Mutex<BTreeMap<String, Creation>>>,
+    creations: Arc<Mutex<Creations>>,
     /// Where the creations are persisted ([`Self::persisting_to`]), when
     /// this registry persists at all: the supervisor's does, in its VM's
     /// state dir; a test's need not.
@@ -3173,7 +3218,7 @@ impl BoxRegistry {
             .collect();
         ids.extend(
             self.creations()
-                .values()
+                .all()
                 .map(|creation| box_id_hex(creation.id())),
         );
         ids.into_iter().collect()
@@ -3351,7 +3396,7 @@ impl BoxRegistry {
             egress_default_phase: crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE
                 .into_sessions_phase(),
             egress_deny_all_opt_out: false,
-            creations: Arc::new(Mutex::new(BTreeMap::new())),
+            creations: Arc::new(Mutex::new(Creations::default())),
             persisted_at: None,
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
@@ -3475,7 +3520,7 @@ impl BoxRegistry {
         let others_in_flight = generations
             .get(key)
             .map_or(0, |entry| entry.in_flight.saturating_sub(own));
-        if row_holds || others_in_flight > 0 || self.creations().contains_key(key) {
+        if row_holds || others_in_flight > 0 || self.creations().holds_name(key) {
             return false;
         }
         release();
@@ -3583,10 +3628,14 @@ impl BoxRegistry {
         loaded.sort_by_key(|creation| !creation.standing);
         for mut creation in loaded {
             let key = canonical_box_name(&creation.name);
-            if self.creations().contains_key(&key) {
+            // A second creation under a name is a superseded one (BOX-004)
+            // when it is dormant: it is kept, resumable by its box id. Two
+            // standing creations under one name cannot both have a row.
+            let superseded = self.creations().contains_key(&key);
+            if superseded && creation.standing {
                 tracing::warn!(
                     box = %creation.name,
-                    "the persisted box registry names a box twice; reloading the first only"
+                    "the persisted box registry names a running box twice; reloading the first only"
                 );
                 continue;
             }
@@ -3596,7 +3645,13 @@ impl BoxRegistry {
             // moment or an older run — would put two boxes at it, and the
             // one that resumes second would find its address held by the
             // first, as a duplicate switch address would.
-            if let Some(holder) = held_loopbacks.get(&creation.loopback_address) {
+            // A superseded creation can share its loopback address with the
+            // creation that took its name: the answerer keys that address by
+            // the name, and only one of them can have a row at a time.
+            if let Some(holder) = held_loopbacks
+                .get(&creation.loopback_address)
+                .filter(|holder: &&String| canonical_box_name(holder) != key)
+            {
                 tracing::warn!(
                     box = %creation.name,
                     held = %holder,
@@ -3617,10 +3672,16 @@ impl BoxRegistry {
                 );
                 continue;
             }
+            held_loopbacks
+                .entry(creation.loopback_address)
+                .or_insert_with(|| creation.name.clone());
+            if superseded {
+                self.creations().superseded.push(creation);
+                continue;
+            }
             if creation.standing {
                 creation.standing = self.reinstate(&creation, now);
             }
-            held_loopbacks.insert(creation.loopback_address, creation.name.clone());
             self.creations().insert(key, creation);
         }
         self.persist();
@@ -3692,7 +3753,7 @@ impl BoxRegistry {
         }
     }
 
-    fn creations(&self) -> MutexGuard<'_, BTreeMap<String, Creation>> {
+    fn creations(&self) -> MutexGuard<'_, Creations> {
         self.creations
             .lock()
             .expect("the creations' lock is never held across a panic")
@@ -3708,7 +3769,7 @@ impl BoxRegistry {
     #[must_use]
     pub fn dormant_creation_rows(&self) -> Vec<(String, Ipv4Addr)> {
         self.creations()
-            .values()
+            .all()
             .filter(|creation| !creation.standing)
             .map(|creation| (zone_name(&creation.name), creation.loopback_address))
             .collect()
@@ -3728,7 +3789,7 @@ impl BoxRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let file = RegistryFile {
             version: REGISTRY_FILE_VERSION,
-            boxes: self.creations().values().cloned().collect(),
+            boxes: self.creations().all().cloned().collect(),
         };
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
@@ -4136,24 +4197,30 @@ impl BoxRegistry {
         self.row_epoch.fetch_add(1, Ordering::Release);
         let created = creation.is_some();
         // BOX-004: a registration under a dormant creation's name takes the
-        // name over. The creation it replaces ends here, so nothing can
-        // resume it, and its reserved addresses go back.
+        // name over. The creation it replaces is superseded, not ended: it
+        // keeps its addresses and its id, so its creator can resume it by
+        // that id once no live row holds the name. A superseded creation
+        // that resumes is the name's own again.
         let replaced = creation.and_then(|creation| {
             let id = creation.id();
-            self.creations()
+            let mut creations = self.creations();
+            creations.superseded.retain(|kept| kept.id() != id);
+            let old = creations
                 .insert(canonical_box_name(&creation.name), creation)
-                .filter(|old| old.id() != id && !old.standing)
+                .filter(|old| old.id() != id && !old.standing)?;
+            let replaced = (old.name.clone(), old.id());
+            creations.superseded.push(old);
+            Some(replaced)
         });
         drop(rows);
-        if let Some(old) = &replaced {
+        if let Some((name, old_id)) = &replaced {
             tracing::info!(
-                box = %old.name,
-                replaced = %crate::bep_attach::BoxIdText(&old.id()),
+                box = %name,
+                replaced = %crate::bep_attach::BoxIdText(old_id),
                 by = %crate::bep_attach::BoxIdText(&record.box_id()),
-                "a new box took over a stopped box's name; the stopped box's creation ended \
-                 and its addresses went back"
+                "a new box took over a stopped box's name; the stopped box keeps its creation \
+                 and its addresses, and resumes by its box id once no running box holds the name"
             );
-            self.give_back_creation_addrs(old);
         }
         if created {
             self.persist();
@@ -4656,11 +4723,7 @@ impl BoxRegistry {
             return Ok(Some(IdHolder::LiveRow));
         }
         drop(rows);
-        if self
-            .creations()
-            .values()
-            .any(|creation| creation.id() == id)
-        {
+        if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
         }
         if self
@@ -4800,13 +4863,25 @@ impl BoxRegistry {
             let ended = {
                 let mut creations = self.creations();
                 let key = canonical_box_name(name);
-                let proven = creations.get(&key).is_some_and(|creation| {
+                let proves = |creation: &Creation| {
                     !creation.standing
                         && creation.switch_address == switch_addr
                         && creation.loopback_address == loopback_addr
                         && box_id.is_none_or(|asked| asked == creation.id())
-                });
-                if proven { creations.remove(&key) } else { None }
+                };
+                if creations.get(&key).is_some_and(proves) {
+                    creations.remove(&key)
+                } else {
+                    // A superseded creation (BOX-004) ends the same way:
+                    // its creator destroyed the stopped box.
+                    creations
+                        .superseded
+                        .iter()
+                        .position(|creation| {
+                            canonical_box_name(&creation.name) == key && proves(creation)
+                        })
+                        .map(|at| creations.superseded.remove(at))
+                }
             };
             drop(rows);
             // Its addresses were reserved for it while it was dormant; they
@@ -4903,9 +4978,15 @@ impl BoxRegistry {
     ) -> Result<Creation, ResumeError> {
         let creations = self.creations();
         let creation = box_id
-            .and_then(|asked| creations.values().find(|creation| creation.id() == asked))
+            .and_then(|asked| creations.all().find(|creation| creation.id() == asked))
             .or_else(|| creations.get(&canonical_box_name(name)))
             .cloned();
+        let superseded = creation.as_ref().is_some_and(|creation| {
+            creations
+                .superseded
+                .iter()
+                .any(|kept| kept.id() == creation.id())
+        });
         drop(creations);
         let Some(creation) = creation else {
             return Err(ResumeError::NoCreation {
@@ -4927,6 +5008,17 @@ impl BoxRegistry {
                 held_box_id: creation.id(),
                 asked_box_id: asked,
             });
+        }
+        // BOX-004: a superseded creation's name went to a newer box. Its
+        // box resumes only while no live row holds the name; a resume
+        // now would put two running boxes under one name.
+        if superseded && let Some(held) = self.held_name_for(&creation.name) {
+            tracing::info!(
+                box = %creation.name,
+                box_id = %crate::bep_attach::BoxIdText(&creation.id()),
+                "refused the resume of a stopped box: a running box holds its name"
+            );
+            return Err(AllocationError::NameAlreadyHeld { held }.into());
         }
         Ok(creation)
     }
@@ -8068,10 +8160,11 @@ mod tests {
 
     /// BOX-004: a dormant creation is a stopped box, and it holds no name.
     /// A registration under the name, in any spelling that folds to it,
-    /// takes the name over: it gets a row of its own under a new id, the
-    /// stopped box's creation ends, and its creator can no longer resume
-    /// or withdraw anything under the name. A later zone hold of the name
-    /// takes over the stopped box's hold too.
+    /// takes the name over: it gets a row of its own under a new id. The
+    /// stopped box keeps its creation and its addresses. Its resume by its
+    /// box id is refused while the new box's row stands, and is accepted
+    /// once that row is withdrawn. A later zone hold of the name takes over
+    /// the stopped box's hold too.
     #[test]
     fn reuse_of_a_stopped_name_takes_over_its_hold() {
         let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
@@ -8086,10 +8179,6 @@ mod tests {
         assert!(registry.hold_box_name("web", Some(stopped)));
         assert!(registry.withdraw(web.switch_addr()).is_some());
         assert!(registry.row_by_name("web").is_none(), "the row is gone");
-        assert!(
-            registry.live_box_ids().contains(&box_id_hex(web.box_id())),
-            "the dormant creation is kept"
-        );
 
         let new = registry
             .register_client_box(client_spec("WEB"))
@@ -8103,10 +8192,28 @@ mod tests {
             new.box_id()
         );
         assert!(
-            !registry.live_box_ids().contains(&box_id_hex(web.box_id())),
-            "the stopped box's creation ended"
+            registry.live_box_ids().contains(&box_id_hex(web.box_id())),
+            "the stopped box's creation is kept"
         );
         assert!(
+            log.contents()
+                .contains("a new box took over a stopped box's name"),
+            "the log says the name was taken over: {}",
+            log.contents()
+        );
+
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        assert_eq!(
             registry
                 .resumable(
                     "web",
@@ -8114,23 +8221,25 @@ mod tests {
                     web.loopback_addr(),
                     Some(web.box_id())
                 )
-                .is_err(),
-            "nothing resumes the stopped box's creation"
+                .map(|_| ()),
+            Err(ResumeError::Allocation(AllocationError::NameAlreadyHeld {
+                held: "WEB".to_string()
+            })),
+            "the stopped box does not resume while the new box's row stands"
         );
         assert_eq!(
-            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
-            Ok(None),
-            "the stopped box's pair withdraws nothing"
+            resume().map(|row| row.box_id()),
+            Err(ResumeError::Allocation(AllocationError::NameAlreadyHeld {
+                held: "WEB".to_string()
+            })),
+            "the refusal names the running box that holds the name"
         );
-        assert!(
-            registry.row_by_name("web").is_some(),
-            "the new box's row is untouched"
-        );
-        assert!(
-            log.contents()
-                .contains("a new box took over a stopped box's name"),
-            "the log says the name was taken over: {}",
-            log.contents()
+        assert_eq!(
+            registry
+                .row_by_name("web")
+                .expect("the new box's row is untouched")
+                .box_id(),
+            new.box_id()
         );
 
         assert!(
@@ -8140,6 +8249,25 @@ mod tests {
         assert!(
             registry.release_held_name("web", Some(reused)),
             "the hold is the new box's now"
+        );
+
+        assert!(registry.withdraw(new.switch_addr()).is_some());
+        let resumed = resume().expect("the stopped box resumes once no row holds its name");
+        assert_eq!(resumed.box_id(), web.box_id(), "under its own id");
+        assert_eq!(resumed.switch_addr(), web.switch_addr());
+        assert_eq!(resumed.loopback_addr(), web.loopback_addr());
+        assert!(
+            registry.live_box_ids().contains(&box_id_hex(new.box_id())),
+            "the new box, stopped now, keeps its creation in turn"
+        );
+        assert_eq!(
+            registry.withdraw_client_box("WEB", new.switch_addr(), new.loopback_addr(), None),
+            Ok(None),
+            "the new box's creator can destroy its stopped box"
+        );
+        assert!(
+            !registry.live_box_ids().contains(&box_id_hex(new.box_id())),
+            "the destroy ends the new box's creation"
         );
     }
 
