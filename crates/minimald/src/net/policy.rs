@@ -596,11 +596,42 @@ pub fn host_ports_in_use(
         .filter(|mapping| mapping.proto == boxes::IpProto::Tcp)
         .map(|mapping| mapping.external_port)
         .filter(|port| !yielded.contains(port))
-        .filter(|&port| {
-            std::net::TcpListener::bind((published, port))
-                .is_err_and(|e| e.kind() == io::ErrorKind::AddrInUse)
-        })
+        .filter(|&port| port_held_at(published, port))
         .collect()
+}
+
+/// How many times [`port_held_at`] binds a port before it reports the port
+/// held.
+const PORT_HELD_BINDS: u32 = 3;
+const _: () = assert!(PORT_HELD_BINDS > 1, "one failed bind is not enough");
+
+/// The pause between two binds of [`port_held_at`].
+const PORT_HELD_RETRY: Duration = Duration::from_millis(20);
+
+/// Whether another process holds `port` at `address`: every one of
+/// [`PORT_HELD_BINDS`] binds, [`PORT_HELD_RETRY`] apart, fails with
+/// `EADDRINUSE`. A single failed bind is not enough, because a parallel
+/// probe of the same port holds it for the moment of its own bind. A real
+/// holder fails every bind. The first bind that succeeds, or fails for any
+/// other reason, ends the probe at once, so a free port costs no pause.
+fn port_held_at(address: Ipv4Addr, port: u16) -> bool {
+    port_held_by(|| std::net::TcpListener::bind((address, port)).map(drop))
+}
+
+/// [`port_held_at`]'s rule over any `bind`, so a test can fail chosen
+/// binds in turn without racing a listener's release.
+fn port_held_by(mut bind: impl FnMut() -> io::Result<()>) -> bool {
+    for attempt in 1..=PORT_HELD_BINDS {
+        match bind() {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                if attempt < PORT_HELD_BINDS {
+                    std::thread::sleep(PORT_HELD_RETRY);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The error [`apply_ingress`] returns for a declared port that something
@@ -932,6 +963,13 @@ pub enum ExposeRefusal {
         owner: super::listeners::PublicationOwner,
         pending: bool,
     },
+    /// The port is published already for this box by its own listening
+    /// process (NET-016): the publication stands, its gate admits the port,
+    /// and it is listed at `local`. The request's goal is met, not refused,
+    /// so the in-box caller hears this as a plain message and exits 0. The
+    /// request publishes nothing of its own: the publication stays the
+    /// listener's, and it is withdrawn when the listener closes (NET-017).
+    ListenPublished { port: u16, local: SocketAddr },
     /// The box shares the host's network (`host_ip`), so the port already
     /// answers on the host and there is nothing to publish. The request's
     /// goal is met, not refused, so the in-box caller hears this as a plain
@@ -995,6 +1033,11 @@ impl ExposeRefusal {
             // The same words for an allow-stance and an ask-stance box: the
             // range refused the port before any prompt (NET-047).
             Self::OutOfRange { .. } => format!("{self}. Nothing was published."),
+            // The listener's publication is the one standing, so the
+            // caller hears how long it lasts: it is not the request's own.
+            Self::ListenPublished { .. } => {
+                format!("{self}. It is unpublished when that process stops listening on it.")
+            }
             _ => self.to_string(),
         }
     }
@@ -1051,6 +1094,11 @@ impl fmt::Display for ExposeRefusal {
                 };
                 write!(f, "port {port} {state} by this box ({})", owner.as_str())
             }
+            Self::ListenPublished { port, local } => write!(
+                f,
+                "port {port} is published already at {local}, because a process in this box \
+                 is listening on it"
+            ),
             Self::NeedsNoExposing { port, .. } => write!(
                 f,
                 "port {port} needs no exposing: this box shares the host's network"
@@ -2142,6 +2190,18 @@ mod tests {
             }
             .for_caller("web", NetworkMode::OwnIp, 3001),
             "port 3001 is being published by this box (listen)"
+        );
+        // A port the box's own listener published is the goal met: the
+        // line says where it answers, and that the publication is the
+        // listener's, which goes when the listener does.
+        assert_eq!(
+            ExposeRefusal::ListenPublished {
+                port: 3001,
+                local: SocketAddr::from(([127, 0, 64, 9], 3001)),
+            }
+            .for_caller("web", NetworkMode::OwnIp, 3001),
+            "port 3001 is published already at 127.0.64.9:3001, because a process in this \
+             box is listening on it. It is unpublished when that process stops listening on it."
         );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(
@@ -3377,14 +3437,16 @@ mod tests {
 
     // ---- a host port another process already holds (reported as EADDRINUSE) --
     mod host_port_in_use {
+        use std::io;
         use std::net::Ipv4Addr;
 
         use tokio::io::AsyncWriteExt as _;
         use tokio::net::UnixListener;
 
         use super::super::{
-            ControlChannel, IngressPolicy, PortMapping, apply_declared, apply_ingress,
-            host_ports_in_use, is_address_in_use, port_in_use_refusal,
+            ControlChannel, IngressPolicy, PORT_HELD_BINDS, PORT_HELD_RETRY, PortMapping,
+            apply_declared, apply_ingress, host_ports_in_use, is_address_in_use, port_held_by,
+            port_in_use_refusal,
         };
         use super::forwarder_probe::read_request;
 
@@ -3621,6 +3683,56 @@ mod tests {
                 host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]).is_empty(),
                 "a UDP mapping is not probed with a TCP bind"
             );
+        }
+
+        /// A port held only for a moment, as a parallel probe of the same
+        /// port holds it, is not reported: the probe binds again before it
+        /// names the port. A port held across every bind still is.
+        #[test]
+        fn a_port_held_only_for_a_moment_is_not_reported() {
+            let native = ControlChannel::Unix("/nonexistent/gvproxy.sock".into());
+            let in_use = || Err(io::Error::from(io::ErrorKind::AddrInUse));
+            for free_at in 2..=PORT_HELD_BINDS {
+                let mut binds = 0;
+                assert!(
+                    !port_held_by(|| {
+                        binds += 1;
+                        if binds < free_at { in_use() } else { Ok(()) }
+                    }),
+                    "a port freed by bind {free_at} is not held by another program"
+                );
+                assert_eq!(
+                    binds, free_at,
+                    "the probe stops at the first bind that succeeds"
+                );
+            }
+            let mut binds = 0;
+            assert!(
+                port_held_by(|| {
+                    binds += 1;
+                    in_use()
+                }),
+                "a port that refuses every bind is held"
+            );
+            assert_eq!(
+                binds, PORT_HELD_BINDS,
+                "the probe binds before it names a held port"
+            );
+
+            let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = held.local_addr().unwrap().port();
+            let declared = ingress(&[port]);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                host_ports_in_use(&native, Ipv4Addr::LOCALHOST, &declared, &[]),
+                [port],
+                "a port held across every bind is still reported"
+            );
+            assert!(
+                started.elapsed() >= PORT_HELD_RETRY * (PORT_HELD_BINDS - 1),
+                "the probe binds again before it names a held port"
+            );
+            drop(held);
         }
 
         /// Only the OS's own words get the taken-port error: any other
