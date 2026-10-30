@@ -1065,10 +1065,16 @@ impl BoxActor {
                 // stays the listener's, to be withdrawn when the listener
                 // closes (NET-017). A pending listen reservation, or one
                 // committed unlisted because its record was refused, is not
-                // reachable yet, so it stays the refusal below.
+                // reachable yet, so it stays the refusal below. So does one
+                // whose listener is closing: its withdrawal refuses the port
+                // at the gate before its row leaves the set, and keeps the
+                // row across a failed unexpose's retries.
+                let admitted = crate::net::switch::live_gate(switch_address)
+                    .is_none_or(|gate| gate.admits_tcp(port));
                 if let Some(local) = self
                     .publications
                     .listen_row(port)
+                    .filter(|_| admitted)
                     .and_then(|row| row.local.parse().ok())
                 {
                     return Err(ExposeFailure::Refused(ExposeRefusal::ListenPublished {

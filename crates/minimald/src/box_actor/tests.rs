@@ -11944,6 +11944,20 @@ async fn expose_on_listen_published_port_answers_published_already() {
     assert_eq!(records[0]["decided_by"], "box-policy");
     assert_eq!(records[0]["outcome"], "published");
 
+    // A closing listener's withdrawal refuses the port at the gate before
+    // its row leaves the set. In that gap the expose is not answered as
+    // published: the port is not reachable, so it is the refusal. The
+    // relay publishes its gate under the box's switch address at spawn;
+    // this harness has no relay, so the test publishes the plan's gate.
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    gate.withdraw_published(port);
+    match handle.expose_dynamic(port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished { port: asked, .. },
+        )) => assert_eq!(asked, port),
+        other => panic!("a withdrawing listen's port is not published: {other:?}"),
+    }
+
     // The listener closes: the watcher withdraws its publication (NET-017),
     // the gate stops admitting the port, and no row is left — the expose
     // held nothing that outlives the listener.
