@@ -833,18 +833,25 @@ pub(crate) struct NameMarker {
     registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
     /// The stable id of the session whose box's name is marked.
     session_id: boxes::SessionId,
+    /// The host launch this marker's host belongs to
+    /// ([`crate::net::dns::HostnameRegistry::begin_host_launch`]). The stop
+    /// mark carries it, so a replaced host cannot mark a newer host's box
+    /// stopped (NET-070).
+    launch: u64,
 }
 
 #[cfg(target_os = "linux")]
 impl NameMarker {
-    /// Marks one session's box name, in one registry.
+    /// Marks one session's box name, in one registry, for one host launch.
     pub(crate) fn new(
         registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
         session_id: boxes::SessionId,
+        launch: u64,
     ) -> Self {
         Self {
             registry,
             session_id,
+            launch,
         }
     }
 
@@ -862,11 +869,12 @@ impl NameMarker {
     /// box is never mistaken for one that never existed — but a name it
     /// shares with the node answers NODATA until a host runs again, so the
     /// node's own listener at that port is not spoken for by a dead box.
+    /// A host that a newer launch replaced changes nothing here.
     pub(crate) fn mark_stopped(&self) {
         self.registry
             .write()
             .expect("hostname registry lock poisoned")
-            .mark_stopped(self.session_id);
+            .mark_host_stopped(self.session_id, self.launch);
     }
 }
 
