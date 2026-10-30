@@ -423,7 +423,16 @@ enum Target {
     /// an `OwnIp` box's published-loopback forwarder, where the requested
     /// port is the published external one and `address` is the host loopback
     /// address a creator handed the box's own ports to publish at (NET-010).
-    Loopback { address: Ipv4Addr },
+    /// `dial` is where the proxy connects for it when that is not `address`:
+    /// on a VM node `address` is the node's address on the *host* loopback,
+    /// where the host's forwarder mirrors the guest's listeners (NET-129).
+    /// The proxy runs in the guest beside those listeners, so it dials them
+    /// at the guest's own `127.0.0.1` wherever the node's address moves
+    /// (#2748). `None` dials `address`.
+    Loopback {
+        address: Ipv4Addr,
+        dial: Option<Ipv4Addr>,
+    },
     /// An `OwnIp` box at its lease on the switch (a VM host): the daemon is on
     /// the switch, so a request reaches the box itself instead of the guest
     /// loopback. `ports` is the box's ingress declaration as an
@@ -446,7 +455,10 @@ impl Route {
         declared: Option<BTreeSet<u16>>,
     ) -> Self {
         Self {
-            target: Target::Loopback { address },
+            target: Target::Loopback {
+                address,
+                dial: None,
+            },
             session: session.into(),
             declared,
             runtime: BTreeSet::new(),
@@ -533,7 +545,9 @@ impl Route {
     pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
         let source = self.source(port)?;
         match (&self.target, source) {
-            (Target::Loopback { address }, _) => Some(SocketAddr::new(IpAddr::V4(*address), port)),
+            (Target::Loopback { address, dial }, _) => {
+                Some(SocketAddr::new(IpAddr::V4(dial.unwrap_or(*address)), port))
+            }
             (Target::Lease { lease, ports }, RouteSource::Declared | RouteSource::Ungated) => {
                 let internal = ports.get(&port).copied()?;
                 Some(SocketAddr::new(IpAddr::V4(*lease), internal))
@@ -560,7 +574,7 @@ impl Route {
     #[must_use]
     pub fn address(&self) -> Ipv4Addr {
         match &self.target {
-            Target::Loopback { address } => *address,
+            Target::Loopback { address, .. } => *address,
             Target::Lease { lease, .. } => *lease,
         }
     }
@@ -572,7 +586,7 @@ impl Route {
     /// host-loopback fact and never carries the node's address, and a box's
     /// own granted address is not the node's either.
     pub(crate) fn repoint(&mut self, from: Ipv4Addr, to: Ipv4Addr) {
-        if let Target::Loopback { address } = &mut self.target
+        if let Target::Loopback { address, .. } = &mut self.target
             && *address == from
         {
             *address = to;
@@ -635,11 +649,31 @@ struct OwnPublished {
     ports: BTreeSet<u16>,
 }
 
+/// A box's publish moved to a new address (#2748): the present landing moved
+/// it off the `127.0.0.1` interim ([`HostnameRegistry::hand_over_moved_publish`]).
+/// Sent as data so the receiver can bind the box's declared ports at the new
+/// address and move the forwards its runtime `min net expose` bound at the
+/// old one, while the box runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishMove {
+    /// The session whose box moved.
+    pub holder: SessionId,
+    /// The address the box published at before the move.
+    pub from: Ipv4Addr,
+    /// The address the box publishes at now.
+    pub to: Ipv4Addr,
+    /// The declared ports the box holds at `to`, one hand-over each: a port
+    /// another box holds there is left out, since the box yields it.
+    pub hand_overs: Vec<PortHandOver>,
+}
+
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
 /// the box created earliest among the running boxes still publishing it
-/// there took it — or among the stopped ones, when none is running.
-/// Returned as data so the caller can bind the new holder's forward.
+/// there took it — or among the stopped ones, when none is running. The
+/// present landing makes one too, for a box it moved off the `127.0.0.1`
+/// interim, and sends it inside the move ([`PublishMove`]). Returned as data
+/// so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
     /// The session whose box holds the port now.
@@ -687,13 +721,14 @@ pub struct InterimPublish {
 /// egress rules its own outbound frames are decided by — the same rules a
 /// request from it is put to, exactly as a direct connection from it would be
 /// ([`super::switch::proxied_request_verdict`]). Named by the
-/// lease-to-session map ([`HostnameRegistry::by_lease`]), so only a box on the
-/// switch is ever a caller: a host-side client has no declaration to honour
-/// and no gate of its own on a direct connection either.
+/// lease-to-session map ([`HostnameRegistry::by_lease`]) for a box on the
+/// switch, and by the box that owns the connecting socket for a host-address
+/// box ([`HostnameRegistry::caller_owning`]). A host-side client is no
+/// caller: it has no declaration to honour.
 #[derive(Debug, Clone)]
 pub struct Caller {
-    /// The switch lease the caller's box holds: the address its proxied
-    /// connections come from, and the address a refusal log names it by.
+    /// The address the caller's proxied connections come from: the switch
+    /// lease its box holds, or the node's address for a host-address box.
     lease: Ipv4Addr,
     /// The caller's session name, for the refusal log.
     name: String,
@@ -843,6 +878,12 @@ pub struct HostnameRegistry {
     /// box runs ([`Self::notify_hand_overs`]). `None` leaves a hand-over a
     /// change of record alone, bound at the new holder's next attach.
     hand_overs: Option<tokio::sync::mpsc::UnboundedSender<PortHandOver>>,
+    /// Where each move of a box's publish is sent
+    /// ([`Self::hand_over_moved_publish`]), for the sessions manager to move
+    /// the forwards the box's `min net expose` bound while its box runs
+    /// ([`Self::notify_publish_moves`]). `None` leaves those forwards where
+    /// they are until the box's spawn ends.
+    publish_moves: Option<tokio::sync::mpsc::UnboundedSender<PublishMove>>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
     /// whether the publish lands at it or at the `127.0.0.1` interim — a
@@ -863,6 +904,20 @@ pub struct HostnameRegistry {
     /// the node's own listener at that port keeps answering and the stopped
     /// box is not silently impersonated by it.
     stopped: HashSet<SessionId>,
+    /// Stopped boxes whose host launch has started and has not reached
+    /// [`Self::mark_running`] yet ([`Self::begin_host_launch`]). The launch
+    /// can start the box's processes before the host's loop clears `stopped`,
+    /// so [`Self::has_unleased_callers`] counts a box with this mark as live
+    /// (NET-070).
+    launching: HashSet<SessionId>,
+    /// Each box's current host launch number ([`Self::begin_host_launch`]).
+    /// A host loop that a newer launch replaced holds an older number, so its
+    /// late stop mark ([`Self::mark_host_stopped`]) changes nothing (NET-070).
+    host_launches: HashMap<SessionId, u64>,
+    /// The last launch number [`Self::begin_host_launch`] gave out. One
+    /// counter for every box, so a number never repeats, even for a box id
+    /// that [`Self::forget_own_address`] forgot and a later attach reuses.
+    last_host_launch: u64,
     /// box name → the route a host-side proxy forwards its requests on.
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
@@ -874,6 +929,17 @@ pub struct HostnameRegistry {
     /// Recorded by [`Self::register_caller`] at hostname registration, before
     /// the box has a lease, so the join is ready the moment it attaches.
     callers: HashMap<SessionId, CallerFacts>,
+    /// The sessions registered as `HostNet` boxes
+    /// ([`Self::register_host_net`]): they hold no switch lease by design, so
+    /// a caller fact without a lease is an unreported own-address lease only
+    /// for a session that is not in this set (NET-070).
+    host_net: HashSet<SessionId>,
+    /// The own-address boxes whose attach is running and has not reported
+    /// its switch lease yet ([`Self::begin_lease_attach`]). Only these make
+    /// [`Self::has_unreported_lease_callers`] true: a box created and never
+    /// started, or stopped, has no attach in flight and connects from no
+    /// lease at all (NET-070).
+    attaching: HashSet<SessionId>,
     /// The lease-to-session map that names a caller (NET-070): the switch
     /// address a proxied request's peer resolves to a session with. Reserved
     /// switch addresses never appear in it — the switch hands a PTask a lease
@@ -914,12 +980,18 @@ impl HostnameRegistry {
             own_holders: HashMap::new(),
             own_bound: HashMap::new(),
             hand_overs: None,
+            publish_moves: None,
             hands: HashMap::new(),
             stopped: HashSet::new(),
+            launching: HashSet::new(),
+            host_launches: HashMap::new(),
+            last_host_launch: 0,
             by_host: HashMap::new(),
             by_session: HashMap::new(),
             own: HashMap::new(),
             callers: HashMap::new(),
+            host_net: HashSet::new(),
+            attaching: HashSet::new(),
             by_lease: HashMap::new(),
         }
     }
@@ -943,10 +1015,24 @@ impl HostnameRegistry {
         self.hand_overs = Some(sender);
     }
 
+    /// Sends every move of a box's publish from here on to `sender`
+    /// (#2748): the receiver moves the forwards the box's runtime
+    /// `min net expose` bound at the old address, if its box is running.
+    /// The send never waits, so the registry's lock is held no longer for
+    /// it.
+    pub fn notify_publish_moves(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<PublishMove>,
+    ) {
+        self.publish_moves = Some(sender);
+    }
+
     /// The box holding `port` at `address` of record (NET-129), declared or
     /// dynamic — what a proof reads where [`Self::holds_shared_port`], which
-    /// also asks for a declared publish, cannot see a dynamic holder.
-    #[cfg(test)]
+    /// also asks for a declared publish, cannot see a dynamic holder, and
+    /// what the listen watcher reads before it moves a port to a new
+    /// address (#2748).
+    #[must_use]
     pub(crate) fn shared_port_holder(&self, address: Ipv4Addr, port: u16) -> Option<SessionId> {
         self.own_holders.get(&(address, port)).copied()
     }
@@ -962,6 +1048,55 @@ impl HostnameRegistry {
                 .own_published
                 .get(&session_id)
                 .is_some_and(|own| own.address == address && own.ports.contains(&port))
+    }
+
+    /// Sends the move of the box `session_id`'s publish from `from` to the
+    /// address it publishes at now (NET-123 §7.1, #2748), with one hand-over
+    /// per declared port it holds there, and returns the hand-overs. The
+    /// present landing calls it for each box it moves off the `127.0.0.1`
+    /// interim: a box that runs has its forwards bound at the interim, so
+    /// the name would answer at an address no forward listens on. A port
+    /// another box holds at the address is left out: the box yields it.
+    ///
+    /// The move goes to [`Self::notify_publish_moves`]'s receiver, never to
+    /// [`Self::notify_hand_overs`]'s. The receiver passes it on only to a
+    /// box whose actor runs, which binds each declared port at the new
+    /// address and moves the forwards its `min net expose` bound at `from`.
+    /// A box with no actor gets nothing and binds at the new address at its
+    /// next attach. The listen watcher reads the box's published address
+    /// here on every poll, and moves the ports it published itself.
+    pub fn hand_over_moved_publish(
+        &self,
+        session_id: SessionId,
+        from: Ipv4Addr,
+    ) -> Vec<PortHandOver> {
+        let Some(own) = self.own_published.get(&session_id) else {
+            return Vec::new();
+        };
+        let hand_overs: Vec<PortHandOver> = own
+            .ports
+            .iter()
+            .filter(|&&port| self.holds_shared_port(session_id, own.address, port))
+            .map(|&port| PortHandOver {
+                holder: session_id,
+                address: own.address,
+                port,
+            })
+            .collect();
+        if own.address != from
+            && let Some(sender) = &self.publish_moves
+        {
+            // A receiver that is gone moves nothing: the box binds its
+            // declared ports at the new address at its next attach, and its
+            // runtime forwards come down with its spawn.
+            drop(sender.send(PublishMove {
+                holder: session_id,
+                from,
+                to: own.address,
+                hand_overs: hand_overs.clone(),
+            }));
+        }
+        hand_overs
     }
 
     /// Sets the node's host loopback address once the answerer granted it —
@@ -1048,12 +1183,20 @@ impl HostnameRegistry {
     /// rejects one on every network mode but `own_ip` — and a direct
     /// connection to it is ungated, so the proxy gates nothing either
     /// (NET-071).
+    ///
+    /// On a VM node (`on_switch`) the name answers at the node's host-side
+    /// address, where the host mirrors the guest's listeners, and the proxy,
+    /// which runs in the guest, dials those listeners at the guest's own
+    /// `127.0.0.1` (#2748).
     pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
-        self.register(
-            session_id,
-            session_name,
-            Route::loopback(session_name, self.node, None),
-        )
+        self.host_net.insert(session_id);
+        let mut route = Route::loopback(session_name, self.node, None);
+        if self.on_switch
+            && let Target::Loopback { dial, .. } = &mut route.target
+        {
+            *dial = Some(Ipv4Addr::LOCALHOST);
+        }
+        self.register(session_id, session_name, route)
     }
 
     /// Registers an `OwnIp` PTask's box name at the address its declaration
@@ -1123,8 +1266,9 @@ impl HostnameRegistry {
     /// carry (NET-084) and the two surfaces decide by one rule set (NET-071).
     /// `None` when the lease names no session — which is what a host-side
     /// caller (the developer's browser, the daemon's own lanes) is, and what a
-    /// host-address session is too: neither has a box on the switch, and
-    /// neither's egress is gated on a direct connection either.
+    /// host-address session is too: neither has a box on the switch. A
+    /// host-address box is named by the socket it connects from instead
+    /// ([`Self::caller_owning`]).
     #[must_use]
     pub fn caller_at(&self, lease: Ipv4Addr) -> Option<Caller> {
         let id = self.by_lease.get(&lease)?;
@@ -1139,6 +1283,108 @@ impl HostnameRegistry {
                 facts.hostname_proxy_port,
             ),
         })
+    }
+
+    /// The caller a connection from the node's address stands for
+    /// (NET-070): the live host-address box `owner`, which owns the
+    /// connecting socket ([`connecting_box`]), with its egress rules compiled
+    /// with `from`, the address the connection came from, as their source.
+    /// A host-address box holds no switch lease, so [`Self::caller_at`]
+    /// cannot name it. `None` when `owner` has no caller facts, or when it is
+    /// an own-address box, whose connections come from its lease. The proxy
+    /// refuses a connection that this returns `None` for: the kernel named a
+    /// box, so the connection is not a host-side client's, and an unknown box
+    /// is denied by default.
+    #[must_use]
+    pub fn caller_owning(&self, owner: SessionId, from: Ipv4Addr) -> Option<Caller> {
+        if self.own.contains_key(&owner) || self.by_lease.values().any(|id| *id == owner) {
+            return None;
+        }
+        let facts = self.callers.get(&owner)?;
+        Some(Caller {
+            lease: from,
+            name: facts.name.clone(),
+            egress: super::switch::compiled_egress(
+                Some(&facts.policy),
+                facts.subnet,
+                from,
+                facts.hostname_proxy_port,
+            ),
+        })
+    }
+
+    /// Whether any live session with caller facts holds no switch lease: a
+    /// host-address box, or a box whose lease is not reported yet. While
+    /// none does, no connection from the node's address can be a box's, so
+    /// the proxy does not look up who owns the connecting socket. A stopped
+    /// box ([`Self::mark_stopped`]) is not live: it keeps its caller facts
+    /// until destroy, but it runs nothing that can connect, so it does not
+    /// count until [`Self::begin_host_launch`] or [`Self::mark_running`].
+    /// A launching box with no own address and no lease counts whether or
+    /// not it has caller facts: an ended box brought up for its destroy hooks
+    /// can have none, and the proxy refuses its connections as unattributed
+    /// rather than pass them as no box's (NET-070, design §7.1).
+    #[must_use]
+    pub fn has_unleased_callers(&self) -> bool {
+        let unleased =
+            |id: &SessionId| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id);
+        self.callers
+            .keys()
+            .any(|id| !self.stopped.contains(id) && unleased(id))
+            || self.launching.iter().any(unleased)
+    }
+
+    /// Whether any own-address box is attaching and has not reported its
+    /// switch lease yet: it sits between [`Self::begin_lease_attach`] at the
+    /// start of its attach and [`Self::report_own_address`] at the end of it.
+    /// Its connections come from a lease this node does not hold, so
+    /// [`connecting_box`] answers [`ConnectingOwner::OffNode`] for them. While
+    /// this is true, the proxy cannot tell such a peer from a host-side client
+    /// off the node, and it refuses the peer as unattributed (NET-070, design
+    /// §7.1). A box that is registered but not attaching does not count: it
+    /// runs nothing that can connect.
+    #[must_use]
+    pub fn has_unreported_lease_callers(&self) -> bool {
+        self.attaching.iter().any(|id| !self.host_net.contains(id))
+    }
+
+    /// Marks `session_id` as an own-address box whose attach has started and
+    /// whose switch lease is not reported yet (NET-070). The mark ends at
+    /// [`Self::report_own_address`], at [`Self::end_lease_attach`] when the
+    /// attach fails or is abandoned, at [`Self::mark_stopped`] and at
+    /// [`Self::forget_own_address`].
+    pub fn begin_lease_attach(&mut self, session_id: SessionId) {
+        self.attaching.insert(session_id);
+    }
+
+    /// Marks `session_id` as a box whose host launch has started (NET-070).
+    /// A resumed box can run processes before its host's loop calls
+    /// [`Self::mark_running`], so from this mark the box counts as live for
+    /// [`Self::has_unleased_callers`], stopped or not. The mark ends at
+    /// [`Self::mark_running`], at [`Self::mark_stopped`], at
+    /// [`Self::forget_own_address`] and at [`Self::end_host_launch`] when the
+    /// launch fails.
+    ///
+    /// Returns this launch's number, which becomes the box's current launch.
+    /// The host's loop passes it to [`Self::mark_host_stopped`], so the loop
+    /// of a host this launch replaced cannot mark the new host's box stopped.
+    pub fn begin_host_launch(&mut self, session_id: SessionId) -> u64 {
+        self.last_host_launch += 1;
+        self.host_launches.insert(session_id, self.last_host_launch);
+        self.launching.insert(session_id);
+        self.last_host_launch
+    }
+
+    /// Ends the launch mark [`Self::begin_host_launch`] set, for a launch
+    /// that failed (NET-070).
+    pub fn end_host_launch(&mut self, session_id: SessionId) {
+        self.launching.remove(&session_id);
+    }
+
+    /// Ends the attach mark [`Self::begin_lease_attach`] set, for an attach
+    /// that failed or was abandoned before it reported a lease (NET-070).
+    pub fn end_lease_attach(&mut self, session_id: SessionId) {
+        self.attaching.remove(&session_id);
     }
 
     /// The own-address publishes standing inside the reserved local range, as
@@ -1305,6 +1551,7 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
+        self.attaching.remove(&session_id);
         // Recorded before the route is derived from it, so the route this
         // registration installs already targets the lease it is reporting:
         // [`Self::own_route`] reads the box's lease from this map, and a box
@@ -1331,6 +1578,10 @@ impl HostnameRegistry {
             self.by_lease.remove(&own.lease);
         }
         self.callers.remove(&session_id);
+        self.host_net.remove(&session_id);
+        self.attaching.remove(&session_id);
+        self.launching.remove(&session_id);
+        self.host_launches.remove(&session_id);
         self.stopped.remove(&session_id);
     }
 
@@ -1719,6 +1970,7 @@ impl HostnameRegistry {
     /// state every box is in from finalize, so a caller that never saw a stop
     /// changes nothing (NET-011).
     pub fn mark_running(&mut self, session_id: SessionId) {
+        self.launching.remove(&session_id);
         if self.stopped.remove(&session_id) {
             tracing::info!(
                 session_id = %session_id,
@@ -1728,6 +1980,27 @@ impl HostnameRegistry {
         }
     }
 
+    /// Marks a box's host as stopped from the loop of the host that `launch`
+    /// started ([`Self::begin_host_launch`]), as [`Self::mark_stopped`] does.
+    /// A loop that a newer launch replaced can end after that launch, so a
+    /// `launch` older than the box's current launch changes nothing: the box
+    /// stays live for [`Self::has_unleased_callers`] (NET-070, design §7.1).
+    pub fn mark_host_stopped(&mut self, session_id: SessionId, launch: u64) {
+        if let Some(&current) = self.host_launches.get(&session_id)
+            && launch < current
+        {
+            tracing::debug!(
+                session_id = %session_id,
+                launch,
+                current,
+                action = "stale-host-stop-ignored",
+                "a replaced host's loop ended; its stop mark is ignored"
+            );
+            return;
+        }
+        self.mark_stopped(session_id);
+    }
+
     /// Marks a box's host as stopped (NET-128). The name stays **held** — a
     /// stopped box is never mistaken for one that never existed, so the zone
     /// never says NXDOMAIN for it — but a name it shares with the node answers
@@ -1735,7 +2008,13 @@ impl HostnameRegistry {
     /// not silently impersonated by a dead box's declaration. A box at its own
     /// address keeps answering A: that address answers for it alone, and a
     /// client connecting there is told where the box would be.
+    ///
+    /// This mark has no launch guard. A host's loop marks its stop through
+    /// [`Self::mark_host_stopped`].
     pub fn mark_stopped(&mut self, session_id: SessionId) {
+        // A stopped box has no attach in flight (NET-070).
+        self.attaching.remove(&session_id);
+        self.launching.remove(&session_id);
         if self.stopped.insert(session_id) {
             tracing::info!(
                 session_id = %session_id,
@@ -2954,6 +3233,208 @@ pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
     );
 }
 
+/// What the kernel says owns the client end of a connection to this host
+/// (NET-070), as [`connecting_box`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectingOwner {
+    /// A process in this box's classifier leaf holds the socket, and no
+    /// holder runs in another box's leaf.
+    Box(SessionId),
+    /// Every process that holds the socket runs in no box's leaf, as the
+    /// developer's browser does.
+    NoBox,
+    /// The lookup found no owner: the socket is gone from the tables or
+    /// held by no process (the client closed it), `/proc` hides a holder or
+    /// its cgroup from this process, a holder's pid stopped holding the
+    /// socket while it was read, or holders run in two boxes' leaves.
+    Unknown,
+    /// The peer's address is one this node does not hold, so no lookup ran.
+    /// The peer is a client off the node, such as the host side of a VM's
+    /// forwarded port, or an own-address box whose lease is not reported
+    /// yet. The caller decides which ([`HostnameRegistry::has_unreported_lease_callers`]).
+    OffNode,
+}
+
+/// The box that owns the client end of a TCP connection to this host
+/// (NET-070): `peer` is the client's address and `local` the address it
+/// connected to, as the accepting side sees them. The kernel's socket tables
+/// give the client socket's inode, every process that holds a descriptor for
+/// it, and each one's cgroup. A host-address box's processes run in its
+/// classifier leaf, `boxes/<allow|deny>/<box id>`, and the leaf's name is the
+/// box's id. The socket is the box's when any holder runs in its leaf
+/// ([`owner_of_holders`]). [`ConnectingOwner::NoBox`] when every holder runs
+/// in no box's leaf, and [`ConnectingOwner::Unknown`] when any step finds
+/// nothing or holders run in two boxes' leaves, so a caller can refuse a
+/// connection it cannot attribute.
+///
+/// A peer whose address this node does not hold is [`ConnectingOwner::OffNode`]
+/// with no lookup. A host-address box shares the node's network namespace,
+/// so it connects from an address the node holds. A client off the node,
+/// such as the host side of a VM's forwarded port that arrives through the
+/// switch's gateway, is never in this node's socket tables. Without this
+/// rule its lookup finds nothing, and the proxy refuses every host request
+/// while a host-address box is live.
+#[must_use]
+pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
+    if !node_holds_address(*peer.ip()) {
+        return ConnectingOwner::OffNode;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(inode) = client_socket_inode(peer, local) else {
+            return ConnectingOwner::Unknown;
+        };
+        let Some(holders) = socket_holders(inode) else {
+            return ConnectingOwner::Unknown;
+        };
+        // Read each holder's cgroup, then check that the pid still holds the
+        // socket. A pid that exited and was reused between the two reads
+        // names another process's cgroup, so it counts as unreadable.
+        owner_of_holders(holders.into_iter().map(|pid| {
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+            holds_socket(pid, inode).then_some(cgroup)
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (peer, local);
+        ConnectingOwner::Unknown
+    }
+}
+
+/// Whether `ip` is an address this node holds: a loopback address, or one
+/// a socket can bind to. A bind to port 0 fails with `EADDRNOTAVAIL` for an
+/// address no interface holds. A host that permits non-local binds
+/// (`ip_nonlocal_bind`) answers true for every address, so the caller's
+/// lookup still runs and fails closed.
+fn node_holds_address(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// The kernel's socket-table spelling of an IPv4 socket address: the
+/// address as one little-endian word, then the port, both in upper-case hex
+/// (`0100007F:1F90` for `127.0.0.1:8080`), and the v4-mapped IPv6 spelling
+/// the `tcp6` table prints for the same address.
+fn socket_table_keys(addr: SocketAddrV4) -> [String; 2] {
+    let word = u32::from(*addr.ip()).swap_bytes();
+    let port = addr.port();
+    [
+        format!("{word:08X}:{port:04X}"),
+        format!("0000000000000000FFFF0000{word:08X}:{port:04X}"),
+    ]
+}
+
+/// The inode of the socket whose local end is `peer` and whose remote end is
+/// `local`: the client end of a connection the accepting side sees from
+/// `peer` to `local`.
+#[cfg(target_os = "linux")]
+fn client_socket_inode(peer: SocketAddrV4, local: SocketAddrV4) -> Option<u64> {
+    let ours = socket_table_keys(peer);
+    let theirs = socket_table_keys(local);
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        if let Some(inode) = socket_row_inode(&text, &ours, &theirs) {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+/// The inode of the first row of one socket table whose local address is
+/// one of `ours` and whose remote address is one of `theirs`. Inode `0` is
+/// a socket no process holds (a time-wait row), so it is skipped.
+fn socket_row_inode(table: &str, ours: &[String; 2], theirs: &[String; 2]) -> Option<u64> {
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (local, remote, inode) = (fields.get(1)?, fields.get(2)?, fields.get(9)?);
+        if !ours.iter().any(|key| key == local) || !theirs.iter().any(|key| key == remote) {
+            return None;
+        }
+        inode.parse().ok().filter(|inode| *inode != 0)
+    })
+}
+
+/// Every process that holds a descriptor for the socket `inode`, in `/proc`
+/// order. A socket can have several holders: a forked child keeps its
+/// parent's descriptors, and a descriptor can be passed over a Unix socket.
+/// `None` when `/proc` cannot be read.
+#[cfg(target_os = "linux")]
+fn socket_holders(inode: u64) -> Option<Vec<u32>> {
+    let holders = std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| holds_socket(*pid, inode))
+        .collect();
+    Some(holders)
+}
+
+/// Whether process `pid` holds a descriptor for the socket `inode` now.
+#[cfg(target_os = "linux")]
+fn holds_socket(pid: u32, inode: u64) -> bool {
+    let target = format!("socket:[{inode}]");
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == target.as_str())
+    })
+}
+
+/// The owner of a socket from its holders' cgroups (NET-070). Each item is
+/// one holder's `/proc/<pid>/cgroup`, or `None` when that read failed or the
+/// pid no longer held the socket after it. The socket is a box's when any
+/// holder runs in that box's leaf, whatever other holders run outside every
+/// box: a process outside the boxes must not lift the box's gate by sharing
+/// its socket. [`ConnectingOwner::Unknown`] when there is no holder, when
+/// any holder cannot be read, or when holders run in two different boxes'
+/// leaves, so the proxy refuses the connection. [`ConnectingOwner::NoBox`]
+/// only when every holder runs outside every box.
+fn owner_of_holders(holders: impl IntoIterator<Item = Option<String>>) -> ConnectingOwner {
+    let mut owner = None;
+    let mut any = false;
+    for cgroup in holders {
+        any = true;
+        let Some(cgroup) = cgroup else {
+            return ConnectingOwner::Unknown;
+        };
+        if let Some(id) = box_in_cgroup(&cgroup) {
+            match owner {
+                Some(seen) if seen != id => return ConnectingOwner::Unknown,
+                _ => owner = Some(id),
+            }
+        }
+    }
+    match owner {
+        Some(id) => ConnectingOwner::Box(id),
+        None if any => ConnectingOwner::NoBox,
+        None => ConnectingOwner::Unknown,
+    }
+}
+
+/// The box whose classifier leaf a process's `/proc/<pid>/cgroup` names:
+/// the path component after `boxes/allow` or `boxes/deny`, read as a box id.
+/// `None` for a process in no box's leaf.
+fn box_in_cgroup(cgroup: &str) -> Option<SessionId> {
+    use sandbox::classifier::BOXES_DIR;
+    let subtrees = [
+        sandbox::config::Verdict::Allow.dir_name(),
+        sandbox::config::Verdict::Deny.dir_name(),
+    ];
+    cgroup.lines().find_map(|line| {
+        // cgroup2's line is `0::<path>`; a v1 line names a controller.
+        let path = line.strip_prefix("0::")?;
+        let parts: Vec<&str> = path.split('/').collect();
+        parts.windows(3).find_map(|window| {
+            (window[0] == BOXES_DIR && subtrees.contains(&window[1]))
+                .then(|| SessionId::parse_str(window[2]).ok())
+                .flatten()
+        })
+    })
+}
+
 /// The wall clock the record stamps grants with, in Unix seconds — the same
 /// clock a daemon stamps its own start with (the stamp the manager passes
 /// to [`LoopbackLeaseBook::release_dead_boxes`]), so the sweep's
@@ -3047,6 +3528,125 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-070's socket-owner lookup, step by step. The cgroup a process
+    /// reports names its box when it runs in a classifier leaf, in either
+    /// subtree, and names no box otherwise.
+    #[test]
+    fn box_in_cgroup_reads_the_classifier_leaf() {
+        let id = "00000000-0000-0000-0000-0000000000aa";
+        let want = SessionId::parse_str(id).ok();
+        for subtree in ["allow", "deny"] {
+            let cgroup = format!("0::/minimald.slice/boxes/{subtree}/{id}\n");
+            assert_eq!(box_in_cgroup(&cgroup), want, "{subtree}");
+        }
+        for cgroup in [
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+            "0::/minimald.slice/boxes/other/00000000-0000-0000-0000-0000000000aa\n",
+            "0::/minimald.slice/boxes/allow/not-a-box-id\n",
+            "4:cpu:/minimald.slice/boxes/allow/00000000-0000-0000-0000-0000000000aa\n",
+        ] {
+            assert_eq!(box_in_cgroup(cgroup), None, "{cgroup}");
+        }
+    }
+
+    /// NET-070: a socket can have several holders. A holder in a box's leaf
+    /// makes the socket that box's, whatever holder outside every box shares
+    /// it and in whatever order `/proc` lists them. Holders in two boxes'
+    /// leaves, or a holder that cannot be read, make the owner unknown.
+    #[test]
+    fn owner_of_holders_prefers_a_box_holder_and_refuses_two_boxes() {
+        let a = "00000000-0000-0000-0000-0000000000aa";
+        let b = "00000000-0000-0000-0000-0000000000bb";
+        let in_box = |id: &str| Some(format!("0::/minimal/boxes/deny/{id}\n"));
+        let outside = || Some("0::/user.slice/user-1000.slice/session-1.scope\n".to_owned());
+        let box_a = ConnectingOwner::Box(SessionId::parse_str(a).unwrap());
+
+        assert_eq!(owner_of_holders([outside(), in_box(a)]), box_a);
+        assert_eq!(owner_of_holders([in_box(a), outside()]), box_a);
+        assert_eq!(owner_of_holders([in_box(a), in_box(a)]), box_a);
+        assert_eq!(
+            owner_of_holders([in_box(a), outside(), in_box(b)]),
+            ConnectingOwner::Unknown,
+            "holders in two boxes' leaves"
+        );
+        assert_eq!(
+            owner_of_holders([outside(), outside()]),
+            ConnectingOwner::NoBox
+        );
+        assert_eq!(
+            owner_of_holders([outside(), None]),
+            ConnectingOwner::Unknown,
+            "a holder whose cgroup read failed or whose pid was reused"
+        );
+        assert_eq!(
+            owner_of_holders(std::iter::empty()),
+            ConnectingOwner::Unknown,
+            "no holder"
+        );
+    }
+
+    /// The socket table row of a connection's client end is the one whose
+    /// local address is the peer and whose remote address is the proxy's,
+    /// in the v4 table and in the v4-mapped spelling of the v6 table alike.
+    #[test]
+    fn socket_row_inode_finds_the_client_end() {
+        let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), 40000);
+        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+        let ours = socket_table_keys(peer);
+        let theirs = socket_table_keys(local);
+        assert_eq!(ours[0], "0400007F:9C40");
+        assert_eq!(theirs[0], "0100007F:1F90");
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+        let v4 = format!(
+            "{header}\n   0: 0100007F:1F90 0400007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 111 1\n   1: 0400007F:9C40 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 222 1\n"
+        );
+        assert_eq!(socket_row_inode(&v4, &ours, &theirs), Some(222));
+        let v6 = format!(
+            "{header}\n   0: 0000000000000000FFFF00000400007F:9C40 0000000000000000FFFF00000100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 333 1\n"
+        );
+        assert_eq!(socket_row_inode(&v6, &ours, &theirs), Some(333));
+        let time_wait = format!(
+            "{header}\n   0: 0400007F:9C40 0100007F:1F90 06 00000000:00000000 00:00000000 00000000     0        0 0 1\n"
+        );
+        assert_eq!(socket_row_inode(&time_wait, &ours, &theirs), None);
+    }
+
+    /// The kernel half of the lookup, against a real connection: the client
+    /// socket's inode is found from the accepting side's view, and the
+    /// process that holds it is this one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connecting_socket_holder_is_found() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, listener.local_addr().unwrap())
+        else {
+            panic!("an IPv4 connection");
+        };
+        let inode = client_socket_inode(peer, local).expect("the client socket is in the table");
+        assert!(holds_socket(std::process::id(), inode));
+        assert!(socket_holders(inode).is_some_and(|pids| pids.contains(&std::process::id())));
+        // A test process runs in no box's leaf, so it is no box.
+        assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
+        drop(client);
+    }
+
+    /// A peer at an address this node does not hold is off the node, with no
+    /// socket lookup: a host-address box connects from the node's own
+    /// addresses, and an off-node client, such as a VM host's forwarded
+    /// request through the switch's gateway, is never in the node's tables
+    /// (NET-070).
+    #[test]
+    fn off_node_peer_is_no_box() {
+        // TEST-NET-1 (RFC 5737): no interface holds it.
+        let peer = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7654);
+        assert!(!node_holds_address(*peer.ip()));
+        assert!(node_holds_address(Ipv4Addr::new(127, 0, 0, 4)));
+        assert_eq!(connecting_box(peer, local), ConnectingOwner::OffNode);
+    }
 
     /// A lease an attach path would report, with an `18080:8080` ingress
     /// declaration behind it.
@@ -3333,7 +3933,9 @@ mod tests {
         );
 
         // A VM node: the node holds one allocated address of its own, and its
-        // host-address boxes answer at it.
+        // host-address boxes answer at it. The host's forwarder mirrors the
+        // guest's listeners there, and the proxy, in the guest beside them,
+        // dials them at the guest's own loopback (#2748).
         let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut vm = HostnameRegistry::new("dev", true).with_node_address(node);
         vm.register_host_net(id("2"), "web");
@@ -3349,13 +3951,18 @@ mod tests {
             .resolve("web.min.internal:8080")
             .expect("a host-address box's name routes");
         assert_eq!(
+            route.address(),
+            node,
+            "the route answers at the node's address"
+        );
+        assert_eq!(
             route.upstream(8080),
-            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
-            "the box's own port number at the node's allocated address"
+            Some(SocketAddr::new(loopback_addr(), 8080)),
+            "the proxy dials the box's own port number on the guest's loopback"
         );
         assert_eq!(
             route.upstream(9090),
-            Some(SocketAddr::new(IpAddr::V4(node), 9090)),
+            Some(SocketAddr::new(loopback_addr(), 9090)),
             "a host-address route gates no port, so no port is translated"
         );
     }
@@ -3396,8 +4003,10 @@ mod tests {
             reg.resolve("shared.min.internal:8080")
                 .expect("a host-address box's name routes")
                 .upstream(8080),
-            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
-            "the proxy forwards a host-address box at the granted address too"
+            Some(SocketAddr::new(loopback_addr(), 8080)),
+            "the proxy, in the guest, still dials the host-address box on the guest's \
+             own loopback: the granted address is the host's, where its forwarder \
+             mirrors the guest's listeners (#2748)"
         );
         assert_eq!(
             reg.resolve("handed.min.internal:18080")
