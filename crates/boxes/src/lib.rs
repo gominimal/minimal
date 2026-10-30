@@ -1699,6 +1699,369 @@ impl Record {
     }
 }
 
+/// Box names on one host and across hosts (BOX-004, BOX-005, BOX-010,
+/// BOX-143).
+///
+/// A name is an alias of a record. Many retained records can share one
+/// name: only a live box (pending, materializing or running) holds it, so
+/// at most one live box on a host has a given name. Every function here
+/// is pure over the records it is given, and answers with a `box_id`,
+/// never with a name, so nothing downstream keys on the name.
+///
+/// Names compare under ASCII case folding, as hostnames do. A name that
+/// matches some record exactly picks among the exact matches only, so a
+/// legacy pair of names that differ only in case stays addressable.
+pub mod box_name {
+    use std::fmt;
+
+    use crate::{BoxId, BoxState, Record};
+
+    /// The exit code of every refusal in this module: the usage-shaped
+    /// code the BOX spec gives a name that cannot be used.
+    pub const REFUSAL_EXIT_CODE: i32 = 2;
+
+    /// The name a box can never take: it addresses the calling box.
+    pub const RESERVED_NAME: &str = "self";
+
+    /// What a name check reads of one retained record on one host.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NamedBox {
+        /// The record's key.
+        pub id: BoxId,
+        /// The record's current alias.
+        pub name: String,
+        /// The record's state, as its `status` stores it.
+        pub status: BoxState,
+    }
+
+    impl NamedBox {
+        /// The facts of `record`, or `None` for a record with no name.
+        #[must_use]
+        pub fn from_record(record: &Record) -> Option<Self> {
+            Some(Self {
+                id: record.id,
+                name: record.name.clone()?,
+                status: record.status,
+            })
+        }
+
+        /// Whether the box holds its name: it is pending, materializing
+        /// or running. A stopped or exited box keeps its name but does
+        /// not hold it, so a new box can reuse the name (BOX-004). A box
+        /// that is still starting holds it, so two creations of one name
+        /// cannot both reach `running`.
+        #[must_use]
+        pub fn is_running(&self) -> bool {
+            holds_name(self.status)
+        }
+
+        /// The state word a person reads: `pending`, `materializing`,
+        /// `running`, `stopped` or `exited`.
+        #[must_use]
+        pub fn state_word(&self) -> &'static str {
+            state_word(self.status)
+        }
+    }
+
+    /// Whether a box in `status` holds its name (see
+    /// [`NamedBox::is_running`]).
+    #[must_use]
+    pub fn holds_name(status: BoxState) -> bool {
+        match status {
+            BoxState::Pending | BoxState::Materializing | BoxState::Active => true,
+            BoxState::Stopped | BoxState::Exited => false,
+        }
+    }
+
+    fn state_word(status: BoxState) -> &'static str {
+        match status {
+            BoxState::Pending => "pending",
+            BoxState::Materializing => "materializing",
+            BoxState::Active => "running",
+            BoxState::Stopped => "stopped",
+            BoxState::Exited => "exited",
+        }
+    }
+
+    /// The records `name` addresses: the exact matches when there are
+    /// any, else the matches under ASCII case folding.
+    #[must_use]
+    pub fn candidates<'a>(boxes: &'a [NamedBox], name: &str) -> Vec<&'a NamedBox> {
+        let exact: Vec<&NamedBox> = boxes.iter().filter(|b| b.name == name).collect();
+        if !exact.is_empty() {
+            return exact;
+        }
+        boxes
+            .iter()
+            .filter(|b| b.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
+    /// The running box on this host, other than `except`, whose name
+    /// folds to `name` under ASCII case: the box that blocks a creation,
+    /// a rename or a resume to `name` (BOX-004, BOX-010, BOX-025).
+    #[must_use]
+    pub fn running_holder<'a>(
+        boxes: &'a [NamedBox],
+        name: &str,
+        except: Option<BoxId>,
+    ) -> Option<&'a NamedBox> {
+        boxes
+            .iter()
+            .find(|b| Some(b.id) != except && b.is_running() && b.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The most recently created of `boxes`. Ids are `UUIDv7`s, minted in
+    /// creation order, so the greatest id is the latest box.
+    #[must_use]
+    pub fn latest<'a>(boxes: impl IntoIterator<Item = &'a NamedBox>) -> Option<&'a NamedBox> {
+        boxes.into_iter().max_by_key(|b| b.id)
+    }
+
+    /// Resolves an unqualified name against one host (BOX-005): the
+    /// running box of that name, else the most recently created box of
+    /// that name, else `None`. Two running boxes of one name are a store
+    /// that broke BOX-004, and resolve to neither.
+    #[must_use]
+    pub fn resolve_on_host(boxes: &[NamedBox], name: &str) -> Option<BoxId> {
+        let found = candidates(boxes, name);
+        let mut running = found.iter().filter(|b| b.is_running());
+        match (running.next(), running.next()) {
+            (Some(one), None) => return Some(one.id),
+            (Some(_), Some(_)) => return None,
+            (None, _) => {}
+        }
+        latest(found).map(|b| b.id)
+    }
+
+    /// One box a name matched on one host, as a refusal lists it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Candidate {
+        /// The host the box is on.
+        pub host: String,
+        /// The box's id.
+        pub id: BoxId,
+        /// The box's name, with the case it was given.
+        pub name: String,
+        /// The box's state word (see [`NamedBox::state_word`]).
+        pub state: &'static str,
+    }
+
+    /// An unqualified name that matches boxes on more than one host, so
+    /// resolution picks none (BOX-005).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AmbiguousName {
+        /// The name that was asked for.
+        pub name: String,
+        /// `true` when running boxes of the name are on more than one
+        /// host. `false` when no box of the name runs, and retained
+        /// records of it are on more than one host.
+        pub running: bool,
+        /// One entry per matching box, in host order.
+        pub candidates: Vec<Candidate>,
+    }
+
+    impl AmbiguousName {
+        /// The exit code of the refusal.
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            REFUSAL_EXIT_CODE
+        }
+    }
+
+    impl fmt::Display for AmbiguousName {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.running {
+                write!(
+                    f,
+                    "Boxes named `{}` are running on more than one host. \
+                     The name alone does not choose one of them.",
+                    self.name
+                )?;
+            } else {
+                write!(
+                    f,
+                    "No box named `{}` is running. More than one host keeps a box \
+                     with that name, so the name alone does not choose one of them.",
+                    self.name
+                )?;
+            }
+            f.write_str(" Use the box id. The boxes are:")?;
+            for c in &self.candidates {
+                if self.running {
+                    write!(f, "\n  {}  {}  {}", c.host, c.id, c.name)?;
+                } else {
+                    write!(f, "\n  {}  {}  {}  {}", c.host, c.id, c.name, c.state)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl std::error::Error for AmbiguousName {}
+
+    /// Resolves an unqualified name against every host the caller can
+    /// reach (BOX-005). `hosts` pairs each host's name with its records.
+    ///
+    /// The answer is the host and id of the one box the name selects, or
+    /// `None` when no host has a box of that name. Running boxes win: the
+    /// name selects the running box when exactly one host runs one. When
+    /// no host runs one, the name selects the latest box of the one host
+    /// that keeps records of it.
+    ///
+    /// # Errors
+    ///
+    /// [`AmbiguousName`] when running boxes of the name are on more than
+    /// one host, or when none runs and records of it are on more than one
+    /// host. It lists every candidate with its host, and its state when
+    /// none runs.
+    pub fn resolve_across_hosts(
+        hosts: &[(String, Vec<NamedBox>)],
+        name: &str,
+    ) -> Result<Option<(String, BoxId)>, AmbiguousName> {
+        let matched: Vec<(&str, Vec<&NamedBox>)> = hosts
+            .iter()
+            .map(|(host, boxes)| (host.as_str(), candidates(boxes, name)))
+            .filter(|(_, found)| !found.is_empty())
+            .collect();
+        let running: Vec<(&str, Vec<&NamedBox>)> = matched
+            .iter()
+            .map(|(host, found)| {
+                (
+                    *host,
+                    found.iter().copied().filter(|b| b.is_running()).collect(),
+                )
+            })
+            .filter(|(_, found): &(&str, Vec<&NamedBox>)| !found.is_empty())
+            .collect();
+        let (pool, is_running) = if running.is_empty() {
+            (matched, false)
+        } else {
+            (running, true)
+        };
+        match pool.as_slice() {
+            [] => Ok(None),
+            [(host, found)] => {
+                let on_host: Vec<NamedBox> = found.iter().map(|b| (*b).clone()).collect();
+                Ok(resolve_on_host(&on_host, name).map(|id| ((*host).to_string(), id)))
+            }
+            _ => Err(AmbiguousName {
+                name: name.to_string(),
+                running: is_running,
+                candidates: pool
+                    .iter()
+                    .flat_map(|(host, found)| {
+                        found.iter().map(move |b| Candidate {
+                            host: (*host).to_string(),
+                            id: b.id,
+                            name: b.name.clone(),
+                            state: b.state_word(),
+                        })
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    /// Why a rename was refused (BOX-010). The box, its name and its
+    /// events stay as they were.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RenameRefusal {
+        /// A running box on the same host holds the new name.
+        HeldByRunning {
+            /// The name that was asked for.
+            name: String,
+            /// The running box that holds it.
+            holder: BoxId,
+            /// The holder's name, with the case it was given.
+            holder_name: String,
+        },
+        /// The new name is the reserved name `self`.
+        Reserved,
+    }
+
+    impl RenameRefusal {
+        /// The exit code of the refusal.
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            REFUSAL_EXIT_CODE
+        }
+    }
+
+    impl fmt::Display for RenameRefusal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::HeldByRunning {
+                    name,
+                    holder,
+                    holder_name,
+                } => write!(
+                    f,
+                    "The running session `{holder_name}` ({holder}) holds the name `{name}`. \
+                     Rename it with `min session rename {holder} <new-name>`, \
+                     or choose another name."
+                ),
+                Self::Reserved => write!(
+                    f,
+                    "The name `{RESERVED_NAME}` is reserved. Choose another name."
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for RenameRefusal {}
+
+    impl From<RenameRefusal> for std::io::Error {
+        fn from(refusal: RenameRefusal) -> Self {
+            let kind = match refusal {
+                RenameRefusal::HeldByRunning { .. } => std::io::ErrorKind::AlreadyExists,
+                RenameRefusal::Reserved => std::io::ErrorKind::InvalidInput,
+            };
+            Self::new(kind, refusal)
+        }
+    }
+
+    /// The `data` of the `renamed` event a rename records (BOX-010): the
+    /// box's name before the rename under `old_name`, `null` when it had
+    /// none, and its new name under `new_name`.
+    #[must_use]
+    pub fn renamed_event_data(old_name: Option<&str>, new_name: &str) -> crate::events::EventData {
+        let mut data = crate::events::EventData::new();
+        data.insert(
+            "old_name".to_string(),
+            old_name.map_or(serde_json_lenient::Value::Null, Into::into),
+        );
+        data.insert("new_name".to_string(), new_name.into());
+        data
+    }
+
+    /// Checks a rename of box `id` to `new_name` on the host whose
+    /// records are `boxes` (BOX-010).
+    ///
+    /// # Errors
+    ///
+    /// [`RenameRefusal::Reserved`] for `self` in any case, and
+    /// [`RenameRefusal::HeldByRunning`] when another running box on the
+    /// host holds a name that folds to `new_name`.
+    pub fn check_rename(
+        boxes: &[NamedBox],
+        id: BoxId,
+        new_name: &str,
+    ) -> Result<(), RenameRefusal> {
+        if new_name.eq_ignore_ascii_case(RESERVED_NAME) {
+            return Err(RenameRefusal::Reserved);
+        }
+        if let Some(holder) = running_holder(boxes, new_name, Some(id)) {
+            return Err(RenameRefusal::HeldByRunning {
+                name: new_name.to_string(),
+                holder: holder.id,
+                holder_name: holder.name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2993,5 +3356,215 @@ mod tests {
     fn pending_serializes_as_pending_not_draft() {
         let s = serde_json_lenient::to_string(&BoxState::Pending).expect("serialize");
         assert_eq!(s, "\"pending\"");
+    }
+
+    // ---- Box names across hosts (BOX-005) ----
+
+    mod box_names {
+        use super::super::box_name::{
+            AmbiguousName, Candidate, NamedBox, resolve_across_hosts, resolve_on_host,
+        };
+        use crate::{BoxId, BoxState};
+        use proptest::prelude::*;
+
+        fn named(id: u128, name: &str, status: BoxState) -> NamedBox {
+            NamedBox {
+                id: BoxId::from(uuid::Uuid::from_u128(id)),
+                name: name.to_string(),
+                status,
+            }
+        }
+
+        fn id(n: u128) -> BoxId {
+            BoxId::from(uuid::Uuid::from_u128(n))
+        }
+
+        fn status() -> impl Strategy<Value = BoxState> {
+            prop_oneof![
+                Just(BoxState::Pending),
+                Just(BoxState::Materializing),
+                Just(BoxState::Active),
+                Just(BoxState::Stopped),
+                Just(BoxState::Exited),
+            ]
+        }
+
+        /// One host's records, with distinct ids and at most one running
+        /// box per name under ASCII case, as BOX-004 keeps a store.
+        fn host_store() -> impl Strategy<Value = Vec<NamedBox>> {
+            prop::collection::vec((0..3usize, status()), 0..8).prop_map(|rows| {
+                let names = ["dev", "DEV", "web"];
+                let mut running: Vec<String> = Vec::new();
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, (n, mut status))| {
+                        let folded = names[n].to_ascii_lowercase();
+                        if super::super::box_name::holds_name(status) {
+                            if running.contains(&folded) {
+                                status = BoxState::Stopped;
+                            } else {
+                                running.push(folded);
+                            }
+                        }
+                        // Ids grow with creation order, as minted ids do.
+                        named(u128::try_from(i).unwrap() + 1, names[n], status)
+                    })
+                    .collect()
+            })
+        }
+
+        proptest! {
+            /// BOX-005: resolution returns the unique running box of the
+            /// name on the host, else the most recently created box of the
+            /// name, else none.
+            #[test]
+            fn unqualified_name_resolves_running_else_latest_for_every_store(
+                store in host_store(),
+                asked in prop_oneof![Just("dev"), Just("Dev"), Just("DEV"), Just("web"), Just("api")],
+            ) {
+                let exact: Vec<&NamedBox> = store.iter().filter(|b| b.name == asked).collect();
+                let matched: Vec<&NamedBox> = if exact.is_empty() {
+                    store.iter().filter(|b| b.name.eq_ignore_ascii_case(asked)).collect()
+                } else {
+                    exact
+                };
+                let running: Vec<&NamedBox> =
+                    matched.iter().copied().filter(|b| b.is_running()).collect();
+                let want = match running.as_slice() {
+                    [one] => Some(one.id),
+                    _ => matched.iter().map(|b| b.id).max(),
+                };
+                prop_assert_eq!(resolve_on_host(&store, asked), want);
+            }
+        }
+
+        /// BOX-005: running boxes of the name on two hosts are ambiguous.
+        /// The refusal exits 2, lists each candidate with its host, and
+        /// picks none. A stopped box elsewhere does not join the list.
+        #[test]
+        fn unqualified_name_running_on_two_hosts_refused_exit2_lists_candidates() {
+            let hosts = vec![
+                (
+                    "local0".to_string(),
+                    vec![
+                        named(1, "dev", BoxState::Stopped),
+                        named(4, "dev", BoxState::Active),
+                    ],
+                ),
+                (
+                    "local-minvmd0".to_string(),
+                    vec![named(2, "dev", BoxState::Active)],
+                ),
+                (
+                    "remote0".to_string(),
+                    vec![named(3, "dev", BoxState::Exited)],
+                ),
+            ];
+            let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert_eq!(
+                err,
+                AmbiguousName {
+                    name: "dev".to_string(),
+                    running: true,
+                    candidates: vec![
+                        Candidate {
+                            host: "local0".to_string(),
+                            id: id(4),
+                            name: "dev".to_string(),
+                            state: "running",
+                        },
+                        Candidate {
+                            host: "local-minvmd0".to_string(),
+                            id: id(2),
+                            name: "dev".to_string(),
+                            state: "running",
+                        },
+                    ],
+                }
+            );
+            let text = err.to_string();
+            for want in [
+                "local0",
+                "local-minvmd0",
+                &id(4).to_string(),
+                &id(2).to_string(),
+            ] {
+                assert!(text.contains(want), "`{want}` missing from: {text}");
+            }
+            assert!(!text.contains("remote0"), "{text}");
+
+            // One host runs it: that box answers, whatever the others keep.
+            let one_running = vec![hosts[0].clone(), hosts[2].clone()];
+            assert_eq!(
+                resolve_across_hosts(&one_running, "dev").unwrap(),
+                Some(("local0".to_string(), id(4)))
+            );
+            // No host has it.
+            assert_eq!(resolve_across_hosts(&hosts, "web").unwrap(), None);
+        }
+
+        /// BOX-005: with no box of the name running, records of it on two
+        /// hosts are ambiguous. The refusal exits 2, lists each candidate
+        /// with its host and state, and picks none.
+        #[test]
+        fn unqualified_name_retained_on_two_hosts_none_running_refused_exit2_lists_candidates() {
+            let hosts = vec![
+                (
+                    "local0".to_string(),
+                    vec![
+                        named(1, "dev", BoxState::Stopped),
+                        named(5, "web", BoxState::Active),
+                    ],
+                ),
+                (
+                    "local-minvmd0".to_string(),
+                    vec![named(2, "Dev", BoxState::Exited)],
+                ),
+            ];
+            let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(!err.running);
+            assert_eq!(
+                err.candidates,
+                vec![
+                    Candidate {
+                        host: "local0".to_string(),
+                        id: id(1),
+                        name: "dev".to_string(),
+                        state: "stopped",
+                    },
+                    Candidate {
+                        host: "local-minvmd0".to_string(),
+                        id: id(2),
+                        name: "Dev".to_string(),
+                        state: "exited",
+                    },
+                ]
+            );
+            let text = err.to_string();
+            for want in [
+                "local0  ",
+                "local-minvmd0  ",
+                "stopped",
+                "exited",
+                "No box named `dev` is running",
+            ] {
+                assert!(text.contains(want), "`{want}` missing from: {text}");
+            }
+
+            // Records on one host only: its latest answers.
+            let one_host = vec![(
+                "local0".to_string(),
+                vec![
+                    named(1, "dev", BoxState::Stopped),
+                    named(3, "dev", BoxState::Exited),
+                ],
+            )];
+            assert_eq!(
+                resolve_across_hosts(&one_host, "dev").unwrap(),
+                Some(("local0".to_string(), id(3)))
+            );
+        }
     }
 }
