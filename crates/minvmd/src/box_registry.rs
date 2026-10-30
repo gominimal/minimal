@@ -4781,7 +4781,9 @@ impl BoxRegistry {
     /// would share one address; this is the check that keeps the live set
     /// one row per folded name. A dormant creation holds no name (BOX-004):
     /// its box stopped, and a registration under the name takes the name
-    /// over and ends the creation ([`Self::try_register`]).
+    /// over ([`Self::try_register`]). The replaced creation is superseded,
+    /// not ended: it keeps its addresses and its box id, so its box can
+    /// still resume once no live row holds the name.
     fn held_name_for(&self, name: &str) -> Option<String> {
         let asked = canonical_box_name(name);
         self.rows
