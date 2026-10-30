@@ -4241,6 +4241,56 @@ mod tests {
         }
     }
 
+    /// NET-070, design §7.1: an ended box brought up for its destroy hooks
+    /// can launch with no caller facts, when another box holds its name. Its
+    /// launch alone turns the owner lookup on, so a request from a socket it
+    /// owns is refused as unattributed, not passed as no box's, and the
+    /// refusal line names no caller.
+    #[tokio::test]
+    async fn proxy_launching_box_without_caller_facts_refused() {
+        let backend_port = spawn_backend().await;
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let ended = SessionId::parse_str(UNREGISTERED_BOX).unwrap();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        reg.report_own_address(
+            web,
+            "web",
+            Ipv4Addr::LOCALHOST,
+            BTreeMap::from([(18080, backend_port)]),
+        );
+        reg.begin_host_launch(ended);
+        assert!(
+            reg.has_unleased_callers(),
+            "a launching box with no caller facts turns the owner lookup on"
+        );
+        let router = Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict)
+            .with_socket_owner(stub_socket_owner);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let (buf, guard) = capture_logs();
+        let refused =
+            proxy_get_from(proxy_addr, UNREGISTERED_BOX_ADDR, "web.min.internal:18080").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected the launching box's request to be refused, got: {refused}"
+        );
+
+        drop(guard);
+        let logged = buf.contents();
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("refused a proxied request")
+                    && line.contains(r#"caller="unknown""#)
+                    && line.contains(&UNREGISTERED_BOX_ADDR.to_string())),
+            "expected the refusal to name no caller, got: {logged}"
+        );
+    }
+
     /// A socket owner that can name no one: a request that reaches the
     /// owner lookup with it is refused as unattributed.
     fn unknown_socket_owner(

@@ -1208,15 +1208,19 @@ impl HostnameRegistry {
     /// the proxy does not look up who owns the connecting socket. A stopped
     /// box ([`Self::mark_stopped`]) is not live: it keeps its caller facts
     /// until destroy, but it runs nothing that can connect, so it does not
-    /// count until [`Self::begin_host_launch`] or [`Self::mark_running`]
-    /// (NET-070).
+    /// count until [`Self::begin_host_launch`] or [`Self::mark_running`].
+    /// A launching box with no own address and no lease counts whether or
+    /// not it has caller facts: an ended box brought up for its destroy hooks
+    /// can have none, and the proxy refuses its connections as unattributed
+    /// rather than pass them as no box's (NET-070, design §7.1).
     #[must_use]
     pub fn has_unleased_callers(&self) -> bool {
-        self.callers.keys().any(|id| {
-            (!self.stopped.contains(id) || self.launching.contains(id))
-                && !self.own.contains_key(id)
-                && !self.by_lease.values().any(|v| v == id)
-        })
+        let unleased =
+            |id: &SessionId| !self.own.contains_key(id) && !self.by_lease.values().any(|v| v == id);
+        self.callers
+            .keys()
+            .any(|id| !self.stopped.contains(id) && unleased(id))
+            || self.launching.iter().any(unleased)
     }
 
     /// Whether any own-address box is attaching and has not reported its
