@@ -415,6 +415,13 @@ enum ManagerMessage {
         Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
     ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
+    /// The handle of the session's live actor, if it has one. Read-only
+    /// against the `running` map: unlike [`GetSession`](Self::GetSession)
+    /// it never starts an actor, so a stopped box stays without one. Linux
+    /// only, like the publish-move receiver that asks it: on macOS minimald
+    /// runs inside the Linux guest.
+    #[cfg(target_os = "linux")]
+    GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
@@ -480,6 +487,8 @@ impl ManagerMessage {
             Self::EventsSource(..) => "EventsSource",
             Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
+            #[cfg(target_os = "linux")]
+            Self::GetRunning(..) => "GetRunning",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
@@ -889,6 +898,38 @@ impl BoxManager {
                         if let Ok(Some(holder)) = holder {
                             holder
                                 .bind_handed_port(hand_over.address, hand_over.port)
+                                .await;
+                        }
+                    }
+                },
+            );
+        }
+        // #2748: each move of a box's publish is passed to that box's
+        // session, which binds its declared ports at the new address and
+        // moves the forwards its `min net expose` bound at the old one, if
+        // the box is running. Off the registry's lock, like the hand-overs
+        // above. Only a live actor is asked: the landing moves stopped boxes
+        // too, and a box with no actor has no forward to move, so none is
+        // started for it. Its next attach binds at the new address.
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
+            hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .notify_publish_moves(sender);
+            let manager = weak_self.clone();
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "sessions.publish_moves"),
+                async move {
+                    while let Some(moved) = moves.recv().await {
+                        let Some(manager) = manager.upgrade() else {
+                            return;
+                        };
+                        if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
+                            let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
+                            holder
+                                .publish_moved(moved.from, moved.to, ports.collect())
                                 .await;
                         }
                     }
@@ -1399,6 +1440,16 @@ pub(crate) fn draw_interim_upgrades(
 /// stopped box keeps its name, so the move applies to it with its stopped
 /// marker intact.
 ///
+/// A move also sends the move itself, with a hand-over for each port the box
+/// declares ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]).
+/// A box that runs has its forwards at the interim, where its attach,
+/// its `min net expose` and its listen watcher bound them, so without these
+/// its name would answer at an address no forward listens on. Its actor
+/// binds the declared forwards and moves the exposed ones to the new
+/// address. Its listen watcher reads the new address on its next poll and
+/// moves the ports it published. A box with no actor running gets nothing:
+/// none is started for it, and its next attach binds at the new address.
+///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
 /// ([`crate::box_manager::BoxManager::init`]), never through the manager's
@@ -1441,6 +1492,11 @@ pub(crate) fn apply_interim_upgrade(
                 upgrade.ports.clone(),
             );
             reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
+            // The forwards follow the name (#2748): a box that runs bound
+            // them at the interim, so its actor binds each port again at the
+            // address the name now answers at, and moves the ports its
+            // `min net expose` published there.
+            reg.hand_over_moved_publish(upgrade.session, Ipv4Addr::LOCALHOST);
             true
         };
         (applied, standing.is_none())
@@ -2752,6 +2808,12 @@ impl BoxManager {
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
+            }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::GetRunning(id, r) => {
+                let running = self.running.get(&id).cloned();
+                r.handle(async move { Ok::<_, BoxManagerError>(running) })
+                    .await;
             }
             // Snapshot a running session's screen without starting its
             // actor. A name resolves through the store to its id, then the
