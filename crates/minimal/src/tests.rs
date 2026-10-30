@@ -327,6 +327,7 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
@@ -356,6 +357,8 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks the list's scope.
+            "cmd/boxes/list.rs::box_list_and_show_render_retained_records = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             // A unit test's request, never sent: it checks the project root.
@@ -3602,6 +3605,43 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
         err.to_string().contains("no-such-box"),
         "the miss names what was asked for: {err}"
     );
+}
+
+/// NET-058's exec half, and `session run` and `net forward` with it: the
+/// three go through the same resolution attach does, so a box activated with
+/// `--vm` is reached by name alone, over the owning VM's socket. Before this,
+/// `min ls` and attach found such a box and `min session exec` answered "No
+/// session found" (lab scenario 720).
+#[tokio::test]
+async fn exec_fall_through_hands_off_the_owning_vm() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+    let selected =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the selected VM's socket path");
+    let mut client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+
+    for verb in ["Running in", "Running the task in", "Forwarding to"] {
+        let (record, handed_off) = cmd::resolve_named_box_version_gated(
+            &global,
+            &mut client,
+            selected.clone(),
+            "web",
+            verb,
+        )
+        .await
+        .expect("a name alpha owns resolves through the selected VM's miss");
+        assert_eq!(record.id, web, "{verb}: the owning VM's record");
+        assert_eq!(
+            handed_off,
+            state.path().join("providers/local-minvmd0/alpha/ssh.sock"),
+            "{verb}: the hand-off runs over the owning VM's socket"
+        );
+    }
 }
 
 /// The resolution path gets the same treatment as the listing: a stopped
