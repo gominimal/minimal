@@ -426,6 +426,30 @@ pub enum BoxCommand {
     /// admitted or refused, each secret minted for the box, and the box's
     /// revocation. A removed box's records stay readable by its id
     Audit(BoxAuditArgs),
+    /// List the boxes of the current project, in any state: their id,
+    /// name, type, parent, project and state, with how a stopped or exited
+    /// box ended. `--all` lists every box on this host
+    List(BoxListArgs),
+    /// Show one box: its id, name, type, parent, project, state, how it
+    /// ended and the identity it runs under
+    Show(BoxShowArgs),
+}
+
+// BOX-158 (BCLI-001): `min box list [--all]`.
+#[derive(Debug, Args)]
+pub struct BoxListArgs {
+    /// List every box on this host, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+}
+
+// BOX-159 (BCLI-003): `min box show <box>`.
+#[derive(Debug, Args)]
+pub struct BoxShowArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
