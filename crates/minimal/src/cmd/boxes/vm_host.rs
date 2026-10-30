@@ -490,6 +490,23 @@ pub(crate) async fn hold_box_name_with_vm_host(
     failure.is_none()
 }
 
+/// Puts what the box's registration handed back on its create request: the
+/// box's addresses and its task addresses. The id the host minted stays
+/// with the client, which keeps it on the registration to withdraw the row
+/// and to mint grants for. The create relays no box id, because the in-VM
+/// daemon takes the id from the VM host daemon alone (BOX-001, BOX-002).
+/// A box that registered nothing carries no addresses and no id.
+pub(crate) fn carry_registration(
+    config: &mut minimald_rpc::BoxConfig,
+    registered: Option<&minimal_client::box_registration::RegisteredWithVmHost>,
+) {
+    config.box_addresses = registered.map(|registration| registration.addresses);
+    config.task_addresses = registered
+        .map(|registration| registration.task_addresses.clone())
+        .unwrap_or_default();
+    config.box_id = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1161,82 @@ mod tests {
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
         );
+    }
+
+    /// BOX-002: a VM box's create request relays no box id. The VM host
+    /// daemon mints the id at registration, and the client keeps it on the
+    /// registration, where the withdrawal and the grant mint read it. The
+    /// create carries the handed addresses and no id, even when the config
+    /// held one before, so the in-VM daemon takes the id from the VM host
+    /// daemon alone.
+    #[tokio::test]
+    async fn activation_relays_no_box_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let _requests = fake_vm_host(
+            host_dir.join("control.sock"),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0","box_id":"07070707070707070707070707070707","task_addresses":["100.64.0.3"]}"#
+                .to_string(),
+        )
+        .await;
+        let registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            NetworkMode::OwnIp,
+            "web",
+            &boxes::BoxPolicy::default(),
+        )
+        .await
+        .expect("the stand-in answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let minted = minimald_rpc::BoxId::from_bytes([7; 16]);
+        assert_eq!(
+            registered.box_id,
+            Some(minted),
+            "the client keeps the id the VM host daemon minted"
+        );
+
+        let mut config = minimald_rpc::CreateSessionRequest::new(
+            "web".to_string(),
+            paths::HostAbsPath::try_new(
+                camino::Utf8PathBuf::from_path_buf(dir.path().join("web-app")).unwrap(),
+            )
+            .unwrap(),
+            NetworkMode::OwnIp,
+            boxes::BoxPolicy::default(),
+        )
+        .config;
+        // A stale id on the config is cleared, not relayed.
+        config.box_id = Some(minimald_rpc::BoxId::from_bytes([9; 16]));
+        carry_registration(&mut config, Some(&registered));
+        assert_eq!(config.box_id, None, "the create relays no box id");
+        assert_eq!(
+            config.box_addresses,
+            Some(registered.addresses),
+            "the create carries the handed addresses"
+        );
+        assert_eq!(
+            config.task_addresses,
+            vec![std::net::Ipv4Addr::new(100, 64, 0, 3)],
+            "the create carries the handed task addresses"
+        );
+        let wire = serde_json_lenient::to_string(&config).expect("the config serialises");
+        assert!(
+            !wire.contains("07070707"),
+            "the minted id never reaches the create request: {wire}"
+        );
+        assert_eq!(
+            registered.box_id,
+            Some(minted),
+            "the registration still holds the minted id for the withdrawal"
+        );
+
+        // A box that registered nothing carries no addresses and no id.
+        carry_registration(&mut config, None);
+        assert_eq!(config.box_id, None);
+        assert_eq!(config.box_addresses, None);
+        assert!(config.task_addresses.is_empty());
     }
 
     /// The VM host daemon refuses a registration whose name folds to a
