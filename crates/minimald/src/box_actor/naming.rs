@@ -679,8 +679,10 @@ impl BoxActor {
     /// (BOX-010).
     ///
     /// A rename to `self`, or to a name a running box on this host holds,
-    /// is refused with exit 2 and changes nothing: the store makes the
-    /// holder check, and its refusal names the holder.
+    /// is refused and changes nothing: the store makes the holder check,
+    /// and its refusal names the holder. The refusal's `exit_code()` is 2,
+    /// but this method returns an `io::Error`, so the code reaches only the
+    /// daemon log. The RPC reply and `min rename` do not carry it yet.
     pub(super) async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
