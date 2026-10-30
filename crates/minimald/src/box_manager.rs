@@ -283,10 +283,15 @@ impl NameSource {
 }
 
 /// The name a create gives its box (BOX-163): the expanded spec's
-/// `[box] name`, else the entry's name. A client that sends a name on the
-/// request, as `min` still does for `--name` and its minted names, keeps
-/// it ahead of the entry until the client stops sending one. A spec the
-/// daemon cannot read as a v0 spec names nothing.
+/// `[box] name`, else the entry's name. A spec the daemon cannot read as a
+/// v0 spec names nothing.
+///
+/// Interim: a name on the request goes ahead of the entry. `min` sends
+/// one for `--name`, and today also for its minted `<dir>-<hex>` names.
+/// `--name` keeps this step. The step stops putting a minted name ahead
+/// of the entry when the client sends a request name only for `--name`,
+/// never a minted `<dir>-<hex>` name. That change is
+/// <https://github.com/gominimal/minimal/issues/2762>.
 fn creation_name(
     requested: Option<&str>,
     spec: Option<&serde_json_lenient::Value>,
