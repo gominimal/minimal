@@ -994,35 +994,82 @@ impl ListenPlan {
         }
     }
 
-    /// Records `port` as held by this box at its published address
-    /// (NET-129): the dynamic port's one holder of record, read by every
-    /// declared publish of the port — so another box's declaration collides
-    /// with the box that is serving and yields its forward, instead of
-    /// failing on a bind the forwarder refuses. A port another box already
+    /// Records `port` as held by this box at `address`, where its forward
+    /// is bound (NET-129): the dynamic port's one holder of record, read by
+    /// every declared publish of the port — so another box's declaration
+    /// collides with the box that is serving and yields its forward, instead
+    /// of failing on a bind the forwarder refuses. A port another box already
     /// holds is left alone: the record never displaces a holder.
-    fn record_dynamic_hold(&self, port: u16) {
+    fn record_dynamic_hold(&self, address: Ipv4Addr, port: u16) {
         let Some(registry) = self.hostnames.as_ref() else {
             return;
         };
         registry
             .write()
             .expect("hostname registry lock poisoned")
-            .record_dynamic_hold(self.session_id, self.published, port);
+            .record_dynamic_hold(self.session_id, address, port);
     }
 
     /// Releases the hold [`Self::record_dynamic_hold`] recorded — the
     /// listener closed or the box stopped — returning the hand-overs the
     /// release elected, so the close's own line can say them beside the
     /// registry's. A port the box still declares keeps its record: the
-    /// declaration is the claim now.
-    fn release_dynamic_hold(&self, port: u16) -> Vec<crate::net::dns::PortHandOver> {
+    /// declaration is the claim now. `address` is where the forward was
+    /// bound, which is where the hold was recorded: after the box's address
+    /// moved, a forward whose move failed is still bound at the old one
+    /// (#2748).
+    fn release_dynamic_hold(
+        &self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Vec<crate::net::dns::PortHandOver> {
         let Some(registry) = self.hostnames.as_ref() else {
             return Vec::new();
         };
         registry
             .write()
             .expect("hostname registry lock poisoned")
-            .release_dynamic_hold(self.session_id, self.published, port)
+            .release_dynamic_hold(self.session_id, address, port)
+    }
+
+    /// The address the hostname registry publishes the box at now
+    /// (NET-010), the source the plan's own `published` was read from at
+    /// the launch. `None` when the launch carried no registry, or the box
+    /// publishes nowhere any more.
+    fn registry_published(&self) -> Option<Ipv4Addr> {
+        self.hostnames.as_ref().and_then(|registry| {
+            registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .published_own_address(self.session_id)
+        })
+    }
+
+    /// The box holding `port` at the plan's published address of record
+    /// (NET-129), declared or dynamic. `None` when nobody holds it, or the
+    /// launch carried no registry.
+    fn holder_at_published(&self, port: u16) -> Option<boxes::SessionId> {
+        self.hostnames.as_ref().and_then(|registry| {
+            registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .shared_port_holder(self.published, port)
+        })
+    }
+
+    /// Moves the hold [`Self::record_dynamic_hold`] recorded at `from` to
+    /// the box's published address (#2748): the forward moved there, so the
+    /// port is released at `from`, where another box may take it over, and
+    /// held where the box serves it now. Returns the hand-overs the release
+    /// elected, as [`Self::release_dynamic_hold`] does.
+    fn move_dynamic_hold(&self, from: Ipv4Addr, port: u16) -> Vec<crate::net::dns::PortHandOver> {
+        let Some(registry) = self.hostnames.as_ref() else {
+            return Vec::new();
+        };
+        let mut registry = registry.write().expect("hostname registry lock poisoned");
+        let hand_overs = registry.release_dynamic_hold(self.session_id, from, port);
+        registry.record_dynamic_hold(self.session_id, self.published, port);
+        hand_overs
     }
 }
 
@@ -1249,6 +1296,22 @@ impl BoxPublications {
             .filter(|entry| entry.owner == owner && entry.published)
         {
             entry.listed = Some(row);
+        }
+    }
+
+    /// Re-points the row `owner`'s listed publication of `port` carries at
+    /// `local`, the forward's new `host:port` after the box's published
+    /// address moved (#2748). A publication with no row stays unlisted:
+    /// the move never lists a port its gate refuses.
+    pub fn relist_local(&self, port: u16, owner: PublicationOwner, local: &str) {
+        let mut set = self.set.lock().expect("box publications lock poisoned");
+        if let Some(row) = set
+            .ports
+            .get_mut(&port)
+            .filter(|entry| entry.owner == owner && entry.published)
+            .and_then(|entry| entry.listed.as_mut())
+        {
+            row.local = local.to_string();
         }
     }
 
@@ -1627,6 +1690,19 @@ struct WatchState {
     /// is written — an allow nobody can read is never admitted, not even
     /// twice. The entry goes when the forward comes down, recorded or not.
     unrecorded: HashSet<u16>,
+    /// Forwards left at the box's old published address after a move
+    /// (#2748) because their unexpose failed. Each poll asks again, and the
+    /// stop's withdrawal passes do too.
+    retired: Vec<ExposedMapping>,
+    /// The ports whose failed move has been said once already: a bind at
+    /// the new address that keeps failing is retried on every poll, and is
+    /// the same failure each time.
+    reported_move_failures: HashSet<u16>,
+}
+
+/// The address `mapping`'s forward is bound at, read off its `local`.
+fn bound_address(mapping: &ExposedMapping) -> Option<Ipv4Addr> {
+    mapping.host_port().and_then(|(host, _)| host.parse().ok())
 }
 
 /// One permitted port whose publish the switch refused: the book
@@ -1695,7 +1771,169 @@ impl WatchState {
             reported_contention: HashSet::new(),
             reported_withdrawal_failures: HashSet::new(),
             unrecorded: HashSet::new(),
+            retired: Vec::new(),
+            reported_move_failures: HashSet::new(),
         }
+    }
+
+    /// The address the forward of `port` is bound at, where its hold of
+    /// record is: the plan's published address, unless the box's address
+    /// moved and the forward's move has not stood yet (#2748).
+    fn bound_address(&self, port: u16) -> Ipv4Addr {
+        self.forwards
+            .get(&port)
+            .and_then(bound_address)
+            .unwrap_or(self.plan.published)
+    }
+
+    /// Follows the box's published address when it moved (#2748): the
+    /// present landing moves a box off the `127.0.0.1` interim while it
+    /// runs, and the registry is the one source of the address the box's
+    /// name answers at. The plan takes the new address, so every publish
+    /// from here binds there. Each forward this watcher bound at another
+    /// address is bound again at the new one, toward the same lease, and
+    /// the old one is unbound after it, so the port is served the whole way
+    /// through. The box's gate and the VM host daemon's row name the port,
+    /// not the address, so neither changes.
+    ///
+    /// A bind at the new address that fails leaves the forward where it is,
+    /// and the next poll asks again. An unexpose at the old address that
+    /// fails is asked again on every poll and at the stop.
+    async fn follow_published_address(&mut self) {
+        if let Some(moved) = self.plan.registry_published()
+            && moved != self.plan.published
+        {
+            tracing::info!(
+                session = %self.plan.box_name,
+                from = %self.plan.published,
+                to = %moved,
+                "the box's published address moved; its listening ports follow"
+            );
+            self.plan.published = moved;
+        }
+        let host = self.plan.published.to_string();
+        let mut stray: Vec<u16> = self
+            .forwards
+            .iter()
+            .filter(|(_, mapping)| mapping.host_port().is_none_or(|(bound, _)| bound != host))
+            .map(|(port, _)| *port)
+            .collect();
+        stray.sort_unstable();
+        for port in stray {
+            self.move_forward(port).await;
+        }
+        self.unbind_retired().await;
+    }
+
+    /// Binds the forward of `port` again at the plan's published address
+    /// and unbinds the one at the address it was bound at before
+    /// ([`Self::follow_published_address`]).
+    async fn move_forward(&mut self, port: u16) {
+        let Some(old) = self.forwards.get(&port).cloned() else {
+            return;
+        };
+        let from = bound_address(&old);
+        // Another box holding the port at the new address keeps it, as a
+        // declared publish there would (NET-129, first-come): the forward
+        // stays where it is, and a later poll moves it once that box gives
+        // the port up. The `127.0.0.1` interim an absent landing moves the
+        // box to is shared, and a stopped box's hold stands there with no
+        // forward behind it.
+        if let Some(holder) = self.plan.holder_at_published(port)
+            && holder != self.plan.session_id
+        {
+            if self.reported_move_failures.insert(port) {
+                tracing::info!(
+                    session = %self.plan.box_name,
+                    host = %self.plan.published,
+                    port,
+                    from = old.local(),
+                    other = %holder,
+                    owner = %PublicationOwner::Listen.as_str(),
+                    "another box holds the listening port at the box's new address; \
+                     it stays at the old address until that box gives it up"
+                );
+            }
+            return;
+        }
+        let moved = match expose_mapping(
+            &self.plan.control,
+            self.plan.published,
+            self.plan.lease,
+            port,
+        )
+        .await
+        {
+            Ok(moved) => moved,
+            Err(error) => {
+                if self.reported_move_failures.insert(port) {
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        from = old.local(),
+                        owner = %PublicationOwner::Listen.as_str(),
+                        %error,
+                        "binding a listening port at the box's new address failed; \
+                         retrying on every poll"
+                    );
+                }
+                return;
+            }
+        };
+        self.reported_move_failures.remove(&port);
+        self.plan
+            .publications
+            .relist_local(port, PublicationOwner::Listen, moved.local());
+        self.forwards.insert(port, moved);
+        // The hold of record follows the forward (NET-129).
+        if let Some(from) = from {
+            for hand_over in self.plan.move_dynamic_hold(from, port) {
+                tracing::info!(
+                    session_id = %hand_over.holder,
+                    address = %hand_over.address,
+                    port = hand_over.port,
+                    from = %self.plan.box_name,
+                    action = "shared-address-port-hand-over",
+                    "a shared-address port passes to the earliest-created box still publishing it"
+                );
+            }
+        }
+        tracing::info!(
+            session = %self.plan.box_name,
+            host = %self.plan.published,
+            port,
+            from = old.local(),
+            owner = %PublicationOwner::Listen.as_str(),
+            "moved a listening port to the box's new address"
+        );
+        if let Err(error) = unexpose_mapping(&self.plan.control, &old).await {
+            tracing::warn!(
+                session = %self.plan.box_name,
+                port,
+                from = old.local(),
+                owner = %PublicationOwner::Listen.as_str(),
+                %error,
+                "unbinding a listening port at the box's old address failed; \
+                 retrying on every poll"
+            );
+            self.retired.push(old);
+        }
+    }
+
+    /// Asks again for the unexpose of each forward a move left at the old
+    /// address ([`Self::move_forward`]). Said once, when the move failed it.
+    async fn unbind_retired(&mut self) {
+        let mut still = Vec::new();
+        for mapping in std::mem::take(&mut self.retired) {
+            if unexpose_mapping(&self.plan.control, &mapping)
+                .await
+                .is_err()
+            {
+                still.push(mapping);
+            }
+        }
+        self.retired = still;
     }
 
     /// The PID this poll reads the box's table through, resolving the leader
@@ -1757,6 +1995,9 @@ impl WatchState {
     /// into a permitted port that stays unpublished until its server
     /// restarts.
     async fn poll(&mut self) {
+        // The publications follow the box's address before anything else:
+        // a move needs no table read, only the forwards already standing.
+        self.follow_published_address().await;
         // The leader first, when the box's host could not resolve it.
         let Some(leader) = self.resolve_leader() else {
             return;
@@ -1984,7 +2225,8 @@ impl WatchState {
                         // The standing forward serves from here on, so the
                         // box holds its port of record (NET-129), exactly
                         // as the fresh publish below records it.
-                        self.plan.record_dynamic_hold(port);
+                        self.plan
+                            .record_dynamic_hold(self.bound_address(port), port);
                         if let Some(mapping) = self.forwards.get(&port) {
                             self.plan.publications.list(
                                 port,
@@ -2286,7 +2528,8 @@ impl WatchState {
                                 // publish of the same port elsewhere sees
                                 // the box that is serving and yields
                                 // instead of failing on it.
-                                self.plan.record_dynamic_hold(port);
+                                self.plan
+                                    .record_dynamic_hold(self.bound_address(port), port);
                                 self.plan.publications.mark_audit_refused(port, false);
                                 tracing::info!(
                                     session = %self.plan.box_name,
@@ -2490,7 +2733,8 @@ impl WatchState {
             // rather than binding onto the forward this one still holds.
             // The re-admit records it again, idempotently, and the close
             // whose unexpose comes down releases it.
-            self.plan.record_dynamic_hold(port);
+            self.plan
+                .record_dynamic_hold(self.bound_address(port), port);
         }
         // The failure reaches `min session policy` as a warning row for as
         // long as the box listens and the log refuses: a watcher-driven
@@ -2590,7 +2834,8 @@ impl WatchState {
                 // another box waits on it. Said here beside the withdraw,
                 // as the hand-over's own line; the registry has already sent
                 // each to the sessions manager.
-                for hand_over in self.plan.release_dynamic_hold(port) {
+                let bound = bound_address(&mapping).unwrap_or(self.plan.published);
+                for hand_over in self.plan.release_dynamic_hold(bound, port) {
                     tracing::info!(
                         session_id = %hand_over.holder,
                         address = %hand_over.address,
@@ -2711,7 +2956,8 @@ impl WatchState {
     /// about.
     async fn withdraw_all(&mut self) {
         for attempt in 0..WITHDRAW_PASSES {
-            if self.forwards.is_empty() {
+            self.unbind_retired().await;
+            if self.forwards.is_empty() && self.retired.is_empty() {
                 return;
             }
             if attempt > 0 {
@@ -2724,14 +2970,19 @@ impl WatchState {
                 self.close(port, "box stopped").await;
             }
         }
-        if self.forwards.is_empty() {
+        if self.forwards.is_empty() && self.retired.is_empty() {
             // The last pass brought the last forward down: every port the
             // box's processes published is unpublished, and a warning that
             // named none of them would only say the stop happened — which
             // the stop itself already says.
             return;
         }
-        let still: Vec<&str> = self.forwards.values().map(ExposedMapping::local).collect();
+        let still: Vec<&str> = self
+            .forwards
+            .values()
+            .chain(&self.retired)
+            .map(ExposedMapping::local)
+            .collect();
         tracing::warn!(
             session = %self.plan.box_name,
             still_published = ?still,
