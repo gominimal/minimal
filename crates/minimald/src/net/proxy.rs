@@ -44,7 +44,7 @@ use tokio::io::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
-use boxes::SessionId;
+use sessions::SessionId;
 
 use super::dns::HostnameRegistry;
 use super::policy::Direction;
@@ -363,7 +363,7 @@ impl<T: HostRoute> Router<T> {
             return CallerLookup::Unattributed;
         };
         let owner = self.owner;
-        let found = crate::traced::spawn_blocking(move || owner(peer, local))
+        let found = tokio::task::spawn_blocking(move || owner(peer, local))
             .await
             .unwrap_or(super::dns::ConnectingOwner::Unknown);
         let box_id = match found {
@@ -3852,11 +3852,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        let deny_all = BoxPolicy {
+        let deny_all = SessionPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         // A host-address box keeps the socket-owner lookup running after the
         // pending box reports its lease.
@@ -3877,7 +3876,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         let refused = proxy_get_from(proxy_addr, OFF_NODE_ADDR, "web.min.internal:18080").await;
         assert!(
@@ -3919,11 +3918,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        let deny_all = BoxPolicy {
+        let deny_all = SessionPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         // A live host-address box keeps the socket-owner lookup running.
         reg.register_host_net(host_box, "hostbox");
@@ -3955,7 +3953,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         let routed = proxy_get_from(proxy_addr, OFF_NODE_ADDR, "web.min.internal:18080").await;
         assert!(
@@ -3994,17 +3992,15 @@ mod tests {
         // (`host_address_box_registers_its_caller_facts` in the box actor's
         // tests proves that production registration). Neither ever reports a
         // switch lease.
-        let deny_all = BoxPolicy {
+        let deny_all = SessionPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
-        let no_rules = BoxPolicy {
+        let no_rules = SessionPolicy {
             egress: None,
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         for (id, name, policy) in [
             (host_box, "hostbox", deny_all),
@@ -4018,7 +4014,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
 
@@ -4119,7 +4115,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         let (buf, guard) = capture_logs();
         let refused =
@@ -4170,11 +4166,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        let deny_all = BoxPolicy {
+        let deny_all = SessionPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         reg.register_host_net(host_box, "hostbox");
         reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
@@ -4193,7 +4188,7 @@ mod tests {
 
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         // The owner lookup answers Unknown for every socket, so a request
         // that ran it is refused. This one routes: no lookup ran.
@@ -4247,11 +4242,10 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             BTreeMap::from([(18080, backend_port)]),
         );
-        let deny_all = BoxPolicy {
+        let deny_all = SessionPolicy {
             egress: Some(EgressPolicy::deny_all()),
             ingress: None,
             credentialed_upstream: None,
-            quic443: None,
         };
         reg.register_host_net(host_box, "hostbox");
         reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
@@ -4263,7 +4257,7 @@ mod tests {
         table.write().unwrap().mark_running(host_box);
 
         // The first host's loop ends late, after the second host runs.
-        crate::box_runtime::NameMarker::new(Arc::clone(&table), host_box, first).mark_stopped();
+        crate::session_host::NameMarker::new(Arc::clone(&table), host_box, first).mark_stopped();
         assert!(
             table.read().unwrap().has_unleased_callers(),
             "a replaced host's late stop mark leaves the running box live"
@@ -4280,7 +4274,7 @@ mod tests {
             .with_socket_owner(host_box_owner);
         let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        crate::traced::spawn(serve(proxy, router));
+        tokio::spawn(serve(proxy, router));
 
         let refused = proxy_get_from(proxy_addr, BROWSER_ADDR, "web.min.internal:18080").await;
         assert!(
@@ -4289,7 +4283,7 @@ mod tests {
         );
 
         // The current launch's own stop mark still marks the box stopped.
-        crate::box_runtime::NameMarker::new(Arc::clone(&table), host_box, second).mark_stopped();
+        crate::session_host::NameMarker::new(Arc::clone(&table), host_box, second).mark_stopped();
         assert!(
             !table.read().unwrap().has_unleased_callers(),
             "the current host's stop mark marks the box stopped"

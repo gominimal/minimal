@@ -8822,12 +8822,12 @@ async fn host_address_box_registers_its_caller_facts() {
     let id = create_configured_session(&mut client, "hostcaller", "/uwu").await;
     let manager = server.state.sessions_manager().await;
     let handle = manager
-        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
         .await
         .unwrap()
         .expect("the host-address box resolves");
     let record = handle.record().await.expect("the record reads");
-    assert_eq!(record.network, boxes::NetworkMode::HostNet);
+    assert_eq!(record.network, sessions::NetworkMode::HostNet);
 
     let registry = manager.hostnames();
     let registry = registry.read().expect("registry lock");

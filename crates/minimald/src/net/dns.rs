@@ -2886,10 +2886,10 @@ fn owner_of_holders(holders: impl IntoIterator<Item = Option<String>>) -> Connec
 /// the path component after `boxes/allow` or `boxes/deny`, read as a box id.
 /// `None` for a process in no box's leaf.
 fn box_in_cgroup(cgroup: &str) -> Option<SessionId> {
-    use sandbox::classifier::BOXES_DIR;
+    use sandbox2::classifier::BOXES_DIR;
     let subtrees = [
-        sandbox::config::Verdict::Allow.dir_name(),
-        sandbox::config::Verdict::Deny.dir_name(),
+        sandbox2::config::Verdict::Allow.dir_name(),
+        sandbox2::config::Verdict::Deny.dir_name(),
     ];
     cgroup.lines().find_map(|line| {
         // cgroup2's line is `0::<path>`; a v1 line names a controller.

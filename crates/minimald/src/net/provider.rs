@@ -825,7 +825,7 @@ impl OwnIpNetwork {
                     // capability is missing separates a kernel-config
                     // problem from a policy one.
                     let tun = std::path::Path::new("/dev/net/tun").exists();
-                    let userns = sandbox::user_namespaces_restriction()
+                    let userns = sandbox2::user_namespaces_restriction()
                         .map_or_else(|| "available".to_string(), |r| r.to_string());
                     return Err(NetworkError::new(std::io::Error::other(format!(
                         "the box's sandbox could not create its network device \
