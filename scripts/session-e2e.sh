@@ -11834,7 +11834,8 @@ proof_bep_second_box_needs_no_sign_in() {
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
   {
     hook_seed_preamble
-    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
   bep_sids=""
@@ -11842,6 +11843,7 @@ proof_bep_second_box_needs_no_sign_in() {
     # Headless: stdin from /dev/null and --no-prompt. A sign-in prompt has
     # no terminal to ask on, so a box that needed one fails here.
     bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --network own_ip --credentialed-upstream \
       --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
       --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
       </dev/null 2>"$WORK/bep-$bep_name.err")" || {
@@ -11879,13 +11881,15 @@ proof_bep_box_env_holds_sealed_value_only() {
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
   {
     hook_seed_preamble
-    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
   bep_sids=""
   bep_values=""
   for bep_name in e2e-bep-env-first e2e-bep-env-second; do
     bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --network own_ip --credentialed-upstream \
       --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
       --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
       </dev/null 2>"$WORK/bep-env-$bep_name.err")" || {
@@ -11976,7 +11980,7 @@ proof_bep_git_and_gh_against_private_repo() {
   {
     hook_seed_preamble
     printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
-    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
@@ -11984,7 +11988,7 @@ proof_bep_git_and_gh_against_private_repo() {
     --name e2e-bep-git-and-gh \
     --network own_ip --credentialed-upstream \
     --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
-    --allow-dns-hosts codeload.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
     </dev/null 2>"$WORK/$gg_case.err")" || {
     echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
     echo "--- stdout ---"; printf '%s\n' "$gg_out"
@@ -12060,7 +12064,7 @@ proof_bep_git_credential_helper_sends_header() {
   {
     hook_seed_preamble
     printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
-    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
@@ -12068,7 +12072,7 @@ proof_bep_git_credential_helper_sends_header() {
     --name e2e-bep-git-credential-helper \
     --network own_ip --credentialed-upstream \
     --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
-    --allow-dns-hosts codeload.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
     </dev/null 2>"$WORK/$gh_case.err")" || {
     echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
     echo "--- stdout ---"; printf '%s\n' "$gh_out"
@@ -12156,9 +12160,9 @@ proof_bep_git_credential_helper_sends_header() {
 #   6. `min box audit` shows the first box's admits for github.com and
 #      api.github.com, and the second box's refusal marked `cross_box`.
 # The value is never printed: the transcript names only its length.
-# The clone meets the same known gap as the private-repository case above:
-# no box ships a git credential helper until #2499 lands, so the clone fails
-# on a lane that runs this case, and the case does not hide it.
+# The clone and push use the git credential helper the box carries from
+# creation (#2499, shipped in #2547); the case configures no helper of its
+# own.
 bep_slice_jsonl_check() { # $1 = the jsonl file, $2 = admit or cross_box
   python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -12756,8 +12760,8 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
 # the root, never the root the box trusts. The case needs the sign-in a
 # person made with `min auth login` and the private repository
 # E2E_BEP_PRIVATE_REPO, and records NOT RUN without them, as
-# bep_first_slice_end_to_end does. The clone meets the same known gap as
-# that case: no box ships a git credential helper until #2499 lands.
+# bep_first_slice_end_to_end does. The clone and push use the git credential
+# helper the box carries from creation (#2499, shipped in #2547).
 proof_bep_signing_rotation_keeps_running_box_working() {
   echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
   local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
@@ -15189,7 +15193,8 @@ bep_trust_box_files() {
     hook_seed_preamble
     printf '\n[session]\npackages = ["ca-certificates"]\n'
     if [ "$tb_kind" = grant ]; then
-      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\n'
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+      printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
     fi
   } > "$tb_seed/minimal.toml"
   mkdir "$tb_seed/.git"
