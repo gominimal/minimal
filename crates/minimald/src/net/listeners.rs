@@ -422,6 +422,73 @@ pub(crate) async fn host_row_standing(
     None
 }
 
+/// The id the VM host daemon mints for a box this daemon is about to
+/// create (BOX-002), asked over the report door. `switch_address` is the
+/// address the box's registration handed it, when it has one: the host
+/// answers with the id it minted for that row, so the record and the row
+/// name one id. `None` on a native host, which has no VM host, and where
+/// this daemon's own store mints the id. An error when the door refused
+/// the ask or did not answer within [`REPORT_DEADLINE`] over its attempts:
+/// the caller refuses the create, because no other source may name the
+/// box's id. A row's id goes to one create only. Each call is one create:
+/// it makes one token and sends it on every attempt, so a retry of the same
+/// create after a lost or late reply gets the same id. Another create that
+/// asks for a claimed row is refused, and that create fails closed.
+pub(crate) async fn mint_box_id(
+    control: &ControlChannel,
+    switch_address: Option<Ipv4Addr>,
+) -> Option<io::Result<minimald_rpc::BoxId>> {
+    let channel = box_report_channel(control)?;
+    let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+        switch_address,
+        create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
+    });
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
+    for attempt in 1..=REPORT_ATTEMPTS {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
+            Ok(minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id }) => {
+                return Some(Ok(minted_box_id));
+            }
+            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
+                tracing::warn!(?switch_address, %error, "the VM host daemon refused the box id mint");
+                return Some(Err(io::Error::other(error)));
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?switch_address,
+                    reply = ?other,
+                    "the VM host daemon answered the box id mint with another verb's reply"
+                );
+                return Some(Err(io::Error::other(
+                    "the VM host daemon answered with something other than a box id",
+                )));
+            }
+            Err(error) => {
+                tracing::debug!(?switch_address, attempt, %error, "the box id mint was not answered");
+                last = error;
+            }
+        }
+        if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    // No door, or a door that never answered: the bare `minvmd boot` path
+    // binds none. The caller refuses the create with this text as its
+    // reply, so it names what happened in the words the client reads.
+    tracing::warn!(?switch_address, error = %last, "the box id mint was never answered");
+    // The kind marks "no answer" for the caller, whatever the transport
+    // said. The transport's error goes to the log above, not to the client.
+    Some(Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "it did not answer in time",
+    )))
+}
+
 /// Whether the Box Egress Proxy's listener is live on the host (BEP-062):
 /// asked over the report door the way [`host_row_standing`] asks, because
 /// the proxy runs on the host and its listener state lives in the VM host
