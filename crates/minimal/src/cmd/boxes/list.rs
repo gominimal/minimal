@@ -347,8 +347,23 @@ Live execs: exec-1
         assert_eq!(
             missing,
             "No box has the name or id `no-such-box`. \
-             Run `min box list` to see the boxes on this host."
+             Run `min box list --all` to see the boxes on this host."
         );
+        // A start that runs past the first dash matches without the dash,
+        // and a name matches ignoring case.
+        assert_eq!(find("0199e0b00000").unwrap(), restarted.box_id);
+        assert_eq!(find("KEPT-session").unwrap(), stopped.box_id);
+        // A name that several boxes held resolves to the running box that
+        // holds it, else to the most recent creation.
+        let reused = |id: &str, state: &str| entry(id, Some("reused"), "session", state);
+        let older = reused("0199e0d0-0000-7000-8000-000000000006", "stopped");
+        let newer = reused("0199e0d0-0000-7000-8000-000000000007", "exited");
+        let live = reused("0199e0d0-0000-7000-8000-000000000008", "running");
+        let latest = reused("0199e0d0-0000-7000-8000-000000000009", "stopped");
+        let ended = [older.clone(), newer.clone()];
+        assert_eq!(find_listed_box(&ended, "reused").unwrap(), newer.box_id);
+        let with_live = [older, live.clone(), latest];
+        assert_eq!(find_listed_box(&with_live, "reused").unwrap(), live.box_id);
         // An id that is not listed still goes to the daemon, which answers
         // for it.
         let unlisted = "0199e0ff-0000-7000-8000-000000000009";

@@ -22,7 +22,9 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     {
         Errorable::Ok(shown) => shown,
         Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
-            bail!("No box has the id `{id}`. Run `min box list` to see the boxes on this host.")
+            bail!(
+                "No box has the id `{id}`. Run `min box list --all` to see the boxes on this host."
+            )
         }
         Errorable::Err { error } => bail!("{error}"),
     };
@@ -31,8 +33,13 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     Ok(())
 }
 
-/// The id of the box `target` names in `listing`: a full id as given, else
-/// the box with that name, else the one box whose id starts with it.
+/// The id of the box `target` names in `listing`: a full id as given,
+/// else the box with that name, else the box with that name ignoring
+/// ASCII case, else the one box whose id starts with it. The id start is
+/// compared without dashes and ignoring case, as `min session attach`
+/// compares it. Several boxes can hold one name over time, so a name
+/// resolves to the running box that holds it, else to the most recent
+/// creation, which is the greatest id.
 pub(crate) fn find_listed_box(
     listing: &[minimald_rpc::BoxListingEntry],
     target: &str,
@@ -40,17 +47,31 @@ pub(crate) fn find_listed_box(
     if let Ok(id) = boxes::SessionId::parse_str(target) {
         return Ok(id);
     }
-    if let Some(entry) = listing
-        .iter()
-        .find(|entry| entry.name.as_deref() == Some(target))
-    {
-        return Ok(entry.box_id);
+    let exact = |entry: &&minimald_rpc::BoxListingEntry| entry.name.as_deref() == Some(target);
+    let folded = |entry: &&minimald_rpc::BoxListingEntry| {
+        entry
+            .name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(target))
+    };
+    for named in [
+        newest_named(listing.iter().filter(exact)),
+        newest_named(listing.iter().filter(folded)),
+    ] {
+        if let Some(id) = named {
+            return Ok(id);
+        }
     }
     if is_id_prefix(target) {
-        let start = target.to_ascii_lowercase();
-        let mut matches = listing
-            .iter()
-            .filter(|entry| entry.box_id.to_string().starts_with(&start));
+        let start = target.replace('-', "").to_ascii_lowercase();
+        let mut matches = listing.iter().filter(|entry| {
+            entry
+                .box_id
+                .as_ref()
+                .simple()
+                .to_string()
+                .starts_with(&start)
+        });
         if let Some(first) = matches.next() {
             if matches.next().is_some() {
                 bail!(
@@ -61,7 +82,21 @@ pub(crate) fn find_listed_box(
             return Ok(first.box_id);
         }
     }
-    bail!("No box has the name or id `{target}`. Run `min box list` to see the boxes on this host.")
+    bail!(
+        "No box has the name or id `{target}`. \
+         Run `min box list --all` to see the boxes on this host."
+    )
+}
+
+/// Of the boxes that hold one name, the running one, else the one with the
+/// greatest id. Box ids are UUIDv7, so the greatest id is the latest
+/// creation.
+fn newest_named<'a>(
+    named: impl Iterator<Item = &'a minimald_rpc::BoxListingEntry>,
+) -> Option<boxes::SessionId> {
+    named
+        .max_by_key(|entry| (entry.state == "running", *entry.box_id.as_ref()))
+        .map(|entry| entry.box_id)
 }
 
 /// Writes one box record as `Label: value` lines. A value the record
