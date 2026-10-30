@@ -151,7 +151,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install cross + nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cross,nextest
 
@@ -163,7 +163,7 @@ jobs:
         # restore-keys chain, which grew to ~19 GB and took ~6.5 min to
         # restore. Cargo tags target/<triple>/ as a nested target dir, so the
         # musl dev and initramfs profiles are kept.
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
         with:
           shared-key: kvm-musl
           # PR branches restore but never write: multi-GB caches written by
@@ -260,7 +260,7 @@ jobs:
           persist-credentials: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: nextest
 
