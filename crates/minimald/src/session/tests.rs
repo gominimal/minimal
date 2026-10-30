@@ -3332,6 +3332,58 @@ async fn own_ip_default_deny_all() {
 // (NET-010 to NET-013)
 // ---------------------------------------------------------------------------
 
+/// The running test's [`declared_port`] and the lock file that holds its
+/// lease. nextest runs each test in a process of its own, so one lease per
+/// process is one port per test, whichever thread asks for it: the test's
+/// own thread or a task it spawned onto a runtime worker. The lock is
+/// released when the process exits.
+static DECLARED_PORT: std::sync::OnceLock<(u16, std::fs::File)> = std::sync::OnceLock::new();
+
+/// The ports [`declared_port`] leases from. The band sits below the kernel's
+/// default ephemeral range (`net.ipv4.ip_local_port_range` starts at 32768),
+/// so no other process's `bind(0)` or outbound `connect` is handed one
+/// between the lease and the finalize's probe, and no fixed port in the tree
+/// falls inside it. A host that widens the ephemeral range down into this
+/// band loses that guarantee.
+const DECLARED_PORTS: std::ops::Range<u16> = 23_000..24_000;
+
+/// Leases a port from [`DECLARED_PORTS`]: the first one whose lock file this
+/// process can lock, among every test process the same user runs on the
+/// host, and that nothing already listens on at `127.0.0.1`. The lock files
+/// live in a directory of the user's own, so another user's run cannot leave
+/// files this one cannot open; a file that still cannot be opened counts as
+/// leased. The probe checks `127.0.0.1` only: a listener on `0.0.0.0` also
+/// fails it, but one bound to a specific `127.0.64.x` address does not. The
+/// port itself stays unbound, because the finalize under test must find it
+/// free.
+fn lease_declared_port() -> (u16, std::fs::File) {
+    let dir = std::env::temp_dir().join(format!("minimald-test-ports-{}", nix::unistd::getuid()));
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("create the port lease directory {dir:?}: {e}"));
+    for port in DECLARED_PORTS {
+        let Ok(lock) = std::fs::File::create(dir.join(format!("{port}.lock"))) else {
+            continue;
+        };
+        if lock.try_lock().is_ok()
+            && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+        {
+            return (port, lock);
+        }
+    }
+    panic!("every port in {DECLARED_PORTS:?} is leased, in use, or has no lease file in {dir:?}");
+}
+
+/// The host port every own-address box of the running test declares, in
+/// place of one fixed number. A finalize refuses a declared port that
+/// something else holds at the box's published address (NET-144), and
+/// nextest runs tests side by side on one host: two tests declaring one
+/// fixed port at `127.0.0.1` can refuse each other's box. So each test
+/// leases its own port, and every box within the test shares it, which the
+/// collision tests need.
+fn declared_port() -> u16 {
+    DECLARED_PORT.get_or_init(lease_declared_port).0
+}
+
 /// An own-address session's config: a box that declares one published port —
 /// the ingress a publish is made of (NET-010) — under the session `name`.
 fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
@@ -3344,7 +3396,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                 egress: None,
                 ingress: Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
-                        external_port: 18080,
+                        external_port: declared_port(),
                         internal_port: 80,
                         proto: sessions::IpProto::Tcp,
                     }],
@@ -3562,7 +3614,8 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 77);
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
     // Another process holds the declared host port at the handed address.
-    let _holder = std::net::TcpListener::bind((handed, 18080)).expect("hold the declared port");
+    let _holder =
+        std::net::TcpListener::bind((handed, declared_port())).expect("hold the declared port");
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let id = create_handed_own_ip_session(&mut client, "taken", switch, handed).await;
@@ -3570,7 +3623,7 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
         &mut client,
         id,
         minimald_rpc::PortInUseRefusal {
-            port: 18080,
+            port: declared_port(),
             box_port: 80,
             holder: minimald_rpc::PortHolder::Host,
         },
@@ -3580,7 +3633,7 @@ async fn activation_refused_when_declared_port_is_held_by_a_host_program() {
     assert!(
         logged.lines().any(|line| line.contains("host-port-in-use")
             && line.contains(&format!("session={id}"))
-            && line.contains("port=18080")
+            && line.contains(&format!("port={}", declared_port()))
             && line.contains("127.0.64.77")
             && line.contains("holder=host")),
         "one warn line names the session, port, address and holder, got: {logged}"
@@ -3628,7 +3681,7 @@ async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fal
         &mut client,
         second,
         minimald_rpc::PortInUseRefusal {
-            port: 18080,
+            port: declared_port(),
             box_port: 80,
             holder: minimald_rpc::PortHolder::Box("first".to_string()),
         },
@@ -3638,7 +3691,7 @@ async fn activation_refused_when_declared_port_is_held_by_another_box_at_the_fal
         registry
             .read()
             .expect("registry lock")
-            .own_port_holder(std::net::Ipv4Addr::LOCALHOST, 18080)
+            .own_port_holder(std::net::Ipv4Addr::LOCALHOST, declared_port())
             .map(|(holder, _)| holder),
         Some(first),
         "the first box keeps the port"
@@ -3687,7 +3740,8 @@ async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict
         finalized
             .shared_port_collisions
             .iter()
-            .any(|collision| collision.port == 18080 && collision.held_by.starts_with("first")),
+            .any(|collision| collision.port == declared_port()
+                && collision.held_by.starts_with("first")),
         "under the pending verdict the second box yields the port: {finalized:?}"
     );
     let registry = manager.hostnames();
@@ -3723,7 +3777,7 @@ async fn activation_refused_when_declared_port_is_held_reported_when_the_verdict
         logged.lines().any(|line| line.contains("host-port-in-use")
             && line.contains("127.0.0.1 fallback")
             && line.contains(&format!("session={second}"))
-            && line.contains("port=18080")
+            && line.contains(&format!("port={}", declared_port()))
             && line.contains("address=127.0.0.1")
             && line.contains("holder=box:first")),
         "the absent landing reports the held port, the address and the holder, got: {logged}"
@@ -3960,10 +4014,10 @@ async fn each_box_gets_own_loopback_address() {
             .resolve(&format!("{name}.min.internal"))
             .unwrap_or_else(|| panic!("{name}'s name routes"));
         assert_eq!(
-            route.upstream(18080),
+            route.upstream(declared_port()),
             Some(std::net::SocketAddr::new(
                 std::net::IpAddr::V4(address),
-                18080
+                declared_port()
             )),
             "{name}'s own port number is published at its own address, not translated"
         );
@@ -4060,13 +4114,13 @@ async fn name_answers_without_attached_client() {
     let route = registry
         .read()
         .expect("registry lock")
-        .resolve("web.min.internal:18080")
+        .resolve(&format!("web.min.internal:{}", declared_port()))
         .expect("the name routes with no client attached");
     assert_eq!(
-        route.upstream(18080),
+        route.upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(address),
-            18080
+            declared_port()
         )),
         "a request for the box's declared port is forwarded to the box's own address"
     );
@@ -5645,12 +5699,12 @@ async fn a_resumed_handed_box_publishes_the_interim_without_waiting_and_takes_it
         registry
             .read()
             .expect("registry lock")
-            .resolve("resumed-hand.min.internal:18080")
+            .resolve(&format!("resumed-hand.min.internal:{}", declared_port()))
             .expect("the name routes once the verdict lands")
-            .upstream(18080),
+            .upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(handed),
-            18080
+            declared_port()
         )),
         "the box's own port number is published at its own address, not translated"
     );
@@ -6544,12 +6598,12 @@ async fn an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late() 
         registry
             .read()
             .expect("registry lock")
-            .resolve("web.min.internal:18080")
+            .resolve(&format!("web.min.internal:{}", declared_port()))
             .expect("the name routes at the hand")
-            .upstream(18080),
+            .upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(handed),
-            18080
+            declared_port()
         )),
         "the box's declared port is published at its own hand, exactly where \
          the attach path binds its forwards"
@@ -6787,23 +6841,23 @@ async fn shared_address_port_collision_reported_not_translated() {
     );
     assert_eq!(
         routes
-            .resolve("first.min.internal:18080")
+            .resolve(&format!("first.min.internal:{}", declared_port()))
             .expect("first's name routes")
-            .upstream(18080),
+            .upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(first_address),
-            18080,
+            declared_port(),
         )),
         "the first box's port is published at the number it asked for"
     );
     assert_eq!(
         routes
-            .resolve("second.min.internal:18080")
+            .resolve(&format!("second.min.internal:{}", declared_port()))
             .expect("second's name routes")
-            .upstream(18080),
+            .upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(second_address),
-            18080,
+            declared_port(),
         )),
         "the second box's port is published at the number it asked for"
     );
@@ -6816,7 +6870,7 @@ async fn shared_address_port_collision_reported_not_translated() {
     assert_eq!(
         routes.shared_port_collisions(second),
         vec![crate::net::dns::SharedPortCollision {
-            port: 18080,
+            port: declared_port(),
             other: "first.min.internal".to_string(),
         }],
         "the second box records the port it yields and the box that holds it"
@@ -6835,7 +6889,7 @@ async fn shared_address_port_collision_reported_not_translated() {
     assert_eq!(
         second_reply.shared_port_collisions,
         vec![minimald_rpc::SharedPortCollision {
-            port: 18080,
+            port: declared_port(),
             held_by: "first.min.internal".to_string(),
         }],
         "the finalize reply names the yielded port and the box that holds it"
@@ -6851,7 +6905,7 @@ async fn shared_address_port_collision_reported_not_translated() {
         .lines()
         .filter(|line| {
             line.contains("action=\"shared-address-port-collision\"")
-                && line.contains("port=18080")
+                && line.contains(&format!("port={}", declared_port()))
                 && (line.contains(&format!("session_id={first}"))
                     || line.contains(&format!("session_id={second}")))
         })
@@ -6903,7 +6957,7 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
         log.lines()
             .filter(|line| {
                 line.contains("action=\"shared-address-port-collision\"")
-                    && line.contains("port=18080")
+                    && line.contains(&format!("port={}", declared_port()))
                     && line.contains(&format!("session_id={second}"))
             })
             .count()
@@ -6938,7 +6992,7 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     assert_eq!(
         routes.shared_port_collisions(second),
         vec![crate::net::dns::SharedPortCollision {
-            port: 18080,
+            port: declared_port(),
             other: "holds.min.internal".to_string(),
         }],
         "after the restart the second box still yields the port to the first"
@@ -7005,7 +7059,7 @@ async fn shared_address_holder_same_in_any_resume_order() {
     let newer = newer.expect("some newer box's store key sorts before an older box's");
     let (older, older_name) = older;
     let held_by_older = vec![crate::net::dns::SharedPortCollision {
-        port: 18080,
+        port: declared_port(),
         other: format!("{older_name}.min.internal"),
     }];
     {
@@ -7069,7 +7123,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     await_echo(&mut channel).await;
     finalize_session(&mut client, older).await;
     let held_by_newer = vec![crate::net::dns::SharedPortCollision {
-        port: 18080,
+        port: declared_port(),
         other: "newer.min.internal".to_string(),
     }];
     {
@@ -7097,7 +7151,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
         .expect("the record reads back");
     assert_eq!(
         record.bound_ports,
-        std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, 18080)]),
+        std::collections::BTreeSet::from([std::net::SocketAddrV4::new(shared, declared_port())]),
         "the launch recorded the port it bound on the box's record"
     );
     let registry = manager.hostnames();
@@ -7113,7 +7167,7 @@ async fn shared_address_port_stays_with_the_box_that_bound_it_across_a_restart()
     );
 }
 
-/// Two boxes handed one loopback address, both declaring port 18080: the
+/// Two boxes handed one loopback address, both declaring the test's port: the
 /// first to finalize holds it and the second yields. Returns the manager,
 /// the two ids, and the shared address the registry publishes them at.
 #[cfg(target_os = "linux")]
@@ -7214,7 +7268,7 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
     );
     let declared = crate::net::policy::expose_request(
         &sessions::PortMapping {
-            external_port: 18080,
+            external_port: declared_port(),
             internal_port: 80,
             proto: sessions::IpProto::Tcp,
         },
@@ -7234,7 +7288,8 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
             "the box holds the port of record"
         );
     }
-    let bound = std::collections::BTreeSet::from([std::net::SocketAddrV4::new(published, 18080)]);
+    let bound =
+        std::collections::BTreeSet::from([std::net::SocketAddrV4::new(published, declared_port())]);
     let mut recorded = false;
     for _ in 0..1_000 {
         if handle
@@ -7267,7 +7322,7 @@ async fn a_destroyed_holders_shared_port_is_bound_for_the_running_box_that_takes
         "the stop unbinds the handed-over forward: {requests:?}"
     );
     assert!(
-        body.contains(&format!("\"local\":\"{published}:18080\"")),
+        body.contains(&format!("\"local\":\"{published}:{}\"", declared_port())),
         "the unexpose names the handed-over listener: {body}"
     );
     assert_eq!(requests.len(), 2, "nothing else was asked: {requests:?}");
@@ -7570,12 +7625,12 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
         registry
             .read()
             .expect("registry lock")
-            .resolve("web.min.internal:18080")
+            .resolve(&format!("web.min.internal:{}", declared_port()))
             .expect("the name routes at the hand")
-            .upstream(18080),
+            .upstream(declared_port()),
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(handed),
-            18080
+            declared_port()
         )),
         "the box's declared port is published at its own hand, exactly where \
          the attach path binds its forwards"
