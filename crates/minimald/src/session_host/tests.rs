@@ -5720,7 +5720,16 @@ async fn expose_unenrolled_decision_audited() {
         .lock()
         .await
         .control_socket();
-    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+    let (forwarder, _served) = fake_forwarder(sock.clone(), 200).await;
+    // On a VM host each decision is also reported to the VM host daemon,
+    // which keeps its own copy outside the VM. The two boxes' audit routes
+    // go to one stand-in door, each under a row key of its own.
+    let web_row = std::net::Ipv4Addr::new(100, 64, 128, 201);
+    let db_row = std::net::Ipv4Addr::new(100, 64, 128, 202);
+    let door_sock = sock.with_file_name("audit-door.sock");
+    let (door, mut reports, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_host_audit_route_for_tests("web", web_row, &door_sock);
+    crate::net::listeners::seed_host_audit_route_for_tests("db", db_row, &door_sock);
 
     web_handle
         .expose_dynamic(3000)
@@ -5732,10 +5741,70 @@ async fn expose_unenrolled_decision_audited() {
         )) => {}
         other => panic!("the deny-all default refuses the request: {other:?}"),
     }
+
+    // Each decision reaches the host as one report keyed by its box's row.
+    let mut host_reports = Vec::new();
+    for _ in 0..2 {
+        let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+            .await
+            .expect("each decision is reported to the VM host daemon")
+            .expect("the report door stand-in lives");
+        replies
+            .send(minimald_rpc::BoxControlReply::Audited { audited: true })
+            .expect("the report door stand-in lives");
+        match report {
+            minimald_rpc::BoxControlRequest::ReportExposeDecision(report) => {
+                host_reports.push(report);
+            }
+            other => panic!("a decision is reported as an expose decision: {other:?}"),
+        }
+    }
+    host_reports.sort_by_key(|report| report.switch_address);
+    assert_eq!(
+        host_reports,
+        vec![
+            minimald_rpc::ExposeDecisionReport {
+                switch_address: web_row,
+                port: 3000,
+                decision: sessions::DynamicIngress::Allow,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Published,
+            },
+            minimald_rpc::ExposeDecisionReport {
+                switch_address: db_row,
+                port: 3000,
+                decision: sessions::DynamicIngress::Deny,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+            },
+        ],
+        "the host hears each decision the local log records"
+    );
+
+    // With the host unreachable, the local record still lands.
+    crate::net::listeners::seed_host_audit_route_for_tests(
+        "db",
+        db_row,
+        sock.with_file_name("no-door.sock"),
+    );
+    match db_handle.expose_dynamic(3001).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("the deny-all default refuses the request: {other:?}"),
+    }
     forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_host_audit_route_for_tests("web", web_row);
+    crate::net::listeners::clear_host_audit_route_for_tests("db", db_row);
 
     let records = audit_records(&server.state.minimal_state_dir().await).await;
-    assert_eq!(records.len(), 2, "each decision is one record: {records:?}");
+    assert_eq!(records.len(), 3, "each decision is one record: {records:?}");
+    assert_eq!(records[2]["box"], "db");
+    assert_eq!(
+        records[2]["port"], 3001,
+        "a decision the host cannot hear is still recorded locally: {records:?}"
+    );
     assert_eq!(records[0]["box"], "web");
     assert_eq!(records[0]["port"], 3000);
     assert_eq!(records[0]["decision"], "allow");

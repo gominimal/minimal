@@ -1017,6 +1017,87 @@ pub trait Listener: Send {
     const IS_LOCAL: bool;
 
     fn accept(&self) -> impl Future<Output = std::io::Result<(Self::Stream, Self::Addr)>> + Send;
+
+    /// The vsock CID of a peer this transport refuses at accept, or `None`
+    /// to serve it. The accept loop asks this before it reads a byte from
+    /// the connection, and drops a refused one unread. Only the vsock
+    /// transport refuses a peer ([`vsock_peer_refused`]); a UDS peer is
+    /// gated by its socket's file mode instead.
+    fn refused_cid(_peer: &Self::Addr) -> Option<u32> {
+        None
+    }
+}
+
+/// Whether a vsock peer at `cid` is refused by the in-VM daemon's RPC
+/// listener (NET-139): every CID but the host's (`VMADDR_CID_HOST`, 2). The
+/// vsock channel into a VM runs host to guest only, so a guest-local peer
+/// (loopback CID 1, the VM's own CID, or a sibling) is not the host and is
+/// refused, whatever the box seal's state.
+#[cfg(target_os = "linux")]
+pub(crate) fn vsock_peer_refused(cid: u32) -> bool {
+    cid != tokio_vsock::VMADDR_CID_HOST
+}
+
+/// How often the refusal line for one peer CID is written (NET-139): the
+/// first refusal in a window writes the line, and the line carries the
+/// count of refusals since the last one, so a peer that connects in a loop
+/// cannot flood the daemon's log.
+const PEER_REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peer CIDs the refusal limiter tracks at once. Past it the
+/// table is cleared, so a peer that cycles CIDs costs a line per CID, not
+/// memory.
+const PEER_REFUSAL_TRACKED: usize = 64;
+
+/// Per peer CID: when its refusal line was last written, and how many
+/// refusals came after that line.
+static PEER_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (std::time::Instant, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records one refused peer at `cid` and answers how many refusals the
+/// line to write now covers, or `None` while the CID's window is still
+/// open and the line is suppressed.
+fn peer_refusal_due(cid: u32, now: std::time::Instant) -> Option<u64> {
+    let mut refusals = PEER_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refusals.len() >= PEER_REFUSAL_TRACKED && !refusals.contains_key(&cid) {
+        refusals.clear();
+    }
+    match refusals.get_mut(&cid) {
+        Some((last, unlogged)) if now.duration_since(*last) < PEER_REFUSAL_LOG_INTERVAL => {
+            *unlogged = unlogged.saturating_add(1);
+            None
+        }
+        Some((last, unlogged)) => {
+            let covered = unlogged.saturating_add(1);
+            *last = now;
+            *unlogged = 0;
+            Some(covered)
+        }
+        None => {
+            refusals.insert(cid, (now, 0));
+            Some(1)
+        }
+    }
+}
+
+/// Writes the audited line for a refused vsock peer (NET-139), rate-limited
+/// per CID by [`peer_refusal_due`]. The line names the CID and counts the
+/// refusals it covers. It is a warn line in the daemon's log, which the
+/// diagnostics bundle ships.
+fn log_refused_peer(transport: &'static str, cid: u32) {
+    if let Some(refused) = peer_refusal_due(cid, std::time::Instant::now()) {
+        tracing::warn!(
+            audit = true,
+            transport,
+            peer_cid = cid,
+            refused,
+            "refused an RPC connection from a vsock peer that is not the host; \
+             only the host (CID 2) may connect"
+        );
+    }
 }
 
 impl Listener for UnixListener {
@@ -1052,6 +1133,14 @@ impl Listener for tokio_vsock::VsockListener {
 
     async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
         tokio_vsock::VsockListener::accept(self).await
+    }
+
+    /// The vsock listener serves only the host (NET-139): a vsock listener
+    /// is what a VM-hosted daemon binds (`--vsock`), and its every peer
+    /// but CID 2 is refused at accept.
+    fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+        let cid = peer.cid();
+        vsock_peer_refused(cid).then_some(cid)
     }
 }
 
@@ -1170,6 +1259,14 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
+            // NET-139: a peer the transport refuses is dropped here, at
+            // accept, before a byte of its stream is read and before it
+            // takes a connection id or a task.
+            if let Some(cid) = L::refused_cid(&peer) {
+                drop(stream);
+                log_refused_peer(L::TRANSPORT, cid);
+                continue;
+            }
             // One span per accepted connection: every record the connection
             // and its channels emit carries `conn`, so accept, channel
             // bindings, and close correlate across the log with a grep
@@ -5970,6 +6067,126 @@ mod tests {
         assert!(
             logged.contains(&format!("guest_port={default_port}")),
             "the publication line must name the guest port beside it, got: {logged}"
+        );
+    }
+
+    /// A vsock-shaped listener a test feeds: each accept hands back the next
+    /// queued stream with the peer address the test chose, so a test can stand
+    /// a peer at any CID without a VM. It refuses peers exactly as the real
+    /// vsock listener does, through that listener's own `refused_cid`.
+    #[cfg(target_os = "linux")]
+    struct FedVsockListener {
+        queued: tokio::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<(tokio::io::DuplexStream, tokio_vsock::VsockAddr)>,
+        >,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Listener for FedVsockListener {
+        type Stream = tokio::io::DuplexStream;
+        type Addr = tokio_vsock::VsockAddr;
+
+        const TRANSPORT: &'static str = "vsock";
+        const IS_LOCAL: bool = true;
+
+        async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
+            match self.queued.lock().await.recv().await {
+                Some(accepted) => Ok(accepted),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+            <tokio_vsock::VsockListener as Listener>::refused_cid(peer)
+        }
+    }
+
+    /// NET-139: the in-VM daemon's vsock RPC listener serves only the host. A
+    /// peer at any other CID (here a sibling at CID 3 and the guest's own
+    /// loopback at CID 1) is dropped at accept. The daemon never sends it the
+    /// SSH banner and never reads what it wrote. One audited line names the
+    /// CID. A peer at CID 2 is served as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vsock_rpc_refuses_non_host_cid() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        assert!(vsock_peer_refused(1), "the guest's loopback CID is refused");
+        assert!(vsock_peer_refused(3), "a sibling CID is refused");
+        assert!(
+            !vsock_peer_refused(tokio_vsock::VMADDR_CID_HOST),
+            "the host's CID is served"
+        );
+
+        let capture = crate::test_harness::captured_log();
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let (feed, queued) = tokio::sync::mpsc::unbounded_channel();
+        let listener = FedVsockListener {
+            queued: tokio::sync::Mutex::new(queued),
+        };
+        let run = tokio::spawn(Server::serve(state, listener));
+
+        for cid in [3, 1] {
+            let (mut peer, served) = tokio::io::duplex(4096);
+            // The peer speaks first. A refusal at accept must not read it.
+            peer.write_all(b"SSH-2.0-not-the-host\r\n").await.unwrap();
+            feed.send((served, tokio_vsock::VsockAddr::new(cid, 22)))
+                .unwrap();
+            let mut heard = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut heard))
+                .await
+                .expect("a refused peer's connection is closed at once");
+            assert!(
+                read.is_ok() && heard.is_empty(),
+                "a peer at CID {cid} hears nothing before its connection closes: {heard:?}"
+            );
+        }
+
+        let (mut host, served) = tokio::io::duplex(4096);
+        feed.send((
+            served,
+            tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, 22),
+        ))
+        .unwrap();
+        let mut banner = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), host.read_exact(&mut banner))
+            .await
+            .expect("the host is answered")
+            .expect("the host reads the daemon's SSH banner");
+        assert_eq!(&banner, b"SSH-", "the host's connection is served");
+
+        let log = capture.contents();
+        for cid in [3, 1] {
+            assert!(
+                log.contains(&format!("peer_cid={cid}")) && log.contains("audit=true"),
+                "the refusal of CID {cid} is one audited line naming it: {log}"
+            );
+        }
+        assert!(
+            !log.contains("peer_cid=2"),
+            "the host's CID is never refused: {log}"
+        );
+        run.abort();
+    }
+
+    /// NET-139's rate limit: the first refusal of a CID writes the line, the
+    /// refusals inside its window are counted and not written, and the first
+    /// refusal after the window writes a line that covers them all.
+    #[test]
+    fn refused_peer_line_is_rate_limited_per_cid() {
+        // A CID no other test refuses: the limiter is process-wide.
+        let cid = 0xdead_beef;
+        let start = std::time::Instant::now();
+        assert_eq!(peer_refusal_due(cid, start), Some(1));
+        assert_eq!(peer_refusal_due(cid, start + Duration::from_secs(1)), None);
+        assert_eq!(peer_refusal_due(cid, start + Duration::from_secs(2)), None);
+        assert_eq!(
+            peer_refusal_due(cid, start + PEER_REFUSAL_LOG_INTERVAL),
+            Some(3),
+            "the next line counts the refusals its window suppressed"
         );
     }
 }
