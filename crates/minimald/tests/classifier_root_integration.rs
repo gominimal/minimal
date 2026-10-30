@@ -6,7 +6,7 @@
 //! before it is loaded, and a request through the proxy is answered before
 //! anything refused it.
 //!
-//! Ten proofs, all `#[ignore]`d so the default suite and the surveyed
+//! Eleven proofs, all `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
 //! `minimald-root-integration` job runs this binary, and its recipe
 //! (`just test-root-integration`) runs it unprivileged — the same posture
@@ -32,7 +32,11 @@
 //! own leaf, completes while the same deny-all box's own connect to the
 //! same server is refused, and that the fetch is recorded as the
 //! node-plane traffic it is, naming that box
-//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — and
+//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — one
+//! proves NET-155: a package build placed in a box's deny leaf cannot
+//! connect to a local peer, and the same build in an allow leaf connects
+//! (`package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`) —
+//! and
 //! four prove the classification itself, live on the kernel that loads
 //! it: that the installer's whole transaction — the classify chain at
 //! output's mangle priority, the mark-keyed postrouting — loads where
@@ -50,7 +54,7 @@
 //! well-known component's range (`install_refuses_a_well_known_mark_range`),
 //! and the table refuses an allow box's IPv6 connection to a peer
 //! (`host_ip_box_ipv6_egress_refused`). The identity proof drives an
-//! eleventh `#[ignore]`d test as its observer — the half of
+//! twelfth `#[ignore]`d test as its observer — the half of
 //! itself that runs re-exec'd inside the peer's namespace — which passes
 //! on its own, with nothing to observe.
 //!
@@ -1327,6 +1331,285 @@ fn daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table() {
         line.contains(PACKAGE_OBJECT),
         "the record names the object fetched: {line}"
     );
+}
+
+/// The connect probe a package build runs (NET-155): a static program that
+/// connects to `127.0.0.1:<argv[1]>` and reports the result the way `curl`
+/// reports a failed connect, so the line reads like a real download's.
+const BUILD_CONNECT_PROBE_C: &str = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    int port = atoi(argv[1]);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { fprintf(stderr, "socket failed: errno %d\n", errno); return 2; }
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        fprintf(stderr, "Failed to connect to 127.0.0.1 port %d: errno %d\n", port, errno);
+        return 1;
+    }
+    fprintf(stderr, "connected to 127.0.0.1 port %d\n", port);
+    close(fd);
+    return 0;
+}
+"#;
+
+/// Compiles [`BUILD_CONNECT_PROBE_C`] statically and lays it out as a
+/// rootfs at `<base>/rootfs-src`, with the probe at `/usr/bin/probe`. Fails
+/// the proof when no C compiler is on `PATH`: this lane promised to run it.
+fn build_probe_rootfs(base: &Path) -> PathBuf {
+    let src = base.join("build_connect_probe.c");
+    let bin = base.join("build_connect_probe");
+    std::fs::write(&src, BUILD_CONNECT_PROBE_C).expect("writing the build probe's source");
+    let status = Command::new("gcc")
+        .args(["-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("running gcc to compile the build probe (install build-essential)");
+    assert!(
+        status.success(),
+        "gcc failed to compile the build probe: {status:?}"
+    );
+    let rootfs = base.join("rootfs-src");
+    let usr_bin = rootfs.join("usr").join("bin");
+    std::fs::create_dir_all(&usr_bin).expect("the rootfs usr/bin dir");
+    std::fs::copy(&bin, usr_bin.join("probe")).expect("copying the probe into the rootfs");
+    std::fs::create_dir_all(rootfs.join("usr").join("lib")).expect("the rootfs usr/lib dir");
+    std::fs::create_dir_all(rootfs.join("etc")).expect("the rootfs etc dir");
+    rootfs
+}
+
+/// An async writer that keeps what a build prints, so the proof can read
+/// the build's own failure line.
+#[derive(Clone, Default)]
+struct BuildOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl BuildOutput {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("the build output lock")).into_owned()
+    }
+}
+
+impl tokio::io::AsyncWrite for BuildOutput {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0
+            .lock()
+            .expect("the build output lock")
+            .extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A source fetcher the probe build never calls: its spec has no sources.
+#[derive(Debug)]
+struct NoSources;
+
+impl op::SourceFetcher for NoSources {
+    async fn download_web(
+        &self,
+        url: &str,
+        _sha256: &str,
+        _op: &ot::OpTracker,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("the probe build has no sources, but it asked for {url}")
+    }
+
+    async fn download_gcs(
+        &self,
+        _bucket_id: String,
+        file: &str,
+        _sha256: &str,
+        _op: &ot::OpTracker,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("the probe build has no sources, but it asked for {file}")
+    }
+}
+
+/// Runs one package build of the connect probe in `leaf`, against the
+/// peer on `port`. Returns whether the build succeeded and what it printed.
+fn run_probe_build(
+    base: &Path,
+    rootfs: &Path,
+    leaf: sandbox::config::ClassifierLeaf,
+    port: u16,
+) -> (bool, String) {
+    let work = tempfile::tempdir_in(base).expect("a temp dir for the build");
+    // The cache opens over a directory that exists: `Cache::at_dir` makes
+    // its subdirectories, not its base.
+    let cache_dir = work.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("the build's cache dir");
+    let cache = lcache::Cache::at_dir(&cache_dir).expect("the build's cache");
+    let graph = graph::Graph::new()
+        .ingest(
+            decode::Layer::new_for_test(format!(
+                r#"
+                let {{BuildSpec, ..}} = import "minimal.ncl" in
+                {{
+                    name = "downloads-at-build",
+                    build_deps = [],
+                    cmd = ["/usr/bin/probe", "{port}"],
+                }} | BuildSpec
+                "#
+            ))
+            .expect("the probe build's spec"),
+        )
+        .expect("the probe build's graph");
+    let spec = *graph
+        .by_name("downloads-at-build")
+        .expect("the probe build in its graph");
+    let output = BuildOutput::default();
+    let mut build = op::SpecBuild {
+        spec: &spec,
+        remote_fetcher: &NoSources,
+        // The rootfs is the probe alone. A build with its dependencies
+        // given shares the host's network, as a build that downloads does.
+        override_deps: Some(std::iter::once(rootfs.to_path_buf()).collect()),
+        stdout_writer: Some(Box::new(output.clone())),
+        stderr_writer: Some(Box::new(output.clone())),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        cpu_weight: None,
+        classifier_leaf: Some(leaf),
+        box_network: None,
+    };
+    let opts = op::Options {
+        cache,
+        graph: &graph,
+        exec_base: work.path().join("exec"),
+        ot: None,
+        daemon_id: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the build");
+    let result = runtime.block_on(async {
+        use op::Runnable as _;
+        tokio::time::timeout(Duration::from_secs(60), build.run(&opts)).await
+    });
+    let ok = match result {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            eprintln!("the probe build failed: {e}");
+            false
+        }
+        Err(_) => panic!("the probe build did not finish in 60 s: {}", output.text()),
+    };
+    (ok, output.text())
+}
+
+/// NET-155, live: a package build placed for a box runs in that box's
+/// classifier leaf. In a deny leaf, the build's own connect to a local peer
+/// is refused by the loaded table. The same build in an allow leaf connects.
+#[test]
+#[ignore = "loads the installer's table and runs a real package build in a boxes/deny and a boxes/allow leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
+    if !nft_present() {
+        eprintln!(
+            "skipping package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table: \
+             no nft on this host — the install's nftables transaction is \
+             the artifact under proof (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+
+    let scratch = mountpoint.join(format!("minimald-proof-build-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    // In the tree before the build starts: the build's sandbox is born in
+    // this process's cgroup, and its move into the box leaf is checked at
+    // the common ancestor of the two.
+    place_this_process_in_the_tree(&scratch);
+    let deny_dir = create_box_leaf(&scratch, "builddeny", Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(deny_dir.clone());
+    let allow_dir = create_box_leaf(&scratch, "buildallow", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    // Dropped before `install`, so the allow leaf goes before the tree.
+    struct AllowLeaf(PathBuf);
+    impl Drop for AllowLeaf {
+        fn drop(&mut self) {
+            let _ = remove_box_leaf(&self.0);
+        }
+    }
+    let _allow_leaf = AllowLeaf(allow_dir.clone());
+    let deny = sandbox::config::ClassifierLeaf::under(&scratch, "builddeny", Verdict::Deny);
+    let allow = sandbox::config::ClassifierLeaf::under(&scratch, "buildallow", Verdict::Allow);
+    assert_eq!(
+        deny.dir(),
+        deny_dir.as_path(),
+        "the deny leaf the build is given"
+    );
+    assert_eq!(
+        allow.dir(),
+        allow_dir.as_path(),
+        "the allow leaf the build is given"
+    );
+
+    // The peer: one loopback listener, the one destination both builds
+    // reach for, so only the leaf differs between them.
+    let peer = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binding the peer's port");
+    let port = peer.local_addr().expect("the peer's address").port();
+
+    let base = tempfile::tempdir().expect("a temp dir for the probe builds");
+    let rootfs = build_probe_rootfs(base.path());
+
+    let (ok, printed) = run_probe_build(base.path(), &rootfs, deny, port);
+    assert!(
+        !ok,
+        "the build in the deny leaf fails, because it cannot reach the peer: {printed}"
+    );
+    let refused = format!(
+        "Failed to connect to 127.0.0.1 port {port}: errno {}",
+        libc::EHOSTUNREACH
+    );
+    assert!(
+        printed.contains(&refused),
+        "the deny-leaf build's connect is refused with EHOSTUNREACH, the \
+         loaded chain's own rejection: {printed}"
+    );
+
+    let (ok, printed) = run_probe_build(base.path(), &rootfs, allow, port);
+    assert!(
+        ok && printed.contains(&format!("connected to 127.0.0.1 port {port}")),
+        "the same build in the allow leaf connects to the peer: {printed}"
+    );
+    drop(peer);
 }
 
 // ── The classification's own proofs ─────────────────────────────────────────

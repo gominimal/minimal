@@ -265,6 +265,10 @@ impl EnvChannel<'_> {
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
                 remote_cache: remote_cache.as_ref(),
+                // NET-155: a client-side patched build runs for no box, so it
+                // stays the caller's own traffic.
+                classifier_leaf: None,
+                box_network: None,
             }
             .run(&op::Options {
                 cache,
