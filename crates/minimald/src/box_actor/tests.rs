@@ -14231,6 +14231,59 @@ fn box_package_build_under_box_egress_verdict_builds_task_of_box_never_placed() 
     }
 }
 
+/// The handle of the box `id` on `server`.
+async fn box_handle(server: &TestServer, id: SessionId) -> crate::box_actor::BoxHandle {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+}
+
+/// NET-155: `min check` on a box whose launch placed it in a classifier leaf
+/// is refused when that leaf is gone, with the same text a task gives. Its
+/// package builds never run in the daemon's own cgroup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_package_build_under_box_egress_verdict_refuses_check_of_placed_box_without_leaf() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "check-sealed", "/uwu").await;
+    rewrite_record(&server, id, |record| {
+        record.host_ip_enforcement = Some(boxes::HostIpEnforcement::PerBox);
+    })
+    .await;
+
+    let refusal = box_handle(&server, id)
+        .await
+        .start_check(crate::box_ops::CheckOpts::from_args("").unwrap())
+        .await
+        .expect_err("a placed box with no leaf has its check refused");
+    assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        refusal.to_string(),
+        super::placed_box_build_refusal("check-sealed")
+    );
+}
+
+/// NET-155: `min check` on a box that was never placed in a leaf still
+/// starts, and its builds run in the daemon's own cgroup, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_package_build_under_box_egress_verdict_starts_check_of_box_never_placed() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "check-plain", "/uwu").await;
+    assert_eq!(read_record(&server, id).await.host_ip_enforcement, None);
+
+    box_handle(&server, id)
+        .await
+        .start_check(crate::box_ops::CheckOpts::from_args("").unwrap())
+        .await
+        .expect("a box that was never placed starts a check");
+}
+
 /// A box record for the NET-155 tests, in `mode` and under `egress`.
 fn build_record(mode: boxes::NetworkMode, egress: Option<boxes::EgressPolicy>) -> boxes::Record {
     boxes::Record {

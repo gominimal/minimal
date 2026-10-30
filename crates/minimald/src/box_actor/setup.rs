@@ -1024,6 +1024,17 @@ impl BoxActor {
         opts: CheckOpts,
     ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        // NET-155: a check's package builds follow the box's egress verdict.
+        // A placed box whose leaf is gone is refused, the same as a task, so
+        // its builds never run in the daemon's own cgroup. No relaunch asks
+        // for a check, so the refusal cannot block a launch.
+        let record = self.record.record().await?;
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        crate::exec::task_build_refusal(
+            record.host_ip_enforcement,
+            &box_name,
+            ctx.classifier_leaf().is_some(),
+        )?;
         let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
             BoxInner::Active { sops, .. } => sops.push(sop),
