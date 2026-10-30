@@ -1309,6 +1309,21 @@ impl BoxPublications {
             .collect()
     }
 
+    /// The row the listen watcher's standing publication of `port` is
+    /// listed as, when one is: the publication stands and its gate admits
+    /// the port, so the port is reachable at the row's `local`. `None` for a
+    /// port the watcher does not hold, a pending reservation, and a
+    /// publication committed unlisted because its record was refused.
+    pub fn listen_row(&self, port: u16) -> Option<minimald_rpc::LiveMapping> {
+        self.set
+            .lock()
+            .expect("box publications lock poisoned")
+            .ports
+            .get(&port)
+            .filter(|entry| entry.owner == PublicationOwner::Listen && entry.published)
+            .and_then(|entry| entry.listed.clone())
+    }
+
     /// Withdraws `port` from the set — `owner`'s own publication only. The
     /// other surface's entry is left standing whatever the caller meant,
     /// because the publisher is the one who withdraws: a port held by
