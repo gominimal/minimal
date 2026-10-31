@@ -1249,7 +1249,9 @@ fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Re
 
 /// The environment variable that sets the size bound of an audit segment,
 /// in bytes. It is a test surface: the end-to-end suite sets it so the log
-/// rotates after a few requests. Only `bep serve` reads it.
+/// rotates after a few requests. Only `bep serve` reads it, and only in a
+/// debug build. A release build ignores it, so a stray value cannot make
+/// the log rotate fast and prune its history.
 const AUDIT_SEGMENT_BYTES_ENV: &str = "BEP_AUDIT_SEGMENT_BYTES";
 
 /// The segment bound that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] sets: a
@@ -1263,10 +1265,19 @@ fn audit_segment_bound(value: Option<&std::ffi::OsStr>) -> u64 {
         .unwrap_or(audit::SEGMENT_BYTES)
 }
 
-/// The rotation bounds of the audit log that `bep serve` writes. The
-/// segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when it is set.
+/// The rotation bounds of the audit log that `bep serve` writes. In a
+/// debug build, the segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when
+/// it is set. A release build always keeps [`audit::SEGMENT_BYTES`].
 fn audit_rotation() -> audit::Rotation {
-    let value = std::env::var_os(AUDIT_SEGMENT_BYTES_ENV);
+    let set = std::env::var_os(AUDIT_SEGMENT_BYTES_ENV);
+    if !cfg!(debug_assertions) && set.is_some() {
+        tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound = audit::SEGMENT_BYTES,
+            "ignored the audit segment test override: this is a release build"
+        );
+    }
+    let value = set.filter(|_| cfg!(debug_assertions));
     let bound = audit_segment_bound(value.as_deref());
     if value.is_some() {
         tracing::info!(
