@@ -1107,6 +1107,44 @@ impl Flow {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because its Host header or its target names a different host."
             )
+        } else if marker == crate::redeemer::SIGN_IN_REQUIRED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the GitHub sign-in on the host has ended. On the host, run `min auth login`, then send the request again."
+            )
+        } else if [
+            Check::Expired,
+            Check::Revoked,
+            Check::Undecryptable,
+            Check::UnboundedMember,
+        ]
+        .iter()
+        .any(|check| check.marker() == marker)
+        {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because this box's sealed credential no longer works on this host. Create the box again to give it a new sealed credential."
+            )
+        } else if [Check::NoLiveBox, Check::CrossBox]
+            .iter()
+            .any(|check| check.marker() == marker)
+        {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the sealed credential in the request belongs to another box. Send the request with the sealed credential that this box was given."
+            )
+        } else if [
+            Check::OffPort,
+            Check::OutsideBoundSet,
+            Check::OutsideCurrentSet,
+        ]
+        .iter()
+        .any(|check| check.marker() == marker)
+        {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because {authority} is not a host that this sealed credential is sent to."
+            )
+        } else if marker == Check::StoreHandleInvalid.marker() {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because no rule in [secret-store-rules] on the host admits this stored secret for {authority}."
+            )
         } else {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because it did not accept the sealed credential in the request."
@@ -2820,6 +2858,64 @@ mod tests {
         assert_eq!(refusal(&end), None, "{end:?}");
         assert!(upstream.contains("Bearer sk-new-key"), "{upstream}");
         assert!(!upstream.contains("sk-old-key"));
+    }
+
+    // BEP-003: each refusal of a sealed credential names its cause, and a
+    // next step where the person has one. The audit marker is unchanged.
+    #[test]
+    fn each_refusal_names_its_cause_and_next_step() {
+        let store = store_with(b"sk-key");
+        let (_records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let authority = flow.authority_text();
+        let prefix = format!("The Box Egress Proxy refused the request to {authority}, because ");
+        let body = |marker: &str| {
+            let body = flow.refusal_body(marker);
+            body.strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("{marker}: {body}"))
+                .to_owned()
+        };
+
+        assert_eq!(
+            body("github_sign_in_required"),
+            "the GitHub sign-in on the host has ended. On the host, run `min auth login`, \
+             then send the request again."
+        );
+        for marker in ["expired", "revoked", "undecryptable", "unbounded_member"] {
+            assert_eq!(
+                body(marker),
+                "this box's sealed credential no longer works on this host. Create the box \
+                 again to give it a new sealed credential.",
+                "{marker}"
+            );
+        }
+        for marker in ["no_live_box", "cross_box"] {
+            assert_eq!(
+                body(marker),
+                "the sealed credential in the request belongs to another box. Send the \
+                 request with the sealed credential that this box was given.",
+                "{marker}"
+            );
+        }
+        for marker in ["off_port", "outside_bound_set", "outside_current_set"] {
+            assert_eq!(
+                body(marker),
+                format!("{authority} is not a host that this sealed credential is sent to."),
+                "{marker}"
+            );
+        }
+        assert_eq!(
+            body("store_handle_invalid"),
+            format!(
+                "no rule in [secret-store-rules] on the host admits this stored secret for \
+                 {authority}."
+            )
+        );
+        // A marker with no cause of its own keeps the general text.
+        assert_eq!(
+            body("some_other_marker"),
+            "it did not accept the sealed credential in the request."
+        );
     }
 
     // BEP-066: a stored value or a prefix with a line break is refused, and
