@@ -469,6 +469,76 @@ impl ActivationSpec<'_> {
     }
 }
 
+/// Why no node-local proxy serves boxes, for the
+/// [`BepRefusal::UnenrolledNode`] text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyAbsence {
+    /// The proxy program `bep` does not exist. `path` is where it was
+    /// looked for, or `None` when no path was resolved.
+    NotInstalled {
+        /// The proxy program's path.
+        path: Option<std::path::PathBuf>,
+    },
+    /// The proxy program's path comes from `MINVMD_BEP_BIN`, which holds
+    /// this relative path, so no proxy program is looked up.
+    RelativePath {
+        /// The relative path the variable holds.
+        path: std::path::PathBuf,
+    },
+    /// The proxy program exists at `path`, and no proxy published its
+    /// identity and control socket. `log` is the file the host daemon
+    /// writes the proxy's output to, when it is known.
+    NotAnswering {
+        /// The proxy program's path.
+        path: std::path::PathBuf,
+        /// The proxy's log file.
+        log: Option<std::path::PathBuf>,
+    },
+    /// The host gives the box no box id or no address stance, so no proxy
+    /// serves it.
+    NotServed,
+}
+
+impl fmt::Display for ProxyAbsence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProxyAbsence::NotInstalled { path: Some(path) } => write!(
+                f,
+                "`bep`, the Box Egress Proxy, is not installed at {}, so no proxy \
+                 serves boxes on this machine.",
+                path.display()
+            )?,
+            ProxyAbsence::NotInstalled { path: None } => write!(
+                f,
+                "`bep`, the Box Egress Proxy, is not installed, so no proxy serves \
+                 boxes on this machine."
+            )?,
+            ProxyAbsence::RelativePath { path } => write!(
+                f,
+                "MINVMD_BEP_BIN sets `bep`, the Box Egress Proxy, to the relative path \
+                 {}, and no proxy serves boxes on this machine. Set MINVMD_BEP_BIN to \
+                 an absolute path.",
+                path.display()
+            )?,
+            ProxyAbsence::NotAnswering { path, log } => {
+                write!(
+                    f,
+                    "`bep`, the Box Egress Proxy, is installed at {}, but it does not \
+                     answer, so no proxy serves boxes on this machine.",
+                    path.display()
+                )?;
+                if let Some(log) = log {
+                    write!(f, " The proxy's log is at {}.", log.display())?;
+                }
+            }
+            ProxyAbsence::NotServed => {
+                write!(f, "no Box Egress Proxy serves boxes on this machine.")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One reason the activation refuses a box spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BepRefusal {
@@ -511,8 +581,13 @@ pub enum BepRefusal {
     /// Gatehouse §6.2: a GitHub grant where no node-local proxy serves
     /// boxes. Its defined error is [`GATEHOUSE_UNENROLLED_NODE`].
     UnenrolledNode {
-        /// The GitHub grants, in name order.
+        /// The grants the proxy serves, in name order.
         grants: Vec<String>,
+        /// Whether any of `grants` is a `source = "store"` reference. The
+        /// text then names them as secrets, not as GitHub grants.
+        stored: bool,
+        /// Why no proxy serves boxes, as far as the creator can tell.
+        cause: ProxyAbsence,
     },
     /// BEP-034: a store reference names the GitHub sign-in item.
     StoreReferenceToSignIn {
@@ -561,6 +636,23 @@ impl BepRefusal {
         match self {
             Self::SignInRequired { .. } => Some(GITHUB_SIGN_IN_REQUIRED),
             Self::UnenrolledNode { .. } => Some(GATEHOUSE_UNENROLLED_NODE),
+            _ => None,
+        }
+    }
+
+    /// The one next step for a refusal that has a defined error, for the
+    /// `-o json` hint.
+    #[must_use]
+    pub fn next_step(&self) -> Option<String> {
+        match self {
+            Self::SignInRequired { .. } => {
+                Some("run `min auth login`, then create the box again".to_owned())
+            }
+            Self::UnenrolledNode { grants, .. } => Some(format!(
+                "to create the box without the grant, remove {} from [session.secrets] in \
+                 minimal.toml",
+                grants.join(", ")
+            )),
             _ => None,
         }
     }
@@ -637,13 +729,24 @@ impl fmt::Display for BepRefusal {
                 "This box declares a GitHub grant, and no GitHub sign-in is held on this \
                  machine. Run `min auth login`, then create the box again."
             ),
-            Self::UnenrolledNode { grants } => write!(
-                f,
-                "Cannot create the box: it declares the GitHub grant {}, and no Box Egress \
-                 Proxy serves boxes on this machine. Remove the grant from the [secrets] table \
-                 in minimal.toml, then create the box again.",
-                grants.join(", ")
-            ),
+            Self::UnenrolledNode {
+                grants,
+                stored,
+                cause,
+            } => {
+                let grants = grants.join(", ");
+                let kind = if *stored { "secret" } else { "GitHub grant" };
+                write!(
+                    f,
+                    "Cannot create the box: it declares the {kind} {grants}, and "
+                )?;
+                write!(f, "{cause}")?;
+                write!(
+                    f,
+                    " To create the box without the grant, remove {grants} from \
+                     [session.secrets] in minimal.toml."
+                )
+            }
             Self::StoreReferenceToSignIn { grant } => write!(
                 f,
                 "The secret {grant} names the item that holds your GitHub sign-in. Only \
@@ -947,30 +1050,42 @@ pub fn require_sign_in(secrets: &SecretGrants, signed_in: bool) -> Result<(), Ac
 }
 
 /// Refuses a box spec with a GitHub grant where no node-local proxy serves
-/// boxes (Gatehouse §6.2). `proxy_present` says whether one does. Logs one
-/// debug line when it refuses.
+/// boxes (Gatehouse §6.2). `absence` is `None` when one does, and else
+/// says why none does. Logs one debug line when it refuses.
 ///
 /// # Errors
 ///
 /// [`ActivationRefused`] with one [`BepRefusal::UnenrolledNode`] when
-/// `secrets` holds a GitHub grant and `proxy_present` is false.
-pub fn require_proxy(secrets: &SecretGrants, proxy_present: bool) -> Result<(), ActivationRefused> {
+/// `secrets` holds a GitHub grant and `absence` is `Some`.
+pub fn require_proxy(
+    secrets: &SecretGrants,
+    absence: Option<ProxyAbsence>,
+) -> Result<(), ActivationRefused> {
     let grants: Vec<String> = secrets
         .iter()
         .filter(|(_, grant)| grant.is_github())
         .map(|(name, _)| name.clone())
         .collect();
-    if proxy_present || grants.is_empty() {
-        return Ok(());
+    match absence {
+        Some(cause) if !grants.is_empty() => Err(unenrolled_node(grants, false, cause)),
+        _ => Ok(()),
     }
-    Err(unenrolled_node(grants))
 }
 
-/// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the GitHub grants `grants`.
-/// Logs one debug line.
+/// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the grants `grants`, for
+/// the cause `cause`. `stored` says whether any of them is a store
+/// reference. Logs one debug line.
 #[must_use]
-pub fn unenrolled_node(grants: Vec<String>) -> ActivationRefused {
-    let refusal = BepRefusal::UnenrolledNode { grants };
+pub fn unenrolled_node(
+    grants: Vec<String>,
+    stored: bool,
+    cause: ProxyAbsence,
+) -> ActivationRefused {
+    let refusal = BepRefusal::UnenrolledNode {
+        grants,
+        stored,
+        cause,
+    };
     tracing::debug!(
         rule = refusal.rule(),
         fields = refusal.fields(),
@@ -1181,6 +1296,11 @@ mod tests {
             "This box declares a GitHub grant, and no GitHub sign-in is held on this machine. \
              Run `min auth login`, then create the box again."
         );
+        // The `-o json` hint is the same next step.
+        assert_eq!(
+            refused.refusals[0].next_step().as_deref(),
+            Some("run `min auth login`, then create the box again")
+        );
 
         // A held sign-in, or a box with no GitHub grant, is not refused.
         assert!(require_sign_in(&secrets, true).is_ok());
@@ -1191,8 +1311,9 @@ mod tests {
         });
         assert!(require_sign_in(&client_env, false).is_ok());
         assert!(require_sign_in(&SecretGrants::new(), false).is_ok());
-        // Another refusal has no defined error.
+        // Another refusal has no defined error, and no `-o json` hint.
         assert_eq!(BepRefusal::SteeringOffWithProxyEnv.code(), None);
+        assert_eq!(BepRefusal::SteeringOffWithProxyEnv.next_step(), None);
     }
 
     fn egress_with(hosts: &[&str]) -> EgressPolicy {

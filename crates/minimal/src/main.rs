@@ -296,6 +296,23 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             "on the host, run `min box audit <box>`".to_string(),
         ));
     }
+    // BEP-003, Gatehouse §6.2: a refused activation with a defined error
+    // answers with that error and its next step.
+    if let Some((code, hint)) = e
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+        .and_then(|refused| {
+            refused
+                .refusals
+                .iter()
+                .find_map(|refusal| Some((refusal.code()?, refusal.next_step()?)))
+        })
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            code,
+            format!("{e:#}"),
+            hint,
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -714,6 +731,49 @@ mod tests {
                 other => panic!("an unmapped failure is still an object, got {other:?}"),
             }
         }
+    }
+
+    // BEP-003, Gatehouse §6.2: a refused grant box reads as its defined
+    // error under `-o json`, with the refusal's next step as the hint.
+    #[test]
+    fn machine_mode_names_the_grant_refusal_code() {
+        use boxes::core::bep::{ActivationRefused, BepRefusal, ProxyAbsence};
+        let answer = |refusal: BepRefusal| match machine_mode_answer(&anyhow::Error::new(
+            ActivationRefused {
+                refusals: vec![refusal],
+            },
+        )) {
+            MachineModeAnswer::Object(failure) => failure,
+            other => panic!("a refusal is an object, got {other:?}"),
+        };
+        let grants = vec!["GH_TOKEN".to_owned()];
+
+        let failure = answer(BepRefusal::SignInRequired {
+            grants: grants.clone(),
+        });
+        assert_eq!(failure.code(), "github_sign_in_required");
+        assert_eq!(
+            failure.hint(),
+            "run `min auth login`, then create the box again"
+        );
+        assert!(failure.message().contains("Run `min auth login`"));
+
+        let failure = answer(BepRefusal::UnenrolledNode {
+            grants,
+            stored: false,
+            cause: ProxyAbsence::NotInstalled { path: None },
+        });
+        assert_eq!(failure.code(), "gatehouse_unenrolled_node");
+        assert_eq!(
+            failure.hint(),
+            "to create the box without the grant, remove GH_TOKEN from [session.secrets] \
+             in minimal.toml"
+        );
+
+        // A refusal with no defined error stays `unspecified`.
+        let failure = answer(BepRefusal::SteeringOffWithProxyEnv);
+        assert_eq!(failure.code(), "unspecified");
+        assert!(failure.hint().is_empty());
     }
 
     /// An `unspecified` object carries no hint key at all.
