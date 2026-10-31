@@ -61,7 +61,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     // BEP-057: every host is un-enrolled today.
-    // Interim: only BEP-057 is previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // Interim: only BEP-057 and BEP-017 are previewed here; the full exit-3 set is gominimal/minimal#2445.
     // BEP-017: the resolver fact is the one creation reads, so the two agree.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
@@ -80,7 +80,9 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
         .filter(|refusal| {
             matches!(
                 refusal,
-                BepRefusal::NarrowScopesUnenrolled { .. } | BepRefusal::BrokerScopeNotGithub { .. }
+                BepRefusal::NarrowScopesUnenrolled { .. }
+                    | BepRefusal::BrokerScopeNotGithub { .. }
+                    | BepRefusal::NoResolver { .. }
             )
         })
         .collect();
@@ -253,6 +255,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             box_zone_resolver: super::box_verbs::host_resolves_box_names(
                 crate::daemon_host_kind(global),
                 boxes::NetworkMode::OwnIp,
+                bep.resolved_steering(),
             ),
             github_hosts: &github_hosts,
             store_rules: &store_rules,
@@ -312,7 +315,9 @@ mod tests {
                 quic443,
                 secrets,
                 acknowledged,
-                box_zone_resolver: false,
+                // An own-address box on the VM host, where `both` reaches
+                // the proxy and `dns` is refused (BEP-017).
+                box_zone_resolver: bep.resolved_steering() == Steering::Both,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -602,16 +607,16 @@ mod tests {
     fn box_spec_flags_allowed_quic_stance_on_grant_box() {
         let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&["github:user-token"]))]);
         let flag = "quic443  allowed (HTTP/3 bypasses the proxy)";
-        let dns = BepSettings {
-            steering: Some(Steering::Dns),
+        let both = BepSettings {
+            steering: Some(Steering::Both),
             ..BepSettings::default()
         };
         let cases = [
             (proxy_env(), None, true),
             (proxy_env(), Some(Quic443::Auto), true),
-            (dns.clone(), Some(Quic443::Allow), true),
-            (dns.clone(), None, false),
-            (dns, Some(Quic443::Auto), false),
+            (both.clone(), Some(Quic443::Allow), true),
+            (both.clone(), None, false),
+            (both, Some(Quic443::Auto), false),
             (proxy_env(), Some(Quic443::Block), false),
         ];
         for (bep, quic443, flagged) in cases {

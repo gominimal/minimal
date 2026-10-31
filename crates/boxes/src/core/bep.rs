@@ -424,13 +424,17 @@ pub type SecretGrants = BTreeMap<String, SecretGrant>;
 pub struct HostFacts {
     /// Whether the host is enrolled with a Gatehouse.
     pub enrolled: bool,
-    /// Whether the box's lookups go through a switch whose DNS gate steers
-    /// the credential module's names to the proxy: true for an own-address
-    /// box on the VM host, whose switch asks the VM host whether the
-    /// proxy's listener is live. False on a native host, where a steered
-    /// name always fails closed. The CLI reads it from the host kind at
-    /// creation and at `min box spec`. While it is false, `dns` and `both`
-    /// steering with a credentialed upstream is refused (BEP-017).
+    /// Whether the box's steered lookups reach the proxy: its lookups go
+    /// through a switch whose DNS gate steers the credential module's names
+    /// to the proxy, and its clients can use the address they get. The CLI
+    /// sets it at creation and at `min box spec`, from the host kind, the
+    /// network mode and the resolved steering. It is true only for an
+    /// own-address box with `both` steering on the VM host, whose switch
+    /// asks the VM host whether the proxy's listener is live. It is false
+    /// for `dns`, because the proxy takes no direct TLS connection, and on
+    /// a native host, where a steered name always fails closed. While it is
+    /// false, `dns` and `both` steering with a credentialed upstream is
+    /// refused (BEP-017).
     pub box_zone_resolver: bool,
     /// Whether the client configuration sets
     /// [`FULL_BREADTH_ACKNOWLEDGEMENT`]. It matters only un-enrolled.
