@@ -907,6 +907,45 @@ mod tests {
         assert_eq!(err, format!("Showing web (box {shown}).\n"));
     }
 
+    // BEP-039, #2435: the proxy refuses a request head with ambiguous
+    // framing and writes one refuse record, with no identifier, handle or
+    // mapping, under the box id in its hex spelling. `min box audit <box>`
+    // lists it as a `refuse` line with the marker `framing_ambiguous`.
+    #[test]
+    fn box_audit_lists_a_refused_ambiguous_head() {
+        let minted = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path().join(segment_name(1))).unwrap();
+        // As `Flow::record` writes it for a head that `forward_requests`
+        // refused for its framing.
+        log.append(&Decision {
+            kind: Kind::Decision,
+            box_id: bep::listener::box_id_text(&minted.to_bytes()),
+            authority: "github.com:443".to_owned(),
+            identifier: None,
+            jti: String::new(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Refuse,
+            marker: Some(bep::http::FRAMING_AMBIGUOUS.to_owned()),
+        })
+        .unwrap();
+        drop(log);
+
+        let shown = minted.to_string();
+        let (result, out, err) =
+            run_to_strings(&args(Some(&shown), None, false), &[], false, dir.path());
+        result.unwrap();
+        let unmapped = bep::audit::MODULE_UNMAPPED;
+        assert_eq!(
+            out,
+            format!(
+                "decision  refuse  github.com:443  {}  {unmapped} {unmapped}  framing_ambiguous\n",
+                bep::audit::NONE
+            )
+        );
+        assert!(err.is_empty(), "{err}");
+    }
+
     // BEP-042: --follow replays the box's records and then tails new ones.
     #[test]
     fn box_audit_follow_stops_when_the_reader_closes() {
