@@ -3220,4 +3220,234 @@ mod tests {
         assert_eq!(chosen(Some(""), None), None);
         assert_eq!(chosen(None, None), None);
     }
+
+    /// A store whose keys are exportable, as the macOS login keychain
+    /// makes a key for the program that generated it. The roles in `held`
+    /// are the exception: their keys are non-exportable. The keys are held
+    /// under the custody rule of `build`.
+    struct ExportableStore {
+        build: keys::Build,
+        held: Vec<Role>,
+        pairs: Mutex<std::collections::HashMap<Role, Arc<rcgen::KeyPair>>>,
+    }
+
+    /// A key of an [`ExportableStore`].
+    struct ExportableKey {
+        role: Role,
+        pair: Arc<rcgen::KeyPair>,
+        build: keys::Build,
+        exportable: bool,
+    }
+
+    impl ExportableStore {
+        fn new(build: keys::Build) -> Self {
+            Self {
+                build,
+                held: Vec::new(),
+                pairs: Mutex::default(),
+            }
+        }
+
+        /// A store that holds a key for each role, as a debug build left
+        /// them. The keys of the roles in `held` are non-exportable.
+        fn holding_every_key(build: keys::Build, held: &[Role]) -> Self {
+            let mut store = Self::new(build);
+            store.held = held.to_vec();
+            for role in Role::ALL {
+                store.pairs.lock().unwrap().insert(
+                    role,
+                    Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap()),
+                );
+            }
+            store
+        }
+
+        fn key(&self, role: Role, pair: Arc<rcgen::KeyPair>) -> ExportableKey {
+            ExportableKey {
+                role,
+                pair,
+                build: self.build,
+                exportable: !self.held.contains(&role),
+            }
+        }
+    }
+
+    impl HeldKey for ExportableKey {
+        fn role(&self) -> Role {
+            self.role
+        }
+
+        fn public(&self) -> ProxyPublicKey {
+            ProxyPublicKey::from_sec1_bytes(self.pair.public_key_raw()).unwrap()
+        }
+
+        fn exportable(&self) -> bool {
+            self.exportable
+        }
+
+        fn build(&self) -> keys::Build {
+            self.build
+        }
+
+        fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(KeyError::Store {
+                role: self.role,
+                detail: "an exportable test key does no key agreement".into(),
+            })
+        }
+
+        fn probe(&self) -> Result<(), KeyError> {
+            Ok(())
+        }
+    }
+
+    impl CaKey for ExportableKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            rcgen::SigningKey::sign(&*self.pair, msg).map_err(|err| KeyError::Store {
+                role: self.role,
+                detail: err.to_string(),
+            })
+        }
+    }
+
+    impl KeyStore for ExportableStore {
+        type Key = ExportableKey;
+
+        fn find(&self, role: Role) -> Result<Option<ExportableKey>, KeyError> {
+            let pair = self.pairs.lock().unwrap().get(&role).cloned();
+            Ok(pair.map(|pair| self.key(role, pair)))
+        }
+
+        fn generate(&self, role: Role) -> Result<ExportableKey, KeyError> {
+            let pair =
+                Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap());
+            let key = self.key(role, Arc::clone(&pair));
+            // The keychain's generation site takes the same decision, and
+            // holds no key it refuses.
+            keys::keep_generated(&key)?;
+            self.pairs.lock().unwrap().insert(role, pair);
+            Ok(key)
+        }
+
+        fn remove(&self, role: Role) -> Result<(), KeyError> {
+            self.pairs.lock().unwrap().remove(&role);
+            Ok(())
+        }
+    }
+
+    /// Runs `f` under a subscriber at the default level. Gives what it
+    /// logged.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        (out, String::from_utf8(bytes).unwrap())
+    }
+
+    fn kept_exportable(role: Role) -> String {
+        format!(
+            "kept the proxy's {role} key although the keychain made it exportable: this is a debug build, and a release build refuses it"
+        )
+    }
+
+    // BEP-014, BEP-059: the macOS login keychain lets the program that made
+    // a key export it. A debug build keeps such a key, warns once for each
+    // role at each start, and serves with it.
+    #[test]
+    fn a_debug_build_starts_with_exportable_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = ExportableStore::new(keys::Build::Debug);
+        for start_number in 1..=2 {
+            let ((), log) = logged(|| {
+                let (keys, root) = start(&store, &path, &[]).unwrap();
+                assert!(keys.signing.exportable());
+                // As `serve` does: the signing CA under the published root,
+                // which issues a leaf that a box validates.
+                let at = SystemTime::now();
+                let ca = Ca::with_root(&keys.root, &keys.signing, root.clone(), at).unwrap();
+                let leaf = ca.issue_leaf("api.github.com", at).unwrap();
+                assert!(validates(root.der(), &leaf, "api.github.com", at));
+                let published = Identity::read(&path).unwrap();
+                assert_eq!(published.key(Role::Root).unwrap(), keys.root.public());
+            });
+            for role in Role::ALL {
+                assert_eq!(
+                    log.matches(&kept_exportable(role)).count(),
+                    1,
+                    "start {start_number}, {role}: {log}"
+                );
+            }
+        }
+    }
+
+    // BEP-014, BEP-059: a release build refuses an exportable key where the
+    // keychain generates it, and when a debug build left it in the keychain:
+    // at the CA for the root and signing keys, and at load for the sealing
+    // key. It writes no warning.
+    #[test]
+    fn a_release_build_refuses_an_exportable_key_at_both_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+
+        let store = ExportableStore::new(keys::Build::Release);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the key store failed for the sealing key: the keychain made the key exportable."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert!(store.pairs.lock().unwrap().is_empty(), "no key is held");
+        assert!(!path.exists());
+
+        let store = ExportableStore::holding_every_key(keys::Build::Release, &[Role::Sealing]);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the proxy root key is exportable, so the proxy does not use it for a CA."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert!(!path.exists());
+
+        let store =
+            ExportableStore::holding_every_key(keys::Build::Release, &[Role::Root, Role::Signing]);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the keychain holds the proxy's sealing key as exportable, and a release build does not use an exportable key. Run `bep --replace-key sealing` to make a new one. Boxes created before then must be re-created."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert_eq!(
+            store.pairs.lock().unwrap().len(),
+            3,
+            "the store keeps its keys"
+        );
+        assert!(!path.exists());
+    }
 }
