@@ -245,7 +245,13 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         ReplaceError::Generate(cause) => format!(
             "The {role} key was not replaced, because no new key was made: {cause}. The old key is still in use."
         ),
+        ReplaceError::NoKey(cause) => format!(
+            "The {role} key was not replaced, because no new key was made: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
+        ),
         // BEP-014, BEP-059: a key was made, and the build refused it.
+        ReplaceError::Exportable(KeyError::Exportable { removed: false, .. }) => format!(
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain, so it is still there beside the old key. The proxy does not use it. The old key is still in use."
+        ),
         ReplaceError::Exportable(_) => format!(
             "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The old key is still in use."
         ),
@@ -258,6 +264,9 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         // A run of the command first tries the move back again.
         ReplaceError::Recover(cause) => format!(
             "The {role} key was not replaced. An earlier `bep --replace-key {role}` stopped before it finished, and its old key was not put back: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to put the old key back and replace it."
+        ),
+        ReplaceError::Check(cause) => format!(
+            "The {role} key was not replaced. The proxy has no {role} key now. The keychain did not say whether an earlier `bep --replace-key {role}` left keys aside: {cause}. Nothing was changed."
         ),
     }
 }
@@ -3513,6 +3522,55 @@ mod tests {
             "The sealing key was not replaced. An earlier `bep --replace-key sealing` stopped before it finished, and its old key was not put back: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to put the old key back and replace it."
         );
         assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: a failed generation for a role whose label held no key says
+    // that the proxy has no key, not that an old key is in use.
+    #[test]
+    fn replace_key_names_no_key_when_none_was_held() {
+        let store = NoNewKeyStore(ExportableStore::new(keys::Build::Debug));
+        let Err(err) = keys::replace(&store, Role::Sealing) else {
+            panic!("the replacement made a key");
+        };
+        assert!(matches!(err, ReplaceError::NoKey(_)), "{err}");
+        let message = replace_failure(Role::Sealing, &err);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced, because no new key was made: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to make a new one."
+        );
+        assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: a store that did not answer the check for keys left aside is
+    // named as that, and not as an earlier replacement that stopped.
+    #[test]
+    fn replace_key_names_an_unanswered_check() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::Check(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. The proxy has no sealing key now. The keychain did not say whether an earlier `bep --replace-key sealing` left keys aside: the key store failed for the sealing key: the keychain is locked. Nothing was changed."
+        );
+        assert!(!message.contains("stopped"), "{message}");
+    }
+
+    // BEP-014, BEP-060: an exportable new key that the keychain did not
+    // remove is not reported as removed.
+    #[test]
+    fn replace_key_names_an_exportable_key_not_removed() {
+        let err = ReplaceError::Exportable(KeyError::Exportable {
+            role: Role::Sealing,
+            removed: false,
+        });
+        let message = replace_failure(Role::Sealing, &err);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain, so it is still there beside the old key. The proxy does not use it. The old key is still in use."
+        );
+        assert!(!message.contains("bep removed"), "{message}");
     }
 
     // BEP-060: an old key that the store did not remove is named, with the
