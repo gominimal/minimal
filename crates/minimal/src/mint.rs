@@ -27,11 +27,9 @@
 //! Box creation reads that key from the host keychain
 //! ([`HostClientKeyStore`]), so every creation signs under one key and the
 //! proxy keeps one registration for this client.
-//! [`mint_store_handle`] has no caller yet: the sealed member list has no
-//! `store` kind to carry a handle to the box.
-//! <https://github.com/gominimal/minimal/issues/2525> owns that kind, and
-//! <https://github.com/gominimal/minimal/issues/2526> owns the
-//! `min box spec` store references.
+//! Box creation seals each store handle as a `store` member, one sealed
+//! value for each store reference that a rule accepts
+//! ([`mint_store_members`], BEP-032).
 //!
 //! A mint refuses a root CA whose validity ended: every handle minted under
 //! it would be expired already.
@@ -1371,13 +1369,6 @@ pub fn mint_and_register(
 /// The claims of a store handle for box `box_id` on Box Host `node`, under
 /// `rule`: its store and identifier, its registered authorities as the
 /// upstream set, its injection form, and `expiry` as the expiry.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
-)]
 #[must_use]
 pub fn store_claims(
     box_id: &str,
@@ -1401,13 +1392,6 @@ pub fn store_claims(
 }
 
 /// One minted store handle.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
-)]
 pub struct StoreHandle {
     /// The handle, a JWS of `typ` `gatehouse-store-handle+jws`.
     pub jws: Zeroizing<String>,
@@ -1447,13 +1431,6 @@ impl fmt::Debug for StoreHandle {
 /// [`MintError::BepRuleRefused`], [`MintError::BepRuleDenied`] and
 /// [`MintError::BepRuleDiffers`] when `config_dir`, the `min --config-dir`
 /// override, gives a rule that `bep serve` does not hold as given.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "each input is a distinct fact of the mint, and the caller holds each one"
@@ -1501,6 +1478,116 @@ pub fn mint_store_handle(
         "minted a store handle"
     );
     Ok(StoreHandle { jws, jti, expiry })
+}
+
+/// A store reference that a `[secret-store-rules]` rule accepted: the grant
+/// the value lands in, and the rule the proxy redeems it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreGrant {
+    /// The grant: the environment variable the value is for.
+    pub grant: String,
+    /// The accepted rule, in the form the proxy holds it.
+    pub rule: StoreRule,
+}
+
+/// Mints a store handle for each of `grants` for the box `box_id`, and
+/// seals each one as a `store` member (BEP-032, BEP-063). Each grant gets
+/// its own sealed value. [`mint_store_handle`] registers `key` before it
+/// gives a handle, so no handle leaves this process under a key the proxy
+/// does not know. After each mint, one `mint` record goes to the proxy's
+/// audit log (BEP-067). A record that the proxy does not take is a warn
+/// line, and the mint stands.
+///
+/// The box must be registered with the proxy before this runs: the caller
+/// does that, and forgets the box when this fails.
+///
+/// # Errors
+///
+/// As [`mint_store_handle`] says, and [`MintError::Identity`] when the
+/// value does not seal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint, and the caller holds each one"
+)]
+pub fn mint_store_members(
+    identity: &Identity,
+    identity_path: &Path,
+    control: &mut ControlClient,
+    key: &ClientKey,
+    box_id: &str,
+    grants: &[StoreGrant],
+    config_dir: Option<&Path>,
+    now: u64,
+) -> Result<Vec<Minted>, MintError> {
+    let mut minted = Vec::with_capacity(grants.len());
+    if grants.is_empty() {
+        return Ok(minted);
+    }
+    let box_id = box_id_hex(box_id)?;
+    let identity_error = |error| MintError::Identity {
+        path: identity_path.to_owned(),
+        error,
+    };
+    let node = identity
+        .key(bep::keys::Role::Sealing)
+        .map_err(identity_error)?
+        .kid();
+    for grant in grants {
+        let handle = mint_store_handle(
+            identity,
+            identity_path,
+            control,
+            key,
+            &box_id,
+            &grant.rule,
+            config_dir,
+            now,
+        )?;
+        // The proxy opens every value under its one module, so a store
+        // member is sealed under it too, as `bep serve` reads it.
+        let context = Context {
+            box_id: box_id.clone(),
+            host: node.clone(),
+            module: GITHUB.id.to_owned(),
+            host_set_version: GITHUB.host_set_version,
+            mode: Mode::User,
+            iat: now,
+            expiry: handle.expiry,
+            kid: node.clone(),
+        };
+        let members = MemberList {
+            members: vec![Member {
+                kind: MemberKind::Store,
+                breadth: Breadth::Full,
+                jws: handle.jws,
+                exp: Some(handle.expiry),
+            }],
+            default_owner: None,
+        };
+        let sealed = Zeroizing::new(identity.seal(&context, &members).map_err(identity_error)?);
+        let identifier = format!("{}:{}", grant.rule.store, grant.rule.id);
+        if let Err(error) = control.record_mint(&box_id, &identifier) {
+            tracing::warn!(
+                box_id = %box_id,
+                identifier = %identifier,
+                error = %error,
+                "the proxy did not record the mint"
+            );
+        }
+        tracing::info!(
+            box_id = %box_id,
+            grant = %grant.grant,
+            identifier = %identifier,
+            jti = %handle.jti,
+            "sealed a store handle as a store member"
+        );
+        minted.push(Minted {
+            grant: grant.grant.clone(),
+            sealed,
+            expiry: handle.expiry,
+        });
+    }
+    Ok(minted)
 }
 
 /// Refuses `rule`, read under the `min --config-dir` override `config_dir`,
