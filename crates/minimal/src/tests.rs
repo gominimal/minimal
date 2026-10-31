@@ -4836,7 +4836,7 @@ mod mint_tests {
         let absence = crate::cmd::proxy_absence(
             Some(&identity),
             Some(&control),
-            Some(binary.clone()),
+            Ok(binary.clone()),
             Some(log.clone()),
         );
         assert_eq!(
@@ -4870,7 +4870,12 @@ mod mint_tests {
         // No path resolved for the program: the text names none.
         let err = crate::cmd::check_github_grants(
             &github_secrets(),
-            crate::cmd::proxy_absence(None, None, None, None),
+            crate::cmd::proxy_absence(
+                None,
+                None,
+                Err(bep::store::ProxyLookupError::NoMinvmd),
+                None,
+            ),
             &signed_in(),
         )
         .unwrap_err();
@@ -4882,13 +4887,40 @@ mod mint_tests {
              minimal.toml."
         );
 
+        // A relative MINVMD_BEP_BIN: the text names the variable and its
+        // value, not a missing program.
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Err(bep::store::ProxyLookupError::RelativeEnv("bin/bep".into())),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::RelativePath {
+                path: "bin/bep".into()
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and MINVMD_BEP_BIN \
+             sets `bep`, the Box Egress Proxy, to the relative path bin/bep, and no proxy \
+             serves boxes on this machine. Set MINVMD_BEP_BIN to an absolute path. To create \
+             the box without the grant, remove GH_TOKEN from the [secrets] table in \
+             minimal.toml."
+        );
+
         // A `bep` program that published nothing: installed, and not
         // answering. The text names its log.
         std::fs::write(&binary, "").unwrap();
         let absence = crate::cmd::proxy_absence(
             Some(&identity),
             Some(&control),
-            Some(binary.clone()),
+            Ok(binary.clone()),
             Some(log.clone()),
         );
         assert_eq!(
@@ -4930,7 +4962,7 @@ mod mint_tests {
         std::fs::write(&control, "").unwrap();
         assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
         assert_eq!(
-            crate::cmd::proxy_absence(Some(&identity), Some(&control), Some(binary), Some(log)),
+            crate::cmd::proxy_absence(Some(&identity), Some(&control), Ok(binary), Some(log)),
             None
         );
         let err =

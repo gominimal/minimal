@@ -519,19 +519,23 @@ pub(crate) fn proxy_present(
 /// starts, by `bep::store::proxy_binary_path`, and `log` is the file that
 /// daemon writes the proxy's output to. A program that does not exist is
 /// not installed. One that exists and published nothing does not answer.
+/// A relative `MINVMD_BEP_BIN` is its own cause, not a missing program.
 pub(crate) fn proxy_absence(
     identity: Option<&std::path::Path>,
     control: Option<&std::path::Path>,
-    binary: Option<std::path::PathBuf>,
+    binary: Result<std::path::PathBuf, bep::store::ProxyLookupError>,
     log: Option<std::path::PathBuf>,
 ) -> Option<boxes::core::bep::ProxyAbsence> {
+    use bep::store::ProxyLookupError;
     use boxes::core::bep::ProxyAbsence;
     if proxy_present(identity, control) {
         return None;
     }
     let absence = match binary {
-        Some(path) if path.exists() => ProxyAbsence::NotAnswering { path, log },
-        path => ProxyAbsence::NotInstalled { path },
+        Ok(path) if path.exists() => ProxyAbsence::NotAnswering { path, log },
+        Ok(path) => ProxyAbsence::NotInstalled { path: Some(path) },
+        Err(ProxyLookupError::RelativeEnv(path)) => ProxyAbsence::RelativePath { path },
+        Err(ProxyLookupError::NoMinvmd) => ProxyAbsence::NotInstalled { path: None },
     };
     tracing::debug!(?absence, "no node-local proxy serves boxes");
     Some(absence)
@@ -1236,8 +1240,7 @@ pub(crate) async fn activate_box(
             let binary = bep::store::proxy_binary_on_path(
                 std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
                 std::env::var_os("PATH").as_deref(),
-            )
-            .ok();
+            );
             let github_grants = check_github_grants(
                 &project_secrets,
                 proxy_absence(

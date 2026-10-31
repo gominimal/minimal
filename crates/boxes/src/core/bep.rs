@@ -359,6 +359,12 @@ pub enum ProxyAbsence {
         /// The proxy program's path.
         path: Option<std::path::PathBuf>,
     },
+    /// The proxy program's path comes from `MINVMD_BEP_BIN`, which holds
+    /// this relative path, so no proxy program is looked up.
+    RelativePath {
+        /// The relative path the variable holds.
+        path: std::path::PathBuf,
+    },
     /// The proxy program exists at `path`, and no proxy published its
     /// identity and control socket. `log` is the file the host daemon
     /// writes the proxy's output to, when it is known.
@@ -567,6 +573,13 @@ impl fmt::Display for BepRefusal {
                         f,
                         "`bep`, the Box Egress Proxy, is not installed, so no proxy serves \
                          boxes on this machine."
+                    )?,
+                    ProxyAbsence::RelativePath { path } => write!(
+                        f,
+                        "MINVMD_BEP_BIN sets `bep`, the Box Egress Proxy, to the relative path \
+                         {}, and no proxy serves boxes on this machine. Set MINVMD_BEP_BIN to \
+                         an absolute path.",
+                        path.display()
                     )?,
                     ProxyAbsence::NotAnswering { path, log } => {
                         write!(
