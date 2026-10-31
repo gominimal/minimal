@@ -120,6 +120,17 @@ pub const PROXY_LISTENER_PORT: u16 = 8118;
 /// ([`proxy_lane_admits`]).
 pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
 
+/// The DSCP value a VM guest's classifier writes on every IPv4 packet of a
+/// connection a box's cgroup opened, so the host-side gate can tell a box's
+/// frame from the guest daemon's own when both leave from the node address.
+/// The guest's table clears the field on every other packet, so an honest
+/// sender outside the boxes cohort never wears the value. Root in the guest
+/// can write any frame, the mark included, so the mark is no proof of a
+/// box: the host gate bounds a marked frame from the node address by the
+/// rules it decides the cohort's frames by. It is in RFC 2474's pool 2
+/// (`xxxx11`), the codepoints kept for local use.
+pub const BOX_COHORT_DSCP: u8 = 0b11_0111;
+
 /// The Box Egress Proxy's listener on the switch this box attaches to —
 /// the destination a credentialed lane's frames are admitted to, and the
 /// only one (NET-134): the listener, never the address, because what a
@@ -500,6 +511,8 @@ pub struct FrameSummary {
     /// [`DNS_PORT`], so the missing port fails the resolver carve-out
     /// closed rather than opening it.
     dst_port: u16,
+    /// The IPv4 header's DSCP field, `0` when the frame carries none.
+    dscp: u8,
 }
 
 impl FrameSummary {
@@ -535,6 +548,13 @@ impl FrameSummary {
     pub fn destination_port(&self) -> u16 {
         self.dst_port
     }
+
+    /// Whether a VM guest's classifier marked the frame as a box's own:
+    /// an IPv4 frame whose DSCP field is [`BOX_COHORT_DSCP`].
+    #[must_use]
+    pub fn box_cohort_marked(&self) -> bool {
+        self.family == FrameFamily::Ipv4 && self.dscp == BOX_COHORT_DSCP
+    }
 }
 
 /// Extracts the verdict's inputs from one Ethernet II frame. Pure and
@@ -549,6 +569,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
         dst: None,
         proto: None,
         dst_port: 0,
+        dscp: 0,
     };
     if frame.len() < ETH_HDR {
         return none(FrameFamily::Truncated);
@@ -582,6 +603,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
                 dst: None,
                 proto: None,
                 dst_port: 0,
+                dscp: 0,
             };
         }
         ETHERTYPE_IPV6 => return none(FrameFamily::Ipv6),
@@ -610,6 +632,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
         dst: Some([ip[16], ip[17], ip[18], ip[19]]),
         proto: Some(ip[9]),
         dst_port,
+        dscp: ip[1] >> 2,
     }
 }
 
