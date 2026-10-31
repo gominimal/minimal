@@ -3429,6 +3429,31 @@ mod tests {
             BoxId::from(uuid::Uuid::from_u128(n))
         }
 
+        /// BOX-163: the entry cleaning keeps the edge cases the removed
+        /// client-side sanitiser covered.
+        #[test]
+        fn entry_box_name_caps_trims_drops_and_falls_back() {
+            use super::super::box_name::{ENTRY_NAME_MAX, entry_box_name};
+
+            // The cap is 48 octets of the cleaned name.
+            let long = "a".repeat(ENTRY_NAME_MAX + 12);
+            assert_eq!(entry_box_name(&long), "a".repeat(ENTRY_NAME_MAX));
+
+            // A `-` that the cap leaves at the end is trimmed again.
+            let cut_at_dash = format!("{}_{}", "a".repeat(ENTRY_NAME_MAX - 1), "b".repeat(5));
+            assert_eq!(entry_box_name(&cut_at_dash), "a".repeat(ENTRY_NAME_MAX - 1));
+
+            // Unicode, tabs and spaces drop; `_` and `.` become `-`.
+            assert_eq!(entry_box_name("\tCafé Bar\t"), "cafbar");
+            assert_eq!(entry_box_name("Build_All.v2"), "build-all-v2");
+            assert_eq!(entry_box_name("-_.dev.-_"), "dev");
+
+            // An entry that cleans to nothing names the box `box`.
+            assert_eq!(entry_box_name(""), "box");
+            assert_eq!(entry_box_name("\t日本\t"), "box");
+            assert_eq!(entry_box_name("-_."), "box");
+        }
+
         fn status() -> impl Strategy<Value = BoxState> {
             prop_oneof![
                 Just(BoxState::Pending),
