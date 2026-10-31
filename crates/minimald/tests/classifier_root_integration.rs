@@ -1437,6 +1437,7 @@ impl op::SourceFetcher for NoSources {
         &self,
         url: &str,
         _sha256: &str,
+        _leaf: Option<&sandbox::config::ClassifierLeaf>,
         _op: &ot::OpTracker,
     ) -> anyhow::Result<PathBuf> {
         anyhow::bail!("the probe build has no sources, but it asked for {url}")

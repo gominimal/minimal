@@ -112,10 +112,10 @@ impl std::fmt::Debug for BuildNetwork {
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
-    async fn build_deps_mapped(
-        &self,
+    async fn build_deps_mapped<'b>(
+        &mut self,
         build: &BuildSpec,
-        opts: &Options<'a>,
+        opts: &Options<'b>,
         op: &OpTracker,
     ) -> Result<Vec<SandboxMapped>, Error> {
         let mut build_deps = Vec::new();
@@ -130,6 +130,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         source,
                         remote_fetcher: self.remote_fetcher,
                         into: None,
+                        classifier_leaf: self.classifier_leaf.as_ref(),
                     }
                     .run(&Options {
                         ot: Some(op.to_owned()),
@@ -138,7 +139,14 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         exec_base: opts.exec_base.clone(),
                         daemon_id: opts.daemon_id.clone(),
                     })
-                    .await?;
+                    .await;
+                    let resolved_src = match resolved_src {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            self.report_failed_fetch(source, &e).await;
+                            return Err(e);
+                        }
+                    };
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
                         // A copy, not a hardlink: the path is the download cache's own file,
@@ -320,9 +328,17 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 source,
                 remote_fetcher: self.remote_fetcher,
                 into: Some(out_dir),
+                classifier_leaf: self.classifier_leaf.as_ref(),
             }
             .run(opts)
-            .await?;
+            .await;
+            let resolved_src = match resolved_src {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    self.report_failed_fetch(source, &e).await;
+                    return Err(e);
+                }
+            };
 
             if let Materialized::Given(d) = resolved_src {
                 let build_ms = Instant::now().duration_since(start).as_millis() as usize;
@@ -343,6 +359,34 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
+    /// Writes a web source this build could not fetch to the build's stderr
+    /// (NET-155), so the output of a build placed for a box names the source
+    /// and its host. A daemon that reads the output can then say which
+    /// destination the box's egress rules refused. The URL is written without
+    /// its credentials and its query.
+    async fn report_failed_fetch(&mut self, source: &graph::SourceInput, e: &Error) {
+        use tokio::io::AsyncWriteExt;
+        let graph::SourceFetch::Web { url, .. } = &source.from else {
+            return;
+        };
+        let Some(writer) = self.stderr_writer.as_mut() else {
+            return;
+        };
+        let shown = match url::Url::parse(url) {
+            Ok(mut parsed) => {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+                parsed.set_query(None);
+                parsed.set_fragment(None);
+                parsed.to_string()
+            }
+            Err(_) => return,
+        };
+        let line = format!("could not fetch the source {shown}: {e}\n");
+        let _ = writer.write_all(line.as_bytes()).await;
+        let _ = writer.flush().await;
+    }
+
     /// The sandbox configuration this build runs in. A build placed for a box
     /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
     /// box's leaf and not the leaf of the process that starts it.
@@ -533,6 +577,7 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
+            _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
         ) -> anyhow::Result<PathBuf> {
             unreachable!("source fetch must not happen on these build paths")
@@ -558,6 +603,7 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
+            _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
         ) -> anyhow::Result<PathBuf> {
             Ok(self.0.clone())
@@ -699,7 +745,7 @@ mod tests {
         "#});
         let bsr = *dg.by_name("uses-raw-source").unwrap();
         let fetcher = OneFileFetcher(cached.clone());
-        let sb = SpecBuild {
+        let mut sb = SpecBuild {
             spec: &bsr,
             remote_fetcher: &fetcher,
             override_deps: None,
