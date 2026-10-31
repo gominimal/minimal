@@ -182,7 +182,7 @@ async fn serve_list_sessions(
                 .map(|(i, record)| {
                     (
                         i.id,
-                        box_network_facts(&mngr, i.id, record.as_ref(), opt_out),
+                        box_network_facts(&mngr, i.id, record.as_ref(), opt_out, in_microvm),
                     )
                 })
                 .collect();
@@ -246,6 +246,13 @@ async fn serve_list_sessions(
         .await
 }
 
+/// The address a host-address box reports in the listing (T110): the
+/// node's address, except in a microVM whose node address is still
+/// `127.0.0.1`, where the box reports none.
+fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<std::net::Ipv4Addr> {
+    (!in_microvm || node != std::net::Ipv4Addr::LOCALHOST).then_some(node)
+}
+
 /// One box's network facts as the listing reports them (T110). The address
 /// is the host loopback address its ports answer at: the node's address for
 /// a host-address box, and for an own-address or `none` box the address its
@@ -254,12 +261,16 @@ async fn serve_list_sessions(
 /// posture is the effective egress `GetEffectiveSessionPolicy` resolves for
 /// the same record ([`effective_policy_reply`]). A box whose record cannot
 /// be read reports no posture, and one that publishes nowhere reports no
-/// address.
+/// address. In a microVM, a host-address box reports no address while the
+/// node's address is still `127.0.0.1`: the answerer has not granted the
+/// node its address yet, and a VM node's host-address boxes are never
+/// mirrored onto `127.0.0.1` (design §7.1).
 fn box_network_facts(
     mngr: &crate::box_manager::BoxManagerHandle,
     id: SessionId,
     record: Option<&boxes::Record>,
     opt_out: bool,
+    in_microvm: bool,
 ) -> minimald_rpc::BoxNetworkFacts {
     let host_address = matches!(
         record.map(|record| record.network),
@@ -269,7 +280,7 @@ fn box_network_facts(
         let registry = mngr.hostnames();
         let routes = registry.read().expect("hostname registry lock poisoned");
         if host_address {
-            Some(routes.node_address())
+            host_address_loopback(routes.node_address(), in_microvm)
         } else {
             routes.published_own_address(id).or_else(|| {
                 record

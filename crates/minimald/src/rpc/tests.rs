@@ -4836,4 +4836,12 @@ async fn list_sessions_reports_box_address_and_posture() {
         minimald_rpc::EgressPosture::of(&policy.egress, NetworkMode::OwnIp),
         minimald_rpc::EgressPosture::DenyAllDefault
     );
+    // In a microVM, a host-address box at the node's `127.0.0.1` is not
+    // mirrored there, so it reports no address until the node is granted
+    // one. A native node's `127.0.0.1` is the box's published address.
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let granted = std::net::Ipv4Addr::new(127, 0, 64, 1);
+    assert_eq!(host_address_loopback(localhost, true), None);
+    assert_eq!(host_address_loopback(granted, true), Some(granted));
+    assert_eq!(host_address_loopback(localhost, false), Some(localhost));
 }
