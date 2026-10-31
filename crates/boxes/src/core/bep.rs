@@ -1768,6 +1768,22 @@ mod tests {
         assert!(grant.is_credentialed() && grant.is_github());
     }
 
+    /// BEP-032: padding around `store` or `id` is trimmed, so a padded
+    /// reference still matches its rule.
+    #[test]
+    fn a_store_grant_parses_store_and_id_trimmed() {
+        let padded: SecretGrant =
+            toml::from_str("source = \"store\"\nstore = \" keychain \"\nid = \" claude \"")
+                .expect("parses");
+        assert_eq!(
+            padded.source,
+            GrantSource::Store {
+                store: "keychain".into(),
+                id: "claude".into()
+            }
+        );
+    }
+
     /// BEP-032: a store reference is `source = "store"` with `store` and
     /// `id`. The grant reads as one store reference, and a broker scope is
     /// never one. A grant that lacks `store` or `id` is refused with text
@@ -1790,12 +1806,6 @@ mod tests {
             toml::from_str::<SecretGrant>(&text).expect("reads back"),
             grant
         );
-        // Padding around store or id is trimmed, so the reference still
-        // matches its rule.
-        let padded: SecretGrant =
-            toml::from_str("source = \"store\"\nstore = \" keychain \"\nid = \" claude \"")
-                .expect("parses");
-        assert_eq!(padded, grant);
 
         // The old spelling, a broker scope that names the item, is refused,
         // so it cannot skip the store rules.
