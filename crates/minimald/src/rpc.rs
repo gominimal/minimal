@@ -3357,4 +3357,19 @@ mod create_naming_tests {
         let web = create(&mut client, &entry_req("web", true)).await;
         assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
     }
+
+    /// A task entry that is not a DNS label, such as `build_all`, names a
+    /// fresh instance with a valid label, not a refused create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_maps_the_entry_onto_a_label() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let build = create(&mut client, &entry_req("build_all", true)).await;
+        assert_eq!(
+            name_of(&server, build).await.as_deref(),
+            Some("build-all-1")
+        );
+        let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
+        assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+    }
 }

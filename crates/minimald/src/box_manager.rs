@@ -304,16 +304,41 @@ impl NameSource {
     }
 }
 
+/// The longest box name [`entry_box_name`] makes from an entry. It leaves
+/// room under the 63-octet DNS label limit for a fresh instance's `-<n>`.
+const ENTRY_NAME_MAX: usize = 48;
+
+/// The box name an entry gives (BOX-163), as one DNS label: ASCII letters
+/// and digits lowercased, `-`, `_` and `.` as `-`, other characters
+/// dropped, at most [`ENTRY_NAME_MAX`] octets, and no `-` at either end.
+/// An entry with nothing left names the box `box`. A `[box] name` or a
+/// `--name` never passes through here, so an invalid one is still refused.
+fn entry_box_name(entry: &str) -> String {
+    let filtered: String = entry
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if matches!(c, '-' | '_' | '.') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .take(ENTRY_NAME_MAX)
+        .collect();
+    let trimmed = filtered.trim_matches('-');
+    if trimmed.is_empty() {
+        "box".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// The name a create gives its box (BOX-163): the expanded spec's
-/// `[box] name`, else the entry's name. A spec the daemon cannot read as a
-/// v0 spec names nothing.
-///
-/// Interim: a name on the request goes ahead of the entry. `min` sends
-/// one for `--name`, and today also for its minted `<dir>-<hex>` names.
-/// `--name` keeps this step. The step stops putting a minted name ahead
-/// of the entry when the client sends a request name only for `--name`,
-/// never a minted `<dir>-<hex>` name. That change is
-/// <https://github.com/gominimal/minimal/issues/2762>.
+/// `[box] name`, else the request's name, else the entry's name as a
+/// valid label ([`entry_box_name`]). `min` sends a request name only for
+/// `--name`. A spec the daemon cannot read as a v0 spec names nothing.
 fn creation_name(
     requested: Option<&str>,
     spec: Option<&serde_json_lenient::Value>,
@@ -328,7 +353,7 @@ fn creation_name(
         return (Some(name.to_string()), NameSource::Request);
     }
     match spec {
-        Some(spec) => (Some(spec.box_name().to_string()), NameSource::Entry),
+        Some(spec) => (Some(entry_box_name(spec.box_name())), NameSource::Entry),
         None => (None, NameSource::None),
     }
 }
@@ -382,8 +407,7 @@ impl BoxManagerHandle {
     /// [`Self::create_box_with_spec`] for a create that asks for a fresh
     /// instance (BOX-163). The box is named `<name>-<n>`, with the smallest
     /// `n` no retained record on this host uses, whether or not a running
-    /// box holds `<name>`. No request field asks for one yet, so only an
-    /// in-process caller reaches this.
+    /// box holds `<name>`. A request with `fresh_instance` set reaches this.
     pub async fn create_fresh_box_with_spec(
         &self,
         config: minimald_rpc::BoxConfig,
