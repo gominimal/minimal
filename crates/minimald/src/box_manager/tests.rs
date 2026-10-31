@@ -3598,8 +3598,8 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
         assert!(text.contains(&holder.to_string()), "{text}");
         assert!(text.contains("`dev`"), "{text}");
         assert!(
-            minimal_client_collision(&text),
-            "a client still reads the refusal as a name collision: {text}"
+            text.contains(&format!("min session rename {holder} <new-name>")),
+            "the refusal names the next step: {text}"
         );
     }
     let listed = mngr.list_boxes(None).await.unwrap();
@@ -3633,10 +3633,40 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
     assert_eq!(record_name(&mngr, reuse).await.as_deref(), Some("dev"));
 }
 
-/// The match `min` makes on a create's error to tell a name collision
-/// apart (`minimal_client::box_name::is_name_collision`).
-fn minimal_client_collision(error: &str) -> bool {
-    error.contains("already exists")
+/// BOX-163: only the entry is cleaned into a label. A `[box] name` is
+/// taken unchanged, so an invalid one is refused, not rewritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
+    let (_state, _cache, mngr) = manager().await;
+    let refused = mngr
+        .create_box_with_spec(
+            unnamed_config(),
+            Some(task_spec("lint", Some("My_Box"))),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an invalid `[box] name` is refused");
+    let text = format!("{refused:#}");
+    assert!(
+        text.contains("invalid session name") && text.contains("DNS label"),
+        "the refusal says the name is invalid: {text}"
+    );
+    assert!(
+        mngr.list_boxes(None).await.unwrap().is_empty(),
+        "a refused name files nothing, and no `my-box` exists"
+    );
+
+    let id = mngr
+        .create_box_with_spec(
+            unnamed_config(),
+            Some(task_spec("build_all", None)),
+            None,
+            None,
+        )
+        .await
+        .expect("an entry name is cleaned into a label");
+    assert_eq!(record_name(&mngr, id).await.as_deref(), Some("build-all"));
 }
 
 /// BOX-163: a fresh instance is named `<name>-<n>`, with the smallest `n`

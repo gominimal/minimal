@@ -6146,7 +6146,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
   # the ls under pipefail and the leftover check would falsely pass.
   ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *task-e2e-echo-* ]]; then
+  if [[ "$ls_out" == *e2e-echo-[0-9]* ]]; then
     echo "::error::ephemeral session still listed after 'min task run e2e-echo'"
     fail
   fi
@@ -6162,18 +6162,18 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   fi
   ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *task-e2e-fail-* ]]; then
+  if [[ "$ls_out" == *e2e-fail-[0-9]* ]]; then
     echo "::error::ephemeral session still listed after a failing 'min task run'"
     fail
   fi
   echo "task run exit-code relay: 7 → 7 OK"
 
-  # --keep retains the session, named task-<task>-<hex>, attachable later.
+  # --keep retains the session, named <task>-<n> by the daemon, attachable later.
   (cd "$TASK_SEED_DIR" && mnl task run e2e-echo --keep >/dev/null 2>"$WORK/task-keep.err") \
     || { echo "::error::'min task run e2e-echo --keep' failed"; cat "$WORK/task-keep.err" 2>/dev/null || true; fail; }
-  kept="$(mnl ls 2>/dev/null | grep -o 'task-e2e-echo-[0-9a-f]\{4\}' | head -n1)"
+  kept="$(mnl ls 2>/dev/null | grep -o 'e2e-echo-[0-9][0-9]*' | head -n1)"
   if [ -z "$kept" ]; then
-    echo "::error::--keep did not leave a 'task-e2e-echo-*' session listed"
+    echo "::error::--keep did not leave a 'e2e-echo-<n>' session listed"
     mnl ls 2>&1 || true
     fail
   fi
@@ -22197,7 +22197,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'task-e2e-port-run-[0-9a-f]\{4\}' | head -n1)"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
     if [ -z "$po_task_box" ]; then
       echo "::error::the run's box was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
@@ -22226,7 +22226,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # failure arm.
       if [ -n "$po_task_ls_now" ]; then
         po_task_ls="$po_task_ls_now"
-        if [[ "$po_task_ls_now" != *task-e2e-port-run-* ]]; then
+        if [[ "$po_task_ls_now" != *e2e-port-run-[0-9]* ]]; then
           po_box_ended=1
           break
         fi
