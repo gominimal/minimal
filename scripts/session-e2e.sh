@@ -20161,7 +20161,7 @@ proof_escapes_and_builds_stay_inside_box_rules() {
   # the sibling VM-backed cases apply. With KVM present, a missing switch
   # stays a fault below, never a skip.
   if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
-    echo "escapes-and-builds proof SKIPPED (no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and no VM means no host-side gate to read)"
+    not_run escapes_and_builds_stay_inside_box_rules "no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and no VM means no host-side gate to read"
     echo "::endgroup::"
     return 0
   fi
