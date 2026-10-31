@@ -1901,6 +1901,42 @@ mod tests {
         open_audit_log(&audit).unwrap();
     }
 
+    // BEP-068 (#2460): the log `bep serve` writes is the log `min box audit`
+    // reads. The writer starts as `bep serve` does, and the reader is the
+    // `LogReader` the `min box audit` command uses, over the same directory.
+    #[test]
+    fn serve_writes_audit_segments_the_reader_reads() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        let (mut log, restored) = start_audit_log(&dir, false).unwrap();
+        assert!(restored.box_ids.is_empty());
+        let written = log
+            .append(&Decision {
+                kind: Kind::Decision,
+                box_id: "box-serve".to_owned(),
+                authority: "github.com".to_owned(),
+                identifier: None,
+                jti: String::new(),
+                mapping: Mapping::ModuleUnmapped,
+                outcome: Outcome::Admit,
+                marker: None,
+            })
+            .unwrap();
+        drop(log);
+
+        let segment = dir.join(audit::segment_name(0));
+        assert_eq!(segment.file_name().unwrap(), "audit-0.jsonl");
+        assert!(segment.is_file(), "{} is missing", segment.display());
+
+        let batch = audit::LogReader::new(&dir).read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
+        assert_eq!(batch.segments, vec![segment]);
+        let records: Vec<_> = batch.entries.into_iter().map(|e| e.record).collect();
+        assert_eq!(records, vec![written]);
+        assert_eq!(records[0].subject, "box-serve");
+    }
+
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
     struct NoSigningKey;
 
