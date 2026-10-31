@@ -280,8 +280,8 @@ fn box_network_facts(
     };
     // A host-address box's node address can be `127.0.0.1` too, so only
     // an own-address or `none` box at `127.0.0.1` is at the fallback.
-    let at_fallback = loopback_address
-        .map(|address| !host_address && address == std::net::Ipv4Addr::LOCALHOST);
+    let at_fallback =
+        loopback_address.map(|address| !host_address && address == std::net::Ipv4Addr::LOCALHOST);
     let egress_posture = record.map(|record| {
         let effective = effective_policy_reply(
             &record.policy,
