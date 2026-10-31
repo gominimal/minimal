@@ -1048,6 +1048,7 @@ fn hostname_routing_field_is_omitted_when_healthy() {
         answerer_bound: false,
         resource_pool: None,
         sessions: vec![],
+        box_networks: Default::default(),
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(
@@ -1233,6 +1234,109 @@ fn list_sessions_entry_decodes_with_and_without_git() {
     assert_eq!(round_trip(&with), with);
 }
 
+/// T110: the listing carries each box's address and egress posture keyed
+/// by its id, both survive the wire, a field the daemon could not fill
+/// stays off it, and a reply from a daemon that predates the map decodes
+/// with every box unreported.
+#[test]
+fn list_sessions_reply_carries_box_address_and_posture() {
+    let own = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let host = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let unreported = SessionId::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+    let reply = ListSessionsResponse {
+        resource_pool: None,
+        sessions: Vec::new(),
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        box_networks: [
+            (
+                own,
+                BoxNetworkFacts {
+                    loopback_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 2)),
+                    egress_posture: Some(EgressPosture::DenyAllDefault),
+                },
+            ),
+            (
+                host,
+                BoxNetworkFacts {
+                    loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
+                    egress_posture: Some(EgressPosture::DeclaredRules),
+                },
+            ),
+            (unreported, BoxNetworkFacts::default()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let json = serde_json_lenient::to_value(&reply).expect("serializes");
+    assert_eq!(
+        json["box_networks"][own.to_string()],
+        serde_json_lenient::json!({
+            "loopback_address": "127.0.64.2",
+            "egress_posture": "deny_all_default",
+        }),
+        "got {json}"
+    );
+    assert_eq!(
+        json["box_networks"][unreported.to_string()],
+        serde_json_lenient::json!({}),
+        "an unreported field stays off the wire: {json}"
+    );
+    let back: ListSessionsResponse = serde_json_lenient::from_value(json).expect("round trips");
+    assert_eq!(back.box_networks, reply.box_networks);
+
+    // A daemon that predates the map sends no key: every box unreported.
+    let older: ListSessionsResponse =
+        serde_json_lenient::from_str(r#"{"sessions": []}"#).expect("an older reply decodes");
+    assert!(older.box_networks.is_empty());
+    let quiet = ListSessionsResponse {
+        box_networks: Default::default(),
+        ..reply
+    };
+    assert!(
+        !serde_json_lenient::to_string(&quiet)
+            .unwrap()
+            .contains("box_networks"),
+        "an empty map stays off the wire"
+    );
+
+    // The posture is the one `min session policy` names, from the same
+    // effective egress.
+    use boxes::{EffectiveEgress, EgressPolicy, NetworkMode};
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::DenyAll, NetworkMode::OwnIp),
+        EgressPosture::DenyAllDefault
+    );
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::AllowAll, NetworkMode::HostNet),
+        EgressPosture::AllowAllDefault
+    );
+    assert_eq!(
+        EgressPosture::of(
+            &EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            NetworkMode::HostNet
+        ),
+        EgressPosture::DenyAll
+    );
+    assert_eq!(
+        EgressPosture::of(
+            &EffectiveEgress::Declared(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::default()
+            }),
+            NetworkMode::OwnIp
+        ),
+        EgressPosture::DeclaredRules
+    );
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::AllowAll, NetworkMode::NoNet),
+        EgressPosture::NoNetwork
+    );
+}
+
 /// NET-129's listing half survives version skew both ways without a
 /// request flag, because neither [`ListSessionsResponse`] nor
 /// [`ListSessionsEntry`] is `deny_unknown_fields`. A newer daemon's
@@ -1261,6 +1365,7 @@ fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
         hostname_proxy_port: None,
         zone_answerer_port: None,
         answerer_bound: false,
+        box_networks: Default::default(),
     };
 
     let quiet =

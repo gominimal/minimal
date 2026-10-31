@@ -350,6 +350,71 @@ pub struct ListSessionsResponse {
     /// native DNS on a host that may not have one.
     #[serde(default)]
     pub answerer_bound: bool,
+    /// Each listed box's network facts, keyed by its id (T110): the host
+    /// loopback address its ports answer at and its effective egress
+    /// posture. A box the daemon has no fact for is absent from the map,
+    /// or carries `None` in the field it cannot fill. Serde-defaulted, so
+    /// a reply from a daemon that predates the map reads as every box
+    /// unreported, and omitted when empty, so the common reply from such
+    /// a daemon is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub box_networks: std::collections::BTreeMap<SessionId, BoxNetworkFacts>,
+}
+
+/// What a listing reports about one box's network (T110): where its ports
+/// answer on the host and what its egress is held to. Both fields are
+/// serde-defaulted and omitted when `None`, so a field this daemon could
+/// not fill reads as unreported rather than as an invented value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxNetworkFacts {
+    /// The host loopback address the box's ports answer at: its own
+    /// reserved-range address (NET-010), `127.0.0.1` where the range is
+    /// absent, or the node's address for a host-address box. `None` while
+    /// the box publishes nowhere, such as before its first launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback_address: Option<std::net::Ipv4Addr>,
+    /// The egress posture the box is held to, from the same resolution
+    /// `GetEffectiveSessionPolicy` answers. `None` when the daemon could
+    /// not read the box's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_posture: Option<EgressPosture>,
+}
+
+/// A box's effective egress, named as one posture (T110): the summary
+/// `min session policy` prints for it. The client owns the printed words.
+/// This is the machine spelling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPosture {
+    /// No `egress` section, resolved to deny everything (NET-074).
+    DenyAllDefault,
+    /// No `egress` section, resolved to allow everything: the opt-out
+    /// (NET-077), or a box without an address of its own.
+    AllowAllDefault,
+    /// A declared section that admits nothing (NET-075).
+    DenyAll,
+    /// A declared section with rules of its own.
+    DeclaredRules,
+    /// A `none` box: it has no network, so no egress posture applies.
+    NoNetwork,
+}
+
+impl EgressPosture {
+    /// The posture of `egress`, the effective egress the gate enforces,
+    /// for a box in `network` mode. A `none` box has no network, whatever
+    /// its egress resolves to, as `min session policy` says for it.
+    #[must_use]
+    pub fn of(egress: &boxes::EffectiveEgress, network: boxes::NetworkMode) -> Self {
+        if network == boxes::NetworkMode::NoNet {
+            return Self::NoNetwork;
+        }
+        match egress {
+            boxes::EffectiveEgress::DenyAll => Self::DenyAllDefault,
+            boxes::EffectiveEgress::AllowAll => Self::AllowAllDefault,
+            boxes::EffectiveEgress::Declared(section) if section.admits_nothing() => Self::DenyAll,
+            boxes::EffectiveEgress::Declared(_) => Self::DeclaredRules,
+        }
+    }
 }
 
 impl OneshotSshRpc for ListSessions {
