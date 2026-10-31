@@ -496,8 +496,11 @@ reuses them.
   side (EPOCH-014). The root index reseals under epoch 1 in the same cycle
   that seals the first epoch-1 snapshot. Until it does, the snapshot's
   root-index fallback is withheld (EPOCH-012). No lookup unions the two
-  epochs, and the flip shows consumers misses and never refusals. The
-  catalog rebuilds cold under epoch-1 keys on the first package CI cycle
+  epochs, and for a client at or after the reading release the flip shows
+  misses and never refusals; a client before it refuses the first epoch-1
+  index as any unknown epoch (EPOCH-009), which is why the reading release
+  ships first and the flip waits until the fleet is on it. The catalog
+  rebuilds cold under epoch-1 keys on the first package CI cycle
   at that release. That is a full world rebuild, and build-infra schedules
   it on purpose. A staged catalog rebuild on the staging cache comes before
   the release.
