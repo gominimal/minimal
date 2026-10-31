@@ -1957,12 +1957,17 @@ pub struct CreateSessionRequest {
 /// (BOX-010). The daemon sends its [`Display`](std::fmt::Display) text as
 /// the reply's error, and a client reads the holder back with
 /// [`Self::from_error`], so one definition spells and parses it.
+///
+/// `holder` is `None` only on the client: the VM host refused the box's
+/// registration under the name, and the in-VM daemon could not say which
+/// box holds it. The refusal then names the held spelling alone, and still
+/// ends the command with [`Self::EXIT_CODE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldNameRefusal {
     /// The name the create asked for.
     pub name: String,
-    /// The running box that holds the name.
-    pub holder: SessionId,
+    /// The running box that holds the name, when it is known.
+    pub holder: Option<SessionId>,
     /// The holder's name, with the case it was given.
     pub holder_name: String,
 }
@@ -1974,18 +1979,27 @@ impl HeldNameRefusal {
 
     const HEAD: &'static str = "Cannot create a session named `";
     const TAKEN: &'static str = "`: the running session `";
-    const HOLDS: &'static str = ") holds that name.";
+    const HOLDS: &'static str = " holds that name.";
 
     /// The refusal a create reply's `error` carries, or `None` when the
     /// error is any other failure.
     pub fn from_error(error: &str) -> Option<Self> {
         let rest = error.strip_prefix(Self::HEAD)?;
         let (name, rest) = rest.split_once(Self::TAKEN)?;
-        let (holder_name, rest) = rest.split_once("` (")?;
-        let (holder, _) = rest.split_once(Self::HOLDS)?;
+        // A box name is a DNS label, so it holds no backtick.
+        let (holder_name, rest) = rest.split_once('`')?;
+        let holder = if rest.starts_with(Self::HOLDS) {
+            None
+        } else {
+            let (holder, _) = rest.strip_prefix(" (")?.split_once(')')?;
+            if !rest.contains(Self::HOLDS) {
+                return None;
+            }
+            Some(SessionId::parse_str(holder).ok()?)
+        };
         Some(Self {
             name: name.to_string(),
-            holder: SessionId::parse_str(holder).ok()?,
+            holder,
             holder_name: holder_name.to_string(),
         })
     }
@@ -1998,15 +2012,19 @@ impl std::fmt::Display for HeldNameRefusal {
             holder,
             holder_name,
         } = self;
-        write!(
-            f,
-            "{head}{name}{taken}{holder_name}` ({holder}{holds} \
-             Rename that session with `min session rename {holder} <new-name>`, \
-             or choose another name.",
-            head = Self::HEAD,
-            taken = Self::TAKEN,
-            holds = Self::HOLDS,
-        )
+        let (head, taken, holds) = (Self::HEAD, Self::TAKEN, Self::HOLDS);
+        match holder {
+            Some(holder) => write!(
+                f,
+                "{head}{name}{taken}{holder_name}` ({holder}){holds} \
+                 Rename that session with `min session rename {holder} <new-name>`, \
+                 or choose another name.",
+            ),
+            None => write!(
+                f,
+                "{head}{name}{taken}{holder_name}`{holds} Choose another name.",
+            ),
+        }
     }
 }
 

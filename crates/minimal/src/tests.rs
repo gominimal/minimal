@@ -1018,7 +1018,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
     let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
     let reply = minimald_rpc::HeldNameRefusal {
         name: "default".to_string(),
-        holder,
+        holder: Some(holder),
         holder_name: "Default".to_string(),
     }
     .to_string();
@@ -1028,7 +1028,7 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
         .downcast_ref::<minimald_rpc::HeldNameRefusal>()
         .expect("main.rs maps this error to its exit code");
     assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
-    assert_eq!(refusal.holder, holder);
+    assert_eq!(refusal.holder, Some(holder));
     assert_eq!(refusal.holder_name, "Default");
     let printed = format!("{error:#}");
     assert_eq!(
@@ -1046,6 +1046,45 @@ fn held_name_refusal_exits_2_and_names_the_holder() {
             .is_none()
     );
     assert_eq!(format!("{other:#}"), "the project path is not a directory");
+}
+
+/// BOX-163: an own-address create whose VM host registration is refused
+/// because a live row holds the name ends `min` with exit 2. The error names
+/// the holder's id, read from the daemon. When the holder cannot be read,
+/// it is still exit 2 and names the held spelling.
+#[test]
+fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let error =
+        registration_held_name_refusal("dev", "Dev", Some((holder, Some("Dev".to_string()))));
+    let refusal = error
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.holder, Some(holder));
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
+         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         or choose another name."
+    );
+
+    let unread = registration_held_name_refusal("dev", "Dev", None);
+    let refusal = unread
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("an unread holder is still exit 2");
+    assert_eq!(refusal.holder, None);
+    assert_eq!(
+        format!("{unread:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` holds that name. \
+         Choose another name."
+    );
+    assert_eq!(
+        minimald_rpc::HeldNameRefusal::from_error(&unread.to_string()).as_ref(),
+        Some(refusal),
+        "the text without an id parses back"
+    );
 }
 
 /// BOX-163: with no `--name`, the create carries no name and the box takes

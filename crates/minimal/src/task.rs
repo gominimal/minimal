@@ -551,6 +551,14 @@ async fn bridge_exec(
 /// Run a declared task in an ephemeral session: create, upload, exec the
 /// canonical in-box `min task run <task>`, relay its exit code, and let the
 /// daemon end the session with the run (NET-131) — or keep it with `--keep`.
+/// The name the create of a task with no spec carries (BOX-163): the
+/// task's name, cleaned as the daemon cleans a spec's entry. The daemon
+/// sends a request name unchanged to its name check, so a `build_all` task
+/// is sent as `build-all`.
+fn interactive_task_box_name(task: &str) -> String {
+    boxes::box_name::entry_box_name(task)
+}
+
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
@@ -679,8 +687,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     {
         crate::put_spec(&mut request, &spec)?;
     } else {
-        // With no spec to name it, the request carries the entry's name.
-        request.config.name = Some(args.task.clone());
+        // With no spec to name it, the request carries the entry's name,
+        // cleaned as the daemon cleans a spec's entry.
+        request.config.name = Some(interactive_task_box_name(&args.task));
     }
 
     // Upload per the normal activate rules: tarball sync (the default), the
@@ -1036,6 +1045,13 @@ mod tests {
     /// Exit-status relay: a reported 0 is success; anything else downcasts
     /// to the typed `TaskExit`, clamped into `u8` like the git-remote
     /// helper's status.
+    /// BOX-163: a task with no spec sends its name cleaned, as the daemon
+    /// cleans a spec's entry, so the daemon's name check accepts it.
+    #[test]
+    fn interactive_task_sends_its_name_cleaned() {
+        assert_eq!(interactive_task_box_name("build_all"), "build-all");
+    }
+
     #[test]
     fn exit_outcome_relays_the_task_status() {
         exit_outcome(Some(0)).expect("exit 0 is success");

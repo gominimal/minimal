@@ -26,7 +26,9 @@ mod tests {
     fn refusal() -> String {
         HeldNameRefusal {
             name: "default".to_string(),
-            holder: boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap(),
+            holder: Some(
+                boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap(),
+            ),
             holder_name: "default".to_string(),
         }
         .to_string()

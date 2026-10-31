@@ -67,6 +67,41 @@ impl std::fmt::Display for HostAddressesExhausted {
 
 impl std::error::Error for HostAddressesExhausted {}
 
+/// The VM host daemon refused a registration because a live row already
+/// holds the box's name, in some spelling (BOX-163). `held` is the spelling
+/// the row holds. The activation reads the holder from the in-VM daemon and
+/// ends with `min`'s held-name refusal, exit 2.
+#[derive(Debug)]
+pub struct NameAlreadyHeld {
+    /// The name the live row holds, in its registered spelling.
+    pub held: String,
+    refusal: String,
+}
+
+impl NameAlreadyHeld {
+    /// The opening and the close of the registry's refusal sentence,
+    /// `a box named <held> already exists`.
+    const OPENING: &'static str = "a box named ";
+    const CLOSE: &'static str = " already exists";
+
+    /// The held name a registration refusal names, or `None` when the
+    /// refusal is any other one.
+    #[must_use]
+    pub fn held_in(error: &str) -> Option<String> {
+        let rest = error.strip_prefix(Self::OPENING)?;
+        let held = rest.strip_suffix(Self::CLOSE)?;
+        (!held.is_empty() && !held.contains(char::is_whitespace)).then(|| held.to_string())
+    }
+}
+
+impl std::fmt::Display for NameAlreadyHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.refusal)
+    }
+}
+
+impl std::error::Error for NameAlreadyHeld {}
+
 /// One control-socket exchange with the VM host daemon (T66): one JSON
 /// line in — the verb's request — and one line out — the untagged reply
 /// the verb is answered with.
@@ -290,6 +325,9 @@ pub async fn register_box_with_vm_host(
             let refusal = format!("the VM host daemon refused the box registration: {error}");
             if minimald_rpc::is_address_capacity_refusal(&error) {
                 return Err(HostAddressesExhausted(refusal).into());
+            }
+            if let Some(held) = NameAlreadyHeld::held_in(&error) {
+                return Err(NameAlreadyHeld { held, refusal }.into());
             }
             Err(anyhow::anyhow!(refusal))
         }
@@ -533,8 +571,10 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
 ///
 /// `name` is the name the daemon will give the box (BOX-163): the one the
 /// person typed, else the spec's. The client mints none. A registration
-/// under a name a live row holds is refused, and the refusal ends the
-/// activation. Nothing re-registers it under another name.
+/// under a name a live row holds is refused with [`NameAlreadyHeld`],
+/// which carries the spelling the row holds. The caller turns it into the
+/// held-name refusal that names the holder and exits 2. Nothing
+/// re-registers the box under another name.
 pub async fn register_box_for_activation(
     kind: paths::HostKind,
     minimal_dir: Option<&Path>,
@@ -981,5 +1021,51 @@ mod tests {
             !settle_lease_after_cleanup(None, CleanupOutcome::Destroyed).await,
             "with no lease, a destroyed session's row is the caller's to withdraw"
         );
+    }
+
+    /// BOX-163: the VM host's refusal of a registration under a name a live
+    /// row holds comes back typed, with the spelling the row holds, so the
+    /// activation can name the holder and exit 2. Any other refusal stays
+    /// untyped.
+    #[tokio::test]
+    async fn a_held_name_registration_refusal_carries_the_held_spelling() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        assert_eq!(
+            NameAlreadyHeld::held_in("a box named Dev already exists").as_deref(),
+            Some("Dev")
+        );
+        assert_eq!(
+            NameAlreadyHeld::held_in("the switch's address plan is exhausted"),
+            None
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Error {
+                error: "a box named Dev already exists".to_string(),
+            })
+            .unwrap();
+            stream
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let error = register_box_at(&sock_path, "dev", &boxes::BoxPolicy::default())
+            .await
+            .expect_err("a held name refuses the registration");
+        daemon.await.unwrap();
+        let held = error
+            .downcast_ref::<NameAlreadyHeld>()
+            .expect("the refusal is typed through its context");
+        assert_eq!(held.held, "Dev");
+        assert!(format!("{error:#}").contains("a box named Dev already exists"));
     }
 }

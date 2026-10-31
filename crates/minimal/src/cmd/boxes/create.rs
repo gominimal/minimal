@@ -1086,7 +1086,7 @@ pub(crate) fn create_refusal(error: String) -> anyhow::Error {
         Some(refusal) => {
             tracing::info!(
                 name = %refusal.name,
-                holder = %refusal.holder,
+                holder = ?refusal.holder,
                 holder_name = %refusal.holder_name,
                 exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
                 "the create was refused: a running box holds the name"
@@ -1095,6 +1095,55 @@ pub(crate) fn create_refusal(error: String) -> anyhow::Error {
         }
         None => anyhow::anyhow!("{error}"),
     }
+}
+
+/// The id and name of the box that holds `held`, read from the daemon by
+/// name. `None` when the read fails or finds no box.
+async fn held_name_holder(
+    client: &mut minimal_client::Client,
+    held: &str,
+) -> Option<(boxes::SessionId, Option<String>)> {
+    match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Name(
+            held.to_string(),
+        ))
+        .await
+    {
+        Ok(reply) => reply.record.map(|record| (record.id, record.name)),
+        Err(error) => {
+            tracing::warn!(held_name = %held, %error, "could not read the box that holds the name");
+            None
+        }
+    }
+}
+
+/// The error an own-address create ends with when the VM host refused its
+/// registration because a live row holds `held` (BOX-163). It is the
+/// held-name refusal a daemon create sends, so `min` exits 2. It names the
+/// holder's id when `holder` gives its id and name, and the held spelling
+/// alone when the holder could not be read.
+pub(crate) fn registration_held_name_refusal(
+    name: &str,
+    held: &str,
+    holder: Option<(boxes::SessionId, Option<String>)>,
+) -> anyhow::Error {
+    let (holder, holder_name) = match holder {
+        Some((id, name)) => (Some(id), name),
+        None => (None, None),
+    };
+    let refusal = minimald_rpc::HeldNameRefusal {
+        name: name.to_string(),
+        holder,
+        holder_name: holder_name.unwrap_or_else(|| held.to_string()),
+    };
+    tracing::info!(
+        name = %refusal.name,
+        holder = ?refusal.holder,
+        holder_name = %refusal.holder_name,
+        exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+        "the box registration was refused: a running box holds the name"
+    );
+    anyhow::Error::new(refusal)
 }
 
 /// Puts the spec of a session box from `dir` on the create request
@@ -1537,14 +1586,29 @@ pub(crate) async fn activate_box(
         .run(async {
             let registered = match box_name.as_deref() {
                 Some(name) => {
-                    register_box_for_activation(
+                    match register_box_for_activation(
                         kind,
                         global.minimal_dir.as_deref(),
                         request.config.network,
                         name,
                         &request.config.policy,
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(registered) => registered,
+                        // BOX-163: a live row holds the name. The refusal
+                        // names the box that holds it and exits 2.
+                        Err(error) => {
+                            let Some(held) = error
+                                .downcast_ref::<minimal_client::box_registration::NameAlreadyHeld>()
+                                .map(|refused| refused.held.clone())
+                            else {
+                                return Err(error);
+                            };
+                            let holder = held_name_holder(&mut client, &held).await;
+                            return Err(registration_held_name_refusal(name, &held, holder));
+                        }
+                    }
                 }
                 None => None,
             };

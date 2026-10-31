@@ -549,7 +549,7 @@ async fn serve_create_session(
                         Some(refusal) => {
                             tracing::info!(
                                 name = %refusal.name,
-                                holder = %refusal.holder,
+                                holder = ?refusal.holder,
                                 holder_name = %refusal.holder_name,
                                 fresh_instance,
                                 "create refused: a running box holds the name; \
@@ -1257,7 +1257,7 @@ fn held_name_refusal(error: &std::io::Error) -> Option<minimald_rpc::HeldNameRef
         .downcast_ref::<crate::box_manager::HeldNameRefusal>()?;
     Some(minimald_rpc::HeldNameRefusal {
         name: refusal.name.clone(),
-        holder: refusal.holder,
+        holder: Some(refusal.holder),
         holder_name: refusal.holder_name.clone(),
     })
 }
@@ -3325,7 +3325,7 @@ mod create_naming_tests {
             refusal,
             HeldNameRefusal {
                 name: "dev".to_string(),
-                holder,
+                holder: Some(holder),
                 holder_name: "dev".to_string(),
             }
         );
