@@ -677,7 +677,10 @@ async fn an_attach_redraw_the_client_never_reads_does_not_wedge_the_host_loop() 
 /// once it is full, blocks its session loop on the keystroke. A blocked loop
 /// applies no more window adjusts, so the write starves on credit the
 /// client already granted: the duplex deadlock of #2197, on the attach path.
-/// The binding now drains the read half while a write is in flight.
+/// The binding now drains the read half while a write is in flight, and
+/// forwards what it read as the host's stdin queue takes it, never parking on
+/// that queue with its own mailbox unread (with the shell blocked on output
+/// behind a full mailbox, that queue only empties once output moves).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
     let screen = truecolor_screen(BIG_SIZE);
@@ -694,30 +697,30 @@ async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
         "the keystroke must land after the server's inbound queue has filled with window adjusts: {redraw}-byte redraw",
     );
 
+    // The shell keeps printing throughout (the feeder stays on). That is the
+    // harder case: with the binding busy on the redraw, its mailbox fills
+    // and the host stops reading the pty, so the shell blocks on output and
+    // stops reading its input, and the host's stdin queue fills behind the
+    // pty. The keystroke must still get through once the client reads.
     let mut attach = FloodedAttach::start_with(Duration::from_secs(30), BIG_SIZE, &screen).await;
-    // An idle shell, as in the scenario: the flood is not part of this
-    // failure, and with it the shell's echo of the keystroke would queue
-    // behind megabytes of its own output.
-    attach.feeder.abort();
 
     // Read at full speed; type once at nine tenths of the redraw, as the
     // scenario does, when the inbound queue is already full of window adjusts.
-    // The keystroke lands in the middle of one of the feeder's lines, so the
-    // shell's `got:` line carries it mid-line; the string itself comes back
-    // twice, as the tty's echo and in that line.
+    // Waited for: the full redraw, then the shell's own line carrying the
+    // keystroke (`got:…ping-643b`).
     let needle = b"ping-643b";
-    let (mut got, mut typed, mut seen) = (0usize, false, Vec::new());
+    let (mut got, mut typed, mut tail) = (0usize, false, Vec::new());
+    let mut seen = Seen::default();
     let outcome = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(msg) = attach.channel.wait().await {
             if let russh::ChannelMsg::Data { data } = msg {
                 got += data.len();
-                seen.extend_from_slice(&data);
+                let answered = saw_answer(&mut tail, needle, &data, &mut seen);
                 if !typed && got >= type_at {
                     typed = true;
                     attach.channel.data(&b"ping-643b\n"[..]).await.unwrap();
                 }
-                if got >= redraw && seen.windows(needle.len()).filter(|w| w == needle).count() >= 2
-                {
+                if got >= redraw && answered {
                     return;
                 }
             }
@@ -727,7 +730,7 @@ async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
     .await;
     assert!(
         outcome.is_ok(),
-        "a keystroke typed mid-redraw wedged the binding: {got} of {redraw} redraw bytes arrived (typed: {typed}), and the shell never answered",
+        "a keystroke typed mid-redraw wedged the binding: {got} of {redraw} redraw bytes arrived (typed: {typed}), and the shell never answered ({seen:?})",
     );
     assert!(
         !attach.task.is_finished(),
@@ -735,6 +738,39 @@ async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
     );
 
     attach.stop().await;
+}
+
+/// Scans output as it streams in for the keystroke coming back, line by
+/// line (`tail` holds the unfinished last line between chunks, so nothing is
+/// re-read). The keystroke comes back twice, as the tty's echo and in the
+/// shell's `got:` line, but with the shell printing throughout the two
+/// interleave: the echo lands wherever the shell's output was at that
+/// moment, and its newline can cut the shell's own line in two. So the
+/// shell is taken to have answered when a line carries `got:` before the
+/// keystroke, or when the keystroke has come back twice in any form.
+fn saw_answer(tail: &mut Vec<u8>, needle: &[u8], data: &[u8], seen: &mut Seen) -> bool {
+    tail.extend_from_slice(data);
+    while let Some(nl) = tail.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = tail.drain(..=nl).collect();
+        seen.lines += 1;
+        let at = line.windows(needle.len()).position(|w| w == needle);
+        if let Some(at) = at {
+            seen.carrying += 1;
+            if line[..at].windows(4).any(|w| w == b"got:") {
+                seen.answered = true;
+            }
+        }
+    }
+    seen.answered || seen.carrying >= 2
+}
+
+/// What the client saw while waiting for the shell's answer: how many lines,
+/// how many carried the keystroke, and whether one was the shell's.
+#[derive(Default, Debug)]
+struct Seen {
+    lines: usize,
+    carrying: usize,
+    answered: bool,
 }
 
 /// An attach the daemon ended exits non-zero, so a script can tell it from
