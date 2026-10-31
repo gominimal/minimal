@@ -3286,18 +3286,36 @@ pub(crate) fn host_address_listening_ports(
         .collect())
 }
 
+/// The longest wait before a refused or unanswered listen notice is sent
+/// again. The wait doubles from [`LISTEN_POLL_INTERVAL`] up to this bound.
+const LISTEN_NOTICE_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// The listen notices the in-VM daemon owes the VM host daemon for the
 /// host-address boxes (NET-138): the diff of one read of
-/// [`host_address_listening_ports`] against the ports already noticed.
+/// [`host_address_listening_ports`] against the ports the host holds as
+/// listening. A port moves into or out of that set only on a holding
+/// answer from the host ([`Self::answered`]). A notice the host refused or
+/// never answered stays owed, and is sent again after a per-port wait that
+/// doubles up to [`LISTEN_NOTICE_RETRY_MAX`].
 #[derive(Debug, Default)]
 pub(crate) struct HostAddressListens {
+    /// The ports the host answered a listening notice for and no stopped
+    /// notice since.
     noticed: BTreeSet<u16>,
+    /// Per port with a notice the host did not hold: when it is owed
+    /// again, and the wait the next failure earns.
+    retry: HashMap<u16, (std::time::Instant, Duration)>,
 }
 
 impl HostAddressListens {
-    /// The notices that move the noticed ports to `now`: one listening
-    /// notice per new port and one stopped notice per closed port.
-    pub(crate) fn notices(&mut self, now: &BTreeSet<u16>) -> Vec<minimald_rpc::ListenNotice> {
+    /// The notices owed at `at` to move the host's ports to `now`: one
+    /// listening notice per new port and one stopped notice per closed
+    /// port, less each port still in its retry wait. It commits nothing.
+    pub(crate) fn notices(
+        &mut self,
+        now: &BTreeSet<u16>,
+        at: std::time::Instant,
+    ) -> Vec<minimald_rpc::ListenNotice> {
         let stopped = self
             .noticed
             .difference(now)
@@ -3311,9 +3329,43 @@ impl HostAddressListens {
                 port: *port,
                 state: minimald_rpc::ListenState::Listening,
             });
-        let notices: Vec<_> = stopped.chain(listening).collect();
-        self.noticed.clone_from(now);
-        notices
+        let owed: Vec<_> = stopped.chain(listening).collect();
+        // A port that owes nothing any more forgets its wait.
+        self.retry
+            .retain(|port, _| owed.iter().any(|notice| notice.port == *port));
+        owed.into_iter()
+            .filter(|notice| {
+                self.retry
+                    .get(&notice.port)
+                    .is_none_or(|(due, _)| *due <= at)
+            })
+            .collect()
+    }
+
+    /// Records the host's answer to `notice` at `at`. `held` is whether
+    /// the host holds the notice: a listening port is then the host's, and
+    /// a stopped one is not. Any other answer leaves the port owed, and
+    /// sends it again after its wait.
+    pub(crate) fn answered(
+        &mut self,
+        notice: minimald_rpc::ListenNotice,
+        held: bool,
+        at: std::time::Instant,
+    ) {
+        if held {
+            self.retry.remove(&notice.port);
+            match notice.state {
+                minimald_rpc::ListenState::Listening => self.noticed.insert(notice.port),
+                minimald_rpc::ListenState::Stopped => self.noticed.remove(&notice.port),
+            };
+            return;
+        }
+        let wait = self
+            .retry
+            .get(&notice.port)
+            .map_or(LISTEN_POLL_INTERVAL, |(_, wait)| *wait);
+        let next = (wait * 2).min(LISTEN_NOTICE_RETRY_MAX);
+        self.retry.insert(notice.port, (at + wait, next));
     }
 }
 
@@ -3322,9 +3374,8 @@ impl HostAddressListens {
 /// [`host_address_listening_ports`] under `/proc` for `lease`, the node's
 /// own address, and sends one notice per change ([`HostAddressListens`]).
 /// A read that fails is logged and retried on the next poll. A notice the
-/// host refuses or never answers is logged and not sent again until the
-/// listener changes. A native host has no report door, so this returns at
-/// once.
+/// host refuses or never answers is logged and sent again after its retry
+/// wait. A native host has no report door, so this returns at once.
 #[expect(
     dead_code,
     reason = "the guest start path that spawns it for a VM-backed node lands with the \
@@ -3343,8 +3394,13 @@ pub(crate) async fn watch_host_address_listens(
     while !*stop.borrow() {
         match host_address_listening_ports(Path::new("/proc"), own_pid, lease) {
             Ok(ports) => {
-                for notice in listens.notices(&ports) {
-                    match send_listen_notice(&control, notice).await {
+                for notice in listens.notices(&ports, std::time::Instant::now()) {
+                    let answer = send_listen_notice(&control, notice).await;
+                    let held = matches!(
+                        answer,
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. }))
+                    );
+                    match answer {
                         Ok(Some(minimald_rpc::BoxControlReply::Error { error })) => {
                             tracing::warn!(
                                 port = notice.port,
@@ -3353,10 +3409,19 @@ pub(crate) async fn watch_host_address_listens(
                                 "the VM host daemon refused a host-address box's listen notice"
                             );
                         }
-                        Ok(_) => tracing::debug!(
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. })) => {
+                            tracing::debug!(
+                                port = notice.port,
+                                state = ?notice.state,
+                                "the VM host daemon holds a host-address box's listen notice"
+                            );
+                        }
+                        Ok(other) => tracing::warn!(
                             port = notice.port,
                             state = ?notice.state,
-                            "sent a host-address box's listen notice"
+                            answer = ?other,
+                            "the VM host daemon answered a host-address box's listen notice \
+                             with an unexpected reply"
                         ),
                         Err(error) => tracing::warn!(
                             port = notice.port,
@@ -3365,6 +3430,7 @@ pub(crate) async fn watch_host_address_listens(
                             "a host-address box's listen notice got no answer"
                         ),
                     }
+                    listens.answered(notice, held, std::time::Instant::now());
                 }
             }
             Err(error) => tracing::warn!(
@@ -6509,7 +6575,8 @@ mod tests {
         assert_eq!(ports, BTreeSet::from([3000, 8080]));
 
         let mut listens = HostAddressListens::default();
-        let notices = listens.notices(&ports);
+        let at = std::time::Instant::now();
+        let notices = listens.notices(&ports, at);
         assert_eq!(
             notices,
             vec![
@@ -6523,16 +6590,46 @@ mod tests {
                 },
             ]
         );
+        // Only a holding answer commits a port. The host held 3000 and
+        // refused 8080, so 8080 stays owed after its wait.
+        listens.answered(notices[0], true, at);
+        listens.answered(notices[1], false, at);
         assert!(
-            listens.notices(&ports).is_empty(),
-            "an unchanged read owes nothing"
+            listens.notices(&ports, at).is_empty(),
+            "a held port owes nothing, and a refused one waits"
         );
         assert_eq!(
-            listens.notices(&BTreeSet::from([8080])),
-            vec![minimald_rpc::ListenNotice {
-                port: 3000,
-                state: minimald_rpc::ListenState::Stopped
-            }]
+            listens.notices(&ports, at + LISTEN_POLL_INTERVAL),
+            vec![notices[1]],
+            "a refused notice is sent again after its wait"
+        );
+        listens.answered(notices[1], true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&ports, at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty(),
+            "an unchanged read owes nothing"
+        );
+        let stop_3000 = minimald_rpc::ListenNotice {
+            port: 3000,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at),
+            vec![stop_3000]
+        );
+        // A stopped notice that got no answer stays owed too.
+        listens.answered(stop_3000, false, at);
+        assert!(listens.notices(&BTreeSet::from([8080]), at).is_empty());
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at + LISTEN_POLL_INTERVAL),
+            vec![stop_3000]
+        );
+        listens.answered(stop_3000, true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&BTreeSet::from([8080]), at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty()
         );
         // The wire line is the fixed notice: a port and a state alone.
         let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlRequest::ListenNotice(
