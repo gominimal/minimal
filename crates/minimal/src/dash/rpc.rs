@@ -750,7 +750,23 @@ async fn create_registering<C: Send>(
         registration: None,
     };
     if let Some(name) = config.name.as_deref() {
-        row.registration = register_box_beside(sock, config.network, name, &config.policy).await?;
+        row.registration =
+            match register_box_beside(sock, config.network, name, &config.policy).await {
+                Ok(registered) => registered,
+                // BOX-163: a live row holds the name. Refuse as the CLI does,
+                // with the held spelling and the next step, not the raw text.
+                Err(error) => {
+                    let Some(held) = error
+                        .downcast_ref::<minimal_client::box_registration::NameAlreadyHeld>()
+                        .map(|refused| refused.held.clone())
+                    else {
+                        return Err(error);
+                    };
+                    return Err(crate::cmd::registration_held_name_refusal(
+                        name, &held, None,
+                    ));
+                }
+            };
     }
     row.name.clone_from(&config.name);
     config.box_addresses = row

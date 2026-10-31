@@ -1042,9 +1042,6 @@ mod tests {
         assert!(err.to_string().contains("whitespace"), "got: {err}");
     }
 
-    /// Exit-status relay: a reported 0 is success; anything else downcasts
-    /// to the typed `TaskExit`, clamped into `u8` like the git-remote
-    /// helper's status.
     /// BOX-163: a task with no spec sends its name cleaned, as the daemon
     /// cleans a spec's entry, so the daemon's name check accepts it.
     #[test]
@@ -1052,6 +1049,9 @@ mod tests {
         assert_eq!(interactive_task_box_name("build_all"), "build-all");
     }
 
+    /// Exit-status relay: a reported 0 is success; anything else downcasts
+    /// to the typed `TaskExit`, clamped into `u8` like the git-remote
+    /// helper's status.
     #[test]
     fn exit_outcome_relays_the_task_status() {
         exit_outcome(Some(0)).expect("exit 0 is success");
