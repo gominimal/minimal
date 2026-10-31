@@ -6614,8 +6614,18 @@ __e2e_same_shell=yes' \
     fail
   fi
   # Keeping at the exit prompt is a detach, and the session must survive it.
-  if ! mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
+  # Capture-then-match, never `mnl ls --raw | grep -q`: grep's early exit
+  # SIGPIPEs the CLI under pipefail, and a failed listing would read as a
+  # gone session. On a miss, print what the listing said and its stderr so
+  # a failed `min ls` is told apart from a session that is truly gone.
+  hook_ls_status=0
+  hook_ls="$(mnl ls --raw 2>"$WORK/hooks-ls.err")" || hook_ls_status=$?
+  if ! printf '%s\n' "$hook_ls" | grep -Fq -- "$hook_sid"; then
     echo "::error::session gone after answering the exit prompt with 'keep'"
+    echo "--- min ls --raw (exit $hook_ls_status) ---"; printf '%s\n' "$hook_ls"
+    echo "--- min ls --raw stderr ---"; cat "$WORK/hooks-ls.err" 2>/dev/null || true
+    echo "--- attach transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- attach stderr ---"; cat "$WORK/hooks-attach.err" 2>/dev/null || true
     fail
   fi
   # `on_detach` is headless (the terminal it would have used is the thing
