@@ -1164,11 +1164,12 @@ impl Callback {
             let (mut conn, target) = tokio::select! {
                 accepted = self.listener.accept() => {
                     let (mut conn, _) = accepted?;
+                    let host = format!("127.0.0.1:{}", self.listener.local_addr()?.port());
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         let read = tokio::time::timeout(
                             REQUEST_READ_TIMEOUT,
-                            read_request_target(&mut conn),
+                            read_request_target(&mut conn, &host),
                         );
                         if let Ok(Some(target)) = read.await {
                             let _ = tx.send((conn, target)).await;
@@ -1193,7 +1194,10 @@ impl Callback {
     }
 }
 
-async fn read_request_target(conn: &mut tokio::net::TcpStream) -> Option<String> {
+/// The target of a `GET` whose `Host` header is `host`, the callback's own
+/// `127.0.0.1:<port>`. A request with another `Host`, such as a page that
+/// reaches the listener through DNS rebinding, gets no reply.
+async fn read_request_target(conn: &mut tokio::net::TcpStream, host: &str) -> Option<String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1207,9 +1211,14 @@ async fn read_request_target(conn: &mut tokio::net::TcpStream) -> Option<String>
         buf.extend_from_slice(&chunk[..n]);
     }
     let head = String::from_utf8_lossy(&buf);
-    let mut parts = head.lines().next()?.split_whitespace();
+    let mut lines = head.lines();
+    let mut parts = lines.next()?.split_whitespace();
     (parts.next()? == "GET").then_some(())?;
-    parts.next().map(str::to_owned)
+    let target = parts.next()?.to_owned();
+    lines
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| name.eq_ignore_ascii_case("host") && value.trim() == host)
+        .then_some(target)
 }
 
 async fn respond(conn: &mut tokio::net::TcpStream, page: &Page) {
@@ -2215,6 +2224,53 @@ mod tests {
                 .expect("utf8")
                 .starts_with("Stopped waiting."),
         );
+    }
+
+    // A request whose Host is not the callback's own 127.0.0.1:<port>, as a
+    // page that reaches the listener through DNS rebinding sends, gets no
+    // reply, so it cannot read the account a callback page names.
+    #[tokio::test]
+    async fn a_callback_with_another_host_gets_no_reply() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        let url = url::Url::parse(&browser.redirect_uri).expect("redirect");
+        let port = url.port().expect("port");
+        let send = |host: String| async move {
+            let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            let request =
+                format!("GET {CALLBACK_PATH}?installation_id=1 HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            conn.write_all(request.as_bytes()).await.expect("write");
+            let mut reply = Vec::new();
+            let _ = tokio::time::timeout(
+                REQUEST_READ_TIMEOUT + Duration::from_secs(1),
+                conn.read_to_end(&mut reply),
+            )
+            .await;
+            reply
+        };
+        let rebound = tokio::spawn(send(format!("attacker.example:{port}")));
+        let next = tokio::time::timeout(Duration::from_secs(2), browser.callback.next()).await;
+        assert!(
+            next.is_err(),
+            "a request with another Host reached the flow"
+        );
+        assert!(rebound.await.expect("join").is_empty());
+
+        let own = tokio::spawn(send(format!("127.0.0.1:{port}")));
+        let (mut conn, query) =
+            tokio::time::timeout(Duration::from_secs(2), browser.callback.next())
+                .await
+                .expect("the callback's own Host reaches the flow")
+                .expect("next");
+        assert_eq!(query.get("installation_id"), Some("1"));
+        respond(&mut conn, &Page::not_found()).await;
+        drop(conn);
+        assert!(!own.await.expect("join").is_empty());
     }
 
     // The install callback's re-read is bounded by the deadline too: a
