@@ -353,7 +353,9 @@ fn creation_name(
         return (Some(name.to_string()), NameSource::Request);
     }
     match spec {
-        Some(spec) => (Some(entry_box_name(spec.box_name())), NameSource::Entry),
+        // Only the entry is cleaned. A spec that sets `[box] name` returned
+        // above, unchanged, so the store still refuses an invalid one.
+        Some(spec) => (Some(entry_box_name(&spec.entry)), NameSource::Entry),
         None => (None, NameSource::None),
     }
 }
