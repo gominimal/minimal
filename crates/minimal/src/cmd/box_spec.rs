@@ -72,7 +72,12 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
-        .filter(|refusal| matches!(refusal, BepRefusal::NarrowScopesUnenrolled { .. }))
+        .filter(|refusal| {
+            matches!(
+                refusal,
+                BepRefusal::NarrowScopesUnenrolled { .. } | BepRefusal::BrokerScopeNotGithub { .. }
+            )
+        })
         .collect();
     if !narrow.is_empty() {
         return Err(ActivationRefused { refusals: narrow }.into());
@@ -382,12 +387,8 @@ mod tests {
             "{text}"
         );
 
-        // A reference in another store names the store, and a broker scope
-        // is not a store reference.
-        let secrets = SecretGrants::from([
-            ("CLAUDE".to_string(), store_grant("vault", "claude")),
-            ("OLD".to_string(), grant(&["claude"])),
-        ]);
+        // A reference in another store names the store.
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), store_grant("vault", "claude"))]);
         let mut out = Vec::new();
         render(
             &SpecInputs {
@@ -407,7 +408,38 @@ mod tests {
             text.contains("store  vault:claude  CLAUDE  upstream api.anthropic.com"),
             "{text}"
         );
-        assert!(!text.contains("OLD"), "{text}");
+
+        // A broker scope is not a store reference. The preview refuses it,
+        // as box creation does.
+        let secrets = SecretGrants::from([
+            ("CLAUDE".to_string(), store_grant("vault", "claude")),
+            ("OLD".to_string(), grant(&["claude"])),
+        ]);
+        let mut out = Vec::new();
+        let error = render(
+            &SpecInputs {
+                root_fingerprint: Some("abc123"),
+                bep: &proxy_env(),
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                github_hosts: HOSTS,
+                store_rules: &other,
+            },
+            &mut out,
+        )
+        .expect_err("the old spelling is refused");
+        let refused = error
+            .downcast_ref::<ActivationRefused>()
+            .expect("an activation refusal");
+        assert_eq!(
+            refused.refusals,
+            vec![BepRefusal::BrokerScopeNotGithub {
+                grant: "OLD".into(),
+                scope: "claude".into(),
+            }]
+        );
+        assert!(out.is_empty(), "no rows before the refusal");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
