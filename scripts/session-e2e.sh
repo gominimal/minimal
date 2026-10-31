@@ -27378,7 +27378,7 @@ proof_names_survive_restart_and_second_vm() {
   local a_name="e2e-nrv-a" b_name="e2e-nrv-b" vm="beta"
   local port=18132 lo=18130 hi=18135
   local a_sid="" b_sid="" a_addr="" a_addr_after="" b_addr="" setup="" cmd=""
-  local before_records="" after_records="" tool
+  local before_records="" after_records="" tool nrv_journal="" nrv_lines=""
 
   if [ "$(uname -s)" != Linux ]; then
     not_run "$nc" "the box-name boot unit is a Linux systemd unit; macOS reserves its names another way"
@@ -27555,7 +27555,10 @@ proof_names_survive_restart_and_second_vm() {
   fi
   echo "boot unit journal:"
   sudo -n journalctl --no-pager -n 5 -u "$unit" 2>/dev/null | sed 's/^/  /' || true
-  if ! sudo -n journalctl --no-pager -n 20 -u "$unit" 2>/dev/null | grep -qF -- 're-created minzone0'; then
+  # Capture first: under pipefail, `grep -q` can SIGPIPE the producer and
+  # turn a match into a failed pipeline. Match the text in bash.
+  nrv_journal="$(sudo -n journalctl --no-pager -n 20 -u "$unit" 2>/dev/null || true)"
+  if [[ "$nrv_journal" != *"re-created minzone0"* ]]; then
     echo "::error::$unit ran but its journal has no 're-created minzone0' line"
     nrv_diag
     fail
@@ -27604,7 +27607,9 @@ proof_names_survive_restart_and_second_vm() {
     nrv_diag
     fail
   fi
-  if nrv_answerer_lines | grep -qF -- "box names are not answered on the host"; then
+  # Capture first, as above: a SIGPIPE on the producer must not hide a match.
+  nrv_lines="$(nrv_answerer_lines)"
+  if [[ "$nrv_lines" == *"box names are not answered on the host"* ]]; then
     echo "::error::a VM host daemon says its box names are not answered on the host: the two daemons contended for the DNS service"
     nrv_diag
     fail
