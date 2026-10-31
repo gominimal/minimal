@@ -15591,9 +15591,10 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
 import json, os, re, sys
 trail, audit, box = sys.argv[1], sys.argv[2], sys.argv[3]
 # The proxy writes the subject as 32 lowercase hex digits, without hyphens
-# (box_id_text in crates/bep/src/proxy.rs; the audit record's subject is the
-# box id, gominimal/arch architecture.md line 505). `box` is the hyphenated id
-# that `min box audit` prints, so every subject match below uses this form.
+# (box_id_text in crates/bep/src/listener.rs. The subject of an audit record
+# is the box id, gominimal/arch architecture.md line 505). The box argument is
+# the hyphenated id that min box audit prints, so every subject match below
+# uses the hex form.
 subject = sys.argv[3].replace("-", "").lower()
 def die(msg):
     print(msg)
