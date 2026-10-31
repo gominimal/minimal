@@ -1247,10 +1247,50 @@ fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Re
     Ok((log, restored))
 }
 
+/// The environment variable that sets the size bound of an audit segment,
+/// in bytes. It is a test surface: the end-to-end suite sets it so the log
+/// rotates after a few requests. Only `bep serve` reads it.
+const AUDIT_SEGMENT_BYTES_ENV: &str = "BEP_AUDIT_SEGMENT_BYTES";
+
+/// The segment bound that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] sets: a
+/// positive integer, else [`audit::SEGMENT_BYTES`]. An unset, empty, zero
+/// or unparsable value keeps the default.
+fn audit_segment_bound(value: Option<&std::ffi::OsStr>) -> u64 {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bound| *bound > 0)
+        .unwrap_or(audit::SEGMENT_BYTES)
+}
+
+/// The rotation bounds of the audit log that `bep serve` writes. The
+/// segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when it is set.
+fn audit_rotation() -> audit::Rotation {
+    let value = std::env::var_os(AUDIT_SEGMENT_BYTES_ENV);
+    let bound = audit_segment_bound(value.as_deref());
+    if value.is_some() {
+        tracing::info!(
+            bound,
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            default = audit::SEGMENT_BYTES,
+            "audit segment bound set by the test override"
+        );
+    }
+    audit::Rotation {
+        bound,
+        ..audit::Rotation::default()
+    }
+}
+
 /// Opens the audit log in `dir` for `bep serve`. The log holds the
 /// directory, so a second `bep serve` on it is refused.
 fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
-    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+    open_audit_log_with(dir, audit_rotation())
+}
+
+/// [`open_audit_log`] with the rotation bounds `rotation`.
+fn open_audit_log_with(dir: &Path, rotation: audit::Rotation) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, rotation).map_err(|err| {
         if err.kind() == io::ErrorKind::WouldBlock {
             tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
             format!(
@@ -1899,6 +1939,53 @@ mod tests {
         );
         drop(first);
         open_audit_log(&audit).unwrap();
+    }
+
+    // T35: `BEP_AUDIT_SEGMENT_BYTES` sets the segment bound when it is a
+    // positive integer, and a log opened with that bound rotates past it.
+    #[test]
+    fn audit_segment_bound_follows_the_test_override() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome};
+        use std::ffi::OsStr;
+        assert_eq!(audit_segment_bound(None), audit::SEGMENT_BYTES);
+        assert_eq!(audit_segment_bound(Some(OsStr::new("4096"))), 4096);
+        assert_eq!(audit_segment_bound(Some(OsStr::new(" 512 "))), 512);
+        for ignored in ["", "0", "-1", "lots", "1.5"] {
+            assert_eq!(
+                audit_segment_bound(Some(OsStr::new(ignored))),
+                audit::SEGMENT_BYTES,
+                "{ignored:?}"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        let rotation = audit::Rotation {
+            bound: audit_segment_bound(Some(OsStr::new("512"))),
+            ..audit::Rotation::default()
+        };
+        let mut log = open_audit_log_with(&dir, rotation).unwrap();
+        for n in 0..20 {
+            log.append(&Decision {
+                kind: Kind::Decision,
+                box_id: format!("box-{n}"),
+                authority: String::new(),
+                identifier: None,
+                jti: String::new(),
+                mapping: Mapping::ModuleUnmapped,
+                outcome: Outcome::Admit,
+                marker: None,
+            })
+            .unwrap();
+        }
+        drop(log);
+        let segments = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+            .count();
+        assert!(segments > 1, "the log did not rotate: {segments} segment");
+        assert_eq!(audit::verify_chain(&dir).unwrap(), Ok(20));
     }
 
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
