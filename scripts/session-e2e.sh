@@ -311,6 +311,15 @@
 #                                    egress plus the baseline set; also
 #                                    pins no CAP_NET_RAW/CAP_NET_ADMIN in
 #                                    a box and no IPv6 route in the guest
+#   escapes_and_builds_stay_inside_box_rules
+#                                    VM host, one deny-all box: no vsock
+#                                    connect from it reaches the guest
+#                                    daemon's RPC listener (NET-139), its
+#                                    package build's web source and a frame
+#                                    wearing the node's address are dropped
+#                                    at the host-side gate (NET-155, NET-085),
+#                                    and each refusal's record is read back
+#                                    from the host's logs
 #   host_ip_deny_all
 #                                    NET-079 end to end, both halves: on a
 #                                    host that decides per box, a deny-all
@@ -356,7 +365,8 @@ case "${1:-}" in
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
-    | answerer_survives_session_stop)
+    | answerer_survives_session_stop \
+    | escapes_and_builds_stay_inside_box_rules)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -486,6 +496,10 @@ ESU_A_SEED_DIR="" # the escape-union proof's box A seed; removed on teardown
 ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
+EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+EBR_LISTENER_PID="" # its host listener; killed on teardown
+EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
+EBR_EXPECTED="" # the record the leg in progress expects; printed on failure
 NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # The classifier tree+table the daemon-fetch proof installs when the lane has
 # none. A run that dies between that install and the proof's own uninstall must
@@ -1149,6 +1163,11 @@ teardown() {
   [ -n "$ESU_B_SEED_DIR" ] && rm -rf "$ESU_B_SEED_DIR"
   if [ -n "$ESU_LISTENER_PID" ]; then
     kill "$ESU_LISTENER_PID" 2>/dev/null || true
+  fi
+  # The escapes-and-builds proof's seed and listener, for the same reasons.
+  [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  if [ -n "$EBR_LISTENER_PID" ]; then
+    kill "$EBR_LISTENER_PID" 2>/dev/null || true
   fi
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
@@ -20083,6 +20102,424 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   echo "::endgroup::"
 }
 
+# T108 on the VM host, end to end: escapes and builds stay inside the box's
+# rules, and each refusal leaves a record on the host. One deny-all
+# own-address box (`--network own_ip --deny-all-egress`) carries three legs:
+#
+#   * the RPC leg (NET-139): from inside the box, a vsock connect to the
+#     guest daemon's RPC port (2222, instance 0) at the loopback CID 1 and
+#     at CID 3, a sibling's or the guest's own. No seal admits AF_VSOCK, so
+#     the expected refusal is the box's own `socket(AF_VSOCK)` failing with
+#     EAFNOSUPPORT. Where a socket opens anyway, the guest daemon's accept
+#     check must refuse the peer, and its audited line ("refused an RPC
+#     connection from a vsock peer") must reach the host-side boot log. The
+#     attempt never reads the server's SSH banner either way.
+#
+#   * the build leg (NET-155 under NET-130): `min add --session` of a
+#     project-local package whose one web source is a literal address in
+#     TEST-NET-2. An own-address box has no classifier leaf, so the daemon
+#     fetches the source from its own namespace with the node's address,
+#     and the host-side gate decides it by the node-plane baseline set: the
+#     address is no registry or cache pin, so the gate drops it and writes
+#     its `egress-node-plane-unpinned` line naming the destination. The
+#     build fails and the package is not installed.
+#
+#   * the escape leg (NET-085): a root escapee wearing the node's own
+#     address speaks the shuttle protocol at the gate's landing edge (the
+#     escape-union case's spoofer, read out of this script) toward the
+#     runner's interface address, which no baseline entry pins. The gate
+#     drops it under `egress-node-plane-unpinned`, its line names the source
+#     and the destination, and the host listener sees no marker.
+#
+# The build leg runs before the escape leg on purpose: the gate writes one
+# line per source per rule per 60 s, and both legs' lines are the node
+# address's under the same rule, so the escape leg waits out the window the
+# build leg's line opened. Every leg's failure prints the record it expected
+# and the host log lines it searched.
+proof_escapes_and_builds_stay_inside_box_rules() {
+  local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
+  local ebr_line="" ebr_log0="" ebr_log0_lines=0 ebr_boot="" ebr_boot0_lines=0
+  local ebr_gate_sock="" ebr_listener_log="" ebr_rows="" ebr_cid="" ebr_prior=0
+  local ebr_policy="" ebr_rc=""
+  local ebr_pkg="e2e-ebr-fetch" ebr_build_dst="198.51.100.9"
+  echo "::group::escapes and builds stay inside the box's rules (NET-085, NET-139, NET-155)"
+
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    echo "escapes-and-builds proof SKIPPED (this run's daemon is minimald: a native host has no VM to escape into — the proof runs where the CLI is VM-backed)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "::error::no MINVMD_GVPROXY_BIN on this VM-backed run: the switch binary the host-side egress gate stands beside is missing, so the escapes-and-builds proof has no gate to read its records from"
+    fail
+  fi
+
+  ebr_gate_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-gate.sock"
+  ebr_boot="${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+  ebr_listener_log="$WORK/ebr-listener.log"
+  EBR_LISTEN_PORT=18095
+  EBR_EXPECTED="the deny-all box's activate"
+
+  # The host-side logs this case reads: the VM host daemon's file log (the
+  # gate's lines, the registration and the baseline set) and the boot log
+  # (the guest daemon's console). Both are scoped to the lines written after
+  # the snapshots below.
+  ebr_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  ebr_case_log() {
+    local f
+    f="$(ebr_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$ebr_log0" ] && [ "$ebr_log0_lines" -gt 0 ]; then
+      tail -n +"$((ebr_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      cat "$f" 2>/dev/null
+    fi
+  }
+  # The boot console paints ANSI around field names, so strip it first.
+  # A boot that rewrote the file leaves fewer lines than the snapshot, and
+  # then every line in it is this case's.
+  ebr_boot_case_log() {
+    local from=$((ebr_boot0_lines + 1)) now
+    now="$(wc -l <"$ebr_boot" 2>/dev/null)" || now=0
+    [ "$now" -ge "$ebr_boot0_lines" ] || from=1
+    tail -n +"$from" "$ebr_boot" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+  }
+  ebr_fail() {
+    if [ -n "${EBR_LISTENER_PID:-}" ]; then
+      kill "$EBR_LISTENER_PID" 2>/dev/null || true
+      EBR_LISTENER_PID=""
+    fi
+    echo "--- the record this leg expected ---"
+    echo "  $EBR_EXPECTED"
+    echo "--- the host logs searched ---"
+    echo "  VM host daemon log: $(ebr_host_log) (lines after $ebr_log0_lines of ${ebr_log0:-no earlier file})"
+    echo "  guest console (boot log): $ebr_boot (lines after $ebr_boot0_lines)"
+    echo "--- this case's gate drop lines ---"
+    ebr_case_log 2>/dev/null | grep -F 'rule_matched' | grep -F 'egress-' || true
+    echo "--- this case's vsock refusal lines from the guest console ---"
+    ebr_boot_case_log | grep -F 'refused an RPC connection from a vsock peer' || true
+    echo "--- the attempts so far ---"
+    printf '%s\n' "$ebr_rows" | sed '/^$/d; s/^/  /'
+    echo "--- the listener's record ---"
+    cat "$ebr_listener_log" 2>/dev/null || true
+    fail
+  }
+  # The gate's lines for one source, rule and destination, oldest first.
+  ebr_gate_lines() {
+    ebr_case_log | grep -F "\"source\":\"$1\"" | grep -F "\"rule_matched\":\"$2\"" \
+      | grep -F "\"destination\":\"$3\"" | sed '/^$/d'
+  }
+  # Waits until the gate wrote more such lines than $4, then prints the
+  # newest. SRC RULE DST BASE_COUNT
+  ebr_wait_new_gate_line() {
+    local count
+    for _ in $(seq 1 40); do
+      count="$(ebr_gate_lines "$1" "$2" "$3" | wc -l)"
+      if [ "$count" -gt "$4" ]; then
+        ebr_gate_lines "$1" "$2" "$3" | tail -n1
+        return 0
+      fi
+      sleep 0.5
+    done
+    return 1
+  }
+
+  # The seed: a project with one local package whose only web source is a
+  # literal address no baseline entry pins, so no name lookup stands between
+  # the build and the gate.
+  EBR_SEED_DIR="$(hook_mktemp /tmp/mnlebr.XXXXXX)"
+  hook_seed_preamble > "$EBR_SEED_DIR/minimal.toml"
+  mkdir "$EBR_SEED_DIR/.git"
+  mkdir -p "$EBR_SEED_DIR/packages/$ebr_pkg"
+  cat > "$EBR_SEED_DIR/packages/$ebr_pkg/build.ncl" <<EBR_PKG_EOF
+let {BuildSpec, Source, OutputLib, ..} = import "minimal.ncl" in
+{
+  name = "$ebr_pkg",
+  prebuilt = true,
+  build_deps = [
+    {
+      url = "https://$ebr_build_dst/$ebr_pkg-1.0.tar.zst",
+      sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+      extract = true,
+    } | Source,
+  ],
+  runtime_deps = [],
+  outputs = { docs = { glob = "*" } | OutputLib },
+} | BuildSpec
+EBR_PKG_EOF
+
+  # The spoofer: the escape-union case's own, read from this script so the
+  # two cases speak the same shuttle protocol.
+  awk '/ESU_SPOOFER_EOF/ { if (grab) exit; grab = 1; next } grab' \
+    "$ROOT/scripts/session-e2e.sh" > "$WORK/ebr-spoofer.py"
+  if ! grep -q '^def spoofed_flow' "$WORK/ebr-spoofer.py"; then
+    echo "::error::the escape-union case's spoofer could not be read out of this script into $WORK/ebr-spoofer.py"
+    ebr_fail
+  fi
+
+  # The destination of the escape leg: the runner's interface address, the
+  # same read and the same exclusions as the escape-union case.
+  ebr_host="$(python3 -c "
+import socket
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.connect(('192.0.2.1', 9))
+print(probe.getsockname()[0])
+" 2>"$WORK/ebr-host.err")" || ebr_host=""
+  if [ -z "$ebr_host" ] || ! python3 -c "
+import ipaddress, sys
+addr = ipaddress.IPv4Address(sys.argv[1])
+blocked = ('127.0.0.0/8', '100.64.0.0/10', '127.0.64.0/24')
+sys.exit(1 if addr.is_unspecified or any(addr in ipaddress.ip_network(n) for n in blocked) else 0)
+" "$ebr_host" 2>>"$WORK/ebr-host.err"; then
+    echo "::error::the runner's interface address ('$ebr_host') is unreadable, unspecified, loopback, inside 100.64/10, or in 127.0.64.0/24, so the escape leg has no destination outside the switch's own drops"
+    cat "$WORK/ebr-host.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  if python3 -c "import socket; socket.create_connection(('$ebr_host', $EBR_LISTEN_PORT), 2)" \
+      2>/dev/null; then
+    echo "::error::$ebr_host:$EBR_LISTEN_PORT already answers on this host; the escape leg needs it free for its listener"
+    ebr_fail
+  fi
+  cat > "$WORK/ebr-listener.py" <<'EBR_LISTENER_EOF'
+"""Logs each connection and each chunk it reads, flushed as it happens."""
+import socket
+import sys
+
+host, port, log = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+
+def note(line):
+    with open(log, "a") as handle:
+        handle.write(line + "\n")
+
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((host, port))
+listener.listen(16)
+note(f"listening on {host}:{port}")
+while True:
+    conn, peer = listener.accept()
+    note(f"accepted from {peer[0]}")
+    conn.settimeout(5)
+    try:
+        chunk = conn.recv(256)
+        if chunk:
+            note("marker " + chunk.decode("utf-8", "replace"))
+    except OSError:
+        pass
+    conn.close()
+EBR_LISTENER_EOF
+  : > "$ebr_listener_log"
+  python3 "$WORK/ebr-listener.py" "$ebr_host" "$EBR_LISTEN_PORT" "$ebr_listener_log" \
+    >"$WORK/ebr-listener.out" 2>"$WORK/ebr-listener.err" &
+  EBR_LISTENER_PID=$!
+  ebr_line=""
+  for _ in $(seq 1 40); do
+    ebr_line="$(grep '^listening ' "$ebr_listener_log" 2>/dev/null)" && break
+    sleep 0.25
+  done
+  if [ -z "$ebr_line" ]; then
+    echo "::error::the host listener never came up on $ebr_host:$EBR_LISTEN_PORT"
+    cat "$WORK/ebr-listener.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "host listener: $ebr_line"
+
+  # Snapshot both host-side logs, then respawn the daemon pair under a filter
+  # that keeps the VM host daemon's INFO records (the registration and the
+  # baseline set). The gate's drop lines are WARN and pass either way.
+  ebr_log0="$(ebr_host_log)"
+  ebr_log0_lines=0
+  if [ -n "$ebr_log0" ]; then
+    ebr_log0_lines="$(wc -l <"$ebr_log0" 2>/dev/null)" || ebr_log0_lines=0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  ebr_boot0_lines=0
+  if [ -f "$ebr_boot" ]; then
+    ebr_boot0_lines="$(wc -l <"$ebr_boot" 2>/dev/null)" || ebr_boot0_lines=0
+  fi
+
+  ebr_sid="$(cd "$EBR_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
+    --no-prompt --name e2e-ebr --network own_ip --deny-all-egress \
+    2>"$WORK/ebr-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-all-egress' failed"
+    cat "$WORK/ebr-activate.err" 2>/dev/null || true
+    ebr_fail
+  }
+  ebr_sid="$(printf '%s\n' "$ebr_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$ebr_sid" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::the deny-all box's activate printed no session id: '$ebr_sid'"
+    cat "$WORK/ebr-activate.err" 2>/dev/null || true
+    ebr_fail
+  fi
+
+  EBR_EXPECTED="the VM host daemon's registration record for e2e-ebr ('registered box with the VM host daemon; addresses allocated') and its 'node-plane baseline set at the gate' record naming node_addr"
+  ebr_rec="" ebr_line=""
+  for _ in $(seq 1 40); do
+    [ -n "$ebr_rec" ] || ebr_rec="$(ebr_case_log \
+      | grep -F 'registered box with the VM host daemon; addresses allocated' \
+      | grep -F '"box":"e2e-ebr"' | tail -n1)"
+    [ -n "$ebr_line" ] || ebr_line="$(ebr_case_log \
+      | grep -F 'node-plane baseline set at the gate' | tail -n1)"
+    [ -n "$ebr_rec" ] && [ -n "$ebr_line" ] && break
+    sleep 0.25
+  done
+  ebr_ip="$(printf '%s\n' "$ebr_rec" | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  ebr_node="$(printf '%s\n' "$ebr_line" | sed -n 's/.*"node_addr":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$ebr_ip" ] || [ -z "$ebr_node" ]; then
+    echo "::error::the VM host daemon's log does not name the box's switch address ('$ebr_ip') or the node's address ('$ebr_node')"
+    ebr_fail
+  fi
+  echo "box e2e-ebr: $ebr_sid at switch address $ebr_ip, declared deny-all"
+  echo "the node's own address (the in-VM daemon's, decided by the baseline set): $ebr_node"
+  if ! ebr_policy="$(mnl session policy "$ebr_sid" 2>"$WORK/ebr-policy.err")"; then
+    echo "::error::'min session policy $ebr_sid' failed"
+    cat "$WORK/ebr-policy.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "the box's effective policy (the baseline set beside the rules):"
+  printf '%s\n' "$ebr_policy" | sed 's/^/  /'
+  if ! grep -q 'registry  github.com' <<<"$ebr_policy" \
+    || ! grep -q 'cache  cache.minimal.dev' <<<"$ebr_policy"; then
+    echo "::error::the box's policy does not show the baseline set beside its rules (the registry github.com and the cache cache.minimal.dev)"
+    ebr_fail
+  fi
+  if [ ! -S "$ebr_gate_sock" ]; then
+    echo "::error::the egress gate's socket is not at $ebr_gate_sock — the VM host daemon did not stand the gate up"
+    ebr_fail
+  fi
+
+  # ---- the RPC leg: a vsock connect from inside the box (NET-139) ---------
+  for ebr_cid in 1 3; do
+    EBR_EXPECTED="the box's socket(AF_VSOCK) refused with 'Address family not supported', or the guest daemon's line 'refused an RPC connection from a vsock peer' naming peer_cid in the boot log; never an SSH banner"
+    # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+    ebr_out="$(mnl session exec "$ebr_sid" \
+      "/usr/bin/socat -T 3 -u VSOCK-CONNECT:$ebr_cid:2222 - 2>&1; echo socat-exit=\$?" \
+      2>"$WORK/ebr-vsock-$ebr_cid.err")" || {
+      echo "::error::the vsock attempt toward CID $ebr_cid could not run inside the box"
+      cat "$WORK/ebr-vsock-$ebr_cid.err" 2>/dev/null || true
+      ebr_fail
+    }
+    ebr_out="$(printf '%s\n' "$ebr_out" | tr -d '\r')"
+    echo "attempt: vsock connect from the box to CID $ebr_cid port 2222:"
+    printf '%s\n' "$ebr_out" | sed 's/^/  /'
+    if grep -q 'SSH-' <<<"$ebr_out"; then
+      echo "::error::the box read the RPC listener's SSH banner over vsock CID $ebr_cid — a box reached the guest daemon's RPC listener"
+      ebr_fail
+    fi
+    if grep -qi 'unknown device\|unknown address\|wrong number of parameters' <<<"$ebr_out"; then
+      echo "::error::the box's socat cannot make a vsock attempt, so the RPC leg was never tried"
+      ebr_fail
+    fi
+    if grep -q 'Address family not supported' <<<"$ebr_out"; then
+      ebr_rows="$ebr_rows
+attempt=vsock CID $ebr_cid port 2222 refusal=socket(AF_VSOCK) refused inside the box (EAFNOSUPPORT) record=the box's own error; no connection reached the guest, so the guest daemon logs nothing"
+      continue
+    fi
+    ebr_line=""
+    for _ in $(seq 1 20); do
+      ebr_line="$(ebr_boot_case_log \
+        | grep -F 'refused an RPC connection from a vsock peer' | tail -n1)" && [ -n "$ebr_line" ] && break
+      sleep 0.5
+    done
+    if [ -z "$ebr_line" ]; then
+      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no refusal line from the guest daemon"
+      ebr_fail
+    fi
+    ebr_rows="$ebr_rows
+attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accept record=boot log: $ebr_line"
+  done
+  echo "RPC leg OK: no box reached the guest daemon's RPC listener over vsock"
+
+  # ---- the build leg: a deny-all box's package build (NET-155) -------------
+  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  ebr_out="$(mnl session exec "$ebr_sid" \
+    "timeout 300 min add --session $ebr_pkg 2>&1; echo min-add-exit=\$?" \
+    2>"$WORK/ebr-build.err")" || {
+    echo "::error::the in-box 'min add --session $ebr_pkg' could not run"
+    cat "$WORK/ebr-build.err" 2>/dev/null || true
+    ebr_fail
+  }
+  ebr_out="$(printf '%s\n' "$ebr_out" | tr -d '\r')"
+  echo "attempt: 'min add --session $ebr_pkg' inside the deny-all box (web source https://$ebr_build_dst/):"
+  printf '%s\n' "$ebr_out" | tail -n 20 | sed 's/^/  /'
+  ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
+  if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
+    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    ebr_fail
+  fi
+  if grep -qi "unknown package\|no package named\|not found in" <<<"$ebr_out" \
+    && ! grep -q "$ebr_build_dst" <<<"$ebr_out"; then
+    echo "::error::the build never started: the box did not resolve the project's own package $ebr_pkg"
+    ebr_fail
+  fi
+  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
+    "$ebr_build_dst" "$ebr_prior")" || {
+    echo "::error::the build failed, but the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the leg)"
+    ebr_fail
+  }
+  ebr_rows="$ebr_rows
+attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=gate: $ebr_line"
+  echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
+
+  # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
+  # The build leg's line opened the gate's 60 s window for this source and
+  # rule. Wait it out, so this leg's own line is not silenced.
+  sleep 61
+  EBR_EXPECTED="the spoofer's flow from $ebr_node refused, no marker at the listener, and an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_host"
+  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)"
+  if ! ebr_out="$(python3 "$WORK/ebr-spoofer.py" --gate "$ebr_gate_sock" \
+      --src "$ebr_node" --dst "$ebr_host" --port "$EBR_LISTEN_PORT" \
+      --marker ebr-spoof-node-arrived --deadline 5 --claim no \
+      2>"$WORK/ebr-spoof.err")"; then
+    echo "::error::the spoofer could not speak to the gate at $ebr_gate_sock"
+    cat "$WORK/ebr-spoof.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "attempt: a frame from the node's address $ebr_node toward $ebr_host:$EBR_LISTEN_PORT: $ebr_out"
+  case "$ebr_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::a flow wearing the node's address completed toward $ebr_host, which no baseline entry pins"
+      ebr_fail
+      ;;
+  esac
+  if grep -q -- ebr-spoof-node-arrived "$ebr_listener_log"; then
+    echo "::error::the flow wearing the node's address was refused, but its marker reached the host listener"
+    ebr_fail
+  fi
+  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
+    "$ebr_host" "$ebr_prior")" || {
+    echo "::error::the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_host ($ebr_prior such line(s) before the leg)"
+    ebr_fail
+  }
+  ebr_rows="$ebr_rows
+attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$EBR_LISTEN_PORT refusal=no SYN-ACK, no marker record=gate: $ebr_line"
+  echo "escape leg OK: the node's address reached nothing outside the baseline set"
+
+  echo "each leg's attempt, its refusal and the host-side record:"
+  printf '%s\n' "$ebr_rows" | sed '/^$/d; s/^/  /'
+  echo "--- the listener's record ---"
+  sed 's/^/  /' "$ebr_listener_log"
+
+  mnl session destroy --force "$ebr_sid" >"$WORK/ebr-destroy.out" 2>"$WORK/ebr-destroy.err" \
+    || { echo "::error::destroying the deny-all box failed"; cat "$WORK/ebr-destroy.err" 2>/dev/null || true; ebr_fail; }
+  kill "$EBR_LISTENER_PID" 2>/dev/null || true
+  EBR_LISTENER_PID=""
+  rm -rf "$EBR_SEED_DIR"
+  EBR_SEED_DIR=""
+  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock; the deny-all box's build and a frame wearing the node's address each reached nothing outside the box's rules and the baseline set; each refusal has its record). NET-085 NET-139 NET-155"
+  echo "::endgroup::"
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The github_only_allowlist case, which the dispatch runs after this one,
@@ -27656,6 +28093,9 @@ case "${1:-}" in
     # are INFO, which the lane's default filter drops), and the daemon-fetch
     # proof respawns the pair again for its own needs.
     proof_escape_reaches_only_declared_union
+    # Beside the escape-union proof, for the same reason: it stops the daemon
+    # pair and autospawns a fresh one under its own record filter.
+    proof_escapes_and_builds_stay_inside_box_rules
     # Second-to-last on purpose, for the same reasons the daemon-fetch proof
     # below is last: it installs its own host classifier tree and table (its
     # own, removed before it returns) and respawns the daemon pair under its
@@ -27703,6 +28143,7 @@ case "${1:-}" in
     | proxy_sees_boxes_by_address \
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
+    | escapes_and_builds_stay_inside_box_rules \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
     | bep_second_box_needs_no_sign_in \
@@ -27768,6 +28209,7 @@ case "${1:-}" in
     echo "         proxy_sees_boxes_by_address"
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
+    echo "         escapes_and_builds_stay_inside_box_rules"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
