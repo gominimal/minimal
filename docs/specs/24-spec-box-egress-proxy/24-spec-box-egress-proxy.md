@@ -1089,8 +1089,9 @@ per-request Keychain access control.
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
 - **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
-  enforced by: process separation; keychain access control bound to the proxy's identity
+  enforced by: keychain access control bound to the proxy's code signature, and process separation
   covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072
+  <!-- The proxy, gvproxy and the VM run as the same login user, so process separation keeps them in separate processes but not under separate users. The user split is deferred to gominimal/inbox#1184. Custody on a real macOS keychain is unproven: gominimal/minimal#2436 is open because the login keychain was observed to make keys exportable. -->
 
 - **Invariant:** THE SYSTEM SHALL stop redeeming a revoked or expired value within 60 seconds.
   enforced by: expiry in the sealed context; revocation records consulted per request before any resolution; sign-in and store items resolved per request, so deletion revokes
