@@ -20438,6 +20438,12 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   echo "RPC leg OK: no box reached the guest daemon's RPC listener over vsock"
 
   # ---- the build leg: a deny-all box's package build (NET-155) -------------
+  # The gate writes one line per source address per rule in a 60 s window,
+  # whatever the destination. An earlier drop from the node's address (the
+  # activate, or an earlier case) can hold that window open and silence this
+  # leg's line. Wait it out, as the escape leg does.
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
+  sleep 61
   EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
   ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
