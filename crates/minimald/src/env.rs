@@ -1865,7 +1865,10 @@ impl BoxChannel {
     /// leave from (where it stands in one), the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
-    /// when the graph knows one.
+    /// when the graph knows one. It also says whether the install's web
+    /// sources are fetched in the box's classifier leaf (NET-155). Those are
+    /// the box's traffic and are not recorded. A `gs://` source, and a web
+    /// source of a box with no leaf, leave from the daemon and are recorded.
     fn fetch_record(
         &self,
         graph: &Graph,
@@ -1894,6 +1897,9 @@ impl BoxChannel {
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),
             objects,
+            // NET-155: the install's web sources are fetched in the box's
+            // leaf when it has one, so they are the box's traffic.
+            sources_placed: self.ctx.classifier_leaf().is_some(),
         }
     }
 
