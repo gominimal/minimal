@@ -15494,6 +15494,12 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
   # The second gate restarts the daemon pair, and the proxy inherits this
   # bound from minvmd's environment.
   export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
+  # The lane's filter drops bep's INFO records, and the bound line and the
+  # rotation lines are INFO. Only this restart admits them: minvmd passes
+  # its RUST_LOG to the proxy, and ar_cleanup restores the lane's filter.
+  AR_SAVED_RUST_LOG="${RUST_LOG-}"
+  AR_HAD_RUST_LOG="${RUST_LOG+1}"
+  export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info"
   ar_mark="$({ wc -l <"$ar_log"; } 2>/dev/null | tr -d ' ')"
   ar_mark="${ar_mark:-0}"
   AR_SID=""
@@ -15506,6 +15512,11 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
     # No later case gets a proxy with the small bound: the next live gate
     # restarts the daemon pair without it.
     unset BEP_AUDIT_SEGMENT_BYTES
+    if [ -n "$AR_HAD_RUST_LOG" ]; then
+      export RUST_LOG="$AR_SAVED_RUST_LOG"
+    else
+      unset RUST_LOG
+    fi
     if [ "$BEP_LIVE_DAEMON" = 1 ] || [ -n "${AR_STARTED:-}" ]; then
       mnl stop --force >/dev/null 2>&1 || true
       minvmd stop >/dev/null 2>&1 || true
