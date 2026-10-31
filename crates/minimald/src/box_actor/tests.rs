@@ -14016,6 +14016,233 @@ fn box_package_build_under_box_egress_verdict() {
     assert_eq!(tap.refusal(&placement, "the build was cancelled"), None);
 }
 
+/// NET-155: a package that declares a web source fetches it in its box's
+/// classifier leaf, so the box's egress verdict decides the fetch. The build
+/// of a deny-all box fails, and its error names the source host and the box,
+/// on the build side operation and on the in-box patched build. A box whose
+/// leaf allows the host builds the package. The fetcher stands in for the
+/// kernel's verdict: a leaf in the deny subtree is refused the connection,
+/// in the words the placed download reports.
+#[tokio::test]
+async fn box_build_web_source_under_box_verdict() {
+    use crate::box_ops::{BuildPlacement, BuildTap};
+    use crate::env::{LineTap, build_denies_all, patched_build_refusal};
+    use op::Runnable;
+    use sandbox::config::{ClassifierLeaf, Verdict};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct VerdictFetcher(std::path::PathBuf, Mutex<Vec<Option<ClassifierLeaf>>>);
+
+    impl op::SourceFetcher for VerdictFetcher {
+        async fn download_web(
+            &self,
+            url: &str,
+            _sha256: &str,
+            leaf: Option<&ClassifierLeaf>,
+            _op: &ot::OpTracker,
+        ) -> anyhow::Result<(std::path::PathBuf, bool)> {
+            self.1.lock().unwrap().push(leaf.cloned());
+            assert!(url.starts_with("https://downloads.example.org/"), "{url}");
+            match leaf {
+                Some(leaf) if leaf.is_deny() => anyhow::bail!(
+                    "could not connect to downloads.example.org:443: \
+                     Connection refused (os error 111)"
+                ),
+                Some(_) => Ok((self.0.clone(), true)),
+                None => anyhow::bail!("the fetch ran outside the box's leaf"),
+            }
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &ot::OpTracker,
+        ) -> anyhow::Result<std::path::PathBuf> {
+            unreachable!("the package declares a web source only")
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("fetcher-1.0.tar.zst");
+    {
+        let enc = zstd::Encoder::new(std::fs::File::create(&archive).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(enc);
+        let body = b"fetched";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("README").unwrap();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, &body[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let graph = graph::Graph::new()
+        .ingest(
+            decode::Layer::new_for_test(
+                r#"
+                let {BuildSpec, Source, OutputLib, ..} = import "minimal.ncl" in
+                {
+                    name = "fetcher",
+                    prebuilt = true,
+                    build_deps = [
+                        {
+                            url = "https://downloads.example.org/fetcher-1.0.tar.zst",
+                            sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+                            extract = true,
+                        } | Source,
+                    ],
+                    runtime_deps = [],
+                    outputs = { docs = { glob = "*" } | OutputLib },
+                } | BuildSpec
+                "#
+                .to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let bsr = *graph.by_name("fetcher").unwrap();
+    std::fs::create_dir(tmp.path().join("cache")).unwrap();
+    let opts = op::Options {
+        cache: lcache::Cache::at_dir(tmp.path().join("cache")).unwrap(),
+        graph: &graph,
+        exec_base: tmp.path().to_path_buf(),
+        ot: None,
+        daemon_id: None,
+    };
+    let fetcher = VerdictFetcher(archive, Mutex::default());
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let sealed = ClassifierLeaf::under(root, "sealed", Verdict::Deny);
+    let open = ClassifierLeaf::under(root, "open", Verdict::Allow);
+
+    let build = |leaf: ClassifierLeaf| {
+        let lines = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let spec_build = op::SpecBuild {
+            spec: &bsr,
+            override_deps: None,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: Some(Box::new(LineTap::new(tokio::io::sink(), lines.clone()))),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            cpu_weight: None,
+            classifier_leaf: Some(leaf),
+            box_network: None,
+        };
+        (spec_build, lines)
+    };
+    let expected = "the build of fetcher could not reach downloads.example.org: \
+                    the egress rules of box sealed do not allow it";
+
+    // The deny-all box: its build fails, naming the host and the box.
+    let (mut spec_build, lines) = build(sealed.clone());
+    let refused = match spec_build.run(&opts).await {
+        Ok(_) => panic!("a deny-all box's fetch of its web source is refused"),
+        Err(e) => e,
+    };
+    drop(spec_build);
+    let lines: Vec<String> = lines.lock().unwrap().iter().cloned().collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // The in-box patched build reads its own error and the build's output.
+    assert_eq!(
+        patched_build_refusal(
+            build_denies_all(Some(&sealed), None),
+            "fetcher",
+            "sealed",
+            &refused.to_string(),
+            lines.iter().copied(),
+        )
+        .as_deref(),
+        Some(expected),
+        "{lines:?}"
+    );
+    // The build side operation reads the build's events.
+    let placement = |name: &str, leaf: &ClassifierLeaf| BuildPlacement {
+        box_name: name.to_string(),
+        leaf: Some(leaf.clone()),
+        network: None,
+    };
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "fetcher".to_string(),
+        refused,
+    ))
+    .to_string();
+    let mut tap = BuildTap::default();
+    for event in build_events("fetcher", &lines) {
+        tap.observe(&event, &placement("sealed", &sealed));
+    }
+    assert_eq!(
+        tap.refusal(&placement("sealed", &sealed), &failed)
+            .as_deref(),
+        Some(expected)
+    );
+
+    // The box its rules allow the host: the package builds from the source.
+    let (mut spec_build, lines) = build(open.clone());
+    let built = spec_build
+        .run(&opts)
+        .await
+        .expect("a box allowed the host builds the package");
+    assert_eq!(
+        std::fs::read_to_string(built.outputs.path().join("README")).unwrap(),
+        "fetched"
+    );
+    drop(spec_build);
+    assert!(lines.lock().unwrap().is_empty(), "no fetch failed");
+
+    assert_eq!(
+        *fetcher.1.lock().unwrap(),
+        vec![Some(sealed), Some(open)],
+        "each fetch ran in its box's leaf"
+    );
+
+    // A fetch that failed for another reason names no refused destination.
+    assert_eq!(
+        crate::env::refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: the sha256 of the download does not match",
+        ]),
+        None
+    );
+}
+
+/// NET-155: a web source that redirects to another host fails on that
+/// host, and the refusal names the host the download could not connect to.
+/// When the failure names no host, the source's own host stands in.
+#[test]
+fn box_build_web_source_under_box_verdict_names_the_host_it_could_not_reach() {
+    use crate::env::refused_destination;
+
+    // The source redirects to a CDN host the box does not allow.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to CDN.example.net:443: the egress rules refused it",
+        ])
+        .as_deref(),
+        Some("cdn.example.net")
+    );
+    // A literal IPv6 address keeps its colons and loses its port.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to 2001:db8::1:443: refused",
+        ])
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+    // The failure names no host: the source's host stands in.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to ",
+        ])
+        .as_deref(),
+        Some("downloads.example.org")
+    );
+}
+
 /// NET-155: a materialize reports the error of a package build it started
 /// the way the build side operation does. A build in a deny leaf whose
 /// output names a refused destination fails with the refusal, which names
