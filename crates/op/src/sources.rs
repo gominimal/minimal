@@ -136,7 +136,7 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                                     .unwrap_or_default(),
                                 host = url.host_str().unwrap_or_default(),
                                 leaf = %leaf.dir().display(),
-                                "fetching a web source for a box in the box's classifier leaf",
+                                "a web source for a box comes from the download cache, or from a fetch in the box's classifier leaf",
                             );
                         }
                         let cached_path = self
