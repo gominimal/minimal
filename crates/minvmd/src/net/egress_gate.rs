@@ -1104,6 +1104,14 @@ impl EgressGate {
         // not of the connection that carried it — the publish and the
         // teardown that retracts it arrive on different connections.
         let forwards = Arc::new(PublishedForwards::new());
+        // The node's mirrored binds go through this ledger too (NET-138), so
+        // the gate tracks their connections and admits the node's replies.
+        table.attach_mirror_ledger(MirrorLedger {
+            forwards: Arc::downgrade(&forwards),
+            replies: replies.clone(),
+            switch_sock: switch_sock.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        });
         // Subscribed before the accept loop starts, so no row withdrawn
         // while the gate serves escapes the revoker. The revoker and the
         // accept loop live as long as the VM, each in a span of its own that
@@ -3625,6 +3633,157 @@ async fn terminate_flows(
             %error,
             "terminating the connections the box's forwarders carried failed"
         ),
+    }
+}
+
+/// The gate's publish ledger as the node's mirror reaches it (NET-138). A
+/// mirrored bind is a forward like a box's publish: its listener is the
+/// node's reserved-range address on the host, and it dials the node's own
+/// switch address at the same port. Noted in the ledger, the gate tracks
+/// the connections it carries and admits the node's replies on them. Its
+/// unbind takes that port's connections and resets them at the switch.
+///
+/// The gate attaches one to its table when it starts
+/// ([`BoxTable::attach_mirror_ledger`]). It holds the ledger weakly, so a
+/// gate that stopped is a ledger the mirror can no longer note in.
+#[derive(Clone)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) struct MirrorLedger {
+    forwards: std::sync::Weak<PublishedForwards>,
+    replies: ReplyTables,
+    switch_sock: PathBuf,
+    runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for MirrorLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirrorLedger")
+            .field("gate_running", &(self.forwards.strong_count() > 0))
+            .field("switch_sock", &self.switch_sock)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`MirrorLedger::note_bind`] noted nothing.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MirrorLedgerRefused {
+    /// The gate stopped, so nothing tracks the forward's connections.
+    #[error("the egress gate is not running")]
+    GateStopped,
+    /// Another address holds the listener in the ledger.
+    #[error("the listener {0} is held for another address")]
+    HeldElsewhere(String),
+    /// The ledger is at its bound.
+    #[error("{0}")]
+    Full(String),
+}
+
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+impl MirrorLedger {
+    /// Notes the mirrored bind of `port` at `listener`, dialling `node` at
+    /// the same port, before the switch is asked for it. Returns whether
+    /// the note is new: `false` when the ledger already held it.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorLedgerRefused`] when the gate stopped, another address
+    /// holds the listener, or the ledger is full.
+    pub(crate) fn note_bind(
+        &self,
+        listener: Ipv4Addr,
+        port: u16,
+        node: Ipv4Addr,
+    ) -> Result<bool, MirrorLedgerRefused> {
+        let forwards = self
+            .forwards
+            .upgrade()
+            .ok_or(MirrorLedgerRefused::GateStopped)?;
+        let key = (listener.octets(), port);
+        let mut applied = forwards.lock();
+        if let Some((_, at, _, _, _)) = applied.iter().find(|(held, _, _, _, _)| *held == key) {
+            return if *at == node.octets() {
+                Ok(false)
+            } else {
+                Err(MirrorLedgerRefused::HeldElsewhere(
+                    forward_revoke::listener_local(key.0, key.1),
+                ))
+            };
+        }
+        PublishedForwards::push_applied(
+            &mut applied,
+            key,
+            node.octets(),
+            port,
+            egress::IPPROTO_TCP,
+            Applied::Row,
+        )
+        .map(|()| true)
+        .map_err(|full| MirrorLedgerRefused::Full(full.to_string()))
+    }
+
+    /// Drops the note of the mirrored bind of `port` at `listener` when it
+    /// still dials `node`, with the reply-flow records it opened.
+    pub(crate) fn forget_bind(&self, listener: Ipv4Addr, port: u16, node: Ipv4Addr) {
+        let Some(forwards) = self.forwards.upgrade() else {
+            return;
+        };
+        let key = (listener.octets(), port);
+        if forwards.address_of(key) == Some(node.octets())
+            && let Some((addr, inside, proto)) = forwards.note_retracted(key)
+            && !forwards.still_published(addr, inside, proto)
+        {
+            self.replies.end_port_at(addr, proto, inside);
+        }
+    }
+
+    /// Takes the connections the gate tracks at `node` and `port` and
+    /// resets them at the switch, in a task of the gate's runtime. Returns
+    /// how many it took. The resets' outcome is logged by that task.
+    pub(crate) fn reset_port(&self, node: Ipv4Addr, port: u16) -> usize {
+        let Some(forwards) = self.forwards.upgrade() else {
+            return 0;
+        };
+        let flows = forwards.flows.take_at_port(node.octets(), port);
+        let taken = flows.len();
+        if taken > 0 {
+            let switch_sock = self.switch_sock.clone();
+            self.runtime.spawn(async move {
+                terminate_flows(&switch_sock, node, &flows).await;
+            });
+        }
+        taken
+    }
+}
+
+/// A ledger attached to `table` for a test, with nothing else of a gate
+/// running: the strong end of the [`MirrorLedger`] it leaves there. Must be
+/// made within a tokio runtime, as the gate is.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestMirrorLedger {
+    forwards: Arc<PublishedForwards>,
+}
+
+#[cfg(test)]
+impl TestMirrorLedger {
+    pub(crate) fn attach(table: &BoxTable, switch_sock: PathBuf) -> Self {
+        let forwards = Arc::new(PublishedForwards::new());
+        table.attach_mirror_ledger(MirrorLedger {
+            forwards: Arc::downgrade(&forwards),
+            replies: ReplyTables::new(),
+            switch_sock,
+            runtime: tokio::runtime::Handle::current(),
+        });
+        Self { forwards }
+    }
+
+    /// The address the ledger's forward at `listener` and `port` dials,
+    /// when one is noted.
+    pub(crate) fn dials(&self, listener: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
+        self.forwards
+            .address_of((listener.octets(), port))
+            .map(Ipv4Addr::from)
     }
 }
 
@@ -19380,5 +19539,87 @@ mod tests {
                 "the guard's drop cancelled the task"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    use super::forward_revoke::TcpSegment;
+    use super::{PublishedForwards, egress};
+
+    const NODE: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+    const LISTENER: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 40);
+
+    /// A segment the switch's stack sends toward the node at `port`.
+    fn toward_node(port: u16, peer_port: u16) -> TcpSegment {
+        TcpSegment {
+            dst_mac: [2, 0, 0, 0, 0, 2],
+            src_mac: [2, 0, 0, 0, 0, 1],
+            src: [192, 168, 127, 254],
+            dst: NODE.octets(),
+            src_port: peer_port,
+            dst_port: port,
+            seq: 1000,
+            ack: 2000,
+            flags: egress::TCP_ACK,
+            advance: 0,
+        }
+    }
+
+    // NET-138: a mirrored bind is noted in the gate's ledger at the node's
+    // switch address, so the gate tracks its connections. Its unbind takes
+    // and resets the connections at that port, and no other port's.
+    #[tokio::test]
+    async fn mirror_unbind_resets_tracked_flows() {
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let ledger = super::MirrorLedger {
+            forwards: std::sync::Arc::downgrade(&forwards),
+            replies: super::ReplyTables::new(),
+            switch_sock: dir.path().join("no-switch.sock"),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        assert_eq!(ledger.note_bind(LISTENER, 8080, NODE), Ok(true));
+        assert_eq!(ledger.note_bind(LISTENER, 8080, NODE), Ok(false));
+        assert_eq!(ledger.note_bind(LISTENER, 9090, NODE), Ok(true));
+        assert!(
+            forwards.inside_published(NODE.octets(), 8080),
+            "the gate admits the node's replies on a mirrored port"
+        );
+        assert!(
+            ledger
+                .note_bind(LISTENER, 8080, Ipv4Addr::new(192, 168, 127, 9))
+                .is_err(),
+            "a listener noted for the node is not another address's"
+        );
+
+        let now = Instant::now();
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(8080, 50_001), now);
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(8080, 50_002), now);
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(9090, 50_003), now);
+
+        ledger.forget_bind(LISTENER, 8080, NODE);
+        assert!(!forwards.inside_published(NODE.octets(), 8080));
+        assert_eq!(
+            ledger.reset_port(NODE, 8080),
+            2,
+            "the unbind resets both connections at its port"
+        );
+        assert_eq!(ledger.reset_port(NODE, 8080), 0, "none is left at the port");
+        assert!(forwards.inside_published(NODE.octets(), 9090));
+        assert_eq!(
+            forwards.flows.take_at(NODE.octets()).len(),
+            1,
+            "the other port's connection is left"
+        );
     }
 }

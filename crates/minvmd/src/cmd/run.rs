@@ -433,9 +433,12 @@ const SWITCH_NOT_BOUND: &str = "proxy not found";
 /// node's reserved-range address on the host and forward to the same port at
 /// the guest node's own address, and to undo it.
 ///
-/// The switch's unexpose closes the listener. The connections it already
-/// accepted end when the node's row is withdrawn, where the egress gate
-/// resets every connection it tracked at the node's address.
+/// Each bind goes through the egress gate's publish ledger at the node's
+/// switch address ([`crate::net::egress_gate::MirrorLedger`]), noted before
+/// the expose. So the gate tracks the connections the forward carries and
+/// admits the node's replies on them. An unbind closes the listener first,
+/// then drops the note and resets the connections the gate tracked at that
+/// port, and no other port's.
 #[derive(Debug)]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 struct SwitchMirrorBinder {
@@ -443,6 +446,8 @@ struct SwitchMirrorBinder {
     switch_sock: std::path::PathBuf,
     /// The guest node's own switch address: where each forward dials.
     node: std::net::Ipv4Addr,
+    /// The table the running egress gate leaves its ledger on.
+    table: crate::box_registry::BoxTable,
 }
 
 impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
@@ -452,11 +457,18 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
         port: u16,
     ) -> Result<(), crate::box_registry::MirrorBindError> {
         use crate::box_registry::MirrorBindError;
+        let ledger = self
+            .table
+            .mirror_ledger()
+            .ok_or_else(|| MirrorBindError::Failed("the egress gate is not running".to_string()))?;
+        let noted = ledger
+            .note_bind(address, port, self.node)
+            .map_err(|refused| MirrorBindError::Failed(refused.to_string()))?;
         let body = format!(
             r#"{{"local":"{address}:{port}","remote":"{}:{port}","protocol":"tcp"}}"#,
             self.node
         );
-        match post_switch_forwarder(&self.switch_sock, "expose", &body) {
+        let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
             Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
             Ok((_, answer)) if answer.contains("address already in use") => {
@@ -466,31 +478,47 @@ impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
                 "the switch answered the expose with HTTP {status}: {:?}",
                 answer.trim()
             ))),
-            Err(error) => Err(MirrorBindError::Failed(format!(
+            Err(error) => Err(MirrorBindError::Unanswered(format!(
                 "the expose went unanswered: {error}"
             ))),
+        };
+        // A note this bind made goes when the switch bound nothing. An
+        // unanswered expose may have bound, so its note stays for the
+        // mirror's retry or undo.
+        if noted
+            && matches!(
+                result,
+                Err(MirrorBindError::Occupied | MirrorBindError::Failed(_))
+            )
+        {
+            ledger.forget_bind(address, port, self.node);
         }
+        result
     }
 
-    fn unbind(&self, address: std::net::Ipv4Addr, port: u16) {
+    fn unbind(&self, address: std::net::Ipv4Addr, port: u16) -> crate::box_registry::MirrorUnbind {
+        use crate::box_registry::MirrorUnbind;
         let body = format!(r#"{{"local":"{address}:{port}","protocol":"tcp"}}"#);
         match post_switch_forwarder(&self.switch_sock, "unexpose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => {}
             Ok((500, answer)) if answer.trim() == SWITCH_NOT_BOUND => {}
-            Ok((status, answer)) => tracing::warn!(
-                %address,
-                port,
-                status,
-                answer = %answer.trim(),
-                "the switch refused to undo a mirrored bind at the node's address"
-            ),
-            Err(error) => tracing::warn!(
-                %address,
-                port,
-                %error,
-                "the switch did not answer the undo of a mirrored bind at the node's address"
-            ),
+            Ok((status, answer)) => {
+                return MirrorUnbind::Refused(format!(
+                    "the switch answered the unexpose with HTTP {status}: {:?}",
+                    answer.trim()
+                ));
+            }
+            Err(error) => {
+                return MirrorUnbind::Unanswered(format!("the unexpose went unanswered: {error}"));
+            }
         }
+        // The listener is closed, so no new connection arrives after the
+        // ones taken here.
+        let connections_reset = self.table.mirror_ledger().map_or(0, |ledger| {
+            ledger.forget_bind(address, port, self.node);
+            ledger.reset_port(self.node, port)
+        });
+        MirrorUnbind::Undone { connections_reset }
     }
 }
 
@@ -1185,6 +1213,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                         SwitchMirrorBinder {
                             switch_sock: mirror_switch_sock,
                             node: subnet.daemon_ip(),
+                            table: boxes.table(),
                         },
                     )));
                     tracing::info!(
@@ -5334,12 +5363,28 @@ mod tests {
                 (200, ""),
             ],
         );
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
         let binder = super::SwitchMirrorBinder {
-            switch_sock: sock,
-            node: std::net::Ipv4Addr::new(192, 168, 127, 2),
+            switch_sock: sock.clone(),
+            node,
+            table: registry.table(),
         };
         let address = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        assert!(
+            binder.bind(address, 8080).is_err(),
+            "no bind is made while no egress gate tracks its connections"
+        );
+        let ledger =
+            crate::net::egress_gate::TestMirrorLedger::attach(&registry.table(), sock.clone());
         assert_eq!(binder.bind(address, 8080), Ok(()));
+        assert_eq!(
+            ledger.dials(address, 8080),
+            Some(node),
+            "the bind is noted in the gate's ledger at the node's switch address"
+        );
         let expose = requests.recv().expect("the expose");
         assert!(expose.starts_with("POST /services/forwarder/expose HTTP/1.1\r\n"));
         assert!(expose.ends_with(
@@ -5353,10 +5398,20 @@ mod tests {
             "a forward the switch already holds is the goal state"
         );
         requests.recv().expect("the third expose");
-        binder.unbind(address, 8080);
+        assert_eq!(
+            binder.unbind(address, 8080),
+            crate::box_registry::MirrorUnbind::Undone {
+                connections_reset: 0
+            }
+        );
         let unexpose = requests.recv().expect("the unexpose");
         assert!(unexpose.starts_with("POST /services/forwarder/unexpose HTTP/1.1\r\n"));
         assert!(unexpose.ends_with(r#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#));
+        assert_eq!(
+            ledger.dials(address, 8080),
+            None,
+            "the unbind drops the note"
+        );
     }
 
     // NET-138: the upkeep opens the node's mirror only while the whole-range
