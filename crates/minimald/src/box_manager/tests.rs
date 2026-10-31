@@ -3844,10 +3844,13 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
 
     let logged = log.contents();
     for (id, name) in [(old, "old"), (new, "web")] {
+        // Match the `new_name` field itself: a bare `old` also matches the
+        // `old_name` key on every rename line.
+        let new_name_field = format!("new_name={name:?}");
         assert!(
             logged.lines().any(|line| line.contains("renamed a box")
                 && line.contains(&id.to_string())
-                && line.contains(name)),
+                && line.contains(&new_name_field)),
             "the daemon log names box {id} and its new name `{name}`:\n{logged}"
         );
     }
