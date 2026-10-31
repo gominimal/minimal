@@ -243,6 +243,14 @@
 #                                    own state, one `min ls` listing both,
 #                                    box names resolving to their VM, both
 #                                    routing at once, stop one leaves the other
+#   names_survive_restart_and_second_vm
+#                                    T121 on a Linux KVM host: the names
+#                                    step's boot unit re-creates the resolver
+#                                    link a restart removed, a second named
+#                                    VM's daemon joins the DNS service with
+#                                    no contention, both boxes' names
+#                                    resolve, and a withdrawn port closes a
+#                                    connection already through it
 #   macos_box_opens_by_name_and_proxy
 #                                    NET-010/069/123/144 on macOS: a declared
 #                                    and a runtime port open at the box's
@@ -354,6 +362,7 @@ E2E_VM="${E2E_VM:-}"
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | names_survive_restart_and_second_vm \
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
     | answerer_survives_session_stop)
@@ -452,6 +461,12 @@ PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardow
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
+NRV_VM_NAME="" # the second VM the names-survive-restart proof boots; stopped on teardown
+NRV_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
+NRV_SEED_B_DIR="" # its second-VM box seed; removed on teardown
+NRV_REVERT_LINK="" # the resolver link its names step created; reverted on teardown
+NRV_UNIT_INSTALLED="" # set once its names step may have installed the boot unit; removed on teardown
+NRV_CONN_PID="" # its host client holding a connection open; killed on teardown
 TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
 TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
 TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
@@ -941,6 +956,17 @@ teardown() {
   if [ -n "$TWO_VM_NAME" ]; then
     minvmd --vm "$TWO_VM_NAME" stop >/dev/null 2>&1 || true
   fi
+  # The names-survive-restart proof's second VM, client, seeds, boot unit
+  # and link, by the same net.
+  if [ -n "$NRV_VM_NAME" ]; then
+    minvmd --vm "$NRV_VM_NAME" stop >/dev/null 2>&1 || true
+  fi
+  if [ -n "$NRV_CONN_PID" ]; then
+    kill "$NRV_CONN_PID" 2>/dev/null || true
+  fi
+  [ -n "$NRV_SEED_A_DIR" ] && rm -rf "$NRV_SEED_A_DIR"
+  [ -n "$NRV_SEED_B_DIR" ] && rm -rf "$NRV_SEED_B_DIR"
+  nrv_teardown_names
   # The daemon-fetch proof's classifier tree+table, if a mid-proof death left
   # them: the daemon stop above comes first because the uninstall refuses while
   # a live leaf or process holds the tree (its own guard) — and the daemon sits
@@ -27315,6 +27341,393 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# Box names survive a restart and a second VM, and a withdrawn port closes
+# the connections already through it — end to end on a Linux KVM host (T121,
+# over T119's boot unit and second-VM registration and T120's patched
+# switch). One box on the default VM, one on a second named VM, and every
+# lookup printed with the address it answered:
+#
+#   1. The names step (`min finalize-install --show --script`, run whole under
+#      one `sudo -n sh`) points systemd-resolved at the VM host daemon's DNS
+#      service through the minzone0 link and enables minzone0-link.service,
+#      the unit a boot starts. Box A's name resolves through the host's own
+#      resolver (getent, no proxy settings).
+#   2. A restart, simulated: the link is deleted — what a reboot leaves, since
+#      a dummy link does not persist — and A's name stops resolving. Then the
+#      enabled unit is started the way a boot starts it, its journal line is
+#      read, and A's name resolves again to the same address.
+#   3. A second named VM boots beside the default one and mints box B. Both
+#      VM host daemons' DNS service records are read: none may say the VM's
+#      box names are not answered on the host, and the second daemon must
+#      write its own record (it holds the port or registers into the holder).
+#      A and B each resolve through the host resolver, at different addresses.
+#   4. A port A's listener published is withdrawn while a host connection
+#      through it is open: the listener's parent is SIGKILLed, so the
+#      in-box connection's own socat child keeps the box side open, and the
+#      host connection must still end within 20 s — closed by the switch.
+#
+# Gates, by observed fact: Linux (the boot unit is systemd's), a minvmd lane
+# with guest images, a switch and a writable /dev/kvm; and the resolver half's
+# tools with passwordless sudo, which a CI lane must have.
+#
+# Diagnostics, when it fails: the boot unit's journal, both VM host daemons'
+# zone-answerer lines, the link's resolvectl state, then `fail`'s bundle.
+proof_names_survive_restart_and_second_vm() {
+  local nc="names_survive_restart_and_second_vm"
+  local unit="minzone0-link.service"
+  local a_name="e2e-nrv-a" b_name="e2e-nrv-b" vm="beta"
+  local port=18132 lo=18130 hi=18135
+  local a_sid="" b_sid="" a_addr="" a_addr_after="" b_addr="" setup="" cmd=""
+  local before_records="" after_records="" tool
+
+  if [ "$(uname -s)" != Linux ]; then
+    not_run "$nc" "the box-name boot unit is a Linux systemd unit; macOS reserves its names another way"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ]; then
+    not_run "$nc" "this run drives '$min_daemon': two VM host daemons are a minvmd-backed story"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    not_run "$nc" "guest images not available"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
+    not_run "$nc" "no MINVMD_GVPROXY_BIN: no switch, so no box could mint or publish a port"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    not_run "$nc" "no writable /dev/kvm: this host cannot boot a VM"
+    return 0
+  fi
+  for tool in resolvectl systemctl journalctl ip getent python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      if [ -n "${CI:-}" ]; then
+        echo "::error::$nc: a CI KVM lane must have $tool to run the names step and read its boot unit"
+        fail
+      fi
+      not_run "$nc" "this host has no $tool"
+      return 0
+    fi
+  done
+  if ! sudo -n true >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::$nc: a CI KVM lane must have passwordless sudo to run the names step"
+      fail
+    fi
+    not_run "$nc" "no passwordless sudo: the names step runs as root"
+    return 0
+  fi
+
+  echo "::group::box names survive a restart and a second VM; a withdrawn port closes its connections (T121)"
+
+  # The zone-answerer start records every VM host daemon of this state base
+  # wrote, in the one log directory they share, plus each VM's run.log.
+  nrv_answerer_lines() {
+    local f
+    {
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null
+      find "$XDG_STATE_HOME/minimal/providers/local-minvmd0" -maxdepth 2 -name run.log -type f 2>/dev/null
+    } | sort -u | while IFS= read -r f; do
+      grep -h -- 'zone-answerer' "$f" 2>/dev/null || true
+    done
+  }
+  nrv_start_records() {
+    nrv_answerer_lines | grep -F -e 'holds the host loopback' \
+      -e "registered this table's zone rows with it" | sort -u
+  }
+  nrv_diag() {
+    echo "--- journal: $unit ---"
+    sudo -n journalctl --no-pager -n 20 -u "$unit" 2>&1 || true
+    echo "--- systemctl status $unit ---"
+    sudo -n systemctl --no-pager status "$unit" 2>&1 | head -n 15 || true
+    echo "--- resolvectl status minzone0 ---"; resolvectl status minzone0 2>&1 || true
+    echo "--- both VM host daemons: zone-answerer lines (tail) ---"
+    nrv_answerer_lines | tail -n 20
+  }
+  # One host-resolver lookup with no proxy settings, polled up to $3 tries
+  # (0.5 s apart) for an answer ($2 = want) or for none ($2 = gone). Prints
+  # the lookup and its answer; leaves the address in NRV_ADDR.
+  nrv_lookup() {
+    local label="$1" want="$2" tries="$3" name="$4" i
+    NRV_ADDR=""
+    for i in $(seq 1 "$tries"); do
+      NRV_ADDR="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy getent hosts "$name" 2>/dev/null | awk '{ print $1; exit }')"
+      if [ "$want" = gone ]; then [ -z "$NRV_ADDR" ] && break; else [ -n "$NRV_ADDR" ] && break; fi
+      [ "$i" -lt "$tries" ] && sleep 0.5
+    done
+    echo "lookup ($label): getent hosts $name -> ${NRV_ADDR:-<no answer>}"
+  }
+
+  NRV_SEED_A_DIR="$(hook_mktemp /tmp/mnlnra.XXXXXX)"
+  hook_seed_preamble > "$NRV_SEED_A_DIR/minimal.toml"
+  mkdir "$NRV_SEED_A_DIR/.git"
+  NRV_SEED_B_DIR="$(hook_mktemp /tmp/mnlnrb.XXXXXX)"
+  hook_seed_preamble > "$NRV_SEED_B_DIR/minimal.toml"
+  mkdir "$NRV_SEED_B_DIR/.git"
+
+  # The default VM comes up under `minvmd=info`, so its DNS service writes
+  # the start record this case reads (the harness quiets the run to warn).
+  mnl stop --force >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  a_sid="$(cd "$NRV_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt \
+    --name "$a_name" --network own_ip --dynamic-ingress allow --dynamic-range "$lo-$hi" \
+    ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/nrv-a-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow' failed for box $a_name on the default VM"
+    cat "$WORK/nrv-a-activate.err" 2>/dev/null || true
+    fail
+  }
+  a_sid="$(printf '%s\n' "$a_sid" | tail -n1 | tr -d '\r')"
+  echo "box A: $a_sid ($a_name) on the default VM"
+
+  # ---- 1. the names step, with its boot unit -------------------------------
+  setup="$WORK/nrv-finalize-install.out"
+  mnl finalize-install --show --script >"$setup" 2>"$setup.note" || true
+  cmd="$(setup_script_from "$setup")"
+  if [ -z "$cmd" ]; then
+    echo "::error::'min finalize-install --show --script' printed no setup script, so this case cannot install the box-name step"
+    cat "$setup" "$setup.note" 2>/dev/null || true
+    fail
+  fi
+  case "$cmd" in
+    *"systemctl enable $unit"*) ;;
+    *)
+      echo "::error::the setup script does not enable $unit, so box names would stop resolving after a restart"
+      printf '%s\n' "$cmd"
+      fail
+      ;;
+  esac
+  # Recorded before the run, so the teardown undoes a half-applied script.
+  NRV_REVERT_LINK=minzone0
+  NRV_UNIT_INSTALLED=1
+  case "$cmd" in
+    *minzoned*) ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$cmd")" ;;
+  esac
+  setup_classifier_note "$setup"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$setup" >"$WORK/nrv-setup.out" 2>"$WORK/nrv-setup.err"; then
+    echo "::error::the setup script 'min finalize-install' runs did not run"
+    cat "$WORK/nrv-setup.out" "$WORK/nrv-setup.err" 2>/dev/null || true
+    setup_units_journal
+    nrv_diag
+    fail
+  fi
+  echo "ran the setup script; $unit is $(systemctl is-enabled "$unit" 2>/dev/null || echo '<unknown>') for boot"
+  if [ "$(systemctl is-enabled "$unit" 2>/dev/null)" != enabled ]; then
+    echo "::error::$unit is not enabled after the setup script, so a boot would not start it"
+    nrv_diag
+    fail
+  fi
+
+  nrv_lookup "before the restart" found 40 "$a_name.min.internal"
+  a_addr="$NRV_ADDR"
+  if [ -z "$a_addr" ]; then
+    echo "::error::$a_name.min.internal did not resolve through the host resolver after the names step"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 2. the restart, simulated -------------------------------------------
+  # A reboot leaves no dummy link behind. Delete it, and the name must stop
+  # resolving: otherwise the restart below proves nothing.
+  if ! sudo -n ip link del minzone0 >/dev/null 2>"$WORK/nrv-linkdel.err"; then
+    echo "::error::could not delete the minzone0 link to simulate a restart"
+    cat "$WORK/nrv-linkdel.err" 2>/dev/null || true
+    fail
+  fi
+  sudo -n resolvectl flush-caches >/dev/null 2>&1 || true
+  echo "simulated restart: deleted the minzone0 link"
+  nrv_lookup "link removed, as after a reboot" gone 40 "$a_name.min.internal"
+  if [ -n "$NRV_ADDR" ]; then
+    echo "::error::$a_name.min.internal still resolves with the minzone0 link deleted, so this host routes the zone some other way and the restart cannot be simulated"
+    nrv_diag
+    fail
+  fi
+  # A boot starts the enabled oneshot. It is RemainAfterExit, so `restart`
+  # runs it whether or not the setup script left it active.
+  if ! sudo -n systemctl restart "$unit" >/dev/null 2>"$WORK/nrv-unit.err"; then
+    echo "::error::$unit failed to start, as a boot would start it"
+    cat "$WORK/nrv-unit.err" 2>/dev/null || true
+    nrv_diag
+    fail
+  fi
+  echo "boot unit journal:"
+  sudo -n journalctl --no-pager -n 5 -u "$unit" 2>/dev/null | sed 's/^/  /' || true
+  if ! sudo -n journalctl --no-pager -n 20 -u "$unit" 2>/dev/null | grep -qF -- 're-created minzone0'; then
+    echo "::error::$unit ran but its journal has no 're-created minzone0' line"
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "after the boot unit ran" found 40 "$a_name.min.internal"
+  a_addr_after="$NRV_ADDR"
+  if [ "$a_addr_after" != "$a_addr" ]; then
+    echo "::error::after the boot unit ran, $a_name.min.internal answers '${a_addr_after:-<no answer>}', not its address $a_addr from before the restart"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 3. a second VM beside the first --------------------------------------
+  before_records="$(nrv_start_records)"
+  NRV_VM_NAME="$vm"
+  # shellcheck disable=SC2086
+  b_sid="$(cd "$NRV_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+    min ${E2E_MINIMAL_ARGS:-} --vm "$NRV_VM_NAME" session activate . --no-prompt \
+    --name "$b_name" --network own_ip 2>"$WORK/nrv-b-activate.err")" || {
+    echo "::error::'min --vm $NRV_VM_NAME session activate' failed to boot a second VM and mint box $b_name"
+    cat "$WORK/nrv-b-activate.err" 2>/dev/null || true
+    nrv_diag
+    fail
+  }
+  b_sid="$(printf '%s\n' "$b_sid" | tail -n1 | tr -d '\r')"
+  echo "box B: $b_sid ($b_name) on VM $NRV_VM_NAME"
+  # The second daemon's own record: it holds the port or registers into the
+  # holder. A record saying the names are not answered is contention.
+  for _ in $(seq 1 40); do
+    after_records="$(nrv_start_records)"
+    [ "$(printf '%s\n' "$after_records" | grep -c .)" -gt "$(printf '%s\n' "$before_records" | grep -c .)" ] && break
+    sleep 0.5
+  done
+  echo "both VM host daemons' DNS service records:"
+  printf '%s\n' "$after_records" | sed 's/^/  /'
+  if [ "$(printf '%s\n' "$after_records" | grep -c .)" -le "$(printf '%s\n' "$before_records" | grep -c .)" ]; then
+    echo "::error::the second VM's host daemon wrote no DNS service record within 20 s: it neither holds the port nor registered with the holder"
+    nrv_diag
+    fail
+  fi
+  if nrv_answerer_lines | grep -qF -- "box names are not answered on the host"; then
+    echo "::error::a VM host daemon says its box names are not answered on the host: the two daemons contended for the DNS service"
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "second VM up, box A" found 40 "$a_name.min.internal"
+  if [ "$NRV_ADDR" != "$a_addr" ]; then
+    echo "::error::with the second VM up, $a_name.min.internal answers '${NRV_ADDR:-<no answer>}', not $a_addr"
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "second VM up, box B" found 40 "$b_name.min.internal"
+  b_addr="$NRV_ADDR"
+  if [ -z "$b_addr" ] || [ "$b_addr" = "$a_addr" ]; then
+    echo "::error::$b_name.min.internal on VM $NRV_VM_NAME answers '${b_addr:-<no answer>}' through the host resolver; it must answer an address of its own, not box A's $a_addr"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 4. a withdrawn port closes the connection already through it -------
+  mnl session exec "$a_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$port,reuseaddr,fork EXEC:cat >/dev/null 2>&1 & echo \$! > /home/nrv.pid" \
+    >/dev/null 2>"$WORK/nrv-listen.err" \
+    || { echo "::error::could not start the echo listener on port $port in box $a_name"; cat "$WORK/nrv-listen.err" 2>/dev/null || true; fail; }
+  # The host client: connect, see one echo, then hold the connection and
+  # report how it ended. "open" is written once the echo came back.
+  cat > "$WORK/nrv-client.py" <<'PY'
+import socket, sys, time
+addr, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def say(line):
+    with open(out, "a") as f:
+        f.write(line + "\n")
+try:
+    s = socket.create_connection((addr, port), timeout=3)
+    s.sendall(b"nrv\n")
+    if s.recv(16) != b"nrv\n":
+        say("no echo"); sys.exit(1)
+except OSError as e:
+    say(f"connect failed: {e}"); sys.exit(1)
+say("open")
+start = time.monotonic()
+s.settimeout(60)
+try:
+    data = s.recv(16)
+    say(f"closed after {int((time.monotonic() - start) * 1000)}ms" if not data else f"unexpected data {data!r}")
+except socket.timeout:
+    say("still open after 60s")
+except OSError as e:
+    say(f"closed after {int((time.monotonic() - start) * 1000)}ms ({e.__class__.__name__})")
+PY
+  local conn_out="$WORK/nrv-client.out" opened=""
+  for _ in $(seq 1 40); do
+    : > "$conn_out"
+    python3 -I "$WORK/nrv-client.py" "$a_addr" "$port" "$conn_out" &
+    NRV_CONN_PID=$!
+    for _ in $(seq 1 10); do
+      grep -qx open "$conn_out" 2>/dev/null && { opened=1; break; }
+      kill -0 "$NRV_CONN_PID" 2>/dev/null || break
+      sleep 0.3
+    done
+    [ -n "$opened" ] && break
+    kill "$NRV_CONN_PID" 2>/dev/null || true; wait "$NRV_CONN_PID" 2>/dev/null || true
+    NRV_CONN_PID=""
+    sleep 0.5
+  done
+  if [ -z "$opened" ]; then
+    echo "::error::the host never opened an echoing connection to $a_addr:$port, the port box $a_name's listener published"
+    cat "$conn_out" 2>/dev/null || true
+    mnl session policy "$a_sid" 2>&1 || true
+    fail
+  fi
+  echo "connection: host -> $a_addr:$port open, echo answered"
+  # SIGKILL the listener alone: its forked child keeps the box side of the
+  # connection open, so only the switch can end the host's side.
+  # shellcheck disable=SC2016 # expands in the box's shell
+  mnl session exec "$a_sid" 'kill -9 "$(cat /home/nrv.pid)"' >/dev/null 2>&1 \
+    || { echo "::error::could not stop the listener on port $port in box $a_name"; fail; }
+  echo "withdraw: killed the listener on port $port in box $a_name; its connection child stays"
+  local ended=""
+  for _ in $(seq 1 40); do
+    ended="$(grep -v -x open "$conn_out" 2>/dev/null | head -n1)"
+    [ -n "$ended" ] && break
+    sleep 0.5
+  done
+  echo "connection after the withdrawal: ${ended:-still open after 20s}"
+  case "$ended" in
+    "closed after"*) ;;
+    *)
+      echo "::error::the host connection through port $port stayed open after the port was withdrawn: the withdrawal must close the connections it accepted"
+      echo "--- in box: TCP sockets on port $port ---"
+      mnl session exec "$a_sid" "grep -i ':$(printf '%04X' "$port") ' /proc/net/tcp" 2>&1 || true
+      mnl session policy "$a_sid" 2>&1 || true
+      fail
+      ;;
+  esac
+  kill "$NRV_CONN_PID" 2>/dev/null || true; wait "$NRV_CONN_PID" 2>/dev/null || true
+  NRV_CONN_PID=""
+
+  # ---- leave the host as found ---------------------------------------------
+  mnl session destroy --force "$a_sid" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  min ${E2E_MINIMAL_ARGS:-} --vm "$NRV_VM_NAME" session destroy --force "$b_sid" >/dev/null 2>&1 || true
+  minvmd --vm "$NRV_VM_NAME" stop >/dev/null 2>&1 || true
+  NRV_VM_NAME=""
+  nrv_teardown_names
+  answerer_service_teardown
+  setup_classifier_teardown || true
+  rm -rf "$NRV_SEED_A_DIR" "$NRV_SEED_B_DIR"
+  NRV_SEED_A_DIR="" NRV_SEED_B_DIR=""
+  echo "$nc OK ($a_name answered $a_addr before and after the simulated restart, $b_name on VM $vm answered $b_addr beside it with no contention, and the withdrawn port $port closed the open connection: $ended)"
+  echo "::endgroup::"
+}
+
+# Undoes what the names step of proof_names_survive_restart_and_second_vm
+# installed: the boot unit first, so nothing re-creates the link, then the
+# link. A no-op until the case recorded the install.
+nrv_teardown_names() {
+  if [ -n "$NRV_UNIT_INSTALLED" ]; then
+    sudo -n systemctl disable --now minzone0-link.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/minzone0-link.service >/dev/null 2>&1 || true
+    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzone0-link.service >/dev/null 2>&1 || true
+    NRV_UNIT_INSTALLED=""
+  fi
+  if [ -n "$NRV_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NRV_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NRV_REVERT_LINK" >/dev/null 2>&1 || true
+    NRV_REVERT_LINK=""
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # A box's ports open by name on macOS, end to end (NET-010, NET-069,
 # NET-123, NET-144). One own-address box declares one port at activate and
 # publishes a second port at runtime with `min net expose`. Each port must
@@ -27622,6 +28035,7 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
+    proof_names_survive_restart_and_second_vm
     proof_macos_box_opens_by_name_and_proxy
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
@@ -27694,6 +28108,7 @@ case "${1:-}" in
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | names_survive_restart_and_second_vm \
     | macos_box_opens_by_name_and_proxy \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | unpublished_port_refused_on_vm_host \
@@ -27761,6 +28176,7 @@ case "${1:-}" in
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         two_named_vms_on_one_machine macos_box_opens_by_name_and_proxy"
+    echo "         names_survive_restart_and_second_vm"
     echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
