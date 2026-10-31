@@ -520,6 +520,13 @@ pub enum ReplaceError {
         /// Why the old key did not move back.
         restored: KeyError,
     },
+    /// An earlier replacement stopped after the old key moved aside, and
+    /// the old key did not move back to the role's label. The store holds
+    /// no key under the role's label.
+    #[error(
+        "the old key that an earlier replacement moved aside was not put back: {0}. The store holds no key for this role now."
+    )]
+    Recover(KeyError),
 }
 
 /// Removes the keys that a failed first start generated. The next start
@@ -583,7 +590,8 @@ pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, ReplaceErro
 /// [`ReplaceError::Remove`] when the old key did not move aside, and
 /// [`ReplaceError::Move`] when the new key did not take its place. The old
 /// key is still in use after each of these. [`ReplaceError::Restore`] when
-/// the old key also did not move back.
+/// the old key also did not move back, and [`ReplaceError::Recover`] when
+/// the old key that an earlier replacement moved aside did not move back.
 pub fn replace_outcome<S: KeyStore>(
     store: &S,
     role: Role,
@@ -595,7 +603,10 @@ pub fn replace_outcome<S: KeyStore>(
     if matches!(store.find(role), Ok(None)) {
         store
             .relabel(role, Slot::Old, Slot::Held)
-            .map_err(ReplaceError::Remove)?;
+            .map_err(|err| {
+                tracing::error!(role = %role, error = %err, "did not move back the proxy key that an earlier replacement moved aside");
+                ReplaceError::Recover(err)
+            })?;
     }
     // A replacement that stopped part way can leave keys in the other slots.
     for slot in [Slot::New, Slot::Old] {
@@ -1009,6 +1020,7 @@ pub(crate) mod memory {
         no_move_in: bool,
         lose_new: bool,
         no_old_removal: bool,
+        no_move_back: bool,
         locked_use: bool,
     }
 
@@ -1060,6 +1072,12 @@ pub(crate) mod memory {
         /// removal of an empty [`Slot::Old`] still works.
         pub(crate) fn fail_old_removal(&self) {
             self.0.lock().unwrap().no_old_removal = true;
+        }
+
+        /// Makes every later move of a key from [`Slot::Old`] to a role's
+        /// label fail, while every other move still works.
+        pub(crate) fn fail_move_back(&self) {
+            self.0.lock().unwrap().no_move_back = true;
         }
 
         /// The secret bytes of the key in `slot`, or `None` when the slot
@@ -1231,7 +1249,10 @@ pub(crate) mod memory {
 
         fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
             let mut inner = self.0.lock().unwrap();
-            if inner.broken || (inner.no_move_in && from == Slot::New && to == Slot::Held) {
+            if inner.broken
+                || (inner.no_move_in && from == Slot::New && to == Slot::Held)
+                || (inner.no_move_back && from == Slot::Old && to == Slot::Held)
+            {
                 return Err(broken(role));
             }
             match inner.keys.remove(&(role, from)) {
@@ -1441,6 +1462,23 @@ mod tests {
         assert_eq!(store.held_in(Role::Sealing, Slot::Old), None);
         let keys = load(&store, &Role::ALL).unwrap();
         assert_eq!(keys.get(Role::Sealing).public().kid(), kid);
+    }
+
+    // BEP-060: an old key that an earlier replacement moved aside and that
+    // does not move back is reported as no key in use, not as a kept key.
+    #[test]
+    fn an_interrupted_replacement_not_put_back_is_reported() {
+        let store = MemoryStore::default();
+        load(&store, &[]).unwrap();
+        let old = store.secret_bytes(Role::Sealing);
+        store.relabel(Role::Sealing, Slot::Held, Slot::Old).unwrap();
+        store.fail_move_back();
+
+        let err = replace(&store, Role::Sealing).unwrap_err();
+        assert!(matches!(err, ReplaceError::Recover(_)), "{err}");
+        assert_eq!(store.held_in(Role::Sealing, Slot::Held), None);
+        assert_eq!(store.held_in(Role::Sealing, Slot::Old), Some(old));
+        assert_eq!(store.held_in(Role::Sealing, Slot::New), None);
     }
 
     // BEP-060: an old key that the store does not remove is reported, not

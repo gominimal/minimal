@@ -251,6 +251,10 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         ReplaceError::Restore { moved, restored } => format!(
             "The {role} key was not replaced: {moved}. The old key was not put back: {restored}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
         ),
+        // A run of the command first tries the move back again.
+        ReplaceError::Recover(cause) => format!(
+            "The {role} key was not replaced. An earlier `bep --replace-key {role}` stopped before it finished, and its old key was not put back: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to put the old key back and replace it."
+        ),
     }
 }
 
@@ -356,7 +360,13 @@ where
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");
             println!("Published the new public key to {}.", path.display());
-            ExitCode::SUCCESS
+            // BEP-060: an old key that still exists is not a finished
+            // replacement, so a script does not read it as one.
+            if old_kept.is_some() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(err) => {
             eprintln!("{err}");
@@ -3337,6 +3347,118 @@ mod tests {
             "The sealing key was not replaced, because no new key was made: the key store failed for the sealing key: the keychain is locked. The old key is still in use."
         );
         assert!(!message.contains("again"), "{message}");
+    }
+
+    /// A store that holds the keys of an [`ExportableStore`] under the
+    /// role's label, and the other slots beside them. It does not remove an
+    /// old key that a replacement moved aside.
+    struct KeepsOldStore {
+        inner: ExportableStore,
+        side: Mutex<std::collections::HashMap<(Role, Slot), Arc<rcgen::KeyPair>>>,
+    }
+
+    impl KeepsOldStore {
+        fn take(&self, role: Role, slot: Slot) -> Option<Arc<rcgen::KeyPair>> {
+            if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().remove(&role)
+            } else {
+                self.side.lock().unwrap().remove(&(role, slot))
+            }
+        }
+
+        fn put(&self, role: Role, slot: Slot, pair: Arc<rcgen::KeyPair>) {
+            if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().insert(role, pair);
+            } else {
+                self.side.lock().unwrap().insert((role, slot), pair);
+            }
+        }
+    }
+
+    impl KeyStore for KeepsOldStore {
+        type Key = ExportableKey;
+
+        fn find(&self, role: Role) -> Result<Option<ExportableKey>, KeyError> {
+            self.inner.find(role)
+        }
+
+        fn generate_in(&self, role: Role, slot: Slot) -> Result<ExportableKey, KeyError> {
+            let pair =
+                Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap());
+            let key = self.inner.key(role, Arc::clone(&pair));
+            keys::keep_generated(&key)?;
+            self.put(role, slot, pair);
+            Ok(key)
+        }
+
+        fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+            if slot == Slot::Old && self.side.lock().unwrap().contains_key(&(role, slot)) {
+                return Err(KeyError::Store {
+                    role,
+                    detail: "the keychain is locked".into(),
+                });
+            }
+            self.take(role, slot);
+            Ok(())
+        }
+
+        fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
+            if let Some(pair) = self.take(role, from) {
+                self.put(role, to, pair);
+            }
+            Ok(())
+        }
+    }
+
+    // BEP-060: a replacement that keeps the old key publishes the new key
+    // and exits non-zero, so a script does not read it as finished.
+    #[test]
+    fn replace_key_exits_non_zero_when_the_old_key_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = ExportableStore::new(keys::Build::Debug);
+        let (keys, _root) = start(&store, &path, &[]).unwrap();
+        let old = keys.sealing.public();
+        drop(keys);
+        let published = std::fs::read(&path).unwrap();
+
+        let store = KeepsOldStore {
+            inner: store,
+            side: Mutex::default(),
+        };
+        let code = replace_key(&store, Role::Sealing, &path, &[]);
+        assert_eq!(code, ExitCode::FAILURE);
+        let new = store.find(Role::Sealing).unwrap().unwrap().public();
+        assert_ne!(new, old, "the new key is in use");
+        assert!(
+            store
+                .side
+                .lock()
+                .unwrap()
+                .contains_key(&(Role::Sealing, Slot::Old)),
+            "the old key stays"
+        );
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            published,
+            "the new key is published"
+        );
+    }
+
+    // BEP-060: an old key that an earlier replacement moved aside and that
+    // did not move back is reported as no key in use.
+    #[test]
+    fn replace_key_names_an_old_key_not_put_back() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::Recover(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. An earlier `bep --replace-key sealing` stopped before it finished, and its old key was not put back: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to put the old key back and replace it."
+        );
+        assert!(!message.contains("still in use"), "{message}");
     }
 
     // BEP-060: an old key that the store did not remove is named, with the
