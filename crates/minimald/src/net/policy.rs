@@ -174,11 +174,12 @@ impl ExposedMapping {
 /// A declared port's forwarder, owned by the daemon (NET-121): the mapping the
 /// switch bound for it, the internal port it forwards to, and — when the box
 /// carries a session gate — that gate, which the forwarder's own
-/// [`revoke`](Self::revoke) drives. The switch's unexpose removes a forward's
-/// *listener* and leaves the connections it already holds open, so a revoked
-/// port's connections end at the gate: `revoke` refuses the port at the
-/// relay's ingress legs, terminates the connections the gate holds, and only
-/// then unexposes.
+/// [`revoke`](Self::revoke) drives. `revoke` refuses the port at the relay's
+/// ingress legs, terminates the connections the gate holds, and only then
+/// unexposes. The patched switch's unexpose closes the forward's listener and
+/// then the connections that forward accepted, so the host-side ends of a
+/// revoked port's connections close with it, while a sibling forward to the
+/// same internal port keeps its own (NET-017).
 #[derive(Clone)]
 pub struct PortForwarder {
     mapping: ExposedMapping,
@@ -245,10 +246,10 @@ impl PortForwarder {
     /// refuses by internal port alone (a box's inbound frames carry no trace
     /// of which external forward they arrived through), so a revocation whose
     /// internal port is in the set *withholds* the gate's termination rather
-    /// than end a sibling forwarder's connections with it: the unbind is this
-    /// port's whole effect while the sibling stands, and the port's
-    /// connections end when the last forwarder to it is revoked — the first
-    /// moment they can be told apart at all.
+    /// than end a sibling forwarder's connections with it. The unbind still
+    /// ends this forward's own connections: the switch tracks what each
+    /// forward accepted, so its unexpose closes this forward's connections
+    /// and leaves the sibling's open (NET-017).
     ///
     /// # Errors
     ///
@@ -290,11 +291,12 @@ impl PortForwarder {
             local: self.mapping.local.clone(),
             protocol: self.mapping.protocol.clone(),
         };
-        match post_json(control, "/services/forwarder/unexpose", &req).await {
-            Ok(()) => {
+        match unexpose_closing(control, &req).await {
+            Ok(closed) => {
                 tracing::info!(
                     host,
                     port = external_port,
+                    closed_connections = %closed,
                     reason = "ingress revoked",
                     "unbound ingress forwarder"
                 );
@@ -330,8 +332,16 @@ impl PortForwarder {
         if self.is_revoked() {
             return Ok(());
         }
-        unexpose_mapping(control, &self.mapping).await?;
+        let closed = unexpose_mapping(control, &self.mapping).await?;
         self.revoked.store(true, Ordering::Release);
+        let (host, port) = self.mapping.host_port().unwrap_or(("", 0));
+        tracing::info!(
+            host,
+            port,
+            protocol = %self.mapping.protocol,
+            closed_connections = %closed,
+            "unbound the forward a move of the box's publish left at the old address"
+        );
         Ok(())
     }
 }
@@ -777,11 +787,12 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
             local: forwarder.mapping.local.clone(),
             protocol: forwarder.mapping.protocol.clone(),
         };
-        match post_json(control, "/services/forwarder/unexpose", &req).await {
-            Ok(()) => {
+        match unexpose_closing(control, &req).await {
+            Ok(closed) => {
                 tracing::info!(
                     host,
                     port = external_port,
+                    closed_connections = %closed,
                     reason = "box stopped",
                     "unbound ingress forwarder"
                 );
@@ -808,7 +819,19 @@ pub async fn unexpose_forwarder(
     if forwarder.is_revoked() {
         return Ok(());
     }
-    unexpose_mapping(control, &forwarder.mapping).await
+    let closed = unexpose_mapping(control, &forwarder.mapping).await?;
+    // The callers withdraw an unaudited publish or unbind the forward a move
+    // left behind, and each says why in its own line. This line carries the
+    // switch's count, and claims no withdrawal.
+    let (host, port) = forwarder.mapping.host_port().unwrap_or(("", 0));
+    tracing::info!(
+        host,
+        port,
+        protocol = %forwarder.mapping.protocol,
+        closed_connections = %closed,
+        "unbound a port's forward on the switch"
+    );
+    Ok(())
 }
 
 /// Ends the declared ports' forwards in `bound` when their box stops (NET-121)
@@ -885,9 +908,69 @@ pub async fn expose_mapping(
         })
 }
 
-/// NET-017's withdraw: unexposes one mapping [`expose_mapping`] bound for a
-/// listener that has since closed, so the box's address stops answering at
-/// the port. The caller refuses the port at the box's gate *first* — the
+/// How many accepted connections the switch closed when it unexposed a
+/// forward: the `closed` field of the patched switch's `/unexpose` reply
+/// (`vendor/gvproxy/patches/`). `None` when the reply carries no count — an
+/// unpatched switch, or a channel that relays no body — so the log says
+/// unknown rather than zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedConnections(pub Option<u64>);
+
+impl ClosedConnections {
+    /// The count in an `/unexpose` reply body, `{"closed":<n>}`.
+    fn from_reply(body: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Reply {
+            closed: Option<u64>,
+        }
+        let text = String::from_utf8_lossy(body);
+        let text = text.trim();
+        if text.is_empty() {
+            return Self(None);
+        }
+        Self(
+            serde_json_lenient::from_str::<Reply>(text)
+                .ok()
+                .and_then(|reply| reply.closed),
+        )
+    }
+}
+
+impl fmt::Display for ClosedConnections {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str("unknown"),
+        }
+    }
+}
+
+/// Asks the switch to unexpose the forward at `req.local`. The switch closes
+/// the forward's listener and then every connection that forward accepted
+/// and still holds. A forward at another `local` to the same in-box port is
+/// a separate forward on the switch, so it keeps its own connections.
+async fn unexpose_closing(
+    control: &ControlChannel,
+    req: &UnexposeRequest,
+) -> io::Result<ClosedConnections> {
+    post_json_reply_within(
+        control,
+        "/services/forwarder/unexpose",
+        req,
+        GVPROXY_CONTROL_TIMEOUT,
+    )
+    .await
+    .map(|body| ClosedConnections::from_reply(&body))
+}
+
+/// Unexposes one mapping [`expose_mapping`] bound, and returns the count of
+/// accepted connections the switch reports it closed. NET-017's withdraw of
+/// a listener that has since closed comes here, so the box's address stops
+/// answering at the port. A move, a revoke and a teardown come here too, so
+/// this logs nothing: each caller logs its own line, with the count, and
+/// only the withdrawal's line ([`log_withdrawal`]) says a port was withdrawn.
+///
+/// The caller refuses the port at the box's gate *first* — the
 /// order [`PortForwarder::revoke`] holds for a declared forward — so no new
 /// connection crosses the gap between a listener already gone and a gate
 /// that still admits the port. A declared port's forward never comes down
@@ -906,12 +989,39 @@ pub async fn expose_mapping(
 pub async fn unexpose_mapping(
     control: &ControlChannel,
     mapping: &ExposedMapping,
-) -> io::Result<()> {
+) -> io::Result<ClosedConnections> {
     let req = UnexposeRequest {
         local: mapping.local.clone(),
         protocol: mapping.protocol.clone(),
     };
-    post_json(control, "/services/forwarder/unexpose", &req).await
+    unexpose_closing(control, &req).await
+}
+
+/// NET-017's one line per withdrawal: a published port's listener closed and
+/// its forward came down. The box is the caller's span: the listen watcher
+/// runs inside one that names it. The line claims closed connections only
+/// when the switch reported a count. An unpatched switch reports none, so
+/// the line then says the count is not known.
+pub fn log_withdrawal(mapping: &ExposedMapping, closed: ClosedConnections) {
+    let (host, port) = mapping.host_port().unwrap_or(("", 0));
+    if closed.0.is_some() {
+        tracing::info!(
+            host,
+            port,
+            protocol = %mapping.protocol,
+            closed_connections = %closed,
+            "withdrew a published port, and the switch closed the connections it accepted"
+        );
+    } else {
+        tracing::info!(
+            host,
+            port,
+            protocol = %mapping.protocol,
+            closed_connections = %closed,
+            "withdrew a published port, and the switch did not report how many \
+             accepted connections it closed"
+        );
+    }
 }
 
 /// Why a runtime port-publish request was refused **before** the switch was
@@ -1577,6 +1687,20 @@ pub(crate) async fn post_json_within<T: Serialize>(
     body: &T,
     timeout: Duration,
 ) -> io::Result<()> {
+    post_json_reply_within(control, path, body, timeout)
+        .await
+        .map(drop)
+}
+
+/// [`post_json_within`] that hands back the body of a 2xx reply, for a verb
+/// whose answer carries data: the patched switch's `/unexpose` says how many
+/// accepted connections it closed.
+async fn post_json_reply_within<T: Serialize>(
+    control: &ControlChannel,
+    path: &str,
+    body: &T,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
     let body = serde_json_lenient::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
@@ -1618,7 +1742,7 @@ pub(crate) async fn post_json_within<T: Serialize>(
 
     let status = parse_status_code(&response)?;
     if (200..300).contains(&status) {
-        Ok(())
+        Ok(body_after_headers(&response).to_vec())
     } else {
         let said = String::from_utf8_lossy(body_after_headers(&response));
         // A refusal that says the listener is already held, by another host
@@ -2590,6 +2714,194 @@ mod tests {
     }
 
     // ---- NET-123's forwarder-conducted range probe -----------------------
+    /// NET-017: a withdrawn publish's unexpose reads how many accepted
+    /// connections the switch closed and logs it, and the sibling publish
+    /// of the same in-box port is never asked to come down.
+    mod closed_on_retract {
+        use super::forwarder_probe::read_request;
+        use super::*;
+        use tokio::net::UnixListener;
+        use tokio::sync::mpsc;
+        use tracing::Instrument as _;
+
+        #[derive(Clone, Default)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+        impl LogCapture {
+            fn contents(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+            type Writer = LogCapture;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// A switch whose `/unexpose` answers each `local` with the body
+        /// `reply` picks, and reports every request's body.
+        fn spawn_switch(
+            path: std::path::PathBuf,
+            reply: impl Fn(&str) -> String + Send + Sync + 'static,
+        ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<String>) {
+            let listener = UnixListener::bind(&path).unwrap();
+            let (tx, rx) = mpsc::channel(16);
+            let handle = crate::traced::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let body = String::from_utf8(read_request(&mut sock).await).unwrap();
+                    let answer = reply(&body);
+                    sock.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("the fake switch must answer");
+                    if tx.send(body).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            (handle, rx)
+        }
+
+        #[tokio::test]
+        async fn retracting_one_publish_closes_only_its_accepted_connections() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let retracted = ExposedMapping {
+                local: "127.0.0.5:8080".to_string(),
+                protocol: "tcp".to_string(),
+            };
+            let sibling = ExposedMapping {
+                local: "127.0.0.6:9090".to_string(),
+                protocol: "tcp".to_string(),
+            };
+            // The retracted publish held two connections. A switch that
+            // reports no count stands in for an unpatched one.
+            let (server, mut asked) = spawn_switch(sock.clone(), |body| {
+                if body.contains("127.0.0.5:8080") {
+                    r#"{"closed":2}"#.to_string()
+                } else {
+                    String::new()
+                }
+            });
+            let control = ControlChannel::Unix(sock);
+
+            let log = LogCapture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let span = tracing::info_span!("listen", session = "web-box");
+            let closed = unexpose_mapping(&control, &retracted)
+                .instrument(span.clone())
+                .await
+                .expect("the retracted publish comes down");
+            assert_eq!(closed, ClosedConnections(Some(2)));
+            assert!(
+                log.contents().is_empty(),
+                "the shared unexpose logs nothing, so a move or a revoke never claims a withdrawal: {}",
+                log.contents()
+            );
+            span.in_scope(|| log_withdrawal(&retracted, closed));
+
+            let first = asked.recv().await.expect("the switch was asked");
+            assert!(
+                first.contains("127.0.0.5:8080"),
+                "the unexpose names the retracted publish: {first}"
+            );
+            assert!(
+                asked.try_recv().is_err(),
+                "the sibling publish of the same in-box port is not asked to come down"
+            );
+            let text = log.contents();
+            let line = text
+                .lines()
+                .find(|l| l.contains("withdrew a published port"))
+                .unwrap_or_else(|| panic!("no retraction line in the log: {text}"));
+            assert!(
+                line.contains("the switch closed the connections it accepted"),
+                "a reported count is said as closed connections: {line}"
+            );
+            assert!(line.contains("web-box"), "the line names the box: {line}");
+            assert!(
+                line.contains("port=8080"),
+                "the line names the port: {line}"
+            );
+            assert!(
+                line.contains("closed_connections=2"),
+                "the line carries the switch's count: {line}"
+            );
+
+            // A reply with no count is logged as unknown, never as zero.
+            let closed = unexpose_mapping(&control, &sibling)
+                .await
+                .expect("the sibling publish comes down when it is retracted");
+            assert_eq!(closed, ClosedConnections(None));
+            log_withdrawal(&sibling, closed);
+            drop(guard);
+            let text = log.contents();
+            let line = text
+                .lines()
+                .filter(|l| l.contains("withdrew a published port"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("no second retraction line: {text}"));
+            assert!(line.contains("port=9090"), "{line}");
+            assert!(line.contains("closed_connections=unknown"), "{line}");
+            assert!(
+                line.contains("did not report how many accepted connections it closed"),
+                "an unknown count says what is known: {line}"
+            );
+            assert!(
+                !line.contains("the switch closed the connections"),
+                "an unknown count claims no closed connection: {line}"
+            );
+            server.abort();
+        }
+
+        #[test]
+        fn the_closed_count_reads_from_the_unexpose_reply() {
+            assert_eq!(
+                ClosedConnections::from_reply(br#"{"closed":3}"#),
+                ClosedConnections(Some(3))
+            );
+            assert_eq!(
+                ClosedConnections::from_reply(b"{\"closed\":0}\n"),
+                ClosedConnections(Some(0))
+            );
+            assert_eq!(ClosedConnections::from_reply(b""), ClosedConnections(None));
+            assert_eq!(
+                ClosedConnections::from_reply(b"{}"),
+                ClosedConnections(None)
+            );
+            assert_eq!(
+                ClosedConnections::from_reply(b"not json"),
+                ClosedConnections(None)
+            );
+            assert_eq!(ClosedConnections(None).to_string(), "unknown");
+            assert_eq!(ClosedConnections(Some(4)).to_string(), "4");
+        }
+    }
+
     mod forwarder_probe {
         use std::collections::HashMap;
         use std::io;
