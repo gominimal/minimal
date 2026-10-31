@@ -409,6 +409,242 @@ fn supervisor_registry(
         .persisting_to(registry_file)
 }
 
+/// The bound on one forwarder exchange the node mirror's binder makes with
+/// the switch: the connect, the request and the answer. A switch that
+/// stalls past it fails the bind, and the guest sends the notice again.
+const MIRROR_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The largest switch answer the node mirror's binder reads. gvproxy's
+/// forwarder answers are one status line and a short body.
+const MIRROR_SWITCH_MAX_ANSWER: usize = 16 * 1024;
+
+/// The body gvproxy's forwarder answers an expose with when it already
+/// holds a forward at the listener: the goal state holds.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SWITCH_ALREADY_BOUND: &str = "proxy already running";
+
+/// The body gvproxy's forwarder answers an unexpose with when it holds no
+/// forward at the listener: the goal state holds.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SWITCH_NOT_BOUND: &str = "proxy not found";
+
+/// The production binder of the node's mirrored binds (NET-138): it asks the
+/// host switch (gvproxy's forwarder, on the switch socket) to listen at the
+/// node's reserved-range address on the host and forward to the same port at
+/// the guest node's own address, and to undo it.
+///
+/// The switch's unexpose closes the listener. The connections it already
+/// accepted end when the node's row is withdrawn, where the egress gate
+/// resets every connection it tracked at the node's address.
+#[derive(Debug)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+struct SwitchMirrorBinder {
+    /// gvproxy's `-listen` socket, which serves the forwarder verbs.
+    switch_sock: std::path::PathBuf,
+    /// The guest node's own switch address: where each forward dials.
+    node: std::net::Ipv4Addr,
+}
+
+impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
+    fn bind(
+        &self,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<(), crate::box_registry::MirrorBindError> {
+        use crate::box_registry::MirrorBindError;
+        let body = format!(
+            r#"{{"local":"{address}:{port}","remote":"{}:{port}","protocol":"tcp"}}"#,
+            self.node
+        );
+        match post_switch_forwarder(&self.switch_sock, "expose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
+            Ok((_, answer)) if answer.contains("address already in use") => {
+                Err(MirrorBindError::Occupied)
+            }
+            Ok((status, answer)) => Err(MirrorBindError::Failed(format!(
+                "the switch answered the expose with HTTP {status}: {:?}",
+                answer.trim()
+            ))),
+            Err(error) => Err(MirrorBindError::Failed(format!(
+                "the expose went unanswered: {error}"
+            ))),
+        }
+    }
+
+    fn unbind(&self, address: std::net::Ipv4Addr, port: u16) {
+        let body = format!(r#"{{"local":"{address}:{port}","protocol":"tcp"}}"#);
+        match post_switch_forwarder(&self.switch_sock, "unexpose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((500, answer)) if answer.trim() == SWITCH_NOT_BOUND => {}
+            Ok((status, answer)) => tracing::warn!(
+                %address,
+                port,
+                status,
+                answer = %answer.trim(),
+                "the switch refused to undo a mirrored bind at the node's address"
+            ),
+            Err(error) => tracing::warn!(
+                %address,
+                port,
+                %error,
+                "the switch did not answer the undo of a mirrored bind at the node's address"
+            ),
+        }
+    }
+}
+
+/// One forwarder exchange with the switch at `switch_sock`: `verb` posted
+/// with the JSON `body`, answered by a status and a body, bounded by
+/// [`MIRROR_SWITCH_TIMEOUT`] per read and write. Blocking: the node mirror
+/// calls its binder from the report door's thread, outside every lock.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn post_switch_forwarder(
+    switch_sock: &std::path::Path,
+    verb: &str,
+    body: &str,
+) -> std::io::Result<(u16, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut switch = std::os::unix::net::UnixStream::connect(switch_sock)?;
+    switch.set_read_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
+    switch.set_write_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
+    let request = format!(
+        "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    switch.write_all(request.as_bytes())?;
+    let mut answer = Vec::with_capacity(256);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(head_end) = answer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+        {
+            let head = String::from_utf8_lossy(answer.get(..head_end).unwrap_or_default());
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if length.is_some_and(|length| answer.len() >= head_end + length) {
+                break;
+            }
+        }
+        if answer.len() >= MIRROR_SWITCH_MAX_ANSWER {
+            break;
+        }
+        let n = switch.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        answer.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&answer);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::other("the switch's answer had no status line"))?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, body)| body.to_string());
+    Ok((status, body))
+}
+
+/// The name the node's mirror address is allocated under in the machine's
+/// answerer: one address per node. A box name holds no space, so no box
+/// can take it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_MIRROR_NAME: &str = "host_ip boxes";
+
+/// How often the host probes the whole reserved local range for the node's
+/// mirror. A host that gains the range aliases after the VM booted opens
+/// the mirror within one interval.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_MIRROR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One pass of the node mirror's upkeep: runs the host-side whole-range
+/// probe, feeds its verdict to the mirror, and while the range passes and
+/// the mirror has no address, opens it at the address `allocate` hands the
+/// node. Returns the reason the mirror did not open, for the caller to log
+/// once per change, or `None` when the mirror is open or the range fails.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_mirror_pass(
+    boxes: &crate::box_registry::BoxRegistry,
+    probe: &switch::loopback::RangeProbe,
+    allocate: impl FnOnce() -> Result<std::net::Ipv4Addr, String>,
+) -> Option<String> {
+    let mirror = boxes.node_mirror();
+    mirror.set_range_probe(probe.present());
+    if !probe.present() || mirror.address().is_some() {
+        return None;
+    }
+    let address = match allocate() {
+        Ok(address) => address,
+        Err(error) => return Some(error),
+    };
+    match boxes.open_node_mirror(address) {
+        Ok(()) => {
+            tracing::info!(
+                node = %boxes.subnet().daemon_ip(),
+                %address,
+                "opened the node's mirrored binds at its reserved-range address"
+            );
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+/// Spawns the node mirror's upkeep thread for the process's life: every
+/// [`NODE_MIRROR_PROBE_INTERVAL`] it runs [`node_mirror_pass`] with the
+/// machine's answerer allocating the node's address. One line per change of
+/// the probe's verdict, and one per new reason the mirror stays closed.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn spawn_node_mirror(
+    boxes: crate::box_registry::BoxRegistry,
+    answerer: crate::net::answerer::AnswererStatus,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("node-mirror".to_string())
+        .spawn(move || {
+            let node = boxes.subnet().daemon_ip();
+            let mut last_present = None;
+            let mut last_refusal: Option<String> = None;
+            loop {
+                let probe = switch::loopback::probe();
+                if last_present != Some(probe.present()) {
+                    tracing::info!(
+                        %node,
+                        probe = %probe.summary(),
+                        range_probe_passes = probe.present(),
+                        "the host's reserved local range probe changed; mirrored binds are \
+                         made only while it passes"
+                    );
+                    last_present = Some(probe.present());
+                }
+                let refusal =
+                    node_mirror_pass(&boxes, &probe, || answerer.allocate(NODE_MIRROR_NAME));
+                if let Some(reason) = &refusal
+                    && last_refusal.as_ref() != Some(reason)
+                {
+                    tracing::warn!(
+                        %node,
+                        %reason,
+                        "could not open the node's mirrored binds at a reserved-range address"
+                    );
+                }
+                last_refusal = refusal;
+                std::thread::sleep(NODE_MIRROR_PROBE_INTERVAL);
+            }
+        })
+}
+
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
 ///
@@ -756,6 +992,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // startup, unlike the control socket: a thread that could not spawn is
     // warned and the VM still boots, its names then answering from whatever
     // answerer holds the port.
+    let mirror_answerer = answerer_status.clone();
     if let Err(error) =
         crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
     {
@@ -763,6 +1000,21 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             %error,
             "failed to start the zone answerer; this VM's box names answer only from \
              another VM host daemon's table, if one is running"
+        );
+    }
+
+    // The node's mirrored binds (NET-138): a host-address box shares the
+    // guest node's namespace, so its listeners open on the host at the
+    // node's own reserved-range address, allocated by the machine's
+    // answerer like a box's. The upkeep thread feeds the host-side
+    // whole-range probe to the mirror, and opens it once the range passes.
+    // Best-effort: a thread that could not spawn is warned, and the VM boots
+    // with no port of a host-address box opened on the host.
+    if let Err(error) = spawn_node_mirror(boxes.clone(), mirror_answerer) {
+        tracing::warn!(
+            %error,
+            "failed to start the node's mirrored binds; no port a host_ip box listens \
+             on opens on this host"
         );
     }
 
@@ -915,6 +1167,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             if let Some(listening) = &proxy_listening {
                 bep_listening.attach(std::sync::Arc::clone(listening));
             }
+            let mirror_switch_sock = switch_sock.clone();
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
@@ -925,6 +1178,15 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
+                    // The node's mirrored binds go through this switch
+                    // (NET-138). Every registry clone shares one mirror, so
+                    // the clone the binder is set on is dropped at once.
+                    drop(boxes.clone().with_mirror_binder(std::sync::Arc::new(
+                        SwitchMirrorBinder {
+                            switch_sock: mirror_switch_sock,
+                            node: subnet.daemon_ip(),
+                        },
+                    )));
                     tracing::info!(
                         pid = gvproxy.pid(),
                         proxy_ip = %subnet.box_egress_proxy_address(),
@@ -5005,5 +5267,132 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         watcher.join().unwrap();
+    }
+
+    /// A stand-in switch: answers each forwarder request on `sock` with the
+    /// next of `answers` (status, body), and sends every request it read,
+    /// head and body, on the returned channel.
+    fn fake_switch(
+        sock: &std::path::Path,
+        answers: Vec<(u16, &'static str)>,
+    ) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
+        let (sent, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in answers {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut chunk).expect("read the request");
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Content-Length: "))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0);
+                        if rest.len() >= length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                sent.send(String::from_utf8_lossy(&request).into_owned())
+                    .expect("send the request");
+                let answer = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(answer.as_bytes()).expect("answer");
+            }
+        });
+        requests
+    }
+
+    // NET-138: the production binder asks the switch to listen at the
+    // node's address and forward to the same port at the guest node. A port
+    // the host already holds is a collision, never another port.
+    #[test]
+    fn switch_mirror_binder_exposes_at_the_node_address_only() {
+        use crate::box_registry::{MirrorBindError, MirrorBinder as _};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sock = dir.path().join("switch.sock");
+        let requests = fake_switch(
+            &sock,
+            vec![
+                (200, ""),
+                (
+                    500,
+                    "listen tcp 127.0.64.9:8080: bind: address already in use\n",
+                ),
+                (500, "proxy already running\n"),
+                (200, ""),
+            ],
+        );
+        let binder = SwitchMirrorBinder {
+            switch_sock: sock,
+            node: std::net::Ipv4Addr::new(192, 168, 127, 2),
+        };
+        let address = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        assert_eq!(binder.bind(address, 8080), Ok(()));
+        let expose = requests.recv().expect("the expose");
+        assert!(expose.starts_with("POST /services/forwarder/expose HTTP/1.1\r\n"));
+        assert!(expose.ends_with(
+            r#"{"local":"127.0.64.9:8080","remote":"192.168.127.2:8080","protocol":"tcp"}"#
+        ));
+        assert_eq!(binder.bind(address, 8080), Err(MirrorBindError::Occupied));
+        requests.recv().expect("the second expose");
+        assert_eq!(
+            binder.bind(address, 8080),
+            Ok(()),
+            "a forward the switch already holds is the goal state"
+        );
+        requests.recv().expect("the third expose");
+        binder.unbind(address, 8080);
+        let unexpose = requests.recv().expect("the unexpose");
+        assert!(unexpose.starts_with("POST /services/forwarder/unexpose HTTP/1.1\r\n"));
+        assert!(unexpose.ends_with(r#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#));
+    }
+
+    // NET-138: the upkeep opens the node's mirror only while the whole-range
+    // probe passes, at the address the answerer hands the node, and never
+    // at the 127.0.0.1 interim.
+    #[test]
+    fn node_mirror_opens_at_the_allocated_address_once_the_range_passes() {
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let absent = switch::loopback::RangeProbe::failed_to_run();
+        let present = switch::loopback::RangeProbe {
+            bound: 1,
+            probed: 1,
+            first_failure: None,
+        };
+        let address = std::net::Ipv4Addr::new(127, 0, 64, 40);
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &absent, || panic!("no allocation while absent")),
+            None
+        );
+        assert_eq!(boxes.node_mirror().address(), None);
+        assert!(
+            super::node_mirror_pass(&boxes, &present, || Ok(std::net::Ipv4Addr::LOCALHOST))
+                .is_some(),
+            "the 127.0.0.1 interim is refused"
+        );
+        assert_eq!(boxes.node_mirror().address(), None);
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &present, || Ok(address)),
+            None
+        );
+        assert_eq!(boxes.node_mirror().address(), Some(address));
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &present, || panic!(
+                "an open mirror allocates nothing"
+            )),
+            None
+        );
     }
 }

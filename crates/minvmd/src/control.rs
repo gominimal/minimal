@@ -1283,6 +1283,7 @@ fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) 
         MirrorOutcome::BindFailed => {
             format!("port {} could not be opened on the host", notice.port)
         }
+        MirrorOutcome::PortZero => "port 0 is not opened on the host".to_string(),
     };
     BoxControlReply::Error { error }
 }
@@ -8049,6 +8050,20 @@ mod tests {
             ),
             "a line past the fixed size is refused"
         );
+
+        // A forged notice for port 0 is refused: a bind there takes a port
+        // the host picks, and the mirror never moves a port.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: 0,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::Error { .. }
+        ));
+        assert!(binder.open().is_empty(), "port 0 binds nothing");
 
         // A box's own port binds at the node's address.
         let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

@@ -6131,9 +6131,10 @@ impl BoxRegistry {
 
     /// Opens the node's mirror at `address`, the reserved-range address the
     /// host allocated for this node (NET-129, NET-138). The address must be
-    /// one of the reserved local range's hosts, so `127.0.0.1` and the
-    /// wildcard are refused, and it must not be a box row's published
-    /// loopback address. A changed address undoes every bind at the old
+    /// in the run of the reserved local range the answerer hands out
+    /// ([`switch::box_loopback_interior`]), so `127.0.0.1`, the wildcard and
+    /// the answerer's own `.1` are refused, and it must not be a box row's
+    /// published loopback address. A changed address undoes every bind at the old
     /// one first.
     ///
     /// # Errors
@@ -6141,7 +6142,10 @@ impl BoxRegistry {
     /// [`MirrorAddressRefused`] names why the address cannot hold the
     /// node's binds. The mirror keeps its earlier address, if it had one.
     pub fn open_node_mirror(&self, address: Ipv4Addr) -> Result<(), MirrorAddressRefused> {
-        if !switch::loopback::range_hosts().any(|host| host == address) {
+        // The run the answerer hands addresses out of: the range's `.1` is
+        // the answerer's own, so the node's binds never open there.
+        let (first, last) = switch::box_loopback_interior();
+        if !(first..=last).contains(&address) {
             return Err(MirrorAddressRefused::OutsideReservedRange(address));
         }
         let held_by_a_row = self
@@ -6211,9 +6215,10 @@ pub enum MirrorBindError {
 /// Why [`BoxRegistry::open_node_mirror`] refused an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MirrorAddressRefused {
-    /// The address is not a host of the reserved local range: the
-    /// wildcard, `127.0.0.1`, or any other address.
-    #[error("{0} is not an address of the reserved local range")]
+    /// The address is not in the run of the reserved local range that
+    /// boxes take addresses from: the wildcard, `127.0.0.1`, the range's
+    /// `.1`, or any other address.
+    #[error("{0} is not an address of the reserved local range that boxes use")]
     OutsideReservedRange(Ipv4Addr),
     /// A box row publishes at the address.
     #[error("{0} is the published address of a box")]
@@ -6242,6 +6247,9 @@ pub enum MirrorOutcome {
     NoHostAddressBox,
     /// The binder failed for a reason other than a held port.
     BindFailed,
+    /// The notice named port 0, which no listener holds. A bind there
+    /// takes whatever port the host picks, so nothing was bound.
+    PortZero,
 }
 
 impl MirrorOutcome {
@@ -6256,6 +6264,7 @@ impl MirrorOutcome {
             Self::Capped => "capped",
             Self::NoHostAddressBox => "no-host-address-box",
             Self::BindFailed => "bind-failed",
+            Self::PortZero => "port-zero",
         }
     }
 }
@@ -6528,6 +6537,12 @@ impl NodeMirror {
             return MirrorOutcome::Capped;
         }
         state.notices.push_back(now);
+        if port == 0 {
+            // A bind at port 0 takes a port the host picks, which moves the
+            // listener to another port. No listener holds port 0.
+            self.warn_refused(state.address, port, MirrorOutcome::PortZero, "port-zero");
+            return MirrorOutcome::PortZero;
+        }
         if !state.published {
             self.warn_refused(
                 state.address,
@@ -6550,7 +6565,16 @@ impl NodeMirror {
             return MirrorOutcome::Waiting;
         };
         drop(state);
-        self.bind(&binder, address, port)
+        let outcome = self.bind(&binder, address, port);
+        if matches!(outcome, MirrorOutcome::Collided | MirrorOutcome::BindFailed) {
+            // The reply refuses the notice, so the guest holds the port as
+            // owed and sends it again. The mirror does not hold it: it is
+            // not counted against the cap, and a later probe pass does not
+            // bind a port that no notice holds. The turn is still held, so
+            // no other change ran since the bind.
+            self.lock().wanted.remove(&port);
+        }
+        outcome
     }
 
     /// The binds that make every held port bound, or none while the mirror
@@ -12255,6 +12279,14 @@ mod tests {
                 Ipv4Addr::UNSPECIFIED
             ))
         );
+        // The range's `.1` is the answerer's, never the node's.
+        let answerer = switch::loopback::range_hosts()
+            .next()
+            .expect("the reserved range's first host");
+        assert_eq!(
+            registry.open_node_mirror(answerer),
+            Err(MirrorAddressRefused::OutsideReservedRange(answerer))
+        );
         let row_address = switch::loopback::range_hosts()
             .nth(3)
             .expect("a reserved-range host");
@@ -12343,6 +12375,15 @@ mod tests {
         assert!(binder.open().is_empty());
         assert_eq!(registry.node_mirror().collisions(), vec![port]);
         assert!(registry.node_mirror().bound_ports().is_empty());
+        // The refused notice holds nothing: a probe pass binds nothing at
+        // the port, and the guest sends the notice again.
+        registry.node_mirror().set_range_probe(false);
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(
+            binder.calls().len(),
+            1,
+            "a refused notice is not bound later"
+        );
 
         // Once the holder is gone, the next notice binds the same port.
         drop(holder);

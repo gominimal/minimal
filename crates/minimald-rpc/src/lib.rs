@@ -1003,7 +1003,8 @@ impl ListenNotice {
     /// The longest request line a listen notice can be, its verb tag
     /// included: `{"verb":"listen_notice","port":65535,"state":"listening"}`
     /// is 57 bytes. The VM host daemon refuses a longer `listen_notice`
-    /// line before it parses it.
+    /// line before the mirror sees it. The line is parsed first, so before
+    /// the parse only the box control channel's own line bound applies.
     pub const MAX_LINE_BYTES: usize = 96;
 }
 
