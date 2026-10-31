@@ -974,6 +974,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-storage",
  "hex",
+ "hickory-proto",
  "jaq-all",
  "libc",
  "lzma-rs",
