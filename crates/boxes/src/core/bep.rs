@@ -238,8 +238,11 @@ impl TryFrom<GrantFields> for SecretGrant {
                         extra.join(" and ")
                     ));
                 }
-                // An empty or blank value names nothing, so it reads as absent.
-                let present = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+                // Padding never names part of an item, so the kept value is
+                // trimmed. An empty or blank value names nothing, so it reads
+                // as absent.
+                let present =
+                    |v: Option<String>| v.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
                 match (present(fields.store), present(fields.id)) {
                     (Some(store), Some(id)) => GrantSource::Store { store, id },
                     (store, id) => {
@@ -1787,6 +1790,12 @@ mod tests {
             toml::from_str::<SecretGrant>(&text).expect("reads back"),
             grant
         );
+        // Padding around store or id is trimmed, so the reference still
+        // matches its rule.
+        let padded: SecretGrant =
+            toml::from_str("source = \"store\"\nstore = \" keychain \"\nid = \" claude \"")
+                .expect("parses");
+        assert_eq!(padded, grant);
 
         // The old spelling, a broker scope that names the item, is refused,
         // so it cannot skip the store rules.
