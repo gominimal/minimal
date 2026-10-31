@@ -4844,4 +4844,12 @@ async fn list_sessions_reports_box_address_and_posture() {
     assert_eq!(host_address_loopback(localhost, true), None);
     assert_eq!(host_address_loopback(granted, true), Some(granted));
     assert_eq!(host_address_loopback(localhost, false), Some(localhost));
+    // A withheld host-address box is reached only through the proxy, so it
+    // reads as the fallback. A box of another mode with no address says
+    // nothing.
+    assert_eq!(box_at_fallback(true, None), Some(true));
+    assert_eq!(box_at_fallback(true, Some(localhost)), Some(false));
+    assert_eq!(box_at_fallback(false, Some(localhost)), Some(true));
+    assert_eq!(box_at_fallback(false, Some(granted)), Some(false));
+    assert_eq!(box_at_fallback(false, None), None);
 }

@@ -941,16 +941,19 @@ pub fn format_ls_on(
     Ok(())
 }
 
-/// Whether the BOX NAMES row reads the own-address form (T110): `false`
-/// when the daemon reports any box at the `127.0.0.1` fallback, since the
-/// row speaks for every box and such a box does not open at its name. A
-/// host-address box at `127.0.0.1` is not at the fallback, and a listing
-/// that reports no fallback keeps the form the surface verdict decides.
+/// Whether the BOX NAMES row reads the own-address form (T110): `true`
+/// only when the daemon reports at least one box off the `127.0.0.1`
+/// fallback and none on it. The row speaks for every box, and a box on the
+/// fallback does not open at its name. A listing that reports no box's
+/// fallback fact (an older daemon, or no box with an address yet) cannot
+/// prove the stronger claim, so it reads the fallback form.
 fn boxes_at_own_address(resp: &minimald_rpc::ListSessionsResponse) -> bool {
-    !resp
+    let fallbacks: Vec<Option<bool>> = resp
         .box_networks
         .values()
-        .any(|facts| facts.at_fallback == Some(true))
+        .map(|facts| facts.at_fallback)
+        .collect();
+    fallbacks.contains(&Some(false)) && !fallbacks.contains(&Some(true))
 }
 
 /// The width of the ADDRESS column: the longest IPv4 address.

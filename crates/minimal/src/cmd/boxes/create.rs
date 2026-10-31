@@ -1884,11 +1884,11 @@ pub(crate) async fn activate_box(
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
                 let box_name = request.config.name.as_deref().unwrap_or("-");
                 // T110: the box's ports answer at its own address unless the
-                // daemon put it on the `127.0.0.1` interim. A host-address
-                // box answers at the node's address, which `min ls` never
-                // marks as the fallback, so the two verbs read the same form.
-                let at_own_address = request.config.network == boxes::NetworkMode::HostNet
-                    || !created.interim_loopback;
+                // daemon put it on the `127.0.0.1` interim. That holds for a
+                // host-address box too: on a VM node before the range lands,
+                // it is not mirrored onto `127.0.0.1` and only the proxy
+                // reaches it, which `min ls` reads as the fallback as well.
+                let at_own_address = !created.interim_loopback;
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(

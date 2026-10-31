@@ -253,6 +253,19 @@ fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<s
     (!in_microvm || node != std::net::Ipv4Addr::LOCALHOST).then_some(node)
 }
 
+/// Whether a listed box stands on the `127.0.0.1` fallback (T110). A
+/// host-address box's node address can be `127.0.0.1` too, so only an
+/// own-address or `none` box at `127.0.0.1` is at the fallback. A
+/// host-address box whose address is withheld (a VM node not yet granted
+/// its address) is reached only through the proxy, so it reads as the
+/// fallback too (design §7.1). Any other box with no address reports none.
+fn box_at_fallback(host_address: bool, loopback_address: Option<std::net::Ipv4Addr>) -> Option<bool> {
+    match loopback_address {
+        None => host_address.then_some(true),
+        Some(address) => Some(!host_address && address == std::net::Ipv4Addr::LOCALHOST),
+    }
+}
+
 /// One box's network facts as the listing reports them (T110). The address
 /// is the host loopback address its ports answer at: the node's address for
 /// a host-address box, and for an own-address or `none` box the address its
@@ -289,10 +302,7 @@ fn box_network_facts(
             })
         }
     };
-    // A host-address box's node address can be `127.0.0.1` too, so only
-    // an own-address or `none` box at `127.0.0.1` is at the fallback.
-    let at_fallback =
-        loopback_address.map(|address| !host_address && address == std::net::Ipv4Addr::LOCALHOST);
+    let at_fallback = box_at_fallback(host_address, loopback_address);
     let egress_posture = record.map(|record| {
         let effective = effective_policy_reply(
             &record.policy,
