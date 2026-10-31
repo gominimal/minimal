@@ -464,10 +464,11 @@ jobs:
         # which only the signing Mac holds; the other fleet Macs carry the base
         # labels only (docs/internal/macos-runner-setup.md).
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
-        # 60, not 45: the build takes about 15 minutes, and the notarization
-        # step below waits on Apple's notary service for three submissions
-        # (minvmd, min, and the app bundle minzoned ships in).
-        timeout-minutes: 60
+        # 75, not 45: the build takes about 15 minutes plus the bep build,
+        # and the notarization step below waits on Apple's notary service
+        # for four submissions (minvmd, min, bep, and the app bundle
+        # minzoned ships in).
+        timeout-minutes: 75
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
         env:
@@ -537,12 +538,23 @@ jobs:
               run: |
                   cargo build --release --locked -p minzoned --bin minzoned
                   scripts/check-zoned-links.sh target/release/minzoned
+            - name: Build release bep binary
+              # The Box Egress Proxy minvmd starts beside gvproxy at boot; it
+              # ships beside minvmd so an installed minvmd finds it (#2498).
+              # Its own invocation, like minimal and minzoned above.
+              env:
+                  # The same client secret as `min`, compiled into the proxy:
+                  # a browser-flow sign-in renews at the proxy only with it.
+                  # Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
+              run: cargo build --release --locked -p bep --bin bep
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
                   mv target/release/min target/release/minimal-macos-arm64
+                  mv target/release/bep target/release/bep-macos-arm64
             - name: Assemble the minzoned app bundle
               # minzoned ships inside Minimal.app, never as a bare file: macOS
               # lists a launchd job under an app's name and icon (System
@@ -565,9 +577,9 @@ jobs:
                     exit 1
                   fi
             - name: Codesign binaries with Developer ID
-              # Sign the two shipped Mach-O binaries and the minzoned app
+              # Sign the three shipped Mach-O binaries and the minzoned app
               # bundle with the Developer ID Application identity held in the
-              # runner's signing keychain. For the two binaries this is the
+              # runner's signing keychain. For the three binaries this is the
               # LAST mutation before upload; the bundle is stapled after it is
               # notarized, which adds a file its signature does not cover.
               # Hardened runtime (--options runtime) + a secure --timestamp so the
@@ -590,6 +602,12 @@ jobs:
                   codesign --force --timestamp --options runtime \
                     --sign "$IDENTITY" \
                     target/release/minimal-macos-arm64
+                  # bep: no entitlements. Its keys live in the login keychain,
+                  # whose access control names this signature, so a key it
+                  # creates is readable only by this signed binary.
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    target/release/bep-macos-arm64
                   # minzoned: no entitlements at all (no hypervisor, no
                   # disable-library-validation, no dyld environment, no JIT),
                   # and an explicit identifier, the one `min` checks it by.
@@ -604,6 +622,7 @@ jobs:
 
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
+                  codesign --verify --strict --verbose=2 target/release/bep-macos-arm64
                   # The exact designated requirement the session advisory and
                   # the privileged step verify the answerer's bundle against.
                   codesign --verify --strict --verbose=2 \
@@ -623,7 +642,7 @@ jobs:
               # or a bundle directory, so each one goes up in a ditto zip that
               # is used only for the submission.
               #
-              # No staple for minvmd and min: the release ships each as a bare
+              # No staple for minvmd, min and bep: the release ships each as a bare
               # Mach-O file, and stapler cannot attach a ticket to one (only to
               # an .app, a .pkg or a .dmg). Gatekeeper looks the ticket up
               # online instead. The app bundle is stapled in the next step.
@@ -647,6 +666,7 @@ jobs:
                   mkdir -p "$work"
                   for f in target/release/minvmd-macos-arm64 \
                            target/release/minimal-macos-arm64 \
+                           target/release/bep-macos-arm64 \
                            target/release/Minimal.app; do
                     name=$(basename "$f")
                     zip="$work/$name.zip"
@@ -685,6 +705,12 @@ jobs:
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
+                  retention-days: 7
+            - name: Upload binary (bep)
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: bep-macos-arm64
+                  path: target/release/bep-macos-arm64
                   retention-days: 7
             - name: Staple and flatten the minzoned app bundle
               # Staple the notarization ticket to the bundle, so macOS can

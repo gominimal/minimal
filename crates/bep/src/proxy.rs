@@ -904,6 +904,7 @@ where
     let box_read = Watched::new(box_read, &activity, &done, idle);
     let mut up_read = Watched::new(up_read, &activity, &done, idle);
     let (refused_tx, refused_rx) = tokio::sync::oneshot::channel();
+    let responses = flow.responses();
     let span = tracing::Span::current();
     let requests = tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
@@ -925,7 +926,7 @@ where
         rule
     });
     let responses = async {
-        forward::relay_responses(&mut up_read, &mut box_write, refused_rx).await;
+        forward::relay_responses(&mut up_read, &mut box_write, responses, refused_rx).await;
         done.cancel();
     };
     let (ended, ()) = tokio::join!(requests, responses);

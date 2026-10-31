@@ -259,6 +259,9 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Test-only: the BEP-032 store mint test registers a box with a
+            // proxy control socket it serves itself, so no daemon is involved.
+            "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
             // Not a daemon connection: `min` registers a GitHub grant box
             // with the Box Egress Proxy over its control socket. The proxy is
             // not the daemon, and the daemon's build is not in question here.
