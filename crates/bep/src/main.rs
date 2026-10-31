@@ -3087,11 +3087,13 @@ mod tests {
         assert_eq!(chosen(None, None), None);
     }
 
-    /// A store whose every key is exportable, as the macOS login keychain
-    /// makes a key for the program that generated it. The keys are held
+    /// A store whose keys are exportable, as the macOS login keychain
+    /// makes a key for the program that generated it. The roles in `held`
+    /// are the exception: their keys are non-exportable. The keys are held
     /// under the custody rule of `build`.
     struct ExportableStore {
         build: keys::Build,
+        held: Vec<Role>,
         pairs: Mutex<std::collections::HashMap<Role, Arc<rcgen::KeyPair>>>,
     }
 
@@ -3100,20 +3102,23 @@ mod tests {
         role: Role,
         pair: Arc<rcgen::KeyPair>,
         build: keys::Build,
+        exportable: bool,
     }
 
     impl ExportableStore {
         fn new(build: keys::Build) -> Self {
             Self {
                 build,
+                held: Vec::new(),
                 pairs: Mutex::default(),
             }
         }
 
         /// A store that holds a key for each role, as a debug build left
-        /// them.
-        fn holding_every_key(build: keys::Build) -> Self {
-            let store = Self::new(build);
+        /// them. The keys of the roles in `held` are non-exportable.
+        fn holding_every_key(build: keys::Build, held: &[Role]) -> Self {
+            let mut store = Self::new(build);
+            store.held = held.to_vec();
             for role in Role::ALL {
                 store.pairs.lock().unwrap().insert(
                     role,
@@ -3128,6 +3133,7 @@ mod tests {
                 role,
                 pair,
                 build: self.build,
+                exportable: !self.held.contains(&role),
             }
         }
     }
@@ -3142,7 +3148,7 @@ mod tests {
         }
 
         fn exportable(&self) -> bool {
-            true
+            self.exportable
         }
 
         fn build(&self) -> keys::Build {
@@ -3259,8 +3265,9 @@ mod tests {
     }
 
     // BEP-014, BEP-059: a release build refuses an exportable key where the
-    // keychain generates it, and at the CA when a debug build left it in the
-    // keychain. It writes no warning.
+    // keychain generates it, and when a debug build left it in the keychain:
+    // at the CA for the root and signing keys, and at load for the sealing
+    // key. It writes no warning.
     #[test]
     fn a_release_build_refuses_an_exportable_key_at_both_sites() {
         let dir = tempfile::tempdir().unwrap();
@@ -3279,7 +3286,7 @@ mod tests {
         assert!(store.pairs.lock().unwrap().is_empty(), "no key is held");
         assert!(!path.exists());
 
-        let store = ExportableStore::holding_every_key(keys::Build::Release);
+        let store = ExportableStore::holding_every_key(keys::Build::Release, &[Role::Sealing]);
         let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
         assert_eq!(
             refused,
@@ -3288,6 +3295,24 @@ mod tests {
         assert!(
             !log.contains("although the keychain made it exportable"),
             "{log}"
+        );
+        assert!(!path.exists());
+
+        let store =
+            ExportableStore::holding_every_key(keys::Build::Release, &[Role::Root, Role::Signing]);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the key store failed for the sealing key: the keychain made the key exportable."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert_eq!(
+            store.pairs.lock().unwrap().len(),
+            3,
+            "the store keeps its keys"
         );
         assert!(!path.exists());
     }

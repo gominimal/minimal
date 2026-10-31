@@ -186,12 +186,13 @@ pub fn custody<K: HeldKey + ?Sized>(key: &K, build: Build) -> Custody {
     }
 }
 
-/// The generation site's refusal of a key that [`custody`] refuses.
+/// The refusal of a key that [`custody`] refuses, where the keychain
+/// generates a key and where [`load`] finds a sealing key.
 ///
 /// # Errors
 ///
-/// [`KeyError::Store`] when the build refuses the newly generated `key`
-/// because the keychain made it exportable.
+/// [`KeyError::Store`] when the build refuses `key` because the keychain
+/// made it exportable.
 pub fn keep_generated<K: HeldKey + ?Sized>(key: &K) -> Result<(), KeyError> {
     match custody(key, key.build()) {
         Custody::Refused => Err(KeyError::Store {
@@ -312,6 +313,13 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
     for role in Role::ALL {
         match store.find(role) {
             Ok(Some(key)) => match key.probe() {
+                // BEP-059: the CA refuses an exportable root or signing key.
+                // The sealing key has no such site, so a release build
+                // refuses it here when a debug build left it exportable.
+                Ok(()) if role == Role::Sealing => {
+                    keep_generated(&key).map_err(StartError::Store)?;
+                    found.push((role, Some(key)));
+                }
                 Ok(()) => found.push((role, Some(key))),
                 Err(err @ KeyError::Refused { .. }) => {
                     tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
