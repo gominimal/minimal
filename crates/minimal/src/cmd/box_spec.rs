@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreReference, StoreRules, refusals,
+    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -72,7 +72,12 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
-        .filter(|refusal| matches!(refusal, BepRefusal::NarrowScopesUnenrolled { .. }))
+        .filter(|refusal| {
+            matches!(
+                refusal,
+                BepRefusal::NarrowScopesUnenrolled { .. } | BepRefusal::BrokerScopeNotGithub { .. }
+            )
+        })
         .collect();
     if !narrow.is_empty() {
         return Err(ActivationRefused { refusals: narrow }.into());
@@ -115,27 +120,29 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
                 )?;
             }
         }
-        for scope in grant.scopes.iter().filter(|s| !s.starts_with("github:")) {
-            // BEP-038, BEP-063: the authorities the matching rule registers
-            // are the upstream the store handle carries.
-            // A deny rule never redeems the reference, whatever upstream it
-            // keeps, so the row says it is denied and lists no authorities.
-            match StoreReference::parse(name, scope).rule(inputs.store_rules) {
-                Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
-                    out,
-                    "store  {scope}  {name}  denied by its rule in [secret-store-rules] in config.toml"
-                )?,
-                Some(rule) if !rule.upstream.is_empty() => writeln!(
-                    out,
-                    "store  {scope}  {name}  upstream {}",
-                    rule.upstream.join(", ")
-                )?,
-                Some(_) => writeln!(out, "store  {scope}  {name}  no upstream registered")?,
-                None => writeln!(
-                    out,
-                    "store  {scope}  {name}  no rule in [secret-store-rules] in config.toml"
-                )?,
-            }
+    }
+    for reference in store_references(inputs.secrets) {
+        // BEP-038, BEP-063: the authorities the matching rule registers
+        // are the upstream the store handle carries.
+        // A deny rule never redeems the reference, whatever upstream it
+        // keeps, so the row says it is denied and lists no authorities.
+        let item = reference.item();
+        let name = reference.grant;
+        match reference.rule(inputs.store_rules) {
+            Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
+                out,
+                "store  {item}  {name}  denied by its rule in [secret-store-rules] in config.toml"
+            )?,
+            Some(rule) if !rule.upstream.is_empty() => writeln!(
+                out,
+                "store  {item}  {name}  upstream {}",
+                rule.upstream.join(", ")
+            )?,
+            Some(_) => writeln!(out, "store  {item}  {name}  no upstream registered")?,
+            None => writeln!(
+                out,
+                "store  {item}  {name}  no rule in [secret-store-rules] in config.toml"
+            )?,
         }
     }
 
@@ -265,6 +272,15 @@ mod tests {
         }
     }
 
+    /// A store reference as a box spec writes it: `source = "store"` with
+    /// `store` and `id`.
+    fn store_grant(store: &str, id: &str) -> SecretGrant {
+        toml::from_str(&format!(
+            "source = \"store\"\nstore = \"{store}\"\nid = \"{id}\""
+        ))
+        .expect("a store reference parses")
+    }
+
     fn proxy_env() -> BepSettings {
         BepSettings {
             steering: Some(Steering::ProxyEnv),
@@ -298,7 +314,8 @@ mod tests {
     /// matching rule registers, and only a rule for the same store matches.
     #[test]
     fn box_spec_lists_store_references_with_their_authorities() {
-        let secrets = SecretGrants::from([("CLAUDE".to_string(), grant(&["keychain:claude"]))]);
+        let secrets =
+            SecretGrants::from([("CLAUDE".to_string(), store_grant("keychain", "claude"))]);
         let rule = |store: &str| boxes::core::bep::StoreRuleConfig {
             store: Some(store.to_string()),
             upstream: vec![
@@ -332,7 +349,7 @@ mod tests {
         let text = render_with(&rules);
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  upstream api.anthropic.com, \
+                "store  claude  CLAUDE  upstream api.anthropic.com, \
                  console.anthropic.com:8443\n"
             ),
             "{text}"
@@ -343,7 +360,7 @@ mod tests {
         let text = render_with(&other);
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
+                "store  claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
             ),
             "{text}"
         );
@@ -354,12 +371,75 @@ mod tests {
         let text = render_with(&StoreRules::from([("claude".to_string(), denied)]));
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  denied by its rule in [secret-store-rules] in \
+                "store  claude  CLAUDE  denied by its rule in [secret-store-rules] in \
                  config.toml\n"
             ),
             "{text}"
         );
         assert!(!text.contains("api.anthropic.com"), "{text}");
+
+        // A rule with no store is a rule for the keychain.
+        let mut native = rule("keychain");
+        native.store = None;
+        let text = render_with(&StoreRules::from([("claude".to_string(), native)]));
+        assert!(
+            text.contains("store  claude  CLAUDE  upstream api.anthropic.com"),
+            "{text}"
+        );
+
+        // A reference in another store names the store.
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), store_grant("vault", "claude"))]);
+        let mut out = Vec::new();
+        render(
+            &SpecInputs {
+                root_fingerprint: Some("abc123"),
+                bep: &proxy_env(),
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                github_hosts: HOSTS,
+                store_rules: &other,
+            },
+            &mut out,
+        )
+        .expect("renders");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.contains("store  vault:claude  CLAUDE  upstream api.anthropic.com"),
+            "{text}"
+        );
+
+        // A broker scope is not a store reference. The preview refuses it,
+        // as box creation does.
+        let secrets = SecretGrants::from([
+            ("CLAUDE".to_string(), store_grant("vault", "claude")),
+            ("OLD".to_string(), grant(&["claude"])),
+        ]);
+        let mut out = Vec::new();
+        let error = render(
+            &SpecInputs {
+                root_fingerprint: Some("abc123"),
+                bep: &proxy_env(),
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                github_hosts: HOSTS,
+                store_rules: &other,
+            },
+            &mut out,
+        )
+        .expect_err("the old spelling is refused");
+        let refused = error
+            .downcast_ref::<ActivationRefused>()
+            .expect("an activation refusal");
+        assert_eq!(
+            refused.refusals,
+            vec![BepRefusal::BrokerScopeNotGithub {
+                grant: "OLD".into(),
+                scope: "claude".into(),
+            }]
+        );
+        assert!(out.is_empty(), "no rows before the refusal");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
@@ -368,7 +448,7 @@ mod tests {
     fn box_spec_renders_ca_upstreams_steering_and_references() {
         let secrets = SecretGrants::from([
             ("GH_TOKEN".to_string(), grant(&["github:user-token"])),
-            ("NPM_TOKEN".to_string(), grant(&["keychain:npm"])),
+            ("NPM_TOKEN".to_string(), store_grant("keychain", "npm")),
         ]);
         let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
         assert_eq!(
@@ -376,7 +456,7 @@ mod tests {
             "root CA  certificate SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
-             store  keychain:npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
+             store  npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
              steering  proxy_env\n\
              quic443  allowed (HTTP/3 bypasses the proxy)\n"
         );

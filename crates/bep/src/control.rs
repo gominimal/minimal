@@ -1447,8 +1447,8 @@ impl Control {
 
     /// [`Control::bind`], with the client key registry bounded by `bound`
     /// in place of [`KeyBound::default`]. The restore applies `bound`, so a
-    /// larger bound keeps each key the file holds inside it. The proxy
-    /// binary does not call it, so its bound is the fixed default.
+    /// larger bound keeps each key the file holds inside it. `bep serve`
+    /// calls it with the value of `--max-client-keys`.
     ///
     /// # Errors
     ///

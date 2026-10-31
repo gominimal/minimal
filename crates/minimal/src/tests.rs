@@ -4819,14 +4819,30 @@ mod mint_tests {
     // proxy.
     #[test]
     fn a_grant_box_with_no_proxy_is_refused_as_an_unenrolled_node() {
+        use boxes::core::bep::ProxyAbsence;
         let dir = tempfile::tempdir().unwrap();
         let identity = dir.path().join("identity.json");
         let control = dir.path().join("control.sock");
+        let binary = dir.path().join("bep");
+        let log = dir.path().join("bep.log");
         assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
         assert!(!crate::cmd::proxy_present(None, None));
 
+        // No `bep` program: the proxy is not installed.
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotInstalled {
+                path: Some(binary.clone())
+            })
+        );
         let err =
-            crate::cmd::check_github_grants(&github_secrets(), false, &signed_in()).unwrap_err();
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
         let refused = refusal(&err);
         assert_eq!(
             refused.refusals[0].code(),
@@ -4839,14 +4855,128 @@ mod mint_tests {
         assert_eq!(refused.exit_code(), 5);
         assert_eq!(
             refused.to_string(),
-            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and no Box Egress \
-             Proxy serves boxes on this machine. Remove the grant from the [secrets] table in \
-             minimal.toml, then create the box again."
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is not installed at {}, so no proxy serves boxes on this \
+                 machine. To create the box without the grant, remove GH_TOKEN from \
+                 [session.secrets] in minimal.toml.",
+                binary.display()
+            )
+        );
+        // No path resolved for the program: the text names none.
+        let err = crate::cmd::check_github_grants(
+            &github_secrets(),
+            crate::cmd::proxy_absence(
+                None,
+                None,
+                Err(bep::store::ProxyLookupError::NoMinvmd),
+                None,
+            ),
+            &signed_in(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the Box \
+             Egress Proxy, is not installed, so no proxy serves boxes on this machine. To \
+             create the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             minimal.toml."
+        );
+
+        // A relative MINVMD_BEP_BIN: the text names the variable and its
+        // value, not a missing program.
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Err(bep::store::ProxyLookupError::RelativeEnv("bin/bep".into())),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::RelativePath {
+                path: "bin/bep".into()
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and MINVMD_BEP_BIN \
+             sets `bep`, the Box Egress Proxy, to the relative path bin/bep, and no proxy \
+             serves boxes on this machine. Set MINVMD_BEP_BIN to an absolute path. To create \
+             the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             minimal.toml."
+        );
+
+        // A `bep` program that published nothing: installed, and not
+        // answering. With no log file written, the text names no log.
+        std::fs::write(&binary, "").unwrap();
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotAnswering {
+                path: binary.clone(),
+                log: None
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
+                 serves boxes on this machine. To create the box without the grant, remove \
+                 GH_TOKEN from [session.secrets] in minimal.toml.",
+                binary.display()
+            )
+        );
+        // With the log file written, the text names it.
+        std::fs::write(&log, "").unwrap();
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotAnswering {
+                path: binary.clone(),
+                log: Some(log.clone())
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
+                 serves boxes on this machine. The proxy's log is at {}. To create the box \
+                 without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml.",
+                binary.display(),
+                log.display()
+            )
         );
         // With no sign-in held either, the missing proxy is what is refused.
-        let err =
-            crate::cmd::check_github_grants(&github_secrets(), false, &MemoryKeychain::default())
-                .unwrap_err();
+        let err = crate::cmd::check_github_grants(
+            &github_secrets(),
+            Some(ProxyAbsence::NotInstalled { path: None }),
+            &MemoryKeychain::default(),
+        )
+        .unwrap_err();
         assert_eq!(
             refusal(&err).refusals[0].code(),
             Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
@@ -4856,8 +4986,12 @@ mod mint_tests {
         std::fs::write(&identity, "{}").unwrap();
         std::fs::write(&control, "").unwrap();
         assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        assert_eq!(
+            crate::cmd::proxy_absence(Some(&identity), Some(&control), Ok(binary), Some(log)),
+            None
+        );
         let err =
-            crate::cmd::check_github_grants(&github_secrets(), true, &MemoryKeychain::default())
+            crate::cmd::check_github_grants(&github_secrets(), None, &MemoryKeychain::default())
                 .unwrap_err();
         let refused = refusal(&err);
         assert_eq!(
@@ -4868,13 +5002,17 @@ mod mint_tests {
         // With a proxy and a sign-in, the grants pass. A box with no GitHub
         // grant is never refused.
         assert_eq!(
-            crate::cmd::check_github_grants(&github_secrets(), true, &signed_in()).unwrap(),
+            crate::cmd::check_github_grants(&github_secrets(), None, &signed_in()).unwrap(),
             ["GH_TOKEN"]
         );
         assert!(
-            crate::cmd::check_github_grants(&Default::default(), false, &MemoryKeychain::default())
-                .unwrap()
-                .is_empty()
+            crate::cmd::check_github_grants(
+                &Default::default(),
+                Some(ProxyAbsence::NotServed),
+                &MemoryKeychain::default()
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
