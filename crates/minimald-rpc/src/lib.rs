@@ -973,6 +973,41 @@ pub struct WithdrawPortRequest {
     pub source: PortReportSource,
 }
 
+/// Whether the listener a [`ListenNotice`] names opened or closed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenState {
+    /// A process in a host-address box started to listen on the port.
+    Listening,
+    /// The listener on the port closed.
+    Stopped,
+}
+
+/// The in-VM daemon's notice that a process in a host-address box started
+/// or stopped listening on a TCP port of the guest node (NET-138, NET-129):
+/// the fixed, size-bounded message the VM host daemon mirrors the node's
+/// binds from. It carries a port and a state and nothing else — no
+/// address, no path, no name, no box — so a forged notice can only select
+/// a port at the node's own host-allocated address, never say where the
+/// host binds it or for whom. Unknown fields refuse the line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListenNotice {
+    /// The TCP port the listener holds in the guest node's namespace.
+    pub port: u16,
+    /// Whether the listener opened or closed.
+    pub state: ListenState,
+}
+
+impl ListenNotice {
+    /// The longest request line a listen notice can be, its verb tag
+    /// included: `{"verb":"listen_notice","port":65535,"state":"listening"}`
+    /// is 57 bytes. The VM host daemon refuses a longer `listen_notice`
+    /// line before the mirror sees it. The line is parsed first, so before
+    /// the parse only the box control channel's own line bound applies.
+    pub const MAX_LINE_BYTES: usize = 96;
+}
+
 /// Who decided a dynamic ingress request, as the in-VM daemon's expose
 /// decision report names it ([`ExposeDecisionReport`]): the same three
 /// deciders, in the same kebab-case spelling, as the in-VM daemon's own
@@ -1503,6 +1538,13 @@ pub enum BoxControlRequest {
     /// channel, appended to the host's audit log under a per-box cap, and
     /// answered with [`BoxControlReply::Audited`].
     ReportRefusedEgress(RefusedEgressReport),
+    /// The in-VM daemon's notice that a host-address box's listener opened
+    /// or closed ([`ListenNotice`], NET-138): carried on the daemon's own
+    /// control channel. The VM host daemon mirrors the bind at the node's
+    /// own address and answers [`BoxControlReply::PortRecorded`] when the
+    /// mirror holds the notice, or [`BoxControlReply::Error`] naming why
+    /// it does not.
+    ListenNotice(ListenNotice),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's

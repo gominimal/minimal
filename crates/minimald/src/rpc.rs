@@ -1004,7 +1004,8 @@ async fn serve_answerer_control(
                 | BoxControlRequest::ProxyListening
                 | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
-                | BoxControlRequest::ReportRefusedEgress(_) => BoxControlReply::Error {
+                | BoxControlRequest::ReportRefusedEgress(_)
+                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),

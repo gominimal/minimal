@@ -3188,6 +3188,289 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
         .map(|word| Ipv4Addr::from(word.swap_bytes()))
 }
 
+/// Whether a process whose cgroup v2 path is `cgroup` (the path after
+/// `0::` in `/proc/<pid>/cgroup`) sits in the boxes subtree, matched as the
+/// classifier's packet filter matches it: the cgroup's ancestor at level 2
+/// is `<tree root>/boxes` (NET-078's cohort identity, NET-079). The daemon's
+/// own leaf is a sibling of that subtree, so its sockets never match.
+pub(crate) fn in_boxes_subtree(cgroup: &str) -> bool {
+    let tree = Path::new(sandbox::classifier::TREE_ROOT)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let mut levels = cgroup.trim().trim_start_matches('/').split('/');
+    tree.is_some_and(|tree| levels.next() == Some(tree))
+        && levels.next() == Some(sandbox::classifier::BOXES_DIR)
+}
+
+/// The TCP ports of the node's own network namespace that a process in the
+/// boxes subtree listens on, read from `proc_root` (`/proc` in the guest):
+/// the listeners of the host-address boxes, which share the node's
+/// namespace (NET-129). A listener counts only when a dial to `lease`, the
+/// node's own address, can reach it ([`binds_for_the_lease`]). A socket
+/// that `own_pid` or any process outside the boxes subtree also holds is
+/// never counted: the in-VM daemon sends no notice for a listener of its
+/// own, even one a box process inherited.
+pub(crate) fn host_address_listening_ports(
+    proc_root: &Path,
+    own_pid: u32,
+    lease: Ipv4Addr,
+) -> io::Result<BTreeSet<u16>> {
+    let mut by_inode: HashMap<u64, u16> = HashMap::new();
+    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
+        let text = match std::fs::read_to_string(proc_root.join(table)) {
+            Ok(text) => text,
+            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in text.lines().skip(1) {
+            let inode = line
+                .split_whitespace()
+                .nth(9)
+                .and_then(|word| word.parse().ok());
+            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
+                by_inode.insert(inode, port);
+            }
+        }
+    }
+    // Per listening socket: whether a box process holds it, and whether
+    // anything that is not a box process holds it too.
+    let mut held: HashMap<u64, (bool, bool)> = HashMap::new();
+    for entry in std::fs::read_dir(proc_root)?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let inodes: Vec<u64> = fds
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter_map(|target| {
+                target
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .filter(|inode| by_inode.contains_key(inode))
+            .collect();
+        if inodes.is_empty() {
+            continue;
+        }
+        let in_boxes = pid != own_pid
+            && std::fs::read_to_string(entry.path().join("cgroup"))
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("0::").map(in_boxes_subtree))
+                })
+                .unwrap_or(false);
+        for inode in inodes {
+            let holders = held.entry(inode).or_default();
+            if in_boxes {
+                holders.0 = true;
+            } else {
+                holders.1 = true;
+            }
+        }
+    }
+    Ok(held
+        .into_iter()
+        .filter(|(_, (box_holds, other_holds))| *box_holds && !*other_holds)
+        .filter_map(|(inode, _)| by_inode.get(&inode).copied())
+        .collect())
+}
+
+/// The longest wait before a refused or unanswered listen notice is sent
+/// again. The wait doubles from [`LISTEN_POLL_INTERVAL`] up to this bound.
+const LISTEN_NOTICE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The listen notices the in-VM daemon owes the VM host daemon for the
+/// host-address boxes (NET-138): the diff of one read of
+/// [`host_address_listening_ports`] against the ports the host holds as
+/// listening. A port moves into or out of that set only on a holding
+/// answer from the host ([`Self::answered`]). A notice the host refused or
+/// never answered stays owed, and is sent again after a per-port wait that
+/// doubles up to [`LISTEN_NOTICE_RETRY_MAX`].
+#[derive(Debug, Default)]
+pub(crate) struct HostAddressListens {
+    /// The ports the host answered a listening notice for and no stopped
+    /// notice since.
+    noticed: BTreeSet<u16>,
+    /// The ports whose last listening notice the host did not hold, and no
+    /// holding answer since. The host can still record such a port, for
+    /// example as a collision, so a port here that stops listening owes a
+    /// stopped notice too.
+    refused: BTreeSet<u16>,
+    /// Per port with a notice the host did not hold: when it is owed
+    /// again, and the wait the next failure earns.
+    retry: HashMap<u16, (std::time::Instant, Duration)>,
+}
+
+impl HostAddressListens {
+    /// The notices owed at `at` to move the host's ports to `now`: one
+    /// listening notice per new port and one stopped notice per closed
+    /// port, held or refused, less each port still in its retry wait. It
+    /// commits nothing.
+    pub(crate) fn notices(
+        &mut self,
+        now: &BTreeSet<u16>,
+        at: std::time::Instant,
+    ) -> Vec<minimald_rpc::ListenNotice> {
+        let stopped = self
+            .noticed
+            .union(&self.refused)
+            .filter(|port| !now.contains(port))
+            .map(|port| minimald_rpc::ListenNotice {
+                port: *port,
+                state: minimald_rpc::ListenState::Stopped,
+            });
+        let listening = now
+            .difference(&self.noticed)
+            .map(|port| minimald_rpc::ListenNotice {
+                port: *port,
+                state: minimald_rpc::ListenState::Listening,
+            });
+        let owed: Vec<_> = stopped.chain(listening).collect();
+        // A port that owes nothing any more forgets its wait.
+        self.retry
+            .retain(|port, _| owed.iter().any(|notice| notice.port == *port));
+        owed.into_iter()
+            .filter(|notice| {
+                self.retry
+                    .get(&notice.port)
+                    .is_none_or(|(due, _)| *due <= at)
+            })
+            .collect()
+    }
+
+    /// Records the host's answer to `notice` at `at`. `held` is whether
+    /// the host holds the notice: a listening port is then the host's, and
+    /// a stopped one is not. Any other answer leaves the port owed, and
+    /// sends it again after its wait.
+    pub(crate) fn answered(
+        &mut self,
+        notice: minimald_rpc::ListenNotice,
+        held: bool,
+        at: std::time::Instant,
+    ) {
+        if held {
+            self.retry.remove(&notice.port);
+            self.refused.remove(&notice.port);
+            match notice.state {
+                minimald_rpc::ListenState::Listening => self.noticed.insert(notice.port),
+                minimald_rpc::ListenState::Stopped => self.noticed.remove(&notice.port),
+            };
+            return;
+        }
+        if notice.state == minimald_rpc::ListenState::Listening {
+            self.refused.insert(notice.port);
+        }
+        let wait = self
+            .retry
+            .get(&notice.port)
+            .map_or(LISTEN_POLL_INTERVAL, |(_, wait)| *wait);
+        let next = (wait * 2).min(LISTEN_NOTICE_RETRY_MAX);
+        self.retry.insert(notice.port, (at + wait, next));
+    }
+}
+
+/// Sends the host-address boxes' listen notices to the VM host daemon until
+/// `stop` turns true: every [`LISTEN_POLL_INTERVAL`] it reads
+/// [`host_address_listening_ports`] under `/proc` for `lease`, the node's
+/// own address, and sends one notice per change ([`HostAddressListens`]).
+/// A read that fails is logged and retried on the next poll. A notice the
+/// host refuses or never answers is logged and sent again after its retry
+/// wait. A native host has no report door, so this returns at once.
+pub(crate) async fn watch_host_address_listens(
+    control: ControlChannel,
+    lease: Ipv4Addr,
+    mut stop: watch::Receiver<bool>,
+) {
+    if box_report_channel(&control).is_none() {
+        return;
+    }
+    let own_pid = std::process::id();
+    let mut listens = HostAddressListens::default();
+    while !*stop.borrow() {
+        match host_address_listening_ports(Path::new("/proc"), own_pid, lease) {
+            Ok(ports) => {
+                for notice in listens.notices(&ports, std::time::Instant::now()) {
+                    let answer = send_listen_notice(&control, notice).await;
+                    let held = matches!(
+                        answer,
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. }))
+                    );
+                    match answer {
+                        Ok(Some(minimald_rpc::BoxControlReply::Error { error })) => {
+                            tracing::warn!(
+                                port = notice.port,
+                                state = ?notice.state,
+                                reason = %error,
+                                "the VM host daemon refused a host-address box's listen notice"
+                            );
+                        }
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. })) => {
+                            tracing::debug!(
+                                port = notice.port,
+                                state = ?notice.state,
+                                "the VM host daemon holds a host-address box's listen notice"
+                            );
+                        }
+                        Ok(other) => tracing::warn!(
+                            port = notice.port,
+                            state = ?notice.state,
+                            answer = ?other,
+                            "the VM host daemon answered a host-address box's listen notice \
+                             with an unexpected reply"
+                        ),
+                        Err(error) => tracing::warn!(
+                            port = notice.port,
+                            state = ?notice.state,
+                            reason = %error,
+                            "a host-address box's listen notice got no answer"
+                        ),
+                    }
+                    listens.answered(notice, held, std::time::Instant::now());
+                }
+            }
+            Err(error) => tracing::warn!(
+                reason = %error,
+                "could not read the node's listening sockets for the host-address boxes"
+            ),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LISTEN_POLL_INTERVAL) => {}
+            changed = stop.changed() => if changed.is_err() { return; },
+        }
+    }
+}
+
+/// Sends one listen notice to the VM host daemon's report door and returns
+/// its answer. A native host has no door: `Ok(None)` without a round trip.
+///
+/// # Errors
+///
+/// The exchange's error when no answer arrived before [`REPORT_DEADLINE`].
+pub(crate) async fn send_listen_notice(
+    control: &ControlChannel,
+    notice: minimald_rpc::ListenNotice,
+) -> io::Result<Option<minimald_rpc::BoxControlReply>> {
+    let Some(channel) = box_report_channel(control) else {
+        return Ok(None);
+    };
+    let request = minimald_rpc::BoxControlRequest::ListenNotice(notice);
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    report_exchange(&channel, &request, deadline)
+        .await
+        .map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -6219,5 +6502,170 @@ mod tests {
         door_task.abort();
         server.abort();
         drop(listener);
+    }
+
+    /// One fake `/proc` entry: `pid` with `cgroup` and fds onto `inodes`.
+    fn fake_process(root: &Path, pid: u32, cgroup: &str, inodes: &[u64]) {
+        let entry = root.join(pid.to_string());
+        std::fs::create_dir_all(entry.join("fd")).expect("a fake fd dir");
+        std::fs::write(entry.join("cgroup"), format!("0::{cgroup}\n")).expect("a fake cgroup");
+        for (n, inode) in inodes.iter().enumerate() {
+            std::os::unix::fs::symlink(
+                format!("socket:[{inode}]"),
+                entry.join("fd").join(n.to_string()),
+            )
+            .expect("a fake socket fd");
+        }
+    }
+
+    /// NET-138: the in-VM daemon notices a listen or a close only for a
+    /// socket a process in the boxes subtree holds, matched as the
+    /// classifier matches the subtree, and never for a listener of its own
+    /// or one any process outside the subtree holds.
+    #[test]
+    fn listen_notice_only_for_box_cgroup_sockets() {
+        assert!(in_boxes_subtree("/minimald.slice/boxes/allow/web"));
+        assert!(in_boxes_subtree("/minimald.slice/boxes/deny/db\n"));
+        assert!(!in_boxes_subtree("/minimald.slice/daemon"));
+        assert!(!in_boxes_subtree("/minimald.slice"));
+        assert!(!in_boxes_subtree("/boxes/allow/web"));
+        assert!(!in_boxes_subtree(
+            "/other.slice/minimald.slice/boxes/allow/web"
+        ));
+        assert!(!in_boxes_subtree("/"));
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("net")).expect("a fake net dir");
+        // Listeners on the any address, ports 0x1F90 (8080), 0x0BB8
+        // (3000), 0x1A0A (6666), 0x1E61 (7777) and 0x08AE (2222); one
+        // established socket on 0x2328 (9000).
+        let row = |sl: u32, port: &str, state: &str, inode: u64| {
+            format!(
+                "{sl:4}: 00000000:{port} 00000000:0000 {state} 00000000:00000000 00:00000000 \
+                 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0"
+            )
+        };
+        let table = [
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode".to_string(),
+            row(0, "1F90", "0A", 101),
+            row(1, "0BB8", "0A", 102),
+            row(2, "1A0A", "0A", 103),
+            row(3, "1E61", "0A", 104),
+            row(4, "08AE", "0A", 105),
+            row(5, "2328", "01", 106),
+        ]
+        .join("\n");
+        std::fs::write(root.join("net/tcp"), table).expect("a fake tcp table");
+        let own_pid = 10;
+        // A box process listens on 8080 and 3000, and holds the established
+        // socket too.
+        fake_process(
+            root,
+            20,
+            "/minimald.slice/boxes/allow/web",
+            &[101, 102, 106],
+        );
+        // The daemon's own listener, in its own leaf.
+        fake_process(root, own_pid, "/minimald.slice/daemon", &[105]);
+        // A box process inherited the daemon's 6666 listener: still the
+        // daemon's own.
+        fake_process(root, 21, "/minimald.slice/boxes/deny/db", &[103]);
+        fake_process(root, own_pid + 1, "/minimald.slice/daemon", &[103]);
+        // A process outside the minimald tree listens on 7777.
+        fake_process(root, 30, "/init.scope", &[104]);
+
+        let lease = Ipv4Addr::new(192, 168, 127, 2);
+        let ports =
+            host_address_listening_ports(root, own_pid, lease).expect("the fake proc reads");
+        assert_eq!(ports, BTreeSet::from([3000, 8080]));
+
+        let mut listens = HostAddressListens::default();
+        let at = std::time::Instant::now();
+        let notices = listens.notices(&ports, at);
+        assert_eq!(
+            notices,
+            vec![
+                minimald_rpc::ListenNotice {
+                    port: 3000,
+                    state: minimald_rpc::ListenState::Listening
+                },
+                minimald_rpc::ListenNotice {
+                    port: 8080,
+                    state: minimald_rpc::ListenState::Listening
+                },
+            ]
+        );
+        // Only a holding answer commits a port. The host held 3000 and
+        // refused 8080, so 8080 stays owed after its wait.
+        listens.answered(notices[0], true, at);
+        listens.answered(notices[1], false, at);
+        assert!(
+            listens.notices(&ports, at).is_empty(),
+            "a held port owes nothing, and a refused one waits"
+        );
+        assert_eq!(
+            listens.notices(&ports, at + LISTEN_POLL_INTERVAL),
+            vec![notices[1]],
+            "a refused notice is sent again after its wait"
+        );
+        listens.answered(notices[1], true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&ports, at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty(),
+            "an unchanged read owes nothing"
+        );
+        let stop_3000 = minimald_rpc::ListenNotice {
+            port: 3000,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at),
+            vec![stop_3000]
+        );
+        // A stopped notice that got no answer stays owed too.
+        listens.answered(stop_3000, false, at);
+        assert!(listens.notices(&BTreeSet::from([8080]), at).is_empty());
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at + LISTEN_POLL_INTERVAL),
+            vec![stop_3000]
+        );
+        listens.answered(stop_3000, true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&BTreeSet::from([8080]), at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty()
+        );
+        // A port the host refused and that then closes owes a stopped
+        // notice, so the host forgets what it recorded for it, such as a
+        // collision. 8080 is refused again here, then its listener closes.
+        let stop_8080 = minimald_rpc::ListenNotice {
+            port: 8080,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        let mut refused = HostAddressListens::default();
+        refused.answered(notices[1], false, at);
+        let later = at + LISTEN_NOTICE_RETRY_MAX;
+        assert_eq!(
+            refused.notices(&BTreeSet::new(), later),
+            vec![stop_8080],
+            "a refused port that closes owes a stopped notice"
+        );
+        refused.answered(stop_8080, true, later);
+        assert!(
+            refused.notices(&BTreeSet::new(), later).is_empty(),
+            "a held stopped notice clears the refused port"
+        );
+        // The wire line is the fixed notice: a port and a state alone.
+        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlRequest::ListenNotice(
+            notices[0],
+        ))
+        .expect("the notice serializes");
+        assert_eq!(
+            line,
+            r#"{"verb":"listen_notice","port":3000,"state":"listening"}"#
+        );
+        assert!(line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES);
     }
 }
