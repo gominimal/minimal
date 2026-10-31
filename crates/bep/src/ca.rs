@@ -34,7 +34,7 @@ use rustls_pki_types::CertificateDer;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-use crate::keys::{HeldKey, KeyError, Role};
+use crate::keys::{self, Custody, HeldKey, KeyError, Role};
 use crate::module::Module;
 
 /// The infrastructure deny set: the names that the root never permits, also
@@ -273,8 +273,8 @@ pub enum CaError {
         /// The role of the key it got.
         got: Role,
     },
-    /// A key passed for a CA role is exportable. The proxy holds only
-    /// non-exportable keys.
+    /// A key passed for a CA role is exportable. A release build of the
+    /// proxy holds only non-exportable keys.
     #[error("the proxy {0} key is exportable, so the proxy does not use it for a CA")]
     Exportable(Role),
     /// The certificate encoding failed.
@@ -712,16 +712,18 @@ fn subject(common_name: &str) -> DistinguishedName {
     name
 }
 
-/// Refuses a CA key that does not hold `expected` or that is exportable.
+/// Refuses a CA key that does not hold `expected`, or that is exportable in
+/// a build whose custody rule refuses it.
 fn check_key<K: HeldKey>(key: &K, expected: Role) -> Result<(), CaError> {
     let got = key.role();
     if got != expected {
         return Err(CaError::WrongRole { expected, got });
     }
-    if key.exportable() {
-        return Err(CaError::Exportable(got));
+    // BEP-014, BEP-059: the same custody rule as the keychain's generation.
+    match keys::custody(key, key.build()) {
+        Custody::Refused => Err(CaError::Exportable(got)),
+        Custody::Held | Custody::KeptExportable => Ok(()),
     }
-    Ok(())
 }
 
 fn root_params(union: &Union, now: SystemTime) -> Result<CertificateParams, CaError> {
@@ -780,6 +782,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use crate::keys::Build;
     use crate::module::{Authority, GITHUB, HTTPS_PORT};
     use crate::seal::ProxyPublicKey;
 
@@ -788,6 +791,7 @@ mod tests {
         role: Role,
         pair: KeyPair,
         exportable: bool,
+        build: Build,
     }
 
     impl TestKey {
@@ -796,6 +800,7 @@ mod tests {
                 role,
                 pair: KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap(),
                 exportable: false,
+                build: Build::Release,
             }
         }
     }
@@ -809,6 +814,9 @@ mod tests {
         }
         fn exportable(&self) -> bool {
             self.exportable
+        }
+        fn build(&self) -> Build {
+            self.build
         }
         fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
             Err(KeyError::Store {
@@ -1198,12 +1206,32 @@ mod tests {
             );
         }
 
-        let exportable = TestKey {
+        // BEP-014, BEP-059: a release build refuses an exportable root or
+        // signing key, and a debug build keeps it and starts its CA.
+        let exportable = |role, build| TestKey {
             exportable: true,
-            ..TestKey::new(Role::Signing)
+            build,
+            ..TestKey::new(role)
         };
-        let err = Ca::new(&root_key, &exportable, union(), now()).unwrap_err();
+        let signing = exportable(Role::Signing, Build::Release);
+        let err = Ca::new(&root_key, &signing, union(), now()).unwrap_err();
         assert!(matches!(err, CaError::Exportable(Role::Signing)), "{err:?}");
+        let root = exportable(Role::Root, Build::Release);
+        let err = Ca::new(&root, &signing_key, union(), now()).unwrap_err();
+        assert!(matches!(err, CaError::Exportable(Role::Root)), "{err:?}");
+        let err = issue_root(&root, union(), now()).unwrap_err();
+        assert!(matches!(err, CaError::Exportable(Role::Root)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the proxy root key is exportable, so the proxy does not use it for a CA"
+        );
+
+        let root = exportable(Role::Root, Build::Debug);
+        let signing = exportable(Role::Signing, Build::Debug);
+        let ca = Ca::new(&root, &signing, union(), now()).unwrap();
+        ca.issue_leaf("api.github.com", now()).unwrap();
+        let issued = issue_root(&root, union(), now()).unwrap();
+        Ca::with_root(&root, &signing, issued, now()).unwrap();
     }
 
     #[test]
