@@ -548,9 +548,6 @@ async fn bridge_exec(
     Ok(exit_status)
 }
 
-/// Run a declared task in an ephemeral session: create, upload, exec the
-/// canonical in-box `min task run <task>`, relay its exit code, and let the
-/// daemon end the session with the run (NET-131) — or keep it with `--keep`.
 /// The name the create of a task with no spec carries (BOX-163): the
 /// task's name, cleaned as the daemon cleans a spec's entry. The daemon
 /// sends a request name unchanged to its name check, so a `build_all` task
@@ -559,6 +556,9 @@ fn interactive_task_box_name(task: &str) -> String {
     boxes::box_name::entry_box_name(task)
 }
 
+/// Run a declared task in an ephemeral session: create, upload, exec the
+/// canonical in-box `min task run <task>`, relay its exit code, and let the
+/// daemon end the session with the run (NET-131) — or keep it with `--keep`.
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
