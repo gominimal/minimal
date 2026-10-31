@@ -565,7 +565,113 @@ pub(crate) fn named_record(
     record: Option<boxes::Record>,
     session: &str,
 ) -> Result<boxes::Record, anyhow::Error> {
-    record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
+    record.ok_or_else(|| BoxNotFound(format!("No session found matching '{session}'")).into())
+}
+
+/// A box name that resolved to no box a command can reach; the message says
+/// why. Typed so a caller can tell the miss from a failed RPC: the selected
+/// VM's own miss ([`named_record`]), no running VM holding the name
+/// ([`no_running_vm_has_box`]), or the box on a stopped VM
+/// ([`box_on_stopped_vm`]).
+#[derive(Debug)]
+pub(crate) struct BoxNotFound(pub(crate) String);
+
+impl std::fmt::Display for BoxNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoxNotFound {}
+
+/// The refusal for a box name no running VM holds, on a host with more than
+/// one VM (NET-058). `example` is the command the user ran, after `min` and
+/// with the box name in place, such as `session policy beta`.
+pub(crate) fn no_running_vm_has_box(name: &str, example: &str) -> String {
+    format!(
+        "no running VM has a box named '{name}'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> {example}"
+    )
+}
+
+/// The refusal for a box name only a stopped VM's persisted records hold
+/// (NET-152). `min --vm <vm> session attach <box>` starts that VM:
+/// `--vm` selects it before any path resolves, and the attach runs
+/// `ensure_daemon`, which spawns the selected VM's `minvmd`
+/// (`autospawn::ensure_minvmd_running`).
+pub(crate) fn box_on_stopped_vm(name: &str, vm: &str) -> String {
+    format!(
+        "box '{name}' is on VM '{vm}', which is stopped. \
+         Start it with: min --vm {vm} session attach {name}"
+    )
+}
+
+/// The box `name` resolved across every VM once the selected VM's daemon
+/// missed it with `selected` (NET-058): the VM that owns it, published as
+/// this process's VM so everything keyed on the VM's name follows it, as
+/// `--vm` would have.
+///
+/// No VM owns it: the selected VM's own error, unless that error is the miss
+/// itself on a host with more than one VM and no `--vm`. Then the refusal
+/// says no running VM holds the name and shows `--vm` on `example`
+/// ([`no_running_vm_has_box`]). A box only a stopped VM holds is refused by
+/// the resolution itself ([`box_on_stopped_vm`]).
+pub(crate) async fn resolve_box_on_another_vm(
+    global: &GlobalArgs,
+    name: &str,
+    example: &str,
+    selected: anyhow::Error,
+) -> Result<crate::attach::ResolvedBoxVm, anyhow::Error> {
+    if let Some(resolved) = crate::attach::resolve_box_vm(global, name).await? {
+        // From here the process acts on the owning VM, as `--vm` would have
+        // made it: everything keyed on the VM's name (the VM host control
+        // socket the pre-attach re-hold asks, the answerer beside it) must be
+        // that VM's. The enumeration validated the name; a second set (none
+        // happens before a resolution) is a no-op.
+        let _ = client::set_vm_name(&resolved.vm);
+        return Ok(resolved);
+    }
+    if global.vm.is_none()
+        && selected.downcast_ref::<BoxNotFound>().is_some()
+        && several_vms(global)
+    {
+        return Err(BoxNotFound(no_running_vm_has_box(name, example)).into());
+    }
+    Err(selected)
+}
+
+/// Whether this host has more than one VM, running or not: only then can a
+/// box be on a VM other than the selected one.
+fn several_vms(global: &GlobalArgs) -> bool {
+    client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())
+        .is_ok_and(|vms| vms.len() > 1)
+}
+
+/// Resolve `name` to its record and a client connected to the VM that owns
+/// it, for the commands that act on a named box over the daemon's RPCs
+/// rather than an ssh hand-off: `min session policy` and `min session
+/// destroy` (NET-058). The selected VM's `client` is asked first. When its
+/// daemon does not know the name, [`resolve_box_on_another_vm`] finds the
+/// owning VM, and the client returned is connected to that VM's socket.
+/// `example` is the command the user ran, for the not-found refusal.
+pub(crate) async fn resolve_box_on_any_vm(
+    global: &GlobalArgs,
+    mut client: client::Client,
+    name: &str,
+    example: &str,
+) -> Result<(client::Client, boxes::Record), anyhow::Error> {
+    match resolve_session(&mut client, name).await {
+        Ok(record) => Ok((client, record)),
+        Err(selected) => {
+            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
+            let client = client::Client::connect(&resolved.sock)
+                .await
+                .with_context(|| {
+                    format!("Failed to connect to the daemon of VM {}", resolved.vm)
+                })?;
+            Ok((client, resolved.record))
+        }
+    }
 }
 
 /// `ListSessions` with the daemon's build asserted off the same reply, for the

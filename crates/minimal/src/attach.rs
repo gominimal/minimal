@@ -153,6 +153,20 @@ impl<W: Write> Drop for TerminalUnwind<W> {
     }
 }
 
+/// The interactive attach could not take the terminal, so it never changed
+/// it: the marker that tells the attach a failure owes the terminal no
+/// unwind ([`crate::cmd::interactive_attach`]).
+#[derive(Debug)]
+pub(crate) struct TerminalNotTaken;
+
+impl fmt::Display for TerminalNotTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the interactive attach needs a terminal, but none could be taken")
+    }
+}
+
+impl std::error::Error for TerminalNotTaken {}
+
 /// The current working directory as a host path, respecting the `--repo-dir`
 /// (`-C`) override. The result is canonicalized so it compares equal to a
 /// `Record.project_path`, which `cmd_activate` canonicalizes at create time.
@@ -265,10 +279,12 @@ pub(crate) struct ResolvedBoxVm {
 /// original error (the selected VM's — usually the more useful of the two).
 /// An explicit `--vm` pins where to look, so it resolves nothing: the
 /// operator chose, and a resolution across the others would override that
-/// choice. A VM that is not running cannot own the name — an answer given
-/// without a word, since finding a stopped VM is the normal case on a host
-/// with several — and a VM whose daemon answers nothing is skipped with a
-/// warning, so the name is resolved from the VMs that did answer. Each look
+/// choice. A VM that is not running is asked through its persisted box
+/// records instead (NET-152): a name only a stopped VM holds is refused with
+/// a [`crate::cmd::BoxNotFound`] that names the VM and the command that
+/// starts it, and a name a running VM owns wins over a stopped VM's record.
+/// A VM whose daemon answers nothing is skipped with a warning, so the name
+/// is resolved from the VMs that did answer. Each look
 /// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
 /// the host, and a wedged one must not hold an attach for the stacked
 /// connect, handshake and RPC deadlines (~72 s each).
@@ -288,11 +304,18 @@ pub(crate) async fn resolve_box_vm(
     let vms =
         crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     let mut owners: Vec<ResolvedBoxVm> = Vec::new();
+    // The stopped VMs whose persisted box records hold the name (NET-152):
+    // asked only when no running VM owns it.
+    let mut stopped_holders: Vec<String> = Vec::new();
     for vm in vms {
-        // A VM that is not running cannot own the name. The check is free, so
-        // it is made first; the probe classifies the cases it cannot see — a
-        // socket that vanished mid-walk reads the same as one never bound.
+        // A VM that is not running has no daemon to ask, so its persisted
+        // records answer for it. The check is free, so it is made first; the
+        // probe classifies the cases it cannot see — a socket that vanished
+        // mid-walk reads the same as one never bound.
         if !vm.sock.exists() {
+            if stopped_vm_holds(&vm, name) {
+                stopped_holders.push(vm.vm);
+            }
             continue;
         }
         #[expect(
@@ -308,12 +331,17 @@ pub(crate) async fn resolve_box_vm(
                 )
             });
         match look {
-            Ok(Ok(Some(record))) => owners.push(ResolvedBoxVm {
+            Ok(Ok(BoxLook::Found(record))) => owners.push(ResolvedBoxVm {
                 vm: vm.vm,
                 sock: vm.sock,
-                record,
+                record: *record,
             }),
-            Ok(Ok(None)) => {}
+            Ok(Ok(BoxLook::Absent)) => {}
+            Ok(Ok(BoxLook::NotRunning)) => {
+                if stopped_vm_holds(&vm, name) {
+                    stopped_holders.push(vm.vm);
+                }
+            }
             // VMs that could not be looked at are named, not silent: a
             // resolution that quietly could not look would read as "no such
             // box".
@@ -324,10 +352,34 @@ pub(crate) async fn resolve_box_vm(
         }
     }
     match owners.len() {
-        0 => Ok(None),
+        0 => match stopped_holders.as_slice() {
+            [] => Ok(None),
+            // NET-152: the box is there, on a VM that is down. Say which VM
+            // and the command that starts it: `--vm` selects the VM, and the
+            // attach autospawns the selected VM's daemon before it looks.
+            [vm] => {
+                tracing::debug!(
+                    box = name,
+                    vm = %vm,
+                    outcome = "on a stopped VM",
+                    "box name resolved to a VM"
+                );
+                Err(crate::cmd::BoxNotFound(crate::cmd::box_on_stopped_vm(name, vm)).into())
+            }
+            several => Err(anyhow::anyhow!(
+                "box name '{name}' exists on more than one stopped VM ({}); \
+                 name the one you mean with --vm",
+                several.join(", ")
+            )),
+        },
         1 => {
             let resolved = owners.pop().expect("the one owner");
-            tracing::debug!(box = name, vm = %resolved.vm, "box name resolved to a VM");
+            tracing::debug!(
+                box = name,
+                vm = %resolved.vm,
+                outcome = "on a running VM",
+                "box name resolved to a VM"
+            );
             Ok(Some(resolved))
         }
         // Two VMs can both own the name, and picking one silently would send
@@ -356,13 +408,10 @@ pub(crate) async fn resolve_box_vm(
 /// The owning daemon is gated on the very reply that named it; the probe
 /// that finds nothing stays ungated, exactly like the dashboard's listing of
 /// a skewed daemon.
-async fn box_record_on(
-    vm: &crate::client::VmSocket,
-    name: &str,
-) -> Result<Option<boxes::Record>, anyhow::Error> {
+async fn box_record_on(vm: &crate::client::VmSocket, name: &str) -> Result<BoxLook, anyhow::Error> {
     let mut client = match crate::client::Client::probe(&vm.sock).await {
         Ok(client) => client,
-        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(None),
+        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(BoxLook::NotRunning),
         Err(crate::client::ProbeRefusal::Unreachable(e)) => {
             return Err(e.context(format!(
                 "Failed to connect to the daemon at {}",
@@ -374,10 +423,57 @@ async fn box_record_on(
     match resp.record {
         Some(record) => {
             crate::client::ensure_version_reported(resp.daemon_version.as_deref())?;
-            Ok(Some(record))
+            Ok(BoxLook::Found(Box::new(record)))
         }
-        None => Ok(None),
+        None => Ok(BoxLook::Absent),
     }
+}
+
+/// What one VM's daemon said about a box name ([`box_record_on`]).
+enum BoxLook {
+    /// The daemon owns the name: its record, boxed so the other answers stay
+    /// small.
+    Found(Box<boxes::Record>),
+    /// The daemon answered and does not know the name.
+    Absent,
+    /// No daemon listens: the VM is stopped.
+    NotRunning,
+}
+
+/// Whether the stopped VM `vm` holds a box named `name` in its persisted box
+/// records (NET-152), read from its state dir with no daemon: the name as it
+/// was registered, compared ignoring ASCII case as names are made unique, or
+/// the box's id or an id prefix. Read-only, so a file this build cannot use
+/// holds nothing and stays as it is.
+fn stopped_vm_holds(vm: &crate::client::VmSocket, name: &str) -> bool {
+    stopped_vm_boxes(vm).iter().any(|held| {
+        held.name.eq_ignore_ascii_case(name)
+            || (crate::cmd::is_id_prefix(name)
+                && held
+                    .id
+                    .as_ref()
+                    .simple()
+                    .to_string()
+                    .starts_with(&name.replace('-', "").to_ascii_lowercase()))
+    })
+}
+
+/// The boxes a stopped VM's persisted records hold (NET-148, NET-152), read
+/// from the state dir beside its socket. One debug line records the count.
+pub(crate) fn stopped_vm_boxes(
+    vm: &crate::client::VmSocket,
+) -> Vec<minvmd::box_registry::PersistedBox> {
+    let held = vm
+        .sock
+        .parent()
+        .map(minvmd::box_registry::persisted_box_names)
+        .unwrap_or_default();
+    tracing::debug!(
+        vm = %vm.vm,
+        boxes = held.len(),
+        "read a stopped VM's persisted box records"
+    );
+    held
 }
 
 /// A pickable session. `Display` renders the row the user sees and fuzzy-

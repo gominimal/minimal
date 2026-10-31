@@ -3650,6 +3650,7 @@ async fn exec_fall_through_hands_off_the_owning_vm() {
             selected.clone(),
             "web",
             verb,
+            "session exec web <command>",
         )
         .await
         .expect("a name alpha owns resolves through the selected VM's miss");
@@ -3804,6 +3805,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             // there is no control socket to read a state from — the shape
             // this render is fed, same as a listing that read none.
             control_sock: None,
+            running: true,
         }
     };
 
@@ -5488,6 +5490,7 @@ fn ls_shows_box_loopback_address() {
         vm: "default".to_string(),
         resp: resp.clone(),
         control_sock: None,
+        running: true,
     }];
 
     let table = render(false, &one);
@@ -5525,11 +5528,13 @@ fn ls_shows_box_loopback_address() {
             vm: "default".to_string(),
             resp: resp.clone(),
             control_sock: None,
+            running: true,
         },
         cmd::VmListing {
             vm: "alpha".to_string(),
             resp: listing_of(&[("other", at(std::net::Ipv4Addr::new(127, 0, 64, 9)), None)]),
             control_sock: None,
+            running: true,
         },
     ];
     let document: serde_json_lenient::Value =
@@ -5664,4 +5669,346 @@ fn ls_egress_matches_session_policy() {
         }
     }
     assert!(!table.contains("per_box"), "got:\n{table}");
+}
+
+/// A stopped VM `vm` under `state`: its state dir with the persisted box
+/// records `boxes` (name, id), as its VM host daemon wrote them before it
+/// stopped, and a stale `ssh.sock` that no daemon listens on.
+fn stopped_vm_with_boxes(state: &std::path::Path, vm: &str, boxes: &[(&str, boxes::SessionId)]) {
+    let dir = state.join("providers/local-minvmd0").join(vm);
+    std::fs::create_dir_all(&dir).expect("the stopped VM's dir");
+    let records: Vec<serde_json_lenient::Value> = boxes
+        .iter()
+        .enumerate()
+        .map(|(index, (name, id))| {
+            serde_json_lenient::json!({
+                "name": name,
+                "box_id": id.to_string(),
+                "switch_address": format!("100.64.0.{}", index + 9),
+                "loopback_address": format!("127.0.64.{}", index + 2),
+                "ingress_ports": [],
+                "standing": true,
+            })
+        })
+        .collect();
+    std::fs::write(
+        dir.join(minvmd::box_registry::REGISTRY_FILE),
+        serde_json_lenient::to_vec(&serde_json_lenient::json!({
+            "version": 1,
+            "boxes": records,
+        }))
+        .expect("the records serialize"),
+    )
+    .expect("write the stopped VM's box records");
+    let stale = std::os::unix::net::UnixListener::bind(dir.join("ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+}
+
+/// The default VM, running, under a fresh state dir: the selected VM of
+/// every test below that pairs it with a stopped one.
+async fn running_default_vm() -> (tempfile::TempDir, minimald::test_harness::TestServer) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).expect("the host dir");
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    (state, default_vm)
+}
+
+/// A client on the selected (default) VM's daemon under `state`.
+async fn selected_client(state: &std::path::Path) -> (client::Client, std::path::PathBuf) {
+    let selected = client::resolve_socket_path_named(Some(state), true, paths::DEFAULT_VM_NAME)
+        .expect("the selected VM's socket path");
+    let client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+    (client, selected)
+}
+
+/// NET-058 for the commands that act on a named box over the daemon's RPCs:
+/// `min session policy` and `min session destroy` find a box on another VM
+/// by its name alone, and the client they get back is that VM's.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_for_policy_and_destroy() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = create_box_on(&alpha, "beta").await;
+    let global = vm_globals(state.path(), None);
+
+    for example in ["session policy beta", "session destroy beta"] {
+        let (client, _) = selected_client(state.path()).await;
+        let (mut owner, record) = cmd::resolve_box_on_any_vm(&global, client, "beta", example)
+            .await
+            .expect("a name alpha owns resolves without --vm");
+        assert_eq!(record.id, beta, "{example}: alpha's record");
+        let again = cmd::resolve_session(&mut owner, "beta")
+            .await
+            .expect("the client returned is connected to alpha");
+        assert_eq!(again.id, beta, "{example}: the follow-up RPCs reach alpha");
+    }
+}
+
+/// NET-058: a box name no running VM holds, on a host with two VMs, is
+/// refused with the flag that names a box on another VM, shown on the
+/// command the user ran. With `--vm`, the selected VM's own miss stands.
+#[tokio::test]
+async fn unknown_box_names_vm_flag() {
+    let (state, _default_vm, _alpha) = two_vms().await;
+    let global = vm_globals(state.path(), None);
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        format!("error: {err:#}"),
+        "error: no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> session policy beta",
+        "the refusal as main prints it"
+    );
+
+    // The hand-off verbs say the same, on their own command.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_named_box_version_gated(
+        &global,
+        &mut client,
+        sock,
+        "beta",
+        "Forwarding to",
+        "net forward beta 8080:3000",
+    )
+    .await
+    .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        err.to_string(),
+        "no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> net forward beta 8080:3000"
+    );
+
+    // An explicit --vm is the operator's choice: the selected VM's miss.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&pinned, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(err.to_string(), "No session found matching 'beta'");
+}
+
+/// NET-152: a box only a stopped VM holds is named with that VM and the
+/// command that starts it, on every verb that resolves a box by name. A
+/// running VM's box of the same name wins over the stopped VM's record.
+#[tokio::test]
+async fn box_on_stopped_vm_names_start_command() {
+    let (state, default_vm) = running_default_vm().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", beta)]);
+    let global = vm_globals(state.path(), None);
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta";
+
+    let err = attach::resolve_box_vm(&global, "beta")
+        .await
+        .expect_err("a box on a stopped VM is refused");
+    assert_eq!(format!("error: {err:#}"), format!("error: {expected}"));
+
+    // The attach path itself: the selected VM's miss falls through to the
+    // stopped VM's records.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "beta")
+        .await
+        .expect_err("attach refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+
+    // And the RPC verbs, with the policy's machine reading still a miss.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("policy refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
+
+    // A name the running VM owns resolves there, whatever a stopped VM holds.
+    stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
+    let resolved = attach::resolve_box_vm(&global, "api")
+        .await
+        .expect("a running VM's box resolves")
+        .expect("'api' is on the running default VM");
+    assert_eq!(resolved.vm, "default");
+}
+
+/// NET-148: `min ls` lists a stopped VM's boxes from its persisted records:
+/// each row's STATUS reads `stopped` and its VM cell `alpha (stopped)`, the
+/// table rule runs under the VM column, and `--json` carries the boxes with
+/// `"status": "stopped"` and `"vm_running": false`.
+#[tokio::test]
+async fn ls_lists_boxes_on_stopped_vm() {
+    let (state, default_vm) = running_default_vm().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", beta)]);
+    // A stopped VM with no boxes adds no listing.
+    stopped_vm_with_boxes(state.path(), "empty", &[]);
+    let global = vm_globals(state.path(), None);
+
+    let listings = cmd::ls_listings(&global)
+        .await
+        .expect("listing past a stopped VM succeeds");
+    assert_eq!(listings.len(), 2, "the running VM and the stopped one");
+    assert_eq!(listings[0].vm, "default");
+    assert!(listings[0].running);
+    assert_eq!(listed_names(&listings[0]), ["api"]);
+    assert_eq!(listings[1].vm, "alpha");
+    assert!(!listings[1].running, "alpha is stopped");
+    assert_eq!(listed_names(&listings[1]), ["beta"]);
+    assert_eq!(listings[1].resp.sessions[0].id, beta);
+    assert_eq!(
+        listings[1].resp.sessions[0].status,
+        boxes::BoxState::Stopped
+    );
+
+    let mut out = Vec::new();
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[],
+        &[],
+    )
+    .expect("the table renders");
+    let table = String::from_utf8(out).expect("UTF-8");
+    let lines: Vec<&str> = table.lines().collect();
+    let header = lines
+        .iter()
+        .position(|line| line.starts_with("VM "))
+        .expect("the table header");
+    assert!(
+        lines[header + 1].starts_with("---------------  "),
+        "the rule runs under the VM column, as wide as its widest cell:\n{table}"
+    );
+    let beta_row = lines
+        .iter()
+        .find(|line| line.contains(&beta.to_string()))
+        .expect("alpha's box has a row");
+    assert!(
+        beta_row.starts_with("alpha (stopped)  "),
+        "the VM cell says the VM is stopped: {beta_row:?}"
+    );
+    assert!(
+        beta_row.split_whitespace().any(|cell| cell == "stopped"),
+        "STATUS reads stopped: {beta_row:?}"
+    );
+    let api_row = lines
+        .iter()
+        .find(|line| line.contains(&api.to_string()))
+        .expect("the running VM's box has a row");
+    assert!(
+        api_row.starts_with("default          "),
+        "a running VM's cell is its name alone, padded to the column: {api_row:?}"
+    );
+
+    let mut out = Vec::new();
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: true,
+        },
+        &listings,
+        &[],
+        &[],
+    )
+    .expect("the JSON renders");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    let sessions = document["sessions"].as_array().expect("a sessions array");
+    let beta_entry = sessions
+        .iter()
+        .find(|entry| entry["name"] == "beta")
+        .expect("alpha's box is in the document");
+    assert_eq!(beta_entry["status"], "stopped");
+    assert_eq!(beta_entry["vm"], "alpha");
+    assert_eq!(beta_entry["vm_running"], false);
+    let api_entry = sessions
+        .iter()
+        .find(|entry| entry["name"] == "api")
+        .expect("the running VM's box is in the document");
+    assert_eq!(api_entry["vm_running"], true);
+}
+
+/// NET-152: an attach that fails once the relay holds the terminal ends
+/// `min session attach` with an error that `main` prints after the attach
+/// returns. By then the relay put the attach-start termios back and the
+/// unwind codes are on the terminal, so the error prints after them and
+/// stays on screen. A relay that never took the terminal writes nothing.
+#[test]
+fn attach_error_printed_after_terminal_restore() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The user's terminal: everything written to it, in order.
+    #[derive(Clone, Default)]
+    struct Screen(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Screen {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let screen = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(screen.clone(), true),
+        |_| Err(anyhow::anyhow!("the relay lost the terminal mid-session")),
+    )
+    .expect_err("a failed relay ends the attach with an error");
+    assert!(
+        screen.0.borrow().ends_with(b"\x1b[?1004l"),
+        "the unwind is on the terminal before the attach returns"
+    );
+    // What main prints for the error, on the same terminal.
+    let printed = format!("error: {err:#}\n");
+    std::io::Write::write_all(&mut screen.clone(), printed.as_bytes()).expect("print");
+    let seen = screen.0.borrow().clone();
+    let at = seen
+        .windows(printed.len())
+        .position(|window| window == printed.as_bytes())
+        .expect("the error is on the terminal");
+    assert!(
+        seen[..at].ends_with(b"\x1b[?1004l"),
+        "the error prints after the restore sequence: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(at + printed.len(), seen.len(), "nothing writes after it");
+
+    // A relay that never took the terminal never changed it.
+    let untouched = Screen::default();
+    interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(untouched.clone(), true),
+        |_| {
+            Err(anyhow::Error::new(std::io::Error::other("no tty"))
+                .context(attach::TerminalNotTaken))
+        },
+    )
+    .expect_err("an attach with no terminal fails");
+    assert!(
+        untouched.0.borrow().is_empty(),
+        "no unwind for a terminal the attach never took"
+    );
 }
