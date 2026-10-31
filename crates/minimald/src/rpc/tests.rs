@@ -4088,7 +4088,11 @@ async fn create_session_errors_if_name_not_unique() {
             .call::<CreateSession>(&req("my-session", "/uwu"))
             .await,
         Errorable::Err {
-            error: "A session with that name already exists".to_string()
+            error: format!(
+                "Cannot create a session named `my-session`: the running session \
+                 `my-session` ({id}) holds that name. Rename that session with \
+                 `min session rename {id} <new-name>`, or choose another name."
+            )
         }
     );
 }
