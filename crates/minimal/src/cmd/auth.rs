@@ -1026,7 +1026,11 @@ impl Browser {
                 continue;
             }
             let id = query.get("installation_id").and_then(|v| v.parse().ok());
-            if let Some((on, selection)) = installed(http, endpoints, token, id).await {
+            // The same bound as the poll arm: a slow read answers the held
+            // page and loops back to the deadline arm.
+            let read =
+                tokio::time::timeout_at(self.deadline, installed(http, endpoints, token, id));
+            if let Ok(Some((on, selection))) = read.await {
                 respond(&mut conn, &Page::installed(&on, &selection)).await;
                 writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
                 return Ok(());
@@ -2203,6 +2207,60 @@ mod tests {
             .expect("wait");
         assert!(
             started.elapsed() < INSTALL_POLL + Duration::from_secs(4),
+            "the wait ran {:?}",
+            started.elapsed()
+        );
+        assert!(
+            String::from_utf8(err)
+                .expect("utf8")
+                .starts_with("Stopped waiting."),
+        );
+    }
+
+    // The install callback's re-read is bounded by the deadline too: a
+    // callback near the deadline does not hold the wait past it.
+    #[tokio::test]
+    async fn a_stalled_install_read_on_the_callback_does_not_outlive_the_deadline() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        // An API that accepts connections and never answers them.
+        let stall = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let api = format!("http://{}", stall.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = stall.accept().await {
+                held.push(conn);
+            }
+        });
+        let endpoints = Endpoints {
+            oauth: gh.endpoints.oauth.clone(),
+            api,
+        };
+        let callback = format!("{}?installation_id=1", browser.redirect_uri);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = reqwest::get(callback).await;
+        });
+        let started = tokio::time::Instant::now();
+        browser.deadline = started + Duration::from_secs(2);
+        let mut err = Vec::new();
+        browser
+            .await_install(
+                &reqwest::Client::new(),
+                &endpoints,
+                ACCESS,
+                "octocat",
+                &mut err,
+            )
+            .await
+            .expect("wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
             "the wait ran {:?}",
             started.elapsed()
         );
