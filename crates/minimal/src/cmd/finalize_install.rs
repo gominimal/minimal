@@ -547,9 +547,10 @@ fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> 
             items.extend(linux::userns_item_on_this_host());
         }
         if global.use_minvmd() {
-            // BEP-047: the vm-users item is not offered until minvmd starts
-            // the VM and gvproxy through `sudo -n` (T66, #2566). Its drop-in
-            // names subcommands minvmd does not have at this head.
+            // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
+            // not offered until minvmd starts the VM and gvproxy through
+            // `sudo -n` (T66, #2566). Its drop-in names subcommands minvmd
+            // does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
             items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
@@ -1566,7 +1567,7 @@ pub(crate) mod linux {
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
     }
 
-    // ── The VM's own users (BEP-047) ──────────────────────────────────────
+    // ── The VM's own users (formerly BEP-047, gominimal/inbox#1184) ────────
     //
     // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
     // each started by the login through `sudo -n -u` under a drop-in this
@@ -2053,8 +2054,9 @@ pub(crate) mod linux {
     }
 
     /// [`vm_users_item_over`] this host's reads, for the default VM.
-    // BEP-047: not offered until T66 (#2566) spawns through `sudo -n`, so
-    // no caller exists at this head. T66 adds the caller back.
+    // Formerly BEP-047 (gominimal/inbox#1184): not offered until T66 (#2566)
+    // spawns through `sudo -n`, so no caller exists at this head. T66 adds
+    // the caller back.
     #[allow(dead_code)]
     pub(crate) fn vm_users_item_on_this_host() -> Item {
         let operator = crate::resolver::operator_name();
@@ -3332,10 +3334,10 @@ mod tests {
         assert!(!in_kvm_group("", "alice"));
     }
 
-    /// BEP-047: the VM users item creates `minimal-vmm` and
-    /// `minimal-gvproxy`, the host dir at 0710 group `minimal-vmm`,
-    /// `vmm/`, the gvproxy, gvproxy config and gate dirs, and the sudoers
-    /// drop-in, and reads as done once all of them hold.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the VM users item creates
+    /// `minimal-vmm` and `minimal-gvproxy`, the host dir at 0710 group
+    /// `minimal-vmm`, `vmm/`, the gvproxy, gvproxy config and gate dirs, and
+    /// the sudoers drop-in, and reads as done once all of them hold.
     #[test]
     fn finalize_install_creates_the_split_users_dirs_and_drop_in() {
         use linux::*;
