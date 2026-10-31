@@ -1015,6 +1015,8 @@ async fn serve_answerer_control(
                 | BoxControlRequest::Withdraw(_)
                 | BoxControlRequest::HoldBoxName(_)
                 | BoxControlRequest::ReleaseBoxName(_)
+                | BoxControlRequest::AdmitHostIpBox(_)
+                | BoxControlRequest::RetireHostIpBox(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)

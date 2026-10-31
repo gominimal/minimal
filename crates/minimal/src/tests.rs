@@ -286,6 +286,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
+            // `min secret set` asks the egress proxy on its control socket to
+            // re-certify its root (#2746). The proxy is not the daemon, and
+            // the rule is already saved before the ask, so a skew can
+            // half-build nothing here, the same as the mint path's sites.
+            "cmd/secret.rs::recertify = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",

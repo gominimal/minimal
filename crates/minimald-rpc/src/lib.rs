@@ -871,6 +871,38 @@ pub struct HoldBoxNameRequest {
     pub session_id: Option<boxes::SessionId>,
 }
 
+/// A `host_ip` box's egress policy, for the VM host's gate to hold while
+/// the box is resident ([`BoxControlRequest::AdmitHostIpBox`], NET-085).
+///
+/// A `host_ip` box leaves the VM from the node's own address, so it has no
+/// row of its own. The guest marks its frames, and root in the guest can
+/// write the same mark on any frame. The host gate therefore decides a
+/// marked frame from the node address by the union of the rules this verb
+/// registers, and drops it when no `host_ip` box is resident. Keyed by the
+/// session id, so an unnamed box and a task box register the same way.
+/// Answered with [`BoxControlReply::HostIpBox`]; idempotent, and a second
+/// admit for the same session replaces the policy the first one held.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostIpBoxRequest {
+    /// The session the box runs as.
+    pub session_id: boxes::SessionId,
+    /// The box's egress policy, as the session's create declared it.
+    /// Absent is the egress default's to fill, the same meaning the create
+    /// request's policy carries. The host fills it under its own phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPolicy>,
+}
+
+/// The session whose `host_ip` box left the VM host's resident set
+/// ([`BoxControlRequest::RetireHostIpBox`]): its rules admit nothing from
+/// then on. Answered with [`BoxControlReply::HostIpBox`]; a session the set
+/// does not hold is the goal state already holding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetireHostIpBoxRequest {
+    /// The session the box ran as.
+    pub session_id: boxes::SessionId,
+}
+
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
 /// NET-138): the fixed fact the host's log line and audit copy name, so a
 /// tail can tell an expose decision from an answered ask from a listen
@@ -1386,6 +1418,16 @@ pub enum BoxControlRequest {
     /// [`BoxControlReply::NameHeld`]; a name no hold kept is the goal
     /// state already holding.
     ReleaseBoxName(HoldBoxNameRequest),
+    /// Hold a resident `host_ip` box's egress policy on the host
+    /// ([`HostIpBoxRequest`], NET-085): the gate decides a box-marked frame
+    /// from the node address by the union of the policies held. Served on
+    /// the host's control socket only, answered with
+    /// [`BoxControlReply::HostIpBox`].
+    AdmitHostIpBox(HostIpBoxRequest),
+    /// Drop the policy [`BoxControlRequest::AdmitHostIpBox`] holds for a
+    /// session: the box stopped or was destroyed. Answered with
+    /// [`BoxControlReply::HostIpBox`].
+    RetireHostIpBox(RetireHostIpBoxRequest),
     /// The in-VM daemon's report that one of its boxes published a port at
     /// runtime (NET-138), carried on the daemon's own control channel: the
     /// host records it in the row only within the grant the host-side
@@ -1765,6 +1807,17 @@ pub enum BoxControlReply {
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
+    /// An admit or a retire of a `host_ip` box's policy was answered: the
+    /// session back, `resident` saying which — `true` the gate holds the
+    /// box's policy now, `false` it holds none for the session. The
+    /// `resident` marker is this shape's own field, so no other reply
+    /// decodes as it.
+    HostIpBox {
+        /// The session the admit or the retire was about.
+        session_id: boxes::SessionId,
+        /// The marker: whether the gate holds the box's policy now.
+        resident: bool,
+    },
     /// A hold or a release was answered: the name back, `held` saying
     /// which — `true` a hold the table now keeps, `false` a release that
     /// freed one (or found none).

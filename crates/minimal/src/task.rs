@@ -748,6 +748,20 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
+    // The task box is a `host_ip` box: its egress is admitted on the VM
+    // host daemon before it runs anything (NET-085), or the host gate drops
+    // every frame it sends outside the VM. The guard retires it on an early
+    // return; the run's end retires it through `release_task_name_hold`.
+    let mut host_ip_residency = crate::HostIpResidency::admit(
+        crate::vm_host_control_sock(
+            crate::daemon_host_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+    )
+    .await;
     // The daemon named the box `<task>-<n>`. A box whose name cannot be read
     // back goes by its id.
     let session_name = crate::daemon_box_name(&mut client, id)
@@ -915,6 +929,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `--keep` retains the session as an attachable box instead.
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
+    }
+    if let Some(residency) = host_ip_residency.as_mut() {
+        residency.keep();
     }
     release_task_name_hold(
         crate::vm_host_control_sock(

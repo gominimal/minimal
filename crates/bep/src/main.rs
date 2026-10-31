@@ -485,9 +485,9 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
     /// Issues the root again for `rules` when their names changed, and
     /// publishes it, or publishes a root that an earlier call did not.
     /// Gives the names the root in use permits, and whether the re-issue
-    /// and the publish succeeded. On an error the root in use stays, and
-    /// the caller tries again at the next CONNECT.
-    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, bool) {
+    /// and the publish succeeded, or why not. On an error the root in use
+    /// stays, and the caller tries again at the next CONNECT.
+    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, Result<(), String>) {
         let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
         let issued = match ca.reissue_root(registered_union(rules), SystemTime::now()) {
             Ok(issued) => issued,
@@ -496,7 +496,8 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
                     error = %err,
                     "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
                 );
-                return (ca.union().clone(), false);
+                let reason = format!("the root certificate was not re-issued: {err}");
+                return (ca.union().clone(), Err(reason));
             }
         };
         if issued || *unpublished {
@@ -507,11 +508,48 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
                     error = %err,
                     "did not publish the re-issued root; boxes created now get the old root"
                 );
-                return (ca.union().clone(), false);
+                let reason = format!(
+                    "the root certificate was not written to {}: {err}",
+                    self.identity.display()
+                );
+                return (ca.union().clone(), Err(reason));
             }
             *unpublished = false;
         }
-        (ca.union().clone(), true)
+        (ca.union().clone(), Ok(()))
+    }
+
+    /// Re-issues and publishes the root for `rules`, and moves the admitted
+    /// set to the names the root in use permits. A failure keeps the retry
+    /// delay for the same rules. Gives the admitted authorities, and
+    /// whether the re-issue and the publish succeeded, or why not.
+    fn update(
+        &self,
+        admitted: &mut Admitted,
+        rules: Vec<StoreRule>,
+    ) -> (Vec<(String, u16)>, Result<(), String>) {
+        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
+        let authorities = store_authorities(&rules, &union);
+        if authorities != admitted.authorities {
+            tracing::info!(
+                before = ?admitted.authorities,
+                after = ?authorities,
+                identity = %self.identity.display(),
+                "admits the changed secret-store upstreams with no restart"
+            );
+        }
+        admitted.authorities.clone_from(&authorities);
+        if done.is_ok() {
+            admitted.rules = rules;
+            admitted.failed = None;
+        } else {
+            tracing::info!(
+                retry_secs = REISSUE_RETRY.as_secs(),
+                "re-issues or publishes the root again after the retry delay, or when the rules change"
+            );
+            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
+        }
+        (authorities, done)
     }
 
     /// Writes `root` to the identity file when the file names the root key
@@ -549,28 +587,35 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
         {
             return admitted.authorities.clone();
         }
-        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
-        let authorities = store_authorities(&rules, &union);
-        if authorities != admitted.authorities {
-            tracing::info!(
-                before = ?admitted.authorities,
-                after = ?authorities,
-                identity = %self.identity.display(),
-                "admits the changed secret-store upstreams with no restart"
+        self.update(&mut admitted, rules).0
+    }
+}
+
+/// A store registration change that the control socket reports: `min
+/// secret set` asks after it writes a rule. The root is re-issued and
+/// published at once, not at the next CONNECT, so the next box created
+/// reads a root that permits the new upstream (#2746, BEP-013). The CONNECT
+/// path stays the fallback for a rule file edited by hand.
+impl<K: CaKey + Send + Sync + 'static> bep::control::RecertifyRoot for StoreAdmission<K> {
+    fn recertify_root(&self) -> Result<(), String> {
+        let rules = self.rules.current();
+        let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if admitted.rules == rules && !admitted.unpublished {
+            tracing::debug!(
+                store_rules = rules.len(),
+                "the published root already permits the secret-store rules"
             );
+            return Ok(());
         }
-        admitted.authorities.clone_from(&authorities);
-        if done {
-            admitted.rules = rules;
-            admitted.failed = None;
-        } else {
-            tracing::info!(
-                retry_secs = REISSUE_RETRY.as_secs(),
-                "re-issues or publishes the root again after the retry delay, or when the rules change"
-            );
-            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
-        }
-        authorities
+        let store_rules = rules.len();
+        let (_, done) = self.update(&mut admitted, rules);
+        tracing::info!(
+            store_rules,
+            published = done.is_ok(),
+            identity = %self.identity.display(),
+            "re-certified the root for a secret-store registration change"
+        );
+        done
     }
 }
 
@@ -1277,16 +1322,16 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     // `off_module`. The set starts with the rules that `start` issued the
     // root under, and each CONNECT asks for the current rules, so a widened
     // rule re-issues the root and is admitted with no restart (#2618).
-    let admitted = Admission::with_source(
-        &[GITHUB],
-        Arc::new(StoreAdmission::new(
-            Arc::clone(&rules),
-            Arc::clone(&ca),
-            root_key.public().kid(),
-            identity.to_path_buf(),
-            held,
-        )),
-    );
+    // The same source takes `recertify_root` on the control socket, which
+    // `min secret set` sends after it writes a rule (#2746).
+    let store_admission = Arc::new(StoreAdmission::new(
+        Arc::clone(&rules),
+        Arc::clone(&ca),
+        root_key.public().kid(),
+        identity.to_path_buf(),
+        held,
+    ));
+    let admitted = Admission::with_source(&[GITHUB], Arc::clone(&store_admission) as _);
     // One log, one writer: the proxy's decisions and the control socket's
     // mint and revocation records share the chain (BEP-067).
     let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
@@ -1318,7 +1363,8 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         let control_socket = wiring
             .control(&control, log, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
-            .with_rotation(ca);
+            .with_rotation(ca)
+            .with_recertification(store_admission);
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
@@ -2649,6 +2695,154 @@ mod tests {
                 .unwrap(),
             ca.lock().unwrap().root().to_vec()
         );
+    }
+
+    /// Sends one `recertify_root` line on `stream`, and reads the reply.
+    async fn ask_recertify(stream: &mut BufReader<UnixStream>) -> Reply {
+        let mut line =
+            serde_json::to_string(&bep::control::RecertifyRequest::RecertifyRoot).unwrap();
+        line.push('\n');
+        stream.get_mut().write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_line(&mut reply).await.unwrap();
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    // BEP-013, #2746: `min secret set` reports a store registration change
+    // on the control socket. The proxy re-issues the root and publishes it
+    // before it replies, with no CONNECT, so the next box reads a root that
+    // permits the new upstream. A failed publish is the reply's reason, and
+    // the next request tries again at once.
+    #[tokio::test]
+    async fn a_store_registration_change_recertifies_the_published_root_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&config, "").unwrap();
+        let rules = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let keys: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let held = rules.current();
+        let at = SystemTime::now();
+        let (identity, root) = Identity::of(keys)
+            .issuing_root(&keys.root, registered_union(&held), at)
+            .unwrap();
+        identity.publish(&path).unwrap();
+        let before = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
+        ));
+        let source = Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            keys.root.public().kid(),
+            path.clone(),
+            held,
+        ));
+        let control = dir.path().join("bep/control.sock");
+        let socket = Control::bind(&control, Registry::default(), BoxRegistry::default())
+            .unwrap()
+            .with_recertification(Arc::clone(&source) as _);
+        tokio::spawn(socket.run());
+        let mut stream = BufReader::new(UnixStream::connect(&control).await.unwrap());
+
+        // No rule changed: the reply is ok, and the published root stays.
+        assert!(ask_recertify(&mut stream).await.ok);
+        let unchanged = Identity::read(&path).unwrap();
+        assert_eq!(unchanged.root_certificate_der().unwrap(), before);
+
+        // `min secret set` writes a rule and asks. No CONNECT runs.
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        let reply = ask_recertify(&mut stream).await;
+        assert!(reply.ok, "{reply:?}");
+        let published = Identity::read(&path).unwrap();
+        let after = published.root_certificate_der().unwrap();
+        assert_ne!(after, before, "the published root was not re-issued");
+        assert_eq!(after, ca.lock().unwrap().root().to_vec());
+        assert_eq!(
+            published.key(Role::Root).unwrap().kid(),
+            keys.root.public().kid()
+        );
+        // A box that reads the published root now trusts the new upstream.
+        // A box created before the change keeps the root it read.
+        let leaf = ca
+            .lock()
+            .unwrap()
+            .issue_leaf("api.openai.com", SystemTime::now())
+            .unwrap();
+        let check_at = SystemTime::now();
+        let after_der = rustls::pki_types::CertificateDer::from(after.clone());
+        let before_der = rustls::pki_types::CertificateDer::from(before.clone());
+        assert!(validates(&after_der, &leaf, "api.openai.com", check_at));
+        assert!(!validates(&before_der, &leaf, "api.openai.com", check_at));
+        // The admitted set follows with no second re-issue.
+        assert_eq!(
+            source.admitted.lock().unwrap().authorities,
+            vec![("api.openai.com".to_owned(), 443)]
+        );
+
+        // A root key replaced in the file: the publish fails, and the reply
+        // says why. The file stays as it was.
+        let other: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let (replaced, _) = Identity::of(other)
+            .issuing_root(&other.root, registered_union(&[]), at)
+            .unwrap();
+        replaced.publish(&path).unwrap();
+        let foreign = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let refused = ask_recertify(&mut stream).await;
+        assert!(!refused.ok);
+        let reason = refused.error.unwrap();
+        assert!(
+            reason.starts_with(&format!(
+                "the root certificate was not written to {}: ",
+                path.display()
+            )),
+            "{reason}"
+        );
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            foreign
+        );
+
+        // The next request does not wait for the CONNECT retry delay.
+        published.publish(&path).unwrap();
+        let retried = ask_recertify(&mut stream).await;
+        assert!(retried.ok, "{retried:?}");
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            ca.lock().unwrap().root().to_vec()
+        );
+        assert!(source.admitted.lock().unwrap().authorities.is_empty());
+
+        // A control socket with no root to re-certify refuses the request.
+        let bare = dir.path().join("bare/control.sock");
+        let socket = Control::bind(&bare, Registry::default(), BoxRegistry::default()).unwrap();
+        tokio::spawn(socket.run());
+        let mut stream = BufReader::new(UnixStream::connect(&bare).await.unwrap());
+        assert!(!ask_recertify(&mut stream).await.ok);
     }
 
     // BEP-032: a redemption stats the files and reads them only when a

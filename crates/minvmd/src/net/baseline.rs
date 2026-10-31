@@ -14,25 +14,32 @@
 //! source identity the set's verdict accepts.
 //!
 //! The host-side egress gate decides a frame from the daemon's address by
-//! the compiled set ([`NodePlaneBaseline::rules`]) beside the boxes' rows: a
-//! deny-all box cannot clip the daemon's own fetches, because the set is
-//! decided before the table is consulted, and a frame wearing the daemon's
-//! address to reach somewhere else is bounded by the enumeration, not by the
-//! interim row (NET-085). Whether the gate decides by the set yet is the
-//! baseline's phase ([`NodeBaselinePhase`], [`NODE_BASELINE_PHASE`]) —
-//! announced until the node plane's store surfaces are configured, the same
-//! cutover shape the unregistered-source phase carries
-//! ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]).
+//! this set beside the boxes' rows: a deny-all box cannot clip the daemon's
+//! own fetches, because the set is decided before the box's row is
+//! consulted, and a frame wearing the daemon's address to reach somewhere
+//! else is bounded by the enumeration, not by the interim row (NET-085).
+//! The gate decides by the set from VM start ([`NODE_BASELINE_PHASE`] is
+//! [`NodeBaselinePhase::InForce`]).
 //!
-//! The built-in registry and cache endpoints name the helper's answer
-//! address on the fabric — the switch's host alias, the one address in this
-//! tree's address plan where a store surface the helper itself carries
-//! answers — because an un-enrolled host's own supply is the helper's to
-//! carry. Which registry and which cache the node plane uses is the
-//! deployment's to say, and neither category is ever dropped from the
-//! enumeration by saying it.
+//! The registry and cache entries are named endpoints: the hosts the
+//! daemon's own fetches go to ([`DAEMON_REGISTRY_ENDPOINT`],
+//! [`DAEMON_CACHE_ENDPOINT`]). A name is not an address, so the set admits a
+//! name's addresses only as the node plane's own lookups resolve them: the
+//! host-side DNS admission table pins each answer against the entry that
+//! named it ([`crate::net::dns_pins`]), under the same window and per-name
+//! cap a box's pins hold. An endpoint spelled as a subnet (`a.b.c.d/n`) is
+//! admitted as it stands. Which registry and which cache the node plane
+//! uses is the deployment's to say (`MINVMD_BASELINE_REGISTRY`,
+//! `MINVMD_BASELINE_CACHE`), every change is logged, and neither category is
+//! ever dropped from the enumeration by saying it.
+//!
+//! A frame from the node address that wears the box mark is not the node
+//! plane's: the gate decides it by the union of the resident `host_ip`
+//! boxes' rules, and drops it when no `host_ip` box is resident
+//! ([`crate::net::egress_gate`]). The set never decides a marked frame, and
+//! the node row never does either.
 
-use boxes::core::egress::{EgressRules, IPPROTO_TCP, Ipv4Cidr};
+use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use std::io;
 use switch::SwitchSubnet;
 
@@ -63,10 +70,12 @@ impl BaselineCategory {
     }
 }
 
-/// One category's entry in the enumeration: the category and the subnets it
-/// admits, spelled the way an egress policy declares subnets (`a.b.c.d/n`) —
-/// the same spelling the compiled rules parse from, so the set a host sees
-/// in its log and its policy display is the set the gate decides by.
+/// One category's entry in the enumeration: the category and the endpoints
+/// it admits. An endpoint is a host name (`cache.minimal.dev`), whose
+/// addresses the node plane's own lookups pin, or a subnet spelled the way an
+/// egress policy declares one (`a.b.c.d/n`), admitted as it stands. The set
+/// a host sees in its log and its policy display is the set the gate decides
+/// by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineEntry {
     category: BaselineCategory,
@@ -80,53 +89,55 @@ impl BaselineEntry {
         self.category
     }
 
-    /// The entry's endpoints, as the CIDR spellings the compiled set parses
-    /// from.
+    /// The entry's endpoints, as the host names and the subnet spellings
+    /// the entry was configured with.
     #[must_use]
     pub fn endpoints(&self) -> &[String] {
         &self.endpoints
     }
 
-    /// The entry's endpoints in the matchable form the compiled rules hold.
-    /// The spellings are the constructors' own, so each parses; one that
-    /// does not is skipped the way an egress policy's subnet declarations
-    /// are compiled ([`EgressRules::from_policy`]).
+    /// The entry's subnet endpoints in the matchable form the compiled rules
+    /// hold. An endpoint that does not parse as a subnet is a host name, and
+    /// [`Self::names`] carries it instead.
     fn cidrs(&self) -> Vec<Ipv4Cidr> {
         self.endpoints
             .iter()
             .filter_map(|cidr| Ipv4Cidr::parse(cidr))
             .collect()
     }
+
+    /// The entry's host-name endpoints, normalized to the form DNS names are
+    /// matched in (ASCII-lowercased, the root dot stripped): the names whose
+    /// answers the node plane's own lookups pin against this entry.
+    pub(crate) fn names(&self) -> impl Iterator<Item = String> + '_ {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| Ipv4Cidr::parse(endpoint).is_none())
+            .map(|name| {
+                let lowered = name.trim().to_ascii_lowercase();
+                lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
+            })
+            .filter(|name| !name.is_empty())
+    }
 }
 
 /// The posture the node plane's own traffic is decided under: whether the
 /// host-side gate decides a frame from the in-VM daemon's address by this
-/// enumeration's compiled set, or leaves the node plane to the run path's
-/// interim node row while the set is announced.
-///
-/// Shipped announced, for the one thing the enumeration cannot fix alone:
-/// the built-in registry and cache endpoints name the helper's answer
-/// address on the fabric, and the guest daemon's shipped cache endpoint is
-/// a public service whose serving addresses no subnet list this tree can
-/// name. A gate deciding by the built-in set before the node plane's store
-/// surfaces are configured would sever the daemon's own fetches — the
-/// traffic the enumeration exists to keep passing (NET-080). The flip is
-/// [`NODE_BASELINE_PHASE`], one constant, the same shape the
-/// unregistered-source cutover carries
-/// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]).
+/// enumeration, or leaves the node plane to the run path's interim node row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeBaselinePhase {
     /// The enumeration is carried, logged at VM start, and shown beside the
-    /// box's rules; the node plane's frames are still decided by the interim
-    /// node row.
-    Announced,
-    /// The gate decides node-plane frames by the enumeration's compiled set.
+    /// box's rules; the node plane's frames are decided by the interim node
+    /// row.
     ///
     /// Constructed today only by the tests that pin the phase's other arm
-    /// ([`NodePlaneBaseline::in_force`]) — the arm the store-surface
-    /// configuration change flips [`NODE_BASELINE_PHASE`] onto. The gate's
-    /// decision reads the arm by path, so the variant is carried live even
-    /// unconstructed; no dead-code expectation sits on it.
+    /// ([`NodePlaneBaseline::announced`]). The gate's decision reads the arm
+    /// by path, so the variant is carried live even unconstructed.
+    Announced,
+    /// The gate decides node-plane frames by the enumeration: the addresses
+    /// the node plane's own lookups pinned for an entry, the entries' subnet
+    /// endpoints, the host alias at the configured host exposures, and the
+    /// resolver carve-out.
     InForce,
 }
 
@@ -134,26 +145,115 @@ impl NodeBaselinePhase {
     /// The phase as the value the gate's start-up line logs and the policy
     /// display spells beside the set: one spelling for the posture, so a
     /// host reading its policy output reads the same terms its daemon log
-    /// wrote at VM start, and a host running the announced interim can tell
-    /// it is.
+    /// wrote at VM start.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Announced => "announced (node row's allow-all interim)",
-            Self::InForce => "in force (decided by the baseline set)",
+            Self::InForce => "in force",
         }
     }
 }
 
-/// The phase this build ships: announced, because the node plane's store
-/// surfaces are not yet configured to the endpoints the built-in enumeration
-/// names. The endpoint-configuration change (#1786) — the deployment's
-/// registry and cache, answering where `with_registry` and `with_cache`
-/// point them — is the change that flips this constant, and the constant is
-/// the whole cutover: the gate's decision reads it off the baseline it was
-/// built with ([`NodePlaneBaseline::phase`]), the start-up line logs it, and
-/// the tests pin both of its arms, so the flip is one line here, beside the
-/// listener that feeds [`REGISTRY_CACHE_FETCH_PORTS`].
-pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
+/// The phase this build ships: in force. The registry and cache entries name
+/// the hosts the daemon's own fetches go to, and the node plane's own lookups
+/// pin their addresses, so the gate deciding by the set keeps those fetches
+/// passing (NET-080) and bounds everything else the node's address sends
+/// (NET-085). The gate's decision reads the phase off the baseline it was
+/// built with ([`NodePlaneBaseline::phase`]), and the start-up line logs it.
+pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::InForce;
+
+/// The registry the daemon's own fetches resolve packages against: the host
+/// of the package source repository a project's `[upstream]` names (`op`'s
+/// default, `https://github.com/gominimal/pkgs`). Before a box launches, the
+/// in-VM daemon git-fetches that repository at its locked commit to build
+/// the package graph, so the fetch is node-plane traffic and the host must
+/// be a member. The package index and the package content the daemon reads
+/// next are objects in the cache ([`DAEMON_CACHE_ENDPOINT`]). Nothing on a
+/// VM host configures another location for the guest daemon, so the
+/// daemon's configured registry is this default. A deployment re-points the
+/// category with [`BASELINE_REGISTRY_ENV`].
+pub const DAEMON_REGISTRY_ENDPOINT: &str = "github.com";
+
+/// The cache the daemon's own fetches read package content from: the host of
+/// its default remote cache read location (`mctx`'s
+/// `DEFAULT_REMOTE_CACHE_READ_URL`, `https://cache.minimal.dev/`). A
+/// deployment re-points the category with [`BASELINE_CACHE_ENV`].
+pub const DAEMON_CACHE_ENDPOINT: &str = "cache.minimal.dev";
+
+/// The environment variable that re-points the registry category: a
+/// comma-separated list of host names (`pkgs.example.com`) and subnets
+/// (`a.b.c.d/n`). Absent, the category keeps [`DAEMON_REGISTRY_ENDPOINT`].
+/// Set and empty, the category stays carried and admits nothing. Read from
+/// the reading process's own environment each time the set is built.
+pub(crate) const BASELINE_REGISTRY_ENV: &str = "MINVMD_BASELINE_REGISTRY";
+
+/// The environment variable that re-points the cache category, spelled the
+/// way [`BASELINE_REGISTRY_ENV`] is. Absent, the category keeps
+/// [`DAEMON_CACHE_ENDPOINT`].
+pub(crate) const BASELINE_CACHE_ENV: &str = "MINVMD_BASELINE_CACHE";
+
+/// One category's endpoints as the deployment spelled them in `var`, or
+/// `None` when the variable is absent. A value that is not Unicode keeps the
+/// built-in endpoints and logs a warning that names the variable.
+fn baseline_endpoints_from_env(var: &str) -> Option<Vec<String>> {
+    match std::env::var(var) {
+        Ok(raw) => Some(baseline_endpoints_from_raw(var, &raw)),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                variable = var,
+                "the node-plane baseline entry's variable is not valid Unicode; the built-in \
+                 endpoints stay in force",
+            );
+            None
+        }
+    }
+}
+
+/// Parses one category's endpoint list: comma-separated terms, whitespace
+/// trimmed, empty terms skipped. A term with a `/` must be an IPv4 subnet,
+/// and any other term must be a host name of letters, digits, `-` and `.`.
+/// A term that is neither is skipped with a warning that names it, so a typo
+/// narrows the set and never widens it. A bare IPv4 address is not a host
+/// name: it is skipped with a warning that names its `/32` subnet form.
+fn baseline_endpoints_from_raw(var: &str, raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .filter(|term| {
+            if term.parse::<std::net::Ipv4Addr>().is_ok() {
+                tracing::warn!(
+                    variable = var,
+                    term = %term,
+                    "skipped a node-plane baseline endpoint that is a bare IPv4 address; \
+                     write it as the subnet {term}/32",
+                );
+                return false;
+            }
+            let valid = if term.contains('/') {
+                Ipv4Cidr::parse(term).is_some()
+            } else {
+                term.trim_end_matches('.').split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            };
+            if !valid {
+                tracing::warn!(
+                    variable = var,
+                    term = %term,
+                    "skipped a node-plane baseline endpoint that is neither a host name nor an \
+                     IPv4 subnet",
+                );
+            }
+            valid
+        })
+        .map(str::to_string)
+        .collect()
+}
 
 /// The environment variable the daemon's host-exposure port list is read
 /// from, each time the daemon starts the VM's network — from the daemon's
@@ -225,31 +325,8 @@ fn bad_host_exposure_term(term: &str) -> io::Error {
     ))
 }
 
-/// The IP protocol the in-force arm opens on the switch's host alias: TCP
-/// alone, because the store surface the built-in endpoints name is HTTPS.
-/// QUIC is not admitted; carrying it would be a stated choice that adds UDP
-/// here. Every other protocol to the alias, ICMP and GRE among them, is the
-/// infrastructure drop, whatever its bytes read as a port.
-pub(crate) const REGISTRY_CACHE_FETCH_PROTOCOL: u8 = IPPROTO_TCP;
-
-/// The ports the in-force arm opens on the switch's host alias, over
-/// [`REGISTRY_CACHE_FETCH_PROTOCOL`]. The compiled set has no port
-/// dimension, so without this bound the alias would be admitted at every
-/// port.
-///
-/// 443 is the planned port of the helper's store surface on the alias. No
-/// listener serves a registry or a cache there yet, and the daemon's own
-/// fetches go to `cache.minimal.dev`, not to the alias. When that listener
-/// lands, this list must be read from the listener's stack, the way
-/// `switch::bep_host::PROXY_PORT` is. `[443]` is the planned port, and no
-/// listener serves it. While [`NODE_BASELINE_PHASE`] is
-/// [`NodeBaselinePhase::Announced`], only the in-force tests exercise this
-/// list. The endpoint-configuration change (#1786) replaces it with the
-/// listener's port, or with an empty list if no listener exists.
-pub(crate) const REGISTRY_CACHE_FETCH_PORTS: [u16; 1] = [443];
-
 /// The node-plane baseline set: the categories in force, each with the
-/// subnets it admits, and the compiled rules the host-side gate decides
+/// endpoints it admits, and the compiled rules the host-side gate decides
 /// node-plane frames by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePlaneBaseline {
@@ -260,77 +337,77 @@ pub struct NodePlaneBaseline {
     /// The switch's resolver, carried into every recompilation so the
     /// resolver carve-out survives a re-pointed category.
     resolver: [u8; 4],
-    /// The switch's host alias: the address the in-force arm bounds to
-    /// [`REGISTRY_CACHE_FETCH_PROTOCOL`] at [`REGISTRY_CACHE_FETCH_PORTS`],
-    /// carried so the policy display spells that bound beside the endpoint.
-    host_alias: [u8; 4],
     /// The categories in force, in the order the display spells them.
     entries: Vec<BaselineEntry>,
     /// The compiled allow list the gate decides node-plane frames by: every
-    /// category's endpoints, every IP protocol within them, keyed to the
-    /// daemon's own address as its lease.
+    /// category's subnet endpoints, every IP protocol within them, keyed to
+    /// the daemon's own address as its lease. A named endpoint is not in it:
+    /// its addresses are the node plane's own pins.
     rules: EgressRules,
-    /// The posture the gate decides the set under: the shipped constant,
-    /// until the store-surface configuration flips it.
+    /// The posture the gate decides the set under: the shipped constant.
     phase: NodeBaselinePhase,
     /// The configured host exposures over the alias, as inclusive port
-    /// ranges: the ports the node row still reaches the host alias at while
-    /// the baseline is announced, every other port refused through the
-    /// alias. Empty unless the deployment names ports. The host-side gate
-    /// alone reads it: the guest-side verdict's own alias list starts empty
-    /// and nothing in the run path fills it, so own-address boxes stay
-    /// refused at every port.
+    /// ranges: the ports the node plane reaches the host alias at, every
+    /// other port refused through the alias. Empty unless the deployment
+    /// names ports. The host-side gate alone reads it: the guest-side
+    /// verdict's own alias list starts empty and nothing in the run path
+    /// fills it, so own-address boxes stay refused at every port.
     host_exposure: Vec<(u16, u16)>,
 }
 
 impl NodePlaneBaseline {
     /// The built-in enumeration for one switch fabric. The categories are
-    /// the design's, in the order the display spells them; the built-in
-    /// endpoints come from the fabric's own address plan:
+    /// the design's, in the order the display spells them, and each names
+    /// the host the daemon's own fetches go to:
     ///
-    /// - `registry` and `cache`: the helper's answer address on the fabric
-    ///   (the switch's host alias) — the one address the plan holds for a
-    ///   store surface the helper itself carries. Which registry and which
-    ///   cache the node plane uses is the deployment's to say:
-    ///   [`with_registry`](Self::with_registry) and
-    ///   [`with_cache`](Self::with_cache) replace these endpoints within
-    ///   their category, and a category is replaced, never absent.
+    /// - `registry`: [`DAEMON_REGISTRY_ENDPOINT`], where the daemon fetches
+    ///   the package source repository its package graph is built from.
+    /// - `cache`: [`DAEMON_CACHE_ENDPOINT`], where the daemon reads the
+    ///   package index and package content.
+    ///
+    /// Which registry and which cache the node plane uses is the
+    /// deployment's to say: [`BASELINE_REGISTRY_ENV`] and
+    /// [`BASELINE_CACHE_ENV`], when set, replace these endpoints within their
+    /// category through [`with_registry`](Self::with_registry) and
+    /// [`with_cache`](Self::with_cache), and each change is logged. A category
+    /// is replaced, never absent. The VM host daemon reads them at VM start,
+    /// and the policy display reads them from its own environment, so the two
+    /// show one set when both run with the same environment.
     ///
     /// The set carries no row for the switch fabric itself: the categories
     /// are the design's named service planes, and the plane the node lives
-    /// on is no allowance of its own — a node-plane frame aimed at a box is
-    /// the target box's ingress rules to decide, so a row naming the box
-    /// leases would hand whoever wears the node's address every box's
-    /// listener, the reach the escape bound (NET-085) exists to keep inside
-    /// the enumerated set.
+    /// on is no allowance of its own. A node-plane frame aimed at a box's
+    /// lease is the target box's ingress to decide, and the gate's in-force
+    /// arm passes it on to the switch for that decision.
     ///
     /// The compiled set allows every IP protocol within the admitted
-    /// subnets — the categories bound destinations, not protocols; the
-    /// gate's in-force arm bounds the host alias to TCP at
-    /// [`REGISTRY_CACHE_FETCH_PORTS`] before the set is consulted — and is
-    /// keyed to the in-VM daemon's own address as its lease: the verdict
-    /// rejects any frame wearing another source, so the set decides
-    /// node-plane frames and only those. The resolver's carve-out keeps the
-    /// node resolving under the declaration, the same carve-out a box's
-    /// rules carry.
+    /// subnets, and is keyed to the in-VM daemon's own address as its lease:
+    /// the verdict rejects any frame wearing another source, so the set
+    /// decides node-plane frames and only those. The resolver's carve-out
+    /// keeps the node resolving, which is how its named endpoints get pinned.
     #[must_use]
     pub fn built_in(subnet: SwitchSubnet) -> Self {
-        let host_alias = subnet.host_alias();
-        Self::from_entries(
+        let mut baseline = Self::from_entries(
             subnet.daemon_ip().octets(),
             subnet.dns_server().octets(),
-            host_alias.octets(),
             vec![
                 BaselineEntry {
                     category: BaselineCategory::Registry,
-                    endpoints: vec![format!("{host_alias}/32")],
+                    endpoints: vec![DAEMON_REGISTRY_ENDPOINT.to_string()],
                 },
                 BaselineEntry {
                     category: BaselineCategory::Cache,
-                    endpoints: vec![format!("{host_alias}/32")],
+                    endpoints: vec![DAEMON_CACHE_ENDPOINT.to_string()],
                 },
             ],
-        )
+        );
+        if let Some(endpoints) = baseline_endpoints_from_env(BASELINE_REGISTRY_ENV) {
+            baseline = baseline.with_registry(endpoints);
+        }
+        if let Some(endpoints) = baseline_endpoints_from_env(BASELINE_CACHE_ENV) {
+            baseline = baseline.with_cache(endpoints);
+        }
+        baseline
     }
 
     /// The in-VM daemon's own address on the fabric: the one source identity
@@ -353,17 +430,38 @@ impl NodePlaneBaseline {
         &self.rules
     }
 
-    /// The posture the gate decides the set under — announced, the shipped
-    /// posture, the run path's allow-all interim node row still decides the
-    /// node plane's frames; in force, the compiled set does.
+    /// The posture the gate decides the set under. In force, the shipped
+    /// posture: the set decides the node plane's frames. Announced: the run
+    /// path's allow-all interim node row does.
     #[must_use]
     pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
     }
 
+    /// The host-name endpoints of every entry, each with the categories that
+    /// name it, in the order the entries carry them: the names whose answers
+    /// the node plane's own lookups pin ([`crate::net::dns_pins`]). One name
+    /// can serve two categories, the built-in registry and cache among them.
+    #[must_use]
+    pub(crate) fn named_endpoints(&self) -> Vec<(String, Vec<BaselineCategory>)> {
+        let mut named: Vec<(String, Vec<BaselineCategory>)> = Vec::new();
+        for entry in &self.entries {
+            for name in entry.names() {
+                match named.iter_mut().find(|(known, _)| *known == name) {
+                    Some((_, categories)) if !categories.contains(&entry.category) => {
+                        categories.push(entry.category);
+                    }
+                    Some(_) => {}
+                    None => named.push((name, vec![entry.category])),
+                }
+            }
+        }
+        named
+    }
+
     /// The host exposures over the alias this gate carries: the inclusive
-    /// port ranges the announced node row still reaches the host alias at,
-    /// empty unless the deployment configured ports.
+    /// port ranges the node plane reaches the host alias at, empty unless
+    /// the deployment configured ports.
     #[must_use]
     pub(crate) fn host_exposure_ports(&self) -> &[(u16, u16)] {
         &self.host_exposure
@@ -401,41 +499,29 @@ impl NodePlaneBaseline {
             .join(",")
     }
 
-    /// One entry's endpoints as the policy display spells them (NET-061): an
-    /// endpoint naming the host alias carries the in-force arm's bound
-    /// beside it (`100.64.255.254/32 tcp/443`), because the set has no port
-    /// dimension and the bound is what in force admits there. Any other
-    /// endpoint is spelled as the set holds it.
+    /// One entry's endpoints as the policy display spells them (NET-061):
+    /// each host name and each subnet as the entry holds it.
     #[must_use]
     pub fn display_endpoints(&self, entry: &BaselineEntry) -> Vec<String> {
-        let alias = format!("{}/32", std::net::Ipv4Addr::from(self.host_alias));
-        let ports = REGISTRY_CACHE_FETCH_PORTS
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        entry
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                if *endpoint == alias {
-                    format!("{endpoint} tcp/{ports}")
-                } else {
-                    endpoint.clone()
-                }
-            })
-            .collect()
+        entry.endpoints.clone()
     }
 
     /// The set as the daemon's start-up line spells it: one
     /// `category=endpoints` term per category, in the order the categories
     /// are carried, so the line names the set in force with each entry's
-    /// category.
+    /// category. An entry with no endpoint is spelled `(none)`.
     #[must_use]
     pub(crate) fn render(&self) -> String {
         self.entries
             .iter()
-            .map(|entry| format!("{}={}", entry.category.as_str(), entry.endpoints.join(",")))
+            .map(|entry| {
+                let endpoints = if entry.endpoints.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    entry.endpoints.join(",")
+                };
+                format!("{}={endpoints}", entry.category.as_str())
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -443,8 +529,9 @@ impl NodePlaneBaseline {
     /// Points the registry category at `endpoints`, replacing the built-in:
     /// which registry the node plane uses is the host's to configure, within
     /// the category. The category stays carried — an empty list is a
-    /// registry that admits nothing, not an absent one (NET-130) — and the
-    /// compiled set is rebuilt from every category's endpoints.
+    /// registry that admits nothing, not an absent one (NET-130) — the
+    /// compiled set is rebuilt from every category's endpoints, and the
+    /// change is logged.
     #[must_use]
     pub fn with_registry(mut self, endpoints: Vec<String>) -> Self {
         self.replace(BaselineCategory::Registry, endpoints);
@@ -453,39 +540,48 @@ impl NodePlaneBaseline {
 
     /// Points the cache category at `endpoints`, the way
     /// [`with_registry`](Self::with_registry) points the registry: replaced
-    /// within its category, never absent, the compiled set rebuilt.
+    /// within its category, never absent, the compiled set rebuilt, the
+    /// change logged.
     #[must_use]
     pub fn with_cache(mut self, endpoints: Vec<String>) -> Self {
         self.replace(BaselineCategory::Cache, endpoints);
         self
     }
 
-    /// Pins the phase's other arm ([`NodeBaselinePhase::InForce`]): the gate
-    /// decides node-plane frames by the compiled set. The arm the
-    /// store-surface configuration change flips the shipped constant onto —
-    /// built here so the in-force behavior has its proof before the flip
-    /// lands, rather than tests to rewrite after it.
+    /// Pins the phase's other arm ([`NodeBaselinePhase::Announced`]): the
+    /// run path's interim node row decides node-plane frames. Kept so the
+    /// tests can pin both arms of the phase.
     #[cfg(test)]
-    pub(crate) fn in_force(mut self) -> Self {
-        self.phase = NodeBaselinePhase::InForce;
+    pub(crate) fn announced(mut self) -> Self {
+        self.phase = NodeBaselinePhase::Announced;
         self
     }
 
-    /// Re-points one category's endpoints and rebuilds the compiled set.
-    /// A category the enumeration does not carry is added rather than
-    /// skipped, so configuring a category can never make it absent.
+    /// Re-points one category's endpoints, rebuilds the compiled set, and
+    /// logs the change with the endpoints before and after it. A category
+    /// the enumeration does not carry is added rather than skipped, so
+    /// configuring a category can never make it absent.
     fn replace(&mut self, category: BaselineCategory, endpoints: Vec<String>) {
-        match self
+        let previous = match self
             .entries
             .iter_mut()
             .find(|entry| entry.category == category)
         {
-            Some(entry) => entry.endpoints = endpoints,
-            None => self.entries.push(BaselineEntry {
-                category,
-                endpoints,
-            }),
-        }
+            Some(entry) => std::mem::replace(&mut entry.endpoints, endpoints.clone()),
+            None => {
+                self.entries.push(BaselineEntry {
+                    category,
+                    endpoints: endpoints.clone(),
+                });
+                Vec::new()
+            }
+        };
+        tracing::info!(
+            entry = category.as_str(),
+            previous = %previous.join(","),
+            endpoints = %endpoints.join(","),
+            "re-pointed a node-plane baseline entry",
+        );
         self.rules = Self::compile_rules(&self.entries, self.resolver, self.node_addr);
     }
 
@@ -493,16 +589,10 @@ impl NodePlaneBaseline {
     /// addresses the compiled rules are keyed to. The host exposures start
     /// empty, the alias closed; the deployment's spelling replaces them in
     /// the run path's builder.
-    fn from_entries(
-        node_addr: [u8; 4],
-        resolver: [u8; 4],
-        host_alias: [u8; 4],
-        entries: Vec<BaselineEntry>,
-    ) -> Self {
+    fn from_entries(node_addr: [u8; 4], resolver: [u8; 4], entries: Vec<BaselineEntry>) -> Self {
         Self {
             node_addr,
             resolver,
-            host_alias,
             rules: Self::compile_rules(&entries, resolver, node_addr),
             entries,
             phase: NODE_BASELINE_PHASE,
@@ -510,8 +600,8 @@ impl NodePlaneBaseline {
         }
     }
 
-    /// Compiles the categories' endpoints into the allow list the gate
-    /// decides node-plane frames by: every category's subnets, every IP
+    /// Compiles the categories' subnet endpoints into the allow list the
+    /// gate decides node-plane frames by: every category's subnets, every IP
     /// protocol within them, the daemon's own address as the lease the
     /// verdict checks the frame's source against.
     fn compile_rules(
@@ -530,8 +620,10 @@ impl NodePlaneBaseline {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselineCategory, BaselineEntry, HOST_EXPOSURE_PORTS_ENV, NodePlaneBaseline,
-        host_exposure_ports_from_raw,
+        BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry,
+        DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT, HOST_EXPOSURE_PORTS_ENV,
+        NodeBaselinePhase, NodePlaneBaseline, baseline_endpoints_from_env,
+        baseline_endpoints_from_raw, host_exposure_ports_from_raw,
     };
     use boxes::core::egress::{FrameVerdict, summarize, verdict};
     use std::net::Ipv4Addr;
@@ -588,31 +680,77 @@ mod tests {
 
     /// NET-130: on a host un-enrolled, the node-plane baseline set comes
     /// from the helper's built-in enumeration — and the enumeration keeps
-    /// the registry and the cache categories, configurable as to which
-    /// registry and which cache, never absent: re-pointing one leaves the
-    /// other carried with its built-in endpoints, and the compiled set
-    /// carries the replacement beside the survivors.
+    /// the registry and the cache categories, each named by the host the
+    /// daemon's own fetches go to, configurable as to which registry and
+    /// which cache, never absent: re-pointing one leaves the other carried
+    /// with its built-in endpoints, every re-pointing is logged, and the
+    /// compiled set carries the replacement beside the survivors.
     #[test]
     fn baseline_enumeration_always_carries_registry_and_cache() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
 
         // The built-in enumeration carries every category — the registry and
-        // the cache, the two the design names — each with an endpoint to
-        // admit.
+        // the cache, the two the design names — each a named endpoint: the
+        // host the daemon's own fetches go to, never an address the fabric
+        // plan made up.
         assert_eq!(baseline.entries().len(), 2);
-        assert!(
-            !entry(&baseline, BaselineCategory::Registry)
-                .endpoints()
-                .is_empty()
+        assert_eq!(
+            entry(&baseline, BaselineCategory::Registry).endpoints(),
+            &[DAEMON_REGISTRY_ENDPOINT.to_string()]
         );
-        assert!(
-            !entry(&baseline, BaselineCategory::Cache)
-                .endpoints()
-                .is_empty()
+        assert_eq!(
+            entry(&baseline, BaselineCategory::Cache).endpoints(),
+            &[DAEMON_CACHE_ENDPOINT.to_string()]
+        );
+        // Both names are the ones the node plane's own lookups pin against,
+        // each against its own category: the package source repository's
+        // host for the registry, the cache's host for the cache.
+        assert_eq!(
+            baseline.named_endpoints(),
+            vec![
+                ("github.com".to_string(), vec![BaselineCategory::Registry]),
+                (
+                    "cache.minimal.dev".to_string(),
+                    vec![BaselineCategory::Cache]
+                ),
+            ]
         );
         // And it carries the in-VM daemon's own address, the one source
         // identity the set's verdict accepts.
         assert_eq!(baseline.node_addr(), SUBNET.daemon_ip().octets());
+        // The shipped posture is in force: the set decides the node plane's
+        // own frames, and a marked frame is the resident `host_ip` boxes'
+        // to decide, never the node row's. The posture carries no caveat.
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
+        assert_eq!(baseline.phase().as_str(), "in force");
+
+        // The deployment's spelling of an entry: host names and subnets,
+        // whitespace trimmed, and a term that is neither skipped, so a typo
+        // narrows the set and never widens it. A bare address is skipped
+        // too: its subnet form is `/32`. Set and empty, the category
+        // is carried with no endpoint.
+        assert_eq!(
+            baseline_endpoints_from_raw(
+                BASELINE_REGISTRY_ENV,
+                " pkgs.example.com , 203.0.113.0/24,,bad name,10.0.0.0/99,a..b,203.0.113.9 "
+            ),
+            vec!["pkgs.example.com".to_string(), "203.0.113.0/24".to_string()]
+        );
+        assert!(baseline_endpoints_from_raw(BASELINE_CACHE_ENV, "").is_empty());
+        let emptied = baseline
+            .clone()
+            .with_cache(baseline_endpoints_from_raw(BASELINE_CACHE_ENV, " "));
+        assert!(
+            entry(&emptied, BaselineCategory::Cache)
+                .endpoints()
+                .is_empty(),
+            "an emptied cache is carried and admits nothing, never absent"
+        );
+        // Absent, the built-in endpoints stand: this run sets neither
+        // variable, which is how the built-in assertions above hold.
+        assert_eq!(baseline_endpoints_from_env(BASELINE_REGISTRY_ENV), None);
+        assert_eq!(baseline_endpoints_from_env(BASELINE_CACHE_ENV), None);
 
         // Which registry the node plane uses is the host's to say. The
         // registry category is replaced within itself, and the cache is
@@ -646,6 +784,29 @@ mod tests {
             registry_endpoints,
         );
 
+        // Every change is logged, naming the entry and its endpoints before
+        // and after.
+        let logged = log.contents();
+        for line in [
+            "entry=\"registry\" previous=github.com endpoints=10.9.0.0/16",
+            "entry=\"cache\" previous=cache.minimal.dev endpoints=10.8.0.0/16",
+        ] {
+            assert!(
+                logged.contains(line) && logged.contains("re-pointed a node-plane baseline entry"),
+                "each re-pointing is logged ({line}), got: {logged}"
+            );
+        }
+
+        // An empty list keeps the category, admitting nothing: never absent.
+        let emptied = re_cached.clone().with_registry(Vec::new());
+        assert_eq!(emptied.entries().len(), 2);
+        assert!(
+            entry(&emptied, BaselineCategory::Registry)
+                .endpoints()
+                .is_empty()
+        );
+        assert_eq!(emptied.render(), "registry=(none), cache=10.8.0.0/16");
+
         // The compiled set decides by what the categories carry: the
         // replaced registry's subnets are admitted beside the surviving
         // cache's, and a destination no category names is not.
@@ -667,45 +828,28 @@ mod tests {
         );
     }
 
-    /// The built-in set's compiled rules decide node-plane frames by the
-    /// enumeration alone: the daemon's own address may reach the categories'
-    /// endpoints and nothing else, and a frame wearing another source is
-    /// rejected by the lease the set is keyed to.
+    /// The built-in set's compiled rules carry no address of their own: the
+    /// named endpoints are admitted by the node plane's pins, not by a
+    /// subnet, so a frame from the daemon's own address to any destination
+    /// is the undeclared drop here and the pins decide it at the gate. A
+    /// frame wearing another source is rejected by the lease the set is
+    /// keyed to.
     #[test]
-    fn baseline_rules_admit_the_enumerated_categories_alone() {
+    fn baseline_rules_admit_no_address_but_the_resolver() {
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         let node_addr = baseline.node_addr();
 
-        // The registry and cache endpoints — the helper's answer address on
-        // the fabric — are admitted from the daemon's own address.
-        let summary = summarize(&tcp_frame(
-            node_addr,
-            first_endpoint(&baseline, BaselineCategory::Registry),
-            443,
-        ));
-        assert!(matches!(
-            verdict(&summary, baseline.rules()),
-            FrameVerdict::Admit
-        ));
-
-        // A destination no category names is dropped as undeclared — the
-        // gap the announced phase covers until the store surfaces are
-        // configured (see `NodeBaselinePhase`).
         let summary = summarize(&tcp_frame(node_addr, [8, 8, 8, 8], 443));
         match verdict(&summary, baseline.rules()) {
             FrameVerdict::Drop(reason) => {
                 assert_eq!(reason.rule(), "egress-undeclared-subnet")
             }
-            FrameVerdict::Admit => panic!("an out-of-set destination is not admitted"),
+            FrameVerdict::Admit => panic!("the compiled set admits no address of its own"),
         }
 
         // A frame wearing another source is rejected by the lease the set
         // is keyed to: the set decides node-plane frames, and only those.
-        let summary = summarize(&tcp_frame(
-            [100, 64, 0, 9],
-            first_endpoint(&baseline, BaselineCategory::Registry),
-            443,
-        ));
+        let summary = summarize(&tcp_frame([100, 64, 0, 9], [8, 8, 8, 8], 443));
         match verdict(&summary, baseline.rules()) {
             FrameVerdict::Drop(reason) => assert_eq!(reason.rule(), "egress-foreign-source"),
             FrameVerdict::Admit => panic!("a foreign source is not admitted by the set"),
@@ -789,17 +933,15 @@ mod tests {
         );
     }
 
-    /// NET-061: the policy display spells the in-force arm's bound beside
-    /// an endpoint naming the host alias, and a re-pointed endpoint as the
-    /// set holds it.
+    /// NET-061: the policy display spells each endpoint as the set holds
+    /// it, a host name as a name and a subnet as a subnet.
     #[test]
-    fn display_endpoints_spell_the_alias_bound() {
+    fn display_endpoints_spell_the_entries() {
         let baseline =
             NodePlaneBaseline::built_in(SUBNET).with_cache(vec!["198.51.100.0/24".to_owned()]);
-        let alias = format!("{}/32 tcp/443", SUBNET.host_alias());
         assert_eq!(
             baseline.display_endpoints(entry(&baseline, BaselineCategory::Registry)),
-            vec![alias]
+            vec!["github.com".to_owned()]
         );
         assert_eq!(
             baseline.display_endpoints(entry(&baseline, BaselineCategory::Cache)),

@@ -12445,6 +12445,10 @@ proof_bep_store_reference_end_to_end() {
     fail
   fi
   bep_live_gate "$sr_case" no_sign_in || { echo "::endgroup::"; return 0; }
+  # r3_proxy_pids selects this run's proxy by its listener socket. Step 1
+  # must leave the same proxy serving.
+  local sr_pids
+  sr_pids="$(r3_proxy_pids)"
 
   sr_id="e2e-store-ref-$(date +%s)-$$"
   sr_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -12508,61 +12512,19 @@ proof_bep_store_reference_end_to_end() {
   fi
   echo "min secret set: stored $sr_id (${#sr_value} characters) with its rule for $sr_host, and printed no value"
 
-  # `bep serve` re-certifies the published root only at the next CONNECT,
-  # not when the registration changes. No CONNECT runs between
-  # `min secret set` and the activate in step 2, so that box would read the
-  # old root from the identity file and keep it. Stop the proxy, and let the
-  # restarted daemon pair start one that publishes a root with the new rule.
-  # minvmd does not restart a `bep serve` that exits.
-  # https://github.com/gominimal/minimal/issues/2746 removes this block.
-  # This reads the real home, as bep_live_gate does.
-  # shellcheck disable=SC2031
-  local sr_control="$HOME/.minimal/bep/control.sock" sr_pids
-  # r3_proxy_pids selects this run's proxy by its listener socket, so a
-  # proxy from another checkout or a person's own proxy is not stopped.
-  sr_pids="$(r3_proxy_pids)"
-  if [ -n "$sr_pids" ]; then
-    # shellcheck disable=SC2086
-    kill -TERM $sr_pids 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      [ -n "$(r3_proxy_pids)" ] || break
-      sleep 0.5
-    done
-    sr_pids="$(r3_proxy_pids)"
-    # shellcheck disable=SC2086
-    [ -n "$sr_pids" ] && kill -KILL $sr_pids 2>/dev/null
-    for _ in $(seq 1 20); do
-      bep_control_live "$sr_control" || break
-      sleep 0.5
-    done
-    if bep_control_live "$sr_control"; then
-      echo "::error::the proxy still answers on $sr_control after its process was stopped"
-      sr_fail
-    fi
-  fi
-  # The gate at the start of this case passed, so the proxy must come back
-  # here. Restart the daemon pair directly, not through bep_live_gate, so a
-  # failure is one failure and never also a NOT RUN row.
-  local sr_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
-  unset MINVMD_BEP_STUB
-  mnl stop --force >/dev/null 2>&1 || true
-  minvmd stop >/dev/null 2>&1 || true
-  if ! mnl ls >/dev/null 2>"$WORK/$sr_case.restart.err"; then
-    echo "::error::the daemon did not start again for $sr_case"
-    cat "$WORK/$sr_case.restart.err" 2>/dev/null || true
+  # `min secret set` asked the running proxy to re-certify its root, and the
+  # proxy published a root with the new rule before it answered. The box in
+  # step 3 activates against that same proxy, with no restart (BEP-013).
+  if grep -qF "did not update its root certificate" "$WORK/$sr_case.set.err" 2>/dev/null; then
+    echo "::error::the running proxy did not re-certify its root for $sr_host after 'min secret set'"
+    grep -vF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null || true
     sr_fail
   fi
-  for _ in $(seq 1 60); do
-    bep_control_live "$sr_control" && break
-    sleep 1
-  done
-  if ! bep_control_live "$sr_control"; then
-    echo "::error::the Box Egress Proxy is not serving: nothing answers on $sr_control 60 s after the VM host daemon started again"
-    echo "--- $sr_log (tail) ---"; tail -40 "$sr_log" 2>/dev/null || echo "(absent)"
+  if [ "$(r3_proxy_pids)" != "$sr_pids" ]; then
+    echo "::error::the proxy is not the one that ran before 'min secret set' (pids '$sr_pids', now '$(r3_proxy_pids)')"
     sr_fail
   fi
-  BEP_LIVE_DAEMON=1
-  echo "the proxy restarted with the rule for $sr_host"
+  echo "the running proxy re-certified its root for $sr_host, with no restart"
 
   # 2. The box spec references the identifier (BEP-032), and `min box spec`
   # shows the reference with its upstream (BEP-038).
@@ -19228,9 +19190,9 @@ ESU_LISTENER_EOF
       esu_fail
     fi
     if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
-      || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
-      || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
-      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
+      || ! grep -q 'registry  github.com' <<<"$esu_policy" \
+      || ! grep -q 'cache  cache.minimal.dev' <<<"$esu_policy"; then
+      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry github.com and the cache cache.minimal.dev)"
       esu_fail
     fi
   done
