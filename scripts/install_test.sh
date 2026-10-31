@@ -3471,6 +3471,52 @@ case_linux_vm_stack() {
         grep -qE "^  switch-binary +(verified|current)" "$OUT"
 }
 
+# --- #2498: the Box Egress Proxy installs beside minvmd on macOS -------------
+# minvmd starts `bep` from beside its own binary, so an installed minvmd finds
+# the proxy only when both land in the same directory. The proof reads the
+# release's own component table (scripts/stage-release.sh), then installs a
+# darwin manifest with those two rows and checks where they land.
+case_bep_installs_beside_minvmd() {
+    _table="$here/stage-release.sh"
+    _row_dest() {
+        awk -F'|' -v c="$1" '$1 ~ "\"" c "$" && $2 == "darwin" && $3 == "arm64" {print $5}' "$_table"
+    }
+    check "bin/bep" "$(_row_dest bep)" "the release stages bep for darwin/arm64 at bin/bep"
+    check "bin/minvmd" "$(_row_dest minvmd)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
+    want_err "the release stages no bep for Linux" \
+        grep -qE '^    "bep\|linux\|' "$_table"
+
+    printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
+    printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"
+    h_dminvmd="$(hash_file "$mock/versions/v1/minvmd-macos-arm64")"
+    h_dbep="$(hash_file "$mock/versions/v1/bep-macos-arm64")"
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd darwin arm64 v1 "$h_dminvmd" file bin/minvmd versions/v1/minvmd-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep darwin arm64 v1 "$h_dbep" file bin/bep versions/v1/bep-macos-arm64
+    } >"$mock/versions/v1/components"
+
+    PLAT_S=Darwin; PLAT_M=arm64
+    : >"$root/xattr.calls"
+    H_BEP="$root/h_bep_darwin"; mkdir -p "$H_BEP"
+    reset_dl
+    run bep_darwin_install "$H_BEP"
+    check 0 "$rc" "darwin install with the bep row exits 0"
+    want_ok "minvmd installs in the same bin directory" test -f "$H_BEP/bin/minvmd"
+    check "$h_dbep" "$(hash_file "$H_BEP/bin/bep")" "the installed bep matches the manifest hash"
+    want_ok "bep is executable like every bin row" test -x "$H_BEP/bin/bep"
+    want_ok "quarantine stripped from bep (xattr)" grep -q "/bin/bep\.tmp" "$root/xattr.calls"
+    want_ok "bep is recorded at its user-prefix path" \
+        record_has bep "$H_BEP/bin/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the installer printed the bep status" \
+        grep -qE "^  bep +(installed|current)" "$OUT"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    PLAT_S=Linux; PLAT_M=x86_64
+}
+
 case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
 case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
 
@@ -3613,6 +3659,7 @@ case_for() {
         answerer_source_installed)      case_answerer_source_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
+        bep_installs_beside_minvmd)         case_bep_installs_beside_minvmd ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -3629,7 +3676,8 @@ case "${1:-}" in
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
             host_classifier_tree_installed answerer_source_installed \
-            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
+            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack \
+            bep_installs_beside_minvmd; do
             case_for "$_c"
         done
         ;;
