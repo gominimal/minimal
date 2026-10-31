@@ -194,8 +194,8 @@ build-infra operator. Release manager.
     verify: cargo nextest run -p rcache index_of_mixed_or_unknown_epoch_is_refused
     property: for all files f: read(f) succeeds only when every record's
       flags is one known epoch and all records share it; a record whose
-      flags is not a known epoch fails at the flags field before the key
-      bytes
+      flags is not a known epoch fails at the flags field before the sha256
+      bytes (the record is key, flags, sha256)
     harness: kani_index_file_one_epoch_or_refused, exhaustive over files of
       two records with symbolic flags (one epoch accepted; two known epochs
       refused; an unknown epoch refused at the flags field), unwind 3 (the
