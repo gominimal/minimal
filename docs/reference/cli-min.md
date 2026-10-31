@@ -702,7 +702,8 @@ GitHub App. With no installation, it gives the install URL,
 `https://github.com/apps/gominimal/installations/new`, where you choose the
 repositories your boxes can reach. The browser page links there too. The
 browser sign-in then waits up to 5 minutes for the installation, and Ctrl-C
-stops the wait. The sign-in is already saved.
+stops the wait. The sign-in is already saved. If the wait ends without an
+installation, `min auth login` gives the install URL again.
 
 `min login` is the same command as `min auth login`. It takes the same flags
 and prints the same prompts.

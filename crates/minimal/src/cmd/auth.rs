@@ -68,6 +68,8 @@ const UNREAD: &str = "`min` could not read where the Minimal GitHub App is insta
 const CLOSE_TAB: &str = "You can close this tab.";
 const WAITING: &str =
     "Waiting for the installation to finish in your browser. Press Ctrl-C to stop waiting.";
+const STOPPED_WAITING: &str =
+    "Stopped waiting. `min` did not see an installation of the Minimal GitHub App.";
 
 /// Where the sign-in talks to GitHub. Tests point it at a local server.
 #[derive(Debug, Clone)]
@@ -392,7 +394,9 @@ pub(crate) async fn run_login(
             let mut browser = Browser::open(login.endpoints, login.open_browser, err).await?;
             let (stored, installs, access) = browser.sign_in(&http, login).await?;
             report(out, err, &stored.metadata.account, &installs)?;
-            if !installs.any() {
+            // Only an empty list shows that no installation exists. After a
+            // failed read the App may already be installed.
+            if installs.none() {
                 writeln!(err, "{WAITING}")?;
                 browser
                     .await_install(
@@ -660,8 +664,9 @@ enum Installs {
 }
 
 impl Installs {
-    fn any(&self) -> bool {
-        matches!(self, Installs::Listed(list) if !list.is_empty())
+    /// Whether `min` read the installations and there were none.
+    fn none(&self) -> bool {
+        matches!(self, Installs::Listed(list) if list.is_empty())
     }
 }
 
@@ -964,7 +969,8 @@ impl Browser {
     /// already held, and an install's code is issued without the PKCE
     /// challenge. The callback need not carry the state, because GitHub may
     /// not pass it through the install. A request that carries another
-    /// state gets the expired-link page.
+    /// state gets the expired-link page. At the deadline the terminal says
+    /// the wait stopped and gives the install URL again.
     async fn await_install(
         &mut self,
         http: &reqwest::Client,
@@ -977,7 +983,11 @@ impl Browser {
             tokio::time::interval_at(tokio::time::Instant::now() + INSTALL_POLL, INSTALL_POLL);
         loop {
             let (mut conn, query) = tokio::select! {
-                () = tokio::time::sleep_until(self.deadline) => return Ok(()),
+                () = tokio::time::sleep_until(self.deadline) => {
+                    writeln!(err, "{STOPPED_WAITING}")?;
+                    writeln!(err, "{NEXT_STEP} at {INSTALL_URL}.")?;
+                    return Ok(());
+                }
                 _ = poll.tick() => {
                     if let Some((on, selection)) = installed(http, endpoints, token, None).await {
                         writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
@@ -2073,6 +2083,61 @@ mod tests {
             "{err}"
         );
         assert_eq!(got.len(), 1);
+    }
+
+    // A failed read of the installations does not prove that none exists,
+    // so the sign-in does not wait for an install.
+    #[tokio::test]
+    async fn unread_installations_do_not_start_the_wait() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() = "not json".to_owned();
+        let keychain = MemoryKeychain::default();
+        let visits = vec![Visit::To(to_callback)];
+        let (done, _, err, got) = tokio::time::timeout(
+            Duration::from_secs(60),
+            browser_login(&keychain, &gh, visits),
+        )
+        .await
+        .expect("the sign-in does not wait");
+        done.expect("login");
+        assert!(
+            err.ends_with(
+                "`min` could not read where the Minimal GitHub App is installed.\n\
+                 One more step: choose which repositories your boxes can reach at \
+                 https://github.com/apps/gominimal/installations/new.\n"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("Waiting for the installation"), "{err}");
+        assert_eq!(got.len(), 1);
+    }
+
+    // At the deadline the wait says it stopped and gives the install URL.
+    #[tokio::test]
+    async fn the_install_wait_gives_the_install_url_at_the_deadline() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        browser.deadline = tokio::time::Instant::now();
+        let mut err = Vec::new();
+        browser
+            .await_install(
+                &reqwest::Client::new(),
+                &gh.endpoints,
+                ACCESS,
+                "octocat",
+                &mut err,
+            )
+            .await
+            .expect("wait");
+        assert_eq!(
+            String::from_utf8(err).expect("utf8"),
+            "Stopped waiting. `min` did not see an installation of the Minimal GitHub App.\n\
+             One more step: choose which repositories your boxes can reach at \
+             https://github.com/apps/gominimal/installations/new.\n"
+        );
     }
 
     // A failed exchange renders the not-finished page, never a success.
