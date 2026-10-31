@@ -15586,6 +15586,8 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
   if ! ar_out="$(python3 - "$WORK/$ar_case.$ar_name.audit" "$ar_audit" "$ar_id" <<'PY'
 import json, os, re, sys
 trail, audit, box = sys.argv[1], sys.argv[2], sys.argv[3]
+# The proxy writes the subject as 32 hex digits, without hyphens.
+subject = box.replace("-", "").lower()
 def die(msg):
     print(msg)
     sys.exit(1)
@@ -15603,7 +15605,7 @@ for name in os.listdir(audit):
                 record = json.loads(line)
             except ValueError:
                 continue
-            if record.get("subject") == box:
+            if record.get("subject") == subject:
                 on_disk += 1
                 segments.add(name)
 if len(segments) < 2:
