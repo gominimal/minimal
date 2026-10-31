@@ -943,9 +943,10 @@ async fn unexpose_closing(
     .map(|body| ClosedConnections::from_reply(&body))
 }
 
-/// NET-017's withdraw: unexposes one mapping [`expose_mapping`] bound for a
-/// listener that has since closed, so the box's address stops answering at
-/// the port. The caller refuses the port at the box's gate *first* — the
+/// Unexposes one mapping [`expose_mapping`] bound. NET-017's withdraw of a
+/// listener that has since closed comes here, so the box's address stops
+/// answering at the port. A move, a revoke and a teardown come here too, so
+/// the line this logs names the unexpose and its count, never a withdrawal. The caller refuses the port at the box's gate *first* — the
 /// order [`PortForwarder::revoke`] holds for a declared forward — so no new
 /// connection crosses the gap between a listener already gone and a gate
 /// that still admits the port. A declared port's forward never comes down
@@ -970,16 +971,30 @@ pub async fn unexpose_mapping(
         protocol: mapping.protocol.clone(),
     };
     let closed = unexpose_closing(control, &req).await?;
-    // One line per retraction. The box is the caller's span: the listen
-    // watcher and the box actor each run inside one that names it.
+    // One line per unexpose. The box is the caller's span: the listen
+    // watcher and the box actor each run inside one that names it. Every
+    // caller comes here: a NET-017 withdrawal, a move off an old address, a
+    // revoke and a teardown. So the line says only what this call did, and
+    // each caller's own line says why. It claims closed connections only
+    // when the switch reported a count. An unpatched switch reports none.
     let (host, port) = mapping.host_port().unwrap_or(("", 0));
-    tracing::info!(
-        host,
-        port,
-        protocol = %mapping.protocol,
-        closed_connections = %closed,
-        "withdrew a published port and closed its accepted connections"
-    );
+    if closed.0.is_some() {
+        tracing::info!(
+            host,
+            port,
+            protocol = %mapping.protocol,
+            closed_connections = %closed,
+            "unexposed a forward on the switch, and the switch closed the connections it accepted"
+        );
+    } else {
+        tracing::info!(
+            host,
+            port,
+            protocol = %mapping.protocol,
+            closed_connections = %closed,
+            "unexposed a forward on the switch, which did not report the connections it closed"
+        );
+    }
     Ok(())
 }
 
@@ -2788,8 +2803,12 @@ mod tests {
             let text = log.contents();
             let line = text
                 .lines()
-                .find(|l| l.contains("withdrew a published port"))
+                .find(|l| l.contains("unexposed a forward on the switch"))
                 .unwrap_or_else(|| panic!("no retraction line in the log: {text}"));
+            assert!(
+                line.contains("the switch closed the connections it accepted"),
+                "a reported count is said as closed connections: {line}"
+            );
             assert!(line.contains("web-box"), "the line names the box: {line}");
             assert!(
                 line.contains("port=8080"),
@@ -2808,11 +2827,19 @@ mod tests {
             let text = log.contents();
             let line = text
                 .lines()
-                .filter(|l| l.contains("withdrew a published port"))
+                .filter(|l| l.contains("unexposed a forward on the switch"))
                 .nth(1)
                 .unwrap_or_else(|| panic!("no second retraction line: {text}"));
             assert!(line.contains("port=9090"), "{line}");
             assert!(line.contains("closed_connections=unknown"), "{line}");
+            assert!(
+                line.contains("did not report the connections it closed"),
+                "an unknown count claims no closed connection: {line}"
+            );
+            assert!(
+                !text.contains("withdrew a published port"),
+                "the shared unexpose never claims a withdrawal: {text}"
+            );
             server.abort();
         }
 
