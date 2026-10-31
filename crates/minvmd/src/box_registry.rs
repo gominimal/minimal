@@ -6164,9 +6164,13 @@ impl BoxRegistry {
     /// Takes one listen notice from the in-VM daemon ([`NodeMirror::notice`])
     /// with this node's host-address boxes' residency as the gate: while
     /// no host-address box is published, a listening notice binds nothing.
-    /// The caller has already refused the node's infrastructure ports.
+    /// A listening notice for one of the node's infrastructure ports
+    /// ([`crate::control::guest_infrastructure_ports`]) is refused here, so
+    /// no caller can reach a bind without that check.
     pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
-        self.node_mirror.notice(notice, Instant::now())
+        let infrastructure = crate::control::guest_infrastructure_ports(self);
+        self.node_mirror
+            .notice(notice, &infrastructure, Instant::now())
     }
 }
 
@@ -6496,12 +6500,29 @@ impl NodeMirror {
     }
 
     /// Takes one listen notice that arrived at `now`. A listening notice
-    /// binds only while a host-address box is published on the node.
-    pub fn notice(&self, notice: minimald_rpc::ListenNotice, now: Instant) -> MirrorOutcome {
+    /// binds only while a host-address box is published on the node. A
+    /// listening notice for a port in `infrastructure`, the ports the VM
+    /// host provisioned for the guest's own services, is refused on the
+    /// host's authority, whatever the notice says.
+    pub fn notice(
+        &self,
+        notice: minimald_rpc::ListenNotice,
+        infrastructure: &BTreeSet<u16>,
+        now: Instant,
+    ) -> MirrorOutcome {
         let _span = self.span().entered();
         let _turn = self.take_turn();
         let port = notice.port;
         let mut state = self.lock();
+        if notice.state == minimald_rpc::ListenState::Listening && infrastructure.contains(&port) {
+            self.warn_refused(
+                state.address,
+                port,
+                MirrorOutcome::RefusedInfrastructure,
+                "guest-infrastructure-port",
+            );
+            return MirrorOutcome::RefusedInfrastructure;
+        }
         if notice.state == minimald_rpc::ListenState::Stopped {
             state.wanted.remove(&port);
             state.collided.remove(&port);
@@ -6693,19 +6714,6 @@ impl NodeMirror {
             outcome = outcome.as_str(),
             reason,
             "refused a mirrored bind at the node's address"
-        );
-    }
-
-    /// Logs the refusal of an infrastructure port, which the caller decides
-    /// before the mirror sees the notice.
-    pub fn warn_refused_infrastructure(&self, port: u16) {
-        let _span = self.span().entered();
-        let address = self.lock().address;
-        self.warn_refused(
-            address,
-            port,
-            MirrorOutcome::RefusedInfrastructure,
-            "guest-infrastructure-port",
         );
     }
 }
@@ -12406,29 +12414,29 @@ mod tests {
         for port in 0..MIRROR_NOTICES_PER_SECOND {
             let port = 20_000 + u16::try_from(port).expect("a small count");
             assert_eq!(
-                mirror.notice(listening(port), start),
+                mirror.notice(listening(port), &BTreeSet::new(), start),
                 MirrorOutcome::Waiting
             );
         }
         assert_eq!(
-            mirror.notice(listening(30_000), start),
+            mirror.notice(listening(30_000), &BTreeSet::new(), start),
             MirrorOutcome::Capped
         );
         assert_eq!(mirror.notices_dropped_by_rate(), 1);
         assert_eq!(
-            mirror.notice(stopped(20_000), start),
+            mirror.notice(stopped(20_000), &BTreeSet::new(), start),
             MirrorOutcome::Unbound,
             "a stop notice is never refused by the rate"
         );
 
         let mut at = start + MIRROR_NOTICE_WINDOW;
         let mut port = 40_000;
-        while mirror.notice(listening(port), at) == MirrorOutcome::Waiting {
+        while mirror.notice(listening(port), &BTreeSet::new(), at) == MirrorOutcome::Waiting {
             port += 1;
             at += MIRROR_NOTICE_WINDOW;
         }
         assert_eq!(
-            mirror.notice(listening(port), at + MIRROR_NOTICE_WINDOW),
+            mirror.notice(listening(port), &BTreeSet::new(), at + MIRROR_NOTICE_WINDOW),
             MirrorOutcome::Capped,
             "a new port past the bind cap is refused"
         );

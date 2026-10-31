@@ -1237,9 +1237,9 @@ pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collection
 }
 
 /// The guest door's answer to a listen notice (NET-138): the node's mirror
-/// binds or undoes the port at the node's own address. A listening notice
-/// for one of [`guest_infrastructure_ports`] is refused on this daemon's
-/// own authority, whatever the notice says. The outcome is the mirror's
+/// binds or undoes the port at the node's own address. The mirror refuses a
+/// listening notice for one of [`guest_infrastructure_ports`] on this
+/// daemon's own authority, whatever the notice says. The outcome is the mirror's
 /// audit line; the reply is [`BoxControlReply::PortRecorded`] when the
 /// mirror holds the notice, and [`BoxControlReply::Error`] when it refused.
 fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) -> BoxControlReply {
@@ -1248,17 +1248,6 @@ fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) 
         port: notice.port,
         proto: IpProto::Tcp,
     };
-    if notice.state == minimald_rpc::ListenState::Listening
-        && guest_infrastructure_ports(boxes).contains(&notice.port)
-    {
-        boxes.node_mirror().warn_refused_infrastructure(notice.port);
-        return BoxControlReply::Error {
-            error: format!(
-                "port {} is used by the VM's own services; it is not opened on the host",
-                notice.port
-            ),
-        };
-    }
     let error = match boxes.mirror_notice(notice) {
         MirrorOutcome::Bound | MirrorOutcome::Waiting | MirrorOutcome::Unbound => {
             return recorded;
@@ -8029,6 +8018,18 @@ mod tests {
                 ),
                 other => panic!("port {port} is the guest's own; got {other:?}"),
             }
+        }
+        // The registry's own entry refuses them too, so no caller can
+        // reach a bind past the check.
+        for port in [rpc_port, proxy_port] {
+            assert_eq!(
+                boxes.mirror_notice(minimald_rpc::ListenNotice {
+                    port,
+                    state: minimald_rpc::ListenState::Listening,
+                }),
+                crate::box_registry::MirrorOutcome::RefusedInfrastructure,
+                "port {port} is the guest's own"
+            );
         }
         assert!(binder.calls().is_empty(), "no infrastructure port is bound");
 
