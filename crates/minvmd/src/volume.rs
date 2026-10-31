@@ -170,8 +170,9 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
             source,
         })?;
     }
-    // 0600, never the mode the umask gives (BEP-047): only the VM user
-    // opens the data disk, and `min diag` reads only its size.
+    // 0600, never the mode the umask gives (formerly BEP-047,
+    // gominimal/inbox#1184): only the VM user opens the data disk, and
+    // `min diag` reads only its size.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -271,7 +272,8 @@ mod tests {
         p
     }
 
-    /// BEP-047: the data volume is created 0600 whatever the umask gives.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the data volume is created
+    /// 0600 whatever the umask gives.
     #[test]
     fn data_volume_is_created_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
