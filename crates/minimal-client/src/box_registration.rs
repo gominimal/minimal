@@ -283,6 +283,12 @@ pub async fn register_box_with_vm_host(
                  read for {switch_address}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::HostIpBox { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the reply to another \
+                 request; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::Audited { .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with an audit report's \
@@ -736,6 +742,116 @@ async fn reminting_autogen(
                 *name = remint();
             }
             registered => return registered,
+        }
+    }
+}
+
+/// The session's record over a connection of its own, bounded by
+/// [`BOX_CONTROL_TIMEOUT`], for a caller that holds only the daemon's socket:
+/// `None` once the session is gone.
+pub async fn session_record_at(
+    sock: &Path,
+    id: sessions::SessionId,
+) -> anyhow::Result<Option<sessions::Record>> {
+    tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
+        let mut client = crate::Client::connect(sock).await?;
+        let resp = client
+            .oneshot_rpc::<minimald_rpc::GetSessionRecord>(
+                minimald_rpc::GetSessionRecordRequest::Id(id),
+            )
+            .await
+            .context("GetSessionRecord RPC failed")?;
+        anyhow::Ok(resp.record)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("no session lookup answer within {BOX_CONTROL_TIMEOUT:?}"))?
+}
+
+/// Admits (`resident`) or retires a `host_ip` box's egress policy on the
+/// VM host daemon (NET-085), off the async worker and bounded by
+/// [`BOX_CONTROL_TIMEOUT`]. The host gate decides a frame a `host_ip` box
+/// sends by the policies admitted there, so a box is admitted before it
+/// runs anything and retired once it is gone. Returns whether the VM host
+/// daemon answered: `false` for no VM host daemon to ask, a refusal, or no
+/// answer (each warned on).
+pub async fn host_ip_box_with_vm_host(
+    control_sock: Option<std::path::PathBuf>,
+    id: sessions::SessionId,
+    egress: Option<sessions::EgressPolicy>,
+    resident: bool,
+) -> bool {
+    let Some(sock_path) = control_sock else {
+        return false;
+    };
+    let exchange = tokio::task::spawn_blocking(move || {
+        crate::attach::host_ip_box_at(&sock_path, id, egress.as_ref(), resident)
+    });
+    match tokio::time::timeout(BOX_CONTROL_TIMEOUT, exchange).await {
+        Ok(Ok(answered)) => answered,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "the host_ip box's egress exchange thread failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                session = %id,
+                "the host_ip box's egress exchange had no answer within {BOX_CONTROL_TIMEOUT:?}"
+            );
+            false
+        }
+    }
+}
+
+/// The `host_ip` box an activation admitted on the VM host daemon
+/// (NET-085), retired when the activation ends without the session: drop
+/// it without [`Self::keep`] and the box's policy is retired, so a session
+/// the activation's cleanup destroyed widens no gate. Retiring is blocking
+/// and best-effort, as the admit is.
+pub struct HostIpResidency {
+    control_sock: std::path::PathBuf,
+    id: sessions::SessionId,
+    kept: bool,
+}
+
+impl HostIpResidency {
+    /// Admits the box's `egress` for session `id` on the VM host daemon
+    /// whose control socket is `control_sock`, when the box is a `host_ip`
+    /// box. `control_sock` is `None` on a host that is not VM-backed. The
+    /// guard is `None` there, for another network mode, and when the admit
+    /// was not answered, since then nothing needs retiring.
+    pub async fn admit(
+        control_sock: Option<std::path::PathBuf>,
+        id: sessions::SessionId,
+        network: sessions::NetworkMode,
+        egress: Option<&sessions::EgressPolicy>,
+    ) -> Option<Self> {
+        if network != sessions::NetworkMode::HostNet {
+            return None;
+        }
+        let control_sock = control_sock?;
+        host_ip_box_with_vm_host(Some(control_sock.clone()), id, egress.cloned(), true)
+            .await
+            .then_some(Self {
+                control_sock,
+                id,
+                kept: false,
+            })
+    }
+
+    /// Keeps the admitted policy: the session stays, so its destroy retires
+    /// it (`release_held_box_name`). The policy also stays while the box
+    /// is `stopped` or `exited`, so the gate's union can include a box with
+    /// no live process until its destroy.
+    /// <https://github.com/gominimal/minimal/issues/2747> owns this case.
+    pub fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for HostIpResidency {
+    fn drop(&mut self) {
+        if !self.kept {
+            crate::attach::host_ip_box_at(&self.control_sock, self.id, None, false);
         }
     }
 }

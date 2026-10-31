@@ -48,10 +48,12 @@ fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
 // The box registration exchange with the VM host daemon (T66) — the
 // register, its lease, the withdrawal and the resume — is the client
 // library's, shared with `min dash` so the two front-ends cannot drift.
-pub(crate) use minimal_client::box_registration::withdraw_box_row;
 use minimal_client::box_registration::{
     BOX_CONTROL_TIMEOUT, control_request_with_vm_host, finalize_holding_lease,
     register_box_reminting_autogen, resume_box_row,
+};
+pub(crate) use minimal_client::box_registration::{
+    HostIpResidency, host_ip_box_with_vm_host, withdraw_box_row,
 };
 #[cfg(test)]
 use minimal_client::box_registration::{
@@ -238,6 +240,9 @@ pub(crate) async fn release_held_box_name(
     if box_addresses.is_some() {
         return;
     }
+    // A `host_ip` box's egress goes with its session, named or not. A box
+    // of another mode admitted none, and a retire of it is the goal state.
+    host_ip_box_with_vm_host(control_sock.clone(), id, None, false).await;
     let Some(name) = name else { return };
     hold_box_name_with_vm_host(control_sock, name, Some(id), false).await;
 }
@@ -315,6 +320,7 @@ pub(crate) async fn release_held_name_after_attach(
                 .await;
             }
             None => {
+                host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
                 hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
             }
         },
@@ -363,6 +369,27 @@ pub(crate) async fn rehold_held_name_before_attach(
     };
     if record.network != sessions::NetworkMode::HostNet {
         return;
+    }
+    // The box's egress, re-admitted before the attach or the exec for the
+    // same reason the name is re-held: a VM host daemon that restarted
+    // holds no `host_ip` box's policy, and its gate then drops every frame
+    // the box sends outside the VM (NET-085). Idempotent.
+    //
+    // The record was read before the admit, so a destroy in between can
+    // retire the box first and leave its rules standing for a gone session.
+    // The session is looked up again once the admit is made, and a session
+    // gone by then has its rules retired, as the name re-hold below undoes
+    // its hold. A destroy that lands after that lookup retires them itself.
+    if host_ip_box_with_vm_host(
+        control_sock_beside(sock),
+        id,
+        record.policy.egress.clone(),
+        true,
+    )
+    .await
+        && let Ok(None) = attached_session_record(sock, id).await
+    {
+        host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
     }
     if record.box_addresses.is_some() {
         return;
@@ -1236,6 +1263,18 @@ pub(crate) async fn activate_session(
         );
     }
     let id = created.id;
+    // A `host_ip` box's egress, admitted on the VM host daemon before the
+    // box runs anything (NET-085): the host gate decides every frame the box
+    // sends from the node's own address by the admitted policies, and drops
+    // a box's frames that none admits. The guard retires it unless the
+    // session outlives this activation.
+    let mut host_ip_residency = HostIpResidency::admit(
+        control_sock.clone(),
+        id,
+        config.network,
+        config.policy.egress.as_ref(),
+    )
+    .await;
 
     // NET-079: the host's verdict on whether it can decide a host-address
     // box's egress per box, spelled by the daemon — the side that read the
@@ -1651,6 +1690,9 @@ pub(crate) async fn activate_session(
     // (the attach hand-off below and the user's own session are fair game
     // for interrupts, but not this cleanup).
     drop(interrupt_guard);
+    if let Some(residency) = host_ip_residency.as_mut() {
+        residency.keep();
+    }
 
     // The `host_ip` interim: the box shares the node's own row, so its name
     // is held in the zone with no row behind it and answers NODATA instead
@@ -6007,10 +6049,25 @@ mod tests {
         sock_path: std::path::PathBuf,
         reply: String,
     ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        fake_vm_host_with_residency(sock_path, reply).await.0
+    }
+
+    /// [`fake_vm_host`], with the `host_ip` box admits and retires (NET-085)
+    /// kept apart: the second list holds them, each answered with the
+    /// residency reply, so the first holds every other verb in its order.
+    async fn fake_vm_host_with_residency(
+        sock_path: std::path::PathBuf,
+        reply: String,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<minimald_rpc::BoxControlRequest>>>,
+    ) {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let residency = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
         let seen = std::sync::Arc::clone(&requests);
+        let seen_residency = std::sync::Arc::clone(&residency);
         tokio::spawn(async move {
             loop {
                 let (stream, _) = match listener.accept().await {
@@ -6022,9 +6079,36 @@ mod tests {
                 if lines.read_line(&mut line).await.is_err() {
                     return;
                 }
-                seen.lock().unwrap().push(line.trim().to_string());
                 let mut writer = lines.into_inner();
-                if writer.write_all(reply.as_bytes()).await.is_err() {
+                let parsed =
+                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim());
+                let answer = match parsed {
+                    Ok(
+                        request @ (minimald_rpc::BoxControlRequest::AdmitHostIpBox(_)
+                        | minimald_rpc::BoxControlRequest::RetireHostIpBox(_)),
+                    ) => {
+                        let (session_id, resident) = match &request {
+                            minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit) => {
+                                (admit.session_id, true)
+                            }
+                            minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) => {
+                                (retire.session_id, false)
+                            }
+                            _ => unreachable!("matched above"),
+                        };
+                        seen_residency.lock().unwrap().push(request);
+                        serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                            session_id,
+                            resident,
+                        })
+                        .unwrap()
+                    }
+                    _ => {
+                        seen.lock().unwrap().push(line.trim().to_string());
+                        reply.clone()
+                    }
+                };
+                if writer.write_all(answer.as_bytes()).await.is_err() {
                     return;
                 }
                 if writer.write_all(b"\n").await.is_err() {
@@ -6032,7 +6116,7 @@ mod tests {
                 }
             }
         });
-        requests
+        (requests, residency)
     }
 
     /// T66: an own-address box on a VM-backed host registers with the VM
@@ -7060,7 +7144,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let provider_dir = dir.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&provider_dir).unwrap();
-        let requests = fake_vm_host(
+        let (requests, residency) = fake_vm_host_with_residency(
             provider_dir.join("control.sock"),
             r#"{"name":"task-build-9c1e","held":false}"#.to_string(),
         )
@@ -7087,6 +7171,14 @@ mod tests {
             request.session_id,
             Some(id),
             "the release names its session"
+        );
+        // The run's end retires the task box's egress too (NET-085).
+        assert_eq!(
+            *residency.lock().unwrap(),
+            vec![minimald_rpc::BoxControlRequest::RetireHostIpBox(
+                minimald_rpc::RetireHostIpBoxRequest { session_id: id }
+            )],
+            "the run's end retires the host_ip box's egress"
         );
     }
 
@@ -7235,7 +7327,7 @@ mod tests {
     async fn a_gone_sessions_rehold_hands_the_name_back_to_its_new_holder() {
         let dir = tempfile::TempDir::new().unwrap();
         let ssh_sock = dir.path().join("ssh.sock");
-        let requests = fake_vm_host(
+        let (requests, residency) = fake_vm_host_with_residency(
             dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
             r#"{"name":"web","held":true}"#.to_string(),
         )
@@ -7290,6 +7382,20 @@ mod tests {
                 ("web".to_string(), Some(live)),
             ],
             "the gone session's re-hold, then the name handed back to the live one"
+        );
+        // The re-hold re-admits the box's egress first (NET-085), by the
+        // session the record names. The session is gone, so the second
+        // lookup finds nothing and the admit is retired again.
+        let residency = residency.lock().unwrap();
+        assert!(
+            matches!(
+                residency.as_slice(),
+                [
+                    minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit),
+                    minimald_rpc::BoxControlRequest::RetireHostIpBox(retire),
+                ] if admit.session_id == gone && retire.session_id == gone
+            ),
+            "an admit for the gone session, then its retire: {residency:?}"
         );
     }
 
