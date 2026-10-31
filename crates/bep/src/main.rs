@@ -273,10 +273,6 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         ReplaceError::Unread => format!(
             "The {role} key was not replaced. The proxy has no {role} key now. An earlier `bep --replace-key {role}` set a {role} key aside in the keychain. bep did not read which {role} key the identity file names, so it did not check whether that key is the one in use. Nothing was changed. Correct the problem above, then run `bep --replace-key {role}` again."
         ),
-        // BEP-060: no command resolves this, so the text names none.
-        ReplaceError::Unnamed => format!(
-            "The {role} key was not replaced. The proxy has no {role} key now. An earlier `bep --replace-key {role}` set a {role} key aside in the keychain. No identity file names a {role} key, so bep did not check whether that key is the one in use, and kept it. Nothing was changed."
-        ),
         ReplaceError::RemoveNoKey(cause) => format!(
             "The {role} key was not replaced: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
         ),
@@ -3835,19 +3831,6 @@ mod tests {
             message,
             "The sealing key was not replaced. The proxy has no sealing key now. An earlier `bep --replace-key sealing` set a sealing key aside in the keychain. bep did not read which sealing key the identity file names, so it did not check whether that key is the one in use. Nothing was changed. Correct the problem above, then run `bep --replace-key sealing` again."
         );
-    }
-
-    // BEP-060: a key set aside alone that no identity file names is kept,
-    // and the message names no command, because none resolves it.
-    #[test]
-    fn replace_key_names_a_key_set_aside_that_no_identity_names() {
-        let message = replace_failure(Role::Sealing, &ReplaceError::Unnamed);
-        assert_eq!(
-            message,
-            "The sealing key was not replaced. The proxy has no sealing key now. An earlier `bep --replace-key sealing` set a sealing key aside in the keychain. No identity file names a sealing key, so bep did not check whether that key is the one in use, and kept it. Nothing was changed."
-        );
-        assert!(!message.contains("Run "), "{message}");
-        assert!(!message.contains("still in use"), "{message}");
     }
 
     // BEP-060: a failed cleanup for a role whose label held no key says that

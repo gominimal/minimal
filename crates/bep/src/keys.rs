@@ -453,7 +453,7 @@ pub fn load_with<S: KeyStore>(
                 Ok(true) => store.find(role),
                 // A start removes no key, so an old key whose `kid` was not
                 // compared stays aside, and the role is a lost key.
-                Ok(false) | Err(Interrupted::Unread | Interrupted::Unnamed) => Ok(None),
+                Ok(false) | Err(Interrupted::Unread) => Ok(None),
                 Err(Interrupted::Check(err) | Interrupted::Move(err)) => {
                     return Err(StartError::Store(err));
                 }
@@ -633,13 +633,6 @@ pub enum ReplaceError {
         "an earlier replacement left a key aside, and the published identity did not say whether it is the key in use. The store holds no key for this role now."
     )]
     Unread,
-    /// The role's label held no key, an earlier replacement left a key
-    /// aside, and no identity file names a key for the role. Nothing was
-    /// changed. The store holds no key under the role's label.
-    #[error(
-        "an earlier replacement left a key aside, and no identity file names a key for this role, so it was kept. The store holds no key for this role now."
-    )]
-    Unnamed,
     /// The role's label held no key, and the store did not remove a key
     /// that an earlier replacement left aside, or did not move the label's
     /// empty slot aside. The store holds no key under the role's label.
@@ -744,8 +737,7 @@ pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, ReplaceErro
 /// [`ReplaceError::Check`] when the role's label holds no key and the store
 /// did not say whether an earlier replacement left keys aside, and
 /// [`ReplaceError::Unread`] when a key alone in [`Slot::Old`] was not
-/// compared with `published`, and [`ReplaceError::Unnamed`] when
-/// `published` is [`PublishedKid::Absent`]. [`ReplaceError::NoKey`],
+/// compared with `published`. [`ReplaceError::NoKey`],
 /// [`ReplaceError::RemoveNoKey`] and [`ReplaceError::MoveNoKey`] when the
 /// role's label held no key and the generation, the cleanup or the move
 /// failed.
@@ -777,10 +769,6 @@ pub fn replace_outcome<S: KeyStore>(
             Err(Interrupted::Unread) => {
                 tracing::error!(role = %role, "did not compare the proxy key that an earlier replacement left aside with the published identity, and kept it");
                 return Err(ReplaceError::Unread);
-            }
-            Err(Interrupted::Unnamed) => {
-                tracing::error!(role = %role, "kept the proxy key that an earlier replacement left aside, because no published identity names a key for the role");
-                return Err(ReplaceError::Unnamed);
             }
             Err(Interrupted::Move(err)) => {
                 tracing::error!(role = %role, error = %err, "did not move back the proxy key that an earlier replacement moved aside");
@@ -861,7 +849,7 @@ pub fn replace_outcome<S: KeyStore>(
 /// alone and its `kid` is the one `published` names: a failed move lost
 /// the new key. A key in [`Slot::Old`] alone whose `kid` differs from the
 /// one `published` names is a replaced key, and values sealed to it are
-/// dead. When `published` names no key, it keeps the key and stops.
+/// dead. When `published` names no key, it moves no key back.
 ///
 /// Returns whether it moved a key back.
 fn recover_interrupted<S: KeyStore>(
@@ -880,9 +868,9 @@ fn recover_interrupted<S: KeyStore>(
         .map_err(Interrupted::Check)?;
     if !new {
         let named = match published {
-            // BEP-060: with no identity file to compare it with, the key
-            // left aside can be the key in use, so it is never removed.
-            PublishedKid::Absent => return Err(Interrupted::Unnamed),
+            // A start keeps the key aside, and an explicit replacement
+            // removes it: the operator asked for a new key.
+            PublishedKid::Absent => return Ok(false),
             PublishedKid::Kid(kid) => kid,
             PublishedKid::Unread => return Err(Interrupted::Unread),
         };
@@ -909,9 +897,6 @@ enum Interrupted {
     /// [`Slot::Old`] alone holds a key, and the published `kid` to compare
     /// it with was not read.
     Unread,
-    /// [`Slot::Old`] alone holds a key, and no identity file names a key
-    /// for the role.
-    Unnamed,
     /// The old key did not move back.
     Move(KeyError),
 }
@@ -1400,6 +1385,11 @@ pub(crate) mod memory {
         /// not keep, as a keychain item that went missing does.
         pub(crate) fn lose_new_keys(&self) {
             self.0.lock().unwrap().lose_new = true;
+        }
+
+        /// Makes the store keep the keys that later generations make.
+        pub(crate) fn keep_new_keys(&self) {
+            self.0.lock().unwrap().lose_new = false;
         }
 
         /// Makes every later removal of a key in [`Slot::Old`] fail. The
@@ -2031,18 +2021,13 @@ mod tests {
     }
 
     // BEP-060: an old key left alone aside, with no identity file that names
-    // a key for the role, can be the key in use. A replacement and a start
-    // keep it, and remove nothing.
+    // a key for the role, stays aside at a start, and the start refuses. An
+    // explicit replacement removes it and makes a new key.
     #[test]
-    fn an_old_key_left_alone_with_no_identity_is_kept() {
+    fn an_old_key_left_alone_with_no_identity_is_kept_until_a_replacement() {
         let (store, _kid) = old_key_left_alone();
         let old = store.held_in(Role::Sealing, Slot::Old);
-
-        let err = replace_outcome(&store, Role::Sealing, &PublishedKid::Absent).unwrap_err();
-        assert_eq!(err, ReplaceError::Unnamed);
-        assert!(!err.to_string().contains("still in use"), "{err}");
-        assert_eq!(store.held_in(Role::Sealing, Slot::Old), old);
-        assert_eq!(store.held_in(Role::Sealing, Slot::Held), None);
+        assert!(old.is_some());
 
         let Err(StartError::Unusable { missing, .. }) = load_with(&store, |_| PublishedKid::Absent)
         else {
@@ -2051,6 +2036,15 @@ mod tests {
         assert_eq!(missing, vec![Role::Sealing]);
         assert_eq!(store.held_in(Role::Sealing, Slot::Old), old);
         assert_eq!(store.held_in(Role::Sealing, Slot::Held), None);
+
+        store.keep_new_keys();
+        let replaced = replace_outcome(&store, Role::Sealing, &PublishedKid::Absent).unwrap();
+        assert!(replaced.old_kept.is_none());
+        let held = store.held_in(Role::Sealing, Slot::Held);
+        assert!(held.is_some());
+        assert_ne!(held, old);
+        assert_eq!(store.held_in(Role::Sealing, Slot::Old), None);
+        assert_eq!(store.held_in(Role::Sealing, Slot::New), None);
     }
 
     // BEP-060: a failed cleanup for a role whose label held no key says that
