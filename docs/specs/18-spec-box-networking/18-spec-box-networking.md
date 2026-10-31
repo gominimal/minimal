@@ -726,12 +726,40 @@ and an activation whose declared port cannot be published is refused
 - **NET-156** WHILE the box host is VM-backed, IF a flow from a box or from the host-address cohort targets the host-gateway alias at a destination that is not a configured host exposure, not the gateway resolver's port, and not a credentialed-lane box's steered flow to the node-local Box Egress Proxy THEN THE SYSTEM SHALL refuse the flow.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_alias_refused_outside_exposures_for_boxes
-  <!-- S10a; design §7.1 ("box→host reach over that alias is default-deny except explicitly configured host exposures"; the resolver port, the steered Box Egress Proxy and configured exposures are the only machine-internal reach); state+unwanted; decided outside the VM, so a root escapee cannot widen it; box-plane rules never grant the baseline set (design §5.1), and the cohort does not inherit it (§4.3 rule 2), so a box or cohort flow to a baseline destination at the alias is refused; what configures a host exposure is an open question (below), and until it closes no exposure exists -->
+  <!-- S10a; design §7.1 ("box→host reach over that alias is default-deny except explicitly configured host exposures"; the resolver port, the steered Box Egress Proxy and configured exposures are the only machine-internal reach); state+unwanted; decided outside the VM, so a root escapee cannot widen it; box-plane rules never grant the baseline set (design §5.1), and the cohort does not inherit it (§4.3 rule 2), so a box or cohort flow to a baseline destination at the alias is refused; NET-159 configures a host exposure (the host's half), and NET-160 adds the box's half (design v0.9.2 §7.1, gominimal/arch#110) -->
 
 - **NET-158** WHILE the box host is VM-backed, IF a flow with the node-plane identity targets the host-gateway alias at a destination that is not a configured host exposure, not the gateway resolver's port, not the node-local Box Egress Proxy, and not in the node-plane baseline set THEN THE SYSTEM SHALL refuse the flow.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_alias_admits_baseline_for_node_plane_only
   <!-- S10a; design §7.1 and §5.1; state+unwanted; the node-plane baseline set (NET-130) keeps the daemon's registry and cache fetches working, and only the node-plane identity carries it; the test sends one flow to a baseline destination at the alias from the node-plane identity, admitted, and the same flow from the host-address cohort, refused (NET-156) -->
+
+- **NET-159** THE SYSTEM SHALL take the host exposures of a box host from the `[host-exposures]` table of the client's `config.toml` alone, where each entry names one exposure, its host-loopback port and its protocol.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_exposures_read_from_client_config
+  <!-- S10a; design v0.9.2 §7.1 (gominimal/arch#110 ruling, gominimal/arch#155): the host's half of an exposure; user or organization configuration beside `[secret-store-rules]`, `[loadout-file-rules]` and `[package-file-rules]`; one table per user per machine, because an exposure is a fact about the host's loopback that every VM and native node on the host shares; the protocol defaults to `tcp`; ubiquitous; this closes the HIGH open question this document carried on what configures a host exposure -->
+  - IF a project `minimal.toml` carries a `[host-exposures]` section THEN THE SYSTEM SHALL ignore the section and warn that a project file cannot configure a host exposure.
+    tier:   T0
+    verify: cargo nextest run -p boxes project_host_exposures_ignored_with_warning
+    <!-- S10a; design v0.9.2 §7.1 and architecture AT7: a cloned repository cannot open the host's loopback to its boxes; unwanted; `min` prints the warning when it expands the spec; the exact text goes in the task and the test that pins it -->
+
+- **NET-160** WHILE the box host is VM-backed, IF a flow from a box targets the host-gateway alias at a configured host exposure, and the box's `egress.allow_dns_hosts` does not name `host.min.internal`, and its `egress.allow_subnets` does not cover the alias THEN THE SYSTEM SHALL refuse the flow.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_alias_exposure_needs_the_box_to_name_the_host
+  <!-- S10a; design v0.9.2 §7.1: the box's half of an exposure, with no new key; reach needs both halves, the host's exposure (NET-159) and the box's egress rule; a box-zone name in `allow_dns_hosts` governs reach, not resolution, so the name resolves whatever the list says (NET-072); coverage of the alias by `allow_subnets` stays the fall-through, so an allow-all box reaches an exposure as it reaches a sibling box, but the documented spelling is the name; the host-address cohort decides by the union of its live boxes' rules (design §4.3 rule 2); state+unwanted -->
+
+- **NET-161** WHILE the box host is VM-backed, WHEN the `[host-exposures]` table changes THE SYSTEM SHALL decide each later flow to the host-gateway alias by the changed table.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_alias_admits_a_port_the_current_table_opens
+  <!-- S10a; design v0.9.2 §7.1: the host-side creator and helper read the table as the current table for each decision, so an exposure added after a box was created is reachable at once by each box that names the host; state+event; the test adds an entry and removes it, and checks one later flow after each change -->
+  - WHEN a change to the `[host-exposures]` table removes an exposure THE SYSTEM SHALL end each established flow to that exposure.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_exposure_removal_ends_established_flows
+    <!-- S10a; design v0.9.2 §7.1: a removed exposure is revoked and its established flows end, the revocation discipline of the parity bullet in the other direction; event-driven -->
+
+- **NET-162** IF an entry of the `[host-exposures]` table names a port that a Minimal listener holds, such as the box-name answerer, the hostname proxy, the node-local Box Egress Proxy or a node-plane baseline endpoint at the host-gateway alias, THEN THE SYSTEM SHALL refuse that entry when it loads the table and name the listener that holds the port.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_exposure_on_minimal_listener_port_refused
+  <!-- S10a; design v0.9.2 §7.1: Minimal's own listeners are never exposures, the fixed-deny pattern that `[secret-store-rules]` applies to Minimal's own infrastructure; a node-plane baseline endpoint at the alias is infrastructure for the node-plane identity alone (NET-158); unwanted; the refusal must say which entry it refused and which listener holds the port; it goes where the loader reports, the host's log for the VM host daemon and `min`'s output when it reads the table at expansion; the design names a `min host show` that lists exposures, which no command provides yet, so this requirement does not bind that surface -->
 
 - **NET-157** WHILE the box host is VM-backed, WHEN the system refuses an own-address box's egress THE SYSTEM SHALL record the refusal in a log on the host, outside the VM.
   tier:     T0
@@ -1240,7 +1268,8 @@ zone is answered only to lookups that originate on the machine (NET-006);
 answering only loopback addresses was the weaker reading considered.
 `host.min.internal` resolves from every box (NET-003) and reach over it is
 local reach evaluated under the box's egress rules, default-deny except
-configured host exposures ([design §7.1][design] local names): a deny-all box
+configured host exposures ([design §7.1][design] local names; the two halves of an
+exposure in design v0.9.2 §7.1, NET-159 to NET-162): a deny-all box
 resolves the name and reaches nothing (NET-079), and the daemon's own package
 fetch is node-plane traffic, not the box's (NET-080). Making the host's
 loopback a baseline exception for every box was considered and rejected: it
@@ -1441,17 +1470,6 @@ refusal holds only inside the VM, below the escape boundary.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
-- [NEEDS CLARIFICATION (HIGH): what configures a host exposure, and must a box
-  also declare its reach to one? The design admits box-to-host reach over the
-  host-gateway alias only for explicitly configured host exposures, and names
-  no surface that configures one. Until one exists, no box reaches a host
-  service at `host.min.internal`: NET-156 refuses every port outside the
-  design's openings for a box, and NET-158 adds the node-plane baseline set for
-  the node alone. One option is an exposure the host's operator
-  names, reachable from every box on the host whatever its egress rules, with
-  Minimal's own listeners excluded by rule. A second adds a box-side
-  declaration, so reach needs both the host's exposure and the box's egress
-  rule. The architecture owns the choice and where the host half lives.]
 - [NEEDS CLARIFICATION (MEDIUM): can one machine-wide box-name service serve
   several users of the same host? The service runs as one operator. Its
   channel's peer check admits that operator's daemons only (NET-122). A
