@@ -15511,12 +15511,14 @@ bep_trust_box_files() {
     fi
   } > "$tb_seed/minimal.toml"
   mkdir "$tb_seed/.git"
-  # Only the grant box declares the GitHub hosts its grant needs. A box with
-  # no grant declares no egress rules: a --network host_ip box on a VM host
-  # refuses hostname rules at the start, and that box needs none.
+  # Only the grant box declares the GitHub hosts its grant needs, and it
+  # takes its own IP with a credentialed upstream, as the other grant cases
+  # do. A box with no grant declares no egress rules: a --network host_ip box
+  # on a VM host refuses hostname rules at the start, and that box needs none.
   tb_egress=()
   if [ "$tb_kind" = grant ]; then
-    tb_egress=(--allow-dns-hosts github.com --allow-dns-hosts api.github.com
+    tb_egress=(--network own_ip --credentialed-upstream
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com
       --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com)
   fi
   tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
