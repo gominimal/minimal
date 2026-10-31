@@ -972,8 +972,9 @@ impl Browser {
     /// already held, and an install's code is issued without the PKCE
     /// challenge. The callback need not carry the state, because GitHub may
     /// not pass it through the install. A request that carries another
-    /// state gets the expired-link page. At the deadline the terminal says
-    /// the wait stopped and gives the install URL again.
+    /// state gets the expired-link page. At the deadline, or when the
+    /// listener fails, the terminal says the wait stopped and gives the
+    /// install URL again.
     async fn await_install(
         &mut self,
         http: &reqwest::Client,
@@ -1005,7 +1006,20 @@ impl Browser {
                     }
                     continue;
                 }
-                request = self.callback.next() => request?,
+                request = self.callback.next() => match request {
+                    Ok(request) => request,
+                    // The sign-in is already saved. A listener that cannot
+                    // accept ends the wait, not the command.
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "the callback listener failed while waiting for the install"
+                        );
+                        writeln!(err, "{STOPPED_WAITING}")?;
+                        writeln!(err, "{NEXT_STEP} at {INSTALL_URL}.")?;
+                        return Ok(());
+                    }
+                },
             };
             if query.get("state").is_some_and(|s| s != self.state) {
                 respond(&mut conn, &Page::stale()).await;
