@@ -331,26 +331,18 @@ fn refuse_unhonourable_grants(
     Ok(plan.warnings)
 }
 
-/// Whether a box with `network` and `steering` on a host of `kind` reaches
-/// the proxy through a switch that steers the credential module's names
-/// (BEP-017, BEP-062). On the VM host, an own-address box's lookups go
-/// through the VM host's switch. Its DNS gate answers a steered name with
-/// the proxy's address while the proxy's listener is live, and SERVFAIL
-/// while it is down. Only `both` counts. The proxy listens on its proxy
-/// port alone and reads only CONNECT or an absolute-form request, so a
-/// `dns`-only box, which has no `HTTPS_PROXY` (BEP-012), opens port 443 at
-/// the proxy's address and its connection is dropped. `dns` stays refused
-/// until the proxy takes a direct TLS connection. A native host has no
-/// proxy, so a steered name there always fails closed, and a `host_ip` or
-/// `none` box has no steered lookups of its own.
-pub(crate) fn host_resolves_box_names(
-    kind: paths::HostKind,
-    network: boxes::NetworkMode,
-    steering: boxes::core::bep::Steering,
-) -> bool {
-    kind == paths::HostKind::Minvmd
-        && network == boxes::NetworkMode::OwnIp
-        && steering == boxes::core::bep::Steering::Both
+/// Whether a box with `network` on a host of `kind` has its lookups go
+/// through a switch that steers the credential module's names (BEP-017,
+/// BEP-062). This is a host fact and does not read the steering. On the VM
+/// host, an own-address box's lookups go through the VM host's switch. Its
+/// DNS gate answers a steered name with the proxy's address while the
+/// proxy's listener is live, and SERVFAIL while it is down. A native host
+/// has no proxy, so a steered name there always fails closed, and a
+/// `host_ip` or `none` box has no steered lookups of its own. Where this is
+/// true, `dns` steering is still refused on its own grounds until the proxy
+/// takes a direct TLS connection (#2805).
+pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
+    kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -1250,11 +1242,7 @@ pub(crate) async fn activate_box(
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
-                host_resolves_box_names(
-                    daemon_host_kind(global),
-                    network,
-                    project_bep.resolved_steering(),
-                ),
+                host_resolves_box_names(daemon_host_kind(global), network),
                 &project_env,
             )?;
             // BEP-034/035/036: each store reference needs a rule that admits
@@ -3232,33 +3220,28 @@ mod tests {
 
     /// BEP-017, BEP-062: a GitHub grant box with `both` steering is created
     /// where the VM host's switch resolves its names, and `min box spec`
-    /// shows it. `dns`, declared or by default, is refused with exit 3 on
-    /// every host, because the proxy takes no direct TLS connection. On a
-    /// native host, and for a `host_ip` box, `both` is refused too. For
-    /// every case, `min box spec` refuses exactly when creation does.
+    /// shows it. There, `dns`, declared or by default, is refused with exit
+    /// 3 and a text that names the proxy, not the host, until the proxy
+    /// takes a direct TLS connection (#2805). On a native host, and for a
+    /// `host_ip` box, both are refused for the missing resolver. For every
+    /// case, `min box spec` refuses exactly when creation does, with the
+    /// same text.
     #[test]
     fn dns_steering_is_admitted_where_the_switch_resolves_boxes() {
         use boxes::core::bep::Steering;
         use paths::HostKind;
+        // The host fact does not read the steering.
         assert!(host_resolves_box_names(
             HostKind::Minvmd,
-            boxes::NetworkMode::OwnIp,
-            Steering::Both
-        ));
-        assert!(!host_resolves_box_names(
-            HostKind::Minvmd,
-            boxes::NetworkMode::OwnIp,
-            Steering::Dns
+            boxes::NetworkMode::OwnIp
         ));
         assert!(!host_resolves_box_names(
             HostKind::Minimald,
-            boxes::NetworkMode::OwnIp,
-            Steering::Both
+            boxes::NetworkMode::OwnIp
         ));
         assert!(!host_resolves_box_names(
             HostKind::Minvmd,
-            boxes::NetworkMode::HostNet,
-            Steering::Both
+            boxes::NetworkMode::HostNet
         ));
         let github_hosts: Vec<&str> = bep::module::GITHUB
             .hosts
@@ -3288,22 +3271,29 @@ mod tests {
             let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
             let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
             assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
-            let steering = bep.resolved_steering();
-            assert_eq!(steering.word(), word);
-            let refusal = format!(
+            assert_eq!(bep.resolved_steering().word(), word);
+            assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
+            let no_resolver = format!(
                 "This box declares a secret with steering = \"{word}\", but this host \
                  has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
             );
+            let no_direct_tls = "This box declares a secret with steering = \"dns\", but the \
+                 Box Egress Proxy does not yet take a direct TLS connection, so dns steering \
+                 cannot reach it. Set steering = \"both\" or steering = \"proxy_env\" in \
+                 [network.bep].";
 
             for (kind, network) in [
                 (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
                 (HostKind::Minimald, boxes::NetworkMode::OwnIp),
                 (HostKind::Minvmd, boxes::NetworkMode::HostNet),
             ] {
-                let resolver = host_resolves_box_names(kind, network, steering);
-                let accepted = word == "both"
-                    && kind == HostKind::Minvmd
-                    && network == boxes::NetworkMode::OwnIp;
+                let resolver = host_resolves_box_names(kind, network);
+                let accepted = word == "both" && resolver;
+                let refusal = if resolver {
+                    no_direct_tls
+                } else {
+                    no_resolver.as_str()
+                };
                 let case = format!("{word} {kind:?} {network:?}");
 
                 let created = refuse_unhonourable_grants(

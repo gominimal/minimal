@@ -62,7 +62,8 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
 
     // BEP-057: every host is un-enrolled today.
     // Interim: only BEP-057 and BEP-017 are previewed here; the full exit-3 set is gominimal/minimal#2445.
-    // BEP-017: the resolver fact is the one creation reads, so the two agree.
+    // BEP-017 and its `dns` interim (#2805): the resolver fact is the one
+    // creation reads, so the two agree.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
         box_zone_resolver: inputs.box_zone_resolver,
@@ -83,6 +84,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
                 BepRefusal::NarrowScopesUnenrolled { .. }
                     | BepRefusal::BrokerScopeNotGithub { .. }
                     | BepRefusal::NoResolver { .. }
+                    | BepRefusal::DnsWithoutDirectTls
             )
         })
         .collect();
@@ -255,7 +257,6 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             box_zone_resolver: super::box_verbs::host_resolves_box_names(
                 crate::daemon_host_kind(global),
                 boxes::NetworkMode::OwnIp,
-                bep.resolved_steering(),
             ),
             github_hosts: &github_hosts,
             store_rules: &store_rules,
@@ -315,9 +316,9 @@ mod tests {
                 quic443,
                 secrets,
                 acknowledged,
-                // An own-address box on the VM host, where `both` reaches
-                // the proxy and `dns` is refused (BEP-017).
-                box_zone_resolver: bep.resolved_steering() == Steering::Both,
+                // An own-address box on the VM host, whose switch resolves
+                // box names (BEP-017).
+                box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
