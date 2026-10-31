@@ -161,45 +161,156 @@ pub enum GrantMode {
 }
 
 /// Where a grant's value comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantSource {
-    /// The credential broker. Only a broker grant makes a credentialed
-    /// upstream.
+    /// The credential broker. A broker grant makes a credentialed upstream.
     Broker,
     /// A copy of a variable from the client's environment. It makes no
     /// credentialed upstream.
     ClientEnv,
+    /// A store reference: the item `id` in the secret store `store`,
+    /// written `source = "store"` with `store` and `id` (BEP-032). It makes
+    /// a credentialed upstream.
+    Store {
+        /// The store that holds the item, for example `keychain`.
+        store: String,
+        /// The item's identifier in the store.
+        id: String,
+    },
 }
 
 /// One `[secrets.<VAR>]` grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "GrantFields", into = "GrantFields")]
 pub struct SecretGrant {
     /// Where the value comes from. Required: a grant with no source, or an
     /// unknown one, does not parse.
     pub source: GrantSource,
     /// The scopes the grant asks for, for example `github:user-token`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     /// The member's mode. `None` reads as [`GrantMode::User`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<GrantMode>,
+}
+
+/// The `source` word of a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceWord {
+    Broker,
+    ClientEnv,
+    Store,
+}
+
+/// A grant's fields as a file writes them. [`SecretGrant`] reads and
+/// writes through this form, so `store` and `id` exist only on a
+/// `source = "store"` grant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantFields {
+    source: SourceWord,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<GrantMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
+impl TryFrom<GrantFields> for SecretGrant {
+    type Error = String;
+
+    fn try_from(fields: GrantFields) -> Result<Self, String> {
+        let source = match fields.source {
+            SourceWord::Store => {
+                let mut extra = Vec::new();
+                if !fields.scopes.is_empty() {
+                    extra.push("scopes");
+                }
+                if fields.mode.is_some() {
+                    extra.push("mode");
+                }
+                if !extra.is_empty() {
+                    return Err(format!(
+                        "A grant with source = \"store\" takes no {}. Remove {}.",
+                        extra.join(" or "),
+                        extra.join(" and ")
+                    ));
+                }
+                match (fields.store, fields.id) {
+                    (Some(store), Some(id)) => GrantSource::Store { store, id },
+                    (store, id) => {
+                        const STORE: &str = "store = \"keychain\"";
+                        const ID: &str =
+                            "id = \"<id>\", the identifier you passed to `min secret set`";
+                        let (absent, add) = match (store.is_none(), id.is_none()) {
+                            (true, true) => {
+                                ("store field and no id field", format!("{STORE} and {ID}"))
+                            }
+                            (true, false) => ("store field", STORE.to_owned()),
+                            _ => ("id field", ID.to_owned()),
+                        };
+                        return Err(format!(
+                            "A grant with source = \"store\" has no {absent}. Add {add}."
+                        ));
+                    }
+                }
+            }
+            word => {
+                if fields.store.is_some() || fields.id.is_some() {
+                    return Err(
+                        "store and id apply only to a grant with source = \"store\". Remove \
+                         them, or set source = \"store\"."
+                            .to_owned(),
+                    );
+                }
+                if word == SourceWord::Broker {
+                    GrantSource::Broker
+                } else {
+                    GrantSource::ClientEnv
+                }
+            }
+        };
+        Ok(Self {
+            source,
+            scopes: fields.scopes,
+            mode: fields.mode,
+        })
+    }
+}
+
+impl From<SecretGrant> for GrantFields {
+    fn from(grant: SecretGrant) -> Self {
+        let (source, store, id) = match grant.source {
+            GrantSource::Broker => (SourceWord::Broker, None, None),
+            GrantSource::ClientEnv => (SourceWord::ClientEnv, None, None),
+            GrantSource::Store { store, id } => (SourceWord::Store, Some(store), Some(id)),
+        };
+        Self {
+            source,
+            scopes: grant.scopes,
+            mode: grant.mode,
+            store,
+            id,
+        }
+    }
 }
 
 impl SecretGrant {
     /// Whether this grant makes a credentialed upstream: its source is the
-    /// broker.
+    /// broker or a store.
     #[must_use]
     pub fn is_credentialed(&self) -> bool {
-        self.source == GrantSource::Broker
+        matches!(self.source, GrantSource::Broker | GrantSource::Store { .. })
     }
 
     /// Whether this grant is a GitHub grant: a broker grant with a
     /// `github:` scope.
     #[must_use]
     pub fn is_github(&self) -> bool {
-        self.is_credentialed() && self.scopes.iter().any(|scope| scope.starts_with("github:"))
+        self.source == GrantSource::Broker
+            && self.scopes.iter().any(|scope| scope.starts_with("github:"))
     }
 
     /// The `github:repo:*` scopes narrower than `full`: every one but
@@ -449,9 +560,9 @@ impl BepRefusal {
                 "secrets.scopes, config [secrets] acknowledge_full_breadth_unenrolled"
             }
             Self::SignInRequired { .. } | Self::UnenrolledNode { .. } => "secrets",
-            Self::StoreReferenceToSignIn { .. } => "secrets.scopes",
+            Self::StoreReferenceToSignIn { .. } => "secrets.id",
             Self::StoreHostsOutsideEgress { .. } => {
-                "secrets.scopes, egress.allow_dns_hosts, config [secret-store-rules] upstream"
+                "secrets.store, secrets.id, egress.allow_dns_hosts, config [secret-store-rules] upstream"
             }
         }
     }
@@ -518,7 +629,8 @@ impl fmt::Display for BepRefusal {
                 f,
                 "The secret {grant} names the item that holds your GitHub sign-in. Only \
                  GitHub grants can use that item. To use your GitHub sign-in, set \
-                 scopes = [\"github:user-token\"] for {grant}."
+                 source = \"broker\" and scopes = [\"github:user-token\"] for {grant}, \
+                 and remove its store and id."
             ),
             Self::StoreHostsOutsideEgress { grant, missing } => write!(
                 f,
@@ -854,57 +966,57 @@ pub fn warn_project_store_rules<'a>(keys: impl IntoIterator<Item = &'a str>) -> 
     found
 }
 
-/// One store reference a box spec declares: a broker grant scope that is not
-/// a `github:` scope, written `<store>:<id>` or `<id>`.
+/// The name of the host's native secret store. A rule with no `store`
+/// names this store. It is the same name as `bep::store::NATIVE_STORE`,
+/// which this crate does not link.
+pub const NATIVE_STORE: &str = "keychain";
+
+/// One store reference a box spec declares: a grant written
+/// `source = "store"` with `store` and `id` (BEP-032).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreReference<'a> {
     /// The grant's name: the variable the value lands in.
     pub grant: &'a str,
-    /// The store. `None` is the host's native store.
-    pub store: Option<&'a str>,
+    /// The store, for example [`NATIVE_STORE`].
+    pub store: &'a str,
     /// The item's identifier in the store.
     pub id: &'a str,
 }
 
-impl<'a> StoreReference<'a> {
-    /// Parses one scope of the grant `grant`.
-    #[must_use]
-    pub fn parse(grant: &'a str, scope: &'a str) -> Self {
-        match scope.split_once(':') {
-            Some((store, id)) => Self {
-                grant,
-                store: Some(store),
-                id,
-            },
-            None => Self {
-                grant,
-                store: None,
-                id: scope,
-            },
-        }
-    }
-
+impl StoreReference<'_> {
     /// The rule in `rules` for this reference: the same identifier and the
-    /// same store.
+    /// same store. A rule with no `store` is a rule for [`NATIVE_STORE`].
     #[must_use]
     pub fn rule<'r>(&self, rules: &'r StoreRules) -> Option<&'r StoreRuleConfig> {
         rules
             .get(self.id)
-            .filter(|rule| rule.store.as_deref() == self.store)
+            .filter(|rule| rule.store.as_deref().unwrap_or(NATIVE_STORE) == self.store)
+    }
+
+    /// The item as a message names it: its identifier in the native store,
+    /// and `<store>:<id>` in any other store.
+    #[must_use]
+    pub fn item(&self) -> String {
+        if self.store == NATIVE_STORE {
+            self.id.to_owned()
+        } else {
+            format!("{}:{}", self.store, self.id)
+        }
     }
 }
 
-/// Every store reference the broker grants in `secrets` declare.
+/// Every store reference the `source = "store"` grants in `secrets`
+/// declare, in grant name order.
 pub fn store_references(secrets: &SecretGrants) -> impl Iterator<Item = StoreReference<'_>> {
     secrets
         .iter()
-        .filter(|(_, grant)| grant.is_credentialed())
-        .flat_map(|(name, grant)| {
-            grant
-                .scopes
-                .iter()
-                .filter(|scope| !scope.starts_with("github:"))
-                .map(move |scope| StoreReference::parse(name, scope))
+        .filter_map(|(name, grant)| match &grant.source {
+            GrantSource::Store { store, id } => Some(StoreReference {
+                grant: name,
+                store,
+                id,
+            }),
+            GrantSource::Broker | GrantSource::ClientEnv => None,
         })
 }
 
@@ -1640,6 +1752,108 @@ mod tests {
         assert!(grant.is_credentialed() && grant.is_github());
     }
 
+    /// BEP-032: a store reference is `source = "store"` with `store` and
+    /// `id`. The grant reads as one store reference, and a broker scope is
+    /// never one. A grant that lacks `store` or `id` is refused with text
+    /// that names the missing field.
+    #[test]
+    fn a_store_grant_parses_store_and_id() {
+        let grant: SecretGrant =
+            toml::from_str("source = \"store\"\nstore = \"keychain\"\nid = \"claude\"")
+                .expect("parses");
+        assert_eq!(
+            grant.source,
+            GrantSource::Store {
+                store: "keychain".into(),
+                id: "claude".into()
+            }
+        );
+        assert!(grant.is_credentialed() && !grant.is_github());
+        let text = toml::to_string(&grant).expect("writes");
+        assert_eq!(
+            toml::from_str::<SecretGrant>(&text).expect("reads back"),
+            grant
+        );
+
+        let secrets = SecretGrants::from([
+            ("CLAUDE".to_string(), grant),
+            (
+                "OLD".to_string(),
+                toml::from_str("source = \"broker\"\nscopes = [\"claude\"]").expect("parses"),
+            ),
+        ]);
+        let references: Vec<StoreReference<'_>> = store_references(&secrets).collect();
+        assert_eq!(
+            references,
+            [StoreReference {
+                grant: "CLAUDE",
+                store: "keychain",
+                id: "claude"
+            }]
+        );
+        let reference = references[0];
+        assert_eq!(reference.item(), "claude");
+        // A rule with no store is a rule for the native store.
+        let mut native = rule(&["api.anthropic.com"]);
+        native.store = None;
+        let mut vault = native.clone();
+        vault.store = Some("vault".into());
+        for (store, matches) in [
+            (None, true),
+            (Some("keychain"), true),
+            (Some("vault"), false),
+        ] {
+            let mut r = native.clone();
+            r.store = store.map(Into::into);
+            let rules = StoreRules::from([("claude".to_string(), r)]);
+            assert_eq!(reference.rule(&rules).is_some(), matches, "{store:?}");
+        }
+        let in_vault = StoreReference {
+            store: "vault",
+            ..reference
+        };
+        assert_eq!(in_vault.item(), "vault:claude");
+        let rules = StoreRules::from([("claude".to_string(), vault)]);
+        assert!(in_vault.rule(&rules).is_some());
+
+        for (text, absent) in [
+            ("source = \"store\"\nid = \"claude\"", "has no store field."),
+            (
+                "source = \"store\"\nstore = \"keychain\"",
+                "has no id field.",
+            ),
+            ("source = \"store\"", "has no store field and no id field."),
+        ] {
+            let err = toml::from_str::<SecretGrant>(text)
+                .expect_err("a store grant needs store and id")
+                .to_string();
+            assert!(err.contains(absent), "{err}");
+        }
+        for text in [
+            "source = \"broker\"\nscopes = [\"github:user-token\"]\nid = \"claude\"",
+            "source = \"client_env\"\nstore = \"keychain\"",
+        ] {
+            let err = toml::from_str::<SecretGrant>(text)
+                .expect_err("store and id need source = \"store\"")
+                .to_string();
+            assert!(
+                err.contains("only to a grant with source = \"store\""),
+                "{err}"
+            );
+        }
+        let err = toml::from_str::<SecretGrant>(
+            "source = \"store\"\nstore = \"keychain\"\nid = \"claude\"\nscopes = [\"x\"]",
+        )
+        .expect_err("a store grant takes no scopes")
+        .to_string();
+        assert!(err.contains("takes no scopes"), "{err}");
+
+        // The native store has the name `bep` gives it.
+        assert!(include_str!("../../../bep/src/store.rs").contains(&format!(
+            "pub const NATIVE_STORE: &str = \"{NATIVE_STORE}\";"
+        )));
+    }
+
     // --- store rules (BEP-034 to BEP-037) ---------------------------------
 
     const SIGN_IN_ITEMS: &[&str] = &[
@@ -1700,10 +1914,13 @@ mod tests {
         }
     }
 
-    fn store_grant(scope: &str) -> SecretGrant {
+    fn store_grant(store: &str, id: &str) -> SecretGrant {
         SecretGrant {
-            source: GrantSource::Broker,
-            scopes: vec![scope.to_string()],
+            source: GrantSource::Store {
+                store: store.into(),
+                id: id.into(),
+            },
+            scopes: Vec::new(),
             mode: None,
         }
     }
@@ -2016,7 +2233,7 @@ mod tests {
         }
         let secrets = SecretGrants::from([(
             "TOKEN".to_string(),
-            store_grant("keychain:dev.minimal.github-sign-in"),
+            store_grant("keychain", "dev.minimal.github-sign-in"),
         )]);
         let err = check_store_references(&secrets, None, &StoreRules::new(), deny())
             .expect_err("a reference to the sign-in item is refused");
@@ -2088,7 +2305,7 @@ mod tests {
                 ),
                 ..EgressPolicy::default()
             };
-            let secrets = SecretGrants::from([("CLAUDE".to_string(), store_grant("keychain:claude"))]);
+            let secrets = SecretGrants::from([("CLAUDE".to_string(), store_grant("keychain", "claude"))]);
             let missing: Vec<String> = upstream
                 .iter()
                 .filter(|h| !allowed.contains(h))
@@ -2108,7 +2325,7 @@ mod tests {
                 }
             }
             // A reference with no rule registers nothing to check.
-            let other = SecretGrants::from([("X".to_string(), store_grant("keychain:other"))]);
+            let other = SecretGrants::from([("X".to_string(), store_grant("keychain", "other"))]);
             prop_assert!(check_store_references(&other, None, &rules, deny()).is_ok());
         }
     }
