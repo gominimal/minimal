@@ -1247,10 +1247,80 @@ fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Re
     Ok((log, restored))
 }
 
+/// The environment variable that sets the size bound of an audit segment,
+/// in bytes. It is a test surface: the end-to-end suite sets it so the log
+/// rotates after a few requests. Only `bep serve` reads it, and only in a
+/// debug build. A release build ignores it, so a stray value cannot make
+/// the log rotate fast and prune its history.
+const AUDIT_SEGMENT_BYTES_ENV: &str = "BEP_AUDIT_SEGMENT_BYTES";
+
+/// The segment bound that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] sets: a
+/// positive integer, else [`audit::SEGMENT_BYTES`]. An unset, empty, zero
+/// or unparsable value keeps the default.
+fn audit_segment_bound(value: Option<&std::ffi::OsStr>) -> u64 {
+    audit_segment_override(value).unwrap_or(audit::SEGMENT_BYTES)
+}
+
+/// The positive integer that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] holds,
+/// or `None` when it is unset, empty, zero or unparsable.
+fn audit_segment_override(value: Option<&std::ffi::OsStr>) -> Option<u64> {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bound| *bound > 0)
+}
+
+/// The rotation bounds of the audit log that `bep serve` writes. In a
+/// debug build, the segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when
+/// it is set. A release build always keeps [`audit::SEGMENT_BYTES`].
+fn audit_rotation() -> audit::Rotation {
+    audit_rotation_for(
+        std::env::var_os(AUDIT_SEGMENT_BYTES_ENV),
+        cfg!(debug_assertions),
+    )
+}
+
+/// [`audit_rotation`] for the value `set` of [`AUDIT_SEGMENT_BYTES_ENV`],
+/// in a debug build when `debug` is true and a release build when false.
+fn audit_rotation_for(set: Option<std::ffi::OsString>, debug: bool) -> audit::Rotation {
+    if !debug && set.is_some() {
+        tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound = audit::SEGMENT_BYTES,
+            "ignored the audit segment test override: this is a release build"
+        );
+    }
+    let value = set.filter(|_| debug);
+    let bound = audit_segment_bound(value.as_deref());
+    match (value.is_some(), audit_segment_override(value.as_deref())) {
+        (true, Some(_)) => tracing::info!(
+            bound,
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            default = audit::SEGMENT_BYTES,
+            "audit segment bound set by the test override"
+        ),
+        (true, None) => tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound,
+            "ignored the audit segment test override: the value is not a positive integer"
+        ),
+        (false, _) => {}
+    }
+    audit::Rotation {
+        bound,
+        ..audit::Rotation::default()
+    }
+}
+
 /// Opens the audit log in `dir` for `bep serve`. The log holds the
 /// directory, so a second `bep serve` on it is refused.
 fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
-    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+    open_audit_log_with(dir, audit_rotation())
+}
+
+/// [`open_audit_log`] with the rotation bounds `rotation`.
+fn open_audit_log_with(dir: &Path, rotation: audit::Rotation) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, rotation).map_err(|err| {
         if err.kind() == io::ErrorKind::WouldBlock {
             tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
             format!(
@@ -1899,6 +1969,63 @@ mod tests {
         );
         drop(first);
         open_audit_log(&audit).unwrap();
+    }
+
+    // T35: `BEP_AUDIT_SEGMENT_BYTES` sets the segment bound when it is a
+    // positive integer, and a log opened with that bound rotates past it.
+    #[test]
+    fn audit_segment_bound_follows_the_test_override() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome};
+        use std::ffi::OsStr;
+        assert_eq!(audit_segment_bound(None), audit::SEGMENT_BYTES);
+        assert_eq!(audit_segment_bound(Some(OsStr::new("4096"))), 4096);
+        assert_eq!(audit_segment_bound(Some(OsStr::new(" 512 "))), 512);
+        for ignored in ["", "0", "-1", "lots", "1.5"] {
+            assert_eq!(
+                audit_segment_bound(Some(OsStr::new(ignored))),
+                audit::SEGMENT_BYTES,
+                "{ignored:?}"
+            );
+            assert_eq!(audit_segment_override(Some(OsStr::new(ignored))), None);
+        }
+        assert_eq!(audit_segment_override(Some(OsStr::new("512"))), Some(512));
+
+        // The gate that `open_audit_log` goes through: a debug build takes
+        // the override, and a release build keeps the default bound.
+        let set = || Some(std::ffi::OsString::from("512"));
+        assert_eq!(audit_rotation_for(set(), true).bound, 512);
+        assert_eq!(audit_rotation_for(set(), false).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, true).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, false).bound, audit::SEGMENT_BYTES);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        let rotation = audit::Rotation {
+            bound: audit_segment_bound(Some(OsStr::new("512"))),
+            ..audit::Rotation::default()
+        };
+        let mut log = open_audit_log_with(&dir, rotation).unwrap();
+        for n in 0..20 {
+            log.append(&Decision {
+                kind: Kind::Decision,
+                box_id: format!("box-{n}"),
+                authority: String::new(),
+                identifier: None,
+                jti: String::new(),
+                mapping: Mapping::ModuleUnmapped,
+                outcome: Outcome::Admit,
+                marker: None,
+            })
+            .unwrap();
+        }
+        drop(log);
+        let segments = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+            .count();
+        assert!(segments > 1, "the log did not rotate: {segments} segment");
+        assert_eq!(audit::verify_chain(&dir).unwrap(), Ok(20));
     }
 
     // BEP-068 (#2460): the log `bep serve` writes is the log `min box audit`
