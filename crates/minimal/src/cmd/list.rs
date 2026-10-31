@@ -774,7 +774,7 @@ pub fn format_ls_on(
     host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
     if args.json {
-        let json = serde_json_lenient::to_string_pretty(resp)
+        let json = serde_json_lenient::to_string_pretty(&listing_json(resp)?)
             .context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());
@@ -869,7 +869,11 @@ pub fn format_ls_on(
             writeln!(
                 out,
                 "BOX NAMES:       {}{}",
-                crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
+                crate::resolver::name_surface_line_at(
+                    surface.clone(),
+                    serving_proxy_port,
+                    boxes_at_own_address(resp),
+                ),
                 crate::resolver::install_clause(crate::resolver::install_unfinished(
                     &surface, host
                 )),
@@ -900,44 +904,129 @@ pub fn format_ls_on(
 
     // Format as a table. The columns mirror the fields `--json` exposes so
     // the two surfaces present the same session attributes.
+    let rows: Vec<[String; 8]> = resp
+        .sessions
+        .iter()
+        .map(|entry| session_cells(entry, resp.box_networks.get(&entry.id)))
+        .collect();
+    let egress_width = egress_column_width(rows.iter());
     writeln!(
         out,
-        "{:<36}  {:<20}  {:<13}  {:<7}  {:<20}  {:<19}  PROJECT PATH",
-        "SESSION ID", "NAME", "STATUS", "EGRESS", "TITLE", "LAST ACTIVITY"
+        "{:<36}  {:<20}  {:<ADDRESS_COLUMN_WIDTH$}  {:<13}  {:<egress_width$}  {:<20}  {:<19}  PROJECT PATH",
+        "SESSION ID", "NAME", "ADDRESS", "STATUS", "EGRESS", "TITLE", "LAST ACTIVITY"
     )?;
     writeln!(
         out,
-        "{:-<36}  {:-<20}  {:-<13}  {:-<7}  {:-<20}  {:-<19}  {:-<24}",
-        "", "", "", "", "", "", ""
+        "{:-<36}  {:-<20}  {:-<ADDRESS_COLUMN_WIDTH$}  {:-<13}  {:-<egress_width$}  {:-<20}  {:-<19}  {:-<24}",
+        "", "", "", "", "", "", "", ""
     )?;
 
-    for entry in &resp.sessions {
-        let [id, name, status, egress, title, last_activity, project_path] = session_cells(entry);
+    for [
+        id,
+        name,
+        address,
+        status,
+        egress,
+        title,
+        last_activity,
+        project_path,
+    ] in rows
+    {
         writeln!(
             out,
-            "{id:<36}  {name:<20}  {status:<13}  {egress:<7}  {title:<20}  {last_activity:<19}  {project_path}"
+            "{id:<36}  {name:<20}  {address:<ADDRESS_COLUMN_WIDTH$}  {status:<13}  {egress:<egress_width$}  {title:<20}  {last_activity:<19}  {project_path}"
         )?;
     }
 
     Ok(())
 }
 
-/// The cells of one session row — id, name, status, egress enforcement,
-/// title, last activity, project path — shared by the single-VM table
+/// Whether the BOX NAMES row reads the own-address form (T110): `true`
+/// only when the daemon reports at least one box off the `127.0.0.1`
+/// fallback and none on it. The row speaks for every box, and a box on the
+/// fallback does not open at its name. A listing that reports no box's
+/// fallback fact (an older daemon, or no box with an address yet) cannot
+/// prove the stronger claim, so it reads the fallback form.
+fn boxes_at_own_address(resp: &minimald_rpc::ListSessionsResponse) -> bool {
+    let fallbacks: Vec<Option<bool>> = resp
+        .box_networks
+        .values()
+        .map(|facts| facts.at_fallback)
+        .collect();
+    fallbacks.contains(&Some(false)) && !fallbacks.contains(&Some(true))
+}
+
+/// The width of the ADDRESS column: the longest IPv4 address.
+const ADDRESS_COLUMN_WIDTH: usize = 15;
+
+/// The width of the EGRESS column: its header, or the longest posture any
+/// row prints, so a posture with a per-box enforcement note keeps the
+/// columns after it aligned.
+fn egress_column_width<'a>(rows: impl Iterator<Item = &'a [String; 8]>) -> usize {
+    rows.map(|row| row[4].len())
+        .fold("EGRESS".len(), usize::max)
+}
+
+/// The `--json` document of one daemon's listing (T110): the reply as it
+/// came, except that each box's network facts move from the reply's map
+/// into that box's own entry, as `loopback_address` and `egress_posture`.
+/// A field the daemon did not report is left out of the entry.
+fn listing_json(
+    resp: &minimald_rpc::ListSessionsResponse,
+) -> Result<serde_json_lenient::Value, anyhow::Error> {
+    let mut document =
+        serde_json_lenient::to_value(resp).context("Failed to serialize session list")?;
+    if let Some(object) = document.as_object_mut() {
+        object.remove("box_networks");
+        if let Some(serde_json_lenient::Value::Array(entries)) = object.get_mut("sessions") {
+            for (entry, session) in entries.iter_mut().zip(&resp.sessions) {
+                let (Some(entry), Some(facts)) =
+                    (entry.as_object_mut(), resp.box_networks.get(&session.id))
+                else {
+                    continue;
+                };
+                if let Some(address) = facts.loopback_address {
+                    entry.insert(
+                        "loopback_address".to_string(),
+                        serde_json_lenient::Value::String(address.to_string()),
+                    );
+                }
+                if let Some(posture) = facts.egress_posture {
+                    entry.insert(
+                        "egress_posture".to_string(),
+                        serde_json_lenient::to_value(posture)
+                            .context("Failed to serialize session list")?,
+                    );
+                }
+            }
+        }
+    }
+    Ok(document)
+}
+
+/// The cells of one session row — id, name, address, status, egress, title,
+/// last activity, project path — shared by the single-VM table
 /// ([`format_ls`]) and the multi-VM one ([`format_ls_across_vms`]), so the
 /// two surfaces present the same session attributes.
 ///
-/// The egress cell is a host-address box's enforcement (NET-079) in the
-/// spelling `--json` carries, `per_box` or `none`; every other box shows
-/// `-`, because the daemon reports no enforcement for it.
-fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 7] {
+/// The address cell is the host loopback address the box's ports answer
+/// at, and the egress cell is the box's posture in `min session policy`'s
+/// words ([`egress_posture_cell`]).
+/// Each shows `-` when the daemon did not report it (T110).
+fn session_cells(
+    entry: &minimald_rpc::ListSessionsEntry,
+    facts: Option<&minimald_rpc::BoxNetworkFacts>,
+) -> [String; 8] {
     let id = entry.id.to_string();
     let name = entry.name.as_deref().unwrap_or("-").to_string();
+    let address = facts
+        .and_then(|facts| facts.loopback_address)
+        .map_or_else(|| "-".to_string(), |address| address.to_string());
     let status = status_label(entry.status).to_string();
-    let egress = entry
-        .host_ip_enforcement
-        .map_or("-", minimald_rpc::HostIpEnforcement::machine_str)
-        .to_string();
+    let egress = egress_posture_cell(
+        facts.and_then(|facts| facts.egress_posture),
+        entry.host_ip_enforcement,
+    );
     let project_path = entry
         .project_path
         .as_ref()
@@ -963,7 +1052,16 @@ fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 7] {
         }
         None => ("-".to_string(), "-".to_string()),
     };
-    [id, name, status, egress, title, last_activity, project_path]
+    [
+        id,
+        name,
+        address,
+        status,
+        egress,
+        title,
+        last_activity,
+        project_path,
+    ]
 }
 
 /// The width of the VM column in the multi-VM table: enough for the default
@@ -1048,6 +1146,7 @@ pub fn format_ls_across_vms_on(
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
                 answerer_bound: false,
+                box_networks: Default::default(),
             },
             None,
             None,
@@ -1068,8 +1167,7 @@ pub fn format_ls_across_vms_on(
         let mut sessions = Vec::new();
         let mut vms = Vec::new();
         for listing in listings {
-            let reply = serde_json_lenient::to_value(&listing.resp)
-                .context("Failed to serialize session list")?;
+            let reply = listing_json(&listing.resp)?;
             let mut object = match reply {
                 serde_json_lenient::Value::Object(map) => map,
                 other => anyhow::bail!("session list did not serialize to an object: {other}"),
@@ -1196,7 +1294,11 @@ pub fn format_ls_across_vms_on(
                 writeln!(
                     out,
                     "BOX NAMES:       {vm:<width$} {}{}",
-                    crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
+                    crate::resolver::name_surface_line_at(
+                        surface.clone(),
+                        serving_proxy_port,
+                        boxes_at_own_address(&listing.resp),
+                    ),
                     crate::resolver::install_clause(crate::resolver::install_unfinished(
                         &surface, host
                     )),
@@ -1233,12 +1335,25 @@ pub fn format_ls_across_vms_on(
 
     // Format as a table, the single-VM columns with the VM each box lives on
     // leading them (NET-057: the listing shows the VM per box).
+    let rows: Vec<(&str, [String; 8])> = listings
+        .iter()
+        .flat_map(|listing| {
+            listing.resp.sessions.iter().map(|entry| {
+                (
+                    listing.vm.as_str(),
+                    session_cells(entry, listing.resp.box_networks.get(&entry.id)),
+                )
+            })
+        })
+        .collect();
+    let egress_width = egress_column_width(rows.iter().map(|(_, row)| row));
     writeln!(
         out,
-        "{:<vm_width$}  {:<36}  {:<20}  {:<13}  {:<7}  {:<20}  {:<19}  PROJECT PATH",
+        "{:<vm_width$}  {:<36}  {:<20}  {:<ADDRESS_COLUMN_WIDTH$}  {:<13}  {:<egress_width$}  {:<20}  {:<19}  PROJECT PATH",
         "VM",
         "SESSION ID",
         "NAME",
+        "ADDRESS",
         "STATUS",
         "EGRESS",
         "TITLE",
@@ -1247,7 +1362,8 @@ pub fn format_ls_across_vms_on(
     )?;
     writeln!(
         out,
-        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<13}  {:-<7}  {:-<20}  {:-<19}  {:-<24}",
+        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<ADDRESS_COLUMN_WIDTH$}  {:-<13}  {:-<egress_width$}  {:-<20}  {:-<19}  {:-<24}",
+        "",
         "",
         "",
         "",
@@ -1258,17 +1374,25 @@ pub fn format_ls_across_vms_on(
         "",
         vm_width = VM_COLUMN_WIDTH,
     )?;
-    for listing in listings {
-        for entry in &listing.resp.sessions {
-            let [id, name, status, egress, title, last_activity, project_path] =
-                session_cells(entry);
-            writeln!(
-                out,
-                "{:<vm_width$}  {id:<36}  {name:<20}  {status:<13}  {egress:<7}  {title:<20}  {last_activity:<19}  {project_path}",
-                listing.vm,
-                vm_width = VM_COLUMN_WIDTH,
-            )?;
-        }
+    for (
+        vm,
+        [
+            id,
+            name,
+            address,
+            status,
+            egress,
+            title,
+            last_activity,
+            project_path,
+        ],
+    ) in rows
+    {
+        writeln!(
+            out,
+            "{vm:<vm_width$}  {id:<36}  {name:<20}  {address:<ADDRESS_COLUMN_WIDTH$}  {status:<13}  {egress:<egress_width$}  {title:<20}  {last_activity:<19}  {project_path}",
+            vm_width = VM_COLUMN_WIDTH,
+        )?;
     }
 
     Ok(())

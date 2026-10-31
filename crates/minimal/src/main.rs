@@ -760,6 +760,7 @@ mod tests {
 
         let failure = answer(BepRefusal::UnenrolledNode {
             grants,
+            stored: false,
             cause: ProxyAbsence::NotInstalled { path: None },
         });
         assert_eq!(failure.code(), "gatehouse_unenrolled_node");

@@ -170,6 +170,11 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minvmd released_address_is_not_reused_within_the_answer_ttl
     <!-- design §7.1; event-driven; allocation runs through the answerer's authenticated channel from `.2` upward within the reserved range, and co-resident nodes never self-assign; a client that resolved the released name can still connect for the answer's 15 s positive TTL, so an early reuse would hand that connection to a different box; this hold is one of two on the address: NET-138's withdrawal path holds it too, from the row's withdrawal until the host has unbound every forward the withdrawn box published there, and refuses a registration at it meanwhile, so the allocator hands out an address only after both holds have cleared, whichever clears later -->
 
+- **NET-147** THE SYSTEM SHALL show each published box's host loopback address in `min ls` and in its machine-readable output.
+  tier:     T0
+  verify:   cargo nextest run -p minimal ls_shows_box_loopback_address
+  <!-- S1b-2a/AC1; ubiquitous; the address is the one NET-010 assigns, or the `127.0.0.1` fallback of NET-123 where the range is absent, so the listing names where the box's ports actually answer; a host-address box shows its node's address (NET-129) -->
+
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
   verify:   cargo nextest run -p minimald name_registered_at_finalize
@@ -247,22 +252,22 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimal activate_and_ls_report_native_surface
   <!-- S1b-3; prose 12; optional-feature; WHERE per design §7.1 v0.5 supersession condition; the line and row that report it are NET-142's -->
 
-- **NET-142** WHEN a box is activated THE SYSTEM SHALL print one host line naming the box, whose resolution clause is `names: <box>.min.internal via 127.0.0.1:<port>`, where `<port>` is the hostname-proxy port.
+- **NET-142** WHEN a box is activated THE SYSTEM SHALL print one host line that names the box, tells the user how to open it by name on this host, and gives the hostname-proxy port when the proxy is the path that opens it.
   tier:     T0
   verify:   cargo nextest run -p minimal activate_prints_one_host_line_per_install_state
-  <!-- event-driven; one line, never a block, so the activation's own output stays what the operator reads; the resolution clause is keyed on the host-DNS state (below) and the install clause on the rest of the install, independently, since a host can have native DNS and still lack the classifier, or the reverse; `<port>` is the port NET-026 discovers -->
-  - WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL print the resolution clause as `names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>`, where `<port>` is the hostname-proxy port, or `names: <box>.min.internal resolves on this machine` while the session start has no proxy port.
+  <!-- event-driven; one line, never a block, so the activation's own output stays what the operator reads; the line is keyed on the host-DNS state (below) and on the rest of the install, independently, since a host can have native DNS and still lack the classifier, or the reverse; the port is the one NET-026 discovers; the exact wording lives with the test that pins it, not in this spec -->
+  - WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL state in the host line that the name resolves on this machine, and whether the box opens at its name directly or through the hostname proxy at its port.
     tier:   T0
     verify: cargo nextest run -p minimal activate_host_line_names_native_dns_when_deployed
-    <!-- optional-feature; the WHERE is NET-018's; the clause promises resolution only, because the name answers with a reserved local address a browser is not promised a connection to; the proxy NET-019 keeps serving is the path that opens the box -->
-  - WHILE any `min finalize-install` item is missing THE SYSTEM SHALL end the host line with the install clause `; finish setup: min finalize-install`, whatever its resolution clause.
+    <!-- optional-feature; the WHERE is NET-018's; the line names the path that works on this host: where the box's ports answer at its own address (NET-010) the name opens directly, and where they answer only at the `127.0.0.1` fallback (NET-123) the proxy NET-019 keeps serving is the path; the line never promises a connection the host cannot make -->
+  - WHILE any `min finalize-install` item is missing THE SYSTEM SHALL end the host line by naming `min finalize-install` as the step that finishes setup.
     tier:   T0
     verify: cargo nextest run -p minimal activate_host_line_carries_finish_setup_clause_while_items_missing
-    <!-- state-driven; the clause is the pointer NET-122 owes an unfinished host, so a session start and `min finalize-install --show` agree on whether anything is left; a finished host has no clause -->
-  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows, keep the resolution wording of its `NAME SURFACE:` row, and end that row with the same install clause as the activate host line while any item is missing.
+    <!-- state-driven; the pointer NET-122 owes an unfinished host, so a session start and `min finalize-install --show` agree on whether anything is left; a finished host has no pointer -->
+  - WHEN `min ls` runs THE SYSTEM SHALL state the same naming surface and the same way to open a box as the activate host line, beside its rows for the hostname-proxy port and the DNS service.
     tier:   T0
-    verify: cargo nextest run -p minimal ls_keeps_detail_rows_and_name_surface_clause
-    <!-- event-driven; the listing is per daemon and names no box, so its row keeps its own words, `the hostname proxy is the live name surface · <name>.min.internal routes through it on 127.0.0.1:<port>` or `native DNS is the live name surface · …`, and only the install clause `; finish setup: min finalize-install` is shared with the host line; a listener failure (NET-020) stays on the `HOSTNAME PROXY:` row here; the port, the answerer and the surface each get a row, while an activation gets one line -->
+    verify: cargo nextest run -p minimal ls_name_surface_matches_activate_host_line
+    <!-- event-driven; the listing is per daemon and names no box, so it states the surface for any box name; the two surfaces state one fact, so a reader of either learns the same path; the finish-setup pointer is shared with the host line while any item is missing; a listener failure (NET-020) stays on the hostname-proxy row -->
 
 - **NET-019** WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL keep the hostname proxy serving.
   tier:     T0
@@ -446,6 +451,11 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimal policy_shows_effective_egress
   <!-- S8a/AC1; prose 39; ubiquitous -->
+
+- **NET-146** THE SYSTEM SHALL show in `min ls`, for every box, the effective egress posture that `min session policy` shows for that box.
+  tier:     T0
+  verify:   cargo nextest run -p minimal ls_egress_matches_session_policy
+  <!-- S8a/AC1, S9a; ubiquitous; the posture is the named default, deny-all, or declared rules, in the words `min session policy` uses; the listing never shows an internal enforcement value in their place, and never a blank for a box whose egress is decided; where a host-address box runs with its rules unenforced (NET-079), the listing says so in the same words as `min session policy` -->
 
 - **NET-062** WHILE a box runs with an own address, IF it opens a connection to a destination its egress rules do not allow THEN THE SYSTEM SHALL drop the connection without resetting it.
   tier:     T2
