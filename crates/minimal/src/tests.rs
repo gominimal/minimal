@@ -382,6 +382,8 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_request = asserts",
             // A unit test's request, never sent: it checks the box's name.
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
+            // A unit test's request, never sent: it checks the cleaned entry name.
+            "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
         ]
     );
 }
@@ -1073,6 +1075,29 @@ fn created_box_name_is_the_entry_without_a_typed_name() {
     spec.name = Some("web".to_string());
     put_spec(&mut request, &spec).unwrap();
     assert_eq!(created_box_name(&request).as_deref(), Some("web"));
+}
+
+/// BOX-163: the VM host row and the box carry one name. For an entry such
+/// as `My App`, the client registers the row under the name the daemon
+/// gives the box, because both sides clean the entry with one function.
+#[test]
+fn entry_name_registers_and_creates_under_one_cleaned_name() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+    spec.entry = "My App".to_string();
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("myapp"));
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some(boxes::box_name::entry_box_name(&spec.entry).as_str()),
+        "the row's name is the daemon's name for the entry"
+    );
 }
 
 #[test]

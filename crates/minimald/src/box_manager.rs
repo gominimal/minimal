@@ -304,41 +304,10 @@ impl NameSource {
     }
 }
 
-/// The longest box name [`entry_box_name`] makes from an entry. It leaves
-/// room under the 63-octet DNS label limit for a fresh instance's `-<n>`.
-const ENTRY_NAME_MAX: usize = 48;
-
-/// The box name an entry gives (BOX-163), as one DNS label: ASCII letters
-/// and digits lowercased, `-`, `_` and `.` as `-`, other characters
-/// dropped, at most [`ENTRY_NAME_MAX`] octets, and no `-` at either end.
-/// An entry with nothing left names the box `box`. A `[box] name` or a
-/// `--name` never passes through here, so an invalid one is still refused.
-fn entry_box_name(entry: &str) -> String {
-    let filtered: String = entry
-        .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() {
-                Some(c.to_ascii_lowercase())
-            } else if matches!(c, '-' | '_' | '.') {
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .take(ENTRY_NAME_MAX)
-        .collect();
-    let trimmed = filtered.trim_matches('-');
-    if trimmed.is_empty() {
-        "box".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// The name a create gives its box (BOX-163): the expanded spec's
 /// `[box] name`, else the request's name, else the entry's name as a
-/// valid label ([`entry_box_name`]). `min` sends a request name only for
-/// `--name`. A spec the daemon cannot read as a v0 spec names nothing.
+/// valid label ([`boxes::box_name::entry_box_name`]). `min` sends a
+/// request name only for `--name`. A spec the daemon cannot read as a v0 spec names nothing.
 fn creation_name(
     requested: Option<&str>,
     spec: Option<&serde_json_lenient::Value>,
@@ -355,7 +324,10 @@ fn creation_name(
     match spec {
         // Only the entry is cleaned. A spec that sets `[box] name` returned
         // above, unchanged, so the store still refuses an invalid one.
-        Some(spec) => (Some(entry_box_name(&spec.entry)), NameSource::Entry),
+        Some(spec) => (
+            Some(boxes::box_name::entry_box_name(&spec.entry)),
+            NameSource::Entry,
+        ),
         None => (None, NameSource::None),
     }
 }
