@@ -22,7 +22,7 @@
 //!
 //! [`resolve`], [`children`] and [`render`] are pure. [`follow`] takes its
 //! wait step as a closure. [`cmd_box_audit`] gathers the boxes this host
-//! knows from the daemon's listing.
+//! knows from the daemon's listing, and each one's parent from its record.
 
 use std::collections::BTreeSet;
 use std::os::fd::AsFd as _;
@@ -81,18 +81,30 @@ pub(crate) struct KnownBox {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Resolved {
     /// The target was a box id.
-    Id(String),
+    Id(boxes::SessionId),
     /// The target was a name, and this is the id it read.
-    Name { name: String, id: String },
+    Name { name: String, id: boxes::SessionId },
 }
 
 impl Resolved {
-    /// The audit subject.
-    pub(crate) fn id(&self) -> &str {
+    /// The box id, displayed in the hyphenated form `min ls` shows.
+    pub(crate) fn id(&self) -> boxes::SessionId {
         match self {
-            Self::Id(id) | Self::Name { id, .. } => id,
+            Self::Id(id) | Self::Name { id, .. } => *id,
         }
     }
+
+    /// The audit subject: the box id as the proxy writes it.
+    pub(crate) fn subject(&self) -> String {
+        subject(self.id())
+    }
+}
+
+/// The box id in the proxy's one text form, 32 lowercase hex digits, as
+/// `bep serve` writes it in a record's `subject` (#2462). The hyphenated
+/// display form never matches a record.
+pub(crate) fn subject(id: boxes::SessionId) -> String {
+    bep::listener::box_id_text(&id.to_bytes())
 }
 
 /// Refuses every read inside a box. The log is the host-side proxy's, and
@@ -133,7 +145,7 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
         );
     }
     if let Ok(id) = boxes::SessionId::parse_str(target) {
-        return Ok(Resolved::Id(id.to_string()));
+        return Ok(Resolved::Id(id));
     }
     let named = known
         .iter()
@@ -147,7 +159,7 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
     match chosen {
         Some(found) => Ok(Resolved::Name {
             name: target.to_owned(),
-            id: found.id.to_string(),
+            id: found.id,
         }),
         None => anyhow::bail!(
             "No box on this host is named `{target}`. \
@@ -156,12 +168,13 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
     }
 }
 
-/// The ids of every child of `parent` that this host knows.
-pub(crate) fn children(parent: &str, known: &[KnownBox]) -> BTreeSet<String> {
+/// The audit subjects of every child of `parent` that this host knows, in
+/// the proxy's text form.
+pub(crate) fn children(parent: boxes::SessionId, known: &[KnownBox]) -> BTreeSet<String> {
     known
         .iter()
-        .filter(|candidate| candidate.parent.is_some_and(|p| p.to_string() == parent))
-        .map(|candidate| candidate.id.to_string())
+        .filter(|candidate| candidate.parent == Some(parent))
+        .map(|candidate| subject(candidate.id))
         .collect()
 }
 
@@ -214,7 +227,9 @@ fn needs_escape(c: char) -> bool {
 }
 
 /// Writes the entries whose subject is in `subjects`, and returns how many
-/// it wrote. `name_box` puts the subject at the start of each text line.
+/// it wrote. `subjects` are in the proxy's text form, see [`subject`].
+/// `name_box` puts the box id, hyphenated as `min ls` shows it, at the
+/// start of each text line.
 pub(crate) fn render(
     entries: &[Entry],
     subjects: &BTreeSet<String>,
@@ -232,7 +247,10 @@ pub(crate) fn render(
             Some(BoxAuditOutputFormat::Jsonl) => writeln!(out, "{}", entry.line)?,
             None => {
                 if name_box {
-                    write!(out, "{}  ", record.subject)?;
+                    match boxes::SessionId::parse_str(&record.subject) {
+                        Ok(id) => write!(out, "{id}  ")?,
+                        Err(_) => write!(out, "{}  ", printable(&record.subject))?,
+                    }
                 }
                 let kind = match record.kind {
                     bep::audit::Kind::Decision => "decision",
@@ -326,76 +344,51 @@ pub(crate) fn follow(
     }
 }
 
-/// Whether the boxes from [`known_boxes`] carry their parent. The daemon's
-/// listing has no parent field yet, so `--parent` is refused.
-// Interim, fail closed: https://github.com/gominimal/minimal/issues/2386
-// (T1 of spec 29: the record, store and clients carry `parent`) makes the
-// listing carry the box's parent (architecture, audit paragraph). Set this
-// const to `true` when `ListSessionsEntry` carries it and `known_boxes`
-// maps it.
-const LISTING_RECORDS_PARENTS: bool = false;
-
-/// The refusal of `--parent` on a host whose listing carries no parent.
-fn parents_unrecorded(parent: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "`min box audit --parent` cannot run here: this host does not record \
-         which boxes are children of box {parent}. \
-         Run `min box audit <box>` for each child box."
-    )
-}
-
-/// Refuses `--parent` before the daemon's listing when the listing carries
-/// no parent, so the refusal never starts a daemon. A box id or name is
-/// named as given. `self` gets the refusal [`resolve`] gives.
-pub(crate) fn refuse_parent_before_listing(
-    args: &BoxAuditArgs,
-    parents_recorded: bool,
-) -> anyhow::Result<()> {
-    let Some(parent) = &args.parent else {
-        return Ok(());
-    };
-    if parents_recorded {
-        return Ok(());
+/// One listed box as `min box audit` knows it. The parent comes from the
+/// box's record, which the daemon stamps at creation. The listing does not
+/// carry it. A box whose record cannot be read has no known parent.
+pub(crate) fn known_box(
+    entry: minimald_rpc::ListSessionsEntry,
+    record: Option<&boxes::Record>,
+) -> KnownBox {
+    KnownBox {
+        id: entry.id,
+        name: entry.name,
+        live: entry.status == boxes::BoxState::Active,
+        parent: record.and_then(|record| record.parent),
     }
-    let named = match resolve(parent, &[]) {
-        Ok(resolved) => resolved.id().to_owned(),
-        Err(_) if parent != "self" => printable(parent).into_owned(),
-        Err(refused) => return Err(refused),
-    };
-    Err(parents_unrecorded(&named))
 }
 
-/// The boxes the daemon lists. The listing carries no parent, so no box
-/// has a known child yet.
-async fn known_boxes(global: &GlobalArgs) -> anyhow::Result<Vec<KnownBox>> {
+/// The boxes the daemon lists. With `parents`, each box's parent is read
+/// from its record, one lookup per listed box. Without it, no box has a
+/// known parent, because only `--parent` asks for one.
+async fn known_boxes(global: &GlobalArgs, parents: bool) -> anyhow::Result<Vec<KnownBox>> {
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
     super::ensure_daemon(global)?;
     // The listing below is the gated call.
     let mut client = super::connect_daemon_unchecked(global).await?;
     let listed = super::list_sessions_version_gated(&mut client).await?;
-    Ok(listed
-        .sessions
-        .into_iter()
-        .map(|entry| KnownBox {
-            id: entry.id,
-            name: entry.name,
-            live: entry.status == boxes::BoxState::Active,
-            // Interim: see `LISTING_RECORDS_PARENTS`.
-            parent: None,
-        })
-        .collect())
+    let mut known = Vec::with_capacity(listed.sessions.len());
+    for entry in listed.sessions {
+        let record = if parents {
+            client
+                .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(entry.id))
+                .await
+                .context("GetSessionRecord RPC failed")?
+                .record
+        } else {
+            None
+        };
+        known.push(known_box(entry, record.as_ref()));
+    }
+    Ok(known)
 }
 
 /// The work of `min box audit`, over the log in `dir` and the boxes in
-/// `known`. Messages go to `err`, records to `out`. `parents_recorded`
-/// says whether `known` carries each box's parent.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is one input the tests replace"
-)]
+/// `known`. Messages go to `err`, records to `out`.
 pub(crate) fn run(
     args: &BoxAuditArgs,
     known: &[KnownBox],
-    parents_recorded: bool,
     in_box: bool,
     dir: &Path,
     out: &mut dyn std::io::Write,
@@ -406,15 +399,12 @@ pub(crate) fn run(
     let (resolved, subjects, name_box) = match (&args.target, &args.parent) {
         (_, Some(parent)) => {
             let resolved = resolve(parent, known)?;
-            if !parents_recorded {
-                return Err(parents_unrecorded(resolved.id()));
-            }
             let subjects = children(resolved.id(), known);
             (resolved, subjects, true)
         }
         (Some(target), None) => {
             let resolved = resolve(target, known)?;
-            let subjects = BTreeSet::from([resolved.id().to_owned()]);
+            let subjects = BTreeSet::from([resolved.subject()]);
             (resolved, subjects, false)
         }
         (None, None) => anyhow::bail!("Name a box: run `min box audit <box>`."),
@@ -467,13 +457,10 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
             .as_deref()
             .is_some_and(|v| v != "self" && boxes::SessionId::parse_str(v).is_err())
     };
-    // Before the listing: `--parent` without parents in the listing never
-    // reaches the daemon.
-    refuse_parent_before_listing(&args, LISTING_RECORDS_PARENTS)?;
     // Only a name needs the daemon's listing, and `--parent` needs it to
     // find the children.
     let known = if names_a_box(&args.target) || args.parent.is_some() {
-        known_boxes(global).await?
+        known_boxes(global, args.parent.is_some()).await?
     } else {
         Vec::new()
     };
@@ -490,7 +477,6 @@ pub(crate) async fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> an
     run(
         &args,
         &known,
-        LISTING_RECORDS_PARENTS,
         in_box,
         &dir,
         &mut stdout,
@@ -534,10 +520,15 @@ mod tests {
         boxes::SessionId::parse_str(s).unwrap()
     }
 
+    /// `box_id` in the proxy's text form, as `bep serve` writes it.
+    fn hex(box_id: &str) -> String {
+        subject(id(box_id))
+    }
+
     fn decision(box_id: &str, authority: &str) -> Decision {
         Decision {
             kind: Kind::Decision,
-            box_id: box_id.to_owned(),
+            box_id: hex(box_id),
             authority: authority.to_owned(),
             identifier: None,
             jti: String::new(),
@@ -563,13 +554,63 @@ mod tests {
         }
     }
 
-    fn known(id_: &str, name: &str, live: bool, parent: Option<&str>) -> KnownBox {
-        KnownBox {
+    /// The listing entry the daemon gives for a box.
+    fn entry(id_: &str, name: &str, live: bool) -> minimald_rpc::ListSessionsEntry {
+        minimald_rpc::ListSessionsEntry {
             id: id(id_),
             name: Some(name.to_owned()),
-            live,
-            parent: parent.map(id),
+            project_path: None,
+            status: if live {
+                boxes::BoxState::Active
+            } else {
+                boxes::BoxState::Stopped
+            },
+            git: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
+            attrs: None,
         }
+    }
+
+    /// The record the daemon stamps for a box, with its parent.
+    fn record(id_: &str, parent: Option<&str>) -> boxes::Record {
+        boxes::Record {
+            id: id(id_),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: boxes::NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            box_addresses: None,
+            task_addresses: Vec::new(),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: parent.map(id),
+            project_root: None,
+            attrs: Default::default(),
+        }
+    }
+
+    /// A box as `known_boxes` gives it: the listing entry, with the parent
+    /// read from the box's record.
+    fn known(id_: &str, name: &str, live: bool, parent: Option<&str>) -> KnownBox {
+        known_box(entry(id_, name, live), Some(&record(id_, parent)))
     }
 
     fn run_to_strings(
@@ -579,7 +620,7 @@ mod tests {
         dir: &Path,
     ) -> (anyhow::Result<()>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = run(args, boxes, true, in_box, dir, &mut out, &mut err, || false);
+        let result = run(args, boxes, in_box, dir, &mut out, &mut err, || false);
         (
             result,
             String::from_utf8(out).unwrap(),
@@ -620,7 +661,10 @@ mod tests {
         result.unwrap();
         for line in out.lines() {
             assert!(line.starts_with('{'), "{line}");
-            assert!(line.contains(&format!("\"subject\":\"{A}\"")), "{line}");
+            assert!(
+                line.contains(&format!("\"subject\":\"{}\"", hex(A))),
+                "{line}"
+            );
         }
         assert_eq!(out.lines().count(), 2);
 
@@ -808,6 +852,61 @@ mod tests {
         assert!(message.contains("min box audit <box-id>"), "{message}");
     }
 
+    // BEP-042, #2462: the proxy writes the subject from the delivery header
+    // as 32 lowercase hex digits. A box id minted on this host reads that
+    // record by its hyphenated id and by its name, and the command names
+    // the hyphenated id a person sees in `min ls`.
+    #[test]
+    fn box_audit_reads_a_record_the_proxy_wrote_for_a_minted_id() {
+        use bep::listener::Delivery;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let minted = boxes::SessionId::mint();
+        let other = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path().join(segment_name(1))).unwrap();
+        for (box_id, authority) in [(minted, "mine.example:443"), (other, "other.example:443")] {
+            // As the switch peer writes the header and `bep serve` reads it.
+            let sent = Delivery {
+                box_id: box_id.to_bytes(),
+                source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40000),
+                destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 443),
+            };
+            let delivery = Delivery::parse(&sent.emit()).unwrap();
+            let mut record = decision(A, authority);
+            record.box_id = delivery.box_id_text();
+            assert_eq!(record.box_id.len(), 32, "{}", record.box_id);
+            log.append(&record).unwrap();
+        }
+        drop(log);
+
+        let shown = minted.to_string();
+        assert!(shown.contains('-'), "{shown}");
+
+        // By id, in the hyphenated form `min ls` shows.
+        let (result, out, err) =
+            run_to_strings(&args(Some(&shown), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("mine.example:443"), "{out}");
+        assert!(!out.contains("other.example"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // By name: the line keeps the hyphenated id.
+        let boxes = [KnownBox {
+            id: minted,
+            name: Some("web".to_owned()),
+            live: true,
+            parent: None,
+        }];
+        let (result, out, err) =
+            run_to_strings(&args(Some("web"), None, false), &boxes, false, dir.path());
+        result.unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("mine.example:443"), "{out}");
+        assert_eq!(err, format!("Showing web (box {shown}).\n"));
+    }
+
     // BEP-042: --follow replays the box's records and then tails new ones.
     #[test]
     fn box_audit_follow_stops_when_the_reader_closes() {
@@ -827,7 +926,7 @@ mod tests {
         );
 
         let mut reader = LogReader::new(dir.path());
-        let subjects = BTreeSet::from([A.to_owned()]);
+        let subjects = BTreeSet::from([hex(A)]);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let mut rounds = 0;
         let path = dir.path().to_path_buf();
@@ -904,51 +1003,57 @@ mod tests {
         result.unwrap();
         assert!(out.is_empty());
         assert_eq!(err, format!("Box {B} has no child boxes.\n"));
+    }
 
-        // A listing without parents refuses, and says how to read each box.
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = run(
-            &args(None, Some("web"), false),
-            &boxes,
-            false,
-            false,
-            dir.path(),
-            &mut out,
-            &mut err,
-            || false,
+    // BEP-042: `known_boxes` reads each box's parent from its record, so
+    // `--parent` finds the children the daemon stamped. The refusal for a
+    // host without parents is gone.
+    #[test]
+    fn box_audit_parent_reads_parents_from_the_box_records() {
+        let web = known_box(entry(A, "web", true), Some(&record(A, None)));
+        let child = known_box(entry(B, "web-1", false), Some(&record(B, Some(A))));
+        let unread = known_box(entry(C, "web-2", true), None);
+        assert_eq!(
+            web,
+            KnownBox {
+                id: id(A),
+                name: Some("web".to_owned()),
+                live: true,
+                parent: None
+            }
         );
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("does not record"), "{message}");
-        assert!(
-            message.contains(&format!("children of box {A}")),
-            "{message}"
+        assert_eq!(
+            child,
+            KnownBox {
+                id: id(B),
+                name: Some("web-1".to_owned()),
+                live: false,
+                parent: Some(id(A))
+            }
         );
-        assert!(message.contains("min box audit <box>"), "{message}");
-        assert!(out.is_empty() && err.is_empty());
+        assert_eq!(unread.parent, None);
 
-        // `cmd_box_audit` refuses before the daemon's listing, so the
-        // refusal starts no daemon. It takes no listing, so it names the
-        // target as given.
-        for (parent, named) in [("web", "web"), (A, A)] {
-            let message = refuse_parent_before_listing(&args(None, Some(parent), false), false)
-                .unwrap_err()
-                .to_string();
-            assert_eq!(
-                message,
-                format!(
-                    "`min box audit --parent` cannot run here: this host does not record \
-                     which boxes are children of box {named}. \
-                     Run `min box audit <box>` for each child box."
-                )
-            );
-        }
-        let message = refuse_parent_before_listing(&args(None, Some("self"), false), false)
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("not inside a box"), "{message}");
-        // A listing with parents, or no `--parent`, goes on to the listing.
-        refuse_parent_before_listing(&args(None, Some("web"), false), true).unwrap();
-        refuse_parent_before_listing(&args(Some("web"), None, false), false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), 1, &[(B, "b.example:443"), (C, "c.example:443")]);
+        let boxes = [web, child, unread];
+        let (result, out, err) =
+            run_to_strings(&args(None, Some(A), false), &boxes, false, dir.path());
+        result.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert!(lines[0].starts_with(B), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // A box with no child says so on stderr, and nothing is refused.
+        let (result, out, err) =
+            run_to_strings(&args(None, Some("web-2"), false), &boxes, false, dir.path());
+        result.unwrap();
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            format!("Showing web-2 (box {C}).\nBox {C} has no child boxes.\n")
+        );
+        assert!(!err.contains("cannot run here"), "{err}");
     }
 
     // BEP-042: un-enrolled, `self` inside a box is the defined error.
