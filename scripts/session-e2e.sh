@@ -7840,8 +7840,10 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -qE -- 'opens at its name on this machine|resolves on this machine' "$range2_err"; then
-    echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
+  # The range is present and the box is off the interim, so its ports
+  # answer at its own address: the host line reads the own-address form.
+  if ! grep -qF -- "names: $RANGE_NAME-2.min.internal opens at its name on this machine" "$range2_err"; then
+    echo "::error::a session started after the range step does not say its box opens at its name on this machine (the host probe must read present, and the box must be off the 127.0.0.1 interim)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
@@ -9337,10 +9339,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -E -- 'opens at its name on this machine|resolves on this machine' \
+  # The box publishes at its own leased address (asserted below), so its
+  # host line reads the own-address form, never the 127.0.0.1 fallback form.
+  bn_api_surface="$(grep -F -- 'opens at its name on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its box opens at its name on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9350,7 +9354,6 @@ proof_box_name_resolves_natively_without_proxy() {
   # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
     "names: $BN_API_NAME.min.internal opens at its name on this machine"*) ;;
-    "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
@@ -9433,11 +9436,12 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_ls="$(mnl ls 2>&1 || true)"
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
   bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
+  # Both boxes stand at their own addresses, so no box is on the fallback
+  # and the row reads the own-address form, as the activate line did.
   case "$bn_surface_line" in
     *"<box>.min.internal opens at its name on this machine"*) ;;
-    *"<box>.min.internal resolves on this machine"*) ;;
     *)
-      echo "::error::min ls's BOX NAMES line does not say box names open through this machine's DNS (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names open at their names on this machine (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
