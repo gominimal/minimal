@@ -180,8 +180,10 @@ mod placed {
         let relay = Arc::new(Relay {
             procs: placement.procs.to_path_buf(),
             admits_nothing: placement.admits_nothing,
-            nameserver: None,
+            hosts: PathBuf::from(HOSTS),
+            nameservers: None,
             connect_timeout: CONNECT_TIMEOUT,
+            head_timeout: HEAD_TIMEOUT,
             auth: auth.clone(),
             failure: Mutex::new(None),
         });
@@ -230,11 +232,18 @@ mod placed {
         /// The cgroup's egress rules admit no destination: refuse every
         /// connection before its host name is resolved.
         admits_nothing: bool,
-        /// The name server the relay asks, from a socket created in the
-        /// cgroup. `None` takes the first `nameserver` of `/etc/resolv.conf`.
-        nameserver: Option<SocketAddr>,
+        /// The `hosts` file the relay reads a host name from before it asks
+        /// a name server.
+        hosts: PathBuf,
+        /// The name servers the relay asks in order, from sockets created in
+        /// the cgroup. `None` takes the `nameserver` lines of
+        /// `/etc/resolv.conf`.
+        nameservers: Option<Vec<SocketAddr>>,
         /// How long the relay waits for one connection to one address.
         connect_timeout: std::time::Duration,
+        /// How long the relay waits for the head of a request, so a client
+        /// that connects and sends nothing does not hold a handler task.
+        head_timeout: std::time::Duration,
         /// The `Proxy-Authorization` value this download's client sends.
         auth: String,
         /// The last destination the relay could not reach, and why. A later
@@ -264,19 +273,32 @@ mod placed {
     impl Relay {
         async fn handle(&self, mut client: TcpStream) -> io::Result<()> {
             let mut head = Vec::with_capacity(1024);
-            let end = loop {
-                if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break at + 4;
+            let reading = async {
+                loop {
+                    if let Some(at) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                        return Ok(Some(at + 4));
+                    }
+                    if head.len() >= MAX_HEAD {
+                        return Err(io::Error::other("the request head is too long"));
+                    }
+                    let mut buf = [0u8; 4096];
+                    let n = client.read(&mut buf).await?;
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    head.extend_from_slice(&buf[..n]);
                 }
-                if head.len() >= MAX_HEAD {
-                    return Err(io::Error::other("the request head is too long"));
+            };
+            let end = match tokio::time::timeout(self.head_timeout, reading).await {
+                Ok(Ok(Some(end))) => end,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("no request head after {:?}", self.head_timeout),
+                    ));
                 }
-                let mut buf = [0u8; 4096];
-                let n = client.read(&mut buf).await?;
-                if n == 0 {
-                    return Ok(());
-                }
-                head.extend_from_slice(&buf[..n]);
             };
             let rest = head.split_off(end);
             let text = String::from_utf8(head).map_err(io::Error::other)?;
@@ -381,11 +403,19 @@ mod placed {
             let addrs = match host.parse::<std::net::IpAddr>() {
                 Ok(ip) => vec![ip],
                 Err(_) => {
-                    let nameserver = match self.nameserver {
-                        Some(nameserver) => nameserver,
-                        None => system_nameserver()?,
-                    };
-                    lookup_in_cgroup(&self.procs, nameserver, host).await?
+                    // A missing or unreadable hosts file lists no name, as
+                    // it does for the system resolver.
+                    let text = std::fs::read_to_string(&self.hosts).unwrap_or_default();
+                    let listed = hosts_addresses(&text, host);
+                    if listed.is_empty() {
+                        let nameservers = match &self.nameservers {
+                            Some(nameservers) => nameservers.clone(),
+                            None => system_nameservers()?,
+                        };
+                        lookup_in_cgroup(&self.procs, &nameservers, host).await?
+                    } else {
+                        listed
+                    }
                 }
             };
             let mut last = None;
@@ -425,77 +455,168 @@ mod placed {
     /// How long the relay waits for one answer from the name server.
     const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// The first `nameserver` of `/etc/resolv.conf`, on port 53.
-    fn system_nameserver() -> io::Result<SocketAddr> {
+    /// How long the relay waits for the head of a request from its client.
+    const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The file the relay reads host names from before it asks a name server.
+    const HOSTS: &str = "/etc/hosts";
+
+    /// The `nameserver` lines of `/etc/resolv.conf`, in order, on port 53.
+    fn system_nameservers() -> io::Result<Vec<SocketAddr>> {
         let text = std::fs::read_to_string("/etc/resolv.conf").map_err(|e| {
             io::Error::new(e.kind(), format!("could not read /etc/resolv.conf: {e}"))
         })?;
-        first_nameserver(&text).ok_or_else(|| {
-            io::Error::new(
+        let servers = nameservers(&text);
+        if servers.is_empty() {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "/etc/resolv.conf names no name server",
-            )
-        })
+            ));
+        }
+        Ok(servers)
     }
 
-    /// The first `nameserver` in the text of a `resolv.conf`, on port 53.
-    fn first_nameserver(text: &str) -> Option<SocketAddr> {
-        let conf = resolv_conf::Config::parse(text).ok()?;
-        let ip: IpAddr = conf.nameservers.first()?.into();
-        Some(SocketAddr::new(ip, 53))
+    /// The `nameserver` lines in the text of a `resolv.conf`, in order, on
+    /// port 53.
+    fn nameservers(text: &str) -> Vec<SocketAddr> {
+        resolv_conf::Config::parse(text)
+            .map(|conf| {
+                conf.nameservers
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip.into(), 53))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// The addresses of `host`: its A and AAAA records, asked of
-    /// `nameserver` from a UDP socket created in the cgroup whose
-    /// `cgroup.procs` is `procs`. So the egress rules that match the cgroup
-    /// decide the query as well as the connection (NET-155).
+    /// The addresses that the text of a `hosts` file gives `host`. A source
+    /// URL names a full host, so no search domain applies.
+    fn hosts_addresses(text: &str, host: &str) -> Vec<IpAddr> {
+        let host = host.trim_end_matches('.');
+        text.lines()
+            .filter_map(|line| {
+                let line = line.split('#').next().unwrap_or_default();
+                let mut fields = line.split_whitespace();
+                let ip: IpAddr = fields.next()?.parse().ok()?;
+                fields
+                    .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(host))
+                    .then_some(ip)
+            })
+            .collect()
+    }
+
+    /// The addresses of `host`: its A and AAAA records, asked of each of
+    /// `nameservers` in order until one answers, from sockets created in the
+    /// cgroup whose `cgroup.procs` is `procs`. So the egress rules that match
+    /// the cgroup decide the query as well as the connection (NET-155).
     async fn lookup_in_cgroup(
         procs: &Path,
-        nameserver: SocketAddr,
+        nameservers: &[SocketAddr],
         host: &str,
     ) -> io::Result<Vec<IpAddr>> {
+        let mut last = None;
+        for &server in nameservers {
+            match lookup_at(procs, server, host).await {
+                Lookup::Found(addrs) => return Ok(addrs),
+                Lookup::Answered(e) => return Err(e),
+                Lookup::Unanswered(e) => {
+                    tracing::debug!(%server, error = %e, "a name server gave no answer; the next one is asked");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no name server to ask")))
+    }
+
+    /// What one name server said about a host.
+    enum Lookup {
+        /// The host's addresses.
+        Found(Vec<IpAddr>),
+        /// The server answered that the host has no address.
+        Answered(io::Error),
+        /// The server gave no usable answer, so the next one is asked.
+        Unanswered(io::Error),
+    }
+
+    /// Asks `server` for the A and AAAA records of `host`, over UDP, and
+    /// again over TCP for an answer that came back truncated.
+    async fn lookup_at(procs: &Path, server: SocketAddr, host: &str) -> Lookup {
+        use hickory_proto::op::ResponseCode;
         use hickory_proto::rr::RecordType;
 
+        let socket = match udp_in_cgroup(procs, server).await {
+            Ok(socket) => socket,
+            Err(e) => return Lookup::Unanswered(e),
+        };
+        let mut addrs = Vec::new();
+        let mut answered = false;
+        let mut no_such_name = None;
+        let mut last = None;
+        for rtype in [RecordType::A, RecordType::AAAA] {
+            let reply = match ask(&socket, procs, server, host, rtype).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            };
+            match reply.metadata.response_code {
+                ResponseCode::NoError => {
+                    answered = true;
+                    addrs.extend(addresses(&reply));
+                }
+                code @ ResponseCode::NXDomain => {
+                    answered = true;
+                    no_such_name = Some(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("could not resolve {host}: {code}"),
+                    ));
+                }
+                code => {
+                    last = Some(io::Error::other(format!(
+                        "the name server {server} could not resolve {host}: {code}"
+                    )))
+                }
+            }
+        }
+        if !addrs.is_empty() {
+            Lookup::Found(addrs)
+        } else if answered {
+            Lookup::Answered(no_such_name.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
+            }))
+        } else {
+            Lookup::Unanswered(last.unwrap_or_else(|| {
+                io::Error::other(format!("the name server {server} did not answer"))
+            }))
+        }
+    }
+
+    /// A UDP socket created in the cgroup and connected to `server`.
+    async fn udp_in_cgroup(procs: &Path, server: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
         let procs = procs.to_path_buf();
         let socket = tokio::task::spawn_blocking(move || {
-            socket_in_cgroup(&procs, nameserver.is_ipv6(), SocketKind::Datagram)
+            socket_in_cgroup(&procs, server.is_ipv6(), SocketKind::Datagram)
         })
         .await
         .map_err(io::Error::other)??;
         let socket = std::net::UdpSocket::from(socket);
         socket.set_nonblocking(true)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
-        socket.connect(nameserver).await.map_err(|e| {
+        socket.connect(server).await.map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("could not reach the name server {nameserver}: {e}"),
+                format!("could not reach the name server {server}: {e}"),
             )
         })?;
-        let mut addrs = Vec::new();
-        let mut last = None;
-        for rtype in [RecordType::A, RecordType::AAAA] {
-            match ask(&socket, host, rtype).await {
-                Ok(found) => addrs.extend(found),
-                Err(e) => last = Some(e),
-            }
-        }
-        if addrs.is_empty() {
-            return Err(last.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
-            }));
-        }
-        Ok(addrs)
+        Ok(socket)
     }
 
-    /// Sends one query for `host` on the connected `socket` and returns the
-    /// addresses its answer carries.
-    async fn ask(
-        socket: &tokio::net::UdpSocket,
-        host: &str,
-        rtype: hickory_proto::rr::RecordType,
-    ) -> io::Result<Vec<IpAddr>> {
-        use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
-        use hickory_proto::rr::{Name, RData};
+    /// A query for the `rtype` records of `host`: its id and its bytes.
+    fn query(host: &str, rtype: hickory_proto::rr::RecordType) -> io::Result<(u16, Vec<u8>)> {
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::Name;
 
         let name = Name::from_utf8(format!("{}.", host.trim_end_matches('.')))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{host}: {e}")))?;
@@ -504,42 +625,22 @@ mod placed {
         query.metadata.id = id;
         query.metadata.recursion_desired = true;
         query.add_query(Query::query(name, rtype));
-        let bytes = query.to_vec().map_err(io::Error::other)?;
-        socket.send(&bytes).await?;
-        let mut buf = vec![0u8; 4096];
-        let reply = tokio::time::timeout(LOOKUP_TIMEOUT, async {
-            loop {
-                let n = socket.recv(&mut buf).await?;
-                // A datagram that is not the answer to this query is not
-                // trusted; the wait goes on for the real one.
-                match Message::from_vec(&buf[..n]) {
-                    Ok(reply)
-                        if reply.metadata.id == id
-                            && reply.metadata.message_type == MessageType::Response =>
-                    {
-                        return Ok::<_, io::Error>(reply);
-                    }
-                    _ => continue,
-                }
-            }
+        Ok((id, query.to_vec().map_err(io::Error::other)?))
+    }
+
+    /// The answer to the query `id`, if `bytes` carry it. Any other message
+    /// is not trusted.
+    fn reply_to(id: u16, bytes: &[u8]) -> Option<hickory_proto::op::Message> {
+        use hickory_proto::op::{Message, MessageType};
+        Message::from_vec(bytes).ok().filter(|reply| {
+            reply.metadata.id == id && reply.metadata.message_type == MessageType::Response
         })
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("the name server did not answer for {host}"),
-            )
-        })??;
-        match reply.metadata.response_code {
-            ResponseCode::NoError => {}
-            code => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("could not resolve {host}: {code}"),
-                ));
-            }
-        }
-        Ok(reply
+    }
+
+    /// The addresses an answer carries.
+    fn addresses(reply: &hickory_proto::op::Message) -> Vec<IpAddr> {
+        use hickory_proto::rr::RData;
+        reply
             .answers
             .iter()
             .filter_map(|record| match &record.data {
@@ -547,7 +648,83 @@ mod placed {
                 RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                 _ => None,
             })
-            .collect())
+            .collect()
+    }
+
+    /// Sends one query for `host` on the connected UDP `socket` and returns
+    /// the answer. An answer with the TC bit set is asked again over TCP,
+    /// from a stream socket created in the cgroup.
+    async fn ask(
+        socket: &tokio::net::UdpSocket,
+        procs: &Path,
+        server: SocketAddr,
+        host: &str,
+        rtype: hickory_proto::rr::RecordType,
+    ) -> io::Result<hickory_proto::op::Message> {
+        let (id, bytes) = query(host, rtype)?;
+        socket.send(&bytes).await?;
+        let mut buf = vec![0u8; 4096];
+        let reply = tokio::time::timeout(LOOKUP_TIMEOUT, async {
+            loop {
+                let n = socket.recv(&mut buf).await?;
+                if let Some(reply) = reply_to(id, &buf[..n]) {
+                    return Ok::<_, io::Error>(reply);
+                }
+            }
+        })
+        .await
+        .map_err(|_| no_answer(server, host))??;
+        if !reply.metadata.truncation {
+            return Ok(reply);
+        }
+        tracing::debug!(%server, host, "a truncated name answer is asked again over TCP");
+        ask_tcp(procs, server, host, rtype).await
+    }
+
+    /// Sends one query for `host` to `server` over TCP, from a stream socket
+    /// created in the cgroup, and returns the answer.
+    async fn ask_tcp(
+        procs: &Path,
+        server: SocketAddr,
+        host: &str,
+        rtype: hickory_proto::rr::RecordType,
+    ) -> io::Result<hickory_proto::op::Message> {
+        let (id, bytes) = query(host, rtype)?;
+        let owned = procs.to_path_buf();
+        let socket = tokio::task::spawn_blocking(move || {
+            socket_in_cgroup(&owned, server.is_ipv6(), SocketKind::Stream)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        let socket = std::net::TcpStream::from(socket);
+        socket.set_nonblocking(true)?;
+        tokio::time::timeout(LOOKUP_TIMEOUT, async {
+            let mut stream = tokio::net::TcpSocket::from_std_stream(socket)
+                .connect(server)
+                .await?;
+            let len = u16::try_from(bytes.len()).map_err(io::Error::other)?;
+            let mut framed = len.to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            stream.write_all(&framed).await?;
+            loop {
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len).await?;
+                let mut buf = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                stream.read_exact(&mut buf).await?;
+                if let Some(reply) = reply_to(id, &buf) {
+                    return Ok(reply);
+                }
+            }
+        })
+        .await
+        .map_err(|_| no_answer(server, host))?
+    }
+
+    fn no_answer(server: SocketAddr, host: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the name server {server} did not answer for {host}"),
+        )
     }
 
     /// The kind of socket a child makes in a cgroup.
@@ -899,13 +1076,46 @@ mod placed {
             );
         }
 
-        /// A name server on loopback that answers every A query for
-        /// `pkg.test.` with 127.0.0.1, and every other query with no
-        /// address.
-        async fn serve_names() -> SocketAddr {
+        /// How a test name server answers over UDP.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Serve {
+            /// It answers every query.
+            Answer,
+            /// It answers every query with SERVFAIL.
+            Fail,
+            /// It answers every query with no record and the TC bit set.
+            Truncate,
+        }
+
+        /// The answer of a test name server: 127.0.0.1 for an A query for
+        /// `pkg.test.`, and no address for every other query.
+        fn answer(request: &hickory_proto::op::Message) -> hickory_proto::op::Message {
             use hickory_proto::op::{Message, ResponseCode};
             use hickory_proto::rr::rdata::A;
             use hickory_proto::rr::{RData, Record, RecordType};
+
+            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
+            let question = request.queries[0].clone();
+            let known = question.name().to_string() == "pkg.test.";
+            reply.metadata.response_code = if known {
+                ResponseCode::NoError
+            } else {
+                ResponseCode::NXDomain
+            };
+            if known && question.query_type() == RecordType::A {
+                reply.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    60,
+                    RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+                ));
+            }
+            reply.add_query(question);
+            reply
+        }
+
+        /// A name server on loopback that answers over UDP as `serve` says.
+        async fn serve_names_as(serve: Serve) -> SocketAddr {
+            use hickory_proto::op::{Message, ResponseCode};
 
             let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -916,28 +1126,63 @@ mod placed {
                 loop {
                     let (n, from) = socket.recv_from(&mut buf).await.unwrap();
                     let request = Message::from_vec(&buf[..n]).unwrap();
-                    let mut reply =
-                        Message::response(request.metadata.id, request.metadata.op_code);
-                    let question = request.queries[0].clone();
-                    let known = question.name().to_string() == "pkg.test.";
-                    reply.metadata.response_code = if known {
-                        ResponseCode::NoError
-                    } else {
-                        ResponseCode::NXDomain
+                    let reply = match serve {
+                        Serve::Answer => answer(&request),
+                        Serve::Fail | Serve::Truncate => {
+                            let mut reply =
+                                Message::response(request.metadata.id, request.metadata.op_code);
+                            if serve == Serve::Fail {
+                                reply.metadata.response_code = ResponseCode::ServFail;
+                            } else {
+                                reply.metadata.truncation = true;
+                            }
+                            reply.add_query(request.queries[0].clone());
+                            reply
+                        }
                     };
-                    if known && question.query_type() == RecordType::A {
-                        reply.add_answer(Record::from_rdata(
-                            question.name().clone(),
-                            60,
-                            RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
-                        ));
-                    }
-                    reply.add_query(question);
-                    let bytes = reply.to_vec().unwrap();
-                    socket.send_to(&bytes, from).await.unwrap();
+                    socket
+                        .send_to(&reply.to_vec().unwrap(), from)
+                        .await
+                        .unwrap();
                 }
             });
             addr
+        }
+
+        /// A name server on loopback that answers every query.
+        async fn serve_names() -> SocketAddr {
+            serve_names_as(Serve::Answer).await
+        }
+
+        /// A name server on loopback that truncates every answer over UDP,
+        /// and answers in full over TCP on the same port. It returns the
+        /// address and how many queries came over TCP.
+        async fn serve_names_over_tcp() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+            use hickory_proto::op::Message;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let udp = serve_names_as(Serve::Truncate).await;
+            let listener = TcpListener::bind(udp).await.unwrap();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let counter = asked.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut conn, _) = listener.accept().await.unwrap();
+                    let counter = counter.clone();
+                    tokio::spawn(async move {
+                        let mut len = [0u8; 2];
+                        conn.read_exact(&mut len).await.unwrap();
+                        let mut buf = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                        conn.read_exact(&mut buf).await.unwrap();
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let bytes = answer(&Message::from_vec(&buf).unwrap()).to_vec().unwrap();
+                        let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&bytes);
+                        conn.write_all(&framed).await.unwrap();
+                    });
+                }
+            });
+            (udp, asked)
         }
 
         /// NET-155: a placed download asks for a host name from a UDP socket
@@ -953,7 +1198,7 @@ mod placed {
             let procs = tmp.path().join("cgroup.procs");
             std::fs::write(&procs, "").unwrap();
 
-            let addrs = lookup_in_cgroup(&procs, nameserver, "pkg.test")
+            let addrs = lookup_in_cgroup(&procs, &[nameserver], "pkg.test")
                 .await
                 .expect("the name resolves");
             assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
@@ -963,7 +1208,7 @@ mod placed {
                 "the child that made the query socket joined the placement"
             );
 
-            let missing = lookup_in_cgroup(&procs, nameserver, "missing.test")
+            let missing = lookup_in_cgroup(&procs, &[nameserver], "missing.test")
                 .await
                 .expect_err("no such name");
             assert!(
@@ -976,7 +1221,7 @@ mod placed {
             // A placement the child cannot join sends no query.
             let refused = lookup_in_cgroup(
                 Path::new("/nonexistent/cgroup.procs"),
-                nameserver,
+                &[nameserver],
                 "pkg.test",
             )
             .await
@@ -994,8 +1239,10 @@ mod placed {
             Relay {
                 procs: procs.to_path_buf(),
                 admits_nothing: false,
-                nameserver: None,
+                hosts: procs.with_file_name("hosts"),
+                nameservers: None,
                 connect_timeout,
+                head_timeout: HEAD_TIMEOUT,
                 auth: "Bearer test".to_string(),
                 failure: Mutex::new(None),
             }
@@ -1113,16 +1360,137 @@ mod placed {
             assert_eq!(*relay.failure.lock().unwrap(), None);
         }
 
-        /// The relay asks the first `nameserver` that `/etc/resolv.conf`
-        /// names, on port 53.
+        /// The relay takes every `nameserver` that `/etc/resolv.conf`
+        /// names, in order, on port 53.
         #[test]
-        fn the_first_nameserver_is_asked() {
+        fn every_nameserver_is_taken_in_order() {
             let text = "search example.com\nnameserver 10.0.0.53\nnameserver 1.1.1.1\n";
             assert_eq!(
-                first_nameserver(text),
-                Some("10.0.0.53:53".parse().unwrap())
+                nameservers(text),
+                vec![
+                    "10.0.0.53:53".parse::<SocketAddr>().unwrap(),
+                    "1.1.1.1:53".parse().unwrap()
+                ]
             );
-            assert_eq!(first_nameserver("search example.com\n"), None);
+            assert!(nameservers("search example.com\n").is_empty());
+        }
+
+        /// A name server that gives no usable answer is passed over, and the
+        /// next one in order is asked.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn the_next_nameserver_is_asked_when_one_does_not_answer() {
+            let failing = serve_names_as(Serve::Fail).await;
+            let answering = serve_names().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+
+            let addrs = lookup_in_cgroup(&procs, &[failing, answering], "pkg.test")
+                .await
+                .expect("the second name server answers");
+            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
+
+            let failed = lookup_in_cgroup(&procs, &[failing], "pkg.test")
+                .await
+                .expect_err("no name server answers");
+            assert!(
+                failed.to_string().starts_with(&format!(
+                    "the name server {failing} could not resolve pkg.test: "
+                )),
+                "{failed}"
+            );
+        }
+
+        /// An answer with the TC bit set is asked again over TCP, from a
+        /// stream socket created in the placement.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_truncated_answer_is_asked_again_over_tcp() {
+            use std::sync::atomic::Ordering;
+            let (nameserver, asked) = serve_names_over_tcp().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+
+            let addrs = lookup_in_cgroup(&procs, &[nameserver], "pkg.test")
+                .await
+                .expect("the answer over TCP carries the address");
+            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
+            assert_eq!(asked.load(Ordering::SeqCst), 2, "A and AAAA, over TCP");
+            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
+        }
+
+        /// A name in the `hosts` file takes its addresses from there, and the
+        /// relay sends no name query for it.
+        #[test]
+        fn a_name_in_the_hosts_file_is_found_there() {
+            let text = "127.0.0.1 localhost\n# 10.0.0.9 pkg.test\n\
+                        10.0.0.7  mirror.test  Pkg.Test # a comment\n::1 pkg.test\n";
+            assert_eq!(
+                hosts_addresses(text, "pkg.test."),
+                vec![
+                    "10.0.0.7".parse::<IpAddr>().unwrap(),
+                    "::1".parse().unwrap()
+                ]
+            );
+            assert!(hosts_addresses(text, "other.test").is_empty());
+        }
+
+        /// The relay connects to a name in the `hosts` file without a name
+        /// server: it has none to ask.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_to_a_listed_name_sends_no_query() {
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let mut relay = test_relay(&procs, CONNECT_TIMEOUT);
+            relay.nameservers = Some(vec![]);
+            let open = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = open.local_addr().unwrap().port();
+
+            relay
+                .connect("pkg.test", port)
+                .await
+                .expect_err("pkg.test is not listed yet, and no name server is asked");
+            std::fs::write(&relay.hosts, "127.0.0.1 pkg.test\n").unwrap();
+            relay
+                .connect("pkg.test", port)
+                .await
+                .expect("the hosts file gives the address");
+        }
+
+        /// A client that connects to the relay and sends nothing is dropped
+        /// at the head deadline, so it does not hold a handler task.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_silent_client_is_dropped_at_the_head_deadline() {
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let mut relay = test_relay(&procs, CONNECT_TIMEOUT);
+            let bound = std::time::Duration::from_millis(300);
+            relay.head_timeout = bound;
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let _client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (conn, _) = listener.accept().await.unwrap();
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .handle(conn)
+                .await
+                .expect_err("the client sent no head");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert!(took >= bound, "it waited {took:?}");
+            assert!(took < bound * 10, "it waited {took:?}");
         }
     }
 }
