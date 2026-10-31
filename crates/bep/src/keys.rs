@@ -721,7 +721,8 @@ pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, ReplaceErro
 /// so the next replacement puts that key back too. A key alone in
 /// [`Slot::Old`] whose `kid` differs from the one the identity file names
 /// is a replaced key, and the replacement removes it. When no identity
-/// file names a key for the role, the replacement keeps that key and stops.
+/// file names a key for the role, a start keeps that key aside and
+/// refuses, and an explicit replacement removes it and makes a new key.
 ///
 /// # Errors
 ///
