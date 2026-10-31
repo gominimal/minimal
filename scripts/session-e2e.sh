@@ -444,6 +444,8 @@ GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
 SR_ID="" # the store-reference proof's Keychain item; removed on teardown
 R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
 R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
+AR_AUDIT_EDIT="" # the audit segment the rotation proof edits; restored on teardown
+AR_AUDIT_BACKUP="" # its original bytes
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1073,6 +1075,9 @@ teardown() {
   # The round-three walk's planted audit segment: a proxy start refuses a
   # log that holds it, so a run that died with it in place must not keep it.
   [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+  # The rotation proof's edited audit segment goes back to its own bytes,
+  # before the `rm -rf "$WORK"` below removes the copy.
+  ar_restore_edit
   [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
@@ -15371,6 +15376,214 @@ proof_bep_round_three_conditions_closed() {
   fi
 }
 
+# Audit rotation proof (BEP-068, BEP-042, BEP-049). The case restarts the
+# daemon pair with BEP_AUDIT_SEGMENT_BYTES set, so `bep serve` rotates its
+# audit log at a small bound. A grant box then sends 'gh api user' until the
+# log rotates twice. The case checks, in order:
+#   1. bep.log names the bound at the start and logs each rotation.
+#   2. The chain verifies across the new segments.
+#   3. `min box audit` shows every record of the box, from every segment.
+#   4. With the proxy down, one record is edited, and `min doctor` reports
+#      the break and exits 6.
+#   5. With the record restored, `min doctor` reports the chain verified.
+# The log is the real one under $HOME/.minimal/bep/audit. The case restores
+# the edited segment on every exit, and the teardown restores it too. The
+# small bound can prune old segments past the retained count.
+ar_segment_numbers() { # $1 = the audit directory; prints the segment numbers, sorted
+  find "$1" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n
+}
+ar_restore_edit() {
+  if [ -n "$AR_AUDIT_EDIT" ] && [ -f "$AR_AUDIT_BACKUP" ]; then
+    cp -p "$AR_AUDIT_BACKUP" "$AR_AUDIT_EDIT"
+  fi
+  AR_AUDIT_EDIT=""
+  AR_AUDIT_BACKUP=""
+}
+proof_bep_audit_rotation_and_doctor_end_to_end() {
+  echo "::group::audit log rotation: the chain carries across segments, min box audit reads them all, min doctor reports an edit"
+  local ar_case=bep_audit_rotation_and_doctor_end_to_end
+  local ar_name=e2e-bep-audit-rotation ar_bound=4096
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local ar_control="$HOME/.minimal/bep/control.sock"
+  local ar_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  local ar_audit ar_first ar_last ar_new ar_try ar_rot ar_out ar_id ar_rc ar_seg ar_mark
+
+  # The gate restarts the daemon pair, and the proxy inherits this bound
+  # from minvmd's environment.
+  export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
+  BEP_LIVE_DAEMON=""
+  ar_mark="$({ wc -l <"$ar_log"; } 2>/dev/null | tr -d ' ')"
+  ar_mark="${ar_mark:-0}"
+  AR_SID=""
+  ar_cleanup() {
+    ar_restore_edit
+    [ -n "$AR_SID" ] && mnl session destroy --force "$AR_SID" >/dev/null 2>&1
+    AR_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # No later case gets a proxy with the small bound: the next live gate
+    # restarts the daemon pair without it.
+    unset BEP_AUDIT_SEGMENT_BYTES
+    if [ "$BEP_LIVE_DAEMON" = 1 ] || [ -n "${AR_STARTED:-}" ]; then
+      mnl stop --force >/dev/null 2>&1 || true
+      minvmd stop >/dev/null 2>&1 || true
+    fi
+    BEP_LIVE_DAEMON=""
+    AR_STARTED=""
+    return 0
+  }
+  ar_fail() { ar_cleanup; fail; }
+  AR_STARTED=""
+  if ! bep_live_gate "$ar_case"; then
+    unset BEP_AUDIT_SEGMENT_BYTES
+    echo "::endgroup::"
+    return 0
+  fi
+  AR_STARTED=1
+  ar_audit="$(dirname "$ar_control")/audit"
+
+  # 1a. The info line at the start names the bound.
+  # The awk drops the colour escapes the log can carry around a field.
+  if ! tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -F 'audit segment bound set by the test override' \
+    | awk '{ gsub(/\033\[[0-9;]*m/, ""); print }' | grep -qF " bound=$ar_bound "; then
+    echo "::error::bep.log has no line that names the audit segment bound $ar_bound at the proxy's start"
+    echo "--- $ar_log (tail) ---"; tail -40 "$ar_log" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "bep serve started with the audit segment bound $ar_bound"
+
+  ar_first="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  ar_first="${ar_first:-0}"
+  bep_revoke_seed "$ar_case"
+  AR_SID="$(bep_revoke_activate "$ar_case" "$ar_name")" || ar_fail
+
+  # 2. Requests until two segments after the first one exist.
+  ar_new=0
+  for ar_try in $(seq 1 60); do
+    if ! mnl session exec "$AR_SID" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$ar_case.gh" 2>&1; then
+      echo "::error::'gh api user' failed in the box $ar_name (request $ar_try)"
+      cat "$WORK/$ar_case.gh" 2>/dev/null || true
+      ar_fail
+    fi
+    ar_new="$(ar_segment_numbers "$ar_audit" | awk -v f="$ar_first" '$1 > f' | wc -l | tr -d ' ')"
+    [ "$ar_new" -ge 2 ] && break
+  done
+  if [ "$ar_new" -lt 2 ]; then
+    echo "::error::the audit log opened $ar_new new segment(s) after $ar_try requests, with a bound of $ar_bound bytes"
+    ls -l "$ar_audit" 2>/dev/null || true
+    ar_fail
+  fi
+  ar_last="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  echo "the audit log rotated: $ar_new new segment(s) after $ar_try request(s), the active one is audit-$ar_last.jsonl"
+  ar_rot="$(tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -cF 'rotated the audit log' || true)"
+  if [ "${ar_rot:-0}" -lt "$ar_new" ]; then
+    echo "::error::bep.log has ${ar_rot:-0} 'rotated the audit log' line(s) for $ar_new new segment(s)"
+    ar_fail
+  fi
+  echo "--- the rotation lines of this run in bep.log ---"
+  tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -F 'rotated the audit log' || true
+
+  # 3. `min box audit` shows every record of the box, from every segment.
+  ar_id="$(bep_recreate_audited_id "$ar_case" "$ar_name")" || ar_fail
+  if ! ar_out="$(python3 - "$WORK/$ar_case.$ar_name.audit" "$ar_audit" "$ar_id" <<'PY'
+import json, os, re, sys
+trail, audit, box = sys.argv[1], sys.argv[2], sys.argv[3]
+def die(msg):
+    print(msg)
+    sys.exit(1)
+shown = [json.loads(l) for l in open(trail) if l.strip()]
+on_disk, segments = 0, set()
+for name in os.listdir(audit):
+    if not re.fullmatch(r"audit-[0-9]+\.jsonl", name):
+        continue
+    with open(os.path.join(audit, name)) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("subject") == box:
+                on_disk += 1
+                segments.add(name)
+if len(segments) < 2:
+    die("the records of box %s are in %d segment(s), not 2 or more" % (box, len(segments)))
+if len(shown) != on_disk:
+    die("min box audit shows %d record(s), and the segments hold %d for box %s"
+        % (len(shown), on_disk, box))
+print("%d record(s) across %d segments" % (on_disk, len(segments)))
+PY
+)"; then
+    echo "::error::'min box audit $ar_name': $ar_out"
+    ar_fail
+  fi
+  echo "min box audit $ar_name: $ar_out"
+
+  # 4. The proxy goes down, so no writer races the edit.
+  r3_proxy_down "$ar_control" || ar_fail
+  AR_STARTED=1
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc before the edit, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor before the edit: $(head -n1 "$WORK/$ar_case.doctor")"
+  # The edit: the first record of the second-newest segment, a rotated one.
+  ar_seg="$ar_audit/audit-$(ar_segment_numbers "$ar_audit" | tail -n2 | head -n1).jsonl"
+  AR_AUDIT_BACKUP="$WORK/$ar_case.segment"
+  cp -p "$ar_seg" "$AR_AUDIT_BACKUP"
+  AR_AUDIT_EDIT="$ar_seg"
+  if ! python3 - "$ar_seg" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.read().split("\n")
+record = json.loads(lines[0])
+record["upstream"] = "edited.example:443"
+lines[0] = json.dumps(record, separators=(",", ":"))
+with open(path, "w") as f:
+    f.write("\n".join(lines))
+PY
+  then
+    echo "::error::the case could not edit the first record of $ar_seg"
+    ar_fail
+  fi
+  echo "edited the upstream of the first record in $ar_seg"
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 6 ] || ! grep -qF 'Audit log: the hash chain breaks at record' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc after the edit, not 6 with the break"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor after the edit (exit 6): $(head -n1 "$WORK/$ar_case.doctor")"
+
+  # 5. The record goes back, and the chain verifies across the rotated
+  # segments again.
+  ar_restore_edit
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc with the record restored, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor with the record restored: chain verified across audit-$ar_first.jsonl to audit-$ar_last.jsonl ($ar_new rotated segment(s) in this run)"
+
+  ar_cleanup
+  rm -f "${WORK:?}/${ar_case:?}".*
+  echo "Audit rotation OK (the chain carries across $ar_new new segments, min box audit reads them all, min doctor reports the edit)"
+  echo "::endgroup::"
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -27303,6 +27516,7 @@ case "${1:-}" in
     proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_bep_round_two_conditions_closed
+    proof_bep_audit_rotation_and_doctor_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -27383,6 +27597,7 @@ case "${1:-}" in
     | bep_revoke_and_sign_out_end_to_end \
     | bep_dns_steering_fails_closed_end_to_end \
     | bep_round_two_conditions_closed \
+    | bep_audit_rotation_and_doctor_end_to_end \
     | bep_host_ip_cohort_blocks_udp_443 \
     | bep_conditions_closed_end_to_end \
     | bep_r3_spec_names_jti_and_quarantine \
@@ -27446,6 +27661,7 @@ case "${1:-}" in
     echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
     echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
     echo "         bep_round_three_conditions_closed"
+    echo "         bep_audit_rotation_and_doctor_end_to_end"
     exit 2
     ;;
 esac
