@@ -58,8 +58,9 @@ pub fn check_uds_path_len(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The user the VMM child runs as (BEP-047), and its primary group. The
-/// host dir and the sockets the VMM child opens carry this group.
+/// The user the VMM child runs as (formerly BEP-047, gominimal/inbox#1184),
+/// and its primary group. The host dir and the sockets the VMM child opens
+/// carry this group.
 pub const VMM_USER: &str = "minimal-vmm";
 /// The user gvproxy runs as, and its primary group.
 pub const GVPROXY_USER: &str = "minimal-gvproxy";
@@ -612,9 +613,10 @@ mod tests {
         verify_host_dir_ownership(&dir).unwrap();
     }
 
-    /// BEP-047: the host dir is 0700, or 0710 with group `minimal-vmm`;
-    /// `vmm/` is verified, never created; each socket gets the mode and the
-    /// group of the design's table, and 0600 while the group is not held.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the host dir is 0700, or 0710
+    /// with group `minimal-vmm`; `vmm/` is verified, never created; each
+    /// socket gets the mode and the group of the design's table, and 0600
+    /// while the group is not held.
     #[test]
     fn split_user_host_dir_modes_are_enforced() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

@@ -109,9 +109,18 @@ pub trait HeldKey {
     /// The public half.
     fn public(&self) -> ProxyPublicKey;
 
-    /// Whether the store lets the private half out. A key the proxy holds is
-    /// never exportable.
+    /// Whether the store lets the private half out. A release build of the
+    /// proxy holds no exportable key (see [`custody`]).
     fn exportable(&self) -> bool;
+
+    /// The build whose custody rule the proxy holds this key under. A store
+    /// answers the build it runs in. A test key can answer
+    /// [`Build::Release`] in a debug build, so a test on every host pins the
+    /// rule of both builds. A key cannot answer its way out of the release
+    /// rule: [`custody_build`] ignores [`Build::Debug`] in a release build.
+    fn build(&self) -> Build {
+        Build::CURRENT
+    }
 
     /// The raw ECDH shared secret (the x-coordinate) with `peer`.
     /// [`seal::open_held`](crate::seal::open_held) opens a sealed value
@@ -132,6 +141,81 @@ pub trait HeldKey {
     /// [`KeyError::Store`] when the store fails for another reason, as a
     /// locked keychain does.
     fn probe(&self) -> Result<(), KeyError>;
+}
+
+/// The kind of build the proxy runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Build {
+    /// A build with debug assertions, as a developer runs it.
+    Debug,
+    /// A release build, as the proxy ships.
+    Release,
+}
+
+impl Build {
+    /// The build this binary is.
+    pub const CURRENT: Self = if cfg!(debug_assertions) {
+        Self::Debug
+    } else {
+        Self::Release
+    };
+}
+
+/// The build whose custody rule holds `key`. A key can make the rule
+/// stricter than the binary's own build, never weaker: a release build
+/// applies the release rule to every key, whatever [`HeldKey::build`]
+/// answers.
+#[must_use]
+pub fn custody_build<K: HeldKey + ?Sized>(key: &K) -> Build {
+    match (Build::CURRENT, key.build()) {
+        (Build::Debug, Build::Debug) => Build::Debug,
+        _ => Build::Release,
+    }
+}
+
+/// What the custody rule does with a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Custody {
+    /// The key is non-exportable, and the proxy holds it.
+    Held,
+    /// The key is exportable, and a debug build keeps it.
+    KeptExportable,
+    /// The key is exportable, and a release build refuses it.
+    Refused,
+}
+
+/// The custody rule for `key` in `build` (BEP-014, BEP-059). The keychain's
+/// generation, [`load`] for a stored sealing key, and the CA's key check all
+/// take this one decision.
+///
+/// A release build refuses an exportable key. A debug build keeps it: the
+/// macOS login keychain lets the program that made a key export it although
+/// the key was asked for non-exportable, and the keychain that enforces it
+/// needs an entitlement that only a Developer ID signature carries.
+#[must_use]
+pub fn custody<K: HeldKey + ?Sized>(key: &K, build: Build) -> Custody {
+    match (key.exportable(), build) {
+        (false, _) => Custody::Held,
+        (true, Build::Debug) => Custody::KeptExportable,
+        (true, Build::Release) => Custody::Refused,
+    }
+}
+
+/// The refusal of a key that [`custody`] refuses where the keychain
+/// generates a key.
+///
+/// # Errors
+///
+/// [`KeyError::Store`] when the build refuses `key` because the keychain
+/// made it exportable.
+pub fn keep_generated<K: HeldKey + ?Sized>(key: &K) -> Result<(), KeyError> {
+    match custody(key, custody_build(key)) {
+        Custody::Refused => Err(KeyError::Store {
+            role: key.role(),
+            detail: "the keychain made the key exportable".to_owned(),
+        }),
+        Custody::Held | Custody::KeptExportable => Ok(()),
+    }
 }
 
 /// A store that generates keys non-exportable and holds them across
@@ -197,6 +281,9 @@ pub enum StartError {
         /// hold.
         missing: Vec<Role>,
     },
+    /// The store holds a key that a release build refuses because the
+    /// keychain made it exportable (BEP-014, BEP-059).
+    Exportable(Role),
     /// The store did not generate a missing key.
     Store(KeyError),
 }
@@ -219,6 +306,10 @@ impl fmt::Display for StartError {
                 }
                 f.write_str(&lines.join("\n"))
             }
+            Self::Exportable(role) => write!(
+                f,
+                "The proxy did not start: the keychain holds the proxy's {role} key as exportable, and a release build does not use an exportable key. Run `bep --replace-key {role}` to make a new one. Boxes created before then must be re-created."
+            ),
             Self::Store(err) => write!(f, "The proxy did not start: {err}."),
         }
     }
@@ -235,8 +326,10 @@ impl fmt::Display for StartError {
 ///
 /// # Errors
 ///
-/// [`StartError::Unusable`] with the role of each refused or lost key, or
-/// [`StartError::Store`] when a missing key was not generated.
+/// [`StartError::Unusable`] with the role of each refused or lost key,
+/// [`StartError::Exportable`] when a release build finds an exportable
+/// sealing key, or [`StartError::Store`] when a missing key was not
+/// generated.
 pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::Key>, StartError> {
     let mut refused = Vec::new();
     let mut missing = Vec::new();
@@ -244,6 +337,15 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
     for role in Role::ALL {
         match store.find(role) {
             Ok(Some(key)) => match key.probe() {
+                // BEP-059: the CA refuses an exportable root or signing key.
+                // The sealing key has no such site, so a release build
+                // refuses it here when a debug build left it exportable.
+                Ok(()) if role == Role::Sealing => {
+                    if custody(&key, custody_build(&key)) == Custody::Refused {
+                        return Err(StartError::Exportable(role));
+                    }
+                    found.push((role, Some(key)));
+                }
                 Ok(()) => found.push((role, Some(key))),
                 Err(err @ KeyError::Refused { .. }) => {
                     tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
@@ -302,6 +404,19 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
             },
         };
         keys.push(key);
+    }
+    for key in &keys {
+        // BEP-014, BEP-059: once for each role at each start of a debug
+        // build. A release build refuses an exportable key where the keychain
+        // generates it, at load for a stored sealing key, and at the CA for
+        // the root and signing keys.
+        if custody(key, custody_build(key)) == Custody::KeptExportable {
+            let role = key.role();
+            tracing::warn!(
+                role = %role,
+                "kept the proxy's {role} key although the keychain made it exportable: this is a debug build, and a release build refuses it"
+            );
+        }
     }
     let mut keys = keys.into_iter();
     let (Some(sealing), Some(root), Some(signing), None) =
@@ -650,13 +765,10 @@ mod keychain {
                     return Err(err);
                 }
             };
-            if key.exportable() {
-                // Never keep a key the keychain lets out.
+            if let Err(err) = super::keep_generated(&key) {
+                // A release build never keeps a key the keychain lets out.
                 drop(self.remove(role));
-                return Err(KeyError::Store {
-                    role,
-                    detail: "the keychain made the key exportable".to_owned(),
-                });
+                return Err(err);
             }
             Ok(key)
         }

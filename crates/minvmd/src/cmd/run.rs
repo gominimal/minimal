@@ -1498,8 +1498,8 @@ fn bep_binary_at(
 ///
 /// Interim: `bep` starts as minvmd's own user, which is also the user of
 /// gvproxy and the VM. Gatehouse §6.10 requires distinct OS users for them
-/// (BEP-047). T38, #2285 (https://github.com/gominimal/minimal/issues/2285),
-/// owns that split.
+/// (formerly BEP-047, gominimal/inbox#1184). T38, #2285
+/// (https://github.com/gominimal/minimal/issues/2285), owns that split.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
 struct BepProxy {

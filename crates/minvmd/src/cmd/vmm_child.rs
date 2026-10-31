@@ -115,9 +115,10 @@ fn run_vmm() -> Result<()> {
         .unwrap_or_else(|| crate::state::host_dir().join("boot.log"));
     // Capture is diagnostics, not a boot dependency: any failure — creating
     // the file or wiring the console — warns and boots on, never propagates.
-    // The log is 0640 (BEP-047): the VM user writes it, and the login reads
-    // it through the `minimal-vmm` group for `min diag`. The mode is set on
-    // the descriptor too, because a log from an earlier boot keeps its own.
+    // The log is 0640 (formerly BEP-047, gominimal/inbox#1184): the VM user
+    // writes it, and the login reads it through the `minimal-vmm` group for
+    // `min diag`. The mode is set on the descriptor too, because a log from
+    // an earlier boot keeps its own.
     if let Err(e) = create_boot_log(&boot_log) {
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
     } else if let Err(e) = ctx.set_console_output(&boot_log) {
@@ -293,8 +294,8 @@ fn create_boot_log(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// BEP-047: the boot log is 0640, also when a log from an earlier boot
-    /// had another mode.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the boot log is 0640, also
+    /// when a log from an earlier boot had another mode.
     #[test]
     fn boot_log_is_created_0640() {
         use std::os::unix::fs::PermissionsExt as _;
