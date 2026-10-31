@@ -3781,7 +3781,7 @@ async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
         .unwrap();
     assert_eq!(answers_to(&mngr, "dev").await, Some(old));
     let stopped = RecordState::Stopped(StopEnding::AtDaemonStart);
-    set_record_state(state.path(), old, stopped.clone()).await;
+    set_record_state(state.path(), old, stopped).await;
     assert_eq!(
         answers_to(&mngr, "dev").await,
         Some(old),
