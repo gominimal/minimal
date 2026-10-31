@@ -514,6 +514,37 @@ pub(crate) fn proxy_present(
     identity.is_some_and(std::path::Path::exists) && control.is_some_and(std::path::Path::exists)
 }
 
+/// Why no node-local proxy serves boxes on this host, or `None` when one
+/// does ([`proxy_present`]). `binary` is the proxy program the host daemon
+/// starts, by `bep::store::proxy_binary_path`, and `log` is the file that
+/// daemon writes the proxy's output to. A program that does not exist is
+/// not installed. One that exists and published nothing does not answer.
+pub(crate) fn proxy_absence(
+    identity: Option<&std::path::Path>,
+    control: Option<&std::path::Path>,
+    binary: Option<std::path::PathBuf>,
+    log: Option<std::path::PathBuf>,
+) -> Option<boxes::core::bep::ProxyAbsence> {
+    use boxes::core::bep::ProxyAbsence;
+    if proxy_present(identity, control) {
+        return None;
+    }
+    let absence = match binary {
+        Some(path) if path.exists() => ProxyAbsence::NotAnswering { path, log },
+        path => ProxyAbsence::NotInstalled { path },
+    };
+    tracing::debug!(?absence, "no node-local proxy serves boxes");
+    Some(absence)
+}
+
+/// The file the host daemon writes the proxy's output to: `bep.log` in its
+/// host directory, beside the proxy's listener socket.
+fn proxy_log_path(minimal_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    minimal_client::resolve_host_dir(minimal_dir, true)
+        .ok()
+        .map(|dir| dir.join("bep.log"))
+}
+
 /// Checks a box spec's GitHub grants at creation, and gives their names.
 ///
 /// Where no node-local proxy serves boxes, a GitHub grant is refused with
@@ -523,7 +554,7 @@ pub(crate) fn proxy_present(
 /// is read, and nothing asks for a sign-in.
 pub(crate) fn check_github_grants(
     secrets: &boxes::core::bep::SecretGrants,
-    proxy_present: bool,
+    proxy_absence: Option<boxes::core::bep::ProxyAbsence>,
     keychain: &dyn bep::signin::Keychain,
 ) -> Result<Vec<String>, anyhow::Error> {
     let grants = github_grant_names(secrets);
@@ -542,7 +573,7 @@ pub(crate) fn check_github_grants(
         }
         .into());
     }
-    boxes::core::bep::require_proxy(secrets, proxy_present)?;
+    boxes::core::bep::require_proxy(secrets, proxy_absence)?;
     let signed_in = sign_in_held(keychain)?;
     boxes::core::bep::require_sign_in(secrets, signed_in)?;
     Ok(grants)
@@ -562,7 +593,10 @@ pub(crate) fn grant_box_facts(
     }
     match (box_id, proxy_stance(network)) {
         (Some(box_id), Some(stance)) => Ok(Some((box_id, stance))),
-        _ => Err(boxes::core::bep::unenrolled_node(grants.to_vec())),
+        _ => Err(boxes::core::bep::unenrolled_node(
+            grants.to_vec(),
+            boxes::core::bep::ProxyAbsence::NotServed,
+        )),
     }
 }
 
@@ -1197,9 +1231,21 @@ pub(crate) async fn activate_box(
             // read, and nothing asks for a sign-in.
             let identity = crate::mint::identity_path();
             let control = crate::mint::control_path();
+            // The proxy program is the one `min secret` names: `bep` beside
+            // the `minvmd` on PATH, unless MINVMD_BEP_BIN gives it.
+            let binary = bep::store::proxy_binary_on_path(
+                std::env::var_os(bep::store::PROXY_BIN_ENV).as_deref(),
+                std::env::var_os("PATH").as_deref(),
+            )
+            .ok();
             let github_grants = check_github_grants(
                 &project_secrets,
-                proxy_present(identity.as_deref(), control.as_deref()),
+                proxy_absence(
+                    identity.as_deref(),
+                    control.as_deref(),
+                    binary,
+                    proxy_log_path(global.minimal_dir.as_deref()),
+                ),
                 &bep::signin::HostKeychain,
             )?;
             Ok::<_, anyhow::Error>((policy, github_grants))
@@ -2614,12 +2660,13 @@ mod tests {
     /// before the proxy or the sign-in is checked.
     #[test]
     fn a_grant_whose_name_is_not_a_variable_name_is_refused() {
+        use boxes::core::bep::ProxyAbsence;
         let grant: boxes::core::bep::SecretGrant =
             toml::from_str("source = \"broker\"\nscopes = [\"github:user-token\"]").unwrap();
         let keychain = bep::signin::MemoryKeychain::default();
         for name in ["X=1; touch /tmp/owned #", "gh_token", "1TOKEN"] {
             let secrets = boxes::core::bep::SecretGrants::from([(name.to_string(), grant.clone())]);
-            let error = check_github_grants(&secrets, false, &keychain)
+            let error = check_github_grants(&secrets, Some(ProxyAbsence::NotServed), &keychain)
                 .expect_err("a name that is not a variable name is refused");
             assert_eq!(
                 error.downcast_ref::<GrantNotDelivered>(),
@@ -2631,7 +2678,7 @@ mod tests {
         }
         let secrets = boxes::core::bep::SecretGrants::from([("X=1; cmd #".to_string(), grant)]);
         assert_eq!(
-            check_github_grants(&secrets, false, &keychain)
+            check_github_grants(&secrets, Some(ProxyAbsence::NotServed), &keychain)
                 .unwrap_err()
                 .to_string(),
             "Cannot create the box: the secret \"X=1; cmd #\" in [session.secrets] in \
