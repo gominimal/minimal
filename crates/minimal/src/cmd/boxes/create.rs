@@ -1883,6 +1883,12 @@ pub(crate) async fn activate_box(
             if let Some(surface) = surface {
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
                 let box_name = request.config.name.as_deref().unwrap_or("-");
+                // T110: the box's ports answer at its own address unless the
+                // daemon put it on the `127.0.0.1` interim. A host-address
+                // box answers at the node's address, which `min ls` never
+                // marks as the fallback, so the two verbs read the same form.
+                let at_own_address = request.config.network == boxes::NetworkMode::HostNet
+                    || !created.interim_loopback;
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
@@ -1891,6 +1897,7 @@ pub(crate) async fn activate_box(
                         serving_proxy_port,
                         host_install,
                         proxy_cause.as_deref(),
+                        at_own_address,
                     )
                 );
             }

@@ -5015,11 +5015,14 @@ pub fn host_line(
     proxy_port: Option<u16>,
     host: HostInstall,
 ) -> String {
-    host_line_beside(box_name, surface, proxy_port, host, None)
+    host_line_beside(box_name, surface, proxy_port, host, None, true)
 }
 
 /// [`host_line`] beside a proxy-down cause (NET-020), in both of the
-/// line's forms: when the hostname proxy failed to bind — the VM host
+/// line's forms, for a box whose ports answer at its own address
+/// (`at_own_address`) or only at the `127.0.0.1` fallback, as the `min ls`
+/// BOX NAMES row reads the same fact from the box's report. When the
+/// hostname proxy failed to bind — the VM host
 /// daemon's sibling cause, or a native daemon's own report — the cause
 /// replaces the resolution half, `names: <box>.min.internal: the hostname
 /// proxy is not serving: <cause>`, whatever the surface verdict says — the
@@ -5035,17 +5038,17 @@ pub fn host_line_beside(
     proxy_port: Option<u16>,
     host: HostInstall,
     proxy_cause: Option<&str>,
+    at_own_address: bool,
 ) -> String {
     let name = format!("{box_name}.{ZONE}");
     // The not-serving arms keep the box named: the line's contract is one
     // host line naming the box, and a reader whose proxy is down is the one
-    // who most needs to know which name the cause is about. A native
-    // verdict already holds the reserved range on this host's loopback, the
-    // range a box's own address comes from (NET-010), so the line reads the
-    // own-address form for it.
+    // who most needs to know which name the cause is about. The caller
+    // says where the activated box's ports answer, so a box on the
+    // `127.0.0.1` fallback reads the fallback form, as its `min ls` row does.
     let names = match proxy_cause {
         Some(cause) => format!("{name}: the hostname proxy is not serving: {cause}"),
-        None => box_name_opens(&name, surface, proxy_port, true),
+        None => box_name_opens(&name, surface, proxy_port, at_own_address),
     };
     format!(
         "names: {names}{}",
@@ -5176,8 +5179,10 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
 }
 
 /// [`name_surface_line`] for a listing that knows where its boxes' ports
-/// answer (T110): `at_own_address` is `false` when every box the listing
-/// reports an address for answers only at the `127.0.0.1` fallback.
+/// answer (T110). The row speaks for every box, so `at_own_address` is
+/// `false` when the listing reports any box at the `127.0.0.1` fallback.
+/// A listing that reports no fallback, such as one from a daemon that
+/// predates the fact, keeps the own-address form the native verdict gives.
 #[must_use]
 pub fn name_surface_line_at(
     surface: LiveSurface,
@@ -6051,6 +6056,7 @@ mod tests {
             Some(7654),
             HostInstall::default(),
             Some(&cause),
+            true,
         );
         assert_eq!(
             native_down,
@@ -6063,6 +6069,7 @@ mod tests {
             Some(7654),
             others_open,
             Some(&cause),
+            true,
         );
         assert_eq!(
             native_down_open,
@@ -6082,6 +6089,7 @@ mod tests {
             Some(7654),
             HostInstall::default(),
             Some(&daemon_cause),
+            true,
         );
         assert_eq!(
             proxy_down_native_daemon,
@@ -6101,7 +6109,14 @@ mod tests {
         );
         assert_eq!(host_line_proxy_cause(None, None), None);
         assert_eq!(
-            host_line_beside("web", &LiveSurface::Native, Some(7654), others_open, None),
+            host_line_beside(
+                "web",
+                &LiveSurface::Native,
+                Some(7654),
+                others_open,
+                None,
+                true
+            ),
             names_done,
             "no cause: the same line host_line prints"
         );
@@ -7191,24 +7206,25 @@ exit 0
                         other_items_unfinished: true,
                     },
                 ] {
-                    let activate = host_line("web", &surface, port, host);
-                    let row = format!(
-                        "{}{}",
-                        name_surface_line(surface.clone(), port),
-                        install_clause(install_unfinished(&surface, host))
-                    );
+                    for at_own_address in [true, false] {
+                        let activate =
+                            host_line_beside("web", &surface, port, host, None, at_own_address);
+                        let row = format!(
+                            "{}{}",
+                            name_surface_line_at(surface.clone(), port, at_own_address),
+                            install_clause(install_unfinished(&surface, host))
+                        );
+                        assert_eq!(
+                            activate,
+                            format!("names: {}", row.replace("<box>", "web")),
+                            "{surface:?} {port:?} {host:?} {at_own_address}"
+                        );
+                    }
                     assert_eq!(
-                        activate,
-                        format!("names: {}", row.replace("<box>", "web")),
-                        "{surface:?} {port:?} {host:?}"
+                        host_line("web", &surface, port, host),
+                        host_line_beside("web", &surface, port, host, None, true),
                     );
                 }
-            }
-            for port in [Some(7654), None] {
-                assert_eq!(
-                    name_surface_line_at(surface.clone(), port, false),
-                    box_name_opens("<box>.min.internal", &surface, port, false),
-                );
             }
         }
         assert_eq!(
@@ -7230,6 +7246,18 @@ exit 0
             name_surface_line_at(LiveSurface::Native, Some(7654), false),
             "<box>.min.internal resolves on this machine; open it through the HTTP proxy \
              at 127.0.0.1:7654"
+        );
+        assert_eq!(
+            host_line_beside(
+                "web",
+                &LiveSurface::Native,
+                Some(7654),
+                HostInstall::default(),
+                None,
+                false
+            ),
+            "names: web.min.internal resolves on this machine; open it through the HTTP \
+             proxy at 127.0.0.1:7654"
         );
         assert_eq!(
             name_surface_line(held, None),
