@@ -2,7 +2,7 @@
 //! checks to the start line.
 
 use super::*;
-use minimal_client::box_name::{request_name, retry_as_fresh_instance};
+use minimal_client::box_name::request_name;
 use minimal_client::box_registration::{
     CleanupOutcome, register_box_for_activation, settle_lease_after_cleanup,
 };
@@ -1039,7 +1039,8 @@ pub(crate) fn put_spec(
 
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
-/// request's name, else the spec's entry. `None` for a request with no spec
+/// request's name, else the spec's entry as the daemon cleans it
+/// ([`boxes::box_name::entry_box_name`]). `None` for a request with no spec
 /// and no name.
 pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
     let spec = request.spec.as_ref().and_then(|value| {
@@ -1051,7 +1052,10 @@ pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> 
     if let Some(name) = request.config.name.clone() {
         return Some(name);
     }
-    spec.map(|spec| spec.box_name().to_string())
+    // Only the entry is cleaned, as the daemon cleans it, so the VM host
+    // row and the box carry one name. A `[box] name` or `--name` is sent
+    // unchanged above.
+    spec.map(|spec| boxes::box_name::entry_box_name(&spec.entry))
 }
 
 /// The name the daemon gave box `id`, read off its record. `None` when the
@@ -1313,11 +1317,9 @@ pub(crate) async fn activate_box(
         .await?;
 
     // BOX-163: the request carries a name only for `--name`. With none,
-    // the daemon names the box from its spec's entry, and a held entry name
-    // makes the create a fresh instance, `<name>-<n>`, below. A `--name`
-    // that a running box holds ends the command with exit 2, naming the
-    // holder. The client invents no name.
-    let typed_name = args.name.is_some();
+    // the daemon names the box from its spec's entry. A held name, the
+    // entry's or a `--name`, is refused below: the command ends with exit
+    // 2, naming the holder. The client invents no name.
 
     let network: boxes::NetworkMode = args.network.into();
 
@@ -1528,7 +1530,7 @@ pub(crate) async fn activate_box(
     tracing::info!(
         requested_name = ?request.config.name,
         box_name = ?box_name,
-        name_source = if typed_name { "--name" } else { "entry" },
+        name_source = if request.config.name.is_some() { "--name" } else { "entry" },
         "creating the box under the name the daemon gives it"
     );
     let mut registered = ActivationStep::RegisterBox
@@ -1593,15 +1595,13 @@ pub(crate) async fn activate_box(
         .await?;
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
-    // BOX-163: a box the person did not name takes its entry's name. When a
-    // running box holds that name, the create runs again as a fresh
-    // instance, and the daemon names it `<name>-<n>`. A `--name` that a
-    // running box holds ends the command with exit 2, naming the holder. A
-    // box with a VM host row keeps the name its row holds, so it does not
-    // run again under another one.
+    // BOX-163: a box the person did not name takes its entry's name. A
+    // create under a name that a running box holds, the entry's name or a
+    // `--name`, is refused: the command ends with exit 2, naming the
+    // holder. Only `min task run` asks for a fresh instance, `<name>-<n>`.
     let created = ActivationStep::CreateSession
         .run(async {
-            let created = loop {
+            let created = {
                 // The id the VM host daemon minted stays with this client. The
                 // create request carries none (BOX-002).
                 tracing::info!(
@@ -1632,21 +1632,11 @@ pub(crate) async fn activate_box(
                     }
                 };
                 match resp {
-                    minimald_rpc::Errorable::Ok(r) => break r,
+                    minimald_rpc::Errorable::Ok(r) => r,
                     minimald_rpc::Errorable::Err { error } => {
-                        if registered.is_none()
-                            && retry_as_fresh_instance(typed_name, request.fresh_instance, &error)
-                        {
-                            tracing::info!(
-                                box_name = ?box_name,
-                                %error,
-                                "the entry's name is held; creating a fresh instance"
-                            );
-                            request.fresh_instance = true;
-                            continue;
-                        }
                         // Any other create failure abandons the activation and
-                        // its row the same way.
+                        // its row the same way. A held name is one of them: it
+                        // ends the command with exit 2, naming the holder.
                         withdraw_box_row(
                             control_sock.clone(),
                             box_name.as_deref(),

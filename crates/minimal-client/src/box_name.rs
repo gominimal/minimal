@@ -19,15 +19,6 @@ pub fn held_name_refusal(error: &str) -> Option<HeldNameRefusal> {
     HeldNameRefusal::from_error(error)
 }
 
-/// Whether a refused create runs again as a fresh instance (BOX-163): only
-/// a create whose name the person did not type, and only when a running box
-/// holds the name the daemon gave it. The daemon then names it
-/// `<name>-<n>`. A typed name is never changed: its refusal ends the
-/// command, naming the holder.
-pub fn retry_as_fresh_instance(typed: bool, fresh_instance: bool, error: &str) -> bool {
-    !typed && !fresh_instance && held_name_refusal(error).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,26 +39,22 @@ mod tests {
         assert_eq!(request_name(None), None, "no typed name, no name sent");
         assert_eq!(request_name(Some("dev")).as_deref(), Some("dev"));
 
-        // A held name retries as a fresh instance only when nobody typed it.
-        let held = refusal();
-        assert!(retry_as_fresh_instance(false, false, &held));
-        assert!(
-            !retry_as_fresh_instance(true, false, &held),
-            "a typed name is refused, never renamed"
+        // A create under a held name with no typed name is refused, and is
+        // never turned into a fresh instance. Only `min task run` asks for
+        // one.
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            String::new(),
+            paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+            boxes::NetworkMode::HostNet,
+            boxes::BoxPolicy::default(),
         );
+        request.config.name = request_name(None);
         assert!(
-            !retry_as_fresh_instance(false, true, &held),
-            "a fresh instance is not refused for a held name, so it never retries"
+            !request.fresh_instance,
+            "an untyped create does not ask for a fresh instance"
         );
-        assert!(!retry_as_fresh_instance(
-            false,
-            false,
-            "CreateSession failed: boom"
-        ));
-        assert!(!retry_as_fresh_instance(
-            false,
-            false,
-            "A session with that name already exists"
-        ));
+        let held = held_name_refusal(&refusal()).expect("the refusal names the holder");
+        assert_eq!(held.holder_name, "default");
+        assert!(held_name_refusal("CreateSession failed: boom").is_none());
     }
 }
