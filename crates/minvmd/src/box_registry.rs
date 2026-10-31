@@ -6407,17 +6407,9 @@ struct MirrorState {
     /// port, with the address each stands at. Each is retried before the
     /// next change's calls.
     unbind_owed: BTreeMap<u16, Ipv4Addr>,
-    /// The refusal each port was last warned for, at most
-    /// [`MIRROR_REFUSALS_REMEMBERED`] ports.
-    refusals: BTreeMap<u16, MirrorOutcome>,
     /// When each listening notice in the trailing window arrived.
     notices: VecDeque<Instant>,
 }
-
-/// How many ports the mirror remembers a refusal for, so a refused notice
-/// the guest sends again is not a warn line each time. A refusal past it
-/// is warned and not remembered.
-const MIRROR_REFUSALS_REMEMBERED: usize = 4 * MIRRORED_BINDS_CAP;
 
 impl MirrorState {
     /// The address and binder a bind needs now: both set and the range
@@ -6495,8 +6487,9 @@ impl NodeMirror {
         self.lock().bound.iter().copied().collect()
     }
 
-    /// The ports whose bind collided with a holder on the host: the fact
-    /// session start and the listings surface.
+    /// The ports whose bind collided with a holder on the host, recorded on
+    /// the node and logged. Showing them at session start and in `min ls`
+    /// is <https://github.com/gominimal/minimal/issues/2799>.
     pub fn collisions(&self) -> Vec<u16> {
         self.lock().collided.iter().copied().collect()
     }
@@ -6518,10 +6511,8 @@ impl NodeMirror {
         state.range_passes = passes;
         let calls = if passes {
             Self::bind_wanted(&state)
-        } else if !passes {
-            Self::unbind_all(&mut state, MirrorEnd::RangeProbeFailed, false)
         } else {
-            MirrorCalls::default()
+            Self::unbind_all(&mut state, MirrorEnd::RangeProbeFailed, false)
         };
         drop(state);
         self.run(calls);
@@ -6575,7 +6566,8 @@ impl NodeMirror {
     /// binds only while a host-address box is published on the node. A
     /// listening notice for a port in `infrastructure`, the ports the VM
     /// host provisioned for the guest's own services, is refused on the
-    /// host's authority, whatever the notice says.
+    /// host's authority, whatever the notice says. Every listening notice
+    /// spends the notice rate, a refused one included.
     pub fn notice(
         &self,
         notice: minimald_rpc::ListenNotice,
@@ -6586,19 +6578,9 @@ impl NodeMirror {
         let _turn = self.take_turn();
         let port = notice.port;
         let mut state = self.lock();
-        if notice.state == minimald_rpc::ListenState::Listening && infrastructure.contains(&port) {
-            self.warn_refused(
-                &mut state,
-                port,
-                MirrorOutcome::RefusedInfrastructure,
-                "guest-infrastructure-port",
-            );
-            return MirrorOutcome::RefusedInfrastructure;
-        }
         if notice.state == minimald_rpc::ListenState::Stopped {
             state.wanted.remove(&port);
             state.collided.remove(&port);
-            state.refusals.remove(&port);
             let mut calls = MirrorCalls::default();
             if state.bound.remove(&port)
                 && let (Some(address), Some(binder)) = (state.address, state.binder.clone())
@@ -6631,26 +6613,32 @@ impl NodeMirror {
             return MirrorOutcome::Capped;
         }
         state.notices.push_back(now);
+        // Checked after the rate cap, so the cap bounds the warn lines a
+        // guest that repeats a forged notice can cause.
+        if infrastructure.contains(&port) {
+            self.warn_refused(
+                &state,
+                port,
+                MirrorOutcome::RefusedInfrastructure,
+                "guest-infrastructure-port",
+            );
+            return MirrorOutcome::RefusedInfrastructure;
+        }
         if port == 0 {
             // A bind at port 0 takes a port the host picks, which moves the
             // listener to another port. No listener holds port 0.
-            self.warn_refused(&mut state, port, MirrorOutcome::PortZero, "port-zero");
+            self.warn_refused(&state, port, MirrorOutcome::PortZero, "port-zero");
             return MirrorOutcome::PortZero;
         }
         if !state.published {
-            self.warn_refused(
-                &mut state,
-                port,
-                MirrorOutcome::NoHostAddressBox,
-                "no-cohort",
-            );
+            self.warn_refused(&state, port, MirrorOutcome::NoHostAddressBox, "no-cohort");
             return MirrorOutcome::NoHostAddressBox;
         }
         if state.bound.contains(&port) {
             return MirrorOutcome::Bound;
         }
         if !state.wanted.contains(&port) && state.wanted.len() >= MIRRORED_BINDS_CAP {
-            self.warn_refused(&mut state, port, MirrorOutcome::Capped, "bind-cap");
+            self.warn_refused(&state, port, MirrorOutcome::Capped, "bind-cap");
             return MirrorOutcome::Capped;
         }
         state.wanted.insert(port);
@@ -6698,7 +6686,6 @@ impl NodeMirror {
         state.collided.clear();
         if forget {
             state.wanted.clear();
-            state.refusals.clear();
         }
         let mut calls = MirrorCalls::default();
         if let (Some(address), Some(binder)) = (state.address, state.binder.clone()) {
@@ -6840,7 +6827,6 @@ impl NodeMirror {
             Ok(()) => {
                 state.bound.insert(port);
                 state.collided.remove(&port);
-                state.refusals.remove(&port);
                 drop(state);
                 tracing::info!(
                     node = %self.node,
@@ -6853,13 +6839,12 @@ impl NodeMirror {
             }
             Err(MirrorBindError::Occupied) => {
                 state.collided.insert(port);
-                self.warn_refused(&mut state, port, MirrorOutcome::Collided, "port-in-use");
+                self.warn_refused(&state, port, MirrorOutcome::Collided, "port-in-use");
                 (MirrorOutcome::Collided, true)
             }
             Err(MirrorBindError::Failed(error)) => {
-                let first = Self::first_refusal(&mut state, port, MirrorOutcome::BindFailed);
                 drop(state);
-                self.warn_bind_failed(address, port, &error, first);
+                self.warn_bind_failed(address, port, &error);
                 (MirrorOutcome::BindFailed, true)
             }
             Err(MirrorBindError::Unanswered(error)) => {
@@ -6867,46 +6852,24 @@ impl NodeMirror {
                 // owed. A later bind of the same port makes it moot
                 // ([`Self::retry_owed`]).
                 state.unbind_owed.insert(port, address);
-                let first = Self::first_refusal(&mut state, port, MirrorOutcome::BindFailed);
                 drop(state);
-                self.warn_bind_failed(address, port, &error, first);
+                self.warn_bind_failed(address, port, &error);
                 (MirrorOutcome::BindFailed, false)
             }
         }
     }
 
-    fn warn_bind_failed(&self, address: Ipv4Addr, port: u16, error: &str, first: bool) {
-        if first {
-            tracing::warn!(
-                node = %self.node,
-                %address,
-                port,
-                outcome = MirrorOutcome::BindFailed.as_str(),
-                %error,
-                "could not mirror a host-address box's bind at the node's address"
-            );
-        } else {
-            tracing::debug!(
-                node = %self.node,
-                %address,
-                port,
-                outcome = MirrorOutcome::BindFailed.as_str(),
-                %error,
-                "could not mirror a host-address box's bind at the node's address again"
-            );
-        }
-    }
-
-    /// Records `outcome` as the refusal `port` took last. Returns whether
-    /// it is new for the port, so the caller warns once per refusal.
-    fn first_refusal(state: &mut MirrorState, port: u16, outcome: MirrorOutcome) -> bool {
-        if state.refusals.get(&port) == Some(&outcome) {
-            return false;
-        }
-        if state.refusals.contains_key(&port) || state.refusals.len() < MIRROR_REFUSALS_REMEMBERED {
-            state.refusals.insert(port, outcome);
-        }
-        true
+    // One warn line per refusal (NET-138's observability terms). The
+    // per-node notice rate cap bounds how many reach this line.
+    fn warn_bind_failed(&self, address: Ipv4Addr, port: u16, error: &str) {
+        tracing::warn!(
+            node = %self.node,
+            %address,
+            port,
+            outcome = MirrorOutcome::BindFailed.as_str(),
+            %error,
+            "could not mirror a host-address box's bind at the node's address"
+        );
     }
 
     fn info_waiting(&self, state: &MirrorState, port: u16) {
@@ -6920,35 +6883,17 @@ impl NodeMirror {
         );
     }
 
-    /// Logs a refusal: a warn line the first time `port` takes `outcome`,
-    /// and a debug line while it takes the same one again.
-    fn warn_refused(
-        &self,
-        state: &mut MirrorState,
-        port: u16,
-        outcome: MirrorOutcome,
-        reason: &str,
-    ) {
-        let address = state.address;
-        if Self::first_refusal(state, port, outcome) {
-            tracing::warn!(
-                node = %self.node,
-                address = ?address,
-                port,
-                outcome = outcome.as_str(),
-                reason,
-                "refused a mirrored bind at the node's address"
-            );
-        } else {
-            tracing::debug!(
-                node = %self.node,
-                address = ?address,
-                port,
-                outcome = outcome.as_str(),
-                reason,
-                "refused a mirrored bind at the node's address again"
-            );
-        }
+    /// Logs a refusal as a warn line, each time. The per-node notice rate
+    /// cap bounds how many notices reach a refusal.
+    fn warn_refused(&self, state: &MirrorState, port: u16, outcome: MirrorOutcome, reason: &str) {
+        tracing::warn!(
+            node = %self.node,
+            address = ?state.address,
+            port,
+            outcome = outcome.as_str(),
+            reason,
+            "refused a mirrored bind at the node's address"
+        );
     }
 }
 

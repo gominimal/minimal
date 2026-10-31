@@ -8000,37 +8000,61 @@ mod tests {
         assert!(boxes.admit_host_ip_box(session, None));
 
         let rpc_port = u16::try_from(crate::sock::VSOCK_BRIDGE_PORT).expect("a TCP-sized port");
-        for port in [
-            rpc_port,
-            proxy_port,
-            minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
-        ] {
-            let line = format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);
-            let request = parse_request(&line).expect("a well-formed notice parses");
-            assert!(oversized_listen_notice(&request, &line).is_none());
-            let BoxControlRequest::ListenNotice(notice) = request else {
-                panic!("the line is a listen notice");
-            };
-            match listen_notice_reply(&boxes, notice) {
-                BoxControlReply::Error { error } => assert!(
-                    error.contains("used by the VM's own services"),
-                    "the refusal says why: {error}"
-                ),
-                other => panic!("port {port} is the guest's own; got {other:?}"),
+        // Every refusal logs at warn, a repeated one too: the notice rate
+        // cap bounds them, and its counter counts what it drops.
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for port in [
+                rpc_port,
+                proxy_port,
+                minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
+            ] {
+                let line =
+                    format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);
+                let request = parse_request(&line).expect("a well-formed notice parses");
+                assert!(oversized_listen_notice(&request, &line).is_none());
+                let BoxControlRequest::ListenNotice(notice) = request else {
+                    panic!("the line is a listen notice");
+                };
+                match listen_notice_reply(&boxes, notice) {
+                    BoxControlReply::Error { error } => assert!(
+                        error.contains("used by the VM's own services"),
+                        "the refusal says why: {error}"
+                    ),
+                    other => panic!("port {port} is the guest's own; got {other:?}"),
+                }
             }
-        }
-        // The registry's own entry refuses them too, so no caller can
-        // reach a bind past the check.
-        for port in [rpc_port, proxy_port] {
-            assert_eq!(
-                boxes.mirror_notice(minimald_rpc::ListenNotice {
-                    port,
-                    state: minimald_rpc::ListenState::Listening,
-                }),
-                crate::box_registry::MirrorOutcome::RefusedInfrastructure,
-                "port {port} is the guest's own"
-            );
-        }
+            // The registry's own entry refuses them too, so no caller can
+            // reach a bind past the check.
+            for port in [rpc_port, proxy_port] {
+                assert_eq!(
+                    boxes.mirror_notice(minimald_rpc::ListenNotice {
+                        port,
+                        state: minimald_rpc::ListenState::Listening,
+                    }),
+                    crate::box_registry::MirrorOutcome::RefusedInfrastructure,
+                    "port {port} is the guest's own"
+                );
+            }
+        });
+        let log = capture.contents();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("refused a mirrored bind"))
+            .collect();
+        assert_eq!(refusals.len(), 5, "one line per refusal:\n{log}");
+        assert!(
+            refusals
+                .iter()
+                .all(|line| line.contains("WARN") && line.contains("guest-infrastructure-port")),
+            "each refusal is a warn line:\n{log}"
+        );
+        assert_eq!(boxes.node_mirror().notices_dropped_by_rate(), 0);
         assert!(binder.calls().is_empty(), "no infrastructure port is bound");
 
         // A notice that names an address, a path or a name is not a notice.
