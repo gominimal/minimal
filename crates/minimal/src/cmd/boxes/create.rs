@@ -584,18 +584,34 @@ pub(crate) fn check_github_grants(
 /// box id and its address stance. A native host and a daemon that predates
 /// box ids give no id, and no proxy serves those boxes. A grant there is
 /// refused with `gatehouse_unenrolled_node`, and never resolves to nothing.
+#[cfg(test)]
 pub(crate) fn grant_box_facts(
     grants: &[String],
     box_id: Option<String>,
     network: boxes::NetworkMode,
 ) -> Result<Option<(String, bep::boxes::Stance)>, boxes::core::bep::ActivationRefused> {
+    proxy_box_facts(grants, &[], box_id, network)
+}
+
+/// `grant_box_facts` for a box with the GitHub grants `github_grants` and
+/// the store references `stores`. A refusal names every one of them, and
+/// names them as secrets, not as GitHub grants, when any is a store
+/// reference.
+fn proxy_box_facts(
+    github_grants: &[String],
+    stores: &[crate::mint::StoreGrant],
+    box_id: Option<String>,
+    network: boxes::NetworkMode,
+) -> Result<Option<(String, bep::boxes::Stance)>, boxes::core::bep::ActivationRefused> {
+    let grants = proxy_grant_names(github_grants, stores);
     if grants.is_empty() {
         return Ok(None);
     }
     match (box_id, proxy_stance(network)) {
         (Some(box_id), Some(stance)) => Ok(Some((box_id, stance))),
         _ => Err(boxes::core::bep::unenrolled_node(
-            grants.to_vec(),
+            grants,
+            !stores.is_empty(),
             boxes::core::bep::ProxyAbsence::NotServed,
         )),
     }
@@ -606,28 +622,37 @@ pub(crate) fn grant_box_facts(
 /// carries none, one that is not a PEM certificate, or one whose subject
 /// key is not the published root key is refused, so no grant box starts
 /// without the root it needs, and none trusts a stale or foreign root.
+#[cfg(test)]
 pub(crate) fn grant_root_certificate(
     identity: &bep::publish::Identity,
 ) -> Result<String, anyhow::Error> {
+    root_certificate_for(identity, false)
+}
+
+/// `grant_root_certificate` for a box whose only proxy-served secrets are
+/// store references when `stored` is true, so its refusal names no GitHub
+/// grant.
+fn root_certificate_for(
+    identity: &bep::publish::Identity,
+    stored: bool,
+) -> Result<String, anyhow::Error> {
+    let refuse = || no_root_certificate(stored);
     let der = identity.root_certificate_der().map_err(|error| {
         tracing::debug!(%error, "the published identity carries no usable root certificate");
-        no_root_certificate()
+        refuse()
     })?;
     let root = identity
         .key(bep::keys::Role::Root)
         .map_err(|error| {
             tracing::debug!(%error, "the published identity carries no usable root key");
-            no_root_certificate()
+            refuse()
         })?
         .to_sec1_bytes();
     if !certificate_carries_key(&der, &root) {
         tracing::debug!("the published root certificate does not carry the published root key");
-        return Err(no_root_certificate());
+        return Err(refuse());
     }
-    identity
-        .root_certificate
-        .clone()
-        .ok_or_else(no_root_certificate)
+    identity.root_certificate.clone().ok_or_else(refuse)
 }
 
 /// Whether `der`, a DER X.509 certificate, carries `point`, an uncompressed
@@ -687,11 +712,16 @@ fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
     (input.len() >= len).then(|| input.split_at(len))
 }
 
-/// The refusal of a GitHub grant box whose proxy publishes no root
-/// certificate.
-fn no_root_certificate() -> anyhow::Error {
+/// The refusal of a box whose proxy publishes no root certificate.
+/// `stored` says the box's only proxy-served secrets are store references.
+fn no_root_certificate(stored: bool) -> anyhow::Error {
+    let declares = if stored {
+        "a secret from the host's secret store"
+    } else {
+        "a GitHub grant"
+    };
     anyhow::anyhow!(
-        "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy has \
+        "Cannot start the box: it declares {declares}, and the Box Egress Proxy has \
          published no root certificate for the box to trust. Run `bep` to publish it, then \
          create the box again."
     )
@@ -711,10 +741,25 @@ pub(crate) struct MintedGrants {
 
 /// Puts what the mint gave on the create request: one sealed delivery for
 /// each grant (BEP-007) and the proxy's root certificate for the box to
-/// trust (BEP-072). A box with no GitHub grant gets neither.
+/// trust (BEP-072). `grants` names every grant the proxy serves: the
+/// GitHub grants, then the store references. A box with neither gets
+/// neither a delivery nor a root.
+#[cfg(test)]
 pub(crate) fn hand_grants(
     request: &mut minimald_rpc::CreateSessionRequest,
     grants: &[String],
+    minted: &[crate::mint::Minted],
+    root_certificate: Option<String>,
+) -> Result<(), anyhow::Error> {
+    hand_minted(request, grants, false, minted, root_certificate)
+}
+
+/// `hand_grants`, where `stored` says the box's only proxy-served secrets
+/// are store references, so a refusal names no GitHub grant.
+fn hand_minted(
+    request: &mut minimald_rpc::CreateSessionRequest,
+    grants: &[String],
+    stored: bool,
     minted: &[crate::mint::Minted],
     root_certificate: Option<String>,
 ) -> Result<(), anyhow::Error> {
@@ -724,7 +769,7 @@ pub(crate) fn hand_grants(
     } else {
         // A grant box with no root is refused before the mint, and this
         // keeps the refusal on every path to the request.
-        Some(root_certificate.ok_or_else(no_root_certificate)?)
+        Some(root_certificate.ok_or_else(|| no_root_certificate(stored))?)
     };
     request.config.sealed_deliveries = deliveries;
     request.config.root_certificate = root_certificate;
@@ -752,21 +797,29 @@ fn mint_grants(
 ) -> Result<MintedGrants, anyhow::Error> {
     use crate::mint::{
         ControlClient, GrantBox, HostClientKeyStore, MintError, ProxyRegistration,
-        local_client_key, mint_and_register, mint_store_members,
+        StoreOnlyMintError, local_client_key, mint_and_register, mint_store_members,
     };
-    let Some((box_id, stance)) =
-        grant_box_facts(&proxy_grant_names(&grants, stores), box_id, network)?
-    else {
+    let Some((box_id, stance)) = proxy_box_facts(&grants, stores, box_id, network)? else {
         return Ok(MintedGrants {
             minted: Vec::new(),
             root_certificate: None,
             registration: None,
         });
     };
-    let declares = if grants.is_empty() {
+    let stored = grants.is_empty();
+    let declares = if stored {
         "a secret from the host's secret store"
     } else {
         "a GitHub grant"
+    };
+    // A box with store references only is told about its secrets, not
+    // about a GitHub grant it does not declare.
+    let mint_error = |error: MintError| -> anyhow::Error {
+        if stored {
+            StoreOnlyMintError(error).into()
+        } else {
+            error.into()
+        }
     };
     let (Some(identity_path), Some(control_path)) =
         (crate::mint::identity_path(), crate::mint::control_path())
@@ -776,20 +829,21 @@ fn mint_grants(
              which holds the Box Egress Proxy's keys."
         );
     };
-    let identity =
-        bep::publish::Identity::read(&identity_path).map_err(|error| MintError::Identity {
+    let identity = bep::publish::Identity::read(&identity_path).map_err(|error| {
+        mint_error(MintError::Identity {
             path: identity_path.clone(),
             error,
-        })?;
+        })
+    })?;
     // BEP-072: refused before the box registers, so a refusal leaves nothing
     // at the proxy.
-    let root_certificate = grant_root_certificate(&identity)?;
-    let mut control = ControlClient::connect(&control_path)?;
+    let root_certificate = root_certificate_for(&identity, stored)?;
+    let mut control = ControlClient::connect(&control_path).map_err(mint_error)?;
     // BEP-063: every creation signs under the client's one kept key, so the
     // proxy holds one registration for this client, not one for each box. A
     // key the keychain refuses this program is replaced here, and the mint
     // registers the replacement before any handle leaves this process.
-    let key = local_client_key(&HostClientKeyStore)?;
+    let key = local_client_key(&HostClientKeyStore).map_err(mint_error)?;
     // A clock before the epoch gives no issue time, so the mint stops
     // rather than signing handles issued at zero.
     let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
@@ -802,12 +856,12 @@ fn mint_grants(
     let mut minted = if grants.is_empty() {
         // A box with store references only needs no sign-in: it registers
         // its egress and stance here, as the GitHub mint does.
-        let box_hex = crate::mint::box_id_hex(&box_id)?;
+        let box_hex = crate::mint::box_id_hex(&box_id).map_err(mint_error)?;
         if let Err(error) = control.register_box(&box_hex, &egress, stance) {
             if !matches!(error, MintError::NotRunning { .. }) {
-                drop(ProxyRegistration::new(control_path.clone(), &box_id)?);
+                drop(ProxyRegistration::new(control_path.clone(), &box_id).map_err(mint_error)?);
             }
-            return Err(error.into());
+            return Err(mint_error(error));
         }
         Vec::new()
     } else {
@@ -828,19 +882,22 @@ fn mint_grants(
         )?
     };
     // Held from here, so a failed store mint forgets the box at the proxy.
-    let registration = ProxyRegistration::new(control_path, &box_id)?;
+    let registration = ProxyRegistration::new(control_path, &box_id).map_err(mint_error)?;
     // BEP-032, BEP-063: one store handle for each accepted rule, sealed as a
     // `store` member under the grant's variable.
-    minted.extend(mint_store_members(
-        &identity,
-        &identity_path,
-        &mut control,
-        &key,
-        &box_id,
-        stores,
-        config_dir,
-        now,
-    )?);
+    minted.extend(
+        mint_store_members(
+            &identity,
+            &identity_path,
+            &mut control,
+            &key,
+            &box_id,
+            stores,
+            config_dir,
+            now,
+        )
+        .map_err(mint_error)?,
+    );
     Ok(MintedGrants {
         minted,
         root_certificate: Some(root_certificate),
@@ -907,6 +964,7 @@ async fn mint_into_request(
     let grants = github_grants.to_vec();
     let stores = store_grants.to_vec();
     let delivered = proxy_grant_names(github_grants, store_grants);
+    let stored = github_grants.is_empty();
     let box_id = registered_id.map(|box_id| box_id.to_string());
     let egress = request
         .config
@@ -932,7 +990,13 @@ async fn mint_into_request(
     .map_err(anyhow::Error::from)
     .and_then(|minted| minted)
     .and_then(|minted| {
-        hand_grants(request, &delivered, &minted.minted, minted.root_certificate)?;
+        hand_minted(
+            request,
+            &delivered,
+            stored,
+            &minted.minted,
+            minted.root_certificate,
+        )?;
         Ok(minted.registration)
     });
     match minted {
@@ -1591,8 +1655,9 @@ pub(crate) async fn activate_box(
     let registered_id = registered
         .as_ref()
         .and_then(|registration| registration.box_id);
-    if let Err(refused) = grant_box_facts(
-        &proxy_grant_names(&github_grants, &store_grants),
+    if let Err(refused) = proxy_box_facts(
+        &github_grants,
+        &store_grants,
         registered_id.map(|box_id| box_id.to_string()),
         request.config.network,
     ) {
@@ -3419,6 +3484,77 @@ mod tests {
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
         assert_eq!(refused.exit_code(), 3);
+    }
+
+    // BEP-032: a box whose only proxy-served secrets are store references
+    // is refused in words that name no GitHub grant. A GitHub grant box
+    // keeps the GitHub wording.
+    #[test]
+    fn a_store_only_box_is_refused_without_naming_a_github_grant() {
+        use crate::mint::{MintError, StoreOnlyMintError};
+
+        let not_running = || MintError::NotRunning {
+            path: "/home/me/.minimal/bep/control.sock".into(),
+            error: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        };
+        let store = StoreOnlyMintError(not_running()).to_string();
+        assert!(
+            store.starts_with(
+                "Cannot start the box: it declares a secret from the host's secret store, \
+                 and the Box Egress Proxy does not answer on \
+                 /home/me/.minimal/bep/control.sock: "
+            ),
+            "{store}"
+        );
+        assert!(!store.contains("GitHub"), "{store}");
+        let github = not_running().to_string();
+        assert!(
+            github.starts_with(
+                "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy \
+                 does not answer on /home/me/.minimal/bep/control.sock: "
+            ),
+            "{github}"
+        );
+        let random = StoreOnlyMintError(MintError::Random).to_string();
+        assert!(!random.contains("GitHub"), "{random}");
+        assert!(!no_root_certificate(true).to_string().contains("GitHub"));
+        assert!(
+            no_root_certificate(false)
+                .to_string()
+                .contains("it declares a GitHub grant")
+        );
+
+        // Where no proxy serves boxes, the refusal names the store
+        // reference as a secret.
+        let mut secrets = store_grant();
+        secrets.insert("ZZ_KEY".into(), store_reference("openai-key"));
+        let accepted = accept_store_references(
+            &secrets,
+            Some(&egress_of(&["api.openai.com"])),
+            &store_rule(None),
+            false,
+            &mut never_ask,
+        )
+        .expect("the rule accepts both references");
+        let stores = store_grants(&secrets, &accepted).expect("each rule has a form");
+        let refused = proxy_box_facts(&[], &stores, None, boxes::NetworkMode::OwnIp)
+            .expect_err("no box id, so no proxy serves the box")
+            .to_string();
+        assert!(
+            refused.starts_with(
+                "Cannot create the box: it declares the secret OPENAI_KEY, ZZ_KEY, and "
+            ),
+            "{refused}"
+        );
+        assert!(!refused.contains("GitHub"), "{refused}");
+        let refused = proxy_box_facts(&["GH_TOKEN".into()], &[], None, boxes::NetworkMode::OwnIp)
+            .expect_err("no box id, so no proxy serves the box")
+            .to_string();
+        assert!(
+            refused
+                .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
+            "{refused}"
+        );
     }
 }
 

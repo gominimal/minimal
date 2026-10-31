@@ -176,6 +176,33 @@ pub enum MintError {
 
 impl fmt::Display for MintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_for(f, false)
+    }
+}
+
+/// A [`MintError`] for a box whose only proxy-served secrets are
+/// `source = "store"` references. Its text names those secrets, not a
+/// GitHub grant. Every other variant prints as [`MintError`] prints it.
+#[derive(Debug)]
+pub struct StoreOnlyMintError(pub MintError);
+
+impl fmt::Display for StoreOnlyMintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write_for(f, true)
+    }
+}
+
+impl std::error::Error for StoreOnlyMintError {}
+
+impl MintError {
+    /// The error's text. `stored` says the box declares store references
+    /// only, so the text names no GitHub grant.
+    fn write_for(&self, f: &mut fmt::Formatter<'_>, stored: bool) -> fmt::Result {
+        let declares = if stored {
+            "a secret from the host's secret store"
+        } else {
+            "a GitHub grant"
+        };
         match self {
             Self::SignIn(error) => write!(
                 f,
@@ -192,19 +219,16 @@ impl fmt::Display for MintError {
                 error: PublishError::Io { source, .. },
             } if source.kind() == io::ErrorKind::NotFound => write!(
                 f,
-                "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy \
+                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
                  has not published its keys at {}.",
                 path.display()
             ),
             Self::Identity { error, .. } => {
-                write!(
-                    f,
-                    "Cannot start the box: it declares a GitHub grant. {error}"
-                )
+                write!(f, "Cannot start the box: it declares {declares}. {error}")
             }
             Self::NotRunning { path, error } => write!(
                 f,
-                "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy \
+                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
                  does not answer on {}: {error}.",
                 path.display()
             ),
@@ -225,6 +249,10 @@ impl fmt::Display for MintError {
             Self::BoxId(id) => write!(
                 f,
                 "Cannot start the box: its id {id} is not one the Box Egress Proxy accepts."
+            ),
+            Self::Random if stored => write!(
+                f,
+                "Cannot start the box: this machine gave no random bytes for the store handle's key."
             ),
             Self::Random => write!(
                 f,
