@@ -3303,7 +3303,7 @@ mod tests {
         let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
         assert_eq!(
             refused,
-            "The proxy did not start: the key store failed for the sealing key: the keychain made the key exportable."
+            "The proxy did not start: the keychain holds the proxy's sealing key as exportable, and a release build does not use an exportable key. Run `bep --replace-key sealing` to make a new one. Boxes created before then must be re-created."
         );
         assert!(
             !log.contains("although the keychain made it exportable"),

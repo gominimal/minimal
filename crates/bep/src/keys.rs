@@ -185,7 +185,8 @@ pub enum Custody {
 }
 
 /// The custody rule for `key` in `build` (BEP-014, BEP-059). The keychain's
-/// generation and the CA's key check both take this one decision.
+/// generation, [`load`] for a stored sealing key, and the CA's key check all
+/// take this one decision.
 ///
 /// A release build refuses an exportable key. A debug build keeps it: the
 /// macOS login keychain lets the program that made a key export it although
@@ -200,8 +201,8 @@ pub fn custody<K: HeldKey + ?Sized>(key: &K, build: Build) -> Custody {
     }
 }
 
-/// The refusal of a key that [`custody`] refuses, where the keychain
-/// generates a key and where [`load`] finds a sealing key.
+/// The refusal of a key that [`custody`] refuses where the keychain
+/// generates a key.
 ///
 /// # Errors
 ///
@@ -280,6 +281,9 @@ pub enum StartError {
         /// hold.
         missing: Vec<Role>,
     },
+    /// The store holds a key that a release build refuses because the
+    /// keychain made it exportable (BEP-014, BEP-059).
+    Exportable(Role),
     /// The store did not generate a missing key.
     Store(KeyError),
 }
@@ -302,6 +306,10 @@ impl fmt::Display for StartError {
                 }
                 f.write_str(&lines.join("\n"))
             }
+            Self::Exportable(role) => write!(
+                f,
+                "The proxy did not start: the keychain holds the proxy's {role} key as exportable, and a release build does not use an exportable key. Run `bep --replace-key {role}` to make a new one. Boxes created before then must be re-created."
+            ),
             Self::Store(err) => write!(f, "The proxy did not start: {err}."),
         }
     }
@@ -318,8 +326,10 @@ impl fmt::Display for StartError {
 ///
 /// # Errors
 ///
-/// [`StartError::Unusable`] with the role of each refused or lost key, or
-/// [`StartError::Store`] when a missing key was not generated.
+/// [`StartError::Unusable`] with the role of each refused or lost key,
+/// [`StartError::Exportable`] when a release build finds an exportable
+/// sealing key, or [`StartError::Store`] when a missing key was not
+/// generated.
 pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::Key>, StartError> {
     let mut refused = Vec::new();
     let mut missing = Vec::new();
@@ -331,7 +341,9 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
                 // The sealing key has no such site, so a release build
                 // refuses it here when a debug build left it exportable.
                 Ok(()) if role == Role::Sealing => {
-                    keep_generated(&key).map_err(StartError::Store)?;
+                    if custody(&key, custody_build(&key)) == Custody::Refused {
+                        return Err(StartError::Exportable(role));
+                    }
                     found.push((role, Some(key)));
                 }
                 Ok(()) => found.push((role, Some(key))),
@@ -395,8 +407,9 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
     }
     for key in &keys {
         // BEP-014, BEP-059: once for each role at each start of a debug
-        // build. A release build refused the key where it was generated, or
-        // refuses it at the CA.
+        // build. A release build refuses an exportable key where the keychain
+        // generates it, at load for a stored sealing key, and at the CA for
+        // the root and signing keys.
         if custody(key, custody_build(key)) == Custody::KeptExportable {
             let role = key.role();
             tracing::warn!(
