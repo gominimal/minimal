@@ -62,6 +62,16 @@
 //! < {"ok":true,"old_fingerprint":"<hex>","new_fingerprint":"<hex>"}
 //! ```
 //!
+//! `min secret set` asks the serving proxy to re-certify its root after it
+//! writes a store rule. The proxy re-issues the root for the current rules
+//! and publishes it to the identity file before it replies, so the next box
+//! trusts the new upstream (BEP-013):
+//!
+//! ```text
+//! > {"op":"recertify_root"}
+//! < {"ok":true}
+//! ```
+//!
 //! The box's creator asks for the box ids the revocations in force name
 //! before it gives a new box its id, so a minted id that a revocation holds
 //! is refused (BEP-070). The list holds the revocations the proxy restored
@@ -472,6 +482,52 @@ async fn rotate(ca: Option<Rotation>) -> RotationReply {
         Err(error) => {
             tracing::warn!(%error, "the signing CA did not rotate on request");
             RotationReply::refused("the rotation stopped before it finished")
+        }
+    }
+}
+
+/// The client's request to re-certify the root at once, after it changed a
+/// store registration: a rule of the client's `[secret-store-rules]`. It
+/// is a type of its own, beside [`Request`], because only the serving
+/// proxy can do it: [`handle_line`] has no CA. The reply is a [`Reply`],
+/// and it comes after the re-issue and the publish, so a box created after
+/// an `ok` reply reads a root that permits the changed rules (BEP-013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RecertifyRequest {
+    /// Re-issue the root for the current store rules, and publish it.
+    RecertifyRoot,
+}
+
+/// The serving proxy's root, as the control socket re-certifies it.
+pub trait RecertifyRoot: Send + Sync {
+    /// Reads the current store rules, re-issues the root under the same
+    /// key and subject when their names changed, and publishes it to the
+    /// identity file.
+    ///
+    /// # Errors
+    ///
+    /// Why the re-issue or the publish failed, in words for the operator.
+    /// The root in use stays.
+    fn recertify_root(&self) -> Result<(), String>;
+}
+
+/// The root a control socket re-certifies.
+pub type Recertification = Arc<dyn RecertifyRoot>;
+
+/// Re-certifies the root of `source` for one [`RecertifyRequest`]. The
+/// re-issue signs through the keychain, which can block or wait for a
+/// prompt, so it runs on a blocking thread.
+async fn recertify(source: Option<Recertification>) -> Reply {
+    let Some(source) = source else {
+        return Reply::refused("this proxy does not re-issue its root certificate on request");
+    };
+    match tokio::task::spawn_blocking(move || source.recertify_root()).await {
+        Ok(Ok(())) => Reply::done(),
+        Ok(Err(error)) => Reply::refused(error),
+        Err(error) => {
+            tracing::warn!(%error, "the root was not re-certified on request");
+            Reply::refused("the re-issue of the root certificate stopped before it finished")
         }
     }
 }
@@ -1361,6 +1417,7 @@ pub struct Control {
     records: Records,
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
+    recertification: Option<Recertification>,
 }
 
 impl std::fmt::Debug for Control {
@@ -1368,6 +1425,7 @@ impl std::fmt::Debug for Control {
         f.debug_struct("Control")
             .field("inner", &self.inner)
             .field("rotation", &self.rotation.is_some())
+            .field("recertification", &self.recertification.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1421,6 +1479,7 @@ impl Control {
             },
             keys: Arc::new(keys),
             rotation: None,
+            recertification: None,
         })
     }
 
@@ -1445,6 +1504,14 @@ impl Control {
     #[must_use]
     pub fn with_rotation(mut self, ca: Rotation) -> Self {
         self.rotation = Some(ca);
+        self
+    }
+
+    /// Takes `recertify_root` requests for the root of `source`. Without
+    /// it, the socket refuses each one.
+    #[must_use]
+    pub fn with_recertification(mut self, source: Recertification) -> Self {
+        self.recertification = Some(source);
         self
     }
 
@@ -1474,6 +1541,7 @@ impl Control {
                 self.records.clone(),
                 Arc::clone(&self.keys),
                 self.rotation.clone(),
+                self.recertification.clone(),
             ));
         }
     }
@@ -1494,6 +1562,7 @@ async fn serve(
     records: Records,
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
+    recertification: Option<Recertification>,
 ) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
@@ -1527,6 +1596,8 @@ async fn serve(
         }
         let written = if let Ok(RotationRequest::RotateSigning) = serde_json::from_str(&line) {
             write_reply(&mut write, &rotate(rotation.clone()).await).await
+        } else if let Ok(RecertifyRequest::RecertifyRoot) = serde_json::from_str(&line) {
+            write_reply(&mut write, &recertify(recertification.clone()).await).await
         } else if let Ok(RevocationsRequest::RevokedBoxIds) = serde_json::from_str(&line) {
             write_reply(&mut write, &records.revoked_box_ids()).await
         } else if let Ok(LiveBoxesRequest::LiveBoxes { box_ids }) = serde_json::from_str(&line) {
