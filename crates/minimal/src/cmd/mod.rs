@@ -311,14 +311,6 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
-// The autogen session name and its collision retry are the client
-// library's, shared with `min dash`.
-#[cfg(test)]
-pub(crate) use minimal_client::box_name::AUTOGEN_NAME_RETRIES;
-pub(crate) use minimal_client::box_name::{
-    autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
-};
-
 /// Connect to the daemon, resolving the socket path from global args, and
 /// refuse to proceed against a daemon of a different build
 /// ([`ensure_version_match`]).
