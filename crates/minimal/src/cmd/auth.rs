@@ -1000,7 +1000,7 @@ impl Browser {
                         self.deadline,
                         installed(http, endpoints, token, None),
                     );
-                    if let Ok(Some((on, selection))) = read.await {
+                    if let Ok(Ok(Some((on, selection)))) = read.await {
                         writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
                         return Ok(());
                     }
@@ -1030,39 +1030,49 @@ impl Browser {
             // page and loops back to the deadline arm.
             let read =
                 tokio::time::timeout_at(self.deadline, installed(http, endpoints, token, id));
-            if let Ok(Some((on, selection))) = read.await {
-                respond(&mut conn, &Page::installed(&on, &selection)).await;
-                writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
-                return Ok(());
-            }
-            let page = Page::signed_in(account, &Installs::Listed(Vec::new()));
-            respond(&mut conn, &page).await;
+            let installs = match read.await {
+                Ok(Ok(Some((on, selection)))) => {
+                    respond(&mut conn, &Page::installed(&on, &selection)).await;
+                    writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
+                    return Ok(());
+                }
+                Ok(Ok(None)) => Installs::Listed(Vec::new()),
+                // A failed or cut-short read does not show that no
+                // installation exists.
+                Ok(Err(())) | Err(_) => Installs::Unread,
+            };
+            respond(&mut conn, &Page::signed_in(account, &installs)).await;
         }
     }
 }
 
 /// Re-read the App's installations. With one or more, name the account of
 /// the installation `id`, or of the first one, and what it reaches.
+/// `Ok(None)` when the read shows none, and `Err(())` when the read failed,
+/// which does not show that none exists.
 async fn installed(
     http: &reqwest::Client,
     endpoints: &Endpoints,
     token: &str,
     id: Option<u64>,
-) -> Option<(String, String)> {
+) -> Result<Option<(String, String)>, ()> {
     let read = tokio::time::timeout(FINISH_TIMEOUT, list_installations(http, endpoints, token));
     let list = match read.await {
         Ok(Ok(list)) => list,
         Ok(Err(error)) => {
             tracing::warn!(error = %format!("{error:#}"), "could not read the App's installations");
-            return None;
+            return Err(());
         }
-        Err(_) => return None,
+        Err(_) => return Err(()),
     };
-    let chosen = id
+    let Some(chosen) = id
         .and_then(|id| list.iter().find(|i| i.id == id))
-        .or_else(|| list.first())?;
+        .or_else(|| list.first())
+    else {
+        return Ok(None);
+    };
     let selection = selection(http, endpoints, token, chosen).await;
-    Some((chosen.account.login.clone(), selection))
+    Ok(Some((chosen.account.login.clone(), selection)))
 }
 
 /// What one installation lets boxes reach: "all repositories", or how many
@@ -2298,9 +2308,14 @@ mod tests {
             api,
         };
         let callback = format!("{}?installation_id=1", browser.redirect_uri);
-        tokio::spawn(async move {
+        let page = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = reqwest::get(callback).await;
+            reqwest::get(callback)
+                .await
+                .expect("the held page")
+                .text()
+                .await
+                .expect("body")
         });
         let started = tokio::time::Instant::now();
         browser.deadline = started + Duration::from_secs(2);
@@ -2324,6 +2339,13 @@ mod tests {
             String::from_utf8(err)
                 .expect("utf8")
                 .starts_with("Stopped waiting."),
+        );
+        // A read cut short does not show that no installation exists, so
+        // the held page says the read failed.
+        let page = page.await.expect("join");
+        assert!(
+            page.contains("could not read where the Minimal GitHub App is installed."),
+            "{page}"
         );
     }
 
