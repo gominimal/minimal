@@ -3302,6 +3302,11 @@ pub(crate) struct HostAddressListens {
     /// The ports the host answered a listening notice for and no stopped
     /// notice since.
     noticed: BTreeSet<u16>,
+    /// The ports whose last listening notice the host did not hold, and no
+    /// holding answer since. The host can still record such a port, for
+    /// example as a collision, so a port here that stops listening owes a
+    /// stopped notice too.
+    refused: BTreeSet<u16>,
     /// Per port with a notice the host did not hold: when it is owed
     /// again, and the wait the next failure earns.
     retry: HashMap<u16, (std::time::Instant, Duration)>,
@@ -3310,7 +3315,8 @@ pub(crate) struct HostAddressListens {
 impl HostAddressListens {
     /// The notices owed at `at` to move the host's ports to `now`: one
     /// listening notice per new port and one stopped notice per closed
-    /// port, less each port still in its retry wait. It commits nothing.
+    /// port, held or refused, less each port still in its retry wait. It
+    /// commits nothing.
     pub(crate) fn notices(
         &mut self,
         now: &BTreeSet<u16>,
@@ -3318,7 +3324,8 @@ impl HostAddressListens {
     ) -> Vec<minimald_rpc::ListenNotice> {
         let stopped = self
             .noticed
-            .difference(now)
+            .union(&self.refused)
+            .filter(|port| !now.contains(port))
             .map(|port| minimald_rpc::ListenNotice {
                 port: *port,
                 state: minimald_rpc::ListenState::Stopped,
@@ -3354,11 +3361,15 @@ impl HostAddressListens {
     ) {
         if held {
             self.retry.remove(&notice.port);
+            self.refused.remove(&notice.port);
             match notice.state {
                 minimald_rpc::ListenState::Listening => self.noticed.insert(notice.port),
                 minimald_rpc::ListenState::Stopped => self.noticed.remove(&notice.port),
             };
             return;
+        }
+        if notice.state == minimald_rpc::ListenState::Listening {
+            self.refused.insert(notice.port);
         }
         let wait = self
             .retry
@@ -6625,6 +6636,26 @@ mod tests {
             listens
                 .notices(&BTreeSet::from([8080]), at + LISTEN_NOTICE_RETRY_MAX)
                 .is_empty()
+        );
+        // A port the host refused and that then closes owes a stopped
+        // notice, so the host forgets what it recorded for it, such as a
+        // collision. 8080 is refused again here, then its listener closes.
+        let stop_8080 = minimald_rpc::ListenNotice {
+            port: 8080,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        let mut refused = HostAddressListens::default();
+        refused.answered(notices[1], false, at);
+        let later = at + LISTEN_NOTICE_RETRY_MAX;
+        assert_eq!(
+            refused.notices(&BTreeSet::new(), later),
+            vec![stop_8080],
+            "a refused port that closes owes a stopped notice"
+        );
+        refused.answered(stop_8080, true, later);
+        assert!(
+            refused.notices(&BTreeSet::new(), later).is_empty(),
+            "a held stopped notice clears the refused port"
         );
         // The wire line is the fixed notice: a port and a state alone.
         let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlRequest::ListenNotice(
