@@ -3787,7 +3787,7 @@ async fn activate_and_ls_report_native_surface() {
          {ls_stdout}"
     );
     assert!(
-        !ls_stdout.contains("resolves through this machine's DNS"),
+        !ls_stdout.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {ls_stdout}"
     );
 
@@ -3836,7 +3836,7 @@ async fn activate_and_ls_report_native_surface() {
         "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        !activate_stderr.contains("resolves on this machine"),
+        !activate_stderr.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
