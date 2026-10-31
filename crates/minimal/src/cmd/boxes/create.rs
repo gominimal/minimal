@@ -2898,7 +2898,6 @@ mod tests {
         assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
     }
 
-    /// One broker grant `OPENAI_KEY` that reads the item `openai-key`.
     /// A store reference as a box spec writes it: `source = "store"` with
     /// `store` and `id`.
     fn store_reference(id: &str) -> boxes::core::bep::SecretGrant {
@@ -2908,6 +2907,7 @@ mod tests {
         .expect("a store reference parses")
     }
 
+    /// One store grant `OPENAI_KEY` that reads the item `openai-key`.
     fn store_grant() -> boxes::core::bep::SecretGrants {
         boxes::core::bep::SecretGrants::from([("OPENAI_KEY".into(), store_reference("openai-key"))])
     }

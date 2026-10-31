@@ -238,7 +238,9 @@ impl TryFrom<GrantFields> for SecretGrant {
                         extra.join(" and ")
                     ));
                 }
-                match (fields.store, fields.id) {
+                // An empty or blank value names nothing, so it reads as absent.
+                let present = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+                match (present(fields.store), present(fields.id)) {
                     (Some(store), Some(id)) => GrantSource::Store { store, id },
                     (store, id) => {
                         const STORE: &str = "store = \"keychain\"";
@@ -1839,6 +1841,14 @@ mod tests {
                 "has no id field.",
             ),
             ("source = \"store\"", "has no store field and no id field."),
+            (
+                "source = \"store\"\nstore = \"\"\nid = \"claude\"",
+                "has no store field.",
+            ),
+            (
+                "source = \"store\"\nstore = \"keychain\"\nid = \"  \"",
+                "has no id field.",
+            ),
         ] {
             let err = toml::from_str::<SecretGrant>(text)
                 .expect_err("a store grant needs store and id")
