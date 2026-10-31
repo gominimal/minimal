@@ -3376,11 +3376,6 @@ impl HostAddressListens {
 /// A read that fails is logged and retried on the next poll. A notice the
 /// host refuses or never answers is logged and sent again after its retry
 /// wait. A native host has no report door, so this returns at once.
-#[expect(
-    dead_code,
-    reason = "the guest start path that spawns it for a VM-backed node lands with the \
-              host-side binder's wiring (T117's notes)"
-)]
 pub(crate) async fn watch_host_address_listens(
     control: ControlChannel,
     lease: Ipv4Addr,

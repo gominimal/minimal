@@ -1242,6 +1242,10 @@ impl Server {
         // hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
+        #[cfg(target_os = "linux")]
+        if in_microvm {
+            start_host_address_listen_watcher(&state).await;
+        }
 
         Self::serve(state, listener).await
     }
@@ -1688,6 +1692,29 @@ async fn start_host_proxies(
         state.clone(),
         hook_port,
         answerer_status,
+    ));
+}
+
+/// Starts the host-address listen watcher of a daemon inside a microVM for
+/// the daemon's life (NET-138): a host-address box shares the node's
+/// namespace, so the VM host daemon opens its listeners on the host only
+/// from the listen notices this watcher sends over the report door. It
+/// stops when the daemon shuts down.
+#[cfg(target_os = "linux")]
+async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
+    let shutdown = state.shutdown_token().await;
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    crate::traced::spawn(async move {
+        shutdown.cancelled().await;
+        let _ = stop_tx.send(true);
+    });
+    crate::traced::spawn(crate::net::listeners::watch_host_address_listens(
+        crate::net::policy::ControlChannel::Vsock {
+            cid: crate::net::VSOCK_HOST_CID,
+            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+        },
+        crate::net::DEFAULT_SUBNET.daemon_ip(),
+        stop,
     ));
 }
 
