@@ -1258,11 +1258,16 @@ const AUDIT_SEGMENT_BYTES_ENV: &str = "BEP_AUDIT_SEGMENT_BYTES";
 /// positive integer, else [`audit::SEGMENT_BYTES`]. An unset, empty, zero
 /// or unparsable value keeps the default.
 fn audit_segment_bound(value: Option<&std::ffi::OsStr>) -> u64 {
+    audit_segment_override(value).unwrap_or(audit::SEGMENT_BYTES)
+}
+
+/// The positive integer that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] holds,
+/// or `None` when it is unset, empty, zero or unparsable.
+fn audit_segment_override(value: Option<&std::ffi::OsStr>) -> Option<u64> {
     value
         .and_then(|value| value.to_str())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|bound| *bound > 0)
-        .unwrap_or(audit::SEGMENT_BYTES)
 }
 
 /// The rotation bounds of the audit log that `bep serve` writes. In a
@@ -1279,13 +1284,19 @@ fn audit_rotation() -> audit::Rotation {
     }
     let value = set.filter(|_| cfg!(debug_assertions));
     let bound = audit_segment_bound(value.as_deref());
-    if value.is_some() {
-        tracing::info!(
+    match (value.is_some(), audit_segment_override(value.as_deref())) {
+        (true, Some(_)) => tracing::info!(
             bound,
             variable = AUDIT_SEGMENT_BYTES_ENV,
             default = audit::SEGMENT_BYTES,
             "audit segment bound set by the test override"
-        );
+        ),
+        (true, None) => tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound,
+            "ignored the audit segment test override: the value is not a positive integer"
+        ),
+        (false, _) => {}
     }
     audit::Rotation {
         bound,
@@ -1967,7 +1978,9 @@ mod tests {
                 audit::SEGMENT_BYTES,
                 "{ignored:?}"
             );
+            assert_eq!(audit_segment_override(Some(OsStr::new(ignored))), None);
         }
+        assert_eq!(audit_segment_override(Some(OsStr::new("512"))), Some(512));
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("audit");
