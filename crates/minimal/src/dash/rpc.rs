@@ -335,6 +335,30 @@ pub async fn prepare_attach(
     record: Option<boxes::Record>,
 ) -> anyhow::Result<Option<boxes::BoxAddresses>> {
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
+    // A `host_ip` box's egress, re-admitted as `min session attach` re-admits
+    // it: a VM host daemon that restarted holds none, and its gate then drops
+    // the box's frames outside the VM (NET-085). Idempotent. The record was
+    // read before the admit, so a session destroyed in between has its rules
+    // retired here once a second lookup finds it gone.
+    if let Some(record) = record.as_ref()
+        && record.network == NetworkMode::HostNet
+        && crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            record.id,
+            record.policy.egress.clone(),
+            true,
+        )
+        .await
+        && let Ok(None) = crate::attached_box_record(sock, record.id).await
+    {
+        crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            record.id,
+            None,
+            false,
+        )
+        .await;
+    }
     Ok(record.and_then(|record| record.box_addresses))
 }
 
@@ -343,6 +367,16 @@ pub async fn prepare_attach(
 /// registered is withdrawn with the pair off its record, and a `host_ip`
 /// box's zone hold is released. A session that held neither owes nothing.
 async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record) {
+    // A `host_ip` box's egress goes with its session, named or not (NET-085).
+    if record.network == NetworkMode::HostNet && record.box_addresses.is_none() {
+        crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            id,
+            None,
+            false,
+        )
+        .await;
+    }
     let Some(name) = record.name.as_deref() else {
         return;
     };
@@ -503,6 +537,16 @@ pub async fn activate(
     }
     let id = created.id;
     let egress_deny_all_default = undeclared_own_ip && deny_all_default_binds(&created);
+    // A `host_ip` box's egress, admitted on the VM host daemon before the box
+    // runs anything, as `min session activate` admits it (NET-085). The guard
+    // retires it if the flow below fails.
+    let mut host_ip_residency = crate::HostIpResidency::admit(
+        minimal_client::box_registration::vm_host_control_sock(sock),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+    )
+    .await;
 
     // The registration's lease is held across the flow and committed only
     // once the session is active: until then a dashboard that dies leaves
@@ -587,6 +631,9 @@ pub async fn activate(
     // its name and be reaped at the next daemon restart anyway.
     match flow {
         Ok((package_check_skipped, upload)) => {
+            if let Some(residency) = host_ip_residency.as_mut() {
+                residency.keep();
+            }
             // The session is active: a `host_ip` box holds its name in the
             // zone (NODATA) the way `min session activate` holds it, read
             // off the record so an autogen name is the one held.

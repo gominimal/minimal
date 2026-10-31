@@ -2270,6 +2270,11 @@ pub fn render_guest_ruleset_over(
         .arg(params.node_plane_address.to_string())
         .arg("--ct-mark-mask")
         .arg(format!("0x{:08x}", params.ct_mark_mask))
+        // The guest's one address carries both the boxes cohort and the
+        // daemon's own traffic, so the VM host's gate reads the sender's
+        // cgroup from this DSCP mark instead of from the source address.
+        .arg("--cohort-dscp")
+        .arg(boxes::core::egress::BOX_COHORT_DSCP.to_string())
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5516,12 +5521,15 @@ mod tests {
         // own parameters — a VM-backed guest's carve-out is the gateway's
         // resolver.
         let print_mount = standin_mount();
+        let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
         let printed = run_step(
             &print_mount,
             &[
                 "--print-ruleset",
                 GUEST_RESOLVER_FLAGS[0],
                 GUEST_RESOLVER_FLAGS[1],
+                "--cohort-dscp",
+                &dscp,
             ],
             None,
         );
@@ -5552,7 +5560,20 @@ mod tests {
         // posture lifts is the only privilege it does — so this lane
         // asserts the one text on root lanes too, not only where a
         // person's account happens to be the one that ran sudo.
-        let installed = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, stub.path());
+        // The guest's render names the box mark, so the install is handed
+        // the same flag and renders the same one text.
+        let installed = run_install_with(
+            &mount,
+            &[
+                GUEST_RESOLVER_FLAGS[0],
+                GUEST_RESOLVER_FLAGS[1],
+                GUEST_RESOLVER_FLAGS[2],
+                GUEST_RESOLVER_FLAGS[3],
+                "--cohort-dscp",
+                &dscp,
+            ],
+            stub.path(),
+        );
         assert!(
             installed.status.success(),
             "the install lays out its tree and hands its one transaction to nft: {}{}",
@@ -6226,6 +6247,43 @@ mod tests {
         );
     }
 
+    /// The guest's table writes the sender's cgroup into every packet it
+    /// sends: the boxes cohort's connections leave with the box mark, and
+    /// every other packet with the field cleared, so the VM host's gate
+    /// can tell a box's frame from the daemon's own at the one address
+    /// both leave from. A native install, which takes no `--cohort-dscp`,
+    /// renders no such chain and leaves the field alone.
+    #[test]
+    fn guest_table_marks_the_box_cohort_in_dscp() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let dscp = boxes::core::egress::BOX_COHORT_DSCP;
+        let marks = chain_rules(&ruleset, "mark_cohort");
+        assert_eq!(marks.len(), 2, "the chain holds two rules: {marks:?}");
+        assert!(
+            ruleset.contains(
+                "chain mark_cohort {\n        type filter hook postrouting priority mangle;"
+            ),
+            "the mark is a postrouting filter chain, which sees every packet:\n{ruleset}"
+        );
+        assert!(
+            marks[0].ends_with(&format!("ip dscp set {dscp}")) && marks[0].contains("=="),
+            "the cohort's connections take the box mark: {marks:?}"
+        );
+        assert!(
+            marks[1].ends_with("ip dscp set 0") && marks[1].contains("!="),
+            "every other packet leaves with the field cleared: {marks:?}"
+        );
+
+        let mount = standin_mount();
+        let native = run_step(&mount, &["--print-ruleset"], None);
+        assert!(
+            !String::from_utf8_lossy(&native.stdout).contains("mark_cohort"),
+            "a native install renders no DSCP chain"
+        );
+    }
+
     /// NET-079: the guest loads the installer's own render, not a second
     /// spelling of it kept in step. The daemon compiles the installer in
     /// from the one file — `include_str!`, never a copy staged anywhere a
@@ -6258,6 +6316,9 @@ mod tests {
                 "the harness pair the step's own tests render",
             ),
         ] {
+            // The guest's render also names the box mark, which a native
+            // install never takes, so the step is handed the same flag.
+            let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
             let step = step_command_over(
                 &mount,
                 &[
@@ -6266,6 +6327,8 @@ mod tests {
                     GUEST_RESOLVER_FLAGS[1],
                     GUEST_RESOLVER_FLAGS[2],
                     GUEST_RESOLVER_FLAGS[3],
+                    "--cohort-dscp",
+                    &dscp,
                 ],
                 None,
                 &cohort.to_string(),
@@ -6340,6 +6403,8 @@ mod tests {
                 guest_ip.to_string(),
                 "--ct-mark-mask".to_string(),
                 format!("0x{:08x}", GUEST_CT_MARK_MASK),
+                "--cohort-dscp".to_string(),
+                boxes::core::egress::BOX_COHORT_DSCP.to_string(),
             ],
             "every parameter arrives as argv after --print-ruleset, none \
              interpolated into the script the daemon pipes"

@@ -19228,9 +19228,9 @@ ESU_LISTENER_EOF
       esu_fail
     fi
     if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
-      || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
-      || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
-      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
+      || ! grep -q 'registry  github.com' <<<"$esu_policy" \
+      || ! grep -q 'cache  cache.minimal.dev' <<<"$esu_policy"; then
+      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry github.com and the cache cache.minimal.dev)"
       esu_fail
     fi
   done
