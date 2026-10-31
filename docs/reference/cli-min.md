@@ -53,6 +53,33 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+The table has the columns `SESSION ID`, `NAME`, `ADDRESS`, `STATUS`,
+`EGRESS`, `TITLE`, `LAST ACTIVITY` and `PROJECT PATH`. `ADDRESS` is the
+host loopback address where the box's ports answer. A box with an address of
+its own shows that address. A box at the shared fallback shows `127.0.0.1`.
+The column shows `-` when the daemon does not report an address. An older
+daemon does not report it.
+
+`EGRESS` is the box's egress posture, in the words `min session policy`
+prints for it:
+
+| `EGRESS` | `egress_posture` in `--json` | Meaning |
+|---|---|---|
+| `deny-all (default)` | `deny_all_default` | The box does not declare egress, and the default denies every external address |
+| `allow-all (default)` | `allow_all_default` | The box does not declare egress, and the default allows every address: the operator opt-out, or a box without an address of its own |
+| `deny-all` | `deny_all` | The box declares egress that admits nothing |
+| `declared rules` | `declared_rules` | The box declares egress rules of its own. `min session policy` lists them |
+| `no network` | `no_network` | A `--network none` box. It has no network, so no egress posture applies |
+
+A host-address box on a host that cannot decide egress per box adds
+`; per-box enforcement none` to the posture. `min session policy` prints the
+same fact as its `per-box enforcement` row. The column shows `-` when the
+daemon does not report a posture.
+
+With `--json`, each session entry has the address under `loopback_address`
+and the posture under `egress_posture`. The entry omits a key when the daemon
+does not report that value.
+
 Another box at the same shared loopback address can hold a port this box
 declares, and this box does not forward it. The list prints one stderr line
 per such port after the table:
@@ -543,14 +570,24 @@ min finalize-install [--show [--script | --json]] [--undo]
 The installer runs without privilege. Anything on this host that needs root
 is left for this command, which runs it in one `sudo` call. Until it runs,
 the hostname proxy serves box names. The host line that
-`min session activate` prints says where the box name resolves:
-`names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`
-while the proxy serves the names, or
-`names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>`
-once this host resolves the zone natively. Native names resolve to a reserved
-local address. A browser opens the box through the hostname proxy, which
-keeps serving. While any item is not done, the
-line ends with `; finish setup: min finalize-install`. When the proxy failed
+`min session activate` prints says how the box name opens. While the proxy
+serves the names, the line is
+`names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`.
+Once this host resolves the zone natively, the line has one of two forms. The
+first form is for a box with its own reserved local address:
+
+```text
+names: <box>.min.internal opens at its name on this machine; the HTTP proxy at 127.0.0.1:<port> opens it too
+```
+
+The second form is for a box at the `127.0.0.1` fallback:
+
+```text
+names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>
+```
+
+The `BOX NAMES` row of `min ls` states the same words. While any item is not
+done, the line ends with `; finish setup: min finalize-install`. When the proxy failed
 to bind, the cause replaces the resolution and the box stays named:
 `names: <box>.min.internal: the hostname proxy is not serving: <cause>`, with
 the same clause after it when it applies. A session
