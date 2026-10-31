@@ -929,7 +929,11 @@ impl ControlClient {
         })
     }
 
-    fn ask(&mut self, request: &Request, what: &'static str) -> Result<Reply, MintError> {
+    fn ask(
+        &mut self,
+        request: &impl serde::Serialize,
+        what: &'static str,
+    ) -> Result<Reply, MintError> {
         let mut line = serde_json_lenient::to_string(request).map_err(|error| {
             MintError::Control(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
@@ -1028,6 +1032,25 @@ impl ControlClient {
                 Err(error)
             }
         }
+    }
+
+    /// Asks the proxy to re-certify its root for the current store rules,
+    /// after `min secret set` wrote one (BEP-013). The proxy replies after
+    /// it re-issued the root and published it to the identity file, so a box
+    /// created after an `Ok` reads a root that permits the rule's upstream.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy did not re-issue or publish the
+    /// root, with its reason.
+    pub fn recertify_root(&mut self) -> Result<(), MintError> {
+        self.ask(
+            &bep::control::RecertifyRequest::RecertifyRoot,
+            "the re-issue of its root certificate",
+        )?;
+        tracing::debug!("the proxy re-certified its root for the store rules");
+        Ok(())
     }
 
     /// Tells the proxy to forget the box `box_id`.

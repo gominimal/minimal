@@ -2863,6 +2863,11 @@ pub struct BoxRegistry {
     /// frees only that session's hold, never a newer session's under the
     /// same name.
     held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
+    /// The resident `host_ip` boxes' compiled egress, by session
+    /// ([`Self::admit_host_ip_box`], NET-085), shared by every clone and
+    /// every [`BoxTable`]: the union the gate decides a box-marked frame
+    /// from the node address by.
+    host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -3334,6 +3339,7 @@ impl Clone for BoxRegistry {
             rows: self.rows.clone(),
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
+            host_ip_boxes: Arc::clone(&self.host_ip_boxes),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
@@ -3375,6 +3381,7 @@ impl BoxRegistry {
             rows: Arc::new(RwLock::new(BTreeMap::new())),
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
+            host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -5948,6 +5955,7 @@ impl BoxRegistry {
     pub fn table(&self) -> BoxTable {
         BoxTable {
             rows: Arc::clone(&self.rows),
+            host_ip_boxes: Arc::clone(&self.host_ip_boxes),
             subnet: self.subnet,
             withdrawal_reports: self.withdrawal_reports.clone(),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
@@ -5955,7 +5963,237 @@ impl BoxRegistry {
             row_epoch: Arc::clone(&self.row_epoch),
         }
     }
+
+    /// Holds a resident `host_ip` box's egress for the gate (NET-085): the
+    /// session's policy, filled under this registry's egress default the
+    /// way the guest daemon fills it, and compiled with the node's own
+    /// address as its lease, the one source a `host_ip` box's frames carry.
+    /// A second admit for the same session with rules equal to the held
+    /// ones changes nothing and logs nothing: the cohort record, and so
+    /// every resident box's pins and flows, stay. A second admit with other
+    /// rules replaces the first. Returns `true`: the gate holds the box's
+    /// rules once this returns.
+    ///
+    /// A real change of the resident set rebuilds the cohort record: a
+    /// box admitted with new or changed rules, or a box retired
+    /// ([`Self::retire_host_ip_box`]). The pin table then starts a new
+    /// entry, so every resident box's name pins and retained flows go, and
+    /// each box gets them back when it resolves its names again.
+    ///
+    /// The policy is the host-side client's, carried over the host's
+    /// control socket, never anything the guest says. One info line names
+    /// the session and the count of resident boxes.
+    ///
+    /// Only a client of this host retires the rules
+    /// ([`Self::retire_host_ip_box`]). Four cases leave them in
+    /// `host_ip_boxes` while the box has no live process:
+    ///
+    /// - A destroy that no client of this host issues, such as the in-VM
+    ///   daemon's reap. The rules stay until the VM host daemon restarts.
+    /// - A retire that fails. The rules stay until the VM host daemon
+    ///   restarts.
+    /// - A box that the in-VM daemon sets to `stopped` at its start
+    ///   (`stop_orphaned_running_records` in `minimald`'s `box_manager`,
+    ///   BOX-154). The rules stay in the union while no process runs.
+    /// - A box that an attach leaves `stopped` or `exited` through Keep
+    ///   (`HostIpResidency::keep` in the `min` CLI). The rules stay until
+    ///   the box is destroyed.
+    ///
+    /// In each case the union the gate decides a box-marked frame by can
+    /// include a box that is not live. A resume (BOX-025) does not admit a
+    /// box again. After a VM host daemon restart, a resumed `host_ip` box
+    /// gets no egress until it is created again.
+    /// <https://github.com/gominimal/minimal/issues/2747> owns closing these
+    /// cases.
+    pub fn admit_host_ip_box(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<&EgressPolicy>,
+    ) -> bool {
+        let policy = match boxes::effective_egress(
+            declared,
+            boxes::NetworkMode::HostNet,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
+        };
+        let node = self.subnet.daemon_ip().octets();
+        let resolver = self.subnet.dns_server().octets();
+        let rules = HostIpBoxRules {
+            session_id,
+            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
+            dns_hosts: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_dns_hosts.clone())
+                .unwrap_or_default(),
+            allow_subnets: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_subnets.clone()),
+        };
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        if resident
+            .boxes
+            .get(&session_id)
+            .is_some_and(|held| **held == rules)
+        {
+            // An attach re-admits with the rules the set already holds. The
+            // cohort record stays the same `Arc`, so the pins and flows every
+            // resident box took under it stay too.
+            return true;
+        }
+        resident.boxes.insert(session_id, Arc::new(rules));
+        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        let count = resident.boxes.len();
+        drop(resident);
+        tracing::info!(
+            session = %session_id,
+            resident_host_ip_boxes = count,
+            "holding the host_ip box's egress rules; box-marked frames from the node \
+             address are decided by the resident boxes' rules"
+        );
+        true
+    }
+
+    /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
+    /// its box stopped or was destroyed, so its rules admit nothing from
+    /// now on. A session the set does not hold is the goal state already
+    /// holding. Returns whether a box's rules were dropped.
+    pub fn retire_host_ip_box(&self, session_id: boxes::SessionId) -> bool {
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let removed = resident.boxes.remove(&session_id).is_some();
+        if removed {
+            resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        }
+        let count = resident.boxes.len();
+        drop(resident);
+        if removed {
+            tracing::info!(
+                session = %session_id,
+                resident_host_ip_boxes = count,
+                "dropped the host_ip box's egress rules"
+            );
+        }
+        removed
+    }
 }
+
+/// One resident `host_ip` box's egress, compiled on the host
+/// ([`BoxRegistry::admit_host_ip_box`], NET-085): the rules a box-marked
+/// frame from the node address is decided by, beside every other resident
+/// box's.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostIpBoxRules {
+    session_id: boxes::SessionId,
+    egress: EgressRules,
+    dns_hosts: Vec<String>,
+    allow_subnets: Option<Vec<String>>,
+}
+
+impl HostIpBoxRules {
+    /// The session the box runs as.
+    #[must_use]
+    pub fn session_id(&self) -> boxes::SessionId {
+        self.session_id
+    }
+
+    /// The box's compiled egress rules, leased to the node's own address.
+    #[must_use]
+    pub fn egress(&self) -> &EgressRules {
+        &self.egress
+    }
+
+    /// Whether the box declared DNS hosts: its undeclared destinations are
+    /// then the host-side DNS admission table's to decide.
+    #[must_use]
+    pub fn resolves_names(&self) -> bool {
+        !self.dns_hosts.is_empty()
+    }
+}
+
+/// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the
+/// one row-shaped record their declared names pin under.
+#[derive(Debug, Default)]
+struct HostIpBoxes {
+    boxes: BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+    /// The record the host-side DNS admission table pins the resident
+    /// boxes' declared names under: every resident box's DNS hosts and
+    /// allowed subnets, keyed to the node's own address. `None` when no
+    /// resident box declared a DNS host, so nothing can pin for them.
+    /// Rebuilt on every change, so a pin taken for a box that left never
+    /// outlives the record it was taken under.
+    cohort: Option<Arc<BoxRecord>>,
+}
+
+impl HostIpBoxes {
+    /// The pin record for `boxes`: `None` when no box declared a DNS host.
+    fn cohort_record(
+        boxes: &BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+        subnet: SwitchSubnet,
+    ) -> Option<Arc<BoxRecord>> {
+        let mut dns_hosts: Vec<String> = Vec::new();
+        let mut allow_subnets: Vec<String> = Vec::new();
+        for rules in boxes.values().filter(|rules| rules.resolves_names()) {
+            for host in &rules.dns_hosts {
+                if !dns_hosts.contains(host) {
+                    dns_hosts.push(host.clone());
+                }
+            }
+            for subnet in rules.allow_subnets.iter().flatten() {
+                if !allow_subnets.contains(subnet) {
+                    allow_subnets.push(subnet.clone());
+                }
+            }
+        }
+        if dns_hosts.is_empty() {
+            return None;
+        }
+        let node = subnet.daemon_ip();
+        let policy = EgressPolicy {
+            allow_subnets: Some(allow_subnets.clone()),
+            allow_dns_hosts: Some(dns_hosts.clone()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        Some(Arc::new(BoxRecord {
+            name: HOST_IP_COHORT_NAME.to_string(),
+            box_id: crate::bep_attach::mint_box_id(),
+            switch_addr: node,
+            loopback_addr: node,
+            admitted_ports: Vec::new(),
+            declared_names: Vec::new(),
+            egress: EgressRules::from_policy(
+                Some(&policy),
+                subnet.dns_server().octets(),
+                node.octets(),
+            ),
+            resolves_names: true,
+            dns_hosts,
+            deny_all: false,
+            credentialed_upstream: false,
+            dynamic_ingress: DynamicIngress::Deny,
+            dynamic_range: None,
+            runtime_ports: Mutex::new(RowRuntime::default()),
+            egress_allow_list: allow_subnets,
+            attributed: AtomicBool::new(false),
+            liveness: Mutex::new(RowLiveness::default()),
+            task_row_of: None,
+            task_addrs: Vec::new(),
+        }))
+    }
+}
+
+/// The name the resident `host_ip` boxes' pin record carries in the DNS
+/// admission table's log lines.
+const HOST_IP_COHORT_NAME: &str = "host_ip boxes";
 
 /// The run of published loopback addresses a box may take inside `slice`:
 /// the slice clamped to the reserved local range's interior. The range's
@@ -6064,6 +6302,7 @@ fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
 #[derive(Debug, Clone)]
 pub struct BoxTable {
     rows: Arc<RwLock<Rows>>,
+    host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     subnet: SwitchSubnet,
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
     row_withdrawals: RowWithdrawals,
@@ -6259,6 +6498,33 @@ impl BoxTable {
     pub fn is_allocatable(&self, src: [u8; 4]) -> bool {
         let addr = u32::from(Ipv4Addr::from(src));
         self.subnet.first_ptask() <= addr && addr <= self.subnet.last_ptask()
+    }
+
+    /// The resident `host_ip` boxes' rules, in session order: the union a
+    /// box-marked frame from the node address is decided by (NET-085).
+    /// Empty when no `host_ip` box is resident, and the gate then drops
+    /// every such frame.
+    #[must_use]
+    pub fn host_ip_boxes(&self) -> Vec<Arc<HostIpBoxRules>> {
+        self.host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .boxes
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The record the resident `host_ip` boxes' declared names pin under in
+    /// the DNS admission table, keyed to the node's own address. `None`
+    /// when no resident box declared a DNS host.
+    #[must_use]
+    pub fn host_ip_cohort(&self) -> Option<Arc<BoxRecord>> {
+        self.host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .cohort
+            .clone()
     }
 
     /// Every published row, in switch-address order.
@@ -9458,7 +9724,14 @@ mod tests {
         // proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9472,7 +9745,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
@@ -9779,7 +10052,14 @@ mod tests {
         // that proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9793,7 +10073,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
