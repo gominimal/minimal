@@ -339,9 +339,8 @@ fn refuse_unhonourable_grants(
 /// proxy's listener is live, and SERVFAIL while it is down. A native host
 /// has no proxy, so a steered name there always fails closed, and a
 /// `host_ip` or `none` box has no steered lookups of its own. `min box
-/// spec` reads it for a default box, whose network is
-/// [`default_box_network`]. Where this is
-/// true, `dns` steering is still refused on its own grounds until the proxy
+/// spec` reads it for the network its `--network` flag names. Where this
+/// is true, `dns` steering is still refused on its own grounds until the proxy
 /// takes a direct TLS connection (#2805). Under `both`, a tool that
 /// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
 /// TCP connection to port 443 with no reset, so it stalls until #2805 adds
@@ -350,21 +349,15 @@ pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::Net
     kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
 }
 
-/// The network mode of a default box: the default of `min box create
-/// --network`, read from that flag's own definition, so `min box spec`
-/// previews the box a default creation makes and cannot drift from it.
-pub(crate) fn default_box_network() -> boxes::NetworkMode {
-    use clap::Args as _;
-    let command = crate::cli::ActivateArgs::augment_args(clap::Command::new("min"));
-    let raw = command
-        .get_arguments()
-        .find(|arg| arg.get_id() == "network")
-        .and_then(|arg| arg.get_default_values().first())
-        .and_then(|value| value.to_str())
-        .expect("--network declares a default");
-    crate::cli::parse_network_mode(raw)
-        .expect("the --network default parses")
-        .into()
+/// The network and the host fact a creation reads, for a host of `kind`:
+/// the box's `--network` mode, and whether the switch resolves that box's
+/// names. `min box spec` reads the same fact for the same mode.
+pub(crate) fn creation_host(
+    kind: paths::HostKind,
+    args: &crate::cli::ActivateArgs,
+) -> (boxes::NetworkMode, bool) {
+    let network: boxes::NetworkMode = args.network.into();
+    (network, host_resolves_box_names(kind, network))
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -1410,14 +1403,14 @@ pub(crate) async fn activate_box(
                 .values()
                 .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
                 && crate::config::full_breadth_acknowledged(global)?;
-            let network: boxes::NetworkMode = args.network.into();
+            let (network, box_zone_resolver) = creation_host(daemon_host_kind(global), &args);
             refuse_unhonourable_grants(
                 network,
                 policy.egress.as_ref(),
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
-                host_resolves_box_names(daemon_host_kind(global), network),
+                box_zone_resolver,
                 &project_env,
             )?;
             // BEP-034/035/036: each store reference needs a rule that admits
@@ -3648,6 +3641,7 @@ mod tests {
                         quic443: None,
                         secrets: &secrets,
                         acknowledged: false,
+                        network,
                         box_zone_resolver: resolver,
                         github_hosts: &github_hosts,
                         store_rules: &rules,
@@ -3679,43 +3673,105 @@ mod tests {
                 }
             }
 
-            // A default `min box create` and `min box spec` agree on every
-            // host: the preview is of a default box, whose network is the
-            // `--network` default.
-            assert_eq!(default_box_network(), boxes::NetworkMode::HostNet);
-            for kind in [HostKind::Minvmd, HostKind::Minimald] {
-                let network = default_box_network();
-                let created = refuse_unhonourable_grants(
-                    network,
-                    Some(&egress),
-                    &bep,
-                    &secrets,
-                    false,
-                    host_resolves_box_names(kind, network),
-                    &spec_env,
-                );
-                let rules = boxes::core::bep::StoreRules::new();
-                let previewed = crate::cmd::box_spec::render(
-                    &crate::cmd::box_spec::SpecInputs {
-                        root_fingerprint: None,
-                        bep: &bep,
-                        quic443: None,
-                        secrets: &secrets,
-                        acknowledged: false,
-                        box_zone_resolver: crate::cmd::box_spec::preview_box_zone_resolver(kind),
-                        github_hosts: &github_hosts,
-                        store_rules: &rules,
-                    },
-                    &mut Vec::new(),
-                );
-                let case = format!("{word} {kind:?} default network");
-                let created = created.map(|_| ()).map_err(|err| err.to_string());
-                let previewed = previewed.map_err(|err| err.to_string());
-                assert_eq!(created, previewed, "{case}: same refusal");
-                // A default box has no steered lookups of its own, so it is
-                // refused for the missing resolver, `both` included.
-                assert_eq!(created, Err(no_resolver.clone()), "{case}");
+            // `min box spec --network <mode>` and `min session activate
+            // --network <mode>`, parsed as the command line gives them, read
+            // the same network and host fact, so they give the same refusal
+            // for every mode on both host kinds. With no flag, both are of a
+            // `host_ip` box.
+            for flag in [None, Some("none"), Some("host_ip"), Some("own_ip")] {
+                for kind in [HostKind::Minvmd, HostKind::Minimald] {
+                    let mut activate = vec!["min", "session", "activate"];
+                    let mut spec = vec!["min", "box", "spec"];
+                    if let Some(mode) = flag {
+                        activate.extend(["--network", mode]);
+                        spec.extend(["--network", mode]);
+                    }
+                    let activate_args = parsed_activate_args(&activate);
+                    let spec_args = parsed_box_spec_args(&spec);
+                    let (network, resolver) = creation_host(kind, &activate_args);
+                    let (spec_network, spec_resolver) =
+                        crate::cmd::box_spec::preview_host(kind, &spec_args);
+                    let case = format!("{word} {kind:?} --network {flag:?}");
+                    assert_eq!(network, spec_network, "{case}: same network");
+                    assert_eq!(resolver, spec_resolver, "{case}: same host fact");
+
+                    let created = refuse_unhonourable_grants(
+                        network,
+                        Some(&egress),
+                        &bep,
+                        &secrets,
+                        false,
+                        resolver,
+                        &spec_env,
+                    );
+                    let rules = boxes::core::bep::StoreRules::new();
+                    let mut out = Vec::new();
+                    let previewed = crate::cmd::box_spec::render(
+                        &crate::cmd::box_spec::SpecInputs {
+                            root_fingerprint: None,
+                            bep: &bep,
+                            quic443: None,
+                            secrets: &secrets,
+                            acknowledged: false,
+                            network: spec_network,
+                            box_zone_resolver: spec_resolver,
+                            github_hosts: &github_hosts,
+                            store_rules: &rules,
+                        },
+                        &mut out,
+                    );
+                    let created = created.map(|_| ()).map_err(|err| err.to_string());
+                    let previewed = previewed.map_err(|err| err.to_string());
+                    assert_eq!(created, previewed, "{case}: same refusal");
+
+                    let own_ip_on_vm_host = kind == HostKind::Minvmd && flag == Some("own_ip");
+                    if word == "both" && own_ip_on_vm_host {
+                        // On the VM host, `min box spec --network own_ip`
+                        // admits a `both` spec with a credentialed upstream.
+                        assert_eq!(previewed, Ok(()), "{case}: admitted");
+                        let text = String::from_utf8(out).expect("utf-8");
+                        assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    } else if word == "both" {
+                        // Any other mode or host has no steered lookups of
+                        // its own, so `both` is refused for the missing
+                        // resolver. That includes no flag at all, as a
+                        // default activation is refused. A `none` box is
+                        // also refused for its missing network.
+                        let refused = previewed.expect_err("min box spec refuses");
+                        assert!(refused.ends_with(no_resolver.as_str()), "{case}: {refused}");
+                        if flag == Some("none") {
+                            assert!(refused.contains("has no network"), "{case}: {refused}");
+                        } else {
+                            assert_eq!(refused, no_resolver, "{case}");
+                        }
+                    } else {
+                        assert!(previewed.is_err(), "{case}: dns is refused");
+                    }
+                }
             }
+        }
+    }
+
+    /// The `min session activate` arguments for `argv`, from the real clap
+    /// parse.
+    fn parsed_activate_args(argv: &[&str]) -> ActivateArgs {
+        use clap::Parser as _;
+        match crate::Cli::try_parse_from(argv).expect("parses").command {
+            Some(crate::Command::Session(crate::SessionArgs {
+                command: crate::SessionCommand::Activate(args),
+            })) => args,
+            _ => panic!("expected min session activate for {argv:?}"),
+        }
+    }
+
+    /// The `min box spec` arguments for `argv`, from the real clap parse.
+    fn parsed_box_spec_args(argv: &[&str]) -> crate::BoxSpecArgs {
+        use clap::Parser as _;
+        match crate::Cli::try_parse_from(argv).expect("parses").command {
+            Some(crate::Command::Box(crate::BoxArgs {
+                command: crate::BoxCommand::Spec(args),
+            })) => args,
+            _ => panic!("expected min box spec for {argv:?}"),
         }
     }
 

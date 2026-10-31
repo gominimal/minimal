@@ -33,8 +33,12 @@ pub(crate) struct SpecInputs<'a> {
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
     pub acknowledged: bool,
+    /// The box's network mode, from `min box spec --network`, the same
+    /// mode `min session activate --network` gives the box it creates.
+    pub network: boxes::NetworkMode,
     /// Whether this host's switch resolves the box's steered names, the
-    /// same host fact the box's creation reads (BEP-017).
+    /// same host fact the box's creation reads (BEP-017):
+    /// `host_resolves_box_names` for this host and [`Self::network`].
     pub box_zone_resolver: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
@@ -61,7 +65,8 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     // BEP-057: every host is un-enrolled today.
-    // Interim: only BEP-057 and BEP-017 are previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // Interim: only BEP-057, BEP-009 (from `--network`) and BEP-017 are
+    // previewed here; the full exit-3 set is gominimal/minimal#2445.
     // BEP-017 and its `dns` interim (#2805): the resolver fact is the one
     // creation reads, so the two agree.
     let host = HostFacts {
@@ -71,7 +76,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     };
     let egress = None;
     let spec = ActivationSpec {
-        network: boxes::NetworkMode::OwnIp,
+        network: inputs.network,
         egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
@@ -83,6 +88,7 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
                 refusal,
                 BepRefusal::NarrowScopesUnenrolled { .. }
                     | BepRefusal::BrokerScopeNotGithub { .. }
+                    | BepRefusal::NoNetworkWithGrant { .. }
                     | BepRefusal::NoResolver { .. }
                     | BepRefusal::DnsWithoutDirectTls
             )
@@ -204,6 +210,7 @@ pub(crate) fn root_fingerprint(path: Option<&Path>) -> Option<String> {
 pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Result<()> {
     let project = args
         .path
+        .clone()
         .or_else(|| global.repo_dir.clone())
         .unwrap_or_else(|| PathBuf::from("."));
     let session = match mfile::File::from_dir_recursive(&project) {
@@ -245,6 +252,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
         .iter()
         .map(|authority| authority.host)
         .collect();
+    let (network, box_zone_resolver) = preview_host(crate::daemon_host_kind(global), &args);
     let mut stdout = std::io::stdout().lock();
     render(
         &SpecInputs {
@@ -253,7 +261,8 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             quic443,
             secrets: &secrets,
             acknowledged,
-            box_zone_resolver: preview_box_zone_resolver(crate::daemon_host_kind(global)),
+            network,
+            box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
         },
@@ -262,12 +271,20 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
     stdout.flush().context("failed to write to stdout")
 }
 
-/// The host fact the preview reads: whether a default box on a host of
-/// `kind` has its names resolved by the switch. The preview is of a
-/// default box, whose network is the default of `min box create
-/// --network`, so it refuses exactly what a default creation refuses.
-pub(crate) fn preview_box_zone_resolver(kind: paths::HostKind) -> bool {
-    super::box_verbs::host_resolves_box_names(kind, super::box_verbs::default_box_network())
+/// The network and the host fact the preview reads, for a host of `kind`:
+/// the box's `--network` mode, and whether the switch resolves that box's
+/// names. Creation reads the same fact for the same mode, so `min box spec
+/// --network <mode>` refuses what `min session activate --network <mode>`
+/// refuses.
+pub(crate) fn preview_host(
+    kind: paths::HostKind,
+    args: &BoxSpecArgs,
+) -> (boxes::NetworkMode, bool) {
+    let network: boxes::NetworkMode = args.network.into();
+    (
+        network,
+        super::box_verbs::host_resolves_box_names(kind, network),
+    )
 }
 
 #[cfg(test)]
@@ -322,6 +339,7 @@ mod tests {
                 acknowledged,
                 // An own-address box on the VM host, whose switch resolves
                 // box names (BEP-017).
+                network: boxes::NetworkMode::OwnIp,
                 box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -357,6 +375,7 @@ mod tests {
                     quic443: None,
                     secrets: &secrets,
                     acknowledged: false,
+                    network: boxes::NetworkMode::OwnIp,
                     box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
@@ -419,6 +438,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -446,6 +466,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &other,
@@ -496,6 +517,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
@@ -561,6 +583,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
                 box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),

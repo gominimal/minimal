@@ -485,6 +485,17 @@ pub struct BoxSpecArgs {
     /// The project directory whose minimal.toml declares the box
     /// (default: --repo-dir, or the current directory)
     pub path: Option<PathBuf>,
+    // The same flag as `min session activate --network`, from the same
+    // definition, so the preview is of the box that activation creates.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
+    )]
+    pub network: CliNetworkMode,
 }
 
 #[derive(Debug, Args)]
@@ -729,20 +740,15 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode for the session: `none` gives the session no network
-    /// (every socket it opens to a destination outside itself fails),
-    /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session its own IP address, so `--ingress` can
-    /// publish ports; unless the host opts out, an `own_ip` session with
-    /// no egress rules can reach no external address.
-    ///
-    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
-    /// accepted, but each prints a one-line hint naming the current spelling.
+    // The `--network` flag is shared with `min box spec`, so the two
+    // cannot drift: see [`NETWORK_HELP`].
     #[arg(
         long,
-        value_name = "none|host_ip|own_ip",
+        value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = "host_ip"
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
     )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
@@ -875,6 +881,38 @@ pub enum CliNetworkMode {
     HostNet,
     OwnIp,
 }
+
+/// The `--network` value name, shared by `min session activate` and
+/// `min box spec`.
+pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
+
+/// The `--network` default, shared by `min session activate` and `min box
+/// spec`, so a preview with no flag is of a box created with no flag.
+pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
+
+/// The first paragraph of the `--network` help, as a literal so that
+/// [`NETWORK_LONG_HELP`] can extend it.
+macro_rules! network_help {
+    () => {
+        "Network mode for the session: `none` gives the session no network (every socket it \
+         opens to a destination outside itself fails), `host_ip` shares the host's network \
+         namespace (the default), and `own_ip` gives the session its own IP address, so \
+         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
+         egress rules can reach no external address"
+    };
+}
+
+/// The `--network` short help, shared by `min session activate` and `min
+/// box spec`.
+pub(crate) const NETWORK_HELP: &str = network_help!();
+
+/// The `--network` long help: the short help and the legacy spellings.
+pub(crate) const NETWORK_LONG_HELP: &str = concat!(
+    network_help!(),
+    ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
