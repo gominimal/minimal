@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-10-26
+updated: 2026-10-31
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -245,14 +245,16 @@ Steering and the interception CA
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
+- **BEP-014** WHILE the proxy is a release build THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
+  <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable on the host, hold them in the host keychain across proxy restarts, and write them to no file.
+- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable on the host, hold them in the host keychain across proxy restarts, and write them to no file.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
+  <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
 - **BEP-072** THE SYSTEM SHALL publish the sealing key's public half, the key fingerprints a sealed context binds and the root certificate where the operator's processes read them, and seal every value from that published material without opening the proxy's key store.
   tier:     T0
@@ -688,10 +690,6 @@ Review, audit and revocation
     verify: cargo nextest run -p bep reference_to_another_sign_in_instance_is_refused
     <!-- unwanted; what keeps a reference minted before a logout refused after the next sign-in (BEP-002, BEP-044) -->
 
-- **BEP-047** THE SYSTEM SHALL run the proxy as the operator's login user and gvproxy and the VM as a dedicated unprivileged user, as separate processes sharing no writable state.
-  tier:     T0
-  verify:   cargo nextest run -p minvmd bep_and_gvproxy_are_separate_processes_and_users
-
 - **BEP-048** WHEN a record is appended to the audit log THE SYSTEM SHALL include in it, as `previous_hash`, the SHA-256 of the previous record's serialized line, the UTF-8 JSON bytes without the trailing newline, or the all-zero hash for the first record of a log.
   tier:     T0
   verify:   cargo nextest run -p bep audit_record_carries_previous_hash
@@ -791,6 +789,7 @@ Setting secrets
 - A node-local proxy on a SharedLinux host, inside the escape boundary: Gatehouse §6.10, SharedLinux paragraph.
 - The execution-facade lane: a separate design.
 - Multi-user hosts: the degraded-mode profile assumes a single-operator host (networking design §7.1).
+- Separate users for gvproxy and the VM (formerly BEP-047): [gominimal/inbox#1184](https://github.com/gominimal/inbox/issues/1184). That epic runs gvproxy and the VM as dedicated unprivileged users and moves the egress gate into its own process. Its design is `docs/design/2026-10-25-split-user-vmm-provider-dir.md`. Today the proxy, gvproxy and the VM all run as the operator's login user. A compromised VMM or gvproxy also runs as that user.
 
 ## Non-functional requirements
 
@@ -908,7 +907,8 @@ or copied as the plan sees fit. Extending the router in place was rejected
 because the router runs inside the box host and the proxy must run outside it.
 **The proxy runs as the operator.** Keychain items are per user and `min secret
 set` writes to the operator's keychain, so the proxy reads as the operator's
-login user; gvproxy and the VM run as a dedicated unprivileged user (BEP-047).
+login user. Running gvproxy and the VM as dedicated unprivileged users is a
+non-goal of this document (see Non-goals).
 A proxy user with a keychain of its own was rejected for v1 because the write
 path would need a helper channel and the items would fall outside the
 operator's Keychain Access view. On macOS the keychain keys on code signature: a
@@ -1091,8 +1091,9 @@ per-request Keychain access control.
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
 - **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
-  enforced by: process separation; keychain access control bound to the proxy's identity
-  covered by: BEP-014, BEP-047, BEP-051, BEP-059, BEP-060, BEP-072
+  enforced by: keychain access control bound to the proxy's code signature, and process separation
+  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072
+  <!-- The proxy, gvproxy and the VM run as the same login user, so process separation keeps them in separate processes but not under separate users. The user split is deferred to gominimal/inbox#1184. Custody on a real macOS keychain is unproven: gominimal/minimal#2436 is open because the login keychain was observed to make keys exportable. -->
 
 - **Invariant:** THE SYSTEM SHALL stop redeeming a revoked or expired value within 60 seconds.
   enforced by: expiry in the sealed context; revocation records consulted per request before any resolution; sign-in and store items resolved per request, so deletion revokes
