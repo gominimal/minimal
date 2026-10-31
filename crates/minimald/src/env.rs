@@ -2992,7 +2992,8 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
 /// the failure that ended the build wins over an earlier tolerated one. It
 /// knows the failure lines of `curl` and `wget`, which also cover `git` over
 /// HTTPS: a host it could not resolve, or a host and port it could not
-/// connect to.
+/// connect to. It also knows the line a build writes when it could not
+/// fetch a web source it declares, and names that source's host.
 /// `None` when no line names a destination.
 pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let word = |rest: &str| -> Option<String> {
@@ -3005,6 +3006,11 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
     };
     let lines: Vec<&str> = lines.into_iter().collect();
     lines.into_iter().rev().find_map(|line| {
+        // A web source the build declares, fetched in the box's leaf:
+        // `could not fetch the source https://example.com/a.tar.gz: ...`
+        if let Some(rest) = line.strip_prefix(WEB_SOURCE_FAILURE) {
+            return source_host(rest);
+        }
         // curl: `Could not resolve host: example.com`
         if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
             return word(rest);
@@ -3051,6 +3057,24 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
         }
         None
     })
+}
+
+/// How the line starts that a package build writes when it could not fetch
+/// a web source it declares (NET-155). `op`'s spec build writes it, followed
+/// by the source's URL.
+const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
+
+/// The host of the URL `rest` starts with: the authority after the scheme,
+/// without a user name or a port. `None` when `rest` starts with no URL.
+fn source_host(rest: &str) -> Option<String> {
+    let (_, after) = rest.split_once("://")?;
+    let authority = after.split(['/', '?', '#', ' ']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map(|(h, _)| h)?,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Whether the egress rules a box's package build runs under admit no
