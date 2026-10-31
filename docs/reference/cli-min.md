@@ -696,6 +696,15 @@ GitHub in your browser. With `--device`, or in a build with no browser
 sign-in, it prints a code to enter at github.com. The token stays in the host
 keychain and is never written to a file.
 
+The browser sign-in ends on a page that states the outcome. After a sign-in,
+`min auth login` names the accounts that have an installation of the Minimal
+GitHub App. With no installation, it gives the install URL,
+`https://github.com/apps/gominimal/installations/new`, where you choose the
+repositories your boxes can reach. The browser page links there too. The
+browser sign-in then waits up to 5 minutes for the installation, and Ctrl-C
+stops the wait. The sign-in is already saved. If the wait ends without an
+installation, `min auth login` gives the install URL again.
+
 `min login` is the same command as `min auth login`. It takes the same flags
 and prints the same prompts.
 

@@ -36,8 +36,40 @@ const BROWSER_TIMEOUT: Duration = Duration::from_secs(300);
 /// line and headers.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What a new sign-in prints on stderr about the App's installations.
-pub(crate) const INSTALL_NOTE: &str = "The token reaches only the repositories of the accounts and organizations where the Minimal GitHub App is installed.";
+/// How long the browser flow holds the browser's response while it
+/// exchanges the code and reads the account and the App's installations.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the browser flow re-reads the App's installations while it
+/// waits for an installation.
+const INSTALL_POLL: Duration = Duration::from_secs(5);
+
+/// Where a person installs the App and chooses its repositories.
+pub(crate) const INSTALL_URL: &str = "https://github.com/apps/gominimal/installations/new";
+
+/// Where a person changes an installation's repositories.
+const SETTINGS_URL: &str = "https://github.com/settings/installations";
+
+// The sentences the terminal and the browser page share. The page renders a
+// backticked span as a command chip.
+
+/// The next step of every failure.
+pub(crate) const TRY_AGAIN: &str = "Run `min auth login` to try again.";
+const NOTHING_SAVED: &str = "Nothing was saved.";
+const CANCELLED: &str = "The sign-in was cancelled on GitHub.";
+pub(crate) const NOT_FINISHED: &str = "GitHub approved the sign-in, but `min` could not finish it.";
+const NOT_APPROVED: &str = "GitHub did not approve the sign-in.";
+const TERMINAL_SAYS: &str = "Your terminal says why.";
+const STALE: &str = "It belongs to an earlier `min auth login`. Run `min auth login` again.";
+/// Completed by the install URL in the terminal, and by a link on the page.
+pub(crate) const NEXT_STEP: &str = "One more step: choose which repositories your boxes can reach";
+pub(crate) const NO_REACH: &str = "Your boxes can't reach private repositories until you do.";
+const UNREAD: &str = "`min` could not read where the Minimal GitHub App is installed.";
+const CLOSE_TAB: &str = "You can close this tab.";
+const WAITING: &str =
+    "Waiting for the installation to finish in your browser. Press Ctrl-C to stop waiting.";
+const STOPPED_WAITING: &str =
+    "Stopped waiting. `min` did not see an installation of the Minimal GitHub App.";
 
 /// Where the sign-in talks to GitHub. Tests point it at a local server.
 #[derive(Debug, Clone)]
@@ -350,17 +382,83 @@ pub(crate) async fn run_login(
         .build()
         .context("building the HTTP client")?;
     let flow = choose_flow(login.device, login.client_secret);
-    let token = match flow {
-        Flow::Device => device_flow(&http, login.endpoints, err).await?,
+    match flow {
+        Flow::Device => {
+            let token = device_flow(&http, login.endpoints, err).await?;
+            let signed = read_sign_in(&http, login.endpoints, token).await?;
+            let (stored, _) = save(login, flow, signed.token, &signed.account)?;
+            report(out, err, &stored.metadata.account, &signed.installs)?;
+            Ok(stored)
+        }
         Flow::Browser => {
-            let secret = login.client_secret.unwrap_or_default();
-            browser_flow(&http, login.endpoints, secret, login.open_browser, err).await?
+            let mut browser = Browser::open(login.endpoints, login.open_browser, err).await?;
+            let (stored, installs, access) = browser.sign_in(&http, login).await?;
+            report(out, err, &stored.metadata.account, &installs)?;
+            // Only an empty list shows that no installation exists. After a
+            // failed read the App may already be installed.
+            if installs.none() {
+                // The install wait gets its own BROWSER_TIMEOUT, so a slow
+                // sign-in does not shorten the time to install the App.
+                browser.deadline = tokio::time::Instant::now() + BROWSER_TIMEOUT;
+                writeln!(err, "{WAITING}")?;
+                browser
+                    .await_install(
+                        &http,
+                        login.endpoints,
+                        &access,
+                        &stored.metadata.account,
+                        err,
+                    )
+                    .await?;
+            }
+            Ok(stored)
+        }
+    }
+}
+
+/// A token, the account it signs in, and the App's installations it
+/// reaches.
+struct Signed {
+    token: Token,
+    account: String,
+    installs: Installs,
+}
+
+/// Read the account a new token signs in, and the App's installations it
+/// reaches. A failed read of the installations does not fail the sign-in.
+async fn read_sign_in(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    token: Token,
+) -> anyhow::Result<Signed> {
+    let account = signed_in_account(http, endpoints, &token.access_token).await?;
+    let installs = match list_installations(http, endpoints, &token.access_token).await {
+        Ok(list) => Installs::Listed(list),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "could not read the App's installations");
+            Installs::Unread
         }
     };
-    let account = signed_in_account(&http, login.endpoints, &token.access_token).await?;
+    Ok(Signed {
+        token,
+        account,
+        installs,
+    })
+}
+
+/// Store a sign-in in the keychain item. Returns the stored item and a copy
+/// of the access token, for the browser flow's later reads of the App's
+/// installations.
+fn save(
+    login: &Login<'_>,
+    flow: Flow,
+    token: Token,
+    account: &str,
+) -> anyhow::Result<(Stored, zeroize::Zeroizing<String>)> {
+    let access = zeroize::Zeroizing::new(token.access_token.clone());
     let issued = now();
     let completed = Completed {
-        account,
+        account: account.to_owned(),
         flow,
         material: Material {
             // The write stores the metadata's instance, which
@@ -380,13 +478,54 @@ pub(crate) async fn run_login(
         new_instance = stored.new_instance,
         "GitHub sign-in stored in the host keychain"
     );
-    writeln!(out, "Signed in to GitHub as {}.", stored.metadata.account)?;
-    if stored.new_instance {
-        // The App's installations bound what the token reaches. A first
-        // sign-in says so.
-        writeln!(err, "{INSTALL_NOTE}")?;
+    Ok((stored, access))
+}
+
+/// Print the account, then where the App's installations let boxes reach,
+/// or the install URL as the one next step. The browser page says the same.
+fn report(
+    out: &mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
+    account: &str,
+    installs: &Installs,
+) -> anyhow::Result<()> {
+    writeln!(out, "Signed in to GitHub as {account}.")?;
+    match installs {
+        Installs::Listed(list) if !list.is_empty() => {
+            let accounts: Vec<String> = list.iter().map(|i| i.account.login.clone()).collect();
+            writeln!(err, "{}", reach_sentence(&join(&accounts)))?;
+        }
+        Installs::Listed(_) => {
+            writeln!(err, "{NEXT_STEP} at {INSTALL_URL}.")?;
+            writeln!(err, "{NO_REACH}")?;
+        }
+        Installs::Unread => {
+            writeln!(err, "{UNREAD}")?;
+            writeln!(err, "{NEXT_STEP} at {INSTALL_URL}.")?;
+        }
     }
-    Ok(stored)
+    Ok(())
+}
+
+/// The sentence that names where boxes reach repositories. `accounts` is
+/// already joined, as plain text or as HTML.
+fn reach_sentence(accounts: &str) -> String {
+    format!("Your boxes can reach repositories on {accounts} through the Minimal GitHub App.")
+}
+
+/// The sentence that says what one installation reaches. `selection` is
+/// what [`selection`] returns.
+fn reach_there(selection: &str) -> String {
+    format!("Your boxes can reach {selection} there.")
+}
+
+/// "a", "a and b", "a, b and c".
+fn join(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Print the held sign-in's standing. Reads the item's metadata, never its
@@ -491,6 +630,47 @@ struct DeviceCode {
 #[derive(Deserialize)]
 struct User {
     login: String,
+}
+
+/// One installation of the App that the signed-in user can reach.
+#[derive(Deserialize, Clone)]
+struct Installation {
+    id: u64,
+    account: InstallAccount,
+    /// `all` or `selected`.
+    repository_selection: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct InstallAccount {
+    /// A user's or an organization's login, or an enterprise's slug.
+    #[serde(alias = "slug")]
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct InstallationList {
+    installations: Vec<Installation>,
+}
+
+#[derive(Deserialize)]
+struct RepositoryCount {
+    total_count: u64,
+}
+
+/// The App's installations a sign-in reaches, as far as `min` could read
+/// them.
+enum Installs {
+    Listed(Vec<Installation>),
+    /// The read failed.
+    Unread,
+}
+
+impl Installs {
+    /// Whether `min` read the installations and there were none.
+    fn none(&self) -> bool {
+        matches!(self, Installs::Listed(list) if list.is_empty())
+    }
 }
 
 /// Send one form POST and read the whole reply. An error here is a network
@@ -631,126 +811,367 @@ async fn device_flow(
     }
 }
 
-/// The authorization-code flow with PKCE, back through a one-shot listener
-/// on `127.0.0.1` (BEP-001).
-async fn browser_flow(
-    http: &reqwest::Client,
-    endpoints: &Endpoints,
-    client_secret: &str,
-    open_browser: &Opener,
-    err: &mut (dyn Write + Send),
-) -> anyhow::Result<Token> {
-    let verifier = format!(
-        "{}{}",
-        signin::new_instance_id()?,
-        signin::new_instance_id()?
-    );
-    let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
-    let state = signin::new_instance_id()?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("could not open a local port for the browser to return to")?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
-    let mut authorize = url::Url::parse(&format!("{}/login/oauth/authorize", endpoints.oauth))
-        .context("the GitHub address is not a URL")?;
-    authorize
-        .query_pairs_mut()
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("state", &state)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256");
-    writeln!(
-        err,
-        "Opening GitHub in your browser to sign in. If it does not open, go to:\n  {authorize}"
-    )?;
-    if let Err(e) = open_browser(authorize.as_str()) {
-        tracing::warn!(error = %e, "could not open the browser");
-    }
-    let code = tokio::time::timeout(BROWSER_TIMEOUT, await_callback(&listener, &state))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "The browser did not return within 5 minutes. Run `min auth login` to start again, or `min auth login --device` to sign in with a code."
-            )
-        })??;
-    let reply: TokenReply = post_form(
-        http,
-        &format!("{}/login/oauth/access_token", endpoints.oauth),
-        &[
-            ("client_id", CLIENT_ID),
-            ("client_secret", client_secret),
-            ("code", &code),
-            ("redirect_uri", &redirect_uri),
-            ("code_verifier", &verifier),
-        ],
-    )
-    .await?;
-    if let Some(e) = reply.error.as_deref() {
-        bail!(
-            "GitHub refused the sign-in ({e}): {}",
-            reply.error_description.as_deref().unwrap_or_default()
-        );
-    }
-    reply.into_token()
+/// The authorization-code flow with PKCE, back through a listener on
+/// `127.0.0.1` (BEP-001). The listener answers each request with a page
+/// that states the real outcome.
+struct Browser {
+    callback: Callback,
+    state: String,
+    verifier: String,
+    redirect_uri: String,
+    /// When the browser flow gives up: [`BROWSER_TIMEOUT`] after the
+    /// browser was opened, and again after the install wait starts.
+    deadline: tokio::time::Instant,
 }
 
-/// Serve the callback listener until a request to the callback path carries
-/// a code with the expected state.
+impl Browser {
+    /// Open the listener, print the authorize URL, and open it in the
+    /// browser.
+    async fn open(
+        endpoints: &Endpoints,
+        open_browser: &Opener,
+        err: &mut (dyn Write + Send),
+    ) -> anyhow::Result<Self> {
+        let verifier = format!(
+            "{}{}",
+            signin::new_instance_id()?,
+            signin::new_instance_id()?
+        );
+        let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
+        let state = signin::new_instance_id()?;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("could not open a local port for the browser to return to")?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
+        let mut authorize = url::Url::parse(&format!("{}/login/oauth/authorize", endpoints.oauth))
+            .context("the GitHub address is not a URL")?;
+        authorize
+            .query_pairs_mut()
+            .append_pair("client_id", CLIENT_ID)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        writeln!(
+            err,
+            "Opening GitHub in your browser to sign in. If it does not open, go to:\n  {authorize}"
+        )?;
+        let callback = Callback::new(listener);
+        let deadline = tokio::time::Instant::now() + BROWSER_TIMEOUT;
+        if let Err(e) = open_browser(authorize.as_str()) {
+            tracing::warn!(error = %e, "could not open the browser");
+        }
+        Ok(Browser {
+            callback,
+            state,
+            verifier,
+            redirect_uri,
+            deadline,
+        })
+    }
+
+    /// Serve the callback until a request carries a code with the expected
+    /// state. Hold that request's response until the code is exchanged, the
+    /// account and the App's installations are read and the sign-in is
+    /// stored, then answer it with the page for the outcome.
+    async fn sign_in(
+        &mut self,
+        http: &reqwest::Client,
+        login: &Login<'_>,
+    ) -> anyhow::Result<(Stored, Installs, zeroize::Zeroizing<String>)> {
+        loop {
+            let (mut conn, query) = tokio::time::timeout_at(self.deadline, self.callback.next())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "The browser did not return within 5 minutes. Run `min auth login` to start again, or `min auth login --device` to sign in with a code."
+                    )
+                })??;
+            if query.get("state") != Some(self.state.as_str()) {
+                respond(&mut conn, &Page::stale()).await;
+                continue;
+            }
+            if let Some(code) = query.get("code") {
+                return match self.finish(http, login, code).await {
+                    Ok((stored, installs, access)) => {
+                        let page = Page::signed_in(&stored.metadata.account, &installs);
+                        respond(&mut conn, &page).await;
+                        Ok((stored, installs, access))
+                    }
+                    Err(e) => {
+                        respond(&mut conn, &Page::not_finished()).await;
+                        Err(anyhow::anyhow!("{NOT_FINISHED}\n{e:#}\n{TRY_AGAIN}"))
+                    }
+                };
+            }
+            match query.get("error") {
+                Some("access_denied") => {
+                    respond(&mut conn, &Page::cancelled()).await;
+                    bail!("{CANCELLED} {NOTHING_SAVED} {TRY_AGAIN}");
+                }
+                other => {
+                    respond(&mut conn, &Page::not_approved()).await;
+                    bail!(
+                        "{NOT_APPROVED} GitHub sent back `{}`.\n{TRY_AGAIN}",
+                        other.unwrap_or("no code")
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exchange the code, read the account and the App's installations
+    /// under [`FINISH_TIMEOUT`], then store the sign-in.
+    async fn finish(
+        &self,
+        http: &reqwest::Client,
+        login: &Login<'_>,
+        code: &str,
+    ) -> anyhow::Result<(Stored, Installs, zeroize::Zeroizing<String>)> {
+        let secret = login.client_secret.unwrap_or_default();
+        let read = async {
+            let reply: TokenReply = post_form(
+                http,
+                &format!("{}/login/oauth/access_token", login.endpoints.oauth),
+                &[
+                    ("client_id", CLIENT_ID),
+                    ("client_secret", secret),
+                    ("code", code),
+                    ("redirect_uri", &self.redirect_uri),
+                    ("code_verifier", &self.verifier),
+                ],
+            )
+            .await?;
+            if let Some(e) = reply.error.as_deref() {
+                bail!(
+                    "GitHub refused the sign-in ({e}): {}",
+                    reply.error_description.as_deref().unwrap_or_default()
+                );
+            }
+            read_sign_in(http, login.endpoints, reply.into_token()?).await
+        };
+        let signed = tokio::time::timeout(FINISH_TIMEOUT, read)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "GitHub did not answer within {} seconds.",
+                    FINISH_TIMEOUT.as_secs()
+                )
+            })??;
+        let (stored, access) = save(login, Flow::Browser, signed.token, &signed.account)?;
+        Ok((stored, signed.installs, access))
+    }
+
+    /// Wait, until the browser flow's deadline, for the App to be
+    /// installed. A request to the callback re-reads the App's installations
+    /// with the held token, and so does a timer, because GitHub may send the
+    /// browser back from the install to a port nothing listens on.
+    ///
+    /// No code that reaches the callback here is exchanged: the sign-in is
+    /// already held, and an install's code is issued without the PKCE
+    /// challenge. The callback need not carry the state, because GitHub may
+    /// not pass it through the install. A request that carries another
+    /// state gets the expired-link page. At the deadline the terminal says
+    /// the wait stopped and gives the install URL again.
+    async fn await_install(
+        &mut self,
+        http: &reqwest::Client,
+        endpoints: &Endpoints,
+        token: &str,
+        account: &str,
+        err: &mut (dyn Write + Send),
+    ) -> anyhow::Result<()> {
+        let mut poll =
+            tokio::time::interval_at(tokio::time::Instant::now() + INSTALL_POLL, INSTALL_POLL);
+        loop {
+            let (mut conn, query) = tokio::select! {
+                () = tokio::time::sleep_until(self.deadline) => {
+                    writeln!(err, "{STOPPED_WAITING}")?;
+                    writeln!(err, "{NEXT_STEP} at {INSTALL_URL}.")?;
+                    return Ok(());
+                }
+                _ = poll.tick() => {
+                    // Bound the re-read by the deadline too: a slow read must
+                    // not hold the wait past it. A read cut short loops back
+                    // to the deadline arm.
+                    let read = tokio::time::timeout_at(
+                        self.deadline,
+                        installed(http, endpoints, token, None),
+                    );
+                    if let Ok(Some((on, selection))) = read.await {
+                        writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
+                        return Ok(());
+                    }
+                    continue;
+                }
+                request = self.callback.next() => request?,
+            };
+            if query.get("state").is_some_and(|s| s != self.state) {
+                respond(&mut conn, &Page::stale()).await;
+                continue;
+            }
+            let id = query.get("installation_id").and_then(|v| v.parse().ok());
+            if let Some((on, selection)) = installed(http, endpoints, token, id).await {
+                respond(&mut conn, &Page::installed(&on, &selection)).await;
+                writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
+                return Ok(());
+            }
+            let page = Page::signed_in(account, &Installs::Listed(Vec::new()));
+            respond(&mut conn, &page).await;
+        }
+    }
+}
+
+/// Re-read the App's installations. With one or more, name the account of
+/// the installation `id`, or of the first one, and what it reaches.
+async fn installed(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    token: &str,
+    id: Option<u64>,
+) -> Option<(String, String)> {
+    let read = tokio::time::timeout(FINISH_TIMEOUT, list_installations(http, endpoints, token));
+    let list = match read.await {
+        Ok(Ok(list)) => list,
+        Ok(Err(error)) => {
+            tracing::warn!(error = %format!("{error:#}"), "could not read the App's installations");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    let chosen = id
+        .and_then(|id| list.iter().find(|i| i.id == id))
+        .or_else(|| list.first())?;
+    let selection = selection(http, endpoints, token, chosen).await;
+    Some((chosen.account.login.clone(), selection))
+}
+
+/// What one installation lets boxes reach: "all repositories", or how many
+/// were selected.
+async fn selection(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    token: &str,
+    installation: &Installation,
+) -> String {
+    if installation.repository_selection == "all" {
+        return "all repositories".to_owned();
+    }
+    let url = format!(
+        "{}/user/installations/{}/repositories?per_page=1",
+        endpoints.api, installation.id
+    );
+    let count = tokio::time::timeout(
+        FINISH_TIMEOUT,
+        get_json::<RepositoryCount>(http, &url, token),
+    )
+    .await;
+    match count {
+        Ok(Ok(RepositoryCount { total_count: 1 })) => "1 selected repository".to_owned(),
+        Ok(Ok(RepositoryCount { total_count })) => format!("{total_count} selected repositories"),
+        _ => "the selected repositories".to_owned(),
+    }
+}
+
+/// The App's installations the token reaches.
+async fn list_installations(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    token: &str,
+) -> anyhow::Result<Vec<Installation>> {
+    let url = format!("{}/user/installations?per_page=100", endpoints.api);
+    let list: InstallationList = get_json(http, &url, token).await?;
+    Ok(list.installations)
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> anyhow::Result<T> {
+    let reply = http
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("could not reach {url}"))?;
+    let status = reply.status();
+    let text = reply.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("GitHub answered {url} with {status}");
+    }
+    serde_json_lenient::from_str(&text)
+        .with_context(|| format!("GitHub answered {url} with an unexpected reply"))
+}
+
+/// One parsed request to the callback path.
+struct Query(Vec<(String, String)>);
+
+impl Query {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A request the callback listener has read: the connection, and the
+/// request target.
+type Request = (tokio::net::TcpStream, String);
+
+/// The callback listener.
 ///
 /// Each connection is read in its own task under [`REQUEST_READ_TIMEOUT`],
 /// so a connection that sends nothing, such as a browser's speculative
 /// connection, never holds up the callback.
-async fn await_callback(listener: &tokio::net::TcpListener, state: &str) -> anyhow::Result<String> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    loop {
-        let (mut conn, target) = tokio::select! {
-            accepted = listener.accept() => {
-                let (mut conn, _) = accepted?;
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let read = tokio::time::timeout(
-                        REQUEST_READ_TIMEOUT,
-                        read_request_target(&mut conn),
-                    );
-                    if let Ok(Some(target)) = read.await {
-                        let _ = tx.send((conn, target)).await;
-                    }
-                });
+struct Callback {
+    listener: tokio::net::TcpListener,
+    tx: tokio::sync::mpsc::Sender<Request>,
+    rx: tokio::sync::mpsc::Receiver<Request>,
+}
+
+impl Callback {
+    fn new(listener: tokio::net::TcpListener) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        Callback { listener, tx, rx }
+    }
+
+    /// The next request to the callback path. A request to any other path
+    /// gets the not-found page.
+    async fn next(&mut self) -> anyhow::Result<(tokio::net::TcpStream, Query)> {
+        loop {
+            let (mut conn, target) = tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (mut conn, _) = accepted?;
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let read = tokio::time::timeout(
+                            REQUEST_READ_TIMEOUT,
+                            read_request_target(&mut conn),
+                        );
+                        if let Ok(Some(target)) = read.await {
+                            let _ = tx.send((conn, target)).await;
+                        }
+                    });
+                    continue;
+                }
+                Some(request) = self.rx.recv() => request,
+            };
+            let Some(query) = target
+                .strip_prefix(CALLBACK_PATH)
+                .and_then(|r| r.strip_prefix('?'))
+            else {
+                respond(&mut conn, &Page::not_found()).await;
                 continue;
-            }
-            Some(request) = rx.recv() => request,
-        };
-        let Some(query) = target
-            .strip_prefix(CALLBACK_PATH)
-            .and_then(|r| r.strip_prefix('?'))
-        else {
-            respond(&mut conn, "404 Not Found", "Not found.").await;
-            continue;
-        };
-        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
-        let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        if get("state").as_deref() != Some(state) {
-            respond(&mut conn, "400 Bad Request", "This sign-in link is stale.").await;
-            continue;
+            };
+            let pairs = url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+            return Ok((conn, Query(pairs)));
         }
-        if let Some(code) = get("code") {
-            respond(
-                &mut conn,
-                "200 OK",
-                "Return to the terminal to finish signing in.",
-            )
-            .await;
-            return Ok(code);
-        }
-        respond(&mut conn, "200 OK", "The sign-in did not complete.").await;
-        bail!(
-            "The sign-in was cancelled on GitHub ({}). Nothing was saved.",
-            get("error").unwrap_or_default()
-        );
     }
 }
 
@@ -773,15 +1194,230 @@ async fn read_request_target(conn: &mut tokio::net::TcpStream) -> Option<String>
     parts.next().map(str::to_owned)
 }
 
-async fn respond(conn: &mut tokio::net::TcpStream, status: &str, text: &str) {
-    let body = format!("<!doctype html><title>min</title><p>{text}</p>\n");
-    let reply = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = conn.write_all(reply.as_bytes()).await;
+async fn respond(conn: &mut tokio::net::TcpStream, page: &Page) {
+    let _ = conn.write_all(page.response().as_bytes()).await;
     let _ = conn.shutdown().await;
 }
+
+/// The status glyph a page shows.
+#[derive(Clone, Copy)]
+enum Glyph {
+    Done,
+    Stopped,
+    Failed,
+}
+
+/// One page the callback listener answers with. `heading` and `body` are
+/// HTML: every value from GitHub in them is escaped.
+struct Page {
+    status: &'static str,
+    title: &'static str,
+    glyph: Glyph,
+    heading: String,
+    body: String,
+}
+
+impl Page {
+    fn signed_in(account: &str, installs: &Installs) -> Page {
+        let heading = format!(
+            "Signed in to GitHub as <strong>{}</strong>",
+            escape(account)
+        );
+        let body = match installs {
+            Installs::Listed(list) if !list.is_empty() => {
+                let accounts: Vec<String> = list
+                    .iter()
+                    .map(|i| format!("<strong>{}</strong>", escape(&i.account.login)))
+                    .collect();
+                format!(
+                    "<p>{} {}</p>\n<p class=\"muted\"><a href=\"{SETTINGS_URL}\">Change which repositories</a></p>",
+                    reach_sentence(&join(&accounts)),
+                    prose(CLOSE_TAB)
+                )
+            }
+            Installs::Listed(_) => format!(
+                "<p>{}.</p>\n{}\n<p class=\"muted\">{}</p>",
+                prose(NEXT_STEP),
+                choose_button(),
+                prose(NO_REACH)
+            ),
+            Installs::Unread => format!(
+                "<p>{}</p>\n<p>{}.</p>\n{}",
+                prose(UNREAD),
+                prose(NEXT_STEP),
+                choose_button()
+            ),
+        };
+        Page {
+            status: "200 OK",
+            title: "Signed in",
+            glyph: Glyph::Done,
+            heading,
+            body,
+        }
+    }
+
+    fn installed(account: &str, selection: &str) -> Page {
+        Page {
+            status: "200 OK",
+            title: "Installed",
+            glyph: Glyph::Done,
+            heading: format!("Installed on <strong>{}</strong>", escape(account)),
+            body: format!(
+                "<p>{} {}</p>",
+                escape(&reach_there(selection)),
+                prose(CLOSE_TAB)
+            ),
+        }
+    }
+
+    fn not_finished() -> Page {
+        Page {
+            status: "502 Bad Gateway",
+            title: "Sign-in not finished",
+            glyph: Glyph::Failed,
+            heading: "Sign-in not finished".to_owned(),
+            body: format!(
+                "<p>{} {} {}</p>",
+                prose(NOT_FINISHED),
+                prose(TERMINAL_SAYS),
+                prose(TRY_AGAIN)
+            ),
+        }
+    }
+
+    fn not_approved() -> Page {
+        Page {
+            body: format!(
+                "<p>{} {} {}</p>",
+                prose(NOT_APPROVED),
+                prose(TERMINAL_SAYS),
+                prose(TRY_AGAIN)
+            ),
+            ..Page::not_finished()
+        }
+    }
+
+    fn cancelled() -> Page {
+        Page {
+            status: "200 OK",
+            title: "Sign-in cancelled",
+            glyph: Glyph::Stopped,
+            heading: "Sign-in cancelled".to_owned(),
+            body: format!("<p>{} {}</p>", prose(NOTHING_SAVED), prose(TRY_AGAIN)),
+        }
+    }
+
+    fn stale() -> Page {
+        Page {
+            status: "400 Bad Request",
+            title: "Sign-in link expired",
+            glyph: Glyph::Failed,
+            heading: "This sign-in link has expired".to_owned(),
+            body: format!("<p>{}</p>", prose(STALE)),
+        }
+    }
+
+    fn not_found() -> Page {
+        Page {
+            status: "404 Not Found",
+            title: "Not found",
+            glyph: Glyph::Failed,
+            heading: "Not found".to_owned(),
+            body: String::new(),
+        }
+    }
+
+    /// The whole HTTP response: one self-contained document, with no script
+    /// and no external request.
+    fn response(&self) -> String {
+        let (class, symbol) = match self.glyph {
+            Glyph::Done => ("done", "&#10003;"),
+            Glyph::Stopped => ("stopped", "!"),
+            Glyph::Failed => ("failed", "&#215;"),
+        };
+        let document = format!(
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+<meta name=\"referrer\" content=\"no-referrer\">\n<title>{title} · Minimal</title>\n\
+<style>{PAGE_STYLE}</style>\n</head>\n<body>\n<main class=\"card\">\n{MARK}\n\
+<div class=\"glyph {class}\" aria-hidden=\"true\">{symbol}</div>\n<h1>{heading}</h1>\n{body}\n\
+</main>\n</body>\n</html>\n",
+            title = self.title,
+            heading = self.heading,
+            body = self.body,
+        );
+        format!(
+            "HTTP/1.1 {}\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Security-Policy: {PAGE_CSP}\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cache-Control: no-store\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n{document}",
+            self.status,
+            document.len()
+        )
+    }
+}
+
+/// The page's Content-Security-Policy: no script, no external request.
+const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+
+fn choose_button() -> String {
+    format!("<p><a class=\"button\" href=\"{INSTALL_URL}\">Choose repositories</a></p>")
+}
+
+/// Escape text for HTML, then render each backticked span as a command
+/// chip.
+fn prose(text: &str) -> String {
+    escape(text)
+        .split('`')
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                format!("<code>{part}</code>")
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect()
+}
+
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `minimal` mark (`docs/public/minimal-mark-{light,dark}.svg`), filled
+/// with the page's text colour so one copy serves light and dark.
+const MARK: &str = r#"<svg class="mark" width="48" height="24" viewBox="0 0 48 24" fill="currentColor" role="img" aria-label="Minimal" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M10.2734 0.000213623H18.1767L29.2412 16V23.9999H21.338L10.2734 8.00011V0.000213623Z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M3.16132 23.9999L0 19.4285V11.4286H7.90326L11.0645 16V23.9999H3.16132Z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M28.4531 0.000213623H36.3564L47.4208 16V23.9999H39.5176L28.4531 8.00011V0.000213623Z"/></svg>"#;
+
+const PAGE_STYLE: &str = ":root{color-scheme:light dark;--bg:#f5f5f4;--card:#fff;--fg:#141414;--muted:#5c5c5c;--line:#e5e5e5;--chip:#f0f0ef;--done:#1a7f37;--stopped:#9a6700;--failed:#cf222e;--button:#141414;--button-fg:#fff}\
+@media (prefers-color-scheme:dark){:root{--bg:#0d0d0d;--card:#171717;--fg:#e5e5e5;--muted:#a3a3a3;--line:#2a2a2a;--chip:#232323;--done:#2ea043;--stopped:#bb8009;--failed:#da3633;--button:#e5e5e5;--button-fg:#141414}}\
+*{box-sizing:border-box}\
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif}\
+.card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:32px 24px;text-align:center}\
+.mark{display:block;margin:0 auto 24px;color:var(--fg)}\
+.glyph{width:40px;height:40px;margin:0 auto 12px;border-radius:50%;display:grid;place-items:center;font-size:20px;font-weight:700;color:#fff}\
+.done{background:var(--done)}.stopped{background:var(--stopped)}.failed{background:var(--failed)}\
+h1{margin:0 0 12px;font-size:20px;font-weight:600;overflow-wrap:anywhere}\
+p{margin:0 0 12px;overflow-wrap:anywhere}\
+.muted{color:var(--muted);font-size:14px}\
+a{color:inherit}\
+code{font:14px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--chip);border:1px solid var(--line);border-radius:6px;padding:1px 6px;white-space:nowrap;-webkit-user-select:all;user-select:all}\
+.button{display:inline-block;margin:4px 0;padding:10px 18px;border-radius:8px;background:var(--button);color:var(--button-fg);font-weight:600;text-decoration:none}";
 
 async fn signed_in_account(
     http: &reqwest::Client,
@@ -857,6 +1493,28 @@ mod tests {
         seen: Seen,
         /// The PKCE challenge the authorize URL carried.
         challenge: Arc<Mutex<Option<String>>>,
+        /// The reply to `GET /user/installations`. It starts with one
+        /// installation, on the signed-in account, with all repositories.
+        installs: Arc<Mutex<String>>,
+    }
+
+    /// A `GET /user/installations` reply with one installation per
+    /// `(id, account, repository_selection)`.
+    fn installs_json(installs: &[(u64, &str, &str)]) -> String {
+        let list: Vec<String> = installs
+            .iter()
+            .map(|(id, account, selection)| {
+                format!(
+                    r#"{{"id":{id},"app_slug":"gominimal","account":{{"login":{}}},"repository_selection":"{selection}"}}"#,
+                    serde_json_lenient::to_string(account).expect("json")
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"total_count":{},"installations":[{}]}}"#,
+            installs.len(),
+            list.join(",")
+        )
     }
 
     /// How the fake GitHub answers the device flow's polls.
@@ -870,6 +1528,8 @@ mod tests {
         OddToken,
         /// As `Pending`, but the revocation of the token is refused.
         RevokeRefused,
+        /// The browser flow's token exchange fails with a 502.
+        ExchangeFails,
     }
 
     /// A local stand-in for github.com and api.github.com. The device flow
@@ -885,7 +1545,8 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let seen: Seen = Arc::default();
         let challenge: Arc<Mutex<Option<String>>> = Arc::default();
-        let (seen2, challenge2) = (seen.clone(), challenge.clone());
+        let installs = Arc::new(Mutex::new(installs_json(&[(1, account, "all")])));
+        let (seen2, challenge2, installs2) = (seen.clone(), challenge.clone(), installs.clone());
         tokio::spawn(async move {
             let mut polls = 0;
             loop {
@@ -940,6 +1601,10 @@ mod tests {
                             _ => token,
                         }
                     }
+                    "/login/oauth/access_token" if script == Script::ExchangeFails => {
+                        status = "502 Bad Gateway";
+                        "<html>bad gateway</html>".to_owned()
+                    }
                     "/login/oauth/access_token" => {
                         assert_eq!(field("client_secret"), "test-secret");
                         assert_eq!(field("code"), "the-code");
@@ -954,6 +1619,15 @@ mod tests {
                     "/user" => {
                         assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
                         format!(r#"{{"login":"{account}","id":1}}"#)
+                    }
+                    p if p.starts_with("/user/installations/") => {
+                        assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
+                        assert!(p.ends_with("/repositories?per_page=1"), "{p}");
+                        r#"{"total_count":3,"repositories":[]}"#.to_owned()
+                    }
+                    "/user/installations?per_page=100" => {
+                        assert!(headers.contains(&format!("bearer {}", access.to_lowercase())));
+                        installs2.lock().unwrap().clone()
                     }
                     p if p == format!("/applications/{CLIENT_ID}/token") => {
                         assert_eq!(method, "DELETE");
@@ -987,6 +1661,7 @@ mod tests {
             },
             seen,
             challenge,
+            installs,
         }
     }
 
@@ -1191,6 +1866,489 @@ mod tests {
         );
     }
 
+    /// One step of a scripted browser.
+    #[derive(Clone)]
+    enum Visit {
+        /// Go to the URL built from the redirect URI and the state.
+        To(fn(&str, &str) -> String),
+        /// Install the App: GitHub's installations reply becomes this.
+        Install(String),
+    }
+
+    /// What the browser got back for one visit.
+    struct Got {
+        status: u16,
+        headers: reqwest::header::HeaderMap,
+        body: String,
+    }
+
+    /// Sign in through the browser flow, with a browser that makes `visits`
+    /// in order once the authorize URL is opened.
+    async fn browser_login(
+        keychain: &MemoryKeychain,
+        gh: &FakeGitHub,
+        visits: Vec<Visit>,
+    ) -> (anyhow::Result<Stored>, String, String, Vec<Got>) {
+        let got: Arc<Mutex<Vec<Got>>> = Arc::default();
+        let task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::default();
+        let (challenge, installs) = (gh.challenge.clone(), gh.installs.clone());
+        let (got2, task2) = (got.clone(), task.clone());
+        let opener = move |authorize: &str| -> std::io::Result<()> {
+            let url = url::Url::parse(authorize).expect("authorize url");
+            let q: std::collections::HashMap<String, String> =
+                url.query_pairs().into_owned().collect();
+            *challenge.lock().unwrap() = Some(q["code_challenge"].clone());
+            let (redirect, state) = (q["redirect_uri"].clone(), q["state"].clone());
+            let (visits, got, installs) = (visits.clone(), got2.clone(), installs.clone());
+            *task2.lock().unwrap() = Some(tokio::spawn(async move {
+                for visit in visits {
+                    match visit {
+                        Visit::Install(json) => *installs.lock().unwrap() = json,
+                        Visit::To(to) => {
+                            let reply =
+                                reqwest::get(to(&redirect, &state)).await.expect("callback");
+                            let status = reply.status().as_u16();
+                            let headers = reply.headers().clone();
+                            let body = reply.text().await.expect("body");
+                            got.lock().unwrap().push(Got {
+                                status,
+                                headers,
+                                body,
+                            });
+                        }
+                    }
+                }
+            }));
+            Ok(())
+        };
+        let login = Login {
+            keychain,
+            endpoints: &gh.endpoints,
+            client_secret: Some("test-secret"),
+            device: false,
+            open_browser: &opener,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let done = run_login(&login, &mut out, &mut err).await;
+        let browser = task.lock().unwrap().take().expect("the browser was opened");
+        browser.await.expect("browser");
+        let got = std::mem::take(&mut *got.lock().unwrap());
+        (
+            done,
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+            got,
+        )
+    }
+
+    /// The command chip every failure page names as its next step.
+    const CHIP: &str = "<code>min auth login</code>";
+
+    fn to_callback(redirect: &str, state: &str) -> String {
+        format!("{redirect}?code=the-code&state={state}")
+    }
+
+    /// Check what every page carries: the status, the headers, the heading,
+    /// the inline mark, and no script, external request, code or token.
+    fn assert_page(got: &Got, status: u16, heading: &str) {
+        let body = &got.body;
+        assert_eq!(got.status, status, "{body}");
+        assert_eq!(
+            got.headers["content-security-policy"],
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        );
+        assert_eq!(got.headers["referrer-policy"], "no-referrer");
+        assert_eq!(got.headers["cache-control"], "no-store");
+        assert_eq!(got.headers["x-content-type-options"], "nosniff");
+        assert_eq!(got.headers["content-type"], "text/html; charset=utf-8");
+        assert!(body.starts_with("<!doctype html>"), "{body}");
+        assert!(body.contains(&format!("<h1>{heading}</h1>")), "{body}");
+        assert!(body.contains("<svg class=\"mark\""), "{body}");
+        assert!(
+            body.contains("@media (prefers-color-scheme:dark)"),
+            "{body}"
+        );
+        assert!(body.contains("user-select:all"), "{body}");
+        for absent in [
+            "<script", "<img", "<link", "url(", "the-code", "state=", ACCESS,
+        ] {
+            assert!(!body.contains(absent), "{absent} in {body}");
+        }
+    }
+
+    // The browser page: signed in, and the App is installed.
+    #[tokio::test]
+    async fn browser_page_names_the_installed_accounts() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() =
+            installs_json(&[(1, "octocat", "all"), (2, "acme", "selected")]);
+        let keychain = MemoryKeychain::default();
+        let (done, out, err, got) =
+            browser_login(&keychain, &gh, vec![Visit::To(to_callback)]).await;
+        assert_eq!(done.expect("login").metadata.flow, Flow::Browser);
+        assert_eq!(out, "Signed in to GitHub as octocat.\n");
+        assert!(
+            err.ends_with(
+                "Your boxes can reach repositories on octocat and acme through the Minimal GitHub App.\n"
+            ),
+            "{err}"
+        );
+        assert_eq!(got.len(), 1);
+        assert_page(
+            &got[0],
+            200,
+            "Signed in to GitHub as <strong>octocat</strong>",
+        );
+        assert!(
+            got[0].body.contains(
+                "<p>Your boxes can reach repositories on <strong>octocat</strong> and <strong>acme</strong> through the Minimal GitHub App. You can close this tab.</p>\n<p class=\"muted\"><a href=\"https://github.com/settings/installations\">Change which repositories</a></p>"
+            ),
+            "{}",
+            got[0].body
+        );
+    }
+
+    // The browser page: signed in with no installation offers the install,
+    // and GitHub's return from the install renders the installed page from
+    // a fresh read of the installations, without exchanging the install's
+    // code.
+    #[tokio::test]
+    async fn browser_page_offers_choose_repositories_then_confirms_the_install() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() = installs_json(&[]);
+        let keychain = MemoryKeychain::default();
+        let visits = vec![
+            Visit::To(to_callback),
+            Visit::Install(installs_json(&[(7, "acme", "selected")])),
+            // No state, and a code issued without the PKCE challenge.
+            Visit::To(|redirect, _| {
+                format!("{redirect}?code=install-code&installation_id=7&setup_action=install")
+            }),
+        ];
+        let (done, out, err, got) = browser_login(&keychain, &gh, visits).await;
+        done.expect("login");
+        assert!(keychain.raw().is_some());
+        assert_eq!(out, "Signed in to GitHub as octocat.\n");
+        assert_eq!(
+            err.lines().skip(2).collect::<Vec<_>>(),
+            [
+                "One more step: choose which repositories your boxes can reach at https://github.com/apps/gominimal/installations/new.",
+                "Your boxes can't reach private repositories until you do.",
+                "Waiting for the installation to finish in your browser. Press Ctrl-C to stop waiting.",
+                "Installed on acme. Your boxes can reach 3 selected repositories there.",
+            ],
+            "{err}"
+        );
+        assert_eq!(got.len(), 2);
+        assert_page(
+            &got[0],
+            200,
+            "Signed in to GitHub as <strong>octocat</strong>",
+        );
+        assert!(
+            got[0].body.contains(
+                "<p>One more step: choose which repositories your boxes can reach.</p>\n<p><a class=\"button\" href=\"https://github.com/apps/gominimal/installations/new\">Choose repositories</a></p>\n<p class=\"muted\">Your boxes can&#39;t reach private repositories until you do.</p>"
+            ),
+            "{}",
+            got[0].body
+        );
+        assert_page(&got[1], 200, "Installed on <strong>acme</strong>");
+        assert!(
+            got[1].body.contains(
+                "<p>Your boxes can reach 3 selected repositories there. You can close this tab.</p>"
+            ),
+            "{}",
+            got[1].body
+        );
+        assert!(!got[1].body.contains("install-code"));
+        let seen = gh.seen.lock().unwrap();
+        let exchanges: Vec<&String> = seen
+            .iter()
+            .filter(|r| r.starts_with("POST /login/oauth/access_token"))
+            .collect();
+        assert_eq!(exchanges.len(), 1, "{seen:?}");
+        assert!(exchanges[0].contains("code=the-code"), "{seen:?}");
+        assert!(
+            seen.iter()
+                .any(|r| r.starts_with("GET /user/installations/7/repositories")),
+            "{seen:?}"
+        );
+    }
+
+    // GitHub may send the browser back from the install to a port nothing
+    // listens on. The re-read of the installations still ends the wait.
+    #[tokio::test]
+    async fn an_install_the_browser_does_not_return_from_ends_the_wait() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() = installs_json(&[]);
+        let keychain = MemoryKeychain::default();
+        let visits = vec![
+            Visit::To(to_callback),
+            Visit::Install(installs_json(&[(9, "octocat", "all")])),
+        ];
+        let (done, _, err, got) = browser_login(&keychain, &gh, visits).await;
+        done.expect("login");
+        assert!(
+            err.ends_with("Installed on octocat. Your boxes can reach all repositories there.\n"),
+            "{err}"
+        );
+        assert_eq!(got.len(), 1);
+    }
+
+    // A failed read of the installations does not prove that none exists,
+    // so the sign-in does not wait for an install.
+    #[tokio::test]
+    async fn unread_installations_do_not_start_the_wait() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() = "not json".to_owned();
+        let keychain = MemoryKeychain::default();
+        let visits = vec![Visit::To(to_callback)];
+        let (done, _, err, got) = tokio::time::timeout(
+            Duration::from_secs(60),
+            browser_login(&keychain, &gh, visits),
+        )
+        .await
+        .expect("the sign-in does not wait");
+        done.expect("login");
+        assert!(
+            err.ends_with(
+                "`min` could not read where the Minimal GitHub App is installed.\n\
+                 One more step: choose which repositories your boxes can reach at \
+                 https://github.com/apps/gominimal/installations/new.\n"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("Waiting for the installation"), "{err}");
+        assert_eq!(got.len(), 1);
+    }
+
+    // At the deadline the wait says it stopped and gives the install URL.
+    #[tokio::test]
+    async fn the_install_wait_gives_the_install_url_at_the_deadline() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        browser.deadline = tokio::time::Instant::now();
+        let mut err = Vec::new();
+        browser
+            .await_install(
+                &reqwest::Client::new(),
+                &gh.endpoints,
+                ACCESS,
+                "octocat",
+                &mut err,
+            )
+            .await
+            .expect("wait");
+        assert_eq!(
+            String::from_utf8(err).expect("utf8"),
+            "Stopped waiting. `min` did not see an installation of the Minimal GitHub App.\n\
+             One more step: choose which repositories your boxes can reach at \
+             https://github.com/apps/gominimal/installations/new.\n"
+        );
+    }
+
+    // A re-read that GitHub never answers does not hold the wait past its
+    // deadline: the wait stops at the deadline, not at FINISH_TIMEOUT.
+    #[tokio::test]
+    async fn a_stalled_install_read_does_not_outlive_the_deadline() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        // An API that accepts connections and never answers them.
+        let stall = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let api = format!("http://{}", stall.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = stall.accept().await {
+                held.push(conn);
+            }
+        });
+        let endpoints = Endpoints {
+            oauth: gh.endpoints.oauth.clone(),
+            api,
+        };
+        let started = tokio::time::Instant::now();
+        browser.deadline = started + INSTALL_POLL + Duration::from_secs(1);
+        let mut err = Vec::new();
+        browser
+            .await_install(
+                &reqwest::Client::new(),
+                &endpoints,
+                ACCESS,
+                "octocat",
+                &mut err,
+            )
+            .await
+            .expect("wait");
+        assert!(
+            started.elapsed() < INSTALL_POLL + Duration::from_secs(4),
+            "the wait ran {:?}",
+            started.elapsed()
+        );
+        assert!(
+            String::from_utf8(err)
+                .expect("utf8")
+                .starts_with("Stopped waiting."),
+        );
+    }
+
+    // A failed exchange renders the not-finished page, never a success.
+    #[tokio::test]
+    async fn browser_page_says_not_finished_when_the_exchange_fails() {
+        let gh = fake_github_scripted("octocat", Script::ExchangeFails).await;
+        let keychain = MemoryKeychain::default();
+        let (done, out, _, got) = browser_login(&keychain, &gh, vec![Visit::To(to_callback)]).await;
+        let text = format!("{:#}", done.expect_err("a failed exchange fails"));
+        assert!(
+            text.starts_with("GitHub approved the sign-in, but `min` could not finish it.\n"),
+            "{text}"
+        );
+        assert!(text.contains("502 Bad Gateway"), "{text}");
+        assert!(
+            text.ends_with("\nRun `min auth login` to try again."),
+            "{text}"
+        );
+        assert_eq!(out, "");
+        assert!(keychain.raw().is_none());
+        assert_eq!(got.len(), 1);
+        assert_page(&got[0], 502, "Sign-in not finished");
+        assert!(
+            got[0].body.contains(&format!(
+                "<p>GitHub approved the sign-in, but <code>min</code> could not finish it. Your terminal says why. Run {CHIP} to try again.</p>"
+            )),
+            "{}",
+            got[0].body
+        );
+    }
+
+    // The browser page: cancelled on GitHub, and refused by GitHub.
+    #[tokio::test]
+    async fn browser_page_says_cancelled_and_not_approved() {
+        let gh = fake_github("octocat").await;
+        let keychain = MemoryKeychain::default();
+        let cancel = Visit::To(|redirect, state| {
+            format!("{redirect}?error=access_denied&error_description=denied&state={state}")
+        });
+        let (done, out, _, got) = browser_login(&keychain, &gh, vec![cancel]).await;
+        assert_eq!(
+            format!("{:#}", done.expect_err("cancelled")),
+            "The sign-in was cancelled on GitHub. Nothing was saved. Run `min auth login` to try again."
+        );
+        assert_eq!(out, "");
+        assert!(keychain.raw().is_none());
+        assert_page(&got[0], 200, "Sign-in cancelled");
+        assert!(
+            got[0].body.contains(&format!(
+                "<p>Nothing was saved. Run {CHIP} to try again.</p>"
+            )),
+            "{}",
+            got[0].body
+        );
+
+        let refuse = Visit::To(|redirect, state| {
+            format!("{redirect}?error=redirect_uri_mismatch&state={state}")
+        });
+        let (done, _, _, got) = browser_login(&keychain, &gh, vec![refuse]).await;
+        assert_eq!(
+            format!("{:#}", done.expect_err("refused")),
+            "GitHub did not approve the sign-in. GitHub sent back `redirect_uri_mismatch`.\nRun `min auth login` to try again."
+        );
+        assert_page(&got[0], 502, "Sign-in not finished");
+        assert!(
+            got[0].body.contains(&format!(
+                "<p>GitHub did not approve the sign-in. Your terminal says why. Run {CHIP} to try again.</p>"
+            )),
+            "{}",
+            got[0].body
+        );
+    }
+
+    // The browser page: an expired link and an unknown path answer, and the
+    // listener keeps serving the real callback.
+    #[tokio::test]
+    async fn browser_pages_for_expired_link_and_unknown_path_keep_the_listener() {
+        let gh = fake_github("octocat").await;
+        let keychain = MemoryKeychain::default();
+        let visits = vec![
+            Visit::To(|redirect, _| format!("{redirect}?code=the-code&state=earlier")),
+            Visit::To(|redirect, _| redirect.replace("/callback", "/favicon.ico")),
+            Visit::To(to_callback),
+        ];
+        let (done, out, _, got) = browser_login(&keychain, &gh, visits).await;
+        done.expect("login");
+        assert_eq!(out, "Signed in to GitHub as octocat.\n");
+        assert_eq!(got.len(), 3);
+        assert_page(&got[0], 400, "This sign-in link has expired");
+        assert!(
+            got[0].body.contains(&format!(
+                "<p>It belongs to an earlier {CHIP}. Run {CHIP} again.</p>"
+            )),
+            "{}",
+            got[0].body
+        );
+        assert_page(&got[1], 404, "Not found");
+        assert!(!got[1].body.contains("min auth login"), "{}", got[1].body);
+        assert_page(
+            &got[2],
+            200,
+            "Signed in to GitHub as <strong>octocat</strong>",
+        );
+    }
+
+    // Names from GitHub are escaped on the page.
+    #[tokio::test]
+    async fn browser_page_escapes_names_from_github() {
+        let gh = fake_github("octocat").await;
+        let hostile = r#"<img src=x onerror=alert(1)>&"'"#;
+        *gh.installs.lock().unwrap() = installs_json(&[(1, hostile, "all")]);
+        let keychain = MemoryKeychain::default();
+        let (done, _, _, got) = browser_login(&keychain, &gh, vec![Visit::To(to_callback)]).await;
+        done.expect("login");
+        assert_page(
+            &got[0],
+            200,
+            "Signed in to GitHub as <strong>octocat</strong>",
+        );
+        assert!(
+            got[0]
+                .body
+                .contains("<strong>&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;</strong>"),
+            "{}",
+            got[0].body
+        );
+        let installed = Page::installed(hostile, "all repositories").response();
+        assert!(
+            installed.contains(
+                "<h1>Installed on <strong>&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;</strong></h1>"
+            ),
+            "{installed}"
+        );
+        assert!(!installed.contains("<img"), "{installed}");
+    }
+
+    // The device flow prints the same install line as the browser flow.
+    #[tokio::test]
+    async fn device_sign_in_without_installation_prints_the_install_url() {
+        let gh = fake_github("octocat").await;
+        *gh.installs.lock().unwrap() = installs_json(&[]);
+        let keychain = MemoryKeychain::default();
+        let (_, out, err) = login_with(&keychain, &gh, None, true, &no_browser).await;
+        assert_eq!(out, "Signed in to GitHub as octocat.\n");
+        assert!(
+            err.ends_with(
+                "One more step: choose which repositories your boxes can reach at https://github.com/apps/gominimal/installations/new.\nYour boxes can't reach private repositories until you do.\n"
+            ),
+            "{err}"
+        );
+    }
+
     // BEP-001: no browser flow is shipped without the secret
     #[tokio::test]
     async fn auth_login_without_built_in_secret_takes_device_flow() {
@@ -1233,7 +2391,11 @@ mod tests {
         let keychain = MemoryKeychain::default();
         let (first, _, err) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(first.new_instance);
-        assert!(err.contains(INSTALL_NOTE), "{err}");
+        assert_eq!(
+            err.lines().last(),
+            Some("Your boxes can reach repositories on octocat through the Minimal GitHub App."),
+            "{err}"
+        );
         keychain.clear();
         let (after_logout, _, _) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(after_logout.new_instance);
@@ -1274,7 +2436,13 @@ mod tests {
         keychain.write(&held, &old).expect("seed");
         let (stored, _, err) = login_with(&keychain, &gh, None, true, &no_browser).await;
         assert!(!stored.new_instance);
-        assert!(!err.contains(INSTALL_NOTE), "{err}");
+        // Every sign-in says where the App's installations let boxes reach.
+        assert!(
+            err.ends_with(
+                "Your boxes can reach repositories on octocat through the Minimal GitHub App.\n"
+            ),
+            "{err}"
+        );
         assert_eq!(stored.metadata.instance, held.instance);
         let material = keychain.material().expect("read").expect("held");
         assert_eq!(material.access_token, ACCESS);
@@ -1470,10 +2638,16 @@ mod tests {
             !seen.iter().any(|r| r.contains("grant_type=refresh_token")),
             "{seen:?}"
         );
-        // The one request that carries the token is the sign-in's account
-        // lookup.
+        // The requests that carry the token are the sign-in's account
+        // lookup and its one read of the App's installations.
         assert_eq!(
-            seen.iter().filter(|r| r.starts_with("GET /user")).count(),
+            seen.iter().filter(|r| r.starts_with("GET /user ")).count(),
+            1
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|r| r.starts_with("GET /user/installations"))
+                .count(),
             1
         );
     }
