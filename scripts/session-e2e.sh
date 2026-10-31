@@ -446,8 +446,8 @@ R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
 R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
 AR_AUDIT_EDIT="" # the audit segment the rotation proof edits; restored on teardown
 AR_AUDIT_BACKUP="" # its original bytes
-AR_AUDIT_DIR="" # the audit directory the rotation proof restores on teardown
-AR_AUDIT_SNAPSHOT="" # its segments from before the rotation proof
+AR_AUDIT_DIR="" # the audit directory the rotation proof gives back on teardown
+AR_AUDIT_SAVED="" # where the real one waits meanwhile, or "none" when it did not exist
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1080,7 +1080,7 @@ teardown() {
   # The rotation proof's edited audit segment goes back to its own bytes,
   # before the `rm -rf "$WORK"` below removes the copy.
   ar_restore_edit
-  # Its audit segments go back to the copy from before its restart. The
+  # Its own audit directory goes, and the real one is renamed back. The
   # stop above leaves no proxy to write them.
   ar_restore_audit
   [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
@@ -15391,11 +15391,15 @@ proof_bep_round_three_conditions_closed() {
 #   4. With the proxy down, one record is edited, and `min doctor` reports
 #      the break and exits 6.
 #   5. With the record restored, `min doctor` reports the chain verified.
-# The log is the real one under $HOME/.minimal/bep/audit. The small bound
-# can prune old segments past the retained count. So before the restart,
-# with no proxy up, the case copies every segment aside. On every exit, and
-# in the teardown, the segments go back to that copy once no proxy writes
-# them, so the case leaves the real log as it found it.
+# bep has no setting that moves its audit directory from
+# $HOME/.minimal/bep/audit, and min doctor and min box audit read that path.
+# The small bound prunes segments past the retained count, so the case must
+# not run against the real log. Before the restart, with no proxy up, the
+# case renames the real directory to audit.e2e-saved beside it. The proxy
+# then writes a new, empty directory of the case's own. No process opens
+# the real log while the case runs, so nothing in it rotates or is pruned.
+# On every exit, and in the teardown, the case removes its own directory
+# once no proxy writes it, and renames the real one back.
 ar_segment_numbers() { # $1 = the audit directory; prints the segment numbers, sorted
   find "$1" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
     | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n
@@ -15407,14 +15411,13 @@ ar_restore_edit() {
   AR_AUDIT_EDIT=""
   AR_AUDIT_BACKUP=""
 }
-# Puts the audit segments back to the copy the rotation proof took before
-# its restart. This removes the case's segments and restores any that the
-# small bound pruned. It runs only when no `bep serve` of this run writes
-# the log. Otherwise it keeps the copy and names it.
+# Removes the rotation proof's own audit directory and renames the real
+# one back. It runs only when no `bep serve` of this run writes the log.
+# Otherwise it keeps the real directory where it waits, and names it.
 ar_restore_audit() {
-  if [ -z "$AR_AUDIT_DIR" ] || [ ! -d "$AR_AUDIT_SNAPSHOT" ]; then
+  if [ -z "$AR_AUDIT_DIR" ] || [ -z "$AR_AUDIT_SAVED" ]; then
     AR_AUDIT_DIR=""
-    AR_AUDIT_SNAPSHOT=""
+    AR_AUDIT_SAVED=""
     return 0
   fi
   for _ in $(seq 1 20); do
@@ -15422,16 +15425,27 @@ ar_restore_audit() {
     sleep 0.5
   done
   if [ -n "$(r3_proxy_pids)" ]; then
-    echo "::error::the audit log in $AR_AUDIT_DIR was not restored: a bep serve still writes it. Its segments from before the rotation case are in $AR_AUDIT_SNAPSHOT"
+    if [ "$AR_AUDIT_SAVED" = none ]; then
+      echo "::error::the audit directory $AR_AUDIT_DIR of the rotation case was not removed: a bep serve still writes it"
+    else
+      echo "::error::the audit log in $AR_AUDIT_DIR was not given back: a bep serve still writes it. The real log is in $AR_AUDIT_SAVED. Stop bep, remove $AR_AUDIT_DIR, and rename $AR_AUDIT_SAVED to $AR_AUDIT_DIR"
+    fi
     return 0
   fi
-  find "$AR_AUDIT_DIR" -maxdepth 1 -name 'audit-*.jsonl' -type f -exec rm -f {} +
-  find "$AR_AUDIT_SNAPSHOT" -maxdepth 1 -name 'audit-*.jsonl' -type f \
-    -exec cp -p {} "$AR_AUDIT_DIR/" \;
-  echo "restored the audit log in $AR_AUDIT_DIR to its segments from before the rotation case"
-  rm -rf "${AR_AUDIT_SNAPSHOT:?}"
+  if [ "$AR_AUDIT_SAVED" = none ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    echo "removed the audit directory of the rotation case, $AR_AUDIT_DIR"
+  elif [ -d "$AR_AUDIT_SAVED" ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    if mv "$AR_AUDIT_SAVED" "$AR_AUDIT_DIR"; then
+      echo "gave back the real audit log in $AR_AUDIT_DIR, as it was before the rotation case"
+    else
+      echo "::error::the real audit log was not renamed back. It is in $AR_AUDIT_SAVED. Rename it to $AR_AUDIT_DIR"
+      return 0
+    fi
+  fi
   AR_AUDIT_DIR=""
-  AR_AUDIT_SNAPSHOT=""
+  AR_AUDIT_SAVED=""
 }
 proof_bep_audit_rotation_and_doctor_end_to_end() {
   echo "::group::audit log rotation: the chain carries across segments, min box audit reads them all, min doctor reports an edit"
@@ -15444,7 +15458,7 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
   local ar_audit ar_first ar_last ar_new ar_try ar_rot ar_out ar_id ar_rc ar_seg ar_mark
 
   # The first gate only checks that a proxy can run here. Then the pair
-  # stops, so no writer races the copy of the real segments.
+  # stops, so no writer holds the real log when it moves aside.
   if ! bep_live_gate "$ar_case"; then
     echo "::endgroup::"
     return 0
@@ -15457,17 +15471,25 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
     sleep 0.5
   done
   if bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; then
-    echo "::error::the Box Egress Proxy still runs after 'min stop --force' and 'minvmd stop', so the case cannot copy the audit log aside"
+    echo "::error::the Box Egress Proxy still runs after 'min stop --force' and 'minvmd stop', so the case cannot move the audit log aside"
     fail
   fi
   ar_audit="$(dirname "$ar_control")/audit"
-  AR_AUDIT_SNAPSHOT="$(mktemp -d /tmp/mnlaudit.XXXXXX)" || fail
-  AR_AUDIT_DIR="$ar_audit"
-  if [ -d "$ar_audit" ]; then
-    find "$ar_audit" -maxdepth 1 -name 'audit-*.jsonl' -type f \
-      -exec cp -p {} "$AR_AUDIT_SNAPSHOT/" \; || fail
+  # The saved name is fixed, so a copy that an earlier killed run left
+  # behind stops the case before anything can overwrite it.
+  if [ -e "$ar_audit.e2e-saved" ]; then
+    echo "::error::$ar_audit.e2e-saved exists. An earlier run of this case moved the real audit log there and did not rename it back. Remove $ar_audit if it holds only test segments, and rename $ar_audit.e2e-saved to $ar_audit"
+    fail
   fi
-  echo "copied $(ar_segment_numbers "$AR_AUDIT_SNAPSHOT" | wc -l | tr -d ' ') audit segment(s) aside to $AR_AUDIT_SNAPSHOT"
+  if [ -e "$ar_audit" ]; then
+    mv "$ar_audit" "$ar_audit.e2e-saved" || fail
+    AR_AUDIT_SAVED="$ar_audit.e2e-saved"
+    echo "moved the real audit log aside to $AR_AUDIT_SAVED, with $(ar_segment_numbers "$AR_AUDIT_SAVED" | wc -l | tr -d ' ') segment(s)"
+  else
+    AR_AUDIT_SAVED=none
+    echo "no audit log exists yet, so the case writes a new one in $ar_audit and removes it at the end"
+  fi
+  AR_AUDIT_DIR="$ar_audit"
 
   # The second gate restarts the daemon pair, and the proxy inherits this
   # bound from minvmd's environment.
