@@ -517,7 +517,8 @@ pub(crate) fn proxy_present(
 /// Why no node-local proxy serves boxes on this host, or `None` when one
 /// does ([`proxy_present`]). `binary` is the proxy program the host daemon
 /// starts, by `bep::store::proxy_binary_path`, and `log` is the file that
-/// daemon writes the proxy's output to. A program that does not exist is
+/// daemon writes the proxy's output to, kept only when it exists. A
+/// program that does not exist is
 /// not installed. One that exists and published nothing does not answer.
 /// A relative `MINVMD_BEP_BIN` is its own cause, not a missing program.
 pub(crate) fn proxy_absence(
@@ -532,7 +533,11 @@ pub(crate) fn proxy_absence(
         return None;
     }
     let absence = match binary {
-        Ok(path) if path.exists() => ProxyAbsence::NotAnswering { path, log },
+        // The text names the log only when the host daemon wrote it.
+        Ok(path) if path.exists() => ProxyAbsence::NotAnswering {
+            path,
+            log: log.filter(|log| log.exists()),
+        },
         Ok(path) => ProxyAbsence::NotInstalled { path: Some(path) },
         Err(ProxyLookupError::RelativeEnv(path)) => ProxyAbsence::RelativePath { path },
         Err(ProxyLookupError::NoMinvmd) => ProxyAbsence::NotInstalled { path: None },
