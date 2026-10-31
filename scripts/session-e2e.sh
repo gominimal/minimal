@@ -15522,6 +15522,12 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
   fi
 
   # 1a. The info line at the start names the bound.
+  # A release bep ignores the override and logs a warning in its place.
+  if tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -qF 'ignored the audit segment test override: this is a release build'; then
+    echo "::error::bep serve ignored BEP_AUDIT_SEGMENT_BYTES because it is a release build. This case needs a debug build of bep. Set MINVMD_BEP_BIN to a debug build of bep, then run the case again"
+    ar_fail
+  fi
   # The awk drops the colour escapes the log can carry around a field.
   if ! tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
     | grep -F 'audit segment bound set by the test override' \
