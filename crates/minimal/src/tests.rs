@@ -5865,15 +5865,38 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // A name a running VM owns and a stopped VM's records hold is ambiguous:
-    // the error lists both VMs, marks the stopped one, and names --vm.
+    // A running box wins: an active box on the running VM resolves there,
+    // though a stopped VM's records hold the same name.
     stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
-    let err = attach::resolve_box_vm(&global, "api")
+    let resolved = attach::resolve_box_vm(&global, "api")
         .await
-        .expect_err("a running owner and a stopped holder are ambiguous");
+        .expect("an active box on a running VM resolves")
+        .expect("the running VM owns the name");
+    assert_eq!(resolved.vm, paths::DEFAULT_VM_NAME);
+    assert_eq!(resolved.record.status, boxes::BoxState::Active);
+
+    // A stopped record on the running VM and a stopped VM that holds the
+    // name are ambiguous: the error lists both VMs, marks the stopped one,
+    // and names --vm.
+    let web = create_box_on(&default_vm, "web").await;
+    stopped_vm_with_boxes(state.path(), "zeta", &[("web", boxes::SessionId::mint())]);
+    let mut rpc = default_vm.connect().await;
+    match rpc
+        .call::<minimald_rpc::StopBox>(&minimald_rpc::StopBoxRequest {
+            id: web,
+            force: true,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    let err = attach::resolve_box_vm(&global, "web")
+        .await
+        .expect_err("a stopped owner and a stopped holder are ambiguous");
     assert_eq!(
         err.to_string(),
-        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+        "box name 'web' exists on more than one VM (default, zeta (stopped)); \
          name the one you mean with --vm"
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
