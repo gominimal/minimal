@@ -162,6 +162,7 @@ async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() 
 #[test]
 fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -205,6 +206,7 @@ fn ls_shows_shared_resource_pool() {
 #[test]
 fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -249,14 +251,33 @@ fn ls_table_exposes_project_path_and_status() {
     );
 }
 
-/// NET-079's proof names the listing: a host-address box that runs
-/// unenforced shows egress enforcement `none` in the human `min ls`, not
-/// only in `--json`; one decided per box shows `per_box`; a box the daemon
-/// reports no enforcement for shows `-`.
+/// The cell under `column` in the row that contains `row_key`, read by
+/// the header's positions: `column` up to `next`, the column after it. A
+/// cell can hold spaces, so the row is not split on whitespace.
+fn ls_cell(text: &str, row_key: &str, column: &str, next: &str) -> String {
+    let header = text
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a header in:\n{text}"));
+    let start = header.find(column).expect("the column in the header");
+    let end = header.find(next).expect("the next column in the header");
+    let row = text
+        .lines()
+        .find(|l| l.contains(row_key) && !l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a row for {row_key} in:\n{text}"));
+    row[start..end].trim().to_string()
+}
+
+/// NET-079's proof names the listing, in `min session policy`'s words
+/// (T110): a host-address box that runs unenforced shows its posture with
+/// `; per-box enforcement none` in the human `min ls`, one decided per box
+/// shows its posture alone, and a box the daemon reports no posture for
+/// shows `-`.
 #[test]
 fn ls_table_shows_host_address_enforcement() {
+    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
     let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        id: id(n),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
         status: sessions::SessionStatus::Active,
@@ -265,7 +286,18 @@ fn ls_table_shows_host_address_enforcement() {
         shared_port_collisions: Vec::new(),
         attrs: None,
     };
+    let posture = |posture| minimald_rpc::BoxNetworkFacts {
+        loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
+        egress_posture: Some(posture),
+        at_fallback: Some(true),
+    };
     let resp = ListSessionsResponse {
+        box_networks: [
+            (id(1), posture(minimald_rpc::EgressPosture::DenyAll)),
+            (id(2), posture(minimald_rpc::EgressPosture::AllowAllDefault)),
+        ]
+        .into_iter()
+        .collect(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -293,18 +325,15 @@ fn ls_table_shows_host_address_enforcement() {
     .unwrap();
 
     let text = String::from_utf8(out).unwrap();
-    let cells_of = |name: &str| -> Vec<String> {
-        text.lines()
-            .find(|l| l.contains(name))
-            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    };
-    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
-    assert_eq!(cells_of("decided")[3], "per_box", "got:\n{text}");
-    assert_eq!(cells_of("unenforced")[3], "none", "got:\n{text}");
-    assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
+    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
+    assert_eq!(egress("decided"), "deny-all", "got:\n{text}");
+    assert_eq!(
+        egress("unenforced"),
+        "allow-all (default); per-box enforcement none",
+        "got:\n{text}"
+    );
+    assert_eq!(egress("own-address"), "-", "got:\n{text}");
+    assert!(!text.contains("per_box"), "got:\n{text}");
 }
 
 /// NET-129's listing half: a box that yields a declared port at a shared
@@ -329,6 +358,7 @@ fn ls_reports_yielded_shared_address_ports() {
         held_by: "first.min.internal".to_string(),
     };
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -385,12 +415,13 @@ fn ls_reports_yielded_shared_address_ports() {
     );
 }
 
-/// The multi-VM table carries the same EGRESS cell, one column right of the
-/// single-VM one because each row leads with its VM.
+/// The multi-VM table carries the same EGRESS cell, after the VM column
+/// each row leads with.
 #[test]
 fn ls_across_vms_table_shows_host_address_enforcement() {
+    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
     let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        id: id(n),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
         status: sessions::SessionStatus::Active,
@@ -399,9 +430,20 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         shared_port_collisions: Vec::new(),
         attrs: None,
     };
-    let listing = |vm: &str, sessions| VmListing {
+    let posture = |n: u64, posture| {
+        (
+            id(n),
+            minimald_rpc::BoxNetworkFacts {
+                loopback_address: None,
+                egress_posture: Some(posture),
+                at_fallback: None,
+            },
+        )
+    };
+    let listing = |vm: &str, sessions, box_networks| VmListing {
         vm: vm.to_string(),
         resp: ListSessionsResponse {
+            box_networks,
             daemon_version: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
@@ -419,6 +461,9 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
                 entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
                 entry("own-address", 3, None),
             ],
+            [posture(1, minimald_rpc::EgressPosture::AllowAllDefault)]
+                .into_iter()
+                .collect(),
         ),
         listing(
             "alpha",
@@ -427,6 +472,9 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
                 2,
                 Some(minimald_rpc::HostIpEnforcement::None),
             )],
+            [posture(2, minimald_rpc::EgressPosture::DeclaredRules)]
+                .into_iter()
+                .collect(),
         ),
     ];
     let mut out = Vec::new();
@@ -444,18 +492,15 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
     .unwrap();
 
     let text = String::from_utf8(out).unwrap();
-    let cells_of = |name: &str| -> Vec<String> {
-        text.lines()
-            .find(|l| l.contains(name))
-            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    };
-    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
-    assert_eq!(cells_of("decided")[4], "per_box", "got:\n{text}");
-    assert_eq!(cells_of("unenforced")[4], "none", "got:\n{text}");
-    assert_eq!(cells_of("own-address")[4], "-", "got:\n{text}");
+    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
+    assert_eq!(egress("decided"), "allow-all (default)", "got:\n{text}");
+    assert_eq!(
+        egress("unenforced"),
+        "declared rules; per-box enforcement none",
+        "got:\n{text}"
+    );
+    assert_eq!(egress("own-address"), "-", "got:\n{text}");
+    assert_eq!(ls_cell(&text, "decided", "ADDRESS", "STATUS"), "-");
 }
 
 #[tokio::test]
@@ -3646,7 +3691,7 @@ async fn activate_and_ls_report_native_surface() {
     // the port the proxy's half of the line names, and the port a hook
     // would have to route to.
     let mut client = connect_daemon(&args).await.unwrap();
-    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
     let port = resp
         .hostname_proxy_port
         .expect("the proxy must report the port it landed on");
@@ -3678,7 +3723,7 @@ async fn activate_and_ls_report_native_surface() {
          {ls_stdout}"
     );
     assert!(
-        !ls_stdout.contains("resolves through this machine's DNS"),
+        !ls_stdout.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {ls_stdout}"
     );
 
@@ -3727,7 +3772,7 @@ async fn activate_and_ls_report_native_surface() {
         "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        !activate_stderr.contains("resolves on this machine"),
+        !activate_stderr.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
@@ -3746,6 +3791,17 @@ async fn activate_and_ls_report_native_surface() {
     // live surface, the proxy's half stays beside it (NET-019), and neither
     // the NET-122 advisory nor the pointer a native host no longer needs
     // rides it.
+    // A box that reports its own range address (T110): the BOX NAMES row
+    // reads the own-address form only when a box proves it is off the
+    // `127.0.0.1` fallback.
+    resp.box_networks.insert(
+        sessions::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(Ipv4Addr::new(127, 0, 64, 2)),
+            egress_posture: None,
+            at_fallback: Some(false),
+        },
+    );
     let mut native_out = Vec::new();
     format_ls(
         &mut native_out,
@@ -3760,14 +3816,13 @@ async fn activate_and_ls_report_native_surface() {
     .unwrap();
     let native_ls = String::from_utf8(native_out).unwrap();
     assert!(
-        native_ls
-            .contains("BOX NAMES:       <box>.min.internal resolves through this machine's DNS"),
+        native_ls.contains("BOX NAMES:       <box>.min.internal opens at its name on this machine"),
         "`min ls` must say native DNS is the live surface when the three facts hold, got: \
          {native_ls}"
     );
     assert!(
         native_ls.contains(&format!(
-            "the hostname proxy also listens on 127.0.0.1:{port}"
+            "; the HTTP proxy at 127.0.0.1:{port} opens it too"
         )),
         "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
     );
@@ -3790,8 +3845,8 @@ async fn activate_and_ls_report_native_surface() {
     assert_eq!(
         finished,
         format!(
-            "names: native-surface.min.internal resolves on this machine; open it through the \
-             HTTP proxy at 127.0.0.1:{port}"
+            "names: native-surface.min.internal opens at its name on this machine; the HTTP \
+             proxy at 127.0.0.1:{port} opens it too"
         ),
         "a finished host's start line carries no clause"
     );
@@ -3891,6 +3946,7 @@ async fn ls_keeps_detail_rows_and_name_surface_clause() {
 #[test]
 fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -3927,10 +3983,11 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     // The verdict beside it: the query proved the answerer live and this
     // host's facts held, so the surface the CLI computed prints through —
-    // the same `BOX NAMES` line the native host's list carries.
+    // the same `BOX NAMES` line the native host's list carries. No box is
+    // listed, so none proves it is off the `127.0.0.1` fallback, and the
+    // row reads the fallback form (T110).
     assert!(
-        holder_ls
-            .contains("BOX NAMES:       <box>.min.internal resolves through this machine's DNS"),
+        holder_ls.contains("BOX NAMES:       <box>.min.internal resolves on this machine"),
         "the VM-host verdict rides the list like a native one: {holder_ls}"
     );
     assert!(
@@ -3968,8 +4025,8 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     assert!(
         held_ls.contains(
-            "BOX NAMES:       the hostname proxy is not serving, and box names open only \
-             through it"
+            "BOX NAMES:       <box>.min.internal: the hostname proxy is not serving; finish \
+             setup: min finalize-install"
         ),
         "the no-channel verdict reads the proxy: {held_ls}"
     );
@@ -4031,6 +4088,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
 #[test]
 fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -4147,6 +4205,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     // cause row is the one HOSTNAME PROXY row, and neither it nor the NAME
     // SURFACE row names the reported port as serving.
     let reported = ListSessionsResponse {
+        box_networks: Default::default(),
         hostname_proxy_port: Some(7_654),
         ..resp.clone()
     };
@@ -4215,6 +4274,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
     let listing = |vm: &str, proxy_port: u16| VmListing {
         vm: vm.to_string(),
         resp: ListSessionsResponse {
+            box_networks: Default::default(),
             daemon_version: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: Some(proxy_port),
@@ -4300,9 +4360,11 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
                 && !default_surface[0].contains("opens through the HTTP proxy at"),
             "the down VM's surface row does not name its proxy as serving:\n{text}"
         );
+        // The surface row names no proxy at all (T110): the HOSTNAME PROXY
+        // row above is where the cause is named.
         assert!(
-            default_surface[0].contains("not serving"),
-            "the down VM's surface row agrees the proxy is not serving:\n{text}"
+            !default_surface[0].contains("HTTP proxy"),
+            "the down VM's surface row names no proxy to open it through:\n{text}"
         );
 
         // The other VM: its own listening row and serving surface, as before.
@@ -4425,6 +4487,7 @@ fn retired_surfaces_absent() {
 #[test]
 fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: Some("test".to_string()),
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,

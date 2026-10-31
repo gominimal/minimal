@@ -147,23 +147,54 @@ async fn serve_list_sessions(
             // listing.
             let in_microvm = s.in_microvm().await;
             let fact = crate::session_host::host_ip_enforcement_fact();
-            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
-                let record = mngr
-                    .get_record(SessionKeyPredicate::Id(i.id))
+            let opt_out = s.deny_all_opt_out().await;
+            let records = futures::future::join_all(infos.iter().map(|i| async {
+                mngr.get_record(SessionKeyPredicate::Id(i.id))
                     .await
                     .ok()
-                    .flatten();
-                record.map(|record| {
-                    crate::session_host::displayed_host_ip_enforcement(
-                        in_microvm,
-                        record.network,
-                        classifier::verdict_of(record.policy.egress.as_ref()),
-                        &fact,
-                        record.host_ip_enforcement,
-                    )
-                })
+                    .flatten()
             }))
             .await;
+            let enforcement: Vec<_> = records
+                .iter()
+                .map(|record| {
+                    record.as_ref().map(|record| {
+                        crate::session_host::displayed_host_ip_enforcement(
+                            in_microvm,
+                            record.network,
+                            classifier::verdict_of(record.policy.egress.as_ref()),
+                            &fact,
+                            record.host_ip_enforcement,
+                        )
+                    })
+                })
+                .collect();
+            // T110: each box's address and egress posture, from its record
+            // and the hostname registry. A box with no fact for a field
+            // leaves it `None`, so the listing shows `-` rather than an
+            // invented value.
+            let box_networks: std::collections::BTreeMap<_, _> = infos
+                .iter()
+                .zip(&records)
+                .map(|(i, record)| {
+                    (
+                        i.id,
+                        box_network_facts(&mngr, i.id, record.as_ref(), opt_out, in_microvm),
+                    )
+                })
+                .collect();
+            tracing::info!(
+                boxes = infos.len(),
+                with_address = box_networks
+                    .values()
+                    .filter(|f| f.loopback_address.is_some())
+                    .count(),
+                with_posture = box_networks
+                    .values()
+                    .filter(|f| f.egress_posture.is_some())
+                    .count(),
+                "listed boxes with their address and egress posture"
+            );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -171,6 +202,7 @@ async fn serve_list_sessions(
                 zone_answerer_port,
                 answerer_bound: zone_answerer_port.is_some(),
                 resource_pool,
+                box_networks,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
                 // project paths do not exist and git is not on PATH. The
@@ -209,6 +241,82 @@ async fn serve_list_sessions(
             })
         })
         .await
+}
+
+/// The address a host-address box reports in the listing (T110): the
+/// node's address, except in a microVM whose node address is still
+/// `127.0.0.1`, where the box reports none.
+fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<std::net::Ipv4Addr> {
+    (!in_microvm || node != std::net::Ipv4Addr::LOCALHOST).then_some(node)
+}
+
+/// Whether a listed box stands on the `127.0.0.1` fallback (T110). A
+/// host-address box's node address can be `127.0.0.1` too, so only an
+/// own-address or `none` box at `127.0.0.1` is at the fallback. A
+/// host-address box whose address is withheld (a VM node not yet granted
+/// its address) is reached only through the proxy, so it reads as the
+/// fallback too (design §7.1). Any other box with no address reports none.
+fn box_at_fallback(
+    host_address: bool,
+    loopback_address: Option<std::net::Ipv4Addr>,
+) -> Option<bool> {
+    match loopback_address {
+        None => host_address.then_some(true),
+        Some(address) => Some(!host_address && address == std::net::Ipv4Addr::LOCALHOST),
+    }
+}
+
+/// One box's network facts as the listing reports them (T110). The address
+/// is the host loopback address its ports answer at: the node's address for
+/// a host-address box, and for an own-address or `none` box the address its
+/// publish holds (NET-010, or the `127.0.0.1` interim where the range is
+/// absent), else the loopback address its registration was handed. The
+/// posture is the effective egress `GetEffectiveSessionPolicy` resolves for
+/// the same record ([`effective_policy_reply`]). A box whose record cannot
+/// be read reports no posture, and one that publishes nowhere reports no
+/// address. In a microVM, a host-address box reports no address while the
+/// node's address is still `127.0.0.1`: the answerer has not granted the
+/// node its address yet, and a VM node's host-address boxes are never
+/// mirrored onto `127.0.0.1` (design §7.1).
+fn box_network_facts(
+    mngr: &crate::sessions::ManagerHandle,
+    id: SessionId,
+    record: Option<&sessions::Record>,
+    opt_out: bool,
+    in_microvm: bool,
+) -> minimald_rpc::BoxNetworkFacts {
+    let host_address = matches!(
+        record.map(|record| record.network),
+        Some(sessions::NetworkMode::HostNet)
+    );
+    let loopback_address = {
+        let registry = mngr.hostnames();
+        let routes = registry.read().expect("hostname registry lock poisoned");
+        if host_address {
+            host_address_loopback(routes.node_address(), in_microvm)
+        } else {
+            routes.published_own_address(id).or_else(|| {
+                record
+                    .and_then(|record| record.box_addresses)
+                    .map(|addresses| addresses.loopback_address)
+            })
+        }
+    };
+    let at_fallback = box_at_fallback(host_address, loopback_address);
+    let egress_posture = record.map(|record| {
+        let effective = effective_policy_reply(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            opt_out,
+        );
+        minimald_rpc::EgressPosture::of(&effective.egress, record.network)
+    });
+    minimald_rpc::BoxNetworkFacts {
+        loopback_address,
+        egress_posture,
+        at_fallback,
+    }
 }
 
 /// The ports a box's attach yields because a sibling at the same shared
@@ -7587,5 +7695,112 @@ mod tests {
             tokio::net::UnixStream::connect(&sock).await.is_ok(),
             "the live door still answers"
         );
+    }
+
+    /// T110: the listing reports each box's address and egress posture, keyed
+    /// by its id. A host-address box answers at the node's address. An
+    /// own-address or `none` box answers at the address its publish holds, and
+    /// reports none before it publishes. The posture is the one the effective
+    /// policy reply resolves for the same box.
+    #[tokio::test]
+    async fn list_sessions_reports_box_address_and_posture() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let mut host_address = req("host-address", "/uwu");
+        host_address.config.network = NetworkMode::HostNet;
+        let host_id = client
+            .call::<CreateSession>(&host_address)
+            .await
+            .unwrap()
+            .id;
+        let own_id = own_ip_session(
+            &mut client,
+            "own-address",
+            sessions::SessionPolicy::new(None, None),
+        )
+        .await;
+        let mut no_net = req("no-network", "/uwu");
+        no_net.config.network = NetworkMode::NoNet;
+        let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+        // Before either box publishes, neither has an address to report.
+        let listed = client.call::<ListSessions>(&()).await;
+        assert_eq!(
+            listed.box_networks[&own_id].loopback_address, None,
+            "an unpublished box reports no address, never an invented one"
+        );
+
+        let mngr = server.state.sessions_manager().await;
+        let own_address = std::net::Ipv4Addr::new(127, 0, 64, 2);
+        // The `none` box stands on the `127.0.0.1` fallback, so the reply
+        // marks it there, while a host-address box at the node address is not.
+        let none_address = std::net::Ipv4Addr::LOCALHOST;
+        let node = {
+            let registry = mngr.hostnames();
+            let mut routes = registry.write().unwrap();
+            routes.publish_own_address(own_id, "own-address", own_address, Default::default());
+            routes.publish_own_address(none_id, "no-network", none_address, Default::default());
+            routes.node_address()
+        };
+
+        let listed = client.call::<ListSessions>(&()).await;
+        let facts = |id: SessionId| {
+            listed
+                .box_networks
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| panic!("facts for {id} in {:?}", listed.box_networks))
+        };
+        assert_eq!(
+            facts(own_id),
+            minimald_rpc::BoxNetworkFacts {
+                loopback_address: Some(own_address),
+                egress_posture: Some(minimald_rpc::EgressPosture::DenyAllDefault),
+                at_fallback: Some(false),
+            }
+        );
+        assert_eq!(
+            facts(host_id),
+            minimald_rpc::BoxNetworkFacts {
+                loopback_address: Some(node),
+                egress_posture: Some(minimald_rpc::EgressPosture::AllowAllDefault),
+                at_fallback: Some(false),
+            }
+        );
+        assert_eq!(
+            facts(none_id),
+            minimald_rpc::BoxNetworkFacts {
+                loopback_address: Some(none_address),
+                egress_posture: Some(minimald_rpc::EgressPosture::NoNetwork),
+                at_fallback: Some(true),
+            }
+        );
+
+        // The posture agrees with the reply `min session policy` reads.
+        let policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(own_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            minimald_rpc::EgressPosture::of(&policy.egress, NetworkMode::OwnIp),
+            minimald_rpc::EgressPosture::DenyAllDefault
+        );
+        // In a microVM, a host-address box at the node's `127.0.0.1` is not
+        // mirrored there, so it reports no address until the node is granted
+        // one. A native node's `127.0.0.1` is the box's published address.
+        let localhost = std::net::Ipv4Addr::LOCALHOST;
+        let granted = std::net::Ipv4Addr::new(127, 0, 64, 1);
+        assert_eq!(host_address_loopback(localhost, true), None);
+        assert_eq!(host_address_loopback(granted, true), Some(granted));
+        assert_eq!(host_address_loopback(localhost, false), Some(localhost));
+        // A withheld host-address box is reached only through the proxy, so it
+        // reads as the fallback. A box of another mode with no address says
+        // nothing.
+        assert_eq!(box_at_fallback(true, None), Some(true));
+        assert_eq!(box_at_fallback(true, Some(localhost)), Some(false));
+        assert_eq!(box_at_fallback(false, Some(localhost)), Some(true));
+        assert_eq!(box_at_fallback(false, Some(granted)), Some(false));
+        assert_eq!(box_at_fallback(false, None), None);
     }
 }
