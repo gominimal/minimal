@@ -53,10 +53,13 @@ impl RemoteStorage {
     /// `None` opens the connections in the caller's own cgroup. The cache
     /// lookup and the content-hash check are the same either way.
     ///
+    /// The host name is asked of the first `nameserver` in
+    /// `/etc/resolv.conf`, from a UDP socket created in the same cgroup, so
+    /// those rules decide the name query too.
+    ///
     /// `admits_nothing` says that the egress rules of the placement admit no
     /// destination. The download then refuses every connection before it
-    /// resolves the host name, because the node's resolver is not under
-    /// those rules. It has no effect without a placement.
+    /// sends a name query. It has no effect without a placement.
     #[tracing::instrument]
     pub async fn download_web_with_verification_and_caching(
         &self,
@@ -140,6 +143,7 @@ mod placed {
     use crate::fetchers::ReqwestUrl;
     use anyhow::Context;
     use std::io;
+    use std::net::{IpAddr, SocketAddr};
     use std::sync::{Arc, Mutex, PoisonError};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -176,6 +180,7 @@ mod placed {
         let relay = Arc::new(Relay {
             procs: placement.procs.to_path_buf(),
             admits_nothing: placement.admits_nothing,
+            nameserver: None,
             auth: auth.clone(),
             failure: Mutex::new(None),
         });
@@ -224,6 +229,9 @@ mod placed {
         /// The cgroup's egress rules admit no destination: refuse every
         /// connection before its host name is resolved.
         admits_nothing: bool,
+        /// The name server the relay asks, from a socket created in the
+        /// cgroup. `None` takes the first `nameserver` of `/etc/resolv.conf`.
+        nameserver: Option<SocketAddr>,
         /// The `Proxy-Authorization` value this download's client sends.
         auth: String,
         /// The last destination the relay could not reach, and why.
@@ -355,20 +363,32 @@ mod placed {
         /// A connection to `host:port` from a socket created in the cgroup.
         async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
             if self.admits_nothing {
-                // The lookup would run in the node's own cgroup, so a name
-                // would leave the node outside the rules that admit nothing.
+                // Rules that admit nothing refuse the name query as well,
+                // so the relay sends none and fails at once.
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "the egress rules admit no destination",
                 ));
             }
+            let addrs = match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => vec![ip],
+                Err(_) => {
+                    let nameserver = match self.nameserver {
+                        Some(nameserver) => nameserver,
+                        None => system_nameserver()?,
+                    };
+                    lookup_in_cgroup(&self.procs, nameserver, host).await?
+                }
+            };
             let mut last = None;
-            for addr in tokio::net::lookup_host((host, port)).await? {
+            for ip in addrs {
+                let addr = SocketAddr::new(ip, port);
                 let procs = self.procs.clone();
-                let socket =
-                    tokio::task::spawn_blocking(move || socket_in_cgroup(&procs, addr.is_ipv6()))
-                        .await
-                        .map_err(io::Error::other)??;
+                let socket = tokio::task::spawn_blocking(move || {
+                    socket_in_cgroup(&procs, addr.is_ipv6(), SocketKind::Stream)
+                })
+                .await
+                .map_err(io::Error::other)??;
                 let socket = std::net::TcpStream::from(socket);
                 socket.set_nonblocking(true)?;
                 match tokio::net::TcpSocket::from_std_stream(socket)
@@ -385,10 +405,151 @@ mod placed {
         }
     }
 
-    /// A TCP socket that a child process created after it joined the cgroup
+    /// How long the relay waits for one answer from the name server.
+    const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The first `nameserver` of `/etc/resolv.conf`, on port 53.
+    fn system_nameserver() -> io::Result<SocketAddr> {
+        let text = std::fs::read_to_string("/etc/resolv.conf").map_err(|e| {
+            io::Error::new(e.kind(), format!("could not read /etc/resolv.conf: {e}"))
+        })?;
+        first_nameserver(&text).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "/etc/resolv.conf names no name server",
+            )
+        })
+    }
+
+    /// The first `nameserver` in the text of a `resolv.conf`, on port 53.
+    fn first_nameserver(text: &str) -> Option<SocketAddr> {
+        let conf = resolv_conf::Config::parse(text).ok()?;
+        let ip: IpAddr = conf.nameservers.first()?.into();
+        Some(SocketAddr::new(ip, 53))
+    }
+
+    /// The addresses of `host`: its A and AAAA records, asked of
+    /// `nameserver` from a UDP socket created in the cgroup whose
+    /// `cgroup.procs` is `procs`. So the egress rules that match the cgroup
+    /// decide the query as well as the connection (NET-155).
+    async fn lookup_in_cgroup(
+        procs: &Path,
+        nameserver: SocketAddr,
+        host: &str,
+    ) -> io::Result<Vec<IpAddr>> {
+        use hickory_proto::rr::RecordType;
+
+        let procs = procs.to_path_buf();
+        let socket = tokio::task::spawn_blocking(move || {
+            socket_in_cgroup(&procs, nameserver.is_ipv6(), SocketKind::Datagram)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        let socket = std::net::UdpSocket::from(socket);
+        socket.set_nonblocking(true)?;
+        let socket = tokio::net::UdpSocket::from_std(socket)?;
+        socket.connect(nameserver).await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not reach the name server {nameserver}: {e}"),
+            )
+        })?;
+        let mut addrs = Vec::new();
+        let mut last = None;
+        for rtype in [RecordType::A, RecordType::AAAA] {
+            match ask(&socket, host, rtype).await {
+                Ok(found) => addrs.extend(found),
+                Err(e) => last = Some(e),
+            }
+        }
+        if addrs.is_empty() {
+            return Err(last.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"))
+            }));
+        }
+        Ok(addrs)
+    }
+
+    /// Sends one query for `host` on the connected `socket` and returns the
+    /// addresses its answer carries.
+    async fn ask(
+        socket: &tokio::net::UdpSocket,
+        host: &str,
+        rtype: hickory_proto::rr::RecordType,
+    ) -> io::Result<Vec<IpAddr>> {
+        use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RData};
+
+        let name = Name::from_utf8(format!("{}.", host.trim_end_matches('.')))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{host}: {e}")))?;
+        let id: u16 = rand::random();
+        let mut query = Message::query();
+        query.metadata.id = id;
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(name, rtype));
+        let bytes = query.to_vec().map_err(io::Error::other)?;
+        socket.send(&bytes).await?;
+        let mut buf = vec![0u8; 4096];
+        let reply = tokio::time::timeout(LOOKUP_TIMEOUT, async {
+            loop {
+                let n = socket.recv(&mut buf).await?;
+                // A datagram that is not the answer to this query is not
+                // trusted; the wait goes on for the real one.
+                match Message::from_vec(&buf[..n]) {
+                    Ok(reply)
+                        if reply.metadata.id == id
+                            && reply.metadata.message_type == MessageType::Response =>
+                    {
+                        return Ok::<_, io::Error>(reply);
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the name server did not answer for {host}"),
+            )
+        })??;
+        match reply.metadata.response_code {
+            ResponseCode::NoError => {}
+            code => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("could not resolve {host}: {code}"),
+                ));
+            }
+        }
+        Ok(reply
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(IpAddr::V4(a.0)),
+                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The kind of socket a child makes in a cgroup.
+    #[derive(Debug, Clone, Copy)]
+    enum SocketKind {
+        /// A TCP socket, for a connection.
+        Stream,
+        /// A UDP socket, for a name query.
+        Datagram,
+    }
+
+    /// A socket that a child process created after it joined the cgroup
     /// whose `cgroup.procs` is `procs`, so the socket belongs to that cgroup.
     #[cfg(target_os = "linux")]
-    fn socket_in_cgroup(procs: &Path, v6: bool) -> io::Result<std::os::fd::OwnedFd> {
+    fn socket_in_cgroup(
+        procs: &Path,
+        v6: bool,
+        kind: SocketKind,
+    ) -> io::Result<std::os::fd::OwnedFd> {
         use std::os::fd::AsRawFd;
 
         let procs_file = std::fs::OpenOptions::new()
@@ -399,6 +560,10 @@ mod placed {
             })?;
         let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
         let domain = if v6 { libc::AF_INET6 } else { libc::AF_INET };
+        let ty = match kind {
+            SocketKind::Stream => libc::SOCK_STREAM,
+            SocketKind::Datagram => libc::SOCK_DGRAM,
+        };
         let (procs_fd, theirs_fd) = (procs_file.as_raw_fd(), theirs.as_raw_fd());
         // SAFETY: the child calls only async-signal-safe functions (`write`,
         // `socket`, `sendmsg`, `_exit`) on memory it owns, so the locks other
@@ -409,7 +574,7 @@ mod placed {
         }
         if pid == 0 {
             // SAFETY: see above. The child never returns.
-            unsafe { socket_child(procs_fd, theirs_fd, domain) }
+            unsafe { socket_child(procs_fd, theirs_fd, domain, ty) }
         }
         drop(theirs);
         drop(procs_file);
@@ -434,7 +599,11 @@ mod placed {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn socket_in_cgroup(_procs: &Path, _v6: bool) -> io::Result<std::os::fd::OwnedFd> {
+    fn socket_in_cgroup(
+        _procs: &Path,
+        _v6: bool,
+        _kind: SocketKind,
+    ) -> io::Result<std::os::fd::OwnedFd> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "a download placed in a cgroup runs only on Linux",
@@ -463,7 +632,12 @@ mod placed {
     ///
     /// Call only in the child of a `fork`. It never returns.
     #[cfg(target_os = "linux")]
-    unsafe fn socket_child(procs: libc::c_int, out: libc::c_int, domain: libc::c_int) -> ! {
+    unsafe fn socket_child(
+        procs: libc::c_int,
+        out: libc::c_int,
+        domain: libc::c_int,
+        ty: libc::c_int,
+    ) -> ! {
         // SAFETY: plain syscalls on descriptors the parent opened for the
         // child, and on stack memory; no allocation, no lock.
         unsafe {
@@ -473,7 +647,7 @@ mod placed {
                 report[0] = 1;
                 report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
             } else {
-                fd = libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                fd = libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0);
                 if fd < 0 {
                     report[0] = 2;
                     report[1..].copy_from_slice(&(*libc::__errno_location()).to_le_bytes());
@@ -608,6 +782,7 @@ mod placed {
         /// itself into the placement's `cgroup.procs`, and the content-hash
         /// check still applies. A plain file stands in for `cgroup.procs`:
         /// the child's write lands in it, and the socket comes back.
+        #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn a_placed_download_connects_from_the_placement() {
             use sha2::Digest;
@@ -691,16 +866,118 @@ mod placed {
             let tmp = tempfile::tempdir().unwrap();
             let procs = tmp.path().join("cgroup.procs");
             std::fs::write(&procs, "").unwrap();
-            let fd = socket_in_cgroup(&procs, false).expect("a placed socket");
+            let fd = socket_in_cgroup(&procs, false, SocketKind::Stream).expect("a placed socket");
             let socket = std::net::TcpStream::from(fd);
             socket.set_nonblocking(true).unwrap();
             assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
-            let refused = socket_in_cgroup(Path::new("/nonexistent/cgroup.procs"), false)
+            let refused = socket_in_cgroup(
+                Path::new("/nonexistent/cgroup.procs"),
+                false,
+                SocketKind::Stream,
+            )
                 .expect_err("no cgroup, no socket");
             assert!(
                 refused.to_string().contains("/nonexistent/cgroup.procs"),
                 "{refused}"
             );
+        }
+
+        /// A name server on loopback that answers every A query for
+        /// `pkg.test.` with 127.0.0.1, and every other query with no
+        /// address.
+        async fn serve_names() -> SocketAddr {
+            use hickory_proto::op::{Message, ResponseCode};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{RData, Record, RecordType};
+
+            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = socket.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+                    let request = Message::from_vec(&buf[..n]).unwrap();
+                    let mut reply =
+                        Message::response(request.metadata.id, request.metadata.op_code);
+                    let question = request.queries[0].clone();
+                    let known = question.name().to_string() == "pkg.test.";
+                    reply.metadata.response_code = if known {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    };
+                    if known && question.query_type() == RecordType::A {
+                        reply.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            60,
+                            RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+                        ));
+                    }
+                    reply.add_query(question);
+                    let bytes = reply.to_vec().unwrap();
+                    socket.send_to(&bytes, from).await.unwrap();
+                }
+            });
+            addr
+        }
+
+        /// NET-155: a placed download asks for a host name from a UDP socket
+        /// that a child created after it wrote itself into the placement's
+        /// `cgroup.procs`. So the egress rules of the placement decide the
+        /// name query, not only the connection. A plain file stands in for
+        /// `cgroup.procs`.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_name_query_leaves_from_the_placement() {
+            let nameserver = serve_names().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+
+            let addrs = lookup_in_cgroup(&procs, nameserver, "pkg.test")
+                .await
+                .expect("the name resolves");
+            assert_eq!(addrs, vec![IpAddr::from(std::net::Ipv4Addr::LOCALHOST)]);
+            assert_eq!(
+                std::fs::read_to_string(&procs).unwrap(),
+                "0",
+                "the child that made the query socket joined the placement"
+            );
+
+            let missing = lookup_in_cgroup(&procs, nameserver, "missing.test")
+                .await
+                .expect_err("no such name");
+            assert!(
+                missing.to_string().starts_with("could not resolve missing.test: "),
+                "{missing}"
+            );
+
+            // A placement the child cannot join sends no query.
+            let refused = lookup_in_cgroup(
+                Path::new("/nonexistent/cgroup.procs"),
+                nameserver,
+                "pkg.test",
+            )
+            .await
+            .expect_err("no cgroup, no query");
+            assert!(
+                refused.to_string().contains("/nonexistent/cgroup.procs"),
+                "{refused}"
+            );
+        }
+
+        /// The relay asks the first `nameserver` that `/etc/resolv.conf`
+        /// names, on port 53.
+        #[test]
+        fn the_first_nameserver_is_asked() {
+            let text = "search example.com\nnameserver 10.0.0.53\nnameserver 1.1.1.1\n";
+            assert_eq!(
+                first_nameserver(text),
+                Some("10.0.0.53:53".parse().unwrap())
+            );
+            assert_eq!(first_nameserver("search example.com\n"), None);
         }
     }
 }
