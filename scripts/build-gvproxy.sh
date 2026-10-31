@@ -104,7 +104,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # The Go toolchain: the one on PATH when it is the pinned version, else the
-# pinned release archive, verified against the lock's digest for this host.
+# pinned release archive, verified against the lock's digest for this host
+# on every run.
 go_bin=""
 if command -v go >/dev/null 2>&1 && [ "$(GOTOOLCHAIN=local go env GOVERSION 2>/dev/null)" = "go${GO_VERSION}" ]; then
   go_bin="$(command -v go)"
@@ -118,27 +119,36 @@ else
   go_sha="$(lock_value "go-${host}")"
   [ -n "$go_sha" ] || die "no go-${host}= line in $LOCK"
   go_cache="${GVPROXY_GO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/minimal/go}"
-  go_root="${go_cache}/go${GO_VERSION}.${host}"
-  if [ ! -x "${go_root}/bin/go" ]; then
+  archive="${go_cache}/go${GO_VERSION}.${host}.tar.gz"
+  # Only the release archive is cached, never an unpacked toolchain. Its digest
+  # is checked against the lock on every run, before it is unpacked, so a
+  # cached toolchain that was changed after download never runs in the build.
+  if [ -f "$archive" ] && [ "$(sha256_of "$archive")" != "$go_sha" ]; then
+    echo "build-gvproxy: cached ${archive} does not match its SHA-256 in $LOCK; downloading it again"
+    rm -f "$archive"
+  fi
+  if [ ! -f "$archive" ]; then
     url="https://go.dev/dl/go${GO_VERSION}.${host}.tar.gz"
     echo "build-gvproxy: downloading ${url}"
-    archive="${WORK}/go.tar.gz"
-    curl -fsSL "$url" -o "$archive"
-    got="$(sha256_of "$archive")"
-    if [ "$got" != "$go_sha" ]; then
-      echo "build-gvproxy: SHA-256 mismatch for go${GO_VERSION}.${host}.tar.gz" >&2
-      echo "  got:  ${got}" >&2
-      echo "  want: ${go_sha}" >&2
-      exit 1
-    fi
     mkdir -p "$go_cache"
-    unpack="$(mktemp -d "${go_cache}/unpack.XXXXXX")"
-    tar -xzf "$archive" -C "$unpack"
-    # Renamed into place, so a concurrent build never sees half a toolchain.
-    mv "$unpack/go" "$go_root" 2>/dev/null || [ -x "${go_root}/bin/go" ] \
-      || die "could not install the Go toolchain at ${go_root}"
-    rm -rf "$unpack"
+    download="$(mktemp "${go_cache}/download.XXXXXX")"
+    curl -fsSL "$url" -o "$download" || { rm -f "$download"; die "could not download ${url}"; }
+    # Renamed into place, so a concurrent build never sees half an archive.
+    mv -f "$download" "$archive"
   fi
+  # Hash the copy that is unpacked, so the bytes checked are the bytes used.
+  cp "$archive" "${WORK}/go.tar.gz"
+  got="$(sha256_of "${WORK}/go.tar.gz")"
+  if [ "$got" != "$go_sha" ]; then
+    rm -f "$archive"
+    echo "build-gvproxy: SHA-256 mismatch for go${GO_VERSION}.${host}.tar.gz" >&2
+    echo "  got:  ${got}" >&2
+    echo "  want: ${go_sha}" >&2
+    exit 1
+  fi
+  tar -xzf "${WORK}/go.tar.gz" -C "$WORK"
+  rm -f "${WORK}/go.tar.gz"
+  go_root="${WORK}/go"
   go_bin="${go_root}/bin/go"
 fi
 
