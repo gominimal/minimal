@@ -664,11 +664,14 @@ pub(crate) async fn resolve_box_on_any_vm(
         Ok(record) => Ok((client, record)),
         Err(selected) => {
             let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
-            let client = client::Client::connect(&resolved.sock)
+            let mut client = client::Client::connect(&resolved.sock)
                 .await
                 .with_context(|| {
                     format!("Failed to connect to the daemon of VM {}", resolved.vm)
                 })?;
+            // Gated as `connect_daemon` gates the selected VM: a destroy is
+            // a mutation, and this is the connection it runs over.
+            ensure_version_match(&mut client).await?;
             Ok((client, resolved.record))
         }
     }

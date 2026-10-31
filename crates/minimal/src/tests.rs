@@ -285,6 +285,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            // `min session policy` and `min session destroy` on a box another
+            // VM owns: the connection to that VM, gated as `connect_daemon`
+            // gates the selected one.
+            "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
             // `min secret set` asks the egress proxy on its control socket to
             // re-certify its root (#2746). The proxy is not the daemon, and
@@ -340,6 +344,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
             "tests.rs::mint_and_destroy_append_audit_records = ungated",
+            // Test-only: the NET-058 and NET-152 tests' client on the selected
+            // harness daemon, which is this build.
+            "tests.rs::selected_client = ungated",
         ]
     );
 }
