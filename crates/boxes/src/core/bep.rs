@@ -379,6 +379,46 @@ pub enum ProxyAbsence {
     NotServed,
 }
 
+impl fmt::Display for ProxyAbsence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProxyAbsence::NotInstalled { path: Some(path) } => write!(
+                f,
+                "`bep`, the Box Egress Proxy, is not installed at {}, so no proxy \
+                 serves boxes on this machine.",
+                path.display()
+            )?,
+            ProxyAbsence::NotInstalled { path: None } => write!(
+                f,
+                "`bep`, the Box Egress Proxy, is not installed, so no proxy serves \
+                 boxes on this machine."
+            )?,
+            ProxyAbsence::RelativePath { path } => write!(
+                f,
+                "MINVMD_BEP_BIN sets `bep`, the Box Egress Proxy, to the relative path \
+                 {}, and no proxy serves boxes on this machine. Set MINVMD_BEP_BIN to \
+                 an absolute path.",
+                path.display()
+            )?,
+            ProxyAbsence::NotAnswering { path, log } => {
+                write!(
+                    f,
+                    "`bep`, the Box Egress Proxy, is installed at {}, but it does not \
+                     answer, so no proxy serves boxes on this machine.",
+                    path.display()
+                )?;
+                if let Some(log) = log {
+                    write!(f, " The proxy's log is at {}.", log.display())?;
+                }
+            }
+            ProxyAbsence::NotServed => {
+                write!(f, "no Box Egress Proxy serves boxes on this machine.")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One reason the activation refuses a box spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BepRefusal {
@@ -562,40 +602,7 @@ impl fmt::Display for BepRefusal {
                     f,
                     "Cannot create the box: it declares the GitHub grant {grants}, and "
                 )?;
-                match cause {
-                    ProxyAbsence::NotInstalled { path: Some(path) } => write!(
-                        f,
-                        "`bep`, the Box Egress Proxy, is not installed at {}, so no proxy \
-                         serves boxes on this machine.",
-                        path.display()
-                    )?,
-                    ProxyAbsence::NotInstalled { path: None } => write!(
-                        f,
-                        "`bep`, the Box Egress Proxy, is not installed, so no proxy serves \
-                         boxes on this machine."
-                    )?,
-                    ProxyAbsence::RelativePath { path } => write!(
-                        f,
-                        "MINVMD_BEP_BIN sets `bep`, the Box Egress Proxy, to the relative path \
-                         {}, and no proxy serves boxes on this machine. Set MINVMD_BEP_BIN to \
-                         an absolute path.",
-                        path.display()
-                    )?,
-                    ProxyAbsence::NotAnswering { path, log } => {
-                        write!(
-                            f,
-                            "`bep`, the Box Egress Proxy, is installed at {}, but it does not \
-                             answer, so no proxy serves boxes on this machine.",
-                            path.display()
-                        )?;
-                        if let Some(log) = log {
-                            write!(f, " The proxy's log is at {}.", log.display())?;
-                        }
-                    }
-                    ProxyAbsence::NotServed => {
-                        write!(f, "no Box Egress Proxy serves boxes on this machine.")?;
-                    }
-                }
+                write!(f, "{cause}")?;
                 write!(
                     f,
                     " To create the box without the grant, remove {grants} from the [secrets] \
