@@ -636,7 +636,7 @@ pub async fn activate(
             }
             // The session is active: a `host_ip` box holds its name in the
             // zone (NODATA) the way `min session activate` holds it, read
-            // off the record so an autogen name is the one held.
+            // off the record so the name the daemon gave is the one held.
             if let Ok(resp) = client
                 .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
                 .await
@@ -716,10 +716,12 @@ type CreateFuture<'c> = std::pin::Pin<
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
-/// box the form left unnamed is named first the way the CLI names one,
-/// because the row is registered under the name, and an autogen name that
-/// collides with a live row or session is re-minted within the CLI's
-/// budget. Every failure after the row exists withdraws it, with its id.
+/// box the form left unnamed that registers takes the default session
+/// entry's name, because the row is registered under the name and the
+/// daemon must give the box the same one (BOX-163). Nothing mints a name:
+/// a name that a live row or a running box holds refuses the create,
+/// naming the holder. Every failure after the row exists withdraws it,
+/// with its id.
 /// On a native host, or for a box that is not own-address, this is the
 /// plain create it always was. `create` sends the create request on
 /// `client`.
@@ -729,70 +731,53 @@ async fn create_registering<C: Send>(
     client: &mut C,
     mut create: impl for<'c> FnMut(&'c mut C, BoxConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
-    use minimal_client::box_name::{autogen_session_name, random_hex4, should_retry_autogen};
     use minimal_client::box_registration::{
-        control_sock_beside, register_box_beside_reminting_autogen, vm_host_control_sock,
+        control_sock_beside, register_box_beside, vm_host_control_sock,
     };
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
-    let project_dir = config.project_path.as_utf8_path().to_path_buf();
-    let mint = || autogen_session_name(&project_dir, &random_hex4());
-    let autogen = registers && config.name.is_none();
-    if autogen {
-        config.name = Some(mint());
+    if registers && config.name.is_none() {
+        config.name = Some(mfile::spec::DEFAULT_SESSION_ENTRY.to_string());
     }
-    let mut attempts = 0u32;
+    tracing::info!(
+        requested_name = ?config.name,
+        registers,
+        "dashboard create: the request carries only the form's name or the entry's"
+    );
     let mut row = BoxRow {
         control_sock,
         name: None,
         registration: None,
     };
-    loop {
-        if let Some(name) = config.name.as_mut() {
-            row.registration = register_box_beside_reminting_autogen(
-                sock,
-                config.network,
-                name,
-                &config.policy,
-                autogen,
-                &mut attempts,
-                &mint,
-            )
-            .await?;
-        }
-        row.name.clone_from(&config.name);
-        config.box_addresses = row
-            .registration
-            .as_ref()
-            .map(|registration| registration.addresses);
-        config.task_addresses = row
-            .registration
-            .as_ref()
-            .map(|registration| registration.task_addresses.clone())
-            .unwrap_or_default();
-        // The id the VM host daemon minted stays on the row, for the
-        // withdrawal. The create relays none: the in-VM daemon takes the
-        // id from the VM host daemon alone (BOX-002).
-        config.box_id = None;
-        let error = match create(client, config.clone()).await {
-            Ok(Errorable::Ok(created)) => return Ok((created, row)),
-            Ok(Errorable::Err { error }) => error,
-            // A transport failure abandons the create and the row its
-            // registration bought: no session holds the pair.
-            Err(error) => {
-                row.withdraw().await;
-                return Err(error);
-            }
-        };
-        // The row the attempt bought is left behind with it: its creator
-        // withdraws it, and a retry re-registers under the re-minted name.
-        row.withdraw().await;
-        if !should_retry_autogen(autogen, attempts, &error) {
-            return Err(anyhow::anyhow!(error));
-        }
-        attempts += 1;
-        row.registration = None;
-        config.name = Some(mint());
+    if let Some(name) = config.name.as_deref() {
+        row.registration = register_box_beside(sock, config.network, name, &config.policy).await?;
+    }
+    row.name.clone_from(&config.name);
+    config.box_addresses = row
+        .registration
+        .as_ref()
+        .map(|registration| registration.addresses);
+    config.task_addresses = row
+        .registration
+        .as_ref()
+        .map(|registration| registration.task_addresses.clone())
+        .unwrap_or_default();
+    // The id the VM host daemon minted stays on the row, for the
+    // withdrawal. The create relays none: the in-VM daemon takes the id
+    // from the VM host daemon alone (BOX-002).
+    config.box_id = None;
+    let created = create(client, config).await;
+    if let Ok(Errorable::Ok(created)) = created {
+        return Ok((created, row));
+    }
+    // A failed create abandons the row its registration bought: no session
+    // holds the pair. A held name keeps the reply's text, which names the
+    // holder.
+    row.withdraw().await;
+    match created {
+        Ok(Errorable::Err { error }) => Err(anyhow::anyhow!(error)),
+        Err(error) => Err(error),
+        Ok(Errorable::Ok(_)) => unreachable!("a created box returned above"),
     }
 }
 
@@ -932,8 +917,9 @@ mod tests {
 
     /// T66 from the dashboard: an own-address create on a VM-backed host
     /// registers the box first, through the client library the CLI
-    /// registers through — under a name minted the CLI's way, since the form
-    /// left it unnamed and the row is registered under the name — and the
+    /// registers through — under the default session entry's name, since
+    /// the form left it unnamed and the row is registered under the name,
+    /// never a minted `<dir>-<hex>` name (BOX-163) — and the
     /// create carries the addresses the registration handed back, never
     /// none (the in-VM daemon refuses an own-address box with none).
     #[tokio::test]
@@ -973,10 +959,10 @@ mod tests {
             panic!("a registration is carried by the register verb");
         };
         assert!(request.hold, "the create holds its registration as a lease");
-        assert!(
-            request.name.starts_with("web-app-"),
-            "an unnamed box is registered under the CLI's autogen name: {}",
-            request.name
+        assert_eq!(
+            request.name,
+            mfile::spec::DEFAULT_SESSION_ENTRY,
+            "an unnamed box is registered under the entry's name, not a minted one"
         );
 
         let [config] = sent.as_slice() else {

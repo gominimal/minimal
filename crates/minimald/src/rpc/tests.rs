@@ -4083,13 +4083,18 @@ async fn create_session_errors_if_name_not_unique() {
         .id;
     assert!(id != SessionId::nil());
 
-    assert_eq!(
-        client
-            .call::<CreateSession>(&req("my-session", "/uwu"))
-            .await,
-        Errorable::Err {
-            error: "A session with that name already exists".to_string()
-        }
+    let Errorable::Err { error } = client
+        .call::<CreateSession>(&req("my-session", "/uwu"))
+        .await
+    else {
+        panic!("a second create under a held name must be refused");
+    };
+    // The refusal names the holder (its name and id) and the rename hint.
+    assert!(error.contains("`my-session`"), "{error}");
+    assert!(error.contains(&id.to_string()), "{error}");
+    assert!(
+        error.contains(&format!("min session rename {id} <new-name>")),
+        "{error}"
     );
 }
 

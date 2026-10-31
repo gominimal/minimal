@@ -305,15 +305,9 @@ impl NameSource {
 }
 
 /// The name a create gives its box (BOX-163): the expanded spec's
-/// `[box] name`, else the entry's name. A spec the daemon cannot read as a
-/// v0 spec names nothing.
-///
-/// Interim: a name on the request goes ahead of the entry. `min` sends
-/// one for `--name`, and today also for its minted `<dir>-<hex>` names.
-/// `--name` keeps this step. The step stops putting a minted name ahead
-/// of the entry when the client sends a request name only for `--name`,
-/// never a minted `<dir>-<hex>` name. That change is
-/// <https://github.com/gominimal/minimal/issues/2762>.
+/// `[box] name`, else the request's name, else the entry's name as a
+/// valid label ([`boxes::box_name::entry_box_name`]). `min` sends a
+/// request name only for `--name`. A spec the daemon cannot read as a v0 spec names nothing.
 fn creation_name(
     requested: Option<&str>,
     spec: Option<&serde_json_lenient::Value>,
@@ -328,7 +322,12 @@ fn creation_name(
         return (Some(name.to_string()), NameSource::Request);
     }
     match spec {
-        Some(spec) => (Some(spec.box_name().to_string()), NameSource::Entry),
+        // Only the entry is cleaned. A spec that sets `[box] name` returned
+        // above, unchanged, so the store still refuses an invalid one.
+        Some(spec) => (
+            Some(boxes::box_name::entry_box_name(&spec.entry)),
+            NameSource::Entry,
+        ),
         None => (None, NameSource::None),
     }
 }
@@ -382,8 +381,7 @@ impl BoxManagerHandle {
     /// [`Self::create_box_with_spec`] for a create that asks for a fresh
     /// instance (BOX-163). The box is named `<name>-<n>`, with the smallest
     /// `n` no retained record on this host uses, whether or not a running
-    /// box holds `<name>`. No request field asks for one yet, so only an
-    /// in-process caller reaches this.
+    /// box holds `<name>`. A request with `fresh_instance` set reaches this.
     pub async fn create_fresh_box_with_spec(
         &self,
         config: minimald_rpc::BoxConfig,
