@@ -801,6 +801,11 @@ fn serve_connection(
         );
         return Ok(());
     }
+    // A listen notice is the fixed, size-bounded message (NET-138): a line
+    // past its bound is refused before it reaches the mirror.
+    if let Some(reply) = oversized_listen_notice(&request, &line) {
+        return write_reply(&mut stream, &reply);
+    }
     // The ask verbs hold their connection open for as long as the ask or
     // the subscription lives (NET-045), so each runs on a thread of its
     // own under its kind's cap, freeing this connection's door slot at
@@ -1126,6 +1131,10 @@ fn serve_request(
             let reply = order.apply(|| withdraw_report(boxes, &request));
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::ListenNotice(notice), ControlDoor::GuestReports) => {
+            let reply = order.apply(|| listen_notice_reply(boxes, notice));
+            write_reply(stream, &reply)
+        }
         // The audit reports touch no row, so they take no ticket: each is
         // a line in the host's audit log, under the per-box cap.
         (BoxControlRequest::ReportExposeDecision(request), ControlDoor::GuestReports) => {
@@ -1174,6 +1183,108 @@ fn serve_request(
         // frame to drop silently.
         (request, door) => refused_wrong_door(stream, &request, door),
     }
+}
+
+/// The refusal of a `listen_notice` line longer than
+/// [`minimald_rpc::ListenNotice::MAX_LINE_BYTES`], or `None` for any
+/// other line.
+fn oversized_listen_notice(request: &BoxControlRequest, line: &str) -> Option<BoxControlReply> {
+    if !matches!(request, BoxControlRequest::ListenNotice(_))
+        || line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES
+    {
+        return None;
+    }
+    tracing::warn!(
+        bytes = line.len(),
+        max_bytes = minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+        "refused a listen notice longer than its fixed size"
+    );
+    Some(BoxControlReply::Error {
+        error: format!(
+            "a listen notice is at most {} bytes; this one is {}",
+            minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+            line.len()
+        ),
+    })
+}
+
+/// The guest infrastructure ports this VM host provisioned for the guest's
+/// own services, read from this daemon's own configuration and never from
+/// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
+/// bridge, the boot marker, the timekeep bridge, the report door and the
+/// telemetry port), the zone answerer's port, the range probe's port, and
+/// the node row's admitted ports, which hold the hostname proxy's port the
+/// host assigned before boot.
+pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
+    let vsock = [
+        crate::sock::VSOCK_BRIDGE_PORT,
+        crate::cmd::VSOCK_MARKER_PORT,
+        crate::timekeep::VSOCK_TIMEKEEP_PORT,
+        minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+        crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
+    ];
+    let mut ports: std::collections::BTreeSet<u16> = vsock
+        .into_iter()
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect();
+    ports.insert(crate::net::answerer::DEFAULT_ANSWERER_PORT);
+    ports.insert(switch::loopback::RANGE_PROBE_PORT);
+    if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
+        ports.extend(node.admitted_ports().iter().copied());
+    }
+    ports
+}
+
+/// The guest door's answer to a listen notice (NET-138): the node's mirror
+/// binds or undoes the port at the node's own address. A listening notice
+/// for one of [`guest_infrastructure_ports`] is refused on this daemon's
+/// own authority, whatever the notice says. The outcome is the mirror's
+/// audit line; the reply is [`BoxControlReply::PortRecorded`] when the
+/// mirror holds the notice, and [`BoxControlReply::Error`] when it refused.
+fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) -> BoxControlReply {
+    use crate::box_registry::MirrorOutcome;
+    let recorded = BoxControlReply::PortRecorded {
+        port: notice.port,
+        proto: IpProto::Tcp,
+    };
+    if notice.state == minimald_rpc::ListenState::Listening
+        && guest_infrastructure_ports(boxes).contains(&notice.port)
+    {
+        boxes.node_mirror().warn_refused_infrastructure(notice.port);
+        return BoxControlReply::Error {
+            error: format!(
+                "port {} is used by the VM's own services; it is not opened on the host",
+                notice.port
+            ),
+        };
+    }
+    let error = match boxes.mirror_notice(notice) {
+        MirrorOutcome::Bound | MirrorOutcome::Waiting | MirrorOutcome::Unbound => {
+            return recorded;
+        }
+        MirrorOutcome::Collided => format!(
+            "port {} is already in use on the host; it is not opened",
+            notice.port
+        ),
+        MirrorOutcome::RefusedInfrastructure => format!(
+            "port {} is used by the VM's own services; it is not opened on the host",
+            notice.port
+        ),
+        MirrorOutcome::Capped => format!(
+            "port {} is not opened on the host: the VM sent too many listen notices, \
+             or holds the most ports the host opens ({})",
+            notice.port,
+            crate::box_registry::MIRRORED_BINDS_CAP
+        ),
+        MirrorOutcome::NoHostAddressBox => format!(
+            "port {} is not opened on the host: no host-address box runs in the VM",
+            notice.port
+        ),
+        MirrorOutcome::BindFailed => {
+            format!("port {} could not be opened on the host", notice.port)
+        }
+    };
+    BoxControlReply::Error { error }
 }
 
 /// The mint verb's answer (BOX-002): the id of the box the in-VM daemon
@@ -1577,6 +1688,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::MintBoxId(_) => "mint_box_id",
         BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
         BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
+        BoxControlRequest::ListenNotice(_) => "listen_notice",
     }
 }
 
@@ -7871,5 +7983,102 @@ mod tests {
         assert_eq!(suppressed.len(), 2, "the withdrawal flushes the count");
         assert_eq!(suppressed[1]["box"], "web");
         assert_eq!(suppressed[1]["suppressed"], dropped);
+    }
+
+    /// NET-138: the guest door refuses, on this daemon's own authority, a
+    /// listen notice for a guest infrastructure port it provisioned, read
+    /// from its own configuration: the in-VM daemon's RPC bridge port and
+    /// the hostname proxy's port the node row holds. A forged notice that
+    /// carries an address, or a line past the notice's fixed size, never
+    /// reaches the mirror. A box's own port binds.
+    #[test]
+    fn mirror_refuses_guest_rpc_port_under_forged_notice() {
+        let binder = Arc::new(crate::box_registry::TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn crate::box_registry::MirrorBinder>);
+        let proxy_port = 7654;
+        boxes.register_node_namespace(proxy_port);
+        let node = switch::loopback::range_hosts()
+            .nth(201)
+            .expect("a reserved-range host");
+        boxes.open_node_mirror(node).expect("the mirror opens");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+
+        let rpc_port = u16::try_from(crate::sock::VSOCK_BRIDGE_PORT).expect("a TCP-sized port");
+        for port in [
+            rpc_port,
+            proxy_port,
+            minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
+        ] {
+            let line = format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);
+            let request = parse_request(&line).expect("a well-formed notice parses");
+            assert!(oversized_listen_notice(&request, &line).is_none());
+            let BoxControlRequest::ListenNotice(notice) = request else {
+                panic!("the line is a listen notice");
+            };
+            match listen_notice_reply(&boxes, notice) {
+                BoxControlReply::Error { error } => assert!(
+                    error.contains("used by the VM's own services"),
+                    "the refusal says why: {error}"
+                ),
+                other => panic!("port {port} is the guest's own; got {other:?}"),
+            }
+        }
+        assert!(binder.calls().is_empty(), "no infrastructure port is bound");
+
+        // A notice that names an address, a path or a name is not a notice.
+        for forged in [
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","address":"127.0.0.1"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","name":"web"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","path":"/x"}"#,
+        ] {
+            assert!(parse_request(forged).is_err(), "refused: {forged}");
+        }
+        let padded = format!(
+            r#"{{"verb":"listen_notice","port":8080,"state":"listening"}}{}"#,
+            " ".repeat(minimald_rpc::ListenNotice::MAX_LINE_BYTES)
+        );
+        let request = parse_request(&padded).expect("trailing spaces still parse");
+        assert!(
+            matches!(
+                oversized_listen_notice(&request, &padded),
+                Some(BoxControlReply::Error { .. })
+            ),
+            "a line past the fixed size is refused"
+        );
+
+        // A box's own port binds at the node's address.
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        assert_eq!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::PortRecorded {
+                port,
+                proto: IpProto::Tcp
+            }
+        );
+        assert_eq!(binder.open(), vec![(node, port)]);
+        // A stop notice for an infrastructure port is the goal state.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: rpc_port,
+                    state: minimald_rpc::ListenState::Stopped,
+                }
+            ),
+            BoxControlReply::PortRecorded { .. }
+        ));
     }
 }
