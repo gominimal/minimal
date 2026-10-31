@@ -272,16 +272,9 @@ impl TryFrom<GrantFields> for SecretGrant {
                 }
                 if word == SourceWord::Broker {
                     // The old store-reference spelling (a broker scope that
-                    // names a store item) would skip the store rules, so it
-                    // is refused, not read as a broker grant (BEP-032).
-                    if let Some(scope) = fields.scopes.iter().find(|s| !s.starts_with("github:")) {
-                        return Err(format!(
-                            "A grant with source = \"broker\" takes only github: scopes, and \
-                             \"{scope}\" is not one. For a secret you stored with `min secret \
-                             set`, write source = \"store\", store = \"keychain\" and id = \
-                             \"<id>\" in place of source and scopes."
-                        ));
-                    }
+                    // names a store item) still parses here, because a box
+                    // record saved before BEP-032 carries it. Box creation
+                    // refuses it in `refusals`.
                     GrantSource::Broker
                 } else {
                     GrantSource::ClientEnv
@@ -534,6 +527,14 @@ pub enum BepRefusal {
         /// The absent hosts, in the rule's order.
         missing: Vec<String>,
     },
+    /// BEP-032: a broker grant with a scope that is not a `github:` scope,
+    /// the old store-reference spelling. It would skip the store rules.
+    BrokerScopeNotGithub {
+        /// The grant's name.
+        grant: String,
+        /// The first such scope.
+        scope: String,
+    },
 }
 
 impl BepRefusal {
@@ -550,6 +551,7 @@ impl BepRefusal {
             Self::SignInRequired { .. } | Self::UnenrolledNode { .. } => "BEP-003",
             Self::StoreReferenceToSignIn { .. } => "BEP-034",
             Self::StoreHostsOutsideEgress { .. } => "BEP-036",
+            Self::BrokerScopeNotGithub { .. } => "BEP-032",
         }
     }
 
@@ -580,6 +582,7 @@ impl BepRefusal {
             Self::StoreHostsOutsideEgress { .. } => {
                 "secrets.store, secrets.id, egress.allow_dns_hosts, config [secret-store-rules] upstream"
             }
+            Self::BrokerScopeNotGithub { .. } => "secrets.source, secrets.scopes",
         }
     }
 }
@@ -653,6 +656,13 @@ impl fmt::Display for BepRefusal {
                 "The secret {grant} is sent to hosts that this box's egress does not allow: \
                  {}. Add them to egress.allow_dns_hosts.",
                 missing.join(", ")
+            ),
+            Self::BrokerScopeNotGithub { grant, scope } => write!(
+                f,
+                "The secret {grant} sets source = \"broker\" with the scope \"{scope}\". \
+                 A grant with source = \"broker\" takes only github: scopes. For a secret \
+                 you stored with `min secret set`, write source = \"store\", \
+                 store = \"keychain\" and id = \"<id>\" in place of source and scopes."
             ),
         }
     }
@@ -758,6 +768,21 @@ pub fn refusals(
     let mut out = Vec::new();
     let steering = spec.bep.resolved_steering();
     let github: Vec<&str> = spec.github_grants().collect();
+
+    // BEP-032: the old store-reference spelling, a broker scope that names
+    // a store item, would skip the store rules. The grant parse accepts it
+    // so that saved box records still load, and creation refuses it here.
+    for (name, grant) in spec.secrets {
+        if grant.source != GrantSource::Broker {
+            continue;
+        }
+        if let Some(scope) = grant.scopes.iter().find(|s| !s.starts_with("github:")) {
+            out.push(BepRefusal::BrokerScopeNotGithub {
+                grant: name.clone(),
+                scope: scope.clone(),
+            });
+        }
+    }
 
     // BEP-009: a grant in a box with no network reaches nothing.
     if spec.network == NetworkMode::NoNet && spec.has_credentialed_upstream() {
@@ -1211,7 +1236,14 @@ mod tests {
     }
 
     fn any_source() -> impl Strategy<Value = GrantSource> {
-        prop_oneof![Just(GrantSource::Broker), Just(GrantSource::ClientEnv)]
+        prop_oneof![
+            Just(GrantSource::Broker),
+            Just(GrantSource::ClientEnv),
+            Just(GrantSource::Store {
+                store: "keychain".into(),
+                id: "npm".into(),
+            }),
+        ]
     }
 
     /// Grants that all copy a client variable: no credentialed upstream.
@@ -1232,17 +1264,25 @@ mod tests {
                 prop_oneof![
                     Just("github:user-token".to_string()),
                     Just("github:repo:read".to_string()),
-                    Just("keychain:npm".to_string()),
                 ],
                 0..3,
             ),
             any_mode(),
             any_source(),
         )
-            .prop_map(|(scopes, mode, source)| SecretGrant {
-                source,
-                scopes,
-                mode,
+            // A store grant takes no scopes and no mode, as the parse
+            // requires.
+            .prop_map(|(scopes, mode, source)| match source {
+                GrantSource::Store { .. } => SecretGrant {
+                    source,
+                    scopes: Vec::new(),
+                    mode: None,
+                },
+                _ => SecretGrant {
+                    source,
+                    scopes,
+                    mode,
+                },
             })
     }
 
@@ -1333,8 +1373,8 @@ mod tests {
         }
 
         /// BEP-009: the refusal fires iff the network mode is `none` and at
-        /// least one broker grant is declared. It names the broker grants
-        /// only.
+        /// least one broker or store grant is declared. It names those
+        /// grants only.
         #[test]
         fn prop_none_mode_with_grant_is_exit_3(
             network in any_network(),
@@ -1352,19 +1392,19 @@ mod tests {
             prop_assert!(!client_fired);
 
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let broker: Vec<String> = secrets
+            let credentialed: Vec<String> = secrets
                 .iter()
-                .filter(|(_, g)| g.source == GrantSource::Broker)
+                .filter(|(_, g)| g.is_credentialed())
                 .map(|(name, _)| name.clone())
                 .collect();
-            let expected = network == NetworkMode::NoNet && !broker.is_empty();
+            let expected = network == NetworkMode::NoNet && !credentialed.is_empty();
             let named = refusals(&spec, host, GITHUB_HOSTS).into_iter().find_map(|r| match r {
                 BepRefusal::NoNetworkWithGrant { grants } => Some(grants),
                 _ => None,
             });
             prop_assert_eq!(named.is_some(), expected);
             if let Some(grants) = named {
-                prop_assert_eq!(grants, broker);
+                prop_assert_eq!(grants, credentialed);
             }
             if expected {
                 let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
@@ -1373,7 +1413,7 @@ mod tests {
         }
 
         /// BEP-017: with no box-zone resolver, the refusal fires iff a
-        /// broker grant is declared and the resolved steering is `dns` or
+        /// broker or store grant is declared and the resolved steering is `dns` or
         /// `both`. Grants that are all `client_env` never fire it.
         #[test]
         fn prop_dns_steering_without_resolver_is_exit_3(
@@ -1398,7 +1438,7 @@ mod tests {
 
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
             let resolved = bep.steering.unwrap_or(Steering::Dns);
-            let expected = secrets.values().any(|g| g.source == GrantSource::Broker)
+            let expected = secrets.values().any(SecretGrant::is_credentialed)
                 && matches!(resolved, Steering::Dns | Steering::Both);
             let fired = refusals(&spec, host, GITHUB_HOSTS)
                 .iter()
@@ -1573,7 +1613,7 @@ mod tests {
             secrets in any_grants(),
         ) {
             let spec = ActivationSpec { network, egress: egress.as_ref(), bep: &bep, secrets: &secrets };
-            let credentialed = secrets.values().any(|g| g.source == GrantSource::Broker);
+            let credentialed = secrets.values().any(SecretGrant::is_credentialed);
             prop_assert_eq!(spec.has_credentialed_upstream(), credentialed);
             let resolved = bep.steering.unwrap_or(Steering::Dns);
             let expected = match quic443.unwrap_or(Quic443::Auto) {
@@ -1788,6 +1828,73 @@ mod tests {
     /// `id`. The grant reads as one store reference, and a broker scope is
     /// never one. A grant that lacks `store` or `id` is refused with text
     /// that names the missing field.
+    /// A box record saved before BEP-032 can carry the old store spelling,
+    /// a broker grant with a `keychain:` scope. It still loads, so the box
+    /// stays listed and can be destroyed.
+    #[test]
+    fn a_store_grant_parses_store_and_id_in_a_saved_record() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "policy": {
+                "egress": null,
+                "credentialed_upstream": {
+                    "secrets": {
+                        "NPM_TOKEN": {"source": "broker", "scopes": ["keychain:npm"]}
+                    }
+                }
+            },
+            "attrs": {}
+        }"#;
+        let record: crate::Record =
+            serde_json_lenient::from_str(json).expect("a saved record with the old spelling loads");
+        let secrets = &record
+            .policy
+            .credentialed_upstream
+            .expect("the lane is kept")
+            .secrets;
+        assert_eq!(secrets["NPM_TOKEN"].source, GrantSource::Broker);
+        assert_eq!(secrets["NPM_TOKEN"].scopes, ["keychain:npm"]);
+    }
+
+    /// The old spelling, a broker scope that names the item, still parses,
+    /// and box creation refuses it, so it cannot skip the store rules.
+    #[test]
+    fn a_store_grant_parses_store_and_id_not_a_broker_scope() {
+        for scope in ["claude", "keychain:claude"] {
+            let old: SecretGrant = toml::from_str(&format!(
+                "source = \"broker\"\nscopes = [\"github:user-token\", \"{scope}\"]"
+            ))
+            .expect("the old spelling parses");
+            assert_eq!(old.source, GrantSource::Broker);
+            let secrets = grants(old);
+            assert_eq!(store_references(&secrets).count(), 0);
+            let egress = egress_with(GITHUB_HOSTS);
+            let bep = BepSettings::default();
+            let spec = ActivationSpec {
+                network: NetworkMode::OwnIp,
+                egress: Some(&egress),
+                bep: &bep,
+                secrets: &secrets,
+            };
+            let refused =
+                check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect_err("refused");
+            assert_eq!(refused.exit_code(), 3);
+            assert_eq!(
+                refused.refusals,
+                vec![BepRefusal::BrokerScopeNotGithub {
+                    grant: "GH_TOKEN".into(),
+                    scope: scope.into(),
+                }]
+            );
+            let text = refused.to_string();
+            assert!(text.contains(&format!("the scope \"{scope}\"")), "{text}");
+            assert!(text.contains("source = \"store\""), "{text}");
+        }
+    }
+
     #[test]
     fn a_store_grant_parses_store_and_id() {
         let grant: SecretGrant =
@@ -1807,17 +1914,6 @@ mod tests {
             grant
         );
 
-        // The old spelling, a broker scope that names the item, is refused,
-        // so it cannot skip the store rules.
-        for scope in ["claude", "keychain:claude"] {
-            let err = toml::from_str::<SecretGrant>(&format!(
-                "source = \"broker\"\nscopes = [\"github:user-token\", \"{scope}\"]"
-            ))
-            .expect_err("a broker grant takes only github: scopes")
-            .to_string();
-            assert!(err.contains(&format!("\"{scope}\" is not one")), "{err}");
-            assert!(err.contains("source = \"store\""), "{err}");
-        }
         let secrets = SecretGrants::from([("CLAUDE".to_string(), grant)]);
         let references: Vec<StoreReference<'_>> = store_references(&secrets).collect();
         assert_eq!(
