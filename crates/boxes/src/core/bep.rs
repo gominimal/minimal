@@ -575,7 +575,9 @@ pub enum BepRefusal {
     /// box gets the proxy's address for a steered name but no proxy
     /// environment, and the proxy takes no direct TLS connection, so the
     /// box cannot reach the upstream. It is a fact about the proxy, not
-    /// the host.
+    /// the host. Under `both`, a tool that ignores `HTTPS_PROXY` gets the
+    /// proxy's address, and the switch drops its TCP connection to port 443
+    /// with no reset, so it stalls until #2805 adds the direct TLS path.
     DnsWithoutDirectTls,
     /// BEP-056: an `installation` grant on an un-enrolled host.
     InstallationUnenrolled {

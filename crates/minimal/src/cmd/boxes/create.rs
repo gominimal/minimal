@@ -340,7 +340,10 @@ fn refuse_unhonourable_grants(
 /// has no proxy, so a steered name there always fails closed, and a
 /// `host_ip` or `none` box has no steered lookups of its own. Where this is
 /// true, `dns` steering is still refused on its own grounds until the proxy
-/// takes a direct TLS connection (#2805).
+/// takes a direct TLS connection (#2805). Under `both`, a tool that
+/// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
+/// TCP connection to port 443 with no reset, so it stalls until #2805 adds
+/// the direct TLS path.
 pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
     kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
 }
