@@ -33,6 +33,9 @@ pub(crate) struct SpecInputs<'a> {
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
     pub acknowledged: bool,
+    /// Whether this host's switch resolves the box's steered names, the
+    /// same host fact the box's creation reads (BEP-017).
+    pub box_zone_resolver: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
     /// The client's `[secret-store-rules]`, merged and with refused rules
@@ -59,8 +62,10 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
 
     // BEP-057: every host is un-enrolled today.
     // Interim: only BEP-057 is previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // BEP-017: the resolver fact is the one creation reads, so the two agree.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
+        box_zone_resolver: inputs.box_zone_resolver,
         ..HostFacts::LOCAL
     };
     let egress = None;
@@ -237,6 +242,11 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             quic443,
             secrets: &secrets,
             acknowledged,
+            // The preview is of an own-address box, as its checks are.
+            box_zone_resolver: super::box_verbs::host_resolves_box_names(
+                crate::daemon_host_kind(global),
+                boxes::NetworkMode::OwnIp,
+            ),
             github_hosts: &github_hosts,
             store_rules: &store_rules,
         },
@@ -286,6 +296,7 @@ mod tests {
                 quic443,
                 secrets,
                 acknowledged,
+                box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -319,6 +330,7 @@ mod tests {
                     quic443: None,
                     secrets: &secrets,
                     acknowledged: false,
+                    box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
                 },
@@ -392,6 +404,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -456,6 +469,7 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },

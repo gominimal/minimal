@@ -304,7 +304,13 @@ pub type SecretGrants = BTreeMap<String, SecretGrant>;
 pub struct HostFacts {
     /// Whether the host is enrolled with a Gatehouse.
     pub enrolled: bool,
-    /// Whether the host runs a box-zone resolver.
+    /// Whether the box's lookups go through a switch whose DNS gate steers
+    /// the credential module's names to the proxy: true for an own-address
+    /// box on the VM host, whose switch asks the VM host whether the
+    /// proxy's listener is live. False on a native host, where a steered
+    /// name always fails closed. The CLI reads it from the host kind at
+    /// creation and at `min box spec`. While it is false, `dns` and `both`
+    /// steering with a credentialed upstream is refused (BEP-017).
     pub box_zone_resolver: bool,
     /// Whether the client configuration sets
     /// [`FULL_BREADTH_ACKNOWLEDGEMENT`]. It matters only un-enrolled.
@@ -312,7 +318,9 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
-    /// An un-enrolled host with no box-zone resolver and no acknowledgement.
+    /// An un-enrolled host with no box-zone resolver and no acknowledgement:
+    /// a native host. A caller on the VM host sets
+    /// [`Self::box_zone_resolver`] over it, from the host kind.
     pub const LOCAL: Self = Self {
         enrolled: false,
         box_zone_resolver: false,
@@ -718,6 +726,7 @@ pub fn check_activation(
             tracing::debug!(
                 rule = refusal.rule(),
                 fields = refusal.fields(),
+                box_zone_resolver = host.box_zone_resolver,
                 reason = %refusal,
                 "box spec refused at activation"
             );
