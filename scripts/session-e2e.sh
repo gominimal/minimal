@@ -7820,7 +7820,7 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'resolves on this machine' "$range2_err"; then
+  if ! grep -qE -- 'opens at its name on this machine|resolves on this machine' "$range2_err"; then
     echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
@@ -9317,7 +9317,7 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'resolves on this machine' \
+  bn_api_surface="$(grep -E -- 'opens at its name on this machine|resolves on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
     echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
@@ -9329,6 +9329,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # the hostname proxy still serves beside native DNS (NET-019) is `min
   # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
+    "names: $BN_API_NAME.min.internal opens at its name on this machine"*) ;;
     "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
@@ -9413,17 +9414,18 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
   bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
   case "$bn_surface_line" in
-    *"resolves through this machine's DNS"*) ;;
+    *"<box>.min.internal opens at its name on this machine"*) ;;
+    *"<box>.min.internal resolves on this machine"*) ;;
     *)
-      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names open through this machine's DNS (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
+    *"the HTTP proxy at 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
+      echo "::error::min ls's BOX NAMES line does not name the HTTP proxy that still serves (NET-019)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
