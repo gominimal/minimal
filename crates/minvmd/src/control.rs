@@ -768,9 +768,10 @@ fn serve_connection(
         }
     };
     let root_peer = is_root_peer(uid);
-    // The guest door also admits the VM user's uid (BEP-047): the VMM child
-    // dials it as `minimal-vmm`. The host door keeps its check, and the
-    // door, not the peer, decides which verbs a connection can ask for.
+    // The guest door also admits the VM user's uid (formerly BEP-047,
+    // gominimal/inbox#1184): the VMM child dials it as `minimal-vmm`. The
+    // host door keeps its check, and the door, not the peer, decides which
+    // verbs a connection can ask for.
     let checked = match door {
         ControlDoor::GuestReports => check_guest_peer_uid(uid),
         ControlDoor::Host => check_peer_uid(uid),
@@ -3540,8 +3541,9 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    /// BEP-047: the guest door admits the `minimal-vmm` uid the VMM child
-    /// dials as, and the daemon's own; the host door admits only its own.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the guest door admits the
+    /// `minimal-vmm` uid the VMM child dials as, and the daemon's own; the
+    /// host door admits only its own.
     #[test]
     fn guest_door_admits_the_vmm_uid_and_the_host_door_does_not() {
         assert!(guest_peer_admitted(1000, 1000, Some(990)));
