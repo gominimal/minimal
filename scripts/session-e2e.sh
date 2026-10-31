@@ -12532,17 +12532,11 @@ proof_bep_store_reference_end_to_end() {
 
   # 2. The box spec references the identifier (BEP-032), and `min box spec`
   # shows the reference with its upstream (BEP-038).
-  # Interim spelling: BEP-032 and Gatehouse 6.10 write a store reference as
-  # `source = "store"` with `store` and `id`. GrantSource in
-  # crates/boxes/src/core/bep.rs refuses `store` today, so this seed writes
-  # the identifier as a broker scope. When GrantSource accepts `store`, this
-  # seed writes `source = "store"`, `store = "keychain"` and `id`
-  # (https://github.com/gominimal/minimal/issues/2656).
   GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlstore.XXXXXX)"
   {
     hook_seed_preamble
     printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
-    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "broker"\nscopes = ["%s"]\n' "$sr_id"
+    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$sr_id"
     printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
   } > "$GRANT_SEED_DIR/minimal.toml"
   mkdir "$GRANT_SEED_DIR/.git"
