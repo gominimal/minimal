@@ -247,7 +247,7 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         ),
         // BEP-014, BEP-059: a key was made, and the build refused it.
         ReplaceError::Exportable(_) => format!(
-            "The {role} key was not replaced. The keychain made the new key exportable. This build does not use an exportable key. The old key is still in use."
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The old key is still in use."
         ),
         ReplaceError::Remove(cause) | ReplaceError::Move(cause) => {
             format!("The {role} key was not replaced. The old key is still in use: {cause}.")
@@ -3495,7 +3495,7 @@ mod tests {
         };
         assert_eq!(
             replace_failure(Role::Sealing, &err),
-            "The sealing key was not replaced. The keychain made the new key exportable. This build does not use an exportable key. The old key is still in use."
+            "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The old key is still in use."
         );
     }
 
