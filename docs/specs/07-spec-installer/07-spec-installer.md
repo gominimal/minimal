@@ -467,6 +467,16 @@ Three rules make the migration safe:
   it the migration gets exactly one attempt, because the record it reads is
   replaced immediately afterwards.
 
+**R6.1b**, **Install metadata for the update check.** Beside the record the
+installer writes `<state>/install.toml` with the install's `channel` (the
+target the run resolved, or `pinned` for a `--version` run), `method = "installer"` and `key` (the channel
+pointer the run installed, the `VERSION` of R2), atomically, and records the
+file as a generated component so uninstall removes it. The installed `min`
+reads it for its daily update check (gominimal/inbox#589): a pointer that no
+longer equals `key` is what the notice reports. A package manager ships the
+same file read-only at `<prefix>/share/minimal/install.toml` with its own
+`method`; the per-user file wins.
+
 **R6.2**, If the resolved `bin` directory is not on `$PATH` **in the
 installing session**, the installer prints an advisory: the Unit 9 rc hook only
 takes effect in new shells, so the advisory tells the user to restart their

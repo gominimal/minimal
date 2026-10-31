@@ -162,6 +162,10 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// The daily update check (gominimal/inbox#589): run it now, or as the
+    /// detached child every command spawns once a day.
+    #[command(name = "update-check", hide = true)]
+    UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
@@ -1208,6 +1212,20 @@ pub struct SpinArgs {
     /// Ctrl-C cuts it short.
     #[arg(long, default_value_t = 10)]
     pub seconds: u64,
+}
+
+/// `min update-check`: see [`crate::update_check`].
+#[derive(Debug, Default, Args)]
+pub struct UpdateCheckArgs {
+    /// The detached child: one request within the budget, the answer
+    /// cached for the next command, nothing printed, exit 0 whatever
+    /// happens.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub background: bool,
+    /// Print the request that would be made, and the switch that stops it
+    /// if one is set, without making it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

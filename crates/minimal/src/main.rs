@@ -153,6 +153,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
+    // The daily update check (inbox#589): reads its cache, spawns the
+    // detached check when one is due, prints a notice once per new release.
+    // Never waits, never fails the command.
+    minimal::update_check::before_command(&cli.global_args, &cli.command);
+
     let result = minimal::run(cli).await;
     // Flush exported telemetry (bounded; a no-op when export is off). What
     // the bound cuts off is in the spool already.
