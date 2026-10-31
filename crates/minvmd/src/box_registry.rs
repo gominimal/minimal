@@ -4323,12 +4323,7 @@ impl BoxRegistry {
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         // The box's end is observed here, so the withdrawal's own line
         // measures itself against this instant (NET-133's bound).
-        let withdrawn = self.withdraw_where(switch_addr, |_, _| Some(Instant::now()));
-        // The node's own row ended: its mirrored binds end with it.
-        if withdrawn.is_some() && switch_addr == self.subnet.daemon_ip() {
-            self.node_mirror.end_node();
-        }
-        withdrawn
+        self.withdraw_where(switch_addr, |_, _| Some(Instant::now()))
     }
 
     /// Withdraws the row at `switch_addr` when `ended_at` says its box
@@ -4381,6 +4376,14 @@ impl BoxRegistry {
         }
         if rowless {
             self.persist();
+        }
+        // The node's own row ended, by any path that removes it: its
+        // mirrored binds end with it (NET-138's node end).
+        if removed
+            .as_deref()
+            .is_some_and(|record| record.name() == NODE_NAMESPACE && !record.is_task_row())
+        {
+            self.node_mirror.end_node();
         }
         removed
     }
@@ -6060,6 +6063,9 @@ impl BoxRegistry {
         resident.boxes.insert(session_id, Arc::new(rules));
         resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         let count = resident.boxes.len();
+        // Under the resident set's lock, so the mirror's flag follows the
+        // set in order (NET-138).
+        self.node_mirror.set_published(true);
         drop(resident);
         tracing::info!(
             session = %session_id,
@@ -6084,6 +6090,11 @@ impl BoxRegistry {
             resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         }
         let count = resident.boxes.len();
+        if removed {
+            // Under the resident set's lock, so the mirror's flag follows
+            // the set in order (NET-138).
+            self.node_mirror.set_published(count > 0);
+        }
         drop(resident);
         if removed {
             tracing::info!(
@@ -6093,23 +6104,14 @@ impl BoxRegistry {
             );
             // The last host-address box ended: no box shares the node's
             // namespace any more, so nothing the mirror binds has a
-            // listener behind it (NET-138's box end).
+            // listener behind it (NET-138's box end). The mirror checks
+            // the flag again under its own lock, so a box published since
+            // keeps its binds.
             if count == 0 {
                 self.node_mirror.end_binds(MirrorEnd::BoxEnd);
             }
         }
         removed
-    }
-
-    /// Whether a host-address box is published on this node: a resident
-    /// `host_ip` box's rules are held ([`Self::admit_host_ip_box`]).
-    fn host_address_box_published(&self) -> bool {
-        !self
-            .host_ip_boxes
-            .read()
-            .expect("the resident host_ip boxes' lock is never held across a panic")
-            .boxes
-            .is_empty()
     }
 
     /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
@@ -6160,8 +6162,7 @@ impl BoxRegistry {
     /// no host-address box is published, a listening notice binds nothing.
     /// The caller has already refused the node's infrastructure ports.
     pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
-        self.node_mirror
-            .notice(notice, self.host_address_box_published(), Instant::now())
+        self.node_mirror.notice(notice, Instant::now())
     }
 }
 
@@ -6314,6 +6315,13 @@ impl MirrorEnd {
 pub struct NodeMirror {
     /// The node's switch address: the node's name in every audit line.
     node: Ipv4Addr,
+    /// Serialises every change to the mirror, with the binder calls it
+    /// makes, so the binds the host holds follow the decisions in order.
+    /// It is always taken before `state` and never while `state` is held.
+    turn: Mutex<()>,
+    /// What the mirror holds. It is held only to read or decide, and never
+    /// across a binder call, so a slow switch stalls no reader and no
+    /// caller that only records a fact here.
     state: Mutex<MirrorState>,
     dropped_by_rate: AtomicU64,
 }
@@ -6324,6 +6332,11 @@ struct MirrorState {
     address: Option<Ipv4Addr>,
     /// Whether the whole-range probe passes.
     range_passes: bool,
+    /// Whether a host-address box is published on the node. The registry
+    /// sets it under the resident boxes' lock ([`Self::set_published`]),
+    /// and a listening notice reads it under this lock, so a notice and
+    /// the last box's end cannot pass each other.
+    published: bool,
     binder: Option<Arc<dyn MirrorBinder>>,
     /// The ports a listening notice holds: bound or waiting.
     wanted: BTreeSet<u16>,
@@ -6335,10 +6348,30 @@ struct MirrorState {
     notices: VecDeque<Instant>,
 }
 
+impl MirrorState {
+    /// The address and binder a bind needs now: both set and the range
+    /// probe passing.
+    fn bind_target(&self) -> Option<(Ipv4Addr, Arc<dyn MirrorBinder>)> {
+        match (self.address, self.range_passes, self.binder.clone()) {
+            (Some(address), true, Some(binder)) => Some((address, binder)),
+            _ => None,
+        }
+    }
+}
+
+/// The binder calls one change decided, made after the state lock is
+/// released and under the mirror's turn.
+#[derive(Debug, Default)]
+struct MirrorCalls {
+    unbinds: Vec<(Arc<dyn MirrorBinder>, Ipv4Addr, u16, &'static str)>,
+    binds: Vec<(Arc<dyn MirrorBinder>, Ipv4Addr, u16)>,
+}
+
 impl NodeMirror {
     fn new(node: Ipv4Addr) -> Self {
         Self {
             node,
+            turn: Mutex::new(()),
             state: Mutex::new(MirrorState::default()),
             dropped_by_rate: AtomicU64::new(0),
         }
@@ -6354,8 +6387,21 @@ impl NodeMirror {
             .expect("the node mirror's lock is never held across a panic")
     }
 
+    fn take_turn(&self) -> MutexGuard<'_, ()> {
+        self.turn
+            .lock()
+            .expect("the node mirror's turn is never held across a panic")
+    }
+
     fn set_binder(&self, binder: Arc<dyn MirrorBinder>) {
         self.lock().binder = Some(binder);
+    }
+
+    /// Records whether a host-address box is published on the node. The
+    /// registry calls it under the resident boxes' lock, so the flag
+    /// follows the resident set in order. It makes no binder call.
+    fn set_published(&self, published: bool) {
+        self.lock().published = published;
     }
 
     /// The node's address the mirror binds at, once open.
@@ -6384,59 +6430,80 @@ impl NodeMirror {
     /// held, so the next pass binds them again.
     pub fn set_range_probe(&self, passes: bool) {
         let _span = self.span().entered();
+        let _turn = self.take_turn();
         let mut state = self.lock();
         let was = std::mem::replace(&mut state.range_passes, passes);
-        if passes && !was {
-            self.bind_wanted(&mut state);
+        let calls = if passes && !was {
+            Self::bind_wanted(&state)
         } else if !passes {
-            self.unbind_all(&mut state, MirrorEnd::RangeProbeFailed, false);
-        }
+            Self::unbind_all(&mut state, MirrorEnd::RangeProbeFailed, false)
+        } else {
+            MirrorCalls::default()
+        };
+        drop(state);
+        self.run(calls);
     }
 
     fn open(&self, address: Ipv4Addr) {
         let _span = self.span().entered();
+        let _turn = self.take_turn();
         let mut state = self.lock();
         if state.address == Some(address) {
             return;
         }
-        self.unbind_all(&mut state, MirrorEnd::AddressChanged, false);
+        let mut calls = Self::unbind_all(&mut state, MirrorEnd::AddressChanged, false);
         state.address = Some(address);
-        self.bind_wanted(&mut state);
+        calls.binds = Self::bind_wanted(&state).binds;
+        drop(state);
+        self.run(calls);
     }
 
     /// Undoes every bind and forgets every held port: the processes that
-    /// held them are gone.
+    /// held them are gone. For [`MirrorEnd::BoxEnd`] it does nothing when a
+    /// host-address box is published again by the time it runs, because
+    /// that box's binds are not the ended box's.
     pub fn end_binds(&self, end: MirrorEnd) {
         let _span = self.span().entered();
+        let _turn = self.take_turn();
         let mut state = self.lock();
-        self.unbind_all(&mut state, end, true);
+        if end == MirrorEnd::BoxEnd && state.published {
+            return;
+        }
+        let calls = Self::unbind_all(&mut state, end, true);
+        drop(state);
+        self.run(calls);
     }
 
     /// The node's end: every bind undone and the address closed.
     pub fn end_node(&self) {
         let _span = self.span().entered();
+        let _turn = self.take_turn();
         let mut state = self.lock();
-        self.unbind_all(&mut state, MirrorEnd::NodeEnd, true);
+        let calls = Self::unbind_all(&mut state, MirrorEnd::NodeEnd, true);
+        // The unbinds name the address they undo, so it closes now.
         state.address = None;
+        drop(state);
+        self.run(calls);
     }
 
-    /// Takes one listen notice. `published` is whether a host-address box
-    /// is published on the node, and `now` the notice's arrival.
-    pub fn notice(
-        &self,
-        notice: minimald_rpc::ListenNotice,
-        published: bool,
-        now: Instant,
-    ) -> MirrorOutcome {
+    /// Takes one listen notice that arrived at `now`. A listening notice
+    /// binds only while a host-address box is published on the node.
+    pub fn notice(&self, notice: minimald_rpc::ListenNotice, now: Instant) -> MirrorOutcome {
         let _span = self.span().entered();
+        let _turn = self.take_turn();
         let port = notice.port;
         let mut state = self.lock();
         if notice.state == minimald_rpc::ListenState::Stopped {
             state.wanted.remove(&port);
             state.collided.remove(&port);
-            if state.bound.remove(&port) {
-                self.unbind_one(&state, port, "stop-notice");
+            let mut calls = MirrorCalls::default();
+            if state.bound.remove(&port)
+                && let (Some(address), Some(binder)) = (state.address, state.binder.clone())
+            {
+                calls.unbinds.push((binder, address, port, "stop-notice"));
             }
+            drop(state);
+            self.run(calls);
             return MirrorOutcome::Unbound;
         }
         while state
@@ -6461,46 +6528,92 @@ impl NodeMirror {
             return MirrorOutcome::Capped;
         }
         state.notices.push_back(now);
-        if !published {
-            self.warn_refused(&state, port, MirrorOutcome::NoHostAddressBox, "no-cohort");
+        if !state.published {
+            self.warn_refused(
+                state.address,
+                port,
+                MirrorOutcome::NoHostAddressBox,
+                "no-cohort",
+            );
             return MirrorOutcome::NoHostAddressBox;
         }
         if state.bound.contains(&port) {
             return MirrorOutcome::Bound;
         }
         if !state.wanted.contains(&port) && state.wanted.len() >= MIRRORED_BINDS_CAP {
-            self.warn_refused(&state, port, MirrorOutcome::Capped, "bind-cap");
+            self.warn_refused(state.address, port, MirrorOutcome::Capped, "bind-cap");
             return MirrorOutcome::Capped;
         }
         state.wanted.insert(port);
-        self.bind_one(&mut state, port)
+        let Some((address, binder)) = state.bind_target() else {
+            self.info_waiting(&state, port);
+            return MirrorOutcome::Waiting;
+        };
+        drop(state);
+        self.bind(&binder, address, port)
     }
 
-    fn bind_wanted(&self, state: &mut MirrorState) {
-        let ports: Vec<u16> = state.wanted.difference(&state.bound).copied().collect();
-        for port in ports {
-            self.bind_one(state, port);
+    /// The binds that make every held port bound, or none while the mirror
+    /// cannot bind. Each port it cannot bind yet is logged as waiting.
+    fn bind_wanted(state: &MirrorState) -> MirrorCalls {
+        let mut calls = MirrorCalls::default();
+        if let Some((address, binder)) = state.bind_target() {
+            calls.binds = state
+                .wanted
+                .difference(&state.bound)
+                .map(|port| (Arc::clone(&binder), address, *port))
+                .collect();
+        }
+        calls
+    }
+
+    /// Forgets every bind and returns the unbinds that undo them.
+    fn unbind_all(state: &mut MirrorState, end: MirrorEnd, forget: bool) -> MirrorCalls {
+        let bound = std::mem::take(&mut state.bound);
+        state.collided.clear();
+        if forget {
+            state.wanted.clear();
+        }
+        let mut calls = MirrorCalls::default();
+        if let (Some(address), Some(binder)) = (state.address, state.binder.clone()) {
+            calls.unbinds = bound
+                .into_iter()
+                .map(|port| (Arc::clone(&binder), address, port, end.as_str()))
+                .collect();
+        }
+        calls
+    }
+
+    /// Makes the binder calls one change decided: the unbinds first, then
+    /// the binds. The caller holds the turn and not the state lock.
+    fn run(&self, calls: MirrorCalls) {
+        for (binder, address, port, reason) in calls.unbinds {
+            binder.unbind(address, port);
+            tracing::info!(
+                node = %self.node,
+                %address,
+                port,
+                outcome = MirrorOutcome::Unbound.as_str(),
+                reason,
+                "undid a mirrored bind at the node's address and closed its connections"
+            );
+        }
+        for (binder, address, port) in calls.binds {
+            self.bind(&binder, address, port);
         }
     }
 
-    fn bind_one(&self, state: &mut MirrorState, port: u16) -> MirrorOutcome {
-        let (Some(address), true, Some(binder)) =
-            (state.address, state.range_passes, state.binder.clone())
-        else {
-            tracing::info!(
-                node = %self.node,
-                address = ?state.address,
-                port,
-                outcome = MirrorOutcome::Waiting.as_str(),
-                range_probe_passes = state.range_passes,
-                "holding a mirrored bind until the range probe passes at the node's address"
-            );
-            return MirrorOutcome::Waiting;
-        };
-        match binder.bind(address, port) {
+    /// Binds `port` at `address` and records the outcome. The caller holds
+    /// the turn and not the state lock, so the state the bind was decided
+    /// under is the state it commits to.
+    fn bind(&self, binder: &Arc<dyn MirrorBinder>, address: Ipv4Addr, port: u16) -> MirrorOutcome {
+        let result = binder.bind(address, port);
+        let mut state = self.lock();
+        match result {
             Ok(()) => {
                 state.bound.insert(port);
                 state.collided.remove(&port);
+                drop(state);
                 tracing::info!(
                     node = %self.node,
                     %address,
@@ -6512,10 +6625,12 @@ impl NodeMirror {
             }
             Err(MirrorBindError::Occupied) => {
                 state.collided.insert(port);
-                self.warn_refused(state, port, MirrorOutcome::Collided, "port-in-use");
+                drop(state);
+                self.warn_refused(Some(address), port, MirrorOutcome::Collided, "port-in-use");
                 MirrorOutcome::Collided
             }
             Err(MirrorBindError::Failed(error)) => {
+                drop(state);
                 tracing::warn!(
                     node = %self.node,
                     %address,
@@ -6529,36 +6644,27 @@ impl NodeMirror {
         }
     }
 
-    fn unbind_one(&self, state: &MirrorState, port: u16, reason: &str) {
-        let (Some(address), Some(binder)) = (state.address, state.binder.as_ref()) else {
-            return;
-        };
-        binder.unbind(address, port);
+    fn info_waiting(&self, state: &MirrorState, port: u16) {
         tracing::info!(
             node = %self.node,
-            %address,
+            address = ?state.address,
             port,
-            outcome = MirrorOutcome::Unbound.as_str(),
-            reason,
-            "undid a mirrored bind at the node's address and closed its connections"
+            outcome = MirrorOutcome::Waiting.as_str(),
+            range_probe_passes = state.range_passes,
+            "holding a mirrored bind until the range probe passes at the node's address"
         );
     }
 
-    fn unbind_all(&self, state: &mut MirrorState, end: MirrorEnd, forget: bool) {
-        let bound = std::mem::take(&mut state.bound);
-        for port in bound {
-            self.unbind_one(state, port, end.as_str());
-        }
-        state.collided.clear();
-        if forget {
-            state.wanted.clear();
-        }
-    }
-
-    fn warn_refused(&self, state: &MirrorState, port: u16, outcome: MirrorOutcome, reason: &str) {
+    fn warn_refused(
+        &self,
+        address: Option<Ipv4Addr>,
+        port: u16,
+        outcome: MirrorOutcome,
+        reason: &str,
+    ) {
         tracing::warn!(
             node = %self.node,
-            address = ?state.address,
+            address = ?address,
             port,
             outcome = outcome.as_str(),
             reason,
@@ -6570,9 +6676,9 @@ impl NodeMirror {
     /// before the mirror sees the notice.
     pub fn warn_refused_infrastructure(&self, port: u16) {
         let _span = self.span().entered();
-        let state = self.lock();
+        let address = self.lock().address;
         self.warn_refused(
-            &state,
+            address,
             port,
             MirrorOutcome::RefusedInfrastructure,
             "guest-infrastructure-port",
@@ -12050,15 +12156,86 @@ mod tests {
         );
         assert!(binder.open().is_empty());
 
-        // The node's end undoes the binds and closes the address.
+        // The node's end undoes the binds and closes the address. The row
+        // leaves the way production removes it: the drainer withdraws it
+        // once its relay ended and its grace passed.
         assert!(registry.admit_host_ip_box(mirror_session(1), None));
         assert_eq!(
             registry.mirror_notice(listening(ports[1])),
             MirrorOutcome::Bound
         );
-        assert!(registry.withdraw(SUBNET.daemon_ip()).is_some());
-        assert!(binder.open().is_empty(), "the node's end undoes every bind");
+        registry.spawn_withdrawal_drainer(|_| {});
+        let node_row = registry
+            .table()
+            .by_source(SUBNET.daemon_ip().octets())
+            .expect("the node's row stands");
+        relay_carried_and_ended(&registry, &[&node_row]);
+        wait_until(|| node_row.is_detached(), "the node's row detaches");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || binder.open().is_empty(),
+            "the drainer's withdrawal of the node's row undoes every bind",
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(SUBNET.daemon_ip().octets())
+                .is_none()
+        );
         assert_eq!(registry.node_mirror().address(), None);
+    }
+
+    /// A [`MirrorBinder`] that reads the mirror's state from inside every
+    /// call. It deadlocks if the mirror calls it with its state lock held.
+    #[derive(Debug, Default)]
+    struct ReentrantBinder {
+        registry: std::sync::OnceLock<BoxRegistry>,
+        seen: Mutex<Vec<Vec<u16>>>,
+    }
+
+    impl MirrorBinder for ReentrantBinder {
+        fn bind(&self, _: Ipv4Addr, _: u16) -> Result<(), MirrorBindError> {
+            let registry = self.registry.get().expect("the registry is set");
+            let bound = registry.node_mirror().bound_ports();
+            self.seen.lock().expect("the seen lock").push(bound);
+            Ok(())
+        }
+
+        fn unbind(&self, _: Ipv4Addr, _: u16) {
+            let registry = self.registry.get().expect("the registry is set");
+            let bound = registry.node_mirror().bound_ports();
+            self.seen.lock().expect("the seen lock").push(bound);
+        }
+    }
+
+    /// NET-138: the mirror makes every binder call with its state lock
+    /// released, so a slow switch stalls no reader of the mirror.
+    #[test]
+    fn mirror_calls_the_binder_without_its_state_lock() {
+        let binder = Arc::new(ReentrantBinder::default());
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        binder
+            .registry
+            .set(registry.clone())
+            .expect("the registry is set once");
+        registry.register_node_namespace(7654);
+        registry
+            .open_node_mirror(mirror_address())
+            .expect("the mirror opens");
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        assert_eq!(
+            registry.mirror_notice(listening(18_080)),
+            MirrorOutcome::Bound
+        );
+        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(registry.node_mirror().bound_ports().is_empty());
+        assert_eq!(
+            *binder.seen.lock().expect("the seen lock"),
+            vec![Vec::<u16>::new(), Vec::<u16>::new()],
+            "the bind ran before it was recorded, and the unbind after it was forgotten"
+        );
     }
 
     /// NET-138: the node's mirror opens only at a reserved-range address
@@ -12188,29 +12365,29 @@ mod tests {
         for port in 0..MIRROR_NOTICES_PER_SECOND {
             let port = 20_000 + u16::try_from(port).expect("a small count");
             assert_eq!(
-                mirror.notice(listening(port), true, start),
+                mirror.notice(listening(port), start),
                 MirrorOutcome::Waiting
             );
         }
         assert_eq!(
-            mirror.notice(listening(30_000), true, start),
+            mirror.notice(listening(30_000), start),
             MirrorOutcome::Capped
         );
         assert_eq!(mirror.notices_dropped_by_rate(), 1);
         assert_eq!(
-            mirror.notice(stopped(20_000), true, start),
+            mirror.notice(stopped(20_000), start),
             MirrorOutcome::Unbound,
             "a stop notice is never refused by the rate"
         );
 
         let mut at = start + MIRROR_NOTICE_WINDOW;
         let mut port = 40_000;
-        while mirror.notice(listening(port), true, at) == MirrorOutcome::Waiting {
+        while mirror.notice(listening(port), at) == MirrorOutcome::Waiting {
             port += 1;
             at += MIRROR_NOTICE_WINDOW;
         }
         assert_eq!(
-            mirror.notice(listening(port), true, at + MIRROR_NOTICE_WINDOW),
+            mirror.notice(listening(port), at + MIRROR_NOTICE_WINDOW),
             MirrorOutcome::Capped,
             "a new port past the bind cap is refused"
         );
