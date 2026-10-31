@@ -360,7 +360,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 
 /// `url` without its credentials, its query and its fragment, or `None`
 /// when it is not a URL.
-fn stripped_url(url: &str) -> Option<String> {
+pub(crate) fn stripped_url(url: &str) -> Option<String> {
     let mut parsed = url::Url::parse(url).ok()?;
     let _ = parsed.set_username("");
     let _ = parsed.set_password(None);
@@ -372,7 +372,7 @@ fn stripped_url(url: &str) -> Option<String> {
 /// `text` with each URL in it stripped as `stripped_url` strips one. A URL
 /// runs from its scheme to the next space, quote, bracket or parenthesis.
 /// One that does not parse is replaced whole, so no credential in it stays.
-fn strip_urls(text: &str) -> String {
+pub(crate) fn strip_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {

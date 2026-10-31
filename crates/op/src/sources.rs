@@ -149,15 +149,21 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                                     %box_id, host, %leaf,
                                     "the download cache served a web source for a box, and no connection opened",
                                 ),
+                                // The error can quote the request URL, with
+                                // its credentials and its signed query.
                                 Err(e) => info!(
-                                    %box_id, host, %leaf, error = %format!("{e:#}"),
+                                    %box_id, host, %leaf,
+                                    error = %crate::specs::strip_urls(&format!("{e:#}")),
                                     "a web source for a box could not be fetched in the box's classifier leaf",
                                 ),
                             }
                         }
                         let (cached_path, _) = fetched?;
 
-                        debug!("  Downloaded and verified source from {}", url);
+                        debug!(
+                            "  Downloaded and verified source from {}",
+                            crate::specs::stripped_url(url.as_str()).unwrap_or_default()
+                        );
                         (cached_path, filename)
                     }
 
@@ -419,6 +425,121 @@ mod tests {
             leaf.procs(),
             Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/sealed/cgroup.procs"),
             "the download joins the leaf through its cgroup.procs"
+        );
+    }
+
+    /// Fails every web fetch with an error that quotes a URL with
+    /// credentials and a signed query, as a reqwest error does.
+    #[derive(Debug)]
+    struct LeakyFailFetcher;
+
+    impl SourceFetcher for LeakyFailFetcher {
+        async fn download_web(
+            &self,
+            _url: &str,
+            _sha256: &str,
+            _leaf: Option<&ClassifierLeaf>,
+            _op: &OpTracker,
+        ) -> anyhow::Result<(PathBuf, bool)> {
+            Err(anyhow!(
+                "error sending request for url (https://user:secret@host/x?sig=abc)"
+            ))
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            unreachable!("only web sources are fetched here")
+        }
+    }
+
+    /// Writes every event's fields into one shared string.
+    #[derive(Clone, Default)]
+    struct CaptureEvents(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl tracing::field::Visit for CaptureEvents {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = writeln!(self.0.lock().unwrap(), "{}={value:?}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for CaptureEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// NET-155: the daemon log line for a box's failed web-source fetch
+    /// keeps the error, but strips the credentials and the query from any
+    /// URL the error quotes.
+    #[tokio::test]
+    async fn web_source_fetch_failure_log_strips_url_credentials() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
+        let graph = Graph::new();
+        let opts = Options {
+            cache,
+            graph: &graph,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let source = SourceInput {
+            from: SourceFetch::Web {
+                url: "https://host/x.tar.gz".into(),
+                sha256: SHA.into(),
+                url_pos: None,
+                sha256_pos: None,
+            },
+            extract: true,
+            strip_prefix: None,
+        };
+        let leaf = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "sealed",
+            sandbox::config::Verdict::Deny,
+        );
+        let capture = CaptureEvents::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let result = SourceLoad {
+            source: &source,
+            remote_fetcher: &LeakyFailFetcher,
+            into: None,
+            classifier_leaf: Some(&leaf),
+        }
+        .run(&opts)
+        .await;
+
+        assert!(result.is_err(), "the failed fetch fails the load");
+        let logged = capture.0.lock().unwrap().clone();
+        assert!(
+            logged.contains("could not be fetched") && logged.contains("https://host/x"),
+            "the failure is logged with the stripped URL: {logged}"
+        );
+        assert!(
+            !logged.contains("secret"),
+            "no password in the log: {logged}"
+        );
+        assert!(
+            !logged.contains("sig=abc"),
+            "no signed query in the log: {logged}"
         );
     }
 }
