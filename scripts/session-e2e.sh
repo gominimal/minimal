@@ -27378,7 +27378,7 @@ proof_names_survive_restart_and_second_vm() {
   local a_name="e2e-nrv-a" b_name="e2e-nrv-b" vm="beta"
   local port=18132 lo=18130 hi=18135
   local a_sid="" b_sid="" a_addr="" a_addr_after="" b_addr="" setup="" cmd=""
-  local before_records="" after_records="" tool nrv_journal="" nrv_lines=""
+  local before_records="" after_records="" tool nrv_journal="" nrv_lines="" b_record=""
 
   if [ "$(uname -s)" != Linux ]; then
     not_run "$nc" "the box-name boot unit is a Linux systemd unit; macOS reserves its names another way"
@@ -27590,11 +27590,13 @@ proof_names_survive_restart_and_second_vm() {
   # record must be new since the boot and carry the second VM's node id,
   # `<state dir>#<vm>` (crates/minvmd/src/net/answerer.rs node_id_for), so a
   # re-register line from the first daemon or an old log line cannot pass.
+  # The detached supervisor writes minvmd.log as JSON (`"node":"<id>"` under
+  # `fields`); a foreground run writes text (`node=<id>`). Match either.
   b_record=""
   for _ in $(seq 1 40); do
     after_records="$(nrv_start_records)"
     b_record="$(comm -13 <(printf '%s\n' "$before_records") <(printf '%s\n' "$after_records") \
-      | grep -E -- "node=[^ ]*#${NRV_VM_NAME}( |\$)" || true)"
+      | grep -E -- "(node=|\"node\":\")[^ \"]*#${NRV_VM_NAME}( |\"|\$)" || true)"
     [ -n "$b_record" ] && break
     sleep 0.5
   done
