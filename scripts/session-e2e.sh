@@ -5069,8 +5069,9 @@ echo "::endgroup::"
 #   * `http://<name>.min.internal:8080` returns the in-box server's response,
 #     through the resolver file the same script wrote;
 #   * the box's own range address (the zone answerer's A record for its name)
-#     returns the same response at port 8080.
-# That `min ls` names the address belongs to T110 (#2696), which adds it.
+#     returns the same response at port 8080;
+#   * `min ls` shows the same range address in the box's ADDRESS column,
+#     never `-` or the `127.0.0.1` fallback.
 # The host is restored on every exit: the range unit, its aliases, the
 # resolver file and the answerer service go (range_teardown_unit,
 # answerer_service_teardown — the teardown repeats both if the case dies).
@@ -5219,10 +5220,19 @@ fresh_install_range_lands_on_macos() {
     fi
   done
 
+  # The listing shows the address the zone answers for the box (T110).
+  mnl ls >"$WORK/fi-range-ls.out" 2>&1 || true
+  if ! grep -F -- "$frm_name" "$WORK/fi-range-ls.out" | grep -qF -- " $frm_addr "; then
+    echo "::error::'min ls' does not show $frm_addr on the $frm_name row, the address the zone answers for it"
+    cat "$WORK/fi-range-ls.out" 2>/dev/null || true
+    fail
+  fi
+  echo "min ls shows $frm_addr on the $frm_name row"
+
   mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
   range_teardown_unit
   answerer_service_teardown
-  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls shows $frm_addr, host restored)"
   echo "::endgroup::"
 }
 
