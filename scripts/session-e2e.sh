@@ -20223,6 +20223,13 @@ proof_escapes_and_builds_stay_inside_box_rules() {
     cat "$ebr_listener_log" 2>/dev/null || true
     fail
   }
+  # The guest daemon's vsock refusal lines for one peer CID, oldest first.
+  # The console prints the field as peer_cid=N, a JSON record as
+  # "peer_cid":N, so match both and never a longer number.
+  ebr_vsock_refusals() {
+    ebr_boot_case_log | grep -F 'refused an RPC connection from a vsock peer' \
+      | grep -E "peer_cid(=|\":)$1([^0-9]|\$)" || true
+  }
   # The gate's lines for one source, rule and destination, oldest first.
   ebr_gate_lines() {
     ebr_case_log | grep -F "\"source\":\"$1\"" | grep -F "\"rule_matched\":\"$2\"" \
@@ -20413,7 +20420,10 @@ EBR_LISTENER_EOF
 
   # ---- the RPC leg: a vsock connect from inside the box (NET-139) ---------
   for ebr_cid in 1 3; do
-    EBR_EXPECTED="the box's socket(AF_VSOCK) refused with 'Address family not supported', or the guest daemon's line 'refused an RPC connection from a vsock peer' naming peer_cid in the boot log; never an SSH banner"
+    EBR_EXPECTED="the box's socket(AF_VSOCK) refused with 'Address family not supported', or the guest daemon's line 'refused an RPC connection from a vsock peer' naming peer_cid=$ebr_cid in the boot log; never an SSH banner"
+    # Count this CID's refusal lines before the attempt, so the attempt's
+    # own line is the new one the wait below looks for.
+    ebr_prior="$(ebr_vsock_refusals "$ebr_cid" | wc -l)"
     # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
     ebr_out="$(mnl session exec "$ebr_sid" \
       "/usr/bin/socat -T 3 -u VSOCK-CONNECT:$ebr_cid:2222 - 2>&1; echo socat-exit=\$?" \
@@ -20444,20 +20454,18 @@ attempt=vsock CID $ebr_cid port 2222 refusal=socket(AF_VSOCK) refused inside the
       continue
     fi
     # The socket opened. The guest daemon must write a new refusal line
-    # for this attempt: count the lines before it, so an earlier CID's
-    # line cannot stand in for this one.
-    ebr_prior="$(ebr_boot_case_log | grep -cF 'refused an RPC connection from a vsock peer')" || true
+    # naming this CID: the count before the attempt is the baseline, so
+    # neither an earlier attempt nor another CID's line stands in for it.
     ebr_line=""
     for _ in $(seq 1 20); do
-      if [ "$(ebr_boot_case_log | grep -cF 'refused an RPC connection from a vsock peer')" -gt "$ebr_prior" ]; then
-        ebr_line="$(ebr_boot_case_log \
-          | grep -F 'refused an RPC connection from a vsock peer' | tail -n1)"
+      if [ "$(ebr_vsock_refusals "$ebr_cid" | wc -l)" -gt "$ebr_prior" ]; then
+        ebr_line="$(ebr_vsock_refusals "$ebr_cid" | tail -n1)"
         break
       fi
       sleep 0.5
     done
     if [ -z "$ebr_line" ]; then
-      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no new refusal line from the guest daemon for it ($ebr_prior such line(s) before the attempt)"
+      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no new refusal line from the guest daemon naming peer_cid=$ebr_cid ($ebr_prior such line(s) before the attempt)"
       ebr_fail
     fi
     ebr_rows="$ebr_rows
