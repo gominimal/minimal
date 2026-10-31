@@ -259,7 +259,10 @@ fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<s
 /// host-address box whose address is withheld (a VM node not yet granted
 /// its address) is reached only through the proxy, so it reads as the
 /// fallback too (design §7.1). Any other box with no address reports none.
-fn box_at_fallback(host_address: bool, loopback_address: Option<std::net::Ipv4Addr>) -> Option<bool> {
+fn box_at_fallback(
+    host_address: bool,
+    loopback_address: Option<std::net::Ipv4Addr>,
+) -> Option<bool> {
     match loopback_address {
         None => host_address.then_some(true),
         Some(address) => Some(!host_address && address == std::net::Ipv4Addr::LOCALHOST),
