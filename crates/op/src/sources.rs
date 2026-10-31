@@ -4,19 +4,26 @@ use lcache::PendingDir;
 
 use anyhow::{Context, Result, anyhow};
 use ot::OpTracker;
+use sandbox::config::ClassifierLeaf;
 use std::future::Future;
 use std::path::PathBuf;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
     /// Returns a path to the specified URL, after sha256 verification.
     ///
     /// The returned path may be cached - there's no expectation a fresh fetch is performed.
+    ///
+    /// `leaf` is the classifier leaf of the box the build runs for, if any
+    /// (NET-155). A fetch with a leaf opens its connections in that leaf, so
+    /// the box's egress verdict decides them. `None` keeps the fetch as the
+    /// caller's own traffic.
     fn download_web(
         &self,
         url: &str,
         sha256: &str,
+        leaf: Option<&ClassifierLeaf>,
         op: &OpTracker,
     ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
 
@@ -37,10 +44,21 @@ impl SourceFetcher for common::RemoteStorage {
         &self,
         url: &str,
         sha256: &str,
+        leaf: Option<&ClassifierLeaf>,
         op: &OpTracker,
     ) -> Result<PathBuf, anyhow::Error> {
-        self.download_web_with_verification_and_caching(url, sha256, op)
-            .await
+        let procs = leaf.map(ClassifierLeaf::procs);
+        // A leaf in the deny subtree admits no destination, so the download
+        // resolves no name for it.
+        let admits_nothing = leaf.is_some_and(ClassifierLeaf::is_deny);
+        self.download_web_with_verification_and_caching(
+            url,
+            sha256,
+            procs.as_deref(),
+            admits_nothing,
+            op,
+        )
+        .await
     }
 
     async fn download_gcs(
@@ -60,6 +78,10 @@ pub struct SourceLoad<'a, SF: SourceFetcher> {
     pub source: &'a SourceInput,
     pub remote_fetcher: &'a SF,
     pub into: Option<PendingDir>,
+    /// The classifier leaf of the box the build runs for, if any (NET-155).
+    /// A web source is fetched in that leaf, so the box's egress verdict
+    /// decides the fetch. `None` fetches it as the caller's own traffic.
+    pub classifier_leaf: Option<&'a ClassifierLeaf>,
 }
 
 impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
@@ -104,9 +126,22 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                 match url.scheme() {
                     "https" | "http" => {
+                        if let Some(leaf) = self.classifier_leaf {
+                            // The leaf's own name is the box's id in the tree.
+                            info!(
+                                box_id = %leaf
+                                    .dir()
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy())
+                                    .unwrap_or_default(),
+                                host = url.host_str().unwrap_or_default(),
+                                leaf = %leaf.dir().display(),
+                                "fetching a web source for a box in the box's classifier leaf",
+                            );
+                        }
                         let cached_path = self
                             .remote_fetcher
-                            .download_web(url.as_str(), sha256, &op)
+                            .download_web(url.as_str(), sha256, self.classifier_leaf, &op)
                             .await?;
 
                         debug!("  Downloaded and verified source from {}", url);
@@ -206,16 +241,25 @@ mod tests {
     const SHA: &str = "4474de87e084953eefc1120cf905a79f72bbbf85091e30cf37c9214eafcaa9c9";
 
     /// Serves one local archive for any URL, standing in for a verified fetch.
+    /// It records the classifier leaf each fetch was asked to run in.
     #[derive(Debug)]
-    struct FixtureFetcher(PathBuf);
+    struct FixtureFetcher(PathBuf, std::sync::Mutex<Vec<Option<ClassifierLeaf>>>);
+
+    impl FixtureFetcher {
+        fn new(archive: PathBuf) -> Self {
+            Self(archive, Default::default())
+        }
+    }
 
     impl SourceFetcher for FixtureFetcher {
         async fn download_web(
             &self,
             _url: &str,
             _sha256: &str,
+            leaf: Option<&ClassifierLeaf>,
             _op: &OpTracker,
         ) -> anyhow::Result<PathBuf> {
+            self.1.lock().unwrap().push(leaf.cloned());
             Ok(self.0.clone())
         }
 
@@ -259,7 +303,7 @@ mod tests {
                 ("pkg-1.0/src/main.rs", b"fn main() {}"),
             ],
         );
-        let fetcher = FixtureFetcher(archive);
+        let fetcher = FixtureFetcher::new(archive);
         let graph = Graph::new();
         let opts = Options {
             cache: cache.clone(),
@@ -283,6 +327,7 @@ mod tests {
             source: &source,
             remote_fetcher: &fetcher,
             into: None,
+            classifier_leaf: None,
         }
         .run(&opts)
         .await
@@ -300,5 +345,67 @@ mod tests {
         let names: Vec<&str> = record.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["NOTICE"]);
         assert_eq!(record.files[0].text.as_deref(), Some("upstream notice"));
+    }
+
+    /// NET-155: a web source loaded for a build placed in a box's classifier
+    /// leaf is fetched in that leaf, so the box's egress verdict decides the
+    /// fetch. A load with no leaf fetches as the caller's own traffic. The
+    /// fetched archive is extracted the same way in both cases.
+    #[tokio::test]
+    async fn web_source_fetch_runs_in_the_given_classifier_leaf() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("cache")).unwrap();
+        let cache = Cache::at_dir(tmp.path().join("cache")).unwrap();
+        let archive = tarball(tmp.path(), &[("pkg-1.0/README", b"readme")]);
+        let fetcher = FixtureFetcher::new(archive);
+        let graph = Graph::new();
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &graph,
+            exec_base: tmp.path().to_path_buf(),
+            ot: None,
+            daemon_id: None,
+        };
+        let source = SourceInput {
+            from: SourceFetch::Web {
+                url: "https://downloads.example.org/pkg-1.0.tar.gz".into(),
+                sha256: SHA.into(),
+                url_pos: None,
+                sha256_pos: None,
+            },
+            extract: true,
+            strip_prefix: Some("pkg-1.0".into()),
+        };
+        let leaf = ClassifierLeaf::under(
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "sealed",
+            sandbox::config::Verdict::Deny,
+        );
+
+        for given in [Some(&leaf), None] {
+            let materialized = SourceLoad {
+                source: &source,
+                remote_fetcher: &fetcher,
+                into: None,
+                classifier_leaf: given,
+            }
+            .run(&opts)
+            .await
+            .unwrap();
+            let Materialized::TempDir(root) = materialized else {
+                panic!("an extracted source materializes into a temp dir");
+            };
+            assert!(root.path().join("README").exists());
+        }
+        assert_eq!(
+            *fetcher.1.lock().unwrap(),
+            vec![Some(leaf.clone()), None],
+            "each fetch runs in the leaf its load was given"
+        );
+        assert_eq!(
+            leaf.procs(),
+            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/sealed/cgroup.procs"),
+            "the download joins the leaf through its cgroup.procs"
+        );
     }
 }
