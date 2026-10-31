@@ -14196,6 +14196,15 @@ async fn box_build_web_source_under_box_verdict() {
         vec![Some(sealed), Some(open)],
         "each fetch ran in its box's leaf"
     );
+
+    // A fetch that failed for another reason names no refused destination.
+    assert_eq!(
+        crate::env::refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: the sha256 of the download does not match",
+        ]),
+        None
+    );
 }
 
 /// NET-155: a materialize reports the error of a package build it started

@@ -3008,8 +3008,13 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
     lines.into_iter().rev().find_map(|line| {
         // A web source the build declares, fetched in the box's leaf:
         // `could not fetch the source https://example.com/a.tar.gz: ...`
+        // Only a connection the download could not open names a
+        // destination. A bad hash or a failed extract is no refusal.
         if let Some(rest) = line.strip_prefix(WEB_SOURCE_FAILURE) {
-            return source_host(rest);
+            return rest
+                .contains(WEB_SOURCE_CONNECT_FAILURE)
+                .then(|| source_host(rest))
+                .flatten();
         }
         // curl: `Could not resolve host: example.com`
         if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
@@ -3063,6 +3068,11 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
 /// a web source it declares (NET-155). `op`'s spec build writes it, followed
 /// by the source's URL.
 const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
+
+/// What the error of a web-source fetch says when the download could not
+/// open a connection to the source. `common`'s placed download writes it,
+/// followed by the host and the port.
+const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
 
 /// The host of the URL `rest` starts with: the authority after the scheme,
 /// without a user name or a port. `None` when `rest` starts with no URL.
