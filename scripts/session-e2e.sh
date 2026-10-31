@@ -27583,16 +27583,24 @@ proof_names_survive_restart_and_second_vm() {
   b_sid="$(printf '%s\n' "$b_sid" | tail -n1 | tr -d '\r')"
   echo "box B: $b_sid ($b_name) on VM $NRV_VM_NAME"
   # The second daemon's own record: it holds the port or registers into the
-  # holder. A record saying the names are not answered is contention.
+  # holder. A record saying the names are not answered is contention. The
+  # record must be new since the boot and carry the second VM's node id,
+  # `<state dir>#<vm>` (crates/minvmd/src/net/answerer.rs node_id_for), so a
+  # re-register line from the first daemon or an old log line cannot pass.
+  b_record=""
   for _ in $(seq 1 40); do
     after_records="$(nrv_start_records)"
-    [ "$(printf '%s\n' "$after_records" | grep -c .)" -gt "$(printf '%s\n' "$before_records" | grep -c .)" ] && break
+    b_record="$(comm -13 <(printf '%s\n' "$before_records") <(printf '%s\n' "$after_records") \
+      | grep -E -- "node=[^ ]*#${NRV_VM_NAME}( |\$)" || true)"
+    [ -n "$b_record" ] && break
     sleep 0.5
   done
   echo "both VM host daemons' DNS service records:"
   printf '%s\n' "$after_records" | sed 's/^/  /'
-  if [ "$(printf '%s\n' "$after_records" | grep -c .)" -le "$(printf '%s\n' "$before_records" | grep -c .)" ]; then
-    echo "::error::the second VM's host daemon wrote no DNS service record within 20 s: it neither holds the port nor registered with the holder"
+  echo "VM $NRV_VM_NAME's new record:"
+  printf '%s\n' "${b_record:-<none>}" | sed 's/^/  /'
+  if [ -z "$b_record" ]; then
+    echo "::error::the second VM's host daemon wrote no DNS service record for node #$NRV_VM_NAME within 20 s: it neither holds the port nor registered with the holder"
     nrv_diag
     fail
   fi
