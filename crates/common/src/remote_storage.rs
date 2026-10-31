@@ -181,6 +181,7 @@ mod placed {
             procs: placement.procs.to_path_buf(),
             admits_nothing: placement.admits_nothing,
             nameserver: None,
+            connect_timeout: CONNECT_TIMEOUT,
             auth: auth.clone(),
             failure: Mutex::new(None),
         });
@@ -232,9 +233,13 @@ mod placed {
         /// The name server the relay asks, from a socket created in the
         /// cgroup. `None` takes the first `nameserver` of `/etc/resolv.conf`.
         nameserver: Option<SocketAddr>,
+        /// How long the relay waits for one connection to one address.
+        connect_timeout: std::time::Duration,
         /// The `Proxy-Authorization` value this download's client sends.
         auth: String,
-        /// The last destination the relay could not reach, and why.
+        /// The last destination the relay could not reach, and why. A later
+        /// connection that succeeds clears it, so an error that comes after
+        /// is never blamed on an earlier destination.
         failure: Mutex<Option<String>>,
     }
 
@@ -336,7 +341,10 @@ mod placed {
                 .to_string();
 
             let mut upstream = match self.connect(&host, port).await {
-                Ok(upstream) => upstream,
+                Ok(upstream) => {
+                    *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    upstream
+                }
                 Err(e) => {
                     let failure = format!("could not connect to {host}:{port}: {e}");
                     tracing::debug!(cgroup = %self.procs.display(), "{failure}");
@@ -391,12 +399,18 @@ mod placed {
                 .map_err(io::Error::other)??;
                 let socket = std::net::TcpStream::from(socket);
                 socket.set_nonblocking(true)?;
-                match tokio::net::TcpSocket::from_std_stream(socket)
-                    .connect(addr)
-                    .await
-                {
-                    Ok(stream) => return Ok(stream),
-                    Err(e) => last = Some(e),
+                // Rules that drop packets, not reject them, leave a connect
+                // waiting for the kernel's retry limit. The deadline bounds it.
+                let connecting = tokio::net::TcpSocket::from_std_stream(socket).connect(addr);
+                match tokio::time::timeout(self.connect_timeout, connecting).await {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(e)) => last = Some(e),
+                    Err(_) => {
+                        last = Some(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("no answer from {addr} after {:?}", self.connect_timeout),
+                        ))
+                    }
                 }
             }
             Err(last.unwrap_or_else(|| {
@@ -404,6 +418,9 @@ mod placed {
             }))
         }
     }
+
+    /// How long the relay waits for one connection to one address.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     /// How long the relay waits for one answer from the name server.
     const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -968,6 +985,132 @@ mod placed {
                 refused.to_string().contains("/nonexistent/cgroup.procs"),
                 "{refused}"
             );
+        }
+
+        /// A relay for tests, with its connections placed by a plain file
+        /// that stands in for `cgroup.procs`.
+        #[cfg(target_os = "linux")]
+        fn test_relay(procs: &Path, connect_timeout: std::time::Duration) -> Relay {
+            Relay {
+                procs: procs.to_path_buf(),
+                admits_nothing: false,
+                nameserver: None,
+                connect_timeout,
+                auth: "Bearer test".to_string(),
+                failure: Mutex::new(None),
+            }
+        }
+
+        /// A loopback port whose accept queue is full, so the kernel drops
+        /// every new SYN to it, as egress rules that drop packets do.
+        #[cfg(target_os = "linux")]
+        async fn dropping_port() -> (SocketAddr, Vec<TcpStream>, tokio::net::TcpListener) {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .unwrap();
+            let listener = socket.listen(0).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut held = Vec::new();
+            loop {
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    TcpStream::connect(addr),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(stream)) => held.push(stream),
+                    _ => break,
+                }
+                assert!(held.len() < 64, "the accept queue never filled");
+            }
+            (addr, held, listener)
+        }
+
+        /// A connect to an address that drops packets ends with `TimedOut`
+        /// at the relay's deadline, not at the kernel's retry limit.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_to_a_dropping_address_times_out() {
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let bound = std::time::Duration::from_millis(500);
+            let relay = test_relay(&procs, bound);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect(&addr.ip().to_string(), addr.port())
+                .await
+                .expect_err("the address drops every packet");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert!(took >= bound, "it waited {took:?}");
+            assert!(took < bound * 4, "it waited {took:?}");
+        }
+
+        /// Sends one CONNECT to `target` through the relay at `relay`, and
+        /// returns the status line of the answer.
+        #[cfg(target_os = "linux")]
+        async fn tunnel_status(relay: SocketAddr, target: SocketAddr) -> String {
+            let mut conn = TcpStream::connect(relay).await.unwrap();
+            let head =
+                format!("CONNECT {target} HTTP/1.1\r\nproxy-authorization: Bearer test\r\n\r\n");
+            conn.write_all(head.as_bytes()).await.unwrap();
+            let mut answer = Vec::new();
+            let mut buf = [0u8; 256];
+            while !answer.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "the relay closed before it answered");
+                answer.extend_from_slice(&buf[..n]);
+            }
+            let answer = String::from_utf8_lossy(&answer).to_string();
+            answer.lines().next().unwrap_or_default().to_string()
+        }
+
+        /// A connection that succeeds clears the failure of an earlier one,
+        /// so a later error is not reported as a destination the relay could
+        /// not reach.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_connection_that_succeeds_clears_an_earlier_failure() {
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let relay = Arc::new(test_relay(&procs, CONNECT_TIMEOUT));
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let relay_addr = listener.local_addr().unwrap();
+            let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
+
+            let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let closed_addr = closed.local_addr().unwrap();
+            drop(closed);
+            assert_eq!(
+                tunnel_status(relay_addr, closed_addr).await,
+                "HTTP/1.1 502 Bad Gateway"
+            );
+            let failure = relay.failure.lock().unwrap().clone();
+            assert!(
+                failure.as_deref().is_some_and(
+                    |f| f.starts_with(&format!("could not connect to {closed_addr}: "))
+                ),
+                "{failure:?}"
+            );
+
+            let open = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let open_addr = open.local_addr().unwrap();
+            assert_eq!(
+                tunnel_status(relay_addr, open_addr).await,
+                "HTTP/1.1 200 Connection Established"
+            );
+            assert_eq!(*relay.failure.lock().unwrap(), None);
         }
 
         /// The relay asks the first `nameserver` that `/etc/resolv.conf`
