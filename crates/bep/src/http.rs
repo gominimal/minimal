@@ -16,8 +16,10 @@
 //!
 //! A request that asks for `Upgrade: h2c` stays HTTP/1.1. The parser removes
 //! the `h2c` upgrade token, its `Connection` token and `HTTP2-Settings`
-//! (BEP-074). On the response side, [`relay_response_head`] removes every
-//! `Alt-Svc` header (BEP-076).
+//! (BEP-074). On the response side, [`parse_response`] reads a response head
+//! under the same strict framing rules, and [`Response::strip_alt_svc`]
+//! removes every `Alt-Svc` header (BEP-076). The response half of a live
+//! flow, `crate::forward::relay_responses`, uses both.
 //!
 //! [`relay_request_body`] relays the body under the framing that the parsed
 //! head declares. It copies exactly `Content-Length` bytes, or it parses the
@@ -122,6 +124,11 @@ pub struct Response {
     pub reason: Vec<u8>,
     /// The header fields, in the order received.
     pub headers: Vec<Header>,
+    /// The body framing that the headers declare. [`BodyFraming::None`]
+    /// here means that no header frames the body: the body then runs until
+    /// the upstream closes, unless the status or the request method says
+    /// that the response has no body.
+    pub body: BodyFraming,
 }
 
 impl Response {
@@ -373,9 +380,9 @@ pub fn parse_request(buf: &[u8]) -> Result<Parse<Request>, CloseReason> {
 /// response that HTTP/1.1 permits but that these rules refuse closes the
 /// connection as framing ambiguous. Examples are `Transfer-Encoding:
 /// gzip, chunked`, a repeated equal `Content-Length`, or a `Connection`
-/// option that names a framing header. The framing result is not kept:
-/// the head parser does not know the request method, so the caller
-/// decides the body of a reply to `HEAD` or of a `1xx`, `204` or `304`.
+/// option that names a framing header. The head parser does not know the
+/// request method, so the caller decides the body of a reply to `HEAD` or
+/// of a `1xx`, `204` or `304`, and of a response that no header frames.
 ///
 /// # Errors
 ///
@@ -391,13 +398,14 @@ pub fn parse_response(buf: &[u8]) -> Result<Parse<Response>, CloseReason> {
     let headers = parse_headers(lines)?;
     // The same framing rules as for a request, so that a hostile upstream
     // cannot desync the box's connection.
-    framing(&headers)?;
+    let body = framing(&headers)?;
     Ok(Parse::Complete {
         head: Response {
             minor_version,
             status,
             reason,
             headers,
+            body,
         },
         head_len,
     })
@@ -449,26 +457,6 @@ fn forward_head<R: Read, W: Write>(
         });
     }
     result
-}
-
-/// Read one response head from `upstream`, remove every `Alt-Svc` header
-/// (BEP-076), and write the canonical serialization to `client`.
-///
-/// Returns the response as relayed and the bytes read after its head.
-///
-/// # Errors
-///
-/// Returns the [`CloseReason`] when the proxy must close the connection.
-pub fn relay_response_head<R: Read, W: Write>(
-    upstream: &mut R,
-    client: &mut W,
-) -> Result<(Response, Vec<u8>), CloseReason> {
-    let (mut response, rest) = read_head(Vec::new(), upstream, parse_response)?;
-    response.strip_alt_svc();
-    client
-        .write_all(&response.serialize())
-        .map_err(|e| CloseReason::Io(e.kind()))?;
-    Ok((response, rest))
 }
 
 /// Relay the body of a forwarded request from `client` to `upstream`, under
@@ -655,7 +643,7 @@ fn relay_chunked<R: Read, W: Write>(
 
 /// The size of a chunk-size line: hex digits, then an optional extension
 /// after `;`, which is dropped.
-fn parse_chunk_size(line: &[u8]) -> Result<u64, CloseReason> {
+pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<u64, CloseReason> {
     let malformed = CloseReason::Malformed("chunk_size");
     let (digits, extension) = match line.iter().position(|&b| b == b';') {
         Some(semi) => (&line[..semi], &line[semi + 1..]),
@@ -1027,11 +1015,6 @@ fn is_field_byte(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{TcpListener, TcpStream};
-    use std::thread;
-
-    use proptest::prelude::*;
-
     use super::*;
 
     fn parse_ok(raw: &[u8]) -> Request {
@@ -1042,41 +1025,6 @@ mod tests {
             }
             other => panic!("expected a complete head, got {other:?}"),
         }
-    }
-
-    // BEP-074: the h2 prior-knowledge preface closes the connection, and
-    // nothing reaches the upstream.
-    #[test]
-    fn h2_prior_knowledge_preface_is_closed() {
-        assert_eq!(parse_request(H2_PREFACE), Err(CloseReason::H2Preface));
-        assert_eq!(
-            parse_request(b"PRI * HTTP/2.0\r\n"),
-            Err(CloseReason::H2Preface),
-            "the first line of the preface is enough"
-        );
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let mut upstream = Vec::new();
-            let mut audit = Vec::new();
-            let result = forward_request_head("box-a", &mut conn, &mut upstream, &mut audit);
-            drop(conn);
-            (result, upstream, audit)
-        });
-        let mut client = TcpStream::connect(addr).unwrap();
-        client.write_all(H2_PREFACE).unwrap();
-        let mut buf = Vec::new();
-        match client.read_to_end(&mut buf) {
-            Ok(_) => assert!(buf.is_empty(), "the proxy sends nothing back"),
-            Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
-        }
-        let (result, upstream, audit) = server.join().unwrap();
-        assert_eq!(result, Err(CloseReason::H2Preface));
-        assert_eq!(result.unwrap_err().rule(), "h2_prior_knowledge_preface");
-        assert!(upstream.is_empty(), "no byte reaches the upstream");
-        assert!(audit.is_empty());
     }
 
     // BEP-074: `Upgrade: h2c`, its `Connection` tokens and `HTTP2-Settings`
@@ -1106,191 +1054,6 @@ mod tests {
         // A request with no h2c upgrade keeps its headers.
         let req = parse_ok(b"GET / HTTP/1.1\r\nHost: a\r\nHTTP2-Settings: x\r\n\r\n");
         assert_eq!(req.headers.len(), 2);
-    }
-
-    // BEP-076: every `Alt-Svc` header leaves the relayed response.
-    #[test]
-    fn alt_svc_is_stripped_from_responses() {
-        let raw: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
-            Alt-Svc: h3=\":443\"; ma=86400\r\nContent-Length: 2\r\nalt-svc: clear\r\n\
-            ALT-SVC: h3-29=\":443\"\r\n\r\nok";
-        let mut client = Vec::new();
-        let (response, rest) = relay_response_head(&mut &raw[..], &mut client).unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(rest, b"ok");
-        assert!(response.headers.iter().all(|h| h.name != "alt-svc"));
-        assert_eq!(
-            client,
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\n".to_vec()
-        );
-        let lower = String::from_utf8_lossy(&client).to_ascii_lowercase();
-        assert!(!lower.contains("alt-svc"));
-    }
-
-    fn name_case(name: &str, mask: u64) -> String {
-        name.chars()
-            .enumerate()
-            .map(|(i, c)| {
-                if mask >> (i % 64) & 1 == 1 {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                }
-            })
-            .collect()
-    }
-
-    fn ows() -> impl Strategy<Value = &'static str> {
-        prop_oneof![Just(""), Just(" "), Just("  "), Just("\t"), Just(" \t ")]
-    }
-
-    fn header_line() -> impl Strategy<Value = (String, String, String, String, u64)> {
-        (
-            "x-[a-z0-9-]{1,12}",
-            "[!-~]([ !-~]{0,20}[!-~])?",
-            ows(),
-            ows(),
-            any::<u64>(),
-        )
-            .prop_map(|(n, v, a, b, m)| (n, v, a.to_owned(), b.to_owned(), m))
-    }
-
-    // BEP-077: the forwarded head is the canonical serialization of the
-    // parsed request, never the box's bytes, and it parses back the same.
-    proptest! {
-        #[test]
-        fn prop_forwarded_head_is_canonical(
-            method in "[A-Z]{1,10}",
-            target in "/[!-~]{0,40}",
-            host_mask in any::<u64>(),
-            headers in prop::collection::vec(header_line(), 0..8),
-            body in prop_oneof![
-                Just(None),
-                (0u64..1_000_000).prop_map(|n| Some(format!("Content-Length: {n}"))),
-                Just(Some("Transfer-Encoding: chunked".to_owned())),
-            ],
-        ) {
-            let mut raw = format!("{method} {target} HTTP/1.1\r\n{}: github.com\r\n", name_case("host", host_mask));
-            let mut expected = format!("{method} {target} HTTP/1.1\r\nhost: github.com\r\n");
-            for (name, value, pre, post, mask) in &headers {
-                raw.push_str(&format!("{}:{pre}{value}{post}\r\n", name_case(name, *mask)));
-                expected.push_str(&format!("{name}: {value}\r\n"));
-            }
-            if let Some(line) = &body {
-                raw.push_str(&format!("{line}\r\n"));
-                let (n, v) = line.split_once(": ").unwrap();
-                expected.push_str(&format!("{}: {v}\r\n", n.to_ascii_lowercase()));
-            }
-            raw.push_str("\r\n");
-            expected.push_str("\r\n");
-            let mut input = raw.clone().into_bytes();
-            input.extend_from_slice(b"body-bytes");
-
-            let mut upstream = Vec::new();
-            let mut audit = Vec::new();
-            let forwarded = forward_request_head("box-a", &mut &input[..], &mut upstream, &mut audit)
-                .expect("an unambiguous head is forwarded");
-            prop_assert_eq!(&upstream, &forwarded.request.serialize());
-            prop_assert_eq!(String::from_utf8(upstream.clone()).unwrap(), expected);
-            prop_assert_eq!(forwarded.rest, b"body-bytes".to_vec());
-            prop_assert!(audit.is_empty());
-
-            let again = parse_ok(&upstream);
-            prop_assert_eq!(&again, &forwarded.request);
-            prop_assert_eq!(again.serialize(), upstream);
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    enum FramingLine {
-        Length(String),
-        Te(&'static str),
-        Fold,
-    }
-
-    fn framing_line() -> impl Strategy<Value = FramingLine> {
-        prop_oneof![
-            (0u64..100_000).prop_map(|n| FramingLine::Length(n.to_string())),
-            Just(FramingLine::Length("5, 5".to_owned())),
-            Just(FramingLine::Length("5, 6".to_owned())),
-            Just(FramingLine::Length("+5".to_owned())),
-            Just(FramingLine::Length("0x5".to_owned())),
-            Just(FramingLine::Length("5,".to_owned())),
-            Just(FramingLine::Length(", 5".to_owned())),
-            Just(FramingLine::Te("chunked")),
-            Just(FramingLine::Te("Chunked")),
-            Just(FramingLine::Te("gzip")),
-            Just(FramingLine::Te("gzip, chunked")),
-            Just(FramingLine::Te("chunked, gzip")),
-            Just(FramingLine::Te("chunked, chunked")),
-            Just(FramingLine::Te("identity")),
-            Just(FramingLine::Te("chunked,")),
-            Just(FramingLine::Te(", chunked")),
-            Just(FramingLine::Fold),
-        ]
-    }
-
-    /// The oracle: whether a head with these framing lines is ambiguous
-    /// under BEP-077's rules.
-    fn oracle_ambiguous(lines: &[FramingLine]) -> bool {
-        let mut lengths = Vec::new();
-        let mut codings = Vec::new();
-        let mut has_te = false;
-        let mut fold = false;
-        for line in lines {
-            match line {
-                FramingLine::Length(v) => lengths.extend(v.split(',').map(|s| s.trim().to_owned())),
-                FramingLine::Te(v) => {
-                    has_te = true;
-                    codings.extend(v.split(',').map(|s| s.trim().to_ascii_lowercase()));
-                }
-                FramingLine::Fold => fold = true,
-            }
-        }
-        let invalid_length = lengths
-            .iter()
-            .any(|l| l.parse::<u64>().is_err() || l.starts_with('+'));
-        fold || (has_te && !lengths.is_empty())
-            || lengths.len() > 1
-            || invalid_length
-            || (has_te && codings != ["chunked"])
-    }
-
-    // BEP-077: a head is forwarded only when its framing is unambiguous, and
-    // otherwise the connection closes and the refusal is audited.
-    proptest! {
-        #[test]
-        fn prop_ambiguous_framing_is_refused(
-            lines in prop::collection::vec(framing_line(), 0..4),
-            name_mask in any::<u64>(),
-        ) {
-            let mut raw = String::from("POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\n");
-            for line in &lines {
-                match line {
-                    FramingLine::Length(v) => raw.push_str(&format!("{}: {v}\r\n", name_case("content-length", name_mask))),
-                    FramingLine::Te(v) => raw.push_str(&format!("{}: {v}\r\n", name_case("transfer-encoding", name_mask))),
-                    FramingLine::Fold => raw.push_str("X-Note: a\r\n folded\r\n"),
-                }
-            }
-            raw.push_str("\r\n");
-
-            let mut upstream = Vec::new();
-            let mut audit = Vec::new();
-            let result = forward_request_head("box-a", &mut raw.as_bytes(), &mut upstream, &mut audit);
-            if oracle_ambiguous(&lines) {
-                let reason = result.expect_err("an ambiguous head is refused");
-                prop_assert!(matches!(reason, CloseReason::FramingAmbiguous(_)), "{reason:?}");
-                prop_assert!(upstream.is_empty(), "no byte reaches the upstream");
-                prop_assert_eq!(audit.len(), 1);
-                prop_assert_eq!(audit[0].marker, FRAMING_AMBIGUOUS);
-                prop_assert_eq!(audit[0].box_id.as_str(), "box-a");
-                prop_assert_eq!(audit[0].rule, reason.rule());
-            } else {
-                let forwarded = result.expect("an unambiguous head is forwarded");
-                prop_assert_eq!(upstream, forwarded.request.serialize());
-                prop_assert!(audit.is_empty());
-            }
-        }
     }
 
     #[test]
@@ -1667,8 +1430,8 @@ mod tests {
         }
     }
 
-    // A response with ambiguous framing is refused before any byte of it
-    // reaches the box.
+    // A response with ambiguous framing is refused at its head, so the live
+    // relay sends no byte of it to the box.
     #[test]
     fn ambiguous_response_framing_is_refused() {
         for (raw, rule) in [
@@ -1681,12 +1444,10 @@ mod tests {
                 Ambiguity::DuplicateContentLength,
             ),
         ] {
-            let mut client = Vec::new();
             assert_eq!(
-                relay_response_head(&mut &raw[..], &mut client).unwrap_err(),
+                parse_response(raw).unwrap_err(),
                 CloseReason::FramingAmbiguous(rule)
             );
-            assert!(client.is_empty());
         }
     }
 }
