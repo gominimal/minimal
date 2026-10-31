@@ -1442,7 +1442,7 @@ impl op::SourceFetcher for NoSources {
         _sha256: &str,
         _leaf: Option<&sandbox::config::ClassifierLeaf>,
         _op: &ot::OpTracker,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<(PathBuf, bool)> {
         anyhow::bail!("the probe build has no sources, but it asked for {url}")
     }
 
@@ -1753,10 +1753,11 @@ fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
             "no fetch from the deny leaf reached the source"
         );
 
-        let path = storage
+        let (path, connected) = storage
             .download_web(&url, &sha, Some(&allow), &op)
             .await
             .expect("the same fetch in the allow leaf reaches the source");
+        assert!(connected, "the allow leaf's fetch opened a connection");
         assert_eq!(std::fs::read(path).expect("the fetched source"), body);
         assert_eq!(
             served.load(std::sync::atomic::Ordering::SeqCst),

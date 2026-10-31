@@ -11,21 +11,24 @@ use tracing::{debug, info};
 use url::Url;
 
 pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
-    /// Returns a path to the specified URL, after sha256 verification.
+    /// Returns a path to the specified URL, after sha256 verification, and
+    /// whether the fetch opened a connection in `leaf`.
     ///
     /// The returned path may be cached - there's no expectation a fresh fetch is performed.
     ///
     /// `leaf` is the classifier leaf of the box the build runs for, if any
     /// (NET-155). A fetch with a leaf opens its connections in that leaf, so
     /// the box's egress verdict decides them. `None` keeps the fetch as the
-    /// caller's own traffic.
+    /// caller's own traffic. The `bool` is `true` only when the fetch had a
+    /// leaf and opened a connection in it. It is `false` when the download
+    /// cache served the source, or when the fetch had no leaf.
     fn download_web(
         &self,
         url: &str,
         sha256: &str,
         leaf: Option<&ClassifierLeaf>,
         op: &OpTracker,
-    ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
+    ) -> impl Future<Output = Result<(PathBuf, bool), anyhow::Error>> + Send;
 
     /// Returns a path to the specified bucket + file, after sha256 verification.
     ///
@@ -46,19 +49,17 @@ impl SourceFetcher for common::RemoteStorage {
         sha256: &str,
         leaf: Option<&ClassifierLeaf>,
         op: &OpTracker,
-    ) -> Result<PathBuf, anyhow::Error> {
-        let procs = leaf.map(ClassifierLeaf::procs);
+    ) -> Result<(PathBuf, bool), anyhow::Error> {
+        let Some(leaf) = leaf else {
+            let path = self
+                .download_web_with_verification_and_caching(url, sha256, None, false, op)
+                .await?;
+            return Ok((path, false));
+        };
         // A leaf in the deny subtree admits no destination, so the download
         // resolves no name for it.
-        let admits_nothing = leaf.is_some_and(ClassifierLeaf::is_deny);
-        self.download_web_with_verification_and_caching(
-            url,
-            sha256,
-            procs.as_deref(),
-            admits_nothing,
-            op,
-        )
-        .await
+        self.download_web_placed(url, sha256, &leaf.procs(), leaf.is_deny(), op)
+            .await
     }
 
     async fn download_gcs(
@@ -126,23 +127,35 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                 match url.scheme() {
                     "https" | "http" => {
-                        if let Some(leaf) = self.classifier_leaf {
-                            // The leaf's own name is the box's id in the tree.
-                            info!(
-                                box_id = %leaf
-                                    .dir()
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy())
-                                    .unwrap_or_default(),
-                                host = url.host_str().unwrap_or_default(),
-                                leaf = %leaf.dir().display(),
-                                "a web source for a box comes from the download cache, or from a fetch in the box's classifier leaf",
-                            );
-                        }
-                        let cached_path = self
+                        let fetched = self
                             .remote_fetcher
                             .download_web(url.as_str(), sha256, self.classifier_leaf, &op)
-                            .await?;
+                            .await;
+                        if let Some(leaf) = self.classifier_leaf {
+                            // The leaf's own name is the box's id in the tree.
+                            let box_id = leaf
+                                .dir()
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let host = url.host_str().unwrap_or_default();
+                            let leaf = leaf.dir().display();
+                            match &fetched {
+                                Ok((_, true)) => info!(
+                                    %box_id, host, %leaf,
+                                    "fetched a web source for a box in the box's classifier leaf",
+                                ),
+                                Ok((_, false)) => info!(
+                                    %box_id, host, %leaf,
+                                    "the download cache served a web source for a box, and no connection opened",
+                                ),
+                                Err(e) => info!(
+                                    %box_id, host, %leaf, error = %format!("{e:#}"),
+                                    "a web source for a box could not be fetched in the box's classifier leaf",
+                                ),
+                            }
+                        }
+                        let (cached_path, _) = fetched?;
 
                         debug!("  Downloaded and verified source from {}", url);
                         (cached_path, filename)
@@ -258,9 +271,9 @@ mod tests {
             _sha256: &str,
             leaf: Option<&ClassifierLeaf>,
             _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
+        ) -> anyhow::Result<(PathBuf, bool)> {
             self.1.lock().unwrap().push(leaf.cloned());
-            Ok(self.0.clone())
+            Ok((self.0.clone(), leaf.is_some()))
         }
 
         async fn download_gcs(

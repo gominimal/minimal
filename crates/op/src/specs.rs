@@ -638,7 +638,7 @@ mod tests {
             _sha256: &str,
             _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
+        ) -> anyhow::Result<(PathBuf, bool)> {
             unreachable!("source fetch must not happen on these build paths")
         }
 
@@ -664,8 +664,8 @@ mod tests {
             _sha256: &str,
             _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
-            Ok(self.0.clone())
+        ) -> anyhow::Result<(PathBuf, bool)> {
+            Ok((self.0.clone(), false))
         }
 
         async fn download_gcs(

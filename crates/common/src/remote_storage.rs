@@ -70,11 +70,10 @@ impl RemoteStorage {
         op: &OpTracker,
     ) -> Result<PathBuf> {
         if let Some(procs) = placement {
-            let placement = placed::Placement {
-                procs,
-                admits_nothing,
-            };
-            return placed::download(&self.cache, url, sha256, placement, op).await;
+            return self
+                .download_web_placed(url, sha256, procs, admits_nothing, op)
+                .await
+                .map(|(path, _connected)| path);
         }
         let client = reqwest::Client::new();
         let backend = (&client, &self.cache);
@@ -85,6 +84,30 @@ impl RemoteStorage {
                 either::Either::Left(e) => anyhow::Error::from(e),
                 either::Either::Right(e) => anyhow::Error::from(e),
             })
+    }
+
+    /// Returns the cached copy of `url`, or downloads it with every
+    /// connection opened in the cgroup whose `cgroup.procs` is `procs`, after
+    /// the sha256 check. It is
+    /// [`download_web_with_verification_and_caching`](Self::download_web_with_verification_and_caching)
+    /// with a placement. It returns the file and whether the download asked
+    /// for a connection. `false` says that the download cache served the
+    /// file and no connection opened.
+    #[tracing::instrument]
+    pub async fn download_web_placed(
+        &self,
+        url: &str,
+        sha256: &str,
+        procs: &Path,
+        admits_nothing: bool,
+        op: &OpTracker,
+    ) -> Result<(PathBuf, bool)> {
+        let placement = placed::Placement {
+            procs,
+            admits_nothing,
+        };
+        let download = placed::download(&self.cache, url, sha256, placement, op).await?;
+        Ok((download.path, download.connected))
     }
 
     #[tracing::instrument]
@@ -128,6 +151,16 @@ impl RemoteStorage {
     }
 }
 
+/// A web download whose connections open in a given cgroup (NET-155).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacedDownload {
+    /// The verified file, which can be the download cache's copy.
+    path: PathBuf,
+    /// The download asked for a connection in the cgroup. `false` when the
+    /// download cache served the file and no connection opened.
+    connected: bool,
+}
+
 /// Web downloads whose connections open in a given cgroup (NET-155).
 ///
 /// A socket belongs to the cgroup of the process that creates it, and the
@@ -144,6 +177,7 @@ mod placed {
     use anyhow::Context;
     use std::io;
     use std::net::{IpAddr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -168,7 +202,7 @@ mod placed {
         sha256: &str,
         placement: Placement<'_>,
         op: &OpTracker,
-    ) -> Result<PathBuf> {
+    ) -> Result<PlacedDownload> {
         let url = ReqwestUrl::try_from(url)?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -186,6 +220,7 @@ mod placed {
             head_timeout: HEAD_TIMEOUT,
             auth: auth.clone(),
             failure: Mutex::new(None),
+            asked: AtomicBool::new(false),
         });
         let _serving = AbortOnDrop(tokio::spawn(serve(listener, relay.clone())));
 
@@ -198,7 +233,7 @@ mod placed {
             .pool_max_idle_per_host(0)
             .build()?;
         let backend = (&client, cache);
-        backend.download(url, sha256, op).await.map_err(|e| {
+        let path = backend.download(url, sha256, op).await.map_err(|e| {
             let e = match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
                 either::Either::Right(e) => anyhow::Error::from(e),
@@ -214,6 +249,10 @@ mod placed {
                 Some(failure) => e.context(failure),
                 None => e,
             }
+        })?;
+        Ok(PlacedDownload {
+            path,
+            connected: relay.asked.load(Ordering::SeqCst),
         })
     }
 
@@ -250,6 +289,9 @@ mod placed {
         /// connection that succeeds clears it, so an error that comes after
         /// is never blamed on an earlier destination.
         failure: Mutex<Option<String>>,
+        /// The download's client asked the relay for a connection, so the
+        /// download cache did not serve the file.
+        asked: AtomicBool,
     }
 
     async fn serve(listener: TcpListener, relay: Arc<Relay>) {
@@ -258,6 +300,9 @@ mod placed {
                 Ok((conn, _)) => conn,
                 Err(e) => {
                     tracing::debug!(error = %e, "the relay of a placed download could not accept");
+                    // A lasting error, such as EMFILE, returns at once on
+                    // each call. The pause keeps the loop from spinning.
+                    tokio::time::sleep(ACCEPT_RETRY).await;
                     continue;
                 }
             };
@@ -327,6 +372,7 @@ mod placed {
                     .await?;
                 return Ok(());
             }
+            self.asked.store(true, Ordering::SeqCst);
 
             let tunnel = method.eq_ignore_ascii_case("CONNECT");
             let (host, port, forwarded) = if tunnel {
@@ -454,6 +500,9 @@ mod placed {
 
     /// How long the relay waits for one answer from the name server.
     const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long the relay's accept loop waits after `accept` fails.
+    const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// How long the relay waits for the head of a request from its client.
     const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -994,15 +1043,26 @@ mod placed {
                 procs: &procs,
                 admits_nothing: false,
             };
-            let path = download(&cache, &url, &sha, placement, &OpTracker::new_root())
+            let fetched = download(&cache, &url, &sha, placement, &OpTracker::new_root())
                 .await
                 .expect("the placed download succeeds");
-            assert_eq!(std::fs::read(path).unwrap(), body);
+            assert_eq!(std::fs::read(&fetched.path).unwrap(), body);
+            assert!(fetched.connected, "the first download opens a connection");
             assert_eq!(
                 std::fs::read_to_string(&procs).unwrap(),
                 "0",
                 "the child that made the socket joined the placement"
             );
+
+            // The same source again: the download cache serves it, and the
+            // download says that it opened no connection.
+            std::fs::write(&procs, "").unwrap();
+            let cached = download(&cache, &url, &sha, placement, &OpTracker::new_root())
+                .await
+                .expect("the cache serves the source");
+            assert_eq!(cached.path, fetched.path);
+            assert!(!cached.connected, "a cache hit opens no connection");
+            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
 
             // A destination the placed socket cannot reach names itself.
             let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1245,6 +1305,7 @@ mod placed {
                 head_timeout: HEAD_TIMEOUT,
                 auth: "Bearer test".to_string(),
                 failure: Mutex::new(None),
+                asked: AtomicBool::new(false),
             }
         }
 
