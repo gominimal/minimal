@@ -3135,20 +3135,8 @@ mod tests {
         .unwrap();
         assert!(clients.read().unwrap().contains(&key.kid()));
 
-        let mut request = minimald_rpc::CreateSessionRequest::new(
-            "store-box",
-            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
-            boxes::NetworkMode::OwnIp,
-            boxes::BoxPolicy::default(),
-        );
-        hand_grants(
-            &mut request,
-            &proxy_grant_names(&[], &stores),
-            &minted,
-            Some("root".into()),
-        )
-        .unwrap();
-        let deliveries = &request.config.sealed_deliveries;
+        // The create request carries one sealed delivery for each grant.
+        let deliveries = sealed_deliveries(&proxy_grant_names(&[], &stores), &minted).unwrap();
         assert_eq!(
             deliveries
                 .iter()
@@ -3158,7 +3146,7 @@ mod tests {
         );
 
         let mut jtis = Vec::new();
-        for delivery in deliveries {
+        for delivery in &deliveries {
             let opened = bep::seal::open(
                 &sealing,
                 &delivery.sealed,
