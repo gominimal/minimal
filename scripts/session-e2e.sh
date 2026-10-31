@@ -446,6 +446,8 @@ R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
 R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
 AR_AUDIT_EDIT="" # the audit segment the rotation proof edits; restored on teardown
 AR_AUDIT_BACKUP="" # its original bytes
+AR_AUDIT_DIR="" # the audit directory the rotation proof restores on teardown
+AR_AUDIT_SNAPSHOT="" # its segments from before the rotation proof
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1078,6 +1080,9 @@ teardown() {
   # The rotation proof's edited audit segment goes back to its own bytes,
   # before the `rm -rf "$WORK"` below removes the copy.
   ar_restore_edit
+  # Its audit segments go back to the copy from before its restart. The
+  # stop above leaves no proxy to write them.
+  ar_restore_audit
   [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
@@ -15386,9 +15391,11 @@ proof_bep_round_three_conditions_closed() {
 #   4. With the proxy down, one record is edited, and `min doctor` reports
 #      the break and exits 6.
 #   5. With the record restored, `min doctor` reports the chain verified.
-# The log is the real one under $HOME/.minimal/bep/audit. The case restores
-# the edited segment on every exit, and the teardown restores it too. The
-# small bound can prune old segments past the retained count.
+# The log is the real one under $HOME/.minimal/bep/audit. The small bound
+# can prune old segments past the retained count. So before the restart,
+# with no proxy up, the case copies every segment aside. On every exit, and
+# in the teardown, the segments go back to that copy once no proxy writes
+# them, so the case leaves the real log as it found it.
 ar_segment_numbers() { # $1 = the audit directory; prints the segment numbers, sorted
   find "$1" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
     | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n
@@ -15400,6 +15407,32 @@ ar_restore_edit() {
   AR_AUDIT_EDIT=""
   AR_AUDIT_BACKUP=""
 }
+# Puts the audit segments back to the copy the rotation proof took before
+# its restart. This removes the case's segments and restores any that the
+# small bound pruned. It runs only when no `bep serve` of this run writes
+# the log. Otherwise it keeps the copy and names it.
+ar_restore_audit() {
+  if [ -z "$AR_AUDIT_DIR" ] || [ ! -d "$AR_AUDIT_SNAPSHOT" ]; then
+    AR_AUDIT_DIR=""
+    AR_AUDIT_SNAPSHOT=""
+    return 0
+  fi
+  for _ in $(seq 1 20); do
+    [ -z "$(r3_proxy_pids)" ] && break
+    sleep 0.5
+  done
+  if [ -n "$(r3_proxy_pids)" ]; then
+    echo "::error::the audit log in $AR_AUDIT_DIR was not restored: a bep serve still writes it. Its segments from before the rotation case are in $AR_AUDIT_SNAPSHOT"
+    return 0
+  fi
+  find "$AR_AUDIT_DIR" -maxdepth 1 -name 'audit-*.jsonl' -type f -exec rm -f {} +
+  find "$AR_AUDIT_SNAPSHOT" -maxdepth 1 -name 'audit-*.jsonl' -type f \
+    -exec cp -p {} "$AR_AUDIT_DIR/" \;
+  echo "restored the audit log in $AR_AUDIT_DIR to its segments from before the rotation case"
+  rm -rf "${AR_AUDIT_SNAPSHOT:?}"
+  AR_AUDIT_DIR=""
+  AR_AUDIT_SNAPSHOT=""
+}
 proof_bep_audit_rotation_and_doctor_end_to_end() {
   echo "::group::audit log rotation: the chain carries across segments, min box audit reads them all, min doctor reports an edit"
   local ar_case=bep_audit_rotation_and_doctor_end_to_end
@@ -15410,10 +15443,35 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
   local ar_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
   local ar_audit ar_first ar_last ar_new ar_try ar_rot ar_out ar_id ar_rc ar_seg ar_mark
 
-  # The gate restarts the daemon pair, and the proxy inherits this bound
-  # from minvmd's environment.
-  export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
+  # The first gate only checks that a proxy can run here. Then the pair
+  # stops, so no writer races the copy of the real segments.
+  if ! bep_live_gate "$ar_case"; then
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
   BEP_LIVE_DAEMON=""
+  for ar_try in $(seq 1 20); do
+    { bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; } || break
+    sleep 0.5
+  done
+  if bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; then
+    echo "::error::the Box Egress Proxy still runs after 'min stop --force' and 'minvmd stop', so the case cannot copy the audit log aside"
+    fail
+  fi
+  ar_audit="$(dirname "$ar_control")/audit"
+  AR_AUDIT_SNAPSHOT="$(mktemp -d /tmp/mnlaudit.XXXXXX)" || fail
+  AR_AUDIT_DIR="$ar_audit"
+  if [ -d "$ar_audit" ]; then
+    find "$ar_audit" -maxdepth 1 -name 'audit-*.jsonl' -type f \
+      -exec cp -p {} "$AR_AUDIT_SNAPSHOT/" \; || fail
+  fi
+  echo "copied $(ar_segment_numbers "$AR_AUDIT_SNAPSHOT" | wc -l | tr -d ' ') audit segment(s) aside to $AR_AUDIT_SNAPSHOT"
+
+  # The second gate restarts the daemon pair, and the proxy inherits this
+  # bound from minvmd's environment.
+  export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
   ar_mark="$({ wc -l <"$ar_log"; } 2>/dev/null | tr -d ' ')"
   ar_mark="${ar_mark:-0}"
   AR_SID=""
@@ -15432,17 +15490,14 @@ proof_bep_audit_rotation_and_doctor_end_to_end() {
     fi
     BEP_LIVE_DAEMON=""
     AR_STARTED=""
+    ar_restore_audit
     return 0
   }
   ar_fail() { ar_cleanup; fail; }
-  AR_STARTED=""
-  if ! bep_live_gate "$ar_case"; then
-    unset BEP_AUDIT_SEGMENT_BYTES
-    echo "::endgroup::"
-    return 0
-  fi
   AR_STARTED=1
-  ar_audit="$(dirname "$ar_control")/audit"
+  if ! bep_live_gate "$ar_case"; then
+    ar_fail
+  fi
 
   # 1a. The info line at the start names the bound.
   # The awk drops the colour escapes the log can carry around a field.
