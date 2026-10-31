@@ -254,14 +254,22 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
     }
 }
 
+/// What `bep --replace-key <role>` prints when the new key is in use and
+/// the store did not remove the old key (BEP-060).
+fn old_key_kept(role: Role, cause: &KeyError) -> String {
+    format!(
+        "The old {role} key was not removed: {cause}. The proxy does not use it. Run `bep --replace-key {role}` again to make another new key and remove the old one."
+    )
+}
+
 /// `bep --replace-key <role>`. It needs no other key and no file, so it
 /// works when the proxy does not start.
 fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path, rules: &[StoreRule]) -> ExitCode
 where
     S::Key: CaKey,
 {
-    let key = match keys::replace(store, role) {
-        Ok(key) => key,
+    let (key, old_kept) = match keys::replace_outcome(store, role) {
+        Ok(replaced) => (replaced.key, replaced.old_kept),
         Err(err) => {
             // The identity file is not read or written: it still names the
             // key the store holds, or the store holds no key for the role.
@@ -270,6 +278,11 @@ where
         }
     };
     println!("{}", keys::replacement_report(role));
+    if let Some(cause) = &old_kept {
+        // BEP-060: a person who replaces a leaked key must learn that the
+        // old key still exists, though the proxy no longer loads it.
+        eprintln!("{}", old_key_kept(role, cause));
+    }
     // The identity file still names the old key. Publish the new one now, so
     // that a mint never seals to a deleted key. The other roles come from
     // the store, or from the old file when the store refuses them.
@@ -3324,6 +3337,20 @@ mod tests {
             "The sealing key was not replaced, because no new key was made: the key store failed for the sealing key: the keychain is locked. The old key is still in use."
         );
         assert!(!message.contains("again"), "{message}");
+    }
+
+    // BEP-060: an old key that the store did not remove is named, with the
+    // one command that removes it.
+    #[test]
+    fn replace_key_names_an_old_key_not_removed() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        assert_eq!(
+            old_key_kept(Role::Sealing, &cause),
+            "The old sealing key was not removed: the key store failed for the sealing key: the keychain is locked. The proxy does not use it. Run `bep --replace-key sealing` again to make another new key and remove the old one."
+        );
     }
 
     /// Runs `f` under a subscriber at the default level. Gives what it
