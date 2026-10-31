@@ -627,7 +627,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own registry, cache and control-plane lookups on the same host and record them as node-plane traffic.
   tier:     T0
   verify:   cargo nextest run -p minimald daemon_fetch_survives_cohort_deny
-  <!-- S9b/AC2; prose 50; state-driven; un-enrolled, the node-plane set is NET-130's. The node plane's own lookups are the registry, the cache and the control plane only. A web source that a box's package declares is the box's own fetch under NET-155 when the build fetches it in the box's leaf, and the node-plane record does not list it (`a_web_source_is_not_recorded_as_node_plane_traffic`). A `gs://` source, and a web source of a box with no leaf, still leave from the daemon, and the record lists them (`an_unplaced_or_gs_source_is_recorded_as_node_plane_traffic`) -->
+  <!-- S9b/AC2; prose 50; state-driven; un-enrolled, the node-plane set is NET-130's. The node plane's own lookups are the registry, the cache and the control plane only. A web source that a box's package declares is the box's own fetch under NET-155 when the build fetches it in the box's leaf, and the node-plane record does not list it (`a_web_source_is_not_recorded_as_node_plane_traffic`). A `gs://` source, and a web source of a box with no leaf, still leave from the daemon, and the record lists them until [#2802](https://github.com/gominimal/minimal/issues/2802) lands (`an_unplaced_or_gs_source_is_recorded_as_node_plane_traffic`) -->
 
 - **NET-155** WHEN `minimald` runs a package build for a box that has a classifier leaf THE SYSTEM SHALL run the build in that leaf.
   tier:     T0
