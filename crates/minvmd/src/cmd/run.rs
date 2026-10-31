@@ -5334,7 +5334,7 @@ mod tests {
                 (200, ""),
             ],
         );
-        let binder = SwitchMirrorBinder {
+        let binder = super::SwitchMirrorBinder {
             switch_sock: sock,
             node: std::net::Ipv4Addr::new(192, 168, 127, 2),
         };
