@@ -48,8 +48,17 @@ impl SourceFetcher for common::RemoteStorage {
         op: &OpTracker,
     ) -> Result<PathBuf, anyhow::Error> {
         let procs = leaf.map(ClassifierLeaf::procs);
-        self.download_web_with_verification_and_caching(url, sha256, procs.as_deref(), op)
-            .await
+        // A leaf in the deny subtree admits no destination, so the download
+        // resolves no name for it.
+        let admits_nothing = leaf.is_some_and(ClassifierLeaf::is_deny);
+        self.download_web_with_verification_and_caching(
+            url,
+            sha256,
+            procs.as_deref(),
+            admits_nothing,
+            op,
+        )
+        .await
     }
 
     async fn download_gcs(

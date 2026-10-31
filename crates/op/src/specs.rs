@@ -358,6 +358,46 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     }
 }
 
+/// `url` without its credentials, its query and its fragment, or `None`
+/// when it is not a URL.
+fn stripped_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+/// `text` with each URL in it stripped as `stripped_url` strips one. A URL
+/// runs from its scheme to the next space, quote, bracket or parenthesis.
+/// One that does not parse is replaced whole, so no credential in it stays.
+fn strip_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |i| i + 1);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')'))
+            .map_or(rest.len(), |i| at + i);
+        out.push_str(&rest[..start]);
+        if start == at {
+            // No scheme before the `://`: not a URL.
+            out.push_str(&rest[start..end]);
+        } else {
+            match stripped_url(&rest[start..end]) {
+                Some(url) => out.push_str(&url),
+                None => out.push_str("<url>"),
+            }
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
     /// Writes a web source this build could not fetch to the build's stderr
     /// (NET-155), so the output of a build placed for a box names the source
@@ -372,17 +412,14 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         let Some(writer) = self.stderr_writer.as_mut() else {
             return;
         };
-        let shown = match url::Url::parse(url) {
-            Ok(mut parsed) => {
-                let _ = parsed.set_username("");
-                let _ = parsed.set_password(None);
-                parsed.set_query(None);
-                parsed.set_fragment(None);
-                parsed.to_string()
-            }
-            Err(_) => return,
+        let Some(shown) = stripped_url(url) else {
+            return;
         };
-        let line = format!("could not fetch the source {shown}: {e}\n");
+        // The error can quote a URL too: reqwest's names the request's.
+        let line = format!(
+            "could not fetch the source {shown}: {}\n",
+            strip_urls(&e.to_string())
+        );
         let _ = writer.write_all(line.as_bytes()).await;
         let _ = writer.flush().await;
     }
@@ -565,6 +602,28 @@ mod tests {
     use lcache::Cache;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    /// NET-155: the line a failed web-source fetch writes to the build's
+    /// stderr keeps no credential and no query of any URL its error quotes.
+    #[test]
+    fn failed_fetch_line_strips_urls() {
+        assert_eq!(
+            strip_urls(
+                "error sending request for url \
+                 (https://user:secret@downloads.example.org/a.tar.gz?token=t0k#f): \
+                 could not connect to downloads.example.org:443: refused"
+            ),
+            "error sending request for url \
+             (https://downloads.example.org/a.tar.gz): \
+             could not connect to downloads.example.org:443: refused"
+        );
+        assert_eq!(strip_urls("no scheme ://here"), "no scheme ://here");
+        assert_eq!(strip_urls("bad http://user:pw@[::1 end"), "bad <url> end");
+        assert_eq!(
+            stripped_url("http://u:p@example.org/x?y=1").as_deref(),
+            Some("http://example.org/x")
+        );
+    }
 
     /// A [`SourceFetcher`] that must never be called. The build paths exercised
     /// here short-circuit before any source is fetched, so reaching either

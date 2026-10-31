@@ -52,16 +52,26 @@ impl RemoteStorage {
     /// in that cgroup, so the egress rules that match the cgroup decide it.
     /// `None` opens the connections in the caller's own cgroup. The cache
     /// lookup and the content-hash check are the same either way.
+    ///
+    /// `admits_nothing` says that the egress rules of the placement admit no
+    /// destination. The download then refuses every connection before it
+    /// resolves the host name, because the node's resolver is not under
+    /// those rules. It has no effect without a placement.
     #[tracing::instrument]
     pub async fn download_web_with_verification_and_caching(
         &self,
         url: &str,
         sha256: &str,
         placement: Option<&Path>,
+        admits_nothing: bool,
         op: &OpTracker,
     ) -> Result<PathBuf> {
         if let Some(procs) = placement {
-            return placed::download(&self.cache, url, sha256, procs, op).await;
+            let placement = placed::Placement {
+                procs,
+                admits_nothing,
+            };
+            return placed::download(&self.cache, url, sha256, placement, op).await;
         }
         let client = reqwest::Client::new();
         let backend = (&client, &self.cache);
@@ -134,6 +144,15 @@ mod placed {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    /// The cgroup a placed download opens its connections in.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct Placement<'a> {
+        /// The `cgroup.procs` of the cgroup.
+        pub(super) procs: &'a Path,
+        /// The egress rules that match the cgroup admit no destination.
+        pub(super) admits_nothing: bool,
+    }
+
     /// The most bytes of a request head the relay reads before it gives up.
     const MAX_HEAD: usize = 16 * 1024;
 
@@ -143,7 +162,7 @@ mod placed {
         cache: &file_cache::FileCache,
         url: &str,
         sha256: &str,
-        procs: &Path,
+        placement: Placement<'_>,
         op: &OpTracker,
     ) -> Result<PathBuf> {
         let url = ReqwestUrl::try_from(url)?;
@@ -155,7 +174,8 @@ mod placed {
         // on the host can open a connection through the relay.
         let auth = format!("Bearer {}", crate::random_alphanumeric(32));
         let relay = Arc::new(Relay {
-            procs: procs.to_path_buf(),
+            procs: placement.procs.to_path_buf(),
+            admits_nothing: placement.admits_nothing,
             auth: auth.clone(),
             failure: Mutex::new(None),
         });
@@ -201,6 +221,9 @@ mod placed {
     struct Relay {
         /// The `cgroup.procs` of the cgroup each connection opens in.
         procs: PathBuf,
+        /// The cgroup's egress rules admit no destination: refuse every
+        /// connection before its host name is resolved.
+        admits_nothing: bool,
         /// The `Proxy-Authorization` value this download's client sends.
         auth: String,
         /// The last destination the relay could not reach, and why.
@@ -331,6 +354,14 @@ mod placed {
 
         /// A connection to `host:port` from a socket created in the cgroup.
         async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+            if self.admits_nothing {
+                // The lookup would run in the node's own cgroup, so a name
+                // would leave the node outside the rules that admit nothing.
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the egress rules admit no destination",
+                ));
+            }
             let mut last = None;
             for addr in tokio::net::lookup_host((host, port)).await? {
                 let procs = self.procs.clone();
@@ -590,7 +621,11 @@ mod placed {
                 file_cache::FileCache::new_with_offline(tmp.path().join("cache"), false).unwrap();
             let url = format!("http://{addr}/pkg-1.0.tar.gz");
 
-            let path = download(&cache, &url, &sha, &procs, &OpTracker::new_root())
+            let placement = Placement {
+                procs: &procs,
+                admits_nothing: false,
+            };
+            let path = download(&cache, &url, &sha, placement, &OpTracker::new_root())
                 .await
                 .expect("the placed download succeeds");
             assert_eq!(std::fs::read(path).unwrap(), body);
@@ -610,7 +645,7 @@ mod placed {
                 &cache,
                 &format!("http://{closed_addr}/other-1.0.tar.gz"),
                 &sha,
-                &procs,
+                placement,
                 &OpTracker::new_root(),
             )
             .await
@@ -621,6 +656,29 @@ mod placed {
                     .starts_with(&format!("could not connect to {closed_addr}: ")),
                 "{refused:#}"
             );
+
+            // A placement whose rules admit nothing resolves no name and
+            // opens no socket: the child never joins the placement.
+            std::fs::write(&procs, "").unwrap();
+            let sealed = download(
+                &cache,
+                "http://downloads.example.invalid/sealed-1.0.tar.gz",
+                &sha,
+                Placement {
+                    procs: &procs,
+                    admits_nothing: true,
+                },
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("rules that admit nothing refuse the connection");
+            assert_eq!(
+                sealed.to_string(),
+                "could not connect to downloads.example.invalid:80: \
+                 the egress rules admit no destination",
+                "{sealed:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&procs).unwrap(), "");
         }
 
         /// NET-155: the child that makes a placed socket writes itself into
