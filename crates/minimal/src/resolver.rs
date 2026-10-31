@@ -5179,10 +5179,12 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
 }
 
 /// [`name_surface_line`] for a listing that knows where its boxes' ports
-/// answer (T110). The row speaks for every box, so `at_own_address` is
-/// `false` when the listing reports any box at the `127.0.0.1` fallback.
-/// A listing that reports no fallback, such as one from a daemon that
-/// predates the fact, keeps the own-address form the native verdict gives.
+/// answer (T110). The row speaks for every box, so pass `at_own_address`
+/// as `true` only when the listing proves a box at its own address and
+/// reports none at the `127.0.0.1` fallback. A listing that reports no
+/// fallback fact, such as one from a daemon that predates the fact, cannot
+/// prove the stronger claim: pass `false`, and the row reads the fallback
+/// form. Only [`name_surface_line`] defaults to the own-address form.
 #[must_use]
 pub fn name_surface_line_at(
     surface: LiveSurface,
