@@ -517,7 +517,7 @@ impl BepRefusal {
                 Some("run `min auth login`, then create the box again".to_owned())
             }
             Self::UnenrolledNode { grants, .. } => Some(format!(
-                "to create the box without the grant, remove {} from the [secrets] table in \
+                "to create the box without the grant, remove {} from [session.secrets] in \
                  minimal.toml",
                 grants.join(", ")
             )),
@@ -605,8 +605,8 @@ impl fmt::Display for BepRefusal {
                 write!(f, "{cause}")?;
                 write!(
                     f,
-                    " To create the box without the grant, remove {grants} from the [secrets] \
-                     table in minimal.toml."
+                    " To create the box without the grant, remove {grants} from \
+                     [session.secrets] in minimal.toml."
                 )
             }
             Self::StoreReferenceToSignIn { grant } => write!(

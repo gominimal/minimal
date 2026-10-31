@@ -1133,20 +1133,25 @@ impl Flow {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because the sealed credential in the request belongs to another box. Send the request with the sealed credential that this box was given."
             )
-        } else if [
-            Check::OffPort,
-            Check::OutsideBoundSet,
-            Check::OutsideCurrentSet,
-        ]
-        .iter()
-        .any(|check| check.marker() == marker)
+        } else if marker == Check::OffPort.marker() {
+            // BEP-031: the hostname is credentialed, but not on this port.
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because this sealed credential is sent to {host} only on other ports, not on port {port}.",
+                host = self.authority.host,
+                port = self.authority.port,
+            )
+        } else if [Check::OutsideBoundSet, Check::OutsideCurrentSet]
+            .iter()
+            .any(|check| check.marker() == marker)
         {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because {authority} is not a host that this sealed credential is sent to."
             )
         } else if marker == Check::StoreHandleInvalid.marker() {
             format!(
-                "The Box Egress Proxy refused the request to {authority}, because no rule in [secret-store-rules] on the host admits this stored secret for {authority}."
+                // BEP-064: the marker covers every `handle::Invalid` kind, so
+                // the text names each cause and no single remedy.
+                "The Box Egress Proxy refused the request to {authority}, because the reference to a stored secret in its sealed credential is not valid. Its signature can fail to verify, it can name another box or host, or it can be past its expiry. The host can also have nothing that admits it, admit it for other hosts than {authority}, or set a different header form for it."
             )
         } else {
             format!(
@@ -2902,7 +2907,14 @@ mod tests {
             "the sealed credential in the request belongs to another box. Send the \
              request with the sealed credential that this box was given."
         );
-        for marker in ["off_port", "outside_bound_set", "outside_current_set"] {
+        assert_eq!(
+            body("off_port"),
+            format!(
+                "this sealed credential is sent to {} only on other ports, not on port {}.",
+                flow.authority.host, flow.authority.port
+            )
+        );
+        for marker in ["outside_bound_set", "outside_current_set"] {
             assert_eq!(
                 body(marker),
                 format!("{authority} is not a host that this sealed credential is sent to."),
@@ -2912,8 +2924,10 @@ mod tests {
         assert_eq!(
             body("store_handle_invalid"),
             format!(
-                "no rule in [secret-store-rules] on the host admits this stored secret for \
-                 {authority}."
+                "the reference to a stored secret in its sealed credential is not valid. Its \
+                 signature can fail to verify, it can name another box or host, or it can be \
+                 past its expiry. The host can also have nothing that admits it, admit it for \
+                 other hosts than {authority}, or set a different header form for it."
             )
         );
         // A marker with no cause of its own keeps the general text.
