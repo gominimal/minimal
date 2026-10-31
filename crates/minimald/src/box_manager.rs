@@ -242,9 +242,8 @@ struct CreateBoxMsg {
 }
 
 /// The refusal of a create whose name a running box holds (BOX-163). It
-/// names the holder, as a rename's refusal does (BOX-010). The message
-/// keeps the words "already exists", because a client re-mints an
-/// autogen name on them.
+/// names the holder, as a rename's refusal does (BOX-010), and the
+/// rename command that frees the name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldNameRefusal {
     /// The name the create asked for.

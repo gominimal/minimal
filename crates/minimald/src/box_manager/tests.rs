@@ -3598,8 +3598,8 @@ async fn create_with_name_held_by_running_box_refused_exit2_names_holder() {
         assert!(text.contains(&holder.to_string()), "{text}");
         assert!(text.contains("`dev`"), "{text}");
         assert!(
-            minimal_client_collision(&text),
-            "a client still reads the refusal as a name collision: {text}"
+            text.contains(&format!("min session rename {holder} <new-name>")),
+            "the refusal names the next step: {text}"
         );
     }
     let listed = mngr.list_boxes(None).await.unwrap();
@@ -3667,12 +3667,6 @@ async fn box_name_is_refused_unchanged_and_entry_is_cleaned() {
         .await
         .expect("an entry name is cleaned into a label");
     assert_eq!(record_name(&mngr, id).await.as_deref(), Some("build-all"));
-}
-
-/// The match `min` makes on a create's error to tell a name collision
-/// apart (`minimal_client::box_name::is_name_collision`).
-fn minimal_client_collision(error: &str) -> bool {
-    error.contains("already exists")
 }
 
 /// BOX-163: a fresh instance is named `<name>-<n>`, with the smallest `n`
