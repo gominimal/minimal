@@ -2999,7 +2999,8 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
 /// knows the failure lines of `curl` and `wget`, which also cover `git` over
 /// HTTPS: a host it could not resolve, or a host and port it could not
 /// connect to. It also knows the line a build writes when it could not
-/// fetch a web source it declares, and names that source's host.
+/// fetch a web source it declares, and names the host the download could
+/// not connect to, or the source's host when the line names none.
 /// `None` when no line names a destination.
 pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let word = |rest: &str| -> Option<String> {
@@ -3016,11 +3017,12 @@ pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) 
         // `could not fetch the source https://example.com/a.tar.gz: ...`
         // Only a connection the download could not open names a
         // destination. A bad hash or a failed extract is no refusal.
+        // The download names the host it could not connect to, which is
+        // the host a redirect sent it to. The source's own host stands in
+        // only when that text names no host.
         if let Some(rest) = line.strip_prefix(WEB_SOURCE_FAILURE) {
-            return rest
-                .contains(WEB_SOURCE_CONNECT_FAILURE)
-                .then(|| source_host(rest))
-                .flatten();
+            let (_, connect) = rest.split_once(WEB_SOURCE_CONNECT_FAILURE)?;
+            return connect_host(connect).or_else(|| source_host(rest));
         }
         // curl: `Could not resolve host: example.com`
         if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
@@ -3079,6 +3081,18 @@ const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
 /// open a connection to the source. `common`'s placed download writes it,
 /// followed by the host and the port.
 const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
+
+/// The host in the `<host>:<port>: <error>` text that follows
+/// [`WEB_SOURCE_CONNECT_FAILURE`], without the port. `None` when the text
+/// names no host and port.
+fn connect_host(rest: &str) -> Option<String> {
+    let addr = rest.split_once(": ").map_or(rest, |(a, _)| a);
+    let addr = addr.split_whitespace().next()?;
+    let (host, port) = addr.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .then(|| host.to_ascii_lowercase())
+}
 
 /// The host of the URL `rest` starts with: the authority after the scheme,
 /// without a user name or a port. `None` when `rest` starts with no URL.

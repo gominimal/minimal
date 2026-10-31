@@ -14041,7 +14041,7 @@ async fn box_build_web_source_under_box_verdict() {
             _sha256: &str,
             leaf: Option<&ClassifierLeaf>,
             _op: &ot::OpTracker,
-        ) -> anyhow::Result<std::path::PathBuf> {
+        ) -> anyhow::Result<(std::path::PathBuf, bool)> {
             self.1.lock().unwrap().push(leaf.cloned());
             assert!(url.starts_with("https://downloads.example.org/"), "{url}");
             match leaf {
@@ -14049,7 +14049,7 @@ async fn box_build_web_source_under_box_verdict() {
                     "could not connect to downloads.example.org:443: \
                      Connection refused (os error 111)"
                 ),
-                Some(_) => Ok(self.0.clone()),
+                Some(_) => Ok((self.0.clone(), true)),
                 None => anyhow::bail!("the fetch ran outside the box's leaf"),
             }
         }
@@ -14204,6 +14204,42 @@ async fn box_build_web_source_under_box_verdict() {
              other: the sha256 of the download does not match",
         ]),
         None
+    );
+}
+
+/// NET-155: a web source that redirects to another host fails on that
+/// host, and the refusal names the host the download could not connect to.
+/// When the failure names no host, the source's own host stands in.
+#[test]
+fn box_build_web_source_under_box_verdict_names_the_host_it_could_not_reach() {
+    use crate::env::refused_destination;
+
+    // The source redirects to a CDN host the box does not allow.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to CDN.example.net:443: the egress rules refused it",
+        ])
+        .as_deref(),
+        Some("cdn.example.net")
+    );
+    // A literal IPv6 address keeps its colons and loses its port.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to 2001:db8::1:443: refused",
+        ])
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+    // The failure names no host: the source's host stands in.
+    assert_eq!(
+        refused_destination([
+            "could not fetch the source https://downloads.example.org/fetcher-1.0.tar.zst: \
+             other: could not connect to ",
+        ])
+        .as_deref(),
+        Some("downloads.example.org")
     );
 }
 
