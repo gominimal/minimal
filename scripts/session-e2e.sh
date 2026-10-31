@@ -20149,6 +20149,15 @@ proof_escapes_and_builds_stay_inside_box_rules() {
     echo "::endgroup::"
     return 0
   fi
+  # A Linux VM boots on KVM. Without it no VM host daemon starts, so there
+  # is no VM to escape from and no host-side gate to read — the same gate
+  # the sibling VM-backed cases apply. With KVM present, a missing switch
+  # stays a fault below, never a skip.
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "escapes-and-builds proof SKIPPED (no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and no VM means no host-side gate to read)"
+    echo "::endgroup::"
+    return 0
+  fi
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     echo "::error::no MINVMD_GVPROXY_BIN on this VM-backed run: the switch binary the host-side egress gate stands beside is missing, so the escapes-and-builds proof has no gate to read its records from"
     fail
