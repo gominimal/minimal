@@ -323,13 +323,13 @@ pub struct VmListing {
     pub control_sock: Option<std::path::PathBuf>,
     /// Whether that VM's daemon answered. `false` for a stopped VM, whose
     /// listing is read from its persisted box records with no daemon
-    /// (NET-148): each box is then `stopped`, and the reply carries nothing
+    /// (NET-152): each box is then `stopped`, and the reply carries nothing
     /// else.
     pub running: bool,
 }
 
 /// The listing of a stopped VM's boxes, from the box records its state dir
-/// persists (NET-148): one `stopped` entry per box, with its name and id and
+/// persists (NET-152): one `stopped` entry per box, with its name and id and
 /// nothing a daemon would have reported. `None` when the records hold no
 /// box, so a stopped VM with nothing on it adds no listing.
 fn stopped_vm_listing(vm: &client::VmSocket) -> Option<VmListing> {
@@ -374,7 +374,7 @@ fn stopped_vm_listing(vm: &client::VmSocket) -> Option<VmListing> {
 /// [`minimal_client::enumerate_vm_sockets`] is the set: the default VM plus
 /// every named one. An explicit `--vm` narrows the listing to that VM alone —
 /// the operator named where to look. A VM that is not running contributes
-/// the boxes its persisted records hold, each one `stopped` (NET-148), and
+/// the boxes its persisted records hold, each one `stopped` (NET-152), and
 /// only to `min ls` (`strict`): a reader of the daemons' own facts has no
 /// daemon to read there. A VM that answers
 /// badly is skipped with a warning, unless it is the VM this process selected
@@ -1227,7 +1227,7 @@ pub fn format_ls_across_vms_on(
                 other => anyhow::bail!("session list did not serialize to an object: {other}"),
             };
             let vm = serde_json_lenient::Value::String(listing.vm.clone());
-            // Whether the VM is up (NET-148): a stopped VM's boxes are listed
+            // Whether the VM is up (NET-152): a stopped VM's boxes are listed
             // from its persisted records, each entry and the VM's own object
             // saying so.
             let vm_running = serde_json_lenient::Value::Bool(listing.running);
@@ -1395,7 +1395,7 @@ pub fn format_ls_across_vms_on(
 
     // Format as a table, the single-VM columns with the VM each box lives on
     // leading them (NET-057: the listing shows the VM per box).
-    // A stopped VM's cell says so (NET-148), so its boxes read as on a VM
+    // A stopped VM's cell says so (NET-152), so its boxes read as on a VM
     // that is down rather than as boxes that stopped on a running one.
     let rows: Vec<(String, [String; 8])> = listings
         .iter()

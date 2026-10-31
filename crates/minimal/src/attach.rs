@@ -282,7 +282,9 @@ pub(crate) struct ResolvedBoxVm {
 /// choice. A VM that is not running is asked through its persisted box
 /// records instead (NET-152): a name only a stopped VM holds is refused with
 /// a [`crate::cmd::BoxNotFound`] that names the VM and the command that
-/// starts it, and a name a running VM owns wins over a stopped VM's record.
+/// starts it. A running VM that owns the name and a stopped VM whose records
+/// hold it make an [`crate::cmd::AmbiguousBoxName`] that lists both VMs, the
+/// stopped one marked, and names `--vm`.
 /// A VM whose daemon answers nothing is skipped with a warning, so the name
 /// is resolved from the VMs that did answer. Each look
 /// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
@@ -304,8 +306,7 @@ pub(crate) async fn resolve_box_vm(
     let vms =
         crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     let mut owners: Vec<ResolvedBoxVm> = Vec::new();
-    // The stopped VMs whose persisted box records hold the name (NET-152):
-    // asked only when no running VM owns it.
+    // The stopped VMs whose persisted box records hold the name (NET-152).
     let mut stopped_holders: Vec<String> = Vec::new();
     for vm in vms {
         // A VM that is not running has no daemon to ask, so its persisted
@@ -351,29 +352,27 @@ pub(crate) async fn resolve_box_vm(
             ),
         }
     }
-    match owners.len() {
-        0 => match stopped_holders.as_slice() {
-            [] => Ok(None),
-            // NET-152: the box is there, on a VM that is down. Say which VM
-            // and the command that starts it: `--vm` selects the VM, and the
-            // attach autospawns the selected VM's daemon before it looks.
-            [vm] => {
-                tracing::debug!(
-                    box = name,
-                    vm = %vm,
-                    outcome = "on a stopped VM",
-                    "box name resolved to a VM"
-                );
-                Err(crate::cmd::BoxNotFound(crate::cmd::box_on_stopped_vm(name, vm)).into())
-            }
-            several => Err(crate::cmd::AmbiguousBoxName(format!(
-                "box name '{name}' exists on more than one stopped VM ({}); \
-                 name the one you mean with --vm",
-                several.join(", ")
-            ))
-            .into()),
-        },
-        1 => {
+    match (owners.len(), stopped_holders.as_slice()) {
+        (0, []) => Ok(None),
+        // NET-152: the box is there, on a VM that is down. Say which VM and
+        // the command that starts it: `--vm` selects the VM, and the attach
+        // autospawns the selected VM's daemon before it looks.
+        (0, [vm]) => {
+            tracing::debug!(
+                box = name,
+                vm = %vm,
+                outcome = "on a stopped VM",
+                "box name resolved to a VM"
+            );
+            Err(crate::cmd::BoxNotFound(crate::cmd::box_on_stopped_vm(name, vm)).into())
+        }
+        (0, several) => Err(crate::cmd::AmbiguousBoxName(format!(
+            "box name '{name}' exists on more than one stopped VM ({}); \
+             name the one you mean with --vm",
+            several.join(", ")
+        ))
+        .into()),
+        (1, []) => {
             let resolved = owners.pop().expect("the one owner");
             tracing::debug!(
                 box = name,
@@ -383,14 +382,16 @@ pub(crate) async fn resolve_box_vm(
             );
             Ok(Some(resolved))
         }
-        // Two VMs can both own the name, and picking one silently would send
-        // an attach into a project the operator may not have meant. The flag
-        // is the disambiguator, so the error names both and points at it.
-        _ => Err(crate::cmd::AmbiguousBoxName(format!(
+        // Two VMs can both hold the name, running or stopped, and picking one
+        // silently would send an attach into a project the operator may not
+        // have meant. The flag is the disambiguator, so the error names every
+        // VM, marks each stopped one, and points at it.
+        (_, stopped) => Err(crate::cmd::AmbiguousBoxName(format!(
             "box name '{name}' exists on more than one VM ({}); name the one you mean with --vm",
             owners
                 .iter()
-                .map(|owner| owner.vm.as_str())
+                .map(|owner| owner.vm.clone())
+                .chain(stopped.iter().map(|vm| format!("{vm} (stopped)")))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -460,7 +461,7 @@ fn stopped_vm_holds(vm: &crate::client::VmSocket, name: &str) -> bool {
     })
 }
 
-/// The boxes a stopped VM's persisted records hold (NET-148, NET-152), read
+/// The boxes a stopped VM's persisted records hold (NET-152), read
 /// from the state dir beside its socket. One debug line records the count.
 pub(crate) fn stopped_vm_boxes(
     vm: &crate::client::VmSocket,

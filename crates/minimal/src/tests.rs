@@ -5811,7 +5811,8 @@ async fn unknown_box_names_vm_flag() {
 
 /// NET-152: a box only a stopped VM holds is named with that VM and the
 /// command that starts it, on every verb that resolves a box by name. A
-/// running VM's box of the same name wins over the stopped VM's record.
+/// running VM's box of the same name and the stopped VM's record are an
+/// ambiguity that names both VMs.
 #[tokio::test]
 async fn box_on_stopped_vm_names_start_command() {
     let (state, default_vm) = running_default_vm().await;
@@ -5864,16 +5865,29 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // A name the running VM owns resolves there, whatever a stopped VM holds.
+    // A name a running VM owns and a stopped VM's records hold is ambiguous:
+    // the error lists both VMs, marks the stopped one, and names --vm.
     stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
-    let resolved = attach::resolve_box_vm(&global, "api")
+    let err = attach::resolve_box_vm(&global, "api")
         .await
-        .expect("a running VM's box resolves")
-        .expect("'api' is on the running default VM");
-    assert_eq!(resolved.vm, "default");
+        .expect_err("a running owner and a stopped holder are ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM owns the name: it resolves there, and no other VM is
+    // asked.
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
+        .await
+        .expect("the selected VM's own box resolves");
+    assert_eq!(record.name.as_deref(), Some("api"));
 }
 
-/// NET-148: `min ls` lists a stopped VM's boxes from its persisted records:
+/// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:
 /// each row's STATUS reads `stopped` and its VM cell `alpha (stopped)`, the
 /// table rule runs under the VM column, and `--json` carries the boxes with
 /// `"status": "stopped"` and `"vm_running": false`.
