@@ -5237,6 +5237,71 @@ fn listing_of(
     }
 }
 
+/// T110: the BOX NAMES row speaks for every listed box, so it reads the
+/// `127.0.0.1` fallback form as soon as one box reports the fallback, even
+/// beside a box at its own address. A host-address box at the node address
+/// `127.0.0.1` is not at the fallback, so it keeps the own-address form.
+#[test]
+fn ls_shows_box_loopback_address_names_row_follows_any_fallback_box() {
+    let at = |address: std::net::Ipv4Addr, at_fallback: bool| {
+        Some(minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(address),
+            egress_posture: None,
+            at_fallback: Some(at_fallback),
+        })
+    };
+    let own = std::net::Ipv4Addr::new(127, 0, 64, 2);
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let row = |boxes: &[(
+        &str,
+        Option<minimald_rpc::BoxNetworkFacts>,
+        Option<boxes::HostIpEnforcement>,
+    )]| {
+        let mut resp = listing_of(boxes);
+        resp.hostname_proxy_port = Some(7654);
+        resp.answerer_bound = true;
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &resp,
+            Some(crate::resolver::LiveSurface::Native),
+            None,
+        )
+        .expect("rendering the listing");
+        let table = String::from_utf8(out).expect("the listing is UTF-8");
+        table
+            .lines()
+            .find(|l| l.starts_with("BOX NAMES:"))
+            .unwrap_or_else(|| panic!("a BOX NAMES row in:\n{table}"))
+            .to_string()
+    };
+    let opens = "<box>.min.internal opens at its name on this machine; the HTTP proxy at \
+                 127.0.0.1:7654 opens it too";
+    let resolves = "<box>.min.internal resolves on this machine; open it through the HTTP \
+                    proxy at 127.0.0.1:7654";
+    assert_eq!(
+        row(&[
+            ("own", at(own, false), None),
+            ("fallback", at(localhost, true), None)
+        ]),
+        format!("BOX NAMES:       {resolves}"),
+        "a mixed listing reads the fallback form"
+    );
+    assert_eq!(
+        row(&[("host", at(localhost, false), None)]),
+        format!("BOX NAMES:       {opens}"),
+        "a host-address box at 127.0.0.1 is not at the fallback"
+    );
+    assert_eq!(
+        row(&[("own", at(own, false), None)]),
+        format!("BOX NAMES:       {opens}")
+    );
+}
+
 /// T110: `min ls` shows each box's address in an ADDRESS column after NAME
 /// — its own address, the `127.0.0.1` fallback, or `-` when the daemon
 /// did not report one — and `--json` carries it per session as
@@ -5247,6 +5312,7 @@ fn ls_shows_box_loopback_address() {
         Some(minimald_rpc::BoxNetworkFacts {
             loopback_address: Some(address),
             egress_posture: None,
+            at_fallback: Some(address == std::net::Ipv4Addr::LOCALHOST),
         })
     };
     let resp = listing_of(&[
@@ -5372,6 +5438,7 @@ fn ls_egress_matches_session_policy() {
                     Some(minimald_rpc::BoxNetworkFacts {
                         loopback_address: None,
                         egress_posture: Some(minimald_rpc::EgressPosture::of(egress, *network)),
+                        at_fallback: None,
                     }),
                     *enforcement,
                 )

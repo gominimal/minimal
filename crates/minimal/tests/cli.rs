@@ -346,6 +346,7 @@ fn ls_table_shows_host_address_enforcement() {
     let posture = |posture| minimald_rpc::BoxNetworkFacts {
         loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
         egress_posture: Some(posture),
+        at_fallback: Some(true),
     };
     let resp = ListSessionsResponse {
         box_networks: [
@@ -492,6 +493,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
             minimald_rpc::BoxNetworkFacts {
                 loopback_address: None,
                 egress_posture: Some(posture),
+                at_fallback: None,
             },
         )
     };

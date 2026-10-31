@@ -261,16 +261,27 @@ fn box_network_facts(
     record: Option<&boxes::Record>,
     opt_out: bool,
 ) -> minimald_rpc::BoxNetworkFacts {
-    let registry = mngr.hostnames();
-    let routes = registry.read().expect("hostname registry lock poisoned");
-    let loopback_address = match record.map(|record| record.network) {
-        Some(boxes::NetworkMode::HostNet) => Some(routes.node_address()),
-        _ => routes.published_own_address(id).or_else(|| {
-            record
-                .and_then(|record| record.box_addresses)
-                .map(|addresses| addresses.loopback_address)
-        }),
+    let host_address = matches!(
+        record.map(|record| record.network),
+        Some(boxes::NetworkMode::HostNet)
+    );
+    let loopback_address = {
+        let registry = mngr.hostnames();
+        let routes = registry.read().expect("hostname registry lock poisoned");
+        if host_address {
+            Some(routes.node_address())
+        } else {
+            routes.published_own_address(id).or_else(|| {
+                record
+                    .and_then(|record| record.box_addresses)
+                    .map(|addresses| addresses.loopback_address)
+            })
+        }
     };
+    // A host-address box's node address can be `127.0.0.1` too, so only
+    // an own-address or `none` box at `127.0.0.1` is at the fallback.
+    let at_fallback = loopback_address
+        .map(|address| !host_address && address == std::net::Ipv4Addr::LOCALHOST);
     let egress_posture = record.map(|record| {
         let effective = effective_policy_reply(
             &record.policy,
@@ -283,6 +294,7 @@ fn box_network_facts(
     minimald_rpc::BoxNetworkFacts {
         loopback_address,
         egress_posture,
+        at_fallback,
     }
 }
 

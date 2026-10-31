@@ -1257,6 +1257,7 @@ fn list_sessions_reply_carries_box_address_and_posture() {
                 BoxNetworkFacts {
                     loopback_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 2)),
                     egress_posture: Some(EgressPosture::DenyAllDefault),
+                    at_fallback: Some(false),
                 },
             ),
             (
@@ -1264,6 +1265,7 @@ fn list_sessions_reply_carries_box_address_and_posture() {
                 BoxNetworkFacts {
                     loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
                     egress_posture: Some(EgressPosture::DeclaredRules),
+                    at_fallback: Some(false),
                 },
             ),
             (unreported, BoxNetworkFacts::default()),
@@ -1277,6 +1279,7 @@ fn list_sessions_reply_carries_box_address_and_posture() {
         serde_json_lenient::json!({
             "loopback_address": "127.0.64.2",
             "egress_posture": "deny_all_default",
+            "at_fallback": false,
         }),
         "got {json}"
     );

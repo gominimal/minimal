@@ -4783,7 +4783,9 @@ async fn list_sessions_reports_box_address_and_posture() {
 
     let mngr = server.state.sessions_manager().await;
     let own_address = std::net::Ipv4Addr::new(127, 0, 64, 2);
-    let none_address = std::net::Ipv4Addr::new(127, 0, 64, 3);
+    // The `none` box stands on the `127.0.0.1` fallback, so the reply
+    // marks it there, while a host-address box at the node address is not.
+    let none_address = std::net::Ipv4Addr::LOCALHOST;
     let node = {
         let registry = mngr.hostnames();
         let mut routes = registry.write().unwrap();
@@ -4805,6 +4807,7 @@ async fn list_sessions_reports_box_address_and_posture() {
         minimald_rpc::BoxNetworkFacts {
             loopback_address: Some(own_address),
             egress_posture: Some(minimald_rpc::EgressPosture::DenyAllDefault),
+            at_fallback: Some(false),
         }
     );
     assert_eq!(
@@ -4812,6 +4815,7 @@ async fn list_sessions_reports_box_address_and_posture() {
         minimald_rpc::BoxNetworkFacts {
             loopback_address: Some(node),
             egress_posture: Some(minimald_rpc::EgressPosture::AllowAllDefault),
+            at_fallback: Some(false),
         }
     );
     assert_eq!(
@@ -4819,6 +4823,7 @@ async fn list_sessions_reports_box_address_and_posture() {
         minimald_rpc::BoxNetworkFacts {
             loopback_address: Some(none_address),
             egress_posture: Some(minimald_rpc::EgressPosture::NoNetwork),
+            at_fallback: Some(true),
         }
     );
 

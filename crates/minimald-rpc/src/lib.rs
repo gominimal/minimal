@@ -378,6 +378,13 @@ pub struct BoxNetworkFacts {
     /// not read the box's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_posture: Option<EgressPosture>,
+    /// Whether [`Self::loopback_address`] is the `127.0.0.1` fallback an
+    /// own-address or `none` box takes where the reserved range is absent.
+    /// `Some(false)` for a host-address box, whose node address can also be
+    /// `127.0.0.1`. The client cannot tell those two apart without it.
+    /// `None` when the box reports no address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_fallback: Option<bool>,
 }
 
 /// A box's effective egress, named as one posture (T110): the summary
