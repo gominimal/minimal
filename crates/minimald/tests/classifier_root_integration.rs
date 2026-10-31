@@ -35,7 +35,10 @@
 //! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — one
 //! proves NET-155: a package build placed in a box's deny leaf cannot
 //! connect to a local peer, and the same build in an allow leaf connects
-//! (`package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`) —
+//! (`package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`),
+//! and its web-source fetch in a deny leaf is refused while the same fetch
+//! in an allow leaf completes
+//! (`web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`) —
 //! and
 //! four prove the classification itself, live on the kernel that loads
 //! it: that the installer's whole transaction — the classify chain at
@@ -1611,6 +1614,156 @@ fn package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
         "the same build in the allow leaf connects to the peer: {printed}"
     );
     drop(peer);
+}
+
+/// Serves `body` to every HTTP request on a loopback port, and counts the
+/// requests that reach it.
+fn serve_source(body: &'static [u8]) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binding the source's port");
+    let port = listener.local_addr().expect("the source's address").port();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = served.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut reader = std::io::BufReader::new(conn.try_clone().expect("a reader"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(body);
+        }
+    });
+    (port, served)
+}
+
+/// NET-155, live: a box build's web source is fetched in the box's
+/// classifier leaf, so the box's verdict decides it. The fetcher the daemon
+/// gives a box's build (`common::RemoteStorage`) refuses the source for a
+/// deny leaf. The placed download's own socket, made in the deny leaf with
+/// the early refusal turned off, is refused by the loaded table itself. The
+/// same fetch in an allow leaf reaches the source and passes the
+/// content-hash check.
+#[test]
+#[ignore = "loads the installer's table and runs a real web-source fetch in a boxes/deny and a boxes/allow leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
+    use op::SourceFetcher as _;
+    use sha2::Digest as _;
+
+    if !nft_present() {
+        eprintln!(
+            "skipping web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table: \
+             no nft on this host — the install's nftables transaction is \
+             the artifact under proof (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+
+    let scratch = mountpoint.join(format!("minimald-proof-source-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    // In the tree before the fetch starts: the child that makes each placed
+    // socket is born in this process's cgroup, and its move into the box
+    // leaf is checked at the common ancestor of the two.
+    place_this_process_in_the_tree(&scratch);
+    let deny_dir = create_box_leaf(&scratch, "sourcedeny", Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(deny_dir.clone());
+    let allow_dir = create_box_leaf(&scratch, "sourceallow", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    // Dropped before `install`, so the allow leaf goes before the tree.
+    struct AllowLeaf(PathBuf);
+    impl Drop for AllowLeaf {
+        fn drop(&mut self) {
+            let _ = remove_box_leaf(&self.0);
+        }
+    }
+    let _allow_leaf = AllowLeaf(allow_dir.clone());
+    let deny = sandbox::config::ClassifierLeaf::under(&scratch, "sourcedeny", Verdict::Deny);
+    let allow = sandbox::config::ClassifierLeaf::under(&scratch, "sourceallow", Verdict::Allow);
+    assert_eq!(
+        deny.dir(),
+        deny_dir.as_path(),
+        "the deny leaf the fetch is given"
+    );
+    assert_eq!(
+        allow.dir(),
+        allow_dir.as_path(),
+        "the allow leaf the fetch is given"
+    );
+
+    // The source: one loopback server, the one destination every fetch
+    // reaches for, so only the leaf differs between them.
+    let body: &'static [u8] = b"the declared web source";
+    let sha = hex::encode(sha2::Sha256::digest(body));
+    let (port, served) = serve_source(body);
+    let url = format!("http://127.0.0.1:{port}/pkg-1.0.tar.gz");
+
+    let base = tempfile::tempdir().expect("a temp dir for the source cache");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the fetches");
+    runtime.block_on(async {
+        let storage = common::RemoteStorage::new(base.path().join("cache"), false)
+            .await
+            .expect("the source cache");
+        let op = ot::OpTracker::new_root();
+
+        let refused = storage
+            .download_web(&url, &sha, Some(&deny), &op)
+            .await
+            .expect_err("the deny leaf's fetch is refused");
+        eprintln!("the deny leaf's fetch: {refused:#}");
+
+        // The early refusal off: the socket made in the deny leaf meets the
+        // loaded chain itself.
+        let procs = deny.procs();
+        let measured = storage
+            .download_web_with_verification_and_caching(&url, &sha, Some(&procs), false, &op)
+            .await
+            .expect_err("the loaded table refuses a socket made in the deny leaf");
+        let text = format!("{measured:#}");
+        assert!(
+            text.contains(&format!("could not connect to 127.0.0.1:{port}")),
+            "the placed connection names the source it could not reach: {text}"
+        );
+        assert!(
+            text.contains(&std::io::Error::from_raw_os_error(libc::EHOSTUNREACH).to_string()),
+            "the deny-leaf socket is refused with EHOSTUNREACH, the loaded \
+             chain's own rejection: {text}"
+        );
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no fetch from the deny leaf reached the source"
+        );
+
+        let path = storage
+            .download_web(&url, &sha, Some(&allow), &op)
+            .await
+            .expect("the same fetch in the allow leaf reaches the source");
+        assert_eq!(std::fs::read(path).expect("the fetched source"), body);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the allow leaf's fetch reached the source once"
+        );
+    });
 }
 
 // ── The classification's own proofs ─────────────────────────────────────────

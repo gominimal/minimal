@@ -875,7 +875,7 @@ mod placed {
                 false,
                 SocketKind::Stream,
             )
-                .expect_err("no cgroup, no socket");
+            .expect_err("no cgroup, no socket");
             assert!(
                 refused.to_string().contains("/nonexistent/cgroup.procs"),
                 "{refused}"
@@ -950,7 +950,9 @@ mod placed {
                 .await
                 .expect_err("no such name");
             assert!(
-                missing.to_string().starts_with("could not resolve missing.test: "),
+                missing
+                    .to_string()
+                    .starts_with("could not resolve missing.test: "),
                 "{missing}"
             );
 

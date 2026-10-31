@@ -981,12 +981,11 @@ mod tests {
 
         let root = OpTracker::new_root();
         let (log, _guard) = capture_log();
-        let _unplaced = SandboxProgress::new(Some(root.clone()), None).with_fetch_record(
-            FetchRecord {
+        let _unplaced =
+            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(FetchRecord {
                 sources_placed: false,
                 ..fetch_record()
-            },
-        );
+            });
         let url = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef";
         let _source = root.new_child().with_op(Operation::FetchSource {
             url: url.to_string(),
