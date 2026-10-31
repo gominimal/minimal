@@ -6361,8 +6361,8 @@ impl MirrorEnd {
 ///   on within one guest poll is bound with no new notice.
 /// * A bind that a probe pass or a new box's publication made and that
 ///   failed stays held, and every probe verdict retries it.
-/// * A refusal is a warn line the first time a port takes it, and a debug
-///   line while the port takes the same refusal again.
+/// * Every refusal is a warn line. [`MIRROR_NOTICES_PER_SECOND`] bounds how
+///   many a guest can cause.
 /// * [`MIRROR_NOTICES_PER_SECOND`] and [`MIRRORED_BINDS_CAP`] bound what
 ///   the guest can make the host do. Each notice the rate drops counts in
 ///   [`Self::notices_dropped_by_rate`].
