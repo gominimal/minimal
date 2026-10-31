@@ -397,6 +397,9 @@ pub(crate) async fn run_login(
             // Only an empty list shows that no installation exists. After a
             // failed read the App may already be installed.
             if installs.none() {
+                // The install wait gets its own BROWSER_TIMEOUT, so a slow
+                // sign-in does not shorten the time to install the App.
+                browser.deadline = tokio::time::Instant::now() + BROWSER_TIMEOUT;
                 writeln!(err, "{WAITING}")?;
                 browser
                     .await_install(
@@ -816,8 +819,8 @@ struct Browser {
     state: String,
     verifier: String,
     redirect_uri: String,
-    /// When the whole browser flow gives up: [`BROWSER_TIMEOUT`] after the
-    /// browser was opened.
+    /// When the browser flow gives up: [`BROWSER_TIMEOUT`] after the
+    /// browser was opened, and again after the install wait starts.
     deadline: tokio::time::Instant,
 }
 
@@ -989,7 +992,14 @@ impl Browser {
                     return Ok(());
                 }
                 _ = poll.tick() => {
-                    if let Some((on, selection)) = installed(http, endpoints, token, None).await {
+                    // Bound the re-read by the deadline too: a slow read must
+                    // not hold the wait past it. A read cut short loops back
+                    // to the deadline arm.
+                    let read = tokio::time::timeout_at(
+                        self.deadline,
+                        installed(http, endpoints, token, None),
+                    );
+                    if let Ok(Some((on, selection))) = read.await {
                         writeln!(err, "Installed on {on}. {}", reach_there(&selection))?;
                         return Ok(());
                     }
@@ -2137,6 +2147,55 @@ mod tests {
             "Stopped waiting. `min` did not see an installation of the Minimal GitHub App.\n\
              One more step: choose which repositories your boxes can reach at \
              https://github.com/apps/gominimal/installations/new.\n"
+        );
+    }
+
+    // A re-read that GitHub never answers does not hold the wait past its
+    // deadline: the wait stops at the deadline, not at FINISH_TIMEOUT.
+    #[tokio::test]
+    async fn a_stalled_install_read_does_not_outlive_the_deadline() {
+        let gh = fake_github("octocat").await;
+        let opener = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let mut browser = Browser::open(&gh.endpoints, &opener, &mut Vec::new())
+            .await
+            .expect("open");
+        // An API that accepts connections and never answers them.
+        let stall = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let api = format!("http://{}", stall.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = stall.accept().await {
+                held.push(conn);
+            }
+        });
+        let endpoints = Endpoints {
+            oauth: gh.endpoints.oauth.clone(),
+            api,
+        };
+        let started = tokio::time::Instant::now();
+        browser.deadline = started + INSTALL_POLL + Duration::from_secs(1);
+        let mut err = Vec::new();
+        browser
+            .await_install(
+                &reqwest::Client::new(),
+                &endpoints,
+                ACCESS,
+                "octocat",
+                &mut err,
+            )
+            .await
+            .expect("wait");
+        assert!(
+            started.elapsed() < INSTALL_POLL + Duration::from_secs(4),
+            "the wait ran {:?}",
+            started.elapsed()
+        );
+        assert!(
+            String::from_utf8(err)
+                .expect("utf8")
+                .starts_with("Stopped waiting."),
         );
     }
 
