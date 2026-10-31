@@ -81,18 +81,30 @@ pub(crate) struct KnownBox {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Resolved {
     /// The target was a box id.
-    Id(String),
+    Id(boxes::SessionId),
     /// The target was a name, and this is the id it read.
-    Name { name: String, id: String },
+    Name { name: String, id: boxes::SessionId },
 }
 
 impl Resolved {
-    /// The audit subject.
-    pub(crate) fn id(&self) -> &str {
+    /// The box id, displayed in the hyphenated form `min ls` shows.
+    pub(crate) fn id(&self) -> boxes::SessionId {
         match self {
-            Self::Id(id) | Self::Name { id, .. } => id,
+            Self::Id(id) | Self::Name { id, .. } => *id,
         }
     }
+
+    /// The audit subject: the box id as the proxy writes it.
+    pub(crate) fn subject(&self) -> String {
+        subject(self.id())
+    }
+}
+
+/// The box id in the proxy's one text form, 32 lowercase hex digits, as
+/// `bep serve` writes it in a record's `subject` (#2462). The hyphenated
+/// display form never matches a record.
+pub(crate) fn subject(id: boxes::SessionId) -> String {
+    bep::listener::box_id_text(&id.to_bytes())
 }
 
 /// Refuses every read inside a box. The log is the host-side proxy's, and
@@ -133,7 +145,7 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
         );
     }
     if let Ok(id) = boxes::SessionId::parse_str(target) {
-        return Ok(Resolved::Id(id.to_string()));
+        return Ok(Resolved::Id(id));
     }
     let named = known
         .iter()
@@ -147,7 +159,7 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
     match chosen {
         Some(found) => Ok(Resolved::Name {
             name: target.to_owned(),
-            id: found.id.to_string(),
+            id: found.id,
         }),
         None => anyhow::bail!(
             "No box on this host is named `{target}`. \
@@ -156,12 +168,13 @@ pub(crate) fn resolve(target: &str, known: &[KnownBox]) -> anyhow::Result<Resolv
     }
 }
 
-/// The ids of every child of `parent` that this host knows.
-pub(crate) fn children(parent: &str, known: &[KnownBox]) -> BTreeSet<String> {
+/// The audit subjects of every child of `parent` that this host knows, in
+/// the proxy's text form.
+pub(crate) fn children(parent: boxes::SessionId, known: &[KnownBox]) -> BTreeSet<String> {
     known
         .iter()
-        .filter(|candidate| candidate.parent.is_some_and(|p| p.to_string() == parent))
-        .map(|candidate| candidate.id.to_string())
+        .filter(|candidate| candidate.parent == Some(parent))
+        .map(|candidate| subject(candidate.id))
         .collect()
 }
 
@@ -214,7 +227,9 @@ fn needs_escape(c: char) -> bool {
 }
 
 /// Writes the entries whose subject is in `subjects`, and returns how many
-/// it wrote. `name_box` puts the subject at the start of each text line.
+/// it wrote. `subjects` are in the proxy's text form, see [`subject`].
+/// `name_box` puts the box id, hyphenated as `min ls` shows it, at the
+/// start of each text line.
 pub(crate) fn render(
     entries: &[Entry],
     subjects: &BTreeSet<String>,
@@ -232,7 +247,10 @@ pub(crate) fn render(
             Some(BoxAuditOutputFormat::Jsonl) => writeln!(out, "{}", entry.line)?,
             None => {
                 if name_box {
-                    write!(out, "{}  ", record.subject)?;
+                    match boxes::SessionId::parse_str(&record.subject) {
+                        Ok(id) => write!(out, "{id}  ")?,
+                        Err(_) => write!(out, "{}  ", printable(&record.subject))?,
+                    }
                 }
                 let kind = match record.kind {
                     bep::audit::Kind::Decision => "decision",
@@ -358,7 +376,7 @@ pub(crate) fn refuse_parent_before_listing(
         return Ok(());
     }
     let named = match resolve(parent, &[]) {
-        Ok(resolved) => resolved.id().to_owned(),
+        Ok(resolved) => resolved.id().to_string(),
         Err(_) if parent != "self" => printable(parent).into_owned(),
         Err(refused) => return Err(refused),
     };
@@ -407,14 +425,14 @@ pub(crate) fn run(
         (_, Some(parent)) => {
             let resolved = resolve(parent, known)?;
             if !parents_recorded {
-                return Err(parents_unrecorded(resolved.id()));
+                return Err(parents_unrecorded(&resolved.id().to_string()));
             }
             let subjects = children(resolved.id(), known);
             (resolved, subjects, true)
         }
         (Some(target), None) => {
             let resolved = resolve(target, known)?;
-            let subjects = BTreeSet::from([resolved.id().to_owned()]);
+            let subjects = BTreeSet::from([resolved.subject()]);
             (resolved, subjects, false)
         }
         (None, None) => anyhow::bail!("Name a box: run `min box audit <box>`."),
@@ -534,10 +552,15 @@ mod tests {
         boxes::SessionId::parse_str(s).unwrap()
     }
 
+    /// `box_id` in the proxy's text form, as `bep serve` writes it.
+    fn hex(box_id: &str) -> String {
+        subject(id(box_id))
+    }
+
     fn decision(box_id: &str, authority: &str) -> Decision {
         Decision {
             kind: Kind::Decision,
-            box_id: box_id.to_owned(),
+            box_id: hex(box_id),
             authority: authority.to_owned(),
             identifier: None,
             jti: String::new(),
@@ -620,7 +643,10 @@ mod tests {
         result.unwrap();
         for line in out.lines() {
             assert!(line.starts_with('{'), "{line}");
-            assert!(line.contains(&format!("\"subject\":\"{A}\"")), "{line}");
+            assert!(
+                line.contains(&format!("\"subject\":\"{}\"", hex(A))),
+                "{line}"
+            );
         }
         assert_eq!(out.lines().count(), 2);
 
@@ -808,6 +834,61 @@ mod tests {
         assert!(message.contains("min box audit <box-id>"), "{message}");
     }
 
+    // BEP-042, #2462: the proxy writes the subject from the delivery header
+    // as 32 lowercase hex digits. A box id minted on this host reads that
+    // record by its hyphenated id and by its name, and the command names
+    // the hyphenated id a person sees in `min ls`.
+    #[test]
+    fn box_audit_reads_a_record_the_proxy_wrote_for_a_minted_id() {
+        use bep::listener::Delivery;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let minted = boxes::SessionId::mint();
+        let other = boxes::SessionId::mint();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path().join(segment_name(1))).unwrap();
+        for (box_id, authority) in [(minted, "mine.example:443"), (other, "other.example:443")] {
+            // As the switch peer writes the header and `bep serve` reads it.
+            let sent = Delivery {
+                box_id: box_id.to_bytes(),
+                source: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 40000),
+                destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 443),
+            };
+            let delivery = Delivery::parse(&sent.emit()).unwrap();
+            let mut record = decision(A, authority);
+            record.box_id = delivery.box_id_text();
+            assert_eq!(record.box_id.len(), 32, "{}", record.box_id);
+            log.append(&record).unwrap();
+        }
+        drop(log);
+
+        let shown = minted.to_string();
+        assert!(shown.contains('-'), "{shown}");
+
+        // By id, in the hyphenated form `min ls` shows.
+        let (result, out, err) =
+            run_to_strings(&args(Some(&shown), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("mine.example:443"), "{out}");
+        assert!(!out.contains("other.example"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // By name: the line keeps the hyphenated id.
+        let boxes = [KnownBox {
+            id: minted,
+            name: Some("web".to_owned()),
+            live: true,
+            parent: None,
+        }];
+        let (result, out, err) =
+            run_to_strings(&args(Some("web"), None, false), &boxes, false, dir.path());
+        result.unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("mine.example:443"), "{out}");
+        assert_eq!(err, format!("Showing web (box {shown}).\n"));
+    }
+
     // BEP-042: --follow replays the box's records and then tails new ones.
     #[test]
     fn box_audit_follow_stops_when_the_reader_closes() {
@@ -827,7 +908,7 @@ mod tests {
         );
 
         let mut reader = LogReader::new(dir.path());
-        let subjects = BTreeSet::from([A.to_owned()]);
+        let subjects = BTreeSet::from([hex(A)]);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let mut rounds = 0;
         let path = dir.path().to_path_buf();
