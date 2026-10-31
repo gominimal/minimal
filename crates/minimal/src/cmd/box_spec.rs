@@ -253,17 +253,21 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             quic443,
             secrets: &secrets,
             acknowledged,
-            // The preview is of an own-address box, as its checks are.
-            box_zone_resolver: super::box_verbs::host_resolves_box_names(
-                crate::daemon_host_kind(global),
-                boxes::NetworkMode::OwnIp,
-            ),
+            box_zone_resolver: preview_box_zone_resolver(crate::daemon_host_kind(global)),
             github_hosts: &github_hosts,
             store_rules: &store_rules,
         },
         &mut stdout,
     )?;
     stdout.flush().context("failed to write to stdout")
+}
+
+/// The host fact the preview reads: whether a default box on a host of
+/// `kind` has its names resolved by the switch. The preview is of a
+/// default box, whose network is the default of `min box create
+/// --network`, so it refuses exactly what a default creation refuses.
+pub(crate) fn preview_box_zone_resolver(kind: paths::HostKind) -> bool {
+    super::box_verbs::host_resolves_box_names(kind, super::box_verbs::default_box_network())
 }
 
 #[cfg(test)]

@@ -338,7 +338,9 @@ fn refuse_unhonourable_grants(
 /// DNS gate answers a steered name with the proxy's address while the
 /// proxy's listener is live, and SERVFAIL while it is down. A native host
 /// has no proxy, so a steered name there always fails closed, and a
-/// `host_ip` or `none` box has no steered lookups of its own. Where this is
+/// `host_ip` or `none` box has no steered lookups of its own. `min box
+/// spec` reads it for a default box, whose network is
+/// [`default_box_network`]. Where this is
 /// true, `dns` steering is still refused on its own grounds until the proxy
 /// takes a direct TLS connection (#2805). Under `both`, a tool that
 /// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
@@ -346,6 +348,23 @@ fn refuse_unhonourable_grants(
 /// the direct TLS path.
 pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
     kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
+}
+
+/// The network mode of a default box: the default of `min box create
+/// --network`, read from that flag's own definition, so `min box spec`
+/// previews the box a default creation makes and cannot drift from it.
+pub(crate) fn default_box_network() -> boxes::NetworkMode {
+    use clap::Args as _;
+    let command = crate::cli::ActivateArgs::augment_args(clap::Command::new("min"));
+    let raw = command
+        .get_arguments()
+        .find(|arg| arg.get_id() == "network")
+        .and_then(|arg| arg.get_default_values().first())
+        .and_then(|value| value.to_str())
+        .expect("--network declares a default");
+    crate::cli::parse_network_mode(raw)
+        .expect("the --network default parses")
+        .into()
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -3658,6 +3677,44 @@ mod tests {
                     assert_eq!(refused.exit_code(), 3, "{case}");
                     assert_eq!(refused.to_string(), refusal, "{case}");
                 }
+            }
+
+            // A default `min box create` and `min box spec` agree on every
+            // host: the preview is of a default box, whose network is the
+            // `--network` default.
+            assert_eq!(default_box_network(), boxes::NetworkMode::HostNet);
+            for kind in [HostKind::Minvmd, HostKind::Minimald] {
+                let network = default_box_network();
+                let created = refuse_unhonourable_grants(
+                    network,
+                    Some(&egress),
+                    &bep,
+                    &secrets,
+                    false,
+                    host_resolves_box_names(kind, network),
+                    &spec_env,
+                );
+                let rules = boxes::core::bep::StoreRules::new();
+                let previewed = crate::cmd::box_spec::render(
+                    &crate::cmd::box_spec::SpecInputs {
+                        root_fingerprint: None,
+                        bep: &bep,
+                        quic443: None,
+                        secrets: &secrets,
+                        acknowledged: false,
+                        box_zone_resolver: crate::cmd::box_spec::preview_box_zone_resolver(kind),
+                        github_hosts: &github_hosts,
+                        store_rules: &rules,
+                    },
+                    &mut Vec::new(),
+                );
+                let case = format!("{word} {kind:?} default network");
+                let created = created.map(|_| ()).map_err(|err| err.to_string());
+                let previewed = previewed.map_err(|err| err.to_string());
+                assert_eq!(created, previewed, "{case}: same refusal");
+                // A default box has no steered lookups of its own, so it is
+                // refused for the missing resolver, `both` included.
+                assert_eq!(created, Err(no_resolver.clone()), "{case}");
             }
         }
     }
