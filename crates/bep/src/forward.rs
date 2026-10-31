@@ -1123,10 +1123,13 @@ impl Flow {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because this box's sealed credential no longer works on this host. Create the box again to give it a new sealed credential."
             )
-        } else if [Check::NoLiveBox, Check::CrossBox]
-            .iter()
-            .any(|check| check.marker() == marker)
-        {
+        } else if marker == Check::NoLiveBox.marker() {
+            // BEP-020: the source address resolves to no live box, so no box
+            // can be named as the owner of the sealed credential.
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the request did not come from a running box on this host. Send the request from inside the running box that was given this sealed credential."
+            )
+        } else if marker == Check::CrossBox.marker() {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because the sealed credential in the request belongs to another box. Send the request with the sealed credential that this box was given."
             )
@@ -2889,14 +2892,16 @@ mod tests {
                 "{marker}"
             );
         }
-        for marker in ["no_live_box", "cross_box"] {
-            assert_eq!(
-                body(marker),
-                "the sealed credential in the request belongs to another box. Send the \
-                 request with the sealed credential that this box was given.",
-                "{marker}"
-            );
-        }
+        assert_eq!(
+            body("no_live_box"),
+            "the request did not come from a running box on this host. Send the request \
+             from inside the running box that was given this sealed credential."
+        );
+        assert_eq!(
+            body("cross_box"),
+            "the sealed credential in the request belongs to another box. Send the \
+             request with the sealed credential that this box was given."
+        );
         for marker in ["off_port", "outside_bound_set", "outside_current_set"] {
             assert_eq!(
                 body(marker),
