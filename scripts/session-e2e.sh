@@ -20103,17 +20103,21 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 }
 
 # T108 on the VM host, end to end: escapes and builds stay inside the box's
-# rules, and each refusal leaves a record on the host. One deny-all
+# rules. Each refusal that reaches the host leaves a record there. The
+# vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
 # own-address box (`--network own_ip --deny-all-egress`) carries three legs:
 #
 #   * the RPC leg (NET-139): from inside the box, a vsock connect to the
 #     guest daemon's RPC port (2222, instance 0) at the loopback CID 1 and
 #     at CID 3, a sibling's or the guest's own. No seal admits AF_VSOCK, so
 #     the expected refusal is the box's own `socket(AF_VSOCK)` failing with
-#     EAFNOSUPPORT. Where a socket opens anyway, the guest daemon's accept
-#     check must refuse the peer, and its audited line ("refused an RPC
-#     connection from a vsock peer") must reach the host-side boot log. The
-#     attempt never reads the server's SSH banner either way.
+#     EAFNOSUPPORT. That refusal has no host-side record: no connection
+#     leaves the box, so the guest daemon logs nothing, and the row says so.
+#     Where a socket opens anyway, the guest daemon's accept check must
+#     refuse the peer, and a new audited line ("refused an RPC connection
+#     from a vsock peer"), written after this attempt, must reach the
+#     host-side boot log. The attempt never reads the server's SSH banner
+#     either way.
 #
 #   * the build leg (NET-155 under NET-130): `min add --session` of a
 #     project-local package whose one web source is a literal address in
@@ -20122,7 +20126,10 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     and the host-side gate decides it by the node-plane baseline set: the
 #     address is no registry or cache pin, so the gate drops it and writes
 #     its `egress-node-plane-unpinned` line naming the destination. The
-#     build fails and the package is not installed.
+#     build fails and the package is not installed. This is the interim
+#     that the NET-155 scope note names, and issue #2802 owns it. When #2802
+#     gives an own-address box its own leaf, change this leg to expect the
+#     box's own drop in place of the node's.
 #
 #   * the escape leg (NET-085): a root escapee wearing the node's own
 #     address speaks the shuttle protocol at the gate's landing edge (the
@@ -20426,19 +20433,31 @@ EBR_LISTENER_EOF
       echo "::error::the box's socat cannot make a vsock attempt, so the RPC leg was never tried"
       ebr_fail
     fi
-    if grep -q 'Address family not supported' <<<"$ebr_out"; then
+    # Only socat's own socket(AF_VSOCK) error (AF_VSOCK is 40) with a
+    # non-zero exit counts as the in-box refusal. Any other failure that
+    # prints the same errno text falls through to the boot-log check.
+    ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^socat-exit=//p' | tail -n1)"
+    if [ -n "$ebr_rc" ] && [ "$ebr_rc" != 0 ] \
+      && grep -F 'socket(40,' <<<"$ebr_out" | grep -q 'Address family not supported'; then
       ebr_rows="$ebr_rows
-attempt=vsock CID $ebr_cid port 2222 refusal=socket(AF_VSOCK) refused inside the box (EAFNOSUPPORT) record=the box's own error; no connection reached the guest, so the guest daemon logs nothing"
+attempt=vsock CID $ebr_cid port 2222 refusal=socket(AF_VSOCK) refused inside the box (EAFNOSUPPORT, socat exit $ebr_rc) record=none on the host: no connection left the box, so the guest daemon logged nothing"
       continue
     fi
+    # The socket opened. The guest daemon must write a new refusal line
+    # for this attempt: count the lines before it, so an earlier CID's
+    # line cannot stand in for this one.
+    ebr_prior="$(ebr_boot_case_log | grep -cF 'refused an RPC connection from a vsock peer')" || true
     ebr_line=""
     for _ in $(seq 1 20); do
-      ebr_line="$(ebr_boot_case_log \
-        | grep -F 'refused an RPC connection from a vsock peer' | tail -n1)" && [ -n "$ebr_line" ] && break
+      if [ "$(ebr_boot_case_log | grep -cF 'refused an RPC connection from a vsock peer')" -gt "$ebr_prior" ]; then
+        ebr_line="$(ebr_boot_case_log \
+          | grep -F 'refused an RPC connection from a vsock peer' | tail -n1)"
+        break
+      fi
       sleep 0.5
     done
     if [ -z "$ebr_line" ]; then
-      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no refusal line from the guest daemon"
+      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no new refusal line from the guest daemon for it ($ebr_prior such line(s) before the attempt)"
       ebr_fail
     fi
     ebr_rows="$ebr_rows
@@ -20469,6 +20488,10 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
   if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
     echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    ebr_fail
+  fi
+  if [ "$ebr_rc" = 124 ]; then
+    echo "::error::the deny-all box's build of $ebr_pkg hung until 'timeout 300' stopped it (exit 124): a hang is a fault, not a refusal"
     ebr_fail
   fi
   if grep -qi "unknown package\|no package named\|not found in" <<<"$ebr_out" \
@@ -20531,7 +20554,7 @@ attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$
   EBR_LISTENER_PID=""
   rm -rf "$EBR_SEED_DIR"
   EBR_SEED_DIR=""
-  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock; the deny-all box's build and a frame wearing the node's address each reached nothing outside the box's rules and the baseline set; each refusal has its record). NET-085 NET-139 NET-155"
+  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock, and a vsock socket refused inside the box has no host-side record; the deny-all box's build and a frame wearing the node's address each reached nothing outside the box's rules and the baseline set, each with its gate record). NET-085 NET-139 NET-155"
   echo "::endgroup::"
 }
 
