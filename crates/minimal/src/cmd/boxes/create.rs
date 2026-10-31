@@ -953,9 +953,11 @@ fn store_grants(
 /// nothing for a box with neither. `config_dir` is the `min --config-dir`
 /// override, which the store mint checks `bep serve` agrees with. No box
 /// exists yet, so a failure only withdraws the row the box's registration
-/// bought (T66).
+/// bought (T66). `box_name` is the name that row was registered under. A
+/// box with no `--name` has none on the request (BOX-163).
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
+    box_name: Option<&str>,
     registered_id: Option<minimald_rpc::BoxId>,
     github_grants: &[String],
     store_grants: &[crate::mint::StoreGrant],
@@ -1005,7 +1007,7 @@ async fn mint_into_request(
         Err(error) => {
             withdraw_box_row(
                 control_sock,
-                request.config.name.as_deref(),
+                box_name,
                 request.config.box_addresses,
                 registered_id,
             )
@@ -1806,6 +1808,7 @@ pub(crate) async fn activate_box(
     let proxy_registration = ActivationStep::MintGrants
         .run(mint_into_request(
             &mut request,
+            box_name.as_deref(),
             registered_id,
             &github_grants,
             &store_grants,
@@ -2997,6 +3000,83 @@ mod tests {
                 .next()
                 .is_none(),
             "nothing was spawned or created before the refusal"
+        );
+    }
+
+    /// T66, BOX-163: an activation with no `--name` registers its row under
+    /// the entry's name, and the request carries no name. When the grant
+    /// mint fails, the row that registration bought is withdrawn under the
+    /// registered name. The mint fails here before it reads the home
+    /// directory: the request's network mode gives the proxy no stance.
+    #[tokio::test]
+    async fn unnamed_activation_withdraws_its_row_when_the_grant_mint_fails() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let attachments = minvmd::bep_attach::Attachments::new();
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+            .feeding_proxy_attachments(attachments.clone());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("unnamed-mint-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+
+        let mut registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &boxes::BoxPolicy::default(),
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        // Commit the lease, as an activation does, so only the withdrawal
+        // under test can remove the row.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
+        let id = registered.box_id.expect("the host minted an id");
+        let source = registered.addresses.switch_address.octets();
+        assert!(
+            registry.table().by_source(source).is_some(),
+            "the registration published the row"
+        );
+
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "web",
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+            boxes::NetworkMode::NoNet,
+            boxes::BoxPolicy::default(),
+        );
+        // No `--name`: the request names no box (BOX-163).
+        request.config.name = None;
+        request.config.box_addresses = Some(registered.addresses);
+
+        let result = mint_into_request(
+            &mut request,
+            Some("web"),
+            Some(id),
+            &["GH_TOKEN".to_owned()],
+            &[],
+            None,
+            Some(sock_path.clone()),
+        )
+        .await;
+        assert!(result.is_err(), "the grant mint fails");
+        assert!(
+            registry.table().by_source(source).is_none(),
+            "the failed mint withdrew the row registered under the entry's name"
+        );
+        assert!(
+            !attachments.holds_id(id.to_bytes()),
+            "the withdrawn box's id is held by no attachment"
         );
     }
 
