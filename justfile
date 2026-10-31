@@ -121,6 +121,10 @@ gvproxy:
     @mkdir -p {{scratch}}
     @scripts/fetch-gvproxy.sh {{gvproxy}}
 
+# Run one Go test on the patched gvproxy source (`just gvproxy-test TestUnexposeClosesOnlyItsOwnAcceptedConnections`).
+gvproxy-test name:
+    scripts/build-gvproxy.sh --test {{quote(name)}}
+
 # Cross-compile minimald → initramfs /init.
 initramfs:
     scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
