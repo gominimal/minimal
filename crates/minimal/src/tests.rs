@@ -5844,6 +5844,26 @@ async fn box_on_stopped_vm_names_start_command() {
     assert_eq!(err.to_string(), expected);
     assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
 
+    // A name two stopped VMs hold is ambiguous, and typed so the policy's
+    // machine reading reports a miss, not an unreachable daemon.
+    stopped_vm_with_boxes(state.path(), "delta", &[("dup", boxes::SessionId::mint())]);
+    stopped_vm_with_boxes(
+        state.path(),
+        "epsilon",
+        &[("dup", boxes::SessionId::mint())],
+    );
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "dup", "session policy dup")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("a name two stopped VMs hold is ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'dup' exists on more than one stopped VM (delta, epsilon); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
     // A name the running VM owns resolves there, whatever a stopped VM holds.
     stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
     let resolved = attach::resolve_box_vm(&global, "api")

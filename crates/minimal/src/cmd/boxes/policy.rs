@@ -948,6 +948,7 @@ async fn box_policy_json_inputs(
         .map_err(|error| {
             if error.downcast_ref::<BoxNotFound>().is_some()
                 || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
+                || error.downcast_ref::<AmbiguousBoxName>().is_some()
             {
                 PolicyJsonFailure::SessionNotFound(error.to_string())
             } else {

@@ -366,11 +366,12 @@ pub(crate) async fn resolve_box_vm(
                 );
                 Err(crate::cmd::BoxNotFound(crate::cmd::box_on_stopped_vm(name, vm)).into())
             }
-            several => Err(anyhow::anyhow!(
+            several => Err(crate::cmd::AmbiguousBoxName(format!(
                 "box name '{name}' exists on more than one stopped VM ({}); \
                  name the one you mean with --vm",
                 several.join(", ")
-            )),
+            ))
+            .into()),
         },
         1 => {
             let resolved = owners.pop().expect("the one owner");
@@ -385,14 +386,15 @@ pub(crate) async fn resolve_box_vm(
         // Two VMs can both own the name, and picking one silently would send
         // an attach into a project the operator may not have meant. The flag
         // is the disambiguator, so the error names both and points at it.
-        _ => Err(anyhow::anyhow!(
+        _ => Err(crate::cmd::AmbiguousBoxName(format!(
             "box name '{name}' exists on more than one VM ({}); name the one you mean with --vm",
             owners
                 .iter()
                 .map(|owner| owner.vm.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )),
+        ))
+        .into()),
     }
 }
 

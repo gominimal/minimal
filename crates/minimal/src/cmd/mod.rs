@@ -584,6 +584,20 @@ impl std::fmt::Display for BoxNotFound {
 
 impl std::error::Error for BoxNotFound {}
 
+/// A box name that more than one VM holds, running or stopped, with no
+/// `--vm` to pick one; the message names the VMs. Typed so a caller can tell
+/// the ambiguity from a failed RPC, as [`AmbiguousIdPrefix`] is.
+#[derive(Debug)]
+pub(crate) struct AmbiguousBoxName(pub(crate) String);
+
+impl std::fmt::Display for AmbiguousBoxName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousBoxName {}
+
 /// The refusal for a box name no running VM holds, on a host with more than
 /// one VM (NET-058). `example` is the command the user ran, after `min` and
 /// with the box name in place, such as `session policy beta`.
