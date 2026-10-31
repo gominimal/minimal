@@ -245,6 +245,10 @@ fn replace_failure(role: Role, err: &ReplaceError) -> String {
         ReplaceError::Generate(cause) => format!(
             "The {role} key was not replaced, because no new key was made: {cause}. The old key is still in use."
         ),
+        // BEP-014, BEP-059: a key was made, and the build refused it.
+        ReplaceError::Exportable(_) => format!(
+            "The {role} key was not replaced. The keychain made the new key exportable. This build does not use an exportable key. The old key is still in use."
+        ),
         ReplaceError::Remove(cause) | ReplaceError::Move(cause) => {
             format!("The {role} key was not replaced. The old key is still in use: {cause}.")
         }
@@ -3275,6 +3279,10 @@ mod tests {
             Ok(())
         }
 
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            Ok(slot == Slot::Held && self.pairs.lock().unwrap().contains_key(&role))
+        }
+
         fn relabel(&self, role: Role, _from: Slot, _to: Slot) -> Result<(), KeyError> {
             Err(KeyError::Store {
                 role,
@@ -3303,6 +3311,10 @@ mod tests {
 
         fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
             self.0.remove_in(role, slot)
+        }
+
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            self.0.holds_in(role, slot)
         }
 
         fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
@@ -3402,6 +3414,14 @@ mod tests {
             Ok(())
         }
 
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            Ok(if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().contains_key(&role)
+            } else {
+                self.side.lock().unwrap().contains_key(&(role, slot))
+            })
+        }
+
         fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
             if let Some(pair) = self.take(role, from) {
                 self.put(role, to, pair);
@@ -3442,6 +3462,40 @@ mod tests {
             std::fs::read(&path).unwrap(),
             published,
             "the new key is published"
+        );
+    }
+
+    // BEP-014, BEP-059, BEP-060: a release build refuses a new key that the
+    // keychain made exportable. The message says that a key was made and
+    // refused, not that none was made, and the old key stays in use.
+    #[test]
+    fn replace_key_refusal_of_an_exportable_key_keeps_the_old_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = KeepsOldStore {
+            inner: ExportableStore::holding_every_key(keys::Build::Release, &[]),
+            side: Mutex::default(),
+        };
+        let old = store.find(Role::Sealing).unwrap().unwrap().public();
+
+        let (code, log) = logged(|| replace_key(&store, Role::Sealing, &path, &[]));
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(!path.exists(), "no identity file is written");
+        assert_eq!(store.find(Role::Sealing).unwrap().unwrap().public(), old);
+        assert!(store.side.lock().unwrap().is_empty(), "no new key is kept");
+        assert_eq!(
+            log.matches("refused the new proxy key and kept the old key")
+                .count(),
+            1,
+            "{log}"
+        );
+
+        let Err(err) = keys::replace(&store, Role::Sealing) else {
+            panic!("the replacement kept an exportable key");
+        };
+        assert_eq!(
+            replace_failure(Role::Sealing, &err),
+            "The sealing key was not replaced. The keychain made the new key exportable. This build does not use an exportable key. The old key is still in use."
         );
     }
 
@@ -3551,7 +3605,7 @@ mod tests {
         let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
         assert_eq!(
             refused,
-            "The proxy did not start: the key store failed for the sealing key: the keychain made the key exportable."
+            "The proxy did not start: the keychain made the new sealing key exportable. This build does not use an exportable key."
         );
         assert!(
             !log.contains("although the keychain made it exportable"),

@@ -123,6 +123,15 @@ pub enum KeyError {
         /// What the store said.
         detail: String,
     },
+    /// The store made a key, the keychain made it exportable, and the
+    /// build refused it. The store holds no such key afterwards.
+    #[error(
+        "the keychain made the new {role} key exportable. This build does not use an exportable key"
+    )]
+    Exportable {
+        /// The role of the key.
+        role: Role,
+    },
 }
 
 /// A key that a [`KeyStore`] holds. No method returns the private half.
@@ -230,14 +239,11 @@ pub fn custody<K: HeldKey + ?Sized>(key: &K, build: Build) -> Custody {
 ///
 /// # Errors
 ///
-/// [`KeyError::Store`] when the build refuses `key` because the keychain
-/// made it exportable.
+/// [`KeyError::Exportable`] when the build refuses `key` because the
+/// keychain made it exportable.
 pub fn keep_generated<K: HeldKey + ?Sized>(key: &K) -> Result<(), KeyError> {
     match custody(key, custody_build(key)) {
-        Custody::Refused => Err(KeyError::Store {
-            role: key.role(),
-            detail: "the keychain made the key exportable".to_owned(),
-        }),
+        Custody::Refused => Err(KeyError::Exportable { role: key.role() }),
         Custody::Held | Custody::KeptExportable => Ok(()),
     }
 }
@@ -290,6 +296,13 @@ pub trait KeyStore {
     ///
     /// [`KeyError::Store`] when the store does not remove the key.
     fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError>;
+
+    /// Whether the store holds a key for `role` in `slot`.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Store`] when the store does not answer.
+    fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError>;
 
     /// Moves the key for `role` from slot `from` to slot `to`. The store
     /// holds no key in `to` when this runs. Moving from an empty slot moves
@@ -411,7 +424,9 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
                 }
                 // A locked store is not a refused key, and the replacement
                 // advice would delete a healthy key.
-                Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
+                Err(err @ (KeyError::Store { .. } | KeyError::Exportable { .. })) => {
+                    return Err(StartError::Store(err));
+                }
             },
             Ok(None) if published.contains(&role) => {
                 tracing::error!(role = %role, "the key store lost a published proxy key");
@@ -422,7 +437,9 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
                 tracing::error!(role = %role, error = %err, "the key store refused a proxy key");
                 refused.push(role);
             }
-            Err(err @ KeyError::Store { .. }) => return Err(StartError::Store(err)),
+            Err(err @ (KeyError::Store { .. } | KeyError::Exportable { .. })) => {
+                return Err(StartError::Store(err));
+            }
         }
     }
     // BEP-060: a first start finds no key at all. When the store holds a key
@@ -505,6 +522,10 @@ pub enum ReplaceError {
     /// No new key was generated, so the old key is still in use.
     #[error("no new key was made, so the old key is still in use: {0}")]
     Generate(KeyError),
+    /// A new key was made, and the build refused it because the keychain
+    /// made it exportable. The old key is still in use.
+    #[error("{0}. The old key is still in use")]
+    Exportable(KeyError),
     /// The new key did not take the role's label. It was removed, and the
     /// old key is still in use.
     #[error("the new key did not take the old key's place, so the old key is still in use: {0}")]
@@ -587,6 +608,7 @@ pub fn replace<S: KeyStore>(store: &S, role: Role) -> Result<S::Key, ReplaceErro
 /// # Errors
 ///
 /// [`ReplaceError::Generate`] when no new key was generated,
+/// [`ReplaceError::Exportable`] when the build refused the new key,
 /// [`ReplaceError::Remove`] when the old key did not move aside, and
 /// [`ReplaceError::Move`] when the new key did not take its place. The old
 /// key is still in use after each of these. [`ReplaceError::Restore`] when
@@ -597,16 +619,25 @@ pub fn replace_outcome<S: KeyStore>(
     role: Role,
 ) -> Result<Replaced<S::Key>, ReplaceError> {
     // A replacement that stopped after the old key moved aside leaves the
-    // role's label empty, and the old key in `Slot::Old`. Move it back
-    // before the cleanup below removes it. A refused or unreadable key is
-    // still under the label, so only an empty label takes the old key back.
+    // role's label empty, the old key in `Slot::Old` and the new key in
+    // `Slot::New`. Move the old key back before the cleanup below removes
+    // it. A refused or unreadable key is still under the label, so only an
+    // empty label takes the old key back. A key in `Slot::Old` with no key
+    // in `Slot::New` is a replaced key that a finished replacement did not
+    // remove. Values sealed to it are dead, so it never comes back.
+    // A store that does not say whether `Slot::New` holds a key stops the
+    // replacement, so the cleanup never removes an old key it can recover.
     if matches!(store.find(role), Ok(None)) {
-        store
-            .relabel(role, Slot::Old, Slot::Held)
-            .map_err(|err| {
-                tracing::error!(role = %role, error = %err, "did not move back the proxy key that an earlier replacement moved aside");
-                ReplaceError::Recover(err)
-            })?;
+        let interrupted = store.holds_in(role, Slot::New);
+        let recovered = match interrupted {
+            Ok(true) => store.relabel(role, Slot::Old, Slot::Held),
+            Ok(false) => Ok(()),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = recovered {
+            tracing::error!(role = %role, error = %err, "did not move back the proxy key that an earlier replacement moved aside");
+            return Err(ReplaceError::Recover(err));
+        }
     }
     // A replacement that stopped part way can leave keys in the other slots.
     for slot in [Slot::New, Slot::Old] {
@@ -614,6 +645,10 @@ pub fn replace_outcome<S: KeyStore>(
     }
     let key = match store.generate_in(role, Slot::New) {
         Ok(key) => key,
+        Err(err @ KeyError::Exportable { .. }) => {
+            tracing::warn!(role = %role, error = %err, "refused the new proxy key and kept the old key");
+            return Err(ReplaceError::Exportable(err));
+        }
         Err(err) => {
             tracing::warn!(role = %role, error = %err, "generated no new proxy key and kept the old key");
             return Err(ReplaceError::Generate(err));
@@ -960,6 +995,26 @@ mod keychain {
             }
         }
 
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            let found = ItemSearchOptions::new()
+                .class(ItemClass::key())
+                .key_class(KeyClass::private())
+                .label(&role.slot_label(slot))
+                .load_refs(true)
+                .limit(1i64)
+                .search();
+            match found {
+                Err(err) if err.code() == errSecItemNotFound => Ok(false),
+                // A key the keychain refuses is still a key in the slot.
+                Err(err) if DENIED.contains(&err.code()) => Ok(true),
+                Err(err) => Err(KeyError::Store {
+                    role,
+                    detail: err.to_string(),
+                }),
+                Ok(results) => Ok(!results.is_empty()),
+            }
+        }
+
         fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
             // SAFETY: the Security framework exports these constants for the
             // life of the process.
@@ -1247,6 +1302,14 @@ pub(crate) mod memory {
             Ok(())
         }
 
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            let inner = self.0.lock().unwrap();
+            if inner.broken {
+                return Err(broken(role));
+            }
+            Ok(inner.keys.contains_key(&(role, slot)))
+        }
+
         fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
             let mut inner = self.0.lock().unwrap();
             if inner.broken
@@ -1453,6 +1516,7 @@ mod tests {
         let store = MemoryStore::default();
         let kid = load(&store, &[]).unwrap().get(Role::Sealing).public().kid();
         let old = store.secret_bytes(Role::Sealing);
+        store.generate_in(Role::Sealing, Slot::New).unwrap();
         store.relabel(Role::Sealing, Slot::Held, Slot::Old).unwrap();
         store.fail_generation();
 
@@ -1460,8 +1524,26 @@ mod tests {
         assert!(matches!(err, ReplaceError::Generate(_)), "{err}");
         assert_eq!(store.held_in(Role::Sealing, Slot::Held), Some(old));
         assert_eq!(store.held_in(Role::Sealing, Slot::Old), None);
+        assert_eq!(store.held_in(Role::Sealing, Slot::New), None);
         let keys = load(&store, &Role::ALL).unwrap();
         assert_eq!(keys.get(Role::Sealing).public().kid(), kid);
+    }
+
+    // BEP-060, Gatehouse §6.10: a replaced key that a finished replacement
+    // did not remove stays in `Slot::Old` with no new key beside it. Values
+    // sealed to it are dead, so a later replacement removes it and never
+    // puts it back under the label.
+    #[test]
+    fn a_replaced_key_left_aside_is_not_put_back() {
+        let store = MemoryStore::default();
+        load(&store, &[]).unwrap();
+        store.relabel(Role::Sealing, Slot::Held, Slot::Old).unwrap();
+        store.fail_generation();
+
+        let err = replace(&store, Role::Sealing).unwrap_err();
+        assert!(matches!(err, ReplaceError::Generate(_)), "{err}");
+        assert_eq!(store.held_in(Role::Sealing, Slot::Held), None);
+        assert_eq!(store.held_in(Role::Sealing, Slot::Old), None);
     }
 
     // BEP-060: an old key that an earlier replacement moved aside and that
@@ -1471,6 +1553,9 @@ mod tests {
         let store = MemoryStore::default();
         load(&store, &[]).unwrap();
         let old = store.secret_bytes(Role::Sealing);
+        store.generate_in(Role::Sealing, Slot::New).unwrap();
+        let new = store.held_in(Role::Sealing, Slot::New);
+        assert!(new.is_some());
         store.relabel(Role::Sealing, Slot::Held, Slot::Old).unwrap();
         store.fail_move_back();
 
@@ -1478,7 +1563,7 @@ mod tests {
         assert!(matches!(err, ReplaceError::Recover(_)), "{err}");
         assert_eq!(store.held_in(Role::Sealing, Slot::Held), None);
         assert_eq!(store.held_in(Role::Sealing, Slot::Old), Some(old));
-        assert_eq!(store.held_in(Role::Sealing, Slot::New), None);
+        assert_eq!(store.held_in(Role::Sealing, Slot::New), new);
     }
 
     // BEP-060: an old key that the store does not remove is reported, not
