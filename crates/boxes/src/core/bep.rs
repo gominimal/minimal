@@ -266,6 +266,17 @@ impl TryFrom<GrantFields> for SecretGrant {
                     );
                 }
                 if word == SourceWord::Broker {
+                    // The old store-reference spelling (a broker scope that
+                    // names a store item) would skip the store rules, so it
+                    // is refused, not read as a broker grant (BEP-032).
+                    if let Some(scope) = fields.scopes.iter().find(|s| !s.starts_with("github:")) {
+                        return Err(format!(
+                            "A grant with source = \"broker\" takes only github: scopes, and \
+                             \"{scope}\" is not one. For a secret you stored with `min secret \
+                             set`, write source = \"store\", store = \"keychain\" and id = \
+                             \"<id>\" in place of source and scopes."
+                        ));
+                    }
                     GrantSource::Broker
                 } else {
                     GrantSource::ClientEnv
@@ -1775,13 +1786,18 @@ mod tests {
             grant
         );
 
-        let secrets = SecretGrants::from([
-            ("CLAUDE".to_string(), grant),
-            (
-                "OLD".to_string(),
-                toml::from_str("source = \"broker\"\nscopes = [\"claude\"]").expect("parses"),
-            ),
-        ]);
+        // The old spelling, a broker scope that names the item, is refused,
+        // so it cannot skip the store rules.
+        for scope in ["claude", "keychain:claude"] {
+            let err = toml::from_str::<SecretGrant>(&format!(
+                "source = \"broker\"\nscopes = [\"github:user-token\", \"{scope}\"]"
+            ))
+            .expect_err("a broker grant takes only github: scopes")
+            .to_string();
+            assert!(err.contains(&format!("\"{scope}\" is not one")), "{err}");
+            assert!(err.contains("source = \"store\""), "{err}");
+        }
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), grant)]);
         let references: Vec<StoreReference<'_>> = store_references(&secrets).collect();
         assert_eq!(
             references,
