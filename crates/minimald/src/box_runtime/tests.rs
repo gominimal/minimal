@@ -669,6 +669,74 @@ async fn an_attach_redraw_the_client_never_reads_does_not_wedge_the_host_loop() 
     attach.stop().await;
 }
 
+/// scenario 643b's control arm: a client that reads its redraw at full speed
+/// and types while it is still arriving must get the rest of the redraw and
+/// see the shell answer. The binding wrote the redraw with one `write_all`
+/// and read nothing from the channel meanwhile; russh queues every window
+/// adjust the client sends into that channel's bounded inbound queue and,
+/// once it is full, blocks its session loop on the keystroke. A blocked loop
+/// applies no more window adjusts, so the write starves on credit the
+/// client already granted: the duplex deadlock of #2197, on the attach path.
+/// The binding now drains the read half while a write is in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
+    let screen = truecolor_screen(BIG_SIZE);
+    let mut model = vt100::Parser::new(BIG_SIZE.rows, BIG_SIZE.cols, 0);
+    model.process(&screen);
+    let redraw = model.screen().state_formatted().len();
+    // The server's inbound queue holds 100 messages (russh's default) and the
+    // client's 16 KiB window sends an adjust per 16 KiB at most, so the queue
+    // is full after 1.6 MiB; the keystroke goes in at nine tenths of the
+    // redraw, which must be well past that.
+    let type_at = redraw * 9 / 10;
+    assert!(
+        type_at > 100 * 16 * 1024 * 5 / 4,
+        "the keystroke must land after the server's inbound queue has filled with window adjusts: {redraw}-byte redraw",
+    );
+
+    let mut attach = FloodedAttach::start_with(Duration::from_secs(30), BIG_SIZE, &screen).await;
+    // An idle shell, as in the scenario: the flood is not part of this
+    // failure, and with it the shell's echo of the keystroke would queue
+    // behind megabytes of its own output.
+    attach.feeder.abort();
+
+    // Read at full speed; type once at nine tenths of the redraw, as the
+    // scenario does, when the inbound queue is already full of window adjusts.
+    // The keystroke lands in the middle of one of the feeder's lines, so the
+    // shell's `got:` line carries it mid-line; the string itself comes back
+    // twice, as the tty's echo and in that line.
+    let needle = b"ping-643b";
+    let (mut got, mut typed, mut seen) = (0usize, false, Vec::new());
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(msg) = attach.channel.wait().await {
+            if let russh::ChannelMsg::Data { data } = msg {
+                got += data.len();
+                seen.extend_from_slice(&data);
+                if !typed && got >= type_at {
+                    typed = true;
+                    attach.channel.data(&b"ping-643b\n"[..]).await.unwrap();
+                }
+                if got >= redraw && seen.windows(needle.len()).filter(|w| w == needle).count() >= 2
+                {
+                    return;
+                }
+            }
+        }
+        panic!("the channel closed after {got} of {redraw} redraw bytes (typed: {typed})");
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a keystroke typed mid-redraw wedged the binding: {got} of {redraw} redraw bytes arrived (typed: {typed}), and the shell never answered",
+    );
+    assert!(
+        !attach.task.is_finished(),
+        "the session must outlive a keystroke typed mid-redraw"
+    );
+
+    attach.stop().await;
+}
+
 /// An attach the daemon ended exits non-zero, so a script can tell it from
 /// one the user ended. A detach and a session process that exited are the
 /// user's own ends and stay 0; a shed keeps ssh's 255.

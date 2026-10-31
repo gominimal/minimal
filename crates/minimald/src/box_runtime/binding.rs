@@ -403,6 +403,13 @@ pub(super) struct Binding {
 
 /// What the host keeps of an attached binding: its mailbox, its task, and
 /// the token that sheds it.
+/// How many inbound channel messages a binding stashes while one of its
+/// writes is in flight (see the write arm in [`Binding::run`]); a client
+/// cannot type that many packets in the time a write takes unless it is
+/// flooding, and a flooding client gets the old behaviour, bounded by its
+/// window.
+const DRAIN_STASH: usize = 256;
+
 pub(super) type BindingSlot = (mpsc::Sender<BindingMsg>, JoinHandle<()>, CancellationToken);
 
 /// The line a shed binding leaves on the terminal before its channel closes.
@@ -517,6 +524,47 @@ impl Binding {
         tokio::select! {
             _ = stdin_tx.send(StdinMsg::new(generation, kind)) => Ok(()),
             () = shed.cancelled() => Err(()),
+        }
+    }
+
+    /// What a channel message means to the host's stdin, if anything:
+    /// keystrokes, a pty request, a resize. Window adjusts (one per burst of
+    /// bytes forwarded, v. noisy) and duplicates of pre-attach requests the
+    /// connection handler already answered (russh buffers them into the
+    /// taken channel) mean nothing here.
+    fn stdin_kind(msg: russh::ChannelMsg) -> Option<StdinMsgKind> {
+        match msg {
+            russh::ChannelMsg::Data { data } => Some(StdinMsgKind::Bytes(data)),
+            russh::ChannelMsg::RequestPty {
+                want_reply: _,
+                term,
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+                terminal_modes,
+            } => Some(StdinMsgKind::TerminalUpdate(RequestedPty {
+                char_sizes: (col_width, row_height),
+                pixel_sizes: (pix_width, pix_height),
+                term: term.to_string(),
+                modes: terminal_modes.to_vec(),
+            })),
+            russh::ChannelMsg::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            } => Some(StdinMsgKind::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            }),
+            russh::ChannelMsg::WindowAdjusted { .. } => None,
+            _ => {
+                tracing::debug!("ignoring channel request on attached binding: {:?}", msg);
+                None
+            }
         }
     }
 
@@ -711,55 +759,11 @@ impl Binding {
                 res = rs.wait(), if remote_open => match res {
                     None => remote_open = false,
                     Some(msg) => {
-                        match msg {
-                            russh::ChannelMsg::Data{ data } => {
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, StdinMsgKind::Bytes(data)).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            }
-                            russh::ChannelMsg::RequestPty {
-                                want_reply: _,
-                                term,
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                                terminal_modes,
-                            } => {
-                                let update = StdinMsgKind::TerminalUpdate(RequestedPty {
-                                    char_sizes: (col_width, row_height),
-                                    pixel_sizes: (pix_width, pix_height),
-                                    term: term.to_string(),
-                                    modes: terminal_modes.to_vec(),
-                                });
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, update).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            },
-                            russh::ChannelMsg::WindowChange{
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                            } => {
-                                let change = StdinMsgKind::WindowChange {
-                                    col_width, row_height, pix_width, pix_height,
-                                };
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, change).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            },
-                            // Flow-control window updates fire on every
-                            // burst of bytes forwarded through the
-                            // channel, v. noisy.
-                            russh::ChannelMsg::WindowAdjusted { .. } => {}
-                            // Duplicates of pre-attach requests the
-                            // connection handler already answered (russh
-                            // buffers them into the taken channel); noise on
-                            // every healthy attach, so keep them out of
-                            // info-level field bundles.
-                            _ => tracing::debug!("ignoring channel request on attached binding: {:?}", msg),
-                        };
+                        if let Some(kind) = Self::stdin_kind(msg)
+                            && Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, kind).await.is_err()
+                        {
+                            break MainloopExitReason::Shed;
+                        }
                     }
                 },
                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
@@ -772,9 +776,34 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             // Raced against the shed: this is where a client
                             // that stopped draining parks the binding.
-                            let delivered = tokio::select! {
-                                _ = w.write_all(&b) => true,
-                                () = self.shed.cancelled() => false,
+                            //
+                            // The read half is drained meanwhile. A long
+                            // write (an attach redraw runs to megabytes)
+                            // otherwise leaves the channel's inbound queue
+                            // unread; russh's session loop blocks on that
+                            // queue when the client types, and a blocked loop
+                            // applies no more window adjusts, so the write
+                            // starves on credit the client already granted:
+                            // the duplex deadlock of #2197, on the attach
+                            // path. What arrives is stashed and handed to the
+                            // host after the write, in order; past
+                            // `DRAIN_STASH` entries the read half is left
+                            // alone again, so a client that floods input
+                            // while refusing output is bounded by its window
+                            // as before.
+                            let mut write = std::pin::pin!(w.write_all(&b));
+                            let mut stashed: VecDeque<StdinMsgKind> = VecDeque::new();
+                            let delivered = loop {
+                                tokio::select! {
+                                    _ = &mut write => break true,
+                                    () = self.shed.cancelled() => break false,
+                                    res = rs.wait(), if remote_open && stashed.len() < DRAIN_STASH => match res {
+                                        None => remote_open = false,
+                                        Some(msg) => if let Some(kind) = Self::stdin_kind(msg) {
+                                            stashed.push_back(kind);
+                                        },
+                                    },
+                                }
                             };
                             if !delivered {
                                 // Dropped mid-send like the dialog and the
@@ -782,6 +811,16 @@ impl Binding {
                                 // notice is not answered with the
                                 // interrupted write's byte count.
                                 w = ws.make_writer();
+                                break MainloopExitReason::Shed;
+                            }
+                            let mut shed_while_forwarding = false;
+                            for kind in stashed {
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, kind).await.is_err() {
+                                    shed_while_forwarding = true;
+                                    break;
+                                }
+                            }
+                            if shed_while_forwarding {
                                 break MainloopExitReason::Shed;
                             }
                         },
