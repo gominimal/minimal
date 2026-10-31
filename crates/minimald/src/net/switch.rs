@@ -8023,6 +8023,81 @@ pub(crate) mod tests {
             door_task.abort();
         }
 
+        /// BEP-062: a GitHub grant box with `steering = "dns"` or `"both"`,
+        /// its gate built as the VM host's attach builds it. While the
+        /// host reports the proxy's listener live, github.com resolves to
+        /// the proxy's address on the switch. While it is down, the lookup
+        /// is SERVFAIL. It never carries a real address.
+        #[tokio::test]
+        async fn a_dns_steered_grant_box_resolves_the_module_through_the_switch() {
+            use boxes::core::bep::{BepSettings, GrantSource};
+            for (index, steering) in [Steering::Dns, Steering::Both].into_iter().enumerate() {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let control_sock = dir.path().join("gvproxy.sock");
+                let door = dir.path().join("guest-control.sock");
+                let listening = Arc::new(AtomicBool::new(false));
+                let door_task = proxy_door(&door, Arc::clone(&listening));
+                crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+                // The policy the create request carries for a box whose
+                // `minimal.toml` declares a broker GitHub grant.
+                let mut policy = steered_policy();
+                policy.credentialed_upstream = Some(boxes::CredentialedUpstream {
+                    bep: BepSettings {
+                        steering: Some(steering),
+                        ..BepSettings::default()
+                    },
+                    secrets: [(
+                        "GH_TOKEN".to_string(),
+                        SecretGrant {
+                            source: GrantSource::Broker,
+                            scopes: vec!["github:user-token".to_string()],
+                            mode: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                });
+                let lease = Ipv4Addr::new(100, 64, 0, 30 + u8::try_from(index).expect("small"));
+                // The attach's own construction (`gvproxy_network.rs`).
+                let gate = BoxGate::for_session_steered(
+                    lease.to_string(),
+                    lease,
+                    &policy,
+                    SwitchSubnet::default(),
+                    None,
+                    ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone())),
+                );
+                let proxy = SwitchSubnet::default().box_egress_proxy_address();
+
+                let down = lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+                assert!(
+                    addresses(&down).is_empty(),
+                    "{steering:?}: no address while down"
+                );
+
+                listening.store(true, Ordering::Release);
+                for name in ["github.com.", "api.github.com."] {
+                    let live = lookup_until(&gate, name, ResponseCode::NoError).await;
+                    assert_eq!(
+                        addresses(&live),
+                        vec![proxy],
+                        "{steering:?}: {name} resolves to the proxy, never a real address"
+                    );
+                }
+
+                listening.store(false, Ordering::Release);
+                let down = lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+                assert!(
+                    addresses(&down).is_empty(),
+                    "{steering:?}: fails closed again"
+                );
+
+                crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+                door_task.abort();
+            }
+        }
+
         /// BEP-062: a native host runs no proxy and has no VM host daemon to
         /// ask, so a steered name always gets SERVFAIL.
         #[tokio::test]
