@@ -759,6 +759,7 @@ pub struct Sent {
     /// The request method is `CONNECT`: a `2xx` opens a tunnel.
     pub connect: bool,
     /// The request asks to leave HTTP/1.1, so it is the last on the flow.
+    /// The relay opens a tunnel on a `101` only when this is set.
     pub switches: bool,
 }
 
@@ -1328,9 +1329,10 @@ fn read_head<R: Read>(mut buf: Vec<u8>, reader: &mut R) -> Result<(Request, Vec<
 /// does this for each response on a kept-alive flow.
 ///
 /// A response to `HEAD`, a `1xx`, a `204` and a `304` have no body. A body
-/// that no header frames runs until the upstream closes. A `101`, or a `2xx`
-/// to `CONNECT`, leaves HTTP/1.1, and the relay copies the rest of the bytes
-/// unparsed. A response head that breaks the strict rules closes the flow,
+/// that no header frames runs until the upstream closes. A `101` to a
+/// request that asks to switch protocols, or a `2xx` to `CONNECT`, leaves
+/// HTTP/1.1, and the relay copies the rest of the bytes unparsed. A `101` to
+/// any other request closes the flow. A response head that breaks the strict rules closes the flow,
 /// and no byte of it reaches the box.
 ///
 /// It ends when the upstream closes. When the request half refuses a
@@ -1422,6 +1424,13 @@ where
             let mut response = self.head().await?;
             let request =
                 *current.get_or_insert_with(|| self.flow.sent.try_recv().unwrap_or_default());
+            // A `101` leaves HTTP/1.1 only for a request that asked to. Any
+            // other `101` would end the parse, and every later response
+            // would reach the box unread, with its `Alt-Svc` (BEP-076). So
+            // the flow closes before a byte of it reaches the box.
+            if response.status == 101 && !request.switches {
+                return Err(self.broken("unsolicited_switch"));
+            }
             if response.headers.iter().any(|h| h.name == "alt-svc") {
                 response.strip_alt_svc();
                 tracing::debug!(
@@ -3601,7 +3610,126 @@ mod tests {
         assert_eq!(reason.rule(), "h2_prior_knowledge_preface");
         assert!(upstream.is_empty(), "no byte reaches the upstream");
         assert!(records.lock().unwrap().is_empty());
-        assert!(relayed(responses, b"").is_empty(), "the box gets nothing");
+        let mut responses = responses;
+        assert!(
+            responses.sent.try_recv().is_err(),
+            "the response half has no request to answer"
+        );
+    }
+
+    // BEP-076: a `101` to a request that did not ask to switch protocols
+    // closes the flow. Neither the `101` nor any later byte reaches the box,
+    // so a later `Alt-Svc` cannot pass unread.
+    #[test]
+    fn unsolicited_switch_is_refused() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (upstream, _) = forwarded(&flow, b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\n");
+        assert!(!upstream.is_empty());
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 101 Switching\r\n\r\n\
+              HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(client.is_empty(), "{:?}", String::from_utf8_lossy(&client));
+    }
+
+    // A `101` to a request that asks to switch protocols still opens the
+    // tunnel: the box gets the head, then the bytes after it unparsed.
+    #[test]
+    fn solicited_switch_opens_the_tunnel() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (_, end) = forwarded(
+            &flow,
+            b"GET /ws HTTP/1.1\r\nHost: api.github.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        assert!(
+            matches!(end, HalfEnd::Closed(CloseReason::ProtocolSwitch { .. })),
+            "{end:?}"
+        );
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\x81\x02hi",
+        );
+        assert_eq!(
+            client,
+            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n\x81\x02hi"
+        );
+    }
+
+    // BEP-076: a chunked body that breaks the framing rules stops the relay.
+    // The box keeps what arrived before the break, and no later byte, so a
+    // later response with an `Alt-Svc` never reaches it.
+    #[test]
+    fn broken_chunked_body_stops_the_relay() {
+        let head = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+        let next = "HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\nContent-Length: 0\r\n\r\n";
+        let trailer = format!("X-Trailer: {}\r\n", "a".repeat(4000)).repeat(17);
+        let cases = [
+            ("bad chunk size", format!("zz\r\n{next}"), ""),
+            (
+                "no CRLF after the chunk data",
+                format!("2\r\nabXY\r\n{next}"),
+                "2\r\nab",
+            ),
+            ("oversized trailer", format!("0\r\n{trailer}\r\n{next}"), ""),
+            ("EOF in a chunk", "5\r\nab".to_owned(), "5\r\nab"),
+        ];
+        for (case, body, kept) in cases {
+            let (_, audit) = memory_audit();
+            let flow = plain_flow("api.github.com", audit);
+            let responses = flow.responses();
+            let (_, end) = forwarded(
+                &flow,
+                b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\nGET /b HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            );
+            assert!(
+                matches!(end, HalfEnd::Closed(CloseReason::ClientClosed)),
+                "{case}: {end:?}"
+            );
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            let client = relayed(responses, raw.as_bytes());
+            assert_eq!(
+                String::from_utf8(client).unwrap(),
+                format!("{head}{kept}"),
+                "{case}"
+            );
+        }
+    }
+
+    // BEP-076: a `204` and a `304` have no body, so the next bytes are read
+    // as a head and lose their `Alt-Svc`. A body that no header frames runs
+    // until the upstream closes, and reaches the box as it arrived.
+    #[test]
+    fn bodiless_and_close_delimited_responses_are_relayed() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (_, end) = forwarded(
+            &flow,
+            b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\n\
+              GET /b HTTP/1.1\r\nHost: api.github.com\r\n\r\n\
+              GET /c HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        );
+        assert!(
+            matches!(end, HalfEnd::Closed(CloseReason::ClientClosed)),
+            "{end:?}"
+        );
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 204 No Content\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+              HTTP/1.1 304 Not Modified\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+              HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\n\r\nall of it, until close",
+        );
+        assert_eq!(
+            String::from_utf8(client).unwrap(),
+            "HTTP/1.1 204 No Content\r\n\r\n\
+             HTTP/1.1 304 Not Modified\r\n\r\n\
+             HTTP/1.1 200 OK\r\n\r\nall of it, until close"
+        );
     }
 
     // BEP-077: the forwarded head is the canonical serialization of the
