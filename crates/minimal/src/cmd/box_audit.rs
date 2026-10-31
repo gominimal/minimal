@@ -889,6 +889,49 @@ mod tests {
         assert_eq!(err, format!("Showing web (box {shown}).\n"));
     }
 
+    // BEP-032, BEP-067: the proxy refuses a store member whose handle
+    // does not verify, and writes the record under the box id in its own
+    // spelling, 32 lowercase hex digits. The box's audit shows the refusal,
+    // the item as `<store>:<id>` and the handle's `jti` on one line.
+    #[test]
+    fn box_audit_shows_a_refused_store_handle_with_its_item_and_jti() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path().join(segment_name(1))).unwrap();
+        let refused = Decision {
+            kind: Kind::Decision,
+            box_id: hex(A),
+            authority: "api.openai.com:443".to_owned(),
+            identifier: Some("keychain:openai-key".to_owned()),
+            jti: "jti-store-7".to_owned(),
+            mapping: Mapping::ModuleUnmapped,
+            outcome: Outcome::Refuse,
+            marker: Some("store_handle_invalid".to_owned()),
+        };
+        assert_eq!(refused.box_id, "01920000000070008000000000000001");
+        log.append(&refused).unwrap();
+        log.append(&decision(B, "other.example:443")).unwrap();
+        drop(log);
+
+        let (result, out, err) =
+            run_to_strings(&args(Some(A), None, false), &[], false, dir.path());
+        result.unwrap();
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        let line = out.lines().next().unwrap();
+        assert!(
+            line.starts_with("decision  refuse  api.openai.com:443  "),
+            "{line}"
+        );
+        assert!(line.contains("  keychain:openai-key  "), "{line}");
+        assert!(line.contains("  store_handle_invalid  "), "{line}");
+        assert!(line.ends_with("  jti=jti-store-7"), "{line}");
+        assert_eq!(
+            out,
+            "decision  refuse  api.openai.com:443  keychain:openai-key  \
+             module_unmapped module_unmapped  store_handle_invalid  jti=jti-store-7\n"
+        );
+    }
+
     // BEP-042: --follow replays the box's records and then tails new ones.
     #[test]
     fn box_audit_follow_stops_when_the_reader_closes() {
