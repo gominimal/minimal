@@ -284,14 +284,16 @@ fn credentialed_upstream_for(
 /// of the variables the box spec's own environment sets. It checks the project's settings
 /// whether or not they declare a credentialed upstream, so a contradiction
 /// in `[session.network.bep]` alone is still refused. The refusal ends the
-/// run with exit 3 (`main.rs`). Every host today is un-enrolled and has no
-/// box-zone resolver.
+/// run with exit 3 (`main.rs`). Every host today is un-enrolled.
+/// `box_zone_resolver` is [`host_resolves_box_names`] for this host and
+/// box (BEP-017).
 fn refuse_unhonourable_grants(
     network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     settings: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
     full_breadth_acknowledged: bool,
+    box_zone_resolver: bool,
     spec_env: &[String],
 ) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
@@ -310,15 +312,45 @@ fn refuse_unhonourable_grants(
     // `min box spec` reads, so the preview and the start agree.
     let host = HostFacts {
         full_breadth_acknowledged,
+        box_zone_resolver,
         ..HostFacts::LOCAL
     };
-    let mut plan = check_activation(&spec, host, &hosts)?;
+    let checked = check_activation(&spec, host, &hosts);
+    tracing::info!(
+        box_zone_resolver = host.box_zone_resolver,
+        steering = settings.resolved_steering().word(),
+        accepted = checked.is_ok(),
+        "checked the box spec's grants against this host"
+    );
+    let mut plan = checked?;
     // BEP-011: a spec that sets a trust variable keeps its value, and says so.
     plan.warn_spec_trust_env(spec_env.iter().map(String::as_str));
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
     Ok(plan.warnings)
+}
+
+/// Whether a box with `network` and `steering` on a host of `kind` reaches
+/// the proxy through a switch that steers the credential module's names
+/// (BEP-017, BEP-062). On the VM host, an own-address box's lookups go
+/// through the VM host's switch. Its DNS gate answers a steered name with
+/// the proxy's address while the proxy's listener is live, and SERVFAIL
+/// while it is down. Only `both` counts. The proxy listens on its proxy
+/// port alone and reads only CONNECT or an absolute-form request, so a
+/// `dns`-only box, which has no `HTTPS_PROXY` (BEP-012), opens port 443 at
+/// the proxy's address and its connection is dropped. `dns` stays refused
+/// until the proxy takes a direct TLS connection. A native host has no
+/// proxy, so a steered name there always fails closed, and a `host_ip` or
+/// `none` box has no steered lookups of its own.
+pub(crate) fn host_resolves_box_names(
+    kind: paths::HostKind,
+    network: boxes::NetworkMode,
+    steering: boxes::core::bep::Steering,
+) -> bool {
+    kind == paths::HostKind::Minvmd
+        && network == boxes::NetworkMode::OwnIp
+        && steering == boxes::core::bep::Steering::Both
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -1211,12 +1243,18 @@ pub(crate) async fn activate_box(
                 .values()
                 .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
                 && crate::config::full_breadth_acknowledged(global)?;
+            let network: boxes::NetworkMode = args.network.into();
             refuse_unhonourable_grants(
-                args.network.into(),
+                network,
                 policy.egress.as_ref(),
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
+                host_resolves_box_names(
+                    daemon_host_kind(global),
+                    network,
+                    project_bep.resolved_steering(),
+                ),
                 &project_env,
             )?;
             // BEP-034/035/036: each store reference needs a rule that admits
@@ -2840,6 +2878,7 @@ mod tests {
                 &bep,
                 &secrets,
                 acknowledged,
+                false,
                 &spec_env,
             )
             .expect_err("refused for the egress");
@@ -2892,6 +2931,7 @@ mod tests {
                 &bep,
                 &secrets,
                 false,
+                false,
                 &spec_env,
             )
             .expect("accepted")
@@ -2929,6 +2969,7 @@ mod tests {
             None,
             &bep,
             &secrets,
+            false,
             false,
             &spec_env,
         )
@@ -3173,13 +3214,148 @@ mod tests {
         };
         let secrets = boxes::core::bep::SecretGrants::new();
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        let err =
-            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false, &[])
-                .expect_err("refused");
+        let err = refuse_unhonourable_grants(
+            boxes::NetworkMode::OwnIp,
+            None,
+            &bep,
+            &secrets,
+            false,
+            false,
+            &[],
+        )
+        .expect_err("refused");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
         assert_eq!(refused.exit_code(), 3);
+    }
+
+    /// BEP-017, BEP-062: a GitHub grant box with `both` steering is created
+    /// where the VM host's switch resolves its names, and `min box spec`
+    /// shows it. `dns`, declared or by default, is refused with exit 3 on
+    /// every host, because the proxy takes no direct TLS connection. On a
+    /// native host, and for a `host_ip` box, `both` is refused too. For
+    /// every case, `min box spec` refuses exactly when creation does.
+    #[test]
+    fn dns_steering_is_admitted_where_the_switch_resolves_boxes() {
+        use boxes::core::bep::Steering;
+        use paths::HostKind;
+        assert!(host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::OwnIp,
+            Steering::Both
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::OwnIp,
+            Steering::Dns
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minimald,
+            boxes::NetworkMode::OwnIp,
+            Steering::Both
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::HostNet,
+            Steering::Both
+        ));
+        let github_hosts: Vec<&str> = bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host)
+            .collect();
+        let egress = boxes::EgressPolicy {
+            allow_dns_hosts: Some(github_hosts.iter().map(|h| (*h).to_string()).collect()),
+            ..boxes::EgressPolicy::default()
+        };
+        // No steering declared resolves to `dns`.
+        for (declared, word) in [
+            ("", "dns"),
+            ("steering = \"dns\"\n", "dns"),
+            ("steering = \"both\"\n", "both"),
+        ] {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!(
+                    "[session.network.bep]\n{declared}\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n"
+                ),
+            )
+            .expect("write minimal.toml");
+            let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
+            let steering = bep.resolved_steering();
+            assert_eq!(steering.word(), word);
+            let refusal = format!(
+                "This box declares a secret with steering = \"{word}\", but this host \
+                 has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
+            );
+
+            for (kind, network) in [
+                (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
+                (HostKind::Minimald, boxes::NetworkMode::OwnIp),
+                (HostKind::Minvmd, boxes::NetworkMode::HostNet),
+            ] {
+                let resolver = host_resolves_box_names(kind, network, steering);
+                let accepted = word == "both"
+                    && kind == HostKind::Minvmd
+                    && network == boxes::NetworkMode::OwnIp;
+                let case = format!("{word} {kind:?} {network:?}");
+
+                let created = refuse_unhonourable_grants(
+                    network,
+                    Some(&egress),
+                    &bep,
+                    &secrets,
+                    false,
+                    resolver,
+                    &spec_env,
+                );
+                // `min box spec` reads the same fact for this host.
+                let rules = boxes::core::bep::StoreRules::new();
+                let mut out = Vec::new();
+                let previewed = crate::cmd::box_spec::render(
+                    &crate::cmd::box_spec::SpecInputs {
+                        root_fingerprint: None,
+                        bep: &bep,
+                        quic443: None,
+                        secrets: &secrets,
+                        acknowledged: false,
+                        box_zone_resolver: resolver,
+                        github_hosts: &github_hosts,
+                        store_rules: &rules,
+                    },
+                    &mut out,
+                );
+                assert_eq!(
+                    created.is_ok(),
+                    previewed.is_ok(),
+                    "{case}: min box spec and creation agree"
+                );
+
+                if accepted {
+                    let warnings = created.unwrap_or_else(|err| panic!("{case}: accepted: {err}"));
+                    assert!(warnings.is_empty(), "{case}: no warning: {warnings:?}");
+                    let text = String::from_utf8(out).expect("utf-8");
+                    assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    continue;
+                }
+                for err in [
+                    created.expect_err("creation refuses"),
+                    previewed.expect_err("min box spec refuses"),
+                ] {
+                    let refused = err
+                        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                        .expect("the refusal is the box spec refusal");
+                    assert_eq!(refused.exit_code(), 3, "{case}");
+                    assert_eq!(refused.to_string(), refusal, "{case}");
+                }
+            }
+        }
     }
 }
 
