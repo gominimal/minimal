@@ -3757,7 +3757,7 @@ async fn activate_and_ls_report_native_surface() {
     // the port the proxy's half of the line names, and the port a hook
     // would have to route to.
     let mut client = connect_daemon(&args).await.unwrap();
-    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
     let port = resp
         .hostname_proxy_port
         .expect("the proxy must report the port it landed on");
@@ -3857,6 +3857,17 @@ async fn activate_and_ls_report_native_surface() {
     // live surface, the proxy's half stays beside it (NET-019), and neither
     // the NET-122 advisory nor the pointer a native host no longer needs
     // rides it.
+    // A box that reports its own range address (T110): the BOX NAMES row
+    // reads the own-address form only when a box proves it is off the
+    // `127.0.0.1` fallback.
+    resp.box_networks.insert(
+        boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(Ipv4Addr::new(127, 0, 64, 2)),
+            egress_posture: None,
+            at_fallback: Some(false),
+        },
+    );
     let mut native_out = Vec::new();
     format_ls(
         &mut native_out,
@@ -4038,9 +4049,11 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     // The verdict beside it: the query proved the answerer live and this
     // host's facts held, so the surface the CLI computed prints through —
-    // the same `BOX NAMES` line the native host's list carries.
+    // the same `BOX NAMES` line the native host's list carries. No box is
+    // listed, so none proves it is off the `127.0.0.1` fallback, and the
+    // row reads the fallback form (T110).
     assert!(
-        holder_ls.contains("BOX NAMES:       <box>.min.internal opens at its name on this machine"),
+        holder_ls.contains("BOX NAMES:       <box>.min.internal resolves on this machine"),
         "the VM-host verdict rides the list like a native one: {holder_ls}"
     );
     assert!(

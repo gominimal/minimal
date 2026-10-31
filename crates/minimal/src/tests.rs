@@ -3118,7 +3118,7 @@ async fn ls_shows_vm_per_box() {
     let api = create_box_on(&default_vm, "api").await;
     let web = create_box_on(&alpha, "web").await;
 
-    let listings = cmd::ls_listings(&vm_globals(state.path(), None))
+    let mut listings = cmd::ls_listings(&vm_globals(state.path(), None))
         .await
         .expect("listing a two-VM host succeeds");
     assert_eq!(listings.len(), 2, "a two-VM host lists both VMs");
@@ -3139,6 +3139,16 @@ async fn ls_shows_vm_per_box() {
     // machine's port says so while a sibling registered with another
     // daemon names that holder instead — one `Holder` and one `Registered`
     // here, fed the same way.
+    // The named VM's box reports its own range address, as a published box
+    // does (T110), so its BOX NAMES row can read the own-address form.
+    listings[1].resp.box_networks.insert(
+        web,
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 2)),
+            egress_posture: None,
+            at_fallback: Some(false),
+        },
+    );
     let surfaces = vec![
         Some(crate::resolver::LiveSurface::Proxy),
         Some(crate::resolver::LiveSurface::Native),
@@ -5299,6 +5309,16 @@ fn ls_shows_box_loopback_address_names_row_follows_any_fallback_box() {
     assert_eq!(
         row(&[("own", at(own, false), None)]),
         format!("BOX NAMES:       {opens}")
+    );
+    assert_eq!(
+        row(&[("unreported", None, None)]),
+        format!("BOX NAMES:       {resolves}"),
+        "a listing that proves no box off the fallback reads the fallback form"
+    );
+    assert_eq!(
+        row(&[]),
+        format!("BOX NAMES:       {resolves}"),
+        "a listing with no box reads the fallback form"
     );
 }
 
