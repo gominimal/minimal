@@ -1274,15 +1274,23 @@ fn audit_segment_override(value: Option<&std::ffi::OsStr>) -> Option<u64> {
 /// debug build, the segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when
 /// it is set. A release build always keeps [`audit::SEGMENT_BYTES`].
 fn audit_rotation() -> audit::Rotation {
-    let set = std::env::var_os(AUDIT_SEGMENT_BYTES_ENV);
-    if !cfg!(debug_assertions) && set.is_some() {
+    audit_rotation_for(
+        std::env::var_os(AUDIT_SEGMENT_BYTES_ENV),
+        cfg!(debug_assertions),
+    )
+}
+
+/// [`audit_rotation`] for the value `set` of [`AUDIT_SEGMENT_BYTES_ENV`],
+/// in a debug build when `debug` is true and a release build when false.
+fn audit_rotation_for(set: Option<std::ffi::OsString>, debug: bool) -> audit::Rotation {
+    if !debug && set.is_some() {
         tracing::warn!(
             variable = AUDIT_SEGMENT_BYTES_ENV,
             bound = audit::SEGMENT_BYTES,
             "ignored the audit segment test override: this is a release build"
         );
     }
-    let value = set.filter(|_| cfg!(debug_assertions));
+    let value = set.filter(|_| debug);
     let bound = audit_segment_bound(value.as_deref());
     match (value.is_some(), audit_segment_override(value.as_deref())) {
         (true, Some(_)) => tracing::info!(
@@ -1981,6 +1989,14 @@ mod tests {
             assert_eq!(audit_segment_override(Some(OsStr::new(ignored))), None);
         }
         assert_eq!(audit_segment_override(Some(OsStr::new("512"))), Some(512));
+
+        // The gate that `open_audit_log` goes through: a debug build takes
+        // the override, and a release build keeps the default bound.
+        let set = || Some(std::ffi::OsString::from("512"));
+        assert_eq!(audit_rotation_for(set(), true).bound, 512);
+        assert_eq!(audit_rotation_for(set(), false).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, true).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, false).bound, audit::SEGMENT_BYTES);
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("audit");
