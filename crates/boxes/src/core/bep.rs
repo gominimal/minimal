@@ -581,8 +581,11 @@ pub enum BepRefusal {
     /// Gatehouse §6.2: a GitHub grant where no node-local proxy serves
     /// boxes. Its defined error is [`GATEHOUSE_UNENROLLED_NODE`].
     UnenrolledNode {
-        /// The GitHub grants, in name order.
+        /// The grants the proxy serves, in name order.
         grants: Vec<String>,
+        /// Whether any of `grants` is a `source = "store"` reference. The
+        /// text then names them as secrets, not as GitHub grants.
+        stored: bool,
         /// Why no proxy serves boxes, as far as the creator can tell.
         cause: ProxyAbsence,
     },
@@ -726,11 +729,16 @@ impl fmt::Display for BepRefusal {
                 "This box declares a GitHub grant, and no GitHub sign-in is held on this \
                  machine. Run `min auth login`, then create the box again."
             ),
-            Self::UnenrolledNode { grants, cause } => {
+            Self::UnenrolledNode {
+                grants,
+                stored,
+                cause,
+            } => {
                 let grants = grants.join(", ");
+                let kind = if *stored { "secret" } else { "GitHub grant" };
                 write!(
                     f,
-                    "Cannot create the box: it declares the GitHub grant {grants}, and "
+                    "Cannot create the box: it declares the {kind} {grants}, and "
                 )?;
                 write!(f, "{cause}")?;
                 write!(
@@ -1059,16 +1067,25 @@ pub fn require_proxy(
         .map(|(name, _)| name.clone())
         .collect();
     match absence {
-        Some(cause) if !grants.is_empty() => Err(unenrolled_node(grants, cause)),
+        Some(cause) if !grants.is_empty() => Err(unenrolled_node(grants, false, cause)),
         _ => Ok(()),
     }
 }
 
-/// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the GitHub grants `grants`,
-/// for the cause `cause`. Logs one debug line.
+/// The [`GATEHOUSE_UNENROLLED_NODE`] refusal of the grants `grants`, for
+/// the cause `cause`. `stored` says whether any of them is a store
+/// reference. Logs one debug line.
 #[must_use]
-pub fn unenrolled_node(grants: Vec<String>, cause: ProxyAbsence) -> ActivationRefused {
-    let refusal = BepRefusal::UnenrolledNode { grants, cause };
+pub fn unenrolled_node(
+    grants: Vec<String>,
+    stored: bool,
+    cause: ProxyAbsence,
+) -> ActivationRefused {
+    let refusal = BepRefusal::UnenrolledNode {
+        grants,
+        stored,
+        cause,
+    };
     tracing::debug!(
         rule = refusal.rule(),
         fields = refusal.fields(),

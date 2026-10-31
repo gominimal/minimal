@@ -444,6 +444,10 @@ GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
 SR_ID="" # the store-reference proof's Keychain item; removed on teardown
 R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
 R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
+AR_AUDIT_EDIT="" # the audit segment the rotation proof edits; restored on teardown
+AR_AUDIT_BACKUP="" # its original bytes
+AR_AUDIT_DIR="" # the audit directory the rotation proof gives back on teardown
+AR_AUDIT_SAVED="" # where the real one waits meanwhile, or "none" when it did not exist
 PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
@@ -1073,6 +1077,12 @@ teardown() {
   # The round-three walk's planted audit segment: a proxy start refuses a
   # log that holds it, so a run that died with it in place must not keep it.
   [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+  # The rotation proof's edited audit segment goes back to its own bytes,
+  # before the `rm -rf "$WORK"` below removes the copy.
+  ar_restore_edit
+  # Its own audit directory goes, and the real one is renamed back. The
+  # stop above leaves no proxy to write them.
+  ar_restore_audit
   [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
@@ -5069,8 +5079,9 @@ echo "::endgroup::"
 #   * `http://<name>.min.internal:8080` returns the in-box server's response,
 #     through the resolver file the same script wrote;
 #   * the box's own range address (the zone answerer's A record for its name)
-#     returns the same response at port 8080.
-# That `min ls` names the address belongs to T110 (#2696), which adds it.
+#     returns the same response at port 8080;
+#   * `min ls` shows the same range address in the box's ADDRESS column,
+#     never `-` or the `127.0.0.1` fallback.
 # The host is restored on every exit: the range unit, its aliases, the
 # resolver file and the answerer service go (range_teardown_unit,
 # answerer_service_teardown — the teardown repeats both if the case dies).
@@ -5219,10 +5230,19 @@ fresh_install_range_lands_on_macos() {
     fi
   done
 
+  # The listing shows the address the zone answers for the box (T110).
+  mnl ls >"$WORK/fi-range-ls.out" 2>&1 || true
+  if ! grep -F -- "$frm_name" "$WORK/fi-range-ls.out" | grep -qF -- " $frm_addr "; then
+    echo "::error::'min ls' does not show $frm_addr on the $frm_name row, the address the zone answers for it"
+    cat "$WORK/fi-range-ls.out" 2>/dev/null || true
+    fail
+  fi
+  echo "min ls shows $frm_addr on the $frm_name row"
+
   mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
   range_teardown_unit
   answerer_service_teardown
-  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls shows $frm_addr, host restored)"
   echo "::endgroup::"
 }
 
@@ -6614,8 +6634,18 @@ __e2e_same_shell=yes' \
     fail
   fi
   # Keeping at the exit prompt is a detach, and the session must survive it.
-  if ! mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
+  # Capture-then-match, never `mnl ls --raw | grep -q`: grep's early exit
+  # SIGPIPEs the CLI under pipefail, and a failed listing would read as a
+  # gone session. On a miss, print what the listing said and its stderr so
+  # a failed `min ls` is told apart from a session that is truly gone.
+  hook_ls_status=0
+  hook_ls="$(mnl ls --raw 2>"$WORK/hooks-ls.err")" || hook_ls_status=$?
+  if ! printf '%s\n' "$hook_ls" | grep -Fq -- "$hook_sid"; then
     echo "::error::session gone after answering the exit prompt with 'keep'"
+    echo "--- min ls --raw (exit $hook_ls_status) ---"; printf '%s\n' "$hook_ls"
+    echo "--- min ls --raw stderr ---"; cat "$WORK/hooks-ls.err" 2>/dev/null || true
+    echo "--- attach transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- attach stderr ---"; cat "$WORK/hooks-attach.err" 2>/dev/null || true
     fail
   fi
   # `on_detach` is headless (the terminal it would have used is the thing
@@ -7820,8 +7850,10 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'resolves on this machine' "$range2_err"; then
-    echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
+  # The range is present and the box is off the interim, so its ports
+  # answer at its own address: the host line reads the own-address form.
+  if ! grep -qF -- "names: $RANGE_NAME-2.min.internal opens at its name on this machine" "$range2_err"; then
+    echo "::error::a session started after the range step does not say its box opens at its name on this machine (the host probe must read present, and the box must be off the 127.0.0.1 interim)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
@@ -9317,10 +9349,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'resolves on this machine' \
+  # The box publishes at its own leased address (asserted below), so its
+  # host line reads the own-address form, never the 127.0.0.1 fallback form.
+  bn_api_surface="$(grep -F -- 'opens at its name on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its box opens at its name on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9329,7 +9363,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # the hostname proxy still serves beside native DNS (NET-019) is `min
   # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
-    "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
+    "names: $BN_API_NAME.min.internal opens at its name on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
@@ -9412,18 +9446,20 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_ls="$(mnl ls 2>&1 || true)"
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
   bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
+  # Both boxes stand at their own addresses, so no box is on the fallback
+  # and the row reads the own-address form, as the activate line did.
   case "$bn_surface_line" in
-    *"resolves through this machine's DNS"*) ;;
+    *"<box>.min.internal opens at its name on this machine"*) ;;
     *)
-      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names open at their names on this machine (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
+    *"the HTTP proxy at 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
+      echo "::error::min ls's BOX NAMES line does not name the HTTP proxy that still serves (NET-019)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
@@ -15367,6 +15403,309 @@ proof_bep_round_three_conditions_closed() {
   if [ "$r3_ran" = 0 ]; then
     not_run bep_round_three_conditions_closed "none of its cases can run on this lane"
   fi
+}
+
+# Audit rotation proof (BEP-068, BEP-042, BEP-049). The case restarts the
+# daemon pair with BEP_AUDIT_SEGMENT_BYTES set, so `bep serve` rotates its
+# audit log at a small bound. A grant box then sends 'gh api user' until the
+# log rotates twice. The case checks, in order:
+#   1. bep.log names the bound at the start and logs each rotation.
+#   2. The chain verifies across the new segments.
+#   3. `min box audit` shows every record of the box, from every segment.
+#   4. With the proxy down, one record is edited, and `min doctor` reports
+#      the break and exits 6.
+#   5. With the record restored, `min doctor` reports the chain verified.
+# bep has no setting that moves its audit directory from
+# $HOME/.minimal/bep/audit, and min doctor and min box audit read that path.
+# The small bound prunes segments past the retained count, so the case must
+# not run against the real log. Before the restart, with no proxy up, the
+# case renames the real directory to audit.e2e-saved beside it. The proxy
+# then writes a new, empty directory of the case's own. No process opens
+# the real log while the case runs, so nothing in it rotates or is pruned.
+# On every exit, and in the teardown, the case removes its own directory
+# once no proxy writes it, and renames the real one back.
+ar_segment_numbers() { # $1 = the audit directory; prints the segment numbers, sorted
+  find "$1" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n
+}
+ar_restore_edit() {
+  if [ -n "$AR_AUDIT_EDIT" ] && [ -f "$AR_AUDIT_BACKUP" ]; then
+    cp -p "$AR_AUDIT_BACKUP" "$AR_AUDIT_EDIT"
+  fi
+  AR_AUDIT_EDIT=""
+  AR_AUDIT_BACKUP=""
+}
+# Removes the rotation proof's own audit directory and renames the real
+# one back. It runs only when no `bep serve` of this run writes the log.
+# Otherwise it keeps the real directory where it waits, and names it.
+ar_restore_audit() {
+  if [ -z "$AR_AUDIT_DIR" ] || [ -z "$AR_AUDIT_SAVED" ]; then
+    AR_AUDIT_DIR=""
+    AR_AUDIT_SAVED=""
+    return 0
+  fi
+  for _ in $(seq 1 20); do
+    [ -z "$(r3_proxy_pids)" ] && break
+    sleep 0.5
+  done
+  if [ -n "$(r3_proxy_pids)" ]; then
+    if [ "$AR_AUDIT_SAVED" = none ]; then
+      echo "::error::the audit directory $AR_AUDIT_DIR of the rotation case was not removed: a bep serve still writes it"
+    else
+      echo "::error::the audit log in $AR_AUDIT_DIR was not given back: a bep serve still writes it. The real log is in $AR_AUDIT_SAVED. Stop bep, remove $AR_AUDIT_DIR, and rename $AR_AUDIT_SAVED to $AR_AUDIT_DIR"
+    fi
+    return 0
+  fi
+  if [ "$AR_AUDIT_SAVED" = none ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    echo "removed the audit directory of the rotation case, $AR_AUDIT_DIR"
+  elif [ -d "$AR_AUDIT_SAVED" ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    if mv "$AR_AUDIT_SAVED" "$AR_AUDIT_DIR"; then
+      echo "gave back the real audit log in $AR_AUDIT_DIR, as it was before the rotation case"
+    else
+      echo "::error::the real audit log was not renamed back. It is in $AR_AUDIT_SAVED. Rename it to $AR_AUDIT_DIR"
+      return 0
+    fi
+  fi
+  AR_AUDIT_DIR=""
+  AR_AUDIT_SAVED=""
+}
+proof_bep_audit_rotation_and_doctor_end_to_end() {
+  echo "::group::audit log rotation: the chain carries across segments, min box audit reads them all, min doctor reports an edit"
+  local ar_case=bep_audit_rotation_and_doctor_end_to_end
+  local ar_name=e2e-bep-audit-rotation ar_bound=4096
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local ar_control="$HOME/.minimal/bep/control.sock"
+  local ar_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  local ar_audit ar_first ar_last ar_new ar_try ar_rot ar_out ar_id ar_rc ar_seg ar_mark
+
+  # The first gate only checks that a proxy can run here. Then the pair
+  # stops, so no writer holds the real log when it moves aside.
+  if ! bep_live_gate "$ar_case"; then
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  BEP_LIVE_DAEMON=""
+  for ar_try in $(seq 1 20); do
+    { bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; } || break
+    sleep 0.5
+  done
+  if bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; then
+    echo "::error::the Box Egress Proxy still runs after 'min stop --force' and 'minvmd stop', so the case cannot move the audit log aside"
+    fail
+  fi
+  ar_audit="$(dirname "$ar_control")/audit"
+  # The saved name is fixed, so a copy that an earlier killed run left
+  # behind stops the case before anything can overwrite it.
+  if [ -e "$ar_audit.e2e-saved" ]; then
+    echo "::error::$ar_audit.e2e-saved exists. An earlier run of this case moved the real audit log there and did not rename it back. Remove $ar_audit if it holds only test segments, and rename $ar_audit.e2e-saved to $ar_audit"
+    fail
+  fi
+  if [ -e "$ar_audit" ]; then
+    mv "$ar_audit" "$ar_audit.e2e-saved" || fail
+    AR_AUDIT_SAVED="$ar_audit.e2e-saved"
+    echo "moved the real audit log aside to $AR_AUDIT_SAVED, with $(ar_segment_numbers "$AR_AUDIT_SAVED" | wc -l | tr -d ' ') segment(s)"
+  else
+    AR_AUDIT_SAVED=none
+    echo "no audit log exists yet, so the case writes a new one in $ar_audit and removes it at the end"
+  fi
+  AR_AUDIT_DIR="$ar_audit"
+
+  # The second gate restarts the daemon pair, and the proxy inherits this
+  # bound from minvmd's environment.
+  export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
+  # The lane's filter drops bep's INFO records, and the bound line and the
+  # rotation lines are INFO. Only this restart admits them: minvmd passes
+  # its RUST_LOG to the proxy, and ar_cleanup restores the lane's filter.
+  AR_SAVED_RUST_LOG="${RUST_LOG-}"
+  AR_HAD_RUST_LOG="${RUST_LOG+1}"
+  export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info"
+  ar_mark="$({ wc -l <"$ar_log"; } 2>/dev/null | tr -d ' ')"
+  ar_mark="${ar_mark:-0}"
+  AR_SID=""
+  ar_cleanup() {
+    ar_restore_edit
+    [ -n "$AR_SID" ] && mnl session destroy --force "$AR_SID" >/dev/null 2>&1
+    AR_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # No later case gets a proxy with the small bound: the next live gate
+    # restarts the daemon pair without it.
+    unset BEP_AUDIT_SEGMENT_BYTES
+    if [ -n "$AR_HAD_RUST_LOG" ]; then
+      export RUST_LOG="$AR_SAVED_RUST_LOG"
+    else
+      unset RUST_LOG
+    fi
+    if [ "$BEP_LIVE_DAEMON" = 1 ] || [ -n "${AR_STARTED:-}" ]; then
+      mnl stop --force >/dev/null 2>&1 || true
+      minvmd stop >/dev/null 2>&1 || true
+    fi
+    BEP_LIVE_DAEMON=""
+    AR_STARTED=""
+    ar_restore_audit
+    return 0
+  }
+  ar_fail() { ar_cleanup; fail; }
+  AR_STARTED=1
+  if ! bep_live_gate "$ar_case"; then
+    ar_fail
+  fi
+
+  # 1a. The info line at the start names the bound.
+  # A release bep ignores the override and logs a warning in its place.
+  if tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -qF 'ignored the audit segment test override: this is a release build'; then
+    echo "::error::bep serve ignored BEP_AUDIT_SEGMENT_BYTES because it is a release build. This case needs a debug build of bep. Set MINVMD_BEP_BIN to a debug build of bep, then run the case again"
+    ar_fail
+  fi
+  # The awk drops the colour escapes the log can carry around a field.
+  if ! tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -F 'audit segment bound set by the test override' \
+    | awk '{ gsub(/\033\[[0-9;]*m/, ""); print }' | grep -qF " bound=$ar_bound "; then
+    echo "::error::bep.log has no line that names the audit segment bound $ar_bound at the proxy's start"
+    echo "--- $ar_log (tail) ---"; tail -40 "$ar_log" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "bep serve started with the audit segment bound $ar_bound"
+
+  ar_first="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  ar_first="${ar_first:-0}"
+  bep_revoke_seed "$ar_case"
+  AR_SID="$(bep_revoke_activate "$ar_case" "$ar_name")" || ar_fail
+
+  # 2. Requests until two segments after the first one exist.
+  ar_new=0
+  for ar_try in $(seq 1 60); do
+    if ! mnl session exec "$AR_SID" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$ar_case.gh" 2>&1; then
+      echo "::error::'gh api user' failed in the box $ar_name (request $ar_try)"
+      cat "$WORK/$ar_case.gh" 2>/dev/null || true
+      ar_fail
+    fi
+    ar_new="$(ar_segment_numbers "$ar_audit" | awk -v f="$ar_first" '$1 > f' | wc -l | tr -d ' ')"
+    [ "$ar_new" -ge 2 ] && break
+  done
+  if [ "$ar_new" -lt 2 ]; then
+    echo "::error::the audit log opened $ar_new new segment(s) after $ar_try requests, with a bound of $ar_bound bytes"
+    ls -l "$ar_audit" 2>/dev/null || true
+    ar_fail
+  fi
+  ar_last="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  echo "the audit log rotated: $ar_new new segment(s) after $ar_try request(s), the active one is audit-$ar_last.jsonl"
+  ar_rot="$(tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -cF 'rotated the audit log' || true)"
+  if [ "${ar_rot:-0}" -lt "$ar_new" ]; then
+    echo "::error::bep.log has ${ar_rot:-0} 'rotated the audit log' line(s) for $ar_new new segment(s)"
+    ar_fail
+  fi
+  echo "--- the rotation lines of this run in bep.log ---"
+  tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -F 'rotated the audit log' || true
+
+  # 3. `min box audit` shows every record of the box, from every segment.
+  ar_id="$(bep_recreate_audited_id "$ar_case" "$ar_name")" || ar_fail
+  if ! ar_out="$(python3 - "$WORK/$ar_case.$ar_name.audit" "$ar_audit" "$ar_id" <<'PY'
+import json, os, re, sys
+trail, audit, box = sys.argv[1], sys.argv[2], sys.argv[3]
+# The proxy writes the subject as 32 lowercase hex digits, without hyphens
+# (box_id_text in crates/bep/src/listener.rs. The subject of an audit record
+# is the box id, gominimal/arch architecture.md line 505). The box argument is
+# the hyphenated id that min box audit prints, so every subject match below
+# uses the hex form.
+subject = sys.argv[3].replace("-", "").lower()
+def die(msg):
+    print(msg)
+    sys.exit(1)
+shown = [json.loads(l) for l in open(trail) if l.strip()]
+on_disk, segments = 0, set()
+for name in os.listdir(audit):
+    if not re.fullmatch(r"audit-[0-9]+\.jsonl", name):
+        continue
+    with open(os.path.join(audit, name)) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("subject") == subject:
+                on_disk += 1
+                segments.add(name)
+if len(segments) < 2:
+    die("the records of box %s are in %d segment(s), not 2 or more" % (box, len(segments)))
+if len(shown) != on_disk:
+    die("min box audit shows %d record(s), and the segments hold %d for box %s"
+        % (len(shown), on_disk, box))
+print("%d record(s) across %d segments" % (on_disk, len(segments)))
+PY
+)"; then
+    echo "::error::'min box audit $ar_name': $ar_out"
+    ar_fail
+  fi
+  echo "min box audit $ar_name: $ar_out"
+
+  # 4. The proxy goes down, so no writer races the edit.
+  r3_proxy_down "$ar_control" || ar_fail
+  AR_STARTED=1
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc before the edit, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor before the edit: $(head -n1 "$WORK/$ar_case.doctor")"
+  # The edit: the first record of the second-newest segment, a rotated one.
+  ar_seg="$ar_audit/audit-$(ar_segment_numbers "$ar_audit" | tail -n2 | head -n1).jsonl"
+  AR_AUDIT_BACKUP="$WORK/$ar_case.segment"
+  cp -p "$ar_seg" "$AR_AUDIT_BACKUP"
+  AR_AUDIT_EDIT="$ar_seg"
+  if ! python3 - "$ar_seg" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.read().split("\n")
+record = json.loads(lines[0])
+record["upstream"] = "edited.example:443"
+lines[0] = json.dumps(record, separators=(",", ":"))
+with open(path, "w") as f:
+    f.write("\n".join(lines))
+PY
+  then
+    echo "::error::the case could not edit the first record of $ar_seg"
+    ar_fail
+  fi
+  echo "edited the upstream of the first record in $ar_seg"
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 6 ] || ! grep -qF 'Audit log: the hash chain breaks at record' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc after the edit, not 6 with the break"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor after the edit (exit 6): $(head -n1 "$WORK/$ar_case.doctor")"
+
+  # 5. The record goes back, and the chain verifies across the rotated
+  # segments again.
+  ar_restore_edit
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc with the record restored, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor with the record restored: chain verified across audit-$ar_first.jsonl to audit-$ar_last.jsonl ($ar_new rotated segment(s) in this run)"
+
+  ar_cleanup
+  rm -f "${WORK:?}/${ar_case:?}".*
+  echo "Audit rotation OK (the chain carries across $ar_new new segments, min box audit reads them all, min doctor reports the edit)"
+  echo "::endgroup::"
 }
 
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
@@ -27304,6 +27643,7 @@ case "${1:-}" in
     proof_bep_revoke_and_sign_out_end_to_end
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_bep_round_two_conditions_closed
+    proof_bep_audit_rotation_and_doctor_end_to_end
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -27384,6 +27724,7 @@ case "${1:-}" in
     | bep_revoke_and_sign_out_end_to_end \
     | bep_dns_steering_fails_closed_end_to_end \
     | bep_round_two_conditions_closed \
+    | bep_audit_rotation_and_doctor_end_to_end \
     | bep_host_ip_cohort_blocks_udp_443 \
     | bep_conditions_closed_end_to_end \
     | bep_r3_spec_names_jti_and_quarantine \
@@ -27447,6 +27788,7 @@ case "${1:-}" in
     echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
     echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
     echo "         bep_round_three_conditions_closed"
+    echo "         bep_audit_rotation_and_doctor_end_to_end"
     exit 2
     ;;
 esac
