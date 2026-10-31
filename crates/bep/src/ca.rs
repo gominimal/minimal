@@ -720,7 +720,7 @@ fn check_key<K: HeldKey>(key: &K, expected: Role) -> Result<(), CaError> {
         return Err(CaError::WrongRole { expected, got });
     }
     // BEP-014, BEP-059: the same custody rule as the keychain's generation.
-    match keys::custody(key, key.build()) {
+    match keys::custody(key, keys::custody_build(key)) {
         Custody::Refused => Err(CaError::Exportable(got)),
         Custody::Held | Custody::KeptExportable => Ok(()),
     }

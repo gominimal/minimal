@@ -114,8 +114,10 @@ pub trait HeldKey {
     fn exportable(&self) -> bool;
 
     /// The build whose custody rule the proxy holds this key under. A store
-    /// answers the build it runs in. A test key answers another build, so a
-    /// test on every host pins the rule of both builds.
+    /// answers the build it runs in. A test key can answer
+    /// [`Build::Release`] in a debug build, so a test on every host pins the
+    /// rule of both builds. A key cannot answer its way out of the release
+    /// rule: [`custody_build`] ignores [`Build::Debug`] in a release build.
     fn build(&self) -> Build {
         Build::CURRENT
     }
@@ -159,6 +161,18 @@ impl Build {
     };
 }
 
+/// The build whose custody rule holds `key`. A key can make the rule
+/// stricter than the binary's own build, never weaker: a release build
+/// applies the release rule to every key, whatever [`HeldKey::build`]
+/// answers.
+#[must_use]
+pub fn custody_build<K: HeldKey + ?Sized>(key: &K) -> Build {
+    match (Build::CURRENT, key.build()) {
+        (Build::Debug, Build::Debug) => Build::Debug,
+        _ => Build::Release,
+    }
+}
+
 /// What the custody rule does with a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Custody {
@@ -194,7 +208,7 @@ pub fn custody<K: HeldKey + ?Sized>(key: &K, build: Build) -> Custody {
 /// [`KeyError::Store`] when the build refuses `key` because the keychain
 /// made it exportable.
 pub fn keep_generated<K: HeldKey + ?Sized>(key: &K) -> Result<(), KeyError> {
-    match custody(key, key.build()) {
+    match custody(key, custody_build(key)) {
         Custody::Refused => Err(KeyError::Store {
             role: key.role(),
             detail: "the keychain made the key exportable".to_owned(),
@@ -383,7 +397,7 @@ pub fn load<S: KeyStore>(store: &S, published: &[Role]) -> Result<ProxyKeys<S::K
         // BEP-014, BEP-059: once for each role at each start of a debug
         // build. A release build refused the key where it was generated, or
         // refuses it at the CA.
-        if custody(key, key.build()) == Custody::KeptExportable {
+        if custody(key, custody_build(key)) == Custody::KeptExportable {
             let role = key.role();
             tracing::warn!(
                 role = %role,
