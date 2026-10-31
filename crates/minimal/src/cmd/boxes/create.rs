@@ -259,8 +259,8 @@ fn project_bep_and_grants(
 }
 
 /// The box's credentialed-upstream declaration: the `--credentialed-upstream`
-/// flag, or a `[session.secrets]` grant whose source is the broker (NET-134,
-/// BEP-016). The set is derived from broker grants. A `[session.network.bep]`
+/// flag, or a `[session.secrets]` grant whose source is the broker or a
+/// store (NET-134, BEP-016, BEP-032). The set is derived from those grants. A `[session.network.bep]`
 /// setting or a `client_env` grant alone declares nothing. The settings
 /// ride the declaration. The declared `quic443` stance does not: it rides
 /// the policy of every box (BEP-018).
@@ -272,7 +272,7 @@ fn credentialed_upstream_for(
     let declared = flag
         || secrets
             .values()
-            .any(|grant| grant.source == boxes::core::bep::GrantSource::Broker);
+            .any(boxes::core::bep::SecretGrant::is_credentialed);
     declared.then(|| boxes::CredentialedUpstream {
         bep: bep.clone(),
         secrets: secrets.clone(),
@@ -319,14 +319,6 @@ fn refuse_unhonourable_grants(
         eprintln!("warning: {warning}");
     }
     Ok(plan.warnings)
-}
-
-/// The reference as the box spec writes it: `<store>:<id>` or `<id>`.
-fn store_item(reference: &boxes::core::bep::StoreReference<'_>) -> String {
-    match reference.store {
-        Some(store) => format!("{store}:{}", reference.id),
-        None => reference.id.to_owned(),
-    }
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -393,7 +385,7 @@ fn accept_store_references(
         let mut to_ask: Vec<(String, Vec<String>, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
         let mut allowed: Vec<(String, &str, &boxes::core::bep::StoreRuleConfig)> = Vec::new();
         for reference in store_references(secrets) {
-            let item = store_item(&reference);
+            let item = reference.item();
             let grant = reference.grant.to_owned();
             let Some(rule) = reference.rule(rules) else {
                 checked.push(format!("{item}: no rule"));
@@ -2913,16 +2905,18 @@ mod tests {
         assert!(credentialed_upstream_for(false, &bep, &broker).is_some());
     }
 
-    /// One broker grant `OPENAI_KEY` that reads the item `openai-key`.
+    /// A store reference as a box spec writes it: `source = "store"` with
+    /// `store` and `id`.
+    fn store_reference(id: &str) -> boxes::core::bep::SecretGrant {
+        toml::from_str(&format!(
+            "source = \"store\"\nstore = \"keychain\"\nid = \"{id}\""
+        ))
+        .expect("a store reference parses")
+    }
+
+    /// One store grant `OPENAI_KEY` that reads the item `openai-key`.
     fn store_grant() -> boxes::core::bep::SecretGrants {
-        boxes::core::bep::SecretGrants::from([(
-            "OPENAI_KEY".into(),
-            boxes::core::bep::SecretGrant {
-                source: boxes::core::bep::GrantSource::Broker,
-                scopes: vec!["openai-key".into()],
-                mode: None,
-            },
-        )])
+        boxes::core::bep::SecretGrants::from([("OPENAI_KEY".into(), store_reference("openai-key"))])
     }
 
     /// A rule for `openai-key` that sends it to `api.openai.com`.
@@ -3089,14 +3083,7 @@ mod tests {
 
         // A deny after an ask asks nothing: every refusal comes first.
         let mut two = store_grant();
-        two.insert(
-            "ZZ_TOKEN".into(),
-            boxes::core::bep::SecretGrant {
-                source: boxes::core::bep::GrantSource::Broker,
-                scopes: vec!["other-key".into()],
-                mode: None,
-            },
-        );
+        two.insert("ZZ_TOKEN".into(), store_reference("other-key"));
         let mut ask_then_deny = ask.clone();
         let mut denied = deny["openai-key"].clone();
         denied.upstream = vec!["api.openai.com".into()];
@@ -3111,14 +3098,7 @@ mod tests {
 
         // One item under two grants is asked once, and names both grants.
         let mut shared = store_grant();
-        shared.insert(
-            "ZZ_TOKEN".into(),
-            boxes::core::bep::SecretGrant {
-                source: boxes::core::bep::GrantSource::Broker,
-                scopes: vec!["openai-key".into()],
-                mode: None,
-            },
-        );
+        shared.insert("ZZ_TOKEN".into(), store_reference("openai-key"));
         let mut questions = Vec::new();
         let accepted = accept_store_references(&shared, Some(&egress), &ask, true, &mut |q| {
             questions.push(q.to_owned());
