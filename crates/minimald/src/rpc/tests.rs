@@ -4748,3 +4748,108 @@ async fn answerer_control_rebinds_a_stale_socket_and_refuses_a_live_one() {
         "the live door still answers"
     );
 }
+
+/// T110: the listing reports each box's address and egress posture, keyed
+/// by its id. A host-address box answers at the node's address. An
+/// own-address or `none` box answers at the address its publish holds, and
+/// reports none before it publishes. The posture is the one the effective
+/// policy reply resolves for the same box.
+#[tokio::test]
+async fn list_sessions_reports_box_address_and_posture() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let host_id = client
+        .call::<CreateSession>(&CreateSessionRequest::new(
+            "host-address",
+            HostAbsPath::try_new("/uwu").unwrap(),
+            NetworkMode::HostNet,
+            BoxPolicy::new(None, None),
+        ))
+        .await
+        .unwrap()
+        .id;
+    let own_id = own_ip_session(&mut client, "own-address", BoxPolicy::new(None, None)).await;
+    let mut no_net = req("no-network", "/uwu");
+    no_net.config.network = NetworkMode::NoNet;
+    let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+    // Before either box publishes, neither has an address to report.
+    let listed = client.call::<ListSessions>(&()).await;
+    assert_eq!(
+        listed.box_networks[&own_id].loopback_address, None,
+        "an unpublished box reports no address, never an invented one"
+    );
+
+    let mngr = server.state.sessions_manager().await;
+    let own_address = std::net::Ipv4Addr::new(127, 0, 64, 2);
+    // The `none` box stands on the `127.0.0.1` fallback, so the reply
+    // marks it there, while a host-address box at the node address is not.
+    let none_address = std::net::Ipv4Addr::LOCALHOST;
+    let node = {
+        let registry = mngr.hostnames();
+        let mut routes = registry.write().unwrap();
+        routes.publish_own_address(own_id, "own-address", own_address, Default::default());
+        routes.publish_own_address(none_id, "no-network", none_address, Default::default());
+        routes.node_address()
+    };
+
+    let listed = client.call::<ListSessions>(&()).await;
+    let facts = |id: SessionId| {
+        listed
+            .box_networks
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| panic!("facts for {id} in {:?}", listed.box_networks))
+    };
+    assert_eq!(
+        facts(own_id),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(own_address),
+            egress_posture: Some(minimald_rpc::EgressPosture::DenyAllDefault),
+            at_fallback: Some(false),
+        }
+    );
+    assert_eq!(
+        facts(host_id),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(node),
+            egress_posture: Some(minimald_rpc::EgressPosture::AllowAllDefault),
+            at_fallback: Some(false),
+        }
+    );
+    assert_eq!(
+        facts(none_id),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(none_address),
+            egress_posture: Some(minimald_rpc::EgressPosture::NoNetwork),
+            at_fallback: Some(true),
+        }
+    );
+
+    // The posture agrees with the reply `min session policy` reads.
+    let policy = client
+        .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(own_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        minimald_rpc::EgressPosture::of(&policy.egress, NetworkMode::OwnIp),
+        minimald_rpc::EgressPosture::DenyAllDefault
+    );
+    // In a microVM, a host-address box at the node's `127.0.0.1` is not
+    // mirrored there, so it reports no address until the node is granted
+    // one. A native node's `127.0.0.1` is the box's published address.
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let granted = std::net::Ipv4Addr::new(127, 0, 64, 1);
+    assert_eq!(host_address_loopback(localhost, true), None);
+    assert_eq!(host_address_loopback(granted, true), Some(granted));
+    assert_eq!(host_address_loopback(localhost, false), Some(localhost));
+    // A withheld host-address box is reached only through the proxy, so it
+    // reads as the fallback. A box of another mode with no address says
+    // nothing.
+    assert_eq!(box_at_fallback(true, None), Some(true));
+    assert_eq!(box_at_fallback(true, Some(localhost)), Some(false));
+    assert_eq!(box_at_fallback(false, Some(localhost)), Some(true));
+    assert_eq!(box_at_fallback(false, Some(granted)), Some(false));
+    assert_eq!(box_at_fallback(false, None), None);
+}

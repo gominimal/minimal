@@ -74,6 +74,42 @@ pub fn print_classifier_advisory(
     }
 }
 
+/// The words `min session policy` and `min ls` both print for a box's
+/// egress posture (T110), so the two surfaces cannot drift. A default is
+/// marked as one. A declared deny-all is not, because the box chose it. A
+/// declaration with rules of its own reads as `declared rules`, the rows
+/// `min session policy` lists under it.
+#[must_use]
+pub fn egress_posture_words(posture: minimald_rpc::EgressPosture) -> &'static str {
+    match posture {
+        minimald_rpc::EgressPosture::DenyAllDefault => "deny-all (default)",
+        minimald_rpc::EgressPosture::AllowAllDefault => "allow-all (default)",
+        minimald_rpc::EgressPosture::DenyAll => "deny-all",
+        minimald_rpc::EgressPosture::DeclaredRules => "declared rules",
+        minimald_rpc::EgressPosture::NoNetwork => "no network",
+    }
+}
+
+/// The EGRESS cell `min ls` prints for a box (T110): the posture in
+/// [`egress_posture_words`]' words, with `; per-box enforcement none`
+/// appended for a host-address box this host cannot decide per box, the
+/// fact `min session policy` prints as its `per-box enforcement` row. A
+/// posture the daemon did not report prints `-`.
+#[must_use]
+pub fn egress_posture_cell(
+    posture: Option<minimald_rpc::EgressPosture>,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
+) -> String {
+    let Some(posture) = posture else {
+        return "-".to_string();
+    };
+    let words = egress_posture_words(posture);
+    match host_ip_enforcement {
+        Some(boxes::HostIpEnforcement::None) => format!("{words}; per-box enforcement none"),
+        _ => words.to_string(),
+    }
+}
+
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
 /// resolved to its list or its default (`allow-all`; `deny subnets` reads
@@ -154,7 +190,8 @@ pub fn format_policy(
         return Ok(());
     }
     writeln!(out, "egress")?;
-    if let Some(label) = effective.egress.summary_label() {
+    let posture = minimald_rpc::EgressPosture::of(&effective.egress, network);
+    if posture != minimald_rpc::EgressPosture::DeclaredRules {
         // A verdict by name rather than as rows: the defaults marked as
         // defaults, and the declared deny-all section unmarked — every list
         // empty would render as blankness, which reads as nothing, the one
@@ -162,8 +199,8 @@ pub fn format_policy(
         // nothing"). The mark is the difference between a verdict the box
         // chose and the one the rollout chose for it, and the JSON document
         // carries the same distinction as `source`. The label is the
-        // `boxes` crate's, shared with the TUI's detail pane.
-        writeln!(out, "  {label}")?;
+        // posture's own words, shared with `min ls` (T110).
+        writeln!(out, "  {}", egress_posture_words(posture))?;
     } else if let boxes::EffectiveEgress::Declared(egress) = &effective.egress {
         write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
         write_rules(

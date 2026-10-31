@@ -5069,8 +5069,9 @@ echo "::endgroup::"
 #   * `http://<name>.min.internal:8080` returns the in-box server's response,
 #     through the resolver file the same script wrote;
 #   * the box's own range address (the zone answerer's A record for its name)
-#     returns the same response at port 8080.
-# That `min ls` names the address belongs to T110 (#2696), which adds it.
+#     returns the same response at port 8080;
+#   * `min ls` shows the same range address in the box's ADDRESS column,
+#     never `-` or the `127.0.0.1` fallback.
 # The host is restored on every exit: the range unit, its aliases, the
 # resolver file and the answerer service go (range_teardown_unit,
 # answerer_service_teardown — the teardown repeats both if the case dies).
@@ -5219,10 +5220,19 @@ fresh_install_range_lands_on_macos() {
     fi
   done
 
+  # The listing shows the address the zone answers for the box (T110).
+  mnl ls >"$WORK/fi-range-ls.out" 2>&1 || true
+  if ! grep -F -- "$frm_name" "$WORK/fi-range-ls.out" | grep -qF -- " $frm_addr "; then
+    echo "::error::'min ls' does not show $frm_addr on the $frm_name row, the address the zone answers for it"
+    cat "$WORK/fi-range-ls.out" 2>/dev/null || true
+    fail
+  fi
+  echo "min ls shows $frm_addr on the $frm_name row"
+
   mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
   range_teardown_unit
   answerer_service_teardown
-  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, host restored)"
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls shows $frm_addr, host restored)"
   echo "::endgroup::"
 }
 
@@ -6614,8 +6624,18 @@ __e2e_same_shell=yes' \
     fail
   fi
   # Keeping at the exit prompt is a detach, and the session must survive it.
-  if ! mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
+  # Capture-then-match, never `mnl ls --raw | grep -q`: grep's early exit
+  # SIGPIPEs the CLI under pipefail, and a failed listing would read as a
+  # gone session. On a miss, print what the listing said and its stderr so
+  # a failed `min ls` is told apart from a session that is truly gone.
+  hook_ls_status=0
+  hook_ls="$(mnl ls --raw 2>"$WORK/hooks-ls.err")" || hook_ls_status=$?
+  if ! printf '%s\n' "$hook_ls" | grep -Fq -- "$hook_sid"; then
     echo "::error::session gone after answering the exit prompt with 'keep'"
+    echo "--- min ls --raw (exit $hook_ls_status) ---"; printf '%s\n' "$hook_ls"
+    echo "--- min ls --raw stderr ---"; cat "$WORK/hooks-ls.err" 2>/dev/null || true
+    echo "--- attach transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- attach stderr ---"; cat "$WORK/hooks-attach.err" 2>/dev/null || true
     fail
   fi
   # `on_detach` is headless (the terminal it would have used is the thing
@@ -7820,8 +7840,10 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'resolves on this machine' "$range2_err"; then
-    echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
+  # The range is present and the box is off the interim, so its ports
+  # answer at its own address: the host line reads the own-address form.
+  if ! grep -qF -- "names: $RANGE_NAME-2.min.internal opens at its name on this machine" "$range2_err"; then
+    echo "::error::a session started after the range step does not say its box opens at its name on this machine (the host probe must read present, and the box must be off the 127.0.0.1 interim)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
@@ -9317,10 +9339,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'resolves on this machine' \
+  # The box publishes at its own leased address (asserted below), so its
+  # host line reads the own-address form, never the 127.0.0.1 fallback form.
+  bn_api_surface="$(grep -F -- 'opens at its name on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not say its name resolves on this machine (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its box opens at its name on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9329,7 +9353,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # the hostname proxy still serves beside native DNS (NET-019) is `min
   # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
-    "names: $BN_API_NAME.min.internal resolves on this machine"*) ;;
+    "names: $BN_API_NAME.min.internal opens at its name on this machine"*) ;;
     *)
       echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
@@ -9412,18 +9436,20 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_ls="$(mnl ls 2>&1 || true)"
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
   bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
+  # Both boxes stand at their own addresses, so no box is on the fallback
+  # and the row reads the own-address form, as the activate line did.
   case "$bn_surface_line" in
-    *"resolves through this machine's DNS"*) ;;
+    *"<box>.min.internal opens at its name on this machine"*) ;;
     *)
-      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names open at their names on this machine (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
+    *"the HTTP proxy at 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
+      echo "::error::min ls's BOX NAMES line does not name the HTTP proxy that still serves (NET-019)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
