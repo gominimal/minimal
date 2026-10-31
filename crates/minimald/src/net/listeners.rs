@@ -134,7 +134,9 @@ use tokio::sync::watch;
 use boxes::IpProto;
 use boxes::core::egress::ListenVerdict;
 
-use super::policy::{ControlChannel, ExposedMapping, expose_mapping, unexpose_mapping};
+use super::policy::{
+    ControlChannel, ExposedMapping, expose_mapping, log_withdrawal, unexpose_mapping,
+};
 use super::switch::BoxGate;
 
 /// How often the watcher reads the box's socket table: often enough that a
@@ -1989,17 +1991,27 @@ impl WatchState {
             owner = %PublicationOwner::Listen.as_str(),
             "moved a listening port to the box's new address"
         );
-        if let Err(error) = unexpose_mapping(&self.plan.control, &old).await {
-            tracing::warn!(
+        match unexpose_mapping(&self.plan.control, &old).await {
+            Ok(closed) => tracing::info!(
                 session = %self.plan.box_name,
                 port,
                 from = old.local(),
                 owner = %PublicationOwner::Listen.as_str(),
-                %error,
-                "unbinding a listening port at the box's old address failed; \
-                 retrying on every poll"
-            );
-            self.retired.push(old);
+                closed_connections = %closed,
+                "unbound a listening port at the box's old address after its move"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %self.plan.box_name,
+                    port,
+                    from = old.local(),
+                    owner = %PublicationOwner::Listen.as_str(),
+                    %error,
+                    "unbinding a listening port at the box's old address failed; \
+                     retrying on every poll"
+                );
+                self.retired.push(old);
+            }
         }
     }
 
@@ -2008,11 +2020,15 @@ impl WatchState {
     async fn unbind_retired(&mut self) {
         let mut still = Vec::new();
         for mapping in std::mem::take(&mut self.retired) {
-            if unexpose_mapping(&self.plan.control, &mapping)
-                .await
-                .is_err()
-            {
-                still.push(mapping);
+            match unexpose_mapping(&self.plan.control, &mapping).await {
+                Ok(closed) => tracing::info!(
+                    session = %self.plan.box_name,
+                    from = mapping.local(),
+                    owner = %PublicationOwner::Listen.as_str(),
+                    closed_connections = %closed,
+                    "unbound a listening port at the box's old address after its move"
+                ),
+                Err(_) => still.push(mapping),
             }
         }
         self.retired = still;
@@ -2847,11 +2863,12 @@ impl WatchState {
     /// already run, so there is no later pass to hand it to.
     async fn unbind_revoked(&mut self, port: u16, mapping: &ExposedMapping) {
         match unexpose_mapping(&self.plan.control, mapping).await {
-            Ok(()) => tracing::info!(
+            Ok(closed) => tracing::info!(
                 session = %self.plan.box_name,
                 host = %self.plan.published,
                 port,
                 owner = %PublicationOwner::Listen.as_str(),
+                closed_connections = %closed,
                 "unbound a listening port whose publication was revoked mid-bind"
             ),
             Err(e) => tracing::warn!(
@@ -2899,7 +2916,10 @@ impl WatchState {
         // way.
         let terminated = self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
-            Ok(()) => {
+            Ok(closed) => {
+                // NET-017's own line: the only caller of the shared unexpose
+                // that withdraws a published port, so the only one to say so.
+                log_withdrawal(&mapping, closed);
                 // The publication is the watcher's own and it came down, so
                 // the set gives the port back: the next surface that wants
                 // it — this watcher, when the box's next server binds the
