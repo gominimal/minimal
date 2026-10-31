@@ -244,6 +244,11 @@ COMPONENTS=(
     "minzoned-ticket|darwin|arm64|file|bin/Minimal.app/Contents/CodeResources|minzoned-macos-arm64-ticket"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
+    # The Box Egress Proxy minvmd starts beside gvproxy at boot. minvmd looks
+    # for it beside its own binary (resolve_bep_binary in
+    # crates/minvmd/src/cmd/run.rs), so it stages into bin/ next to minvmd.
+    # macOS only: the proxy does not run on Linux.
+    "bep|darwin|arm64|file|bin/bep|bep-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
     # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
