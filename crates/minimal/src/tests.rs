@@ -3190,11 +3190,11 @@ async fn ls_shows_vm_per_box() {
         surface_line_of("default")
             .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
             || surface_line_of("default")
-                .contains("the hostname proxy is not serving, and box names open only through it"),
+                .contains("<box>.min.internal: the hostname proxy is not serving"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("resolves through this machine's DNS"),
+        surface_line_of("alpha").contains("<box>.min.internal opens at its name on this machine"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
@@ -5177,4 +5177,266 @@ async fn colliding_box_id_refuses_creation() {
         chain.contains("does not start"),
         "the activation ends on the refusal, so no box is created, got {chain:?}"
     );
+}
+
+/// The cell under `column` in the `min ls` row that contains `row_key`,
+/// read by the header's positions up to `next`, the column after it. A
+/// cell can hold spaces, so the row is not split on whitespace.
+fn ls_cell_at(text: &str, row_key: &str, column: &str, next: &str) -> String {
+    let header = text
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a header in:\n{text}"));
+    let start = header.find(column).expect("the column in the header");
+    let end = header.find(next).expect("the next column in the header");
+    let row = text
+        .lines()
+        .find(|l| l.contains(row_key) && !l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a row for {row_key} in:\n{text}"));
+    row[start..end].trim().to_string()
+}
+
+/// A listing of one box per entry in `boxes`: its name, its network facts
+/// and its per-box enforcement.
+fn listing_of(
+    boxes: &[(
+        &str,
+        Option<minimald_rpc::BoxNetworkFacts>,
+        Option<boxes::HostIpEnforcement>,
+    )],
+) -> minimald_rpc::ListSessionsResponse {
+    let id = |n: usize| {
+        boxes::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap()
+    };
+    minimald_rpc::ListSessionsResponse {
+        resource_pool: None,
+        sessions: boxes
+            .iter()
+            .enumerate()
+            .map(|(n, (name, _, enforcement))| {
+                let mut entry = twin_entry(
+                    &id(n + 1).to_string(),
+                    Some(name),
+                    Some("/work/proj"),
+                    boxes::BoxState::Active,
+                );
+                entry.host_ip_enforcement = *enforcement;
+                entry
+            })
+            .collect(),
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        box_networks: boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(n, (_, facts, _))| facts.clone().map(|facts| (id(n + 1), facts)))
+            .collect(),
+    }
+}
+
+/// T110: `min ls` shows each box's address in an ADDRESS column after NAME
+/// — its own address, the `127.0.0.1` fallback, or `-` when the daemon
+/// did not report one — and `--json` carries it per session as
+/// `loopback_address`, with no key for a box that reported none.
+#[test]
+fn ls_shows_box_loopback_address() {
+    let at = |address: std::net::Ipv4Addr| {
+        Some(minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(address),
+            egress_posture: None,
+        })
+    };
+    let resp = listing_of(&[
+        ("own", at(std::net::Ipv4Addr::new(127, 0, 64, 2)), None),
+        ("fallback", at(std::net::Ipv4Addr::LOCALHOST), None),
+        ("unreported", None, None),
+    ]);
+    let render = |json: bool, listings: &[cmd::VmListing]| {
+        let mut out = Vec::new();
+        format_ls_across_vms(&mut out, &LsArgs { raw: false, json }, listings, &[], &[])
+            .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let one = [cmd::VmListing {
+        vm: "default".to_string(),
+        resp: resp.clone(),
+        control_sock: None,
+    }];
+
+    let table = render(false, &one);
+    let header = table
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .expect("a header");
+    assert!(
+        header.find("NAME") < header.find("ADDRESS")
+            && header.find("ADDRESS") < header.find("STATUS"),
+        "ADDRESS sits after NAME: {header}"
+    );
+    let address = |name: &str| ls_cell_at(&table, name, "ADDRESS", "STATUS");
+    assert_eq!(address("own"), "127.0.64.2", "got:\n{table}");
+    assert_eq!(address("fallback"), "127.0.0.1", "got:\n{table}");
+    assert_eq!(address("unreported"), "-", "got:\n{table}");
+
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&render(true, &one)).expect("the listing is JSON");
+    let sessions = document["sessions"].as_array().expect("a sessions array");
+    assert_eq!(sessions[0]["loopback_address"], "127.0.64.2");
+    assert_eq!(sessions[1]["loopback_address"], "127.0.0.1");
+    assert!(
+        sessions[2].get("loopback_address").is_none(),
+        "an unreported address is no key, never an invented value: {document}"
+    );
+    assert!(
+        document.get("box_networks").is_none(),
+        "the facts ride on each session, not beside them: {document}"
+    );
+
+    // The multi-VM document carries the same field on each session.
+    let two = [
+        cmd::VmListing {
+            vm: "default".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+        },
+        cmd::VmListing {
+            vm: "alpha".to_string(),
+            resp: listing_of(&[("other", at(std::net::Ipv4Addr::new(127, 0, 64, 9)), None)]),
+            control_sock: None,
+        },
+    ];
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&render(true, &two)).expect("the listing is JSON");
+    let other = document["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|s| s["name"] == "other")
+        .expect("the alpha VM's box");
+    assert_eq!(other["loopback_address"], "127.0.64.9", "{document}");
+    assert_eq!(other["vm"], "alpha", "{document}");
+}
+
+/// T110: the EGRESS cell `min ls` prints for a box is the posture `min
+/// session policy` prints for the same box, in the same words: the named
+/// verdict, `declared rules` for a section listed as rows, and the per-box
+/// enforcement note for a host-address box this host cannot decide per
+/// box.
+#[test]
+fn ls_egress_matches_session_policy() {
+    use boxes::{EffectiveEgress, EgressPolicy, HostIpEnforcement, NetworkMode};
+    let rules = EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(Vec::new()),
+        ..EgressPolicy::default()
+    };
+    let cases = [
+        (
+            "own-default",
+            EffectiveEgress::DenyAll,
+            NetworkMode::OwnIp,
+            None,
+            "deny-all (default)",
+        ),
+        (
+            "host-default",
+            EffectiveEgress::AllowAll,
+            NetworkMode::HostNet,
+            Some(HostIpEnforcement::PerBox),
+            "allow-all (default)",
+        ),
+        (
+            "host-unenforced",
+            EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            NetworkMode::HostNet,
+            Some(HostIpEnforcement::None),
+            "deny-all; per-box enforcement none",
+        ),
+        (
+            "own-rules",
+            EffectiveEgress::Declared(rules),
+            NetworkMode::OwnIp,
+            None,
+            "declared rules",
+        ),
+    ];
+    let resp = listing_of(
+        &cases
+            .iter()
+            .map(|(name, egress, network, enforcement, _)| {
+                (
+                    *name,
+                    Some(minimald_rpc::BoxNetworkFacts {
+                        loopback_address: None,
+                        egress_posture: Some(minimald_rpc::EgressPosture::of(egress, *network)),
+                    }),
+                    *enforcement,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .expect("rendering the listing");
+    let table = String::from_utf8(out).expect("the listing is UTF-8");
+
+    for (name, egress, network, enforcement, words) in cases {
+        let cell = ls_cell_at(&table, name, "EGRESS", "TITLE");
+        assert_eq!(cell, words, "{name}:\n{table}");
+        let mut policy = Vec::new();
+        format_policy(
+            &mut policy,
+            &boxes::EffectiveBoxPolicy {
+                egress,
+                ..Default::default()
+            },
+            network,
+            enforcement,
+            &[],
+            None,
+        )
+        .expect("rendering the policy");
+        let policy = String::from_utf8(policy).expect("the policy is UTF-8");
+        let (posture, note) = match cell.split_once("; ") {
+            Some((posture, note)) => (posture, Some(note)),
+            None => (cell.as_str(), None),
+        };
+        if posture == "declared rules" {
+            assert!(
+                policy.contains("egress\n  subnets  "),
+                "a declared-rules box lists its rows in the policy view:\n{policy}"
+            );
+        } else {
+            assert!(
+                policy.contains(&format!("egress\n  {posture}\n")),
+                "{name}: the policy view names the same posture:\n{policy}"
+            );
+        }
+        match note {
+            Some(note) => assert_eq!(note, "per-box enforcement none"),
+            None => assert!(
+                !policy.contains("per-box enforcement  none"),
+                "{name}: only an unenforced box carries the note:\n{policy}"
+            ),
+        }
+        if note.is_some() {
+            assert!(
+                policy.contains("  per-box enforcement  none\n"),
+                "{name}: the policy view states the same enforcement:\n{policy}"
+            );
+        }
+    }
+    assert!(!table.contains("per_box"), "got:\n{table}");
 }

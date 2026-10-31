@@ -4997,17 +4997,15 @@ pub fn install_clause(unfinished: bool) -> &'static str {
 }
 
 /// The one host line a session start prints (NET-018), naming the box:
-/// `names: <box>.min.internal resolves on this machine; open it through
-/// the HTTP proxy at 127.0.0.1:<port>` where native DNS is deployed, and
-/// `names: <box>.min.internal opens through the HTTP proxy at
-/// 127.0.0.1:<port>` where it is not. The native form promises resolution
-/// only: the name answers with a reserved local address, which is not a
-/// connection a browser is promised, so the line names the proxy — which
-/// keeps serving beside native DNS (NET-019) — as the path that opens the
-/// box. Independently, the line carries the clause `; finish setup: min
-/// finalize-install` while any finalize-install item is not done. One
-/// line, never a block, so the activation's own output stays what the
-/// operator reads. Pure, so tests assert the words without
+/// `names: ` and then how the box name opens on this host, in the words
+/// [`box_name_opens`] gives the `min ls` BOX NAMES row too. Where native
+/// DNS is deployed that is `<box>.min.internal opens at its name on this
+/// machine; the HTTP proxy at 127.0.0.1:<port> opens it too`, and where it
+/// is not, `<box>.min.internal opens through the HTTP proxy at
+/// 127.0.0.1:<port>`. Independently, the line carries the clause `; finish
+/// setup: min finalize-install` while any finalize-install item is not
+/// done. One line, never a block, so the activation's own output stays
+/// what the operator reads. Pure, so tests assert the words without
 /// capturing stderr. [`host_line_beside`] is the same line with a
 /// proxy-down cause (NET-020) in place of the resolution half.
 #[must_use]
@@ -5041,31 +5039,70 @@ pub fn host_line_beside(
     let name = format!("{box_name}.{ZONE}");
     // The not-serving arms keep the box named: the line's contract is one
     // host line naming the box, and a reader whose proxy is down is the one
-    // who most needs to know which name the cause is about.
-    let names = match (proxy_cause, surface) {
-        (Some(cause), _) => format!("{name}: the hostname proxy is not serving: {cause}"),
-        (None, LiveSurface::Native) => match proxy_port {
-            Some(port) => format!(
-                "{name} resolves on this machine; open it through the HTTP proxy at \
-                 127.0.0.1:{port}"
-            ),
-            None => format!("{name} resolves on this machine"),
-        },
-        (None, LiveSurface::Proxy) => match proxy_port {
-            Some(port) => format!("{name} opens through the HTTP proxy at 127.0.0.1:{port}"),
-            None => format!("{name}: the hostname proxy is not serving"),
-        },
-        (None, LiveSurface::ProxyNotServing { port, cause }) => {
-            format!(
-                "{name}: the hostname proxy is not serving: {}",
-                proxy_down_detail(*port, cause)
-            )
-        }
+    // who most needs to know which name the cause is about. A native
+    // verdict already holds the reserved range on this host's loopback, the
+    // range a box's own address comes from (NET-010), so the line reads the
+    // own-address form for it.
+    let names = match proxy_cause {
+        Some(cause) => format!("{name}: the hostname proxy is not serving: {cause}"),
+        None => box_name_opens(&name, surface, proxy_port, true),
     };
     format!(
         "names: {names}{}",
         install_clause(install_unfinished(surface, host))
     )
+}
+
+/// How a box name opens on this host (T110): the one statement the
+/// activate host line ([`host_line_beside`]) and the `min ls` BOX NAMES row
+/// ([`name_surface_line_at`]) both print, so the two verbs say it in the
+/// same words. `name` is the name as the line prints it, such as
+/// `web.min.internal` or `<box>.min.internal`.
+///
+/// With native DNS live, the words depend on where the box's ports answer.
+/// At the box's own address (`at_own_address`) the name opens directly and
+/// the proxy opens it too. At the `127.0.0.1` fallback the name only
+/// resolves, and the proxy is the path that opens it. Without native DNS
+/// the proxy is the only path, and the not-serving arms name the box and
+/// then the cause.
+#[must_use]
+pub fn box_name_opens(
+    name: &str,
+    surface: &LiveSurface,
+    proxy_port: Option<u16>,
+    at_own_address: bool,
+) -> String {
+    match (surface, proxy_port) {
+        (LiveSurface::Native, Some(port)) if at_own_address => format!(
+            "{name} opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:{port} opens it too"
+        ),
+        (LiveSurface::Native, None) if at_own_address => {
+            format!("{name} opens at its name on this machine")
+        }
+        (LiveSurface::Native, Some(port)) => format!(
+            "{name} resolves on this machine; open it through the HTTP proxy at \
+             127.0.0.1:{port}"
+        ),
+        (LiveSurface::Native, None) => format!("{name} resolves on this machine"),
+        (LiveSurface::Proxy, Some(port)) => {
+            format!("{name} opens through the HTTP proxy at 127.0.0.1:{port}")
+        }
+        (LiveSurface::Proxy, None) => format!("{name}: the hostname proxy is not serving"),
+        (LiveSurface::ProxyNotServing { port, cause }, _) => {
+            let detail = proxy_down_detail(*port, cause);
+            match cause {
+                ProxyDownCause::PortHeld
+                | ProxyDownCause::RedrawsRanOut
+                | ProxyDownCause::PortHeldAfterStart { .. } => {
+                    format!("{name}: the hostname proxy is not serving: {detail}")
+                }
+                ProxyDownCause::PublishUnconfirmed => {
+                    format!("{name}: the hostname proxy is not confirmed yet: {detail}")
+                }
+            }
+        }
+    }
 }
 
 /// The proxy-down cause a session start's host line names (NET-020), from
@@ -5124,55 +5161,35 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
     }
 }
 
-/// NET-018's report: the line `min ls` and `min session activate` print,
-/// naming the surface [`live_name_surfaces`] decided is live. `proxy_port`
-/// is the port the same reply carries, when the proxy came up: NET-019
-/// keeps it serving beside native DNS, and the line says so, because a
-/// client that captured `HTTP(S)_PROXY` at activation keeps routing
-/// through it — the export does not go stale when the surface changes.
-/// With no port the proxy is down, and the line says that in the daemon's
-/// own words rather than claiming it still serves. Pure, so both verbs
-/// print the same words and tests assert them without capturing output.
+/// NET-018's report: the BOX NAMES row `min ls` prints, naming the surface
+/// [`live_name_surfaces`] decided is live, in the words the activate host
+/// line uses ([`box_name_opens`]) for `<box>.min.internal`. `proxy_port` is
+/// the port the same reply carries, when the proxy came up: NET-019 keeps
+/// it serving beside native DNS, and the row says so. With no port the
+/// proxy is down, and the row says that rather than claiming it still
+/// serves. A native verdict reads the own-address form, because it holds
+/// the reserved range on this host's loopback. Pure, so tests assert the
+/// words without capturing output.
 #[must_use]
 pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> String {
-    let proxy_half = match proxy_port {
-        Some(port) => format!("; the hostname proxy also listens on 127.0.0.1:{port}"),
-        None => "; the hostname proxy is not serving".to_string(),
-    };
-    match surface {
-        LiveSurface::Native => {
-            format!("<box>.min.internal resolves through this machine's DNS{proxy_half}")
-        }
-        // The proxy as the live surface is the host not set up for native
-        // names (NET-122's opt-in): the install clause `min ls` appends to
-        // this row names the step that is, and nothing on either verb's
-        // path prints or runs it.
-        LiveSurface::Proxy => match proxy_port {
-            Some(port) => {
-                format!("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:{port}")
-            }
-            None => {
-                "the hostname proxy is not serving, and box names open only through it".to_string()
-            }
-        },
-        // The named cause replaces the bare "not serving" (T93), in the
-        // words [`proxy_down_detail`] spells for both verbs. The port comes
-        // from the verdict, not `proxy_port`: a reply whose proxy never
-        // published carries no serving port to name.
-        LiveSurface::ProxyNotServing { port, cause } => {
-            let detail = proxy_down_detail(port, &cause);
-            match cause {
-                ProxyDownCause::PortHeld
-                | ProxyDownCause::RedrawsRanOut
-                | ProxyDownCause::PortHeldAfterStart { .. } => {
-                    format!("the hostname proxy is not serving: {detail}")
-                }
-                ProxyDownCause::PublishUnconfirmed => {
-                    format!("the hostname proxy is not confirmed yet: {detail}")
-                }
-            }
-        }
-    }
+    name_surface_line_at(surface, proxy_port, true)
+}
+
+/// [`name_surface_line`] for a listing that knows where its boxes' ports
+/// answer (T110): `at_own_address` is `false` when every box the listing
+/// reports an address for answers only at the `127.0.0.1` fallback.
+#[must_use]
+pub fn name_surface_line_at(
+    surface: LiveSurface,
+    proxy_port: Option<u16>,
+    at_own_address: bool,
+) -> String {
+    box_name_opens(
+        &format!("<box>.{ZONE}"),
+        &surface,
+        proxy_port,
+        at_own_address,
+    )
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -5987,8 +6004,8 @@ mod tests {
         let names_done = host_line("web", &LiveSurface::Native, Some(7654), others_open);
         assert_eq!(
             names_done,
-            "names: web.min.internal resolves on this machine; open it through the HTTP proxy \
-             at 127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:7654 opens it too; finish setup: min finalize-install"
         );
         let finished = host_line(
             "web",
@@ -5998,8 +6015,8 @@ mod tests {
         );
         assert_eq!(
             finished,
-            "names: web.min.internal resolves on this machine; open it through the HTTP proxy \
-             at 127.0.0.1:7654"
+            "names: web.min.internal opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:7654 opens it too"
         );
         // NET-020: a proxy-down cause replaces the resolution half, and the
         // rest of the line is unchanged.
@@ -6106,11 +6123,12 @@ mod tests {
         }
     }
 
-    /// NET-142: the resolution clause is keyed on the host-DNS state alone.
-    /// Native DNS deployed, the box name resolves on this machine and opens
-    /// through the proxy, whatever else is open — never a promise that any
-    /// browser connects to the name itself; not deployed, the name routes
-    /// via the proxy's port, and the native words never print.
+    /// NET-142, T110: the resolution clause is keyed on the host-DNS state.
+    /// Native DNS deployed, a box whose ports answer at its own address
+    /// opens at its name and the proxy opens it too. One that answers only
+    /// at the `127.0.0.1` fallback resolves, and opens through the proxy.
+    /// Not deployed, the name routes via the proxy's port, and the native
+    /// words never print.
     #[test]
     fn activate_host_line_names_native_dns_when_deployed() {
         for host in [
@@ -6120,21 +6138,33 @@ mod tests {
             },
         ] {
             let native = host_line("api", &LiveSurface::Native, Some(7654), host);
-            assert!(
-                native.starts_with(
-                    "names: api.min.internal resolves on this machine; open it through the \
-                     HTTP proxy at 127.0.0.1:7654"
+            assert_eq!(
+                native,
+                format!(
+                    "names: api.min.internal opens at its name on this machine; the HTTP \
+                     proxy at 127.0.0.1:7654 opens it too{}",
+                    install_clause(host.other_items_unfinished)
                 ),
-                "{native}"
             );
             assert!(!native.contains("any browser"), "{native}");
             assert_eq!(
                 host_line("api", &LiveSurface::Native, None, host),
                 format!(
-                    "names: api.min.internal resolves on this machine{}",
+                    "names: api.min.internal opens at its name on this machine{}",
                     install_clause(host.other_items_unfinished)
                 ),
-                "with no proxy port the native line claims resolution only"
+                "with no proxy port the native line names no proxy"
+            );
+            // The `127.0.0.1` fallback: the name resolves, and the proxy
+            // is the path that opens it.
+            assert_eq!(
+                box_name_opens("api.min.internal", &LiveSurface::Native, Some(7654), false),
+                "api.min.internal resolves on this machine; open it through the HTTP proxy \
+                 at 127.0.0.1:7654"
+            );
+            assert_eq!(
+                box_name_opens("api.min.internal", &LiveSurface::Native, None, false),
+                "api.min.internal resolves on this machine"
             );
             let proxy = host_line("api", &LiveSurface::Proxy, Some(7654), host);
             assert!(
@@ -7104,35 +7134,107 @@ exit 0
     #[test]
     fn name_surface_line_says_which_surface_and_where_the_proxy_serves() {
         let native = name_surface_line(LiveSurface::Native, Some(15390));
-        assert!(
-            native.contains("<box>.min.internal resolves through this machine's DNS"),
-            "the native arm names the surface: {native}"
+        assert_eq!(
+            native,
+            "<box>.min.internal opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:15390 opens it too",
+            "the native arm names the surface and the proxy serving beside it (NET-019)"
         );
+        let no_port = name_surface_line(LiveSurface::Native, None);
         assert!(
-            native.contains("the hostname proxy also listens on 127.0.0.1:15390"),
-            "the native arm says the proxy keeps serving beside it (NET-019): {native}"
+            !no_port.contains("HTTP proxy"),
+            "with no port to name, the line must not claim the proxy serves: {no_port}"
         );
-        let not_serving = name_surface_line(LiveSurface::Native, None);
-        assert!(
-            not_serving.contains("the hostname proxy is not serving"),
-            "a daemon with no proxy port is one whose proxy is not serving: {not_serving}"
-        );
-        assert!(
-            !not_serving.contains("also listens"),
-            "with no port to name, the line must not claim the proxy serves: {not_serving}"
+        assert_eq!(
+            name_surface_line_at(LiveSurface::Native, Some(15390), false),
+            "<box>.min.internal resolves on this machine; open it through the HTTP proxy \
+             at 127.0.0.1:15390",
+            "a listing whose boxes answer only at the fallback reads the resolve form"
         );
         let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
-        assert!(
-            proxy.contains("<box>.min.internal opens through the HTTP proxy at"),
-            "the proxy arm names the surface: {proxy}"
+        assert_eq!(
+            proxy,
+            "<box>.min.internal opens through the HTTP proxy at 127.0.0.1:15390"
         );
-        assert!(
-            proxy.contains("opens through the HTTP proxy at 127.0.0.1:15390"),
-            "the proxy arm names where it serves: {proxy}"
+        assert_eq!(
+            name_surface_line(LiveSurface::Proxy, None),
+            "<box>.min.internal: the hostname proxy is not serving"
         );
-        assert!(
-            !proxy.contains("resolves through this machine's DNS"),
-            "the proxy arm must not say the native words: {proxy}"
+    }
+
+    /// T110: the `min ls` BOX NAMES row states how a box name opens in the
+    /// same words the activate host line uses, for every surface: with the
+    /// box's ports at its own address, at the `127.0.0.1` fallback, through
+    /// the proxy alone, and with the proxy not serving. The row says
+    /// `<box>` where the line names the box, and the finish-setup clause
+    /// is the same on both.
+    #[test]
+    fn ls_name_surface_matches_activate_host_line() {
+        let held = LiveSurface::ProxyNotServing {
+            port: 7654,
+            cause: ProxyDownCause::PortHeld,
+        };
+        let unconfirmed = LiveSurface::ProxyNotServing {
+            port: 7654,
+            cause: ProxyDownCause::PublishUnconfirmed,
+        };
+        for surface in [
+            LiveSurface::Native,
+            LiveSurface::Proxy,
+            held.clone(),
+            unconfirmed,
+        ] {
+            for port in [Some(7654), None] {
+                for host in [
+                    HostInstall::default(),
+                    HostInstall {
+                        other_items_unfinished: true,
+                    },
+                ] {
+                    let activate = host_line("web", &surface, port, host);
+                    let row = format!(
+                        "{}{}",
+                        name_surface_line(surface.clone(), port),
+                        install_clause(install_unfinished(&surface, host))
+                    );
+                    assert_eq!(
+                        activate,
+                        format!("names: {}", row.replace("<box>", "web")),
+                        "{surface:?} {port:?} {host:?}"
+                    );
+                }
+            }
+            for port in [Some(7654), None] {
+                assert_eq!(
+                    name_surface_line_at(surface.clone(), port, false),
+                    box_name_opens("<box>.min.internal", &surface, port, false),
+                );
+            }
+        }
+        assert_eq!(
+            host_line(
+                "web",
+                &LiveSurface::Native,
+                Some(7654),
+                HostInstall::default()
+            ),
+            "names: web.min.internal opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:7654 opens it too"
+        );
+        assert_eq!(
+            name_surface_line(LiveSurface::Native, Some(7654)),
+            "<box>.min.internal opens at its name on this machine; the HTTP proxy at \
+             127.0.0.1:7654 opens it too"
+        );
+        assert_eq!(
+            name_surface_line_at(LiveSurface::Native, Some(7654), false),
+            "<box>.min.internal resolves on this machine; open it through the HTTP proxy \
+             at 127.0.0.1:7654"
+        );
+        assert_eq!(
+            name_surface_line(held, None),
+            "<box>.min.internal: the hostname proxy is not serving: another program on \
+             this machine holds 127.0.0.1:7654"
         );
     }
 
@@ -7286,7 +7388,7 @@ exit 0
             Some(19_917),
         );
         assert!(
-            line.starts_with("the hostname proxy is not confirmed yet"),
+            line.starts_with("<box>.min.internal: the hostname proxy is not confirmed yet"),
             "the row says the publish is unconfirmed: {line}"
         );
         assert!(
@@ -7322,8 +7424,9 @@ exit 0
         );
         assert_eq!(
             line,
-            "the hostname proxy is not serving: the VM is up without it because \
-             pid 4242 (python3) holds 127.0.0.1:19918; free the port, then run \
+            "<box>.min.internal: the hostname proxy is not serving: the VM is up \
+             without it because pid 4242 (python3) holds 127.0.0.1:19918; free the \
+             port, then run \
              `min stop` and `min ls` to restart the VM (with the same --vm or \
              --provider flags, if you use them)",
             "the row names the port, the holder, and that the VM is up"
