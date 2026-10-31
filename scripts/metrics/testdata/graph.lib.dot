@@ -1,0 +1,7 @@
+digraph {
+    "graph" -> "graph::builds" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "graph" -> "graph::builds" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "graph::builds" -> "graph::plan" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "graph::plan" -> "graph::builds" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "graph::plan" -> "graph::wire" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+}

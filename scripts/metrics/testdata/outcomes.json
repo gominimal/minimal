@@ -1,0 +1,272 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 41.2,
+          "process_status": "Success",
+          "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--workspace"]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.7,
+          "process_status": "Success",
+          "argv": ["/usr/bin/cargo", "nextest", "run", "--workspace"]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:40:5: replace decode_header -> Result<Header, WireError> with Ok(Default::default())",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "decode_header",
+            "return_type": "-> Result<Header, WireError>",
+            "span": {"start": {"line": 38, "column": 1}, "end": {"line": 52, "column": 2}}
+          },
+          "span": {"start": {"line": 40, "column": 5}, "end": {"line": 51, "column": 6}},
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__graph__src__wire.rs_line_40_col_5.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_40_col_5.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 3.1, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 1.9, "process_status": {"Failure": 100}, "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:44:21: replace == with != in decode_header",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "decode_header",
+            "return_type": "-> Result<Header, WireError>",
+            "span": {"start": {"line": 38, "column": 1}, "end": {"line": 52, "column": 2}}
+          },
+          "span": {"start": {"line": 44, "column": 21}, "end": {"line": 44, "column": 23}},
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__graph__src__wire.rs_line_44_col_21.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_44_col_21.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 3.0, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 1.8, "process_status": {"Failure": 100}, "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:60:5: replace frame_len -> usize with 0",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "frame_len",
+            "return_type": "-> usize",
+            "span": {"start": {"line": 58, "column": 1}, "end": {"line": 62, "column": 2}}
+          },
+          "span": {"start": {"line": 60, "column": 5}, "end": {"line": 61, "column": 30}},
+          "replacement": "0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__graph__src__wire.rs_line_60_col_5.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_60_col_5.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.9, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 1.7, "process_status": {"Failure": 100}, "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:60:5: replace frame_len -> usize with 1",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "frame_len",
+            "return_type": "-> usize",
+            "span": {"start": {"line": 58, "column": 1}, "end": {"line": 62, "column": 2}}
+          },
+          "span": {"start": {"line": 60, "column": 5}, "end": {"line": 61, "column": 30}},
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__graph__src__wire.rs_line_60_col_5_001.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_60_col_5_001.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.8, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 1.9, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:61:14: replace + with - in frame_len",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "frame_len",
+            "return_type": "-> usize",
+            "span": {"start": {"line": 58, "column": 1}, "end": {"line": 62, "column": 2}}
+          },
+          "span": {"start": {"line": 61, "column": 14}, "end": {"line": 61, "column": 15}},
+          "replacement": "-",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__graph__src__wire.rs_line_61_col_14.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_61_col_14.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.8, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 1.8, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/graph/src/wire.rs:75:30: replace < with <= in read_frames",
+          "package": "graph",
+          "file": "crates/graph/src/wire.rs",
+          "function": {
+            "function_name": "read_frames",
+            "return_type": "-> Vec<Frame>",
+            "span": {"start": {"line": 70, "column": 1}, "end": {"line": 82, "column": 2}}
+          },
+          "span": {"start": {"line": 75, "column": 30}, "end": {"line": 75, "column": 31}},
+          "replacement": "<=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__graph__src__wire.rs_line_75_col_30.log",
+      "diff_path": "diff/crates__graph__src__wire.rs_line_75_col_30.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.9, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=graph@0.1.0"]},
+        {"phase": "Test", "duration": 38.2, "process_status": "Timeout", "argv": ["/usr/bin/cargo", "nextest", "run", "--package=graph@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/decode/src/lib.rs:20:5: replace eval -> Result<Layer, DecodeError> with Ok(Default::default())",
+          "package": "decode",
+          "file": "crates/decode/src/lib.rs",
+          "function": {
+            "function_name": "eval",
+            "return_type": "-> Result<Layer, DecodeError>",
+            "span": {"start": {"line": 18, "column": 1}, "end": {"line": 30, "column": 2}}
+          },
+          "span": {"start": {"line": 20, "column": 5}, "end": {"line": 29, "column": 6}},
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__decode__src__lib.rs_line_20_col_5.log",
+      "diff_path": "diff/crates__decode__src__lib.rs_line_20_col_5.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 1.4, "process_status": {"Failure": 101}, "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=decode@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/decode/src/lib.rs:35:5: replace is_hidden -> bool with true",
+          "package": "decode",
+          "file": "crates/decode/src/lib.rs",
+          "function": {
+            "function_name": "is_hidden",
+            "return_type": "-> bool",
+            "span": {"start": {"line": 33, "column": 1}, "end": {"line": 36, "column": 2}}
+          },
+          "span": {"start": {"line": 35, "column": 5}, "end": {"line": 35, "column": 34}},
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__decode__src__lib.rs_line_35_col_5.log",
+      "diff_path": "diff/crates__decode__src__lib.rs_line_35_col_5.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.2, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=decode@0.1.0"]},
+        {"phase": "Test", "duration": 1.1, "process_status": {"Failure": 100}, "argv": ["/usr/bin/cargo", "nextest", "run", "--package=decode@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/decode/src/lib.rs:35:5: replace is_hidden -> bool with false",
+          "package": "decode",
+          "file": "crates/decode/src/lib.rs",
+          "function": {
+            "function_name": "is_hidden",
+            "return_type": "-> bool",
+            "span": {"start": {"line": 33, "column": 1}, "end": {"line": 36, "column": 2}}
+          },
+          "span": {"start": {"line": 35, "column": 5}, "end": {"line": 35, "column": 34}},
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__decode__src__lib.rs_line_35_col_5_001.log",
+      "diff_path": "diff/crates__decode__src__lib.rs_line_35_col_5_001.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.1, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=decode@0.1.0"]},
+        {"phase": "Test", "duration": 1.2, "process_status": {"Failure": 100}, "argv": ["/usr/bin/cargo", "nextest", "run", "--package=decode@0.1.0"]}
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/decode/src/lib.rs:35:21: replace == with != in is_hidden",
+          "package": "decode",
+          "file": "crates/decode/src/lib.rs",
+          "function": {
+            "function_name": "is_hidden",
+            "return_type": "-> bool",
+            "span": {"start": {"line": 33, "column": 1}, "end": {"line": 36, "column": 2}}
+          },
+          "span": {"start": {"line": 35, "column": 21}, "end": {"line": 35, "column": 23}},
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__decode__src__lib.rs_line_35_col_21.log",
+      "diff_path": "diff/crates__decode__src__lib.rs_line_35_col_21.diff",
+      "phase_results": [
+        {"phase": "Build", "duration": 2.0, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--no-run", "--package=decode@0.1.0"]},
+        {"phase": "Test", "duration": 1.1, "process_status": "Success", "argv": ["/usr/bin/cargo", "nextest", "run", "--package=decode@0.1.0"]}
+      ]
+    }
+  ],
+  "total_mutants": 10,
+  "missed": 3,
+  "caught": 5,
+  "timeout": 1,
+  "unviable": 1,
+  "success": 0,
+  "start_time": "2026-10-14T01:00:00.000000000Z",
+  "end_time": "2026-10-14T01:02:11.000000000Z",
+  "cargo_mutants_version": "27.1.0"
+}

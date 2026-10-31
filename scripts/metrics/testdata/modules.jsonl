@@ -1,0 +1,2 @@
+{"crate": "graph", "targets": [{"target": "lib", "dot": "scripts/metrics/testdata/graph.lib.dot", "orphans": [], "error": null}]}
+{"crate": "decode", "targets": [{"target": "lib", "dot": "scripts/metrics/testdata/decode.lib.dot", "orphans": ["crates/decode/src/cli.rs", "crates/decode/src/old.rs"], "error": null}, {"target": "bin:decode", "dot": "scripts/metrics/testdata/decode.bin.dot", "orphans": ["crates/decode/src/old.rs"], "error": null}]}
