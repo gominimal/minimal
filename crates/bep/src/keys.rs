@@ -1272,8 +1272,18 @@ mod keychain {
             let attrs = CFDictionary::from_CFType_pairs(&attrs);
             #[allow(deprecated)]
             let key = SecKey::generate(attrs.to_untyped()).map_err(|err| {
-                let code = i32::try_from(err.code()).unwrap_or_default();
-                store_error(role, &security_framework::base::Error::from_code(code))
+                // Only the missing entitlement gets the plain advice. Every
+                // other failure keeps the text the Security framework gave.
+                match i32::try_from(err.code()) {
+                    Ok(MISSING_ENTITLEMENT) => store_error(
+                        role,
+                        &security_framework::base::Error::from_code(MISSING_ENTITLEMENT),
+                    ),
+                    _ => KeyError::Store {
+                        role,
+                        detail: err.to_string(),
+                    },
+                }
             })?;
             let key = match KeychainKey::new(role, key) {
                 Ok(key) => key,

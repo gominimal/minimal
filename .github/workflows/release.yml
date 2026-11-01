@@ -586,10 +586,9 @@ jobs:
               # profile is the Developer ID profile for the App ID
               # dev.minimal.bep, held base64 in MACOS_BEP_PROVISION_PROFILE.
               #
-              # The profile is checked before it is used: its team, its
-              # application identifier, its keychain access groups and its
-              # expiry. An expired profile, or one for another App ID, makes
-              # a bep that macOS refuses to start.
+              # `build-bep-bundle.sh check-profile` checks the profile before
+              # it is used: its team, its application identifier, its
+              # keychain access groups and its expiry.
               env:
                   BEP_PROFILE: ${{ secrets.MACOS_BEP_PROVISION_PROFILE }}
               run: |
@@ -598,35 +597,12 @@ jobs:
                     exit 1
                   fi
                   profile="$RUNNER_TEMP/bep.provisionprofile"
-                  decoded="$RUNNER_TEMP/bep.provisionprofile.plist"
                   printf '%s' "$BEP_PROFILE" | base64 -D >"$profile"
-                  security cms -D -i "$profile" >"$decoded"
-
-                  want_app="$MINIMAL_ZONED_TEAMID.dev.minimal.bep"
-                  team=$(plutil -extract TeamIdentifier.0 raw -o - "$decoded")
-                  app_id=$(plutil -extract 'Entitlements.com\.apple\.application-identifier' raw -o - "$decoded")
-                  groups=$(plutil -extract Entitlements.keychain-access-groups json -o - "$decoded")
-                  expires=$(plutil -extract ExpirationDate raw -o - "$decoded")
-                  echo "profile: team $team, app $app_id, keychain groups $groups, expires $expires"
-                  if [ "$team" != "$MINIMAL_ZONED_TEAMID" ] || [ "$app_id" != "$want_app" ]; then
-                    echo "::error::MACOS_BEP_PROVISION_PROFILE is for '$app_id' in team '$team', not '$want_app'" >&2
-                    exit 1
-                  fi
-                  case "$groups" in
-                    *"\"$MINIMAL_ZONED_TEAMID.*\""*|*"\"$want_app\""*) ;;
-                    *)
-                      echo "::error::MACOS_BEP_PROVISION_PROFILE does not authorise the keychain access group $want_app" >&2
-                      exit 1
-                      ;;
-                  esac
-                  if [ "$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expires" +%s)" -le "$(date -u +%s)" ]; then
-                    echo "::error::MACOS_BEP_PROVISION_PROFILE expired at $expires" >&2
-                    exit 1
-                  fi
+                  scripts/build-bep-bundle.sh check-profile "$profile" "$MINIMAL_ZONED_TEAMID"
 
                   scripts/build-bep-bundle.sh assemble target/release/bep "$profile" \
                     target/release/bep.app "${MINIMAL_RELEASE_VERSION:-0.0.0}"
-                  rm -f "$profile" "$decoded"
+                  rm -f "$profile"
             - name: Codesign binaries with Developer ID
               # Sign the three shipped Mach-O binaries and the minzoned app
               # bundle with the Developer ID Application identity held in the
@@ -681,9 +657,15 @@ jobs:
                     -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"dev.minimal.bep\"" \
                     target/release/bep.app
                   # The signature carries the keychain access group, or the
-                  # bep it ships cannot reach its keys.
-                  codesign -d --entitlements - --xml target/release/bep.app \
-                    | grep -q "<string>$MINIMAL_ZONED_TEAMID.dev.minimal.bep</string>"
+                  # bep it ships cannot reach its keys. Read that key itself:
+                  # the application identifier holds the same string.
+                  ents="$RUNNER_TEMP/bep.entitlements.plist"
+                  codesign -d --entitlements - --xml target/release/bep.app >"$ents"
+                  group=$(plutil -extract keychain-access-groups.0 raw -o - "$ents")
+                  if [ "$group" != "$MINIMAL_ZONED_TEAMID.dev.minimal.bep" ]; then
+                    echo "::error::bep.app is signed with keychain access group '$group', not '$MINIMAL_ZONED_TEAMID.dev.minimal.bep'" >&2
+                    exit 1
+                  fi
                   # The exact designated requirement the session advisory and
                   # the privileged step verify the answerer's bundle against.
                   codesign --verify --strict --verbose=2 \

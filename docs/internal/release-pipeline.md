@@ -492,9 +492,10 @@ links `bin/bep` to `bep.app/Contents/MacOS/bep`, so `minvmd` still finds
 
 The profile is the repository secret `MACOS_BEP_PROVISION_PROFILE`: the
 Developer ID provisioning profile for the App ID `dev.minimal.bep`, base64
-encoded. The assemble step checks its team, its application identifier, its
-keychain access groups and its expiry, and fails the release if one is
-wrong. The profile names one Developer ID Application certificate. When you renew
+encoded. `build-bep-bundle.sh check-profile` checks its team, its
+application identifier, its keychain access groups and its expiry, and the
+release fails if one is wrong. `scripts/build-bep-bundle_test.sh` tests that
+check. The profile names one Developer ID Application certificate. When you renew
 that certificate, make the profile again against the new certificate and
 replace the secret.
 

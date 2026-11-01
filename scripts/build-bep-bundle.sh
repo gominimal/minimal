@@ -33,7 +33,15 @@
 # names at the same paths under bin/bep.app, and scripts/stage-release_test.sh
 # fails when the two disagree.
 #
+# `check-profile` checks a Developer ID provisioning profile before it goes
+# into the bundle: its team, its application identifier, that it authorises
+# the keychain access group, and that it has not expired. An expired profile,
+# or one for another App ID, makes a bep that macOS refuses to start. It
+# decodes the profile with `security cms -D -i`. BEP_PROFILE_DECODE replaces
+# that command, so scripts/build-bep-bundle_test.sh can feed it plain plists.
+#
 # Usage:
+#   scripts/build-bep-bundle.sh check-profile PROFILE TEAM
 #   scripts/build-bep-bundle.sh assemble BEP PROFILE OUT.app [VERSION]
 #   scripts/build-bep-bundle.sh flatten APP OUTDIR
 #   scripts/build-bep-bundle.sh unflatten INDIR OUT.app
@@ -69,6 +77,38 @@ copy_file() {
 }
 
 case "${1:-}" in
+  check-profile)
+    [ $# = 3 ] || die "usage: $0 check-profile PROFILE TEAM"
+    [ -s "$2" ] || die "no provisioning profile at $2"
+    decoded="$(mktemp)"
+    trap 'rm -f "$decoded"' EXIT
+    # shellcheck disable=SC2086 # the decoder is a command and its arguments
+    ${BEP_PROFILE_DECODE:-security cms -D -i} "$2" >"$decoded" \
+      || die "could not decode the provisioning profile $2"
+    python3 - "$decoded" "$3" <<'EOF'
+import datetime, plistlib, sys
+path, team = sys.argv[1], sys.argv[2]
+want_app = team + ".dev.minimal.bep"
+with open(path, "rb") as f:
+    profile = plistlib.load(f)
+ents = profile.get("Entitlements", {})
+got_team = (profile.get("TeamIdentifier") or [""])[0]
+got_app = ents.get("com.apple.application-identifier", "")
+groups = ents.get("keychain-access-groups", [])
+expires = profile.get("ExpirationDate")
+print(f"profile: team {got_team}, app {got_app}, keychain groups {groups}, expires {expires}")
+if got_team != team or got_app != want_app:
+    sys.exit(f"the profile is for '{got_app}' in team '{got_team}', not '{want_app}'")
+if want_app not in groups and team + ".*" not in groups:
+    sys.exit(f"the profile does not authorise the keychain access group {want_app}")
+if not isinstance(expires, datetime.datetime):
+    sys.exit("the profile has no expiry date")
+if expires.tzinfo is None:
+    expires = expires.replace(tzinfo=datetime.timezone.utc)
+if expires <= datetime.datetime.now(datetime.timezone.utc):
+    sys.exit(f"the profile expired at {expires}")
+EOF
+    ;;
   assemble)
     if [ $# -lt 4 ] || [ $# -gt 5 ]; then
       die "usage: $0 assemble BEP PROFILE OUT.app [VERSION]"
@@ -114,6 +154,6 @@ case "${1:-}" in
     done
     ;;
   *)
-    die "usage: $0 assemble|flatten|unflatten|table (see the header)"
+    die "usage: $0 check-profile|assemble|flatten|unflatten|table (see the header)"
     ;;
 esac
