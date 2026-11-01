@@ -688,25 +688,25 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         crate::cmd::finalize_install::host_install_for_this_host(global)
     };
     // T126 (NET-138): each VM host daemon's collided mirror ports, read
-    // over that VM's own control socket. `--raw` prints bare ids only, so
-    // it pays no read. The count is a field on the `ListSessions` span.
-    let mirror_collisions: Vec<Vec<u16>> = if args.raw {
+    // over that VM's own control socket, all VMs at once so a VM that does
+    // not answer costs one read timeout in total. `None` is a VM that gave
+    // no answer: no socket, a timeout, or a daemon without the read.
+    // `--raw` prints bare ids only, so it pays no read. The count is a
+    // field on the `ListSessions` span.
+    let mirror_collisions: Vec<Option<Vec<u16>>> = if args.raw {
         Vec::new()
     } else {
         let span = tracing::info_span!("ListSessions", mirror_collisions = tracing::field::Empty);
-        let mut read = Vec::with_capacity(listings.len());
-        for listing in &listings {
-            let ports = match listing.control_sock.as_deref() {
-                Some(sock) => minvmd::control::read_mirror_collisions(sock)
-                    .await
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            read.push(ports);
-        }
+        let read = futures::future::join_all(listings.iter().map(|listing| async move {
+            match listing.control_sock.as_deref() {
+                Some(sock) => minvmd::control::read_mirror_collisions(sock).await,
+                None => None,
+            }
+        }))
+        .await;
         span.record(
             "mirror_collisions",
-            read.iter().map(Vec::len).sum::<usize>(),
+            read.iter().flatten().map(Vec::len).sum::<usize>(),
         );
         read
     };
@@ -747,22 +747,21 @@ pub fn mirror_collision_row(vm: &str, ports: &[u16]) -> Option<String> {
 
 /// Adds `mirror_collisions` to each VM's object in a `min ls --json`
 /// document: the top-level object for one listing, each `vms` entry, in
-/// listing order, for several. A VM with no read carries an empty list.
+/// listing order, for several. A VM that answered carries its list, `[]`
+/// when it reports none. A VM with no answer carries `null`.
 fn insert_mirror_collisions(
     json: &mut serde_json_lenient::Value,
     listings: usize,
-    mirror_collisions: &[Vec<u16>],
+    mirror_collisions: &[Option<Vec<u16>>],
 ) {
-    let ports_at = |index: usize| {
-        serde_json_lenient::Value::from(
-            mirror_collisions
-                .get(index)
-                .cloned()
-                .unwrap_or_default()
+    let ports_at = |index: usize| match mirror_collisions.get(index).cloned().flatten() {
+        Some(ports) => serde_json_lenient::Value::from(
+            ports
                 .into_iter()
                 .map(serde_json_lenient::Value::from)
                 .collect::<Vec<_>>(),
-        )
+        ),
+        None => serde_json_lenient::Value::Null,
     };
     if listings <= 1 {
         if let serde_json_lenient::Value::Object(map) = json {
@@ -782,14 +781,15 @@ fn insert_mirror_collisions(
 /// [`format_ls_across_vms_on`] with each VM's collided mirror ports (T126),
 /// in listing order. The table ends with one `MIRROR PORTS` row per VM that
 /// reports any ([`mirror_collision_row`]), and `--json` carries
-/// `mirror_collisions` per VM. `--raw` prints neither.
+/// `mirror_collisions` per VM, `null` for a VM with no answer. `--raw`
+/// prints neither.
 pub fn format_ls_across_vms_with_mirrors_on(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     listings: &[VmListing],
     surfaces: &[Option<crate::resolver::LiveSurface>],
     vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
-    mirror_collisions: &[Vec<u16>],
+    mirror_collisions: &[Option<Vec<u16>>],
     host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
     if args.json {
@@ -808,6 +808,7 @@ pub fn format_ls_across_vms_with_mirrors_on(
         return Ok(());
     }
     for (listing, ports) in listings.iter().zip(mirror_collisions) {
+        let Some(ports) = ports else { continue };
         if let Some(row) = mirror_collision_row(&listing.vm, ports) {
             writeln!(out, "{row}")?;
         }
@@ -1624,10 +1625,16 @@ mod tests {
                 box_networks: Default::default(),
             },
             control_sock: None,
+            running: true,
         }
     }
 
-    fn render(json: bool, raw: bool, listings: &[super::VmListing], ports: &[Vec<u16>]) -> String {
+    fn render(
+        json: bool,
+        raw: bool,
+        listings: &[super::VmListing],
+        ports: &[Option<Vec<u16>>],
+    ) -> String {
         let mut out = Vec::new();
         super::format_ls_across_vms_with_mirrors_on(
             &mut out,
@@ -1648,7 +1655,7 @@ mod tests {
     #[test]
     fn ls_shows_mirror_collisions() {
         let one = [listing("default")];
-        let table = render(false, false, &one, &[vec![8080, 9090]]);
+        let table = render(false, false, &one, &[Some(vec![8080, 9090])]);
         assert!(
             table.lines().any(|line| line
                 == "MIRROR PORTS:  default  port 8080 is held by another program on this \
@@ -1656,16 +1663,25 @@ mod tests {
                     another program on this machine, so a host_ip box cannot open it here."),
             "the row names each port: {table}"
         );
-        assert!(!render(false, false, &one, &[Vec::new()]).contains("MIRROR PORTS"));
-        assert!(!render(false, true, &one, &[vec![8080]]).contains("MIRROR PORTS"));
+        assert!(!render(false, false, &one, &[Some(Vec::new())]).contains("MIRROR PORTS"));
+        assert!(!render(false, false, &one, &[None]).contains("MIRROR PORTS"));
+        assert!(!render(false, true, &one, &[Some(vec![8080])]).contains("MIRROR PORTS"));
 
         let json: serde_json_lenient::Value =
-            serde_json_lenient::from_str(&render(true, false, &one, &[vec![8080]]))
+            serde_json_lenient::from_str(&render(true, false, &one, &[Some(vec![8080])]))
                 .expect("--json is JSON");
         assert_eq!(json["mirror_collisions"], serde_json_lenient::json!([8080]));
+        // A VM that gave no answer carries `null`, never an empty list.
+        let json: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&render(true, false, &one, &[None]))
+                .expect("--json is JSON");
+        assert!(
+            json["mirror_collisions"].is_null(),
+            "no answer is null: {json}"
+        );
 
         let two = [listing("default"), listing("work")];
-        let table = render(false, false, &two, &[Vec::new(), vec![3000]]);
+        let table = render(false, false, &two, &[None, Some(vec![3000])]);
         let rows: Vec<&str> = table
             .lines()
             .filter(|line| line.starts_with("MIRROR PORTS:"))
@@ -1677,9 +1693,13 @@ mod tests {
                  so a host_ip box cannot open it here."
             ]
         );
-        let json: serde_json_lenient::Value =
-            serde_json_lenient::from_str(&render(true, false, &two, &[Vec::new(), vec![3000]]))
-                .expect("--json is JSON");
+        let json: serde_json_lenient::Value = serde_json_lenient::from_str(&render(
+            true,
+            false,
+            &two,
+            &[Some(Vec::new()), Some(vec![3000])],
+        ))
+        .expect("--json is JSON");
         assert_eq!(json["vms"][0]["vm"], "default");
         assert_eq!(
             json["vms"][0]["mirror_collisions"],
