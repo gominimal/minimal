@@ -6309,6 +6309,33 @@ async fn ls_reports_every_proxy_port() {
     );
     assert!(json(&[]).get("hostname_proxy_ports").is_none());
 
+    // A proxy the VM host reports down names no port in `--json`, the same
+    // as the text row beside that verdict.
+    let mut down = Vec::new();
+    cmd::format_ls_with_proxy_ports_on(
+        &mut down,
+        &LsArgs {
+            raw: false,
+            json: true,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 65264,
+                cause: minimald_rpc::ProxyDownCause::RedrawsRanOut,
+            }),
+        }),
+        &[7654, 65264],
+        crate::resolver::HostInstall::default(),
+    )
+    .expect("rendering the listing");
+    let down: serde_json_lenient::Value =
+        serde_json_lenient::from_str(std::str::from_utf8(&down).expect("UTF-8"))
+            .expect("the listing is JSON");
+    assert!(down.get("hostname_proxy_ports").is_none());
+
     // Two VMs: each VM's row names its own ports.
     let listing = |vm: &str, port: u16| cmd::VmListing {
         vm: vm.to_string(),
