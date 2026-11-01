@@ -8611,7 +8611,9 @@ proof_native_resolution_without_proxy_env() {
 #         not dropped.
 #       - two host-address boxes' names, both answering the node's one
 #         reserved-range address (NET-129), and a port each box binds
-#         opening at that address with no proxy setting.
+#         opening at that address with no proxy setting. A macOS host
+#         whose lo0 lacks the reserved range mirrors no bind, so there
+#         both names must answer NODATA instead.
 #
 # A VM lane that cannot produce the answers FAILS, not skips: this case is the
 # box zone's whole story on those lanes.
@@ -8892,7 +8894,18 @@ for row in json.load(open(sys.argv[1])):
   # serves its own page on its own port, so the port, not the address, says
   # which box answered.
   local ha_names=(e2e-answerer-ha1 e2e-answerer-ha2) ha_ports=(18091 18092)
-  local ha_i ha_name ha_port ha_sid ha_reply ha_addr ha_node="" ha_body
+  local ha_i ha_name ha_port ha_sid ha_reply ha_addr ha_node="" ha_body ha_range ha_status
+  # The node's binds are mirrored only while the host carries the whole
+  # reserved range. Linux has all of 127.0.0.0/8 on lo. A macOS host has
+  # it only after `min finalize-install` aliased it onto lo0, and without
+  # it the mirror never opens, so a host-address name answers NODATA.
+  if [ "$(uname -s)" = Darwin ] \
+      && [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 254 ]; then
+    ha_range=absent
+    echo "host: lo0 does not carry the reserved range, so the node's binds are not mirrored and a host-address name must answer NODATA"
+  else
+    ha_range=present
+  fi
   for ha_i in 0 1; do
     ha_name="${ha_names[$ha_i]}"
     # shellcheck disable=SC2086
@@ -8912,7 +8925,30 @@ for row in json.load(open(sys.argv[1])):
       >/dev/null 2>>"$WORK/answerer-ha-responder.err" \
       || { echo "::error::could not start $ha_name's in-box responder on port $ha_port"; cat "$WORK/answerer-ha-responder.err" 2>/dev/null || true; fail; }
   done
+  if [ "$ha_range" = absent ]; then
+    # NET-128/NET-129 without the range: the name is held (NOERROR, not
+    # NXDOMAIN) and carries no address, because no bind is mirrored.
+    for ha_name in "${ha_names[@]}"; do
+      ha_status=""
+      for _ in $(seq 1 60); do
+        ha_reply="$(dig +time=2 +tries=1 +noall +comments +answer "@127.0.0.1" -p "$host_answerer_port" \
+          "$ha_name.min.internal" A 2>/dev/null || true)"
+        ha_status="$(printf '%s\n' "$ha_reply" | sed -En 's/.*status: ([A-Z]+).*/\1/p' | head -n1)"
+        [ "$ha_status" = NOERROR ] && break
+        sleep 0.5
+      done
+      ha_addr="$(printf '%s\n' "$ha_reply" | awk '$4 == "A" { print $5; exit }')"
+      if [ "$ha_status" != NOERROR ] || [ -n "$ha_addr" ]; then
+        echo "::error::without the reserved range the host-address box $ha_name.min.internal must answer NODATA (NOERROR, no address); got status '${ha_status:-no reply}' and address '${ha_addr:-none}'"
+        echo "--- dig ---"; printf '%s\n' "$ha_reply"
+        echo "--- min ls ---"; mnl ls 2>&1 || true
+        fail
+      fi
+      echo "$ha_name.min.internal answers NODATA: the node's binds are not mirrored without the reserved range"
+    done
+  fi
   for ha_i in 0 1; do
+    [ "$ha_range" = present ] || break
     ha_name="${ha_names[$ha_i]}"
     ha_addr=""
     for _ in $(seq 1 60); do
@@ -8945,6 +8981,7 @@ for row in json.load(open(sys.argv[1])):
     echo "$ha_name.min.internal answers the node's address $ha_addr"
   done
   for ha_i in 0 1; do
+    [ "$ha_range" = present ] || break
     ha_name="${ha_names[$ha_i]}"
     ha_port="${ha_ports[$ha_i]}"
     ha_body=""
@@ -8968,7 +9005,7 @@ for row in json.load(open(sys.argv[1])):
     mnl session destroy --force "$ha_name" >/dev/null 2>&1 || true
   done
 
-  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN, two host-address boxes answer the node's one address and open their ports there)"
+  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN, two host-address boxes answer the node's one address and open their ports there, or NODATA where the host lacks the reserved range)"
   echo "::endgroup::"
 }
 
