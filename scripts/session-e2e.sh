@@ -417,6 +417,7 @@ BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
 E2E_NOT_RUN_WHY="" # one line per NOT RUN case: the case, a tab, and its gate
 E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
+E2E_KNOWN_GAP_WHY="" # one line per KNOWN GAP check: the case, a tab, and what is missing
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -927,9 +928,14 @@ not_run() {
 known_gap() {
   echo "$1: KNOWN GAP ($2)"
   E2E_KNOWN_GAP="$E2E_KNOWN_GAP $1"
+  E2E_KNOWN_GAP_WHY="$E2E_KNOWN_GAP_WHY$1"$'\t'"$2"$'\n'
 }
 
 teardown() {
+  # The audit, HTTP and message walk's grant box, when one of its legs ran
+  # alone: only the whole walk destroys it before it returns.
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
+  AHM_SID=""
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -15708,6 +15714,303 @@ PY
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# Audit, HTTP and message conditions (BEP, T112): one walk over the slice,
+# the way a person meets it. Each leg prints PASS or NOT RUN with its gate.
+#   bep_ahm_audit_by_id_and_name: a running grant box sends 'gh api user',
+#     and `min box audit` shows its decision records by box id and by name.
+#     Every record names that box, and the read by name names the box id.
+#   bep_ahm_parent_merges_children: `min box audit --parent` on that box
+#     reads cleanly and says the box has no child boxes. No box gets a
+#     parent today (minimald stamps none until the creating connection can
+#     carry the caller's box identity, BOX-001 and BOX-140), so the merge of
+#     a child's records is a KNOWN GAP on the live path. The issue
+#     https://github.com/gominimal/minimal/issues/2828 owns that gap.
+#   bep_ahm_relayed_response_has_no_alt_svc: a response relayed through the
+#     proxy carries no Alt-Svc header (BEP-076). The leg also says if the
+#     upstream sent one on this run, read directly from the host.
+#   bep_ahm_missing_proxy_refused: with MINVMD_BEP_BIN naming a missing
+#     file and no proxy published under the home directory, a grant box is
+#     refused with exit 5. The text names where `bep` is not installed and
+#     the one next step. The leg runs `min` with a new, empty HOME, so the
+#     live proxy's published identity is not read and the real one is not
+#     touched. The refusal comes before the daemon is asked for anything.
+# The first three legs need the live gate: macOS, a VM lane with gvproxy,
+# and a GitHub sign-in. The fourth needs only macOS and the VM lane.
+AHM_SID="" AHM_GATE=""
+AHM_NAME=e2e-bep-ahm
+
+ahm_cleanup() {
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
+  AHM_SID=""
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+  GRANT_SEED_DIR=""
+  return 0
+}
+ahm_fail() {
+  echo "--- bep.log (box connections, tail) ---"
+  grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+    | tail -20 || true
+  ahm_cleanup
+  fail
+}
+
+# The box id in the form `bep serve` writes in a record's subject: 32
+# lowercase hex digits, with no hyphens.
+ahm_subject() {
+  printf '%s' "$1" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# Starts the one grant box the first three legs share, once, and sends one
+# 'gh api user' through the proxy from it. $1 is the leg. A missing gate
+# records the leg, and each later leg, as NOT RUN with the same reason.
+ahm_box_up() {
+  [ -n "$AHM_SID" ] && return 0
+  if [ -n "$AHM_GATE" ]; then
+    not_run "$1" "$AHM_GATE"
+    return 1
+  fi
+  if ! bep_live_gate "$1"; then
+    AHM_GATE="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$1" '$1 == c { w = $2 } END { print w }')"
+    return 1
+  fi
+  bep_revoke_seed "$1"
+  AHM_SID="$(bep_revoke_activate "$1" "$AHM_NAME")" || { AHM_SID=""; ahm_fail; }
+  if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/bep_ahm.first" 2>&1; then
+    echo "::error::'gh api user' failed in the box $AHM_NAME, so the proxy wrote no record to read"
+    cat "$WORK/bep_ahm.first" 2>/dev/null || true
+    ahm_fail
+  fi
+  echo "box $AHM_NAME ($AHM_SID): 'gh api user' answered through the proxy"
+}
+
+# Checks the jsonl file $1 from `min box audit`: at least one record, every
+# record's subject is $2, and an admit decision for api.github.com names
+# it. With $3, every record of the jsonl file $3, an earlier read, is
+# also in $1. The proxy can append records between the two reads, so $1
+# can hold more records than $3.
+ahm_audit_check() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+path, subject, other = sys.argv[1], sys.argv[2], sys.argv[3]
+def read(p):
+    with open(p) as f:
+        return [l.strip() for l in f if l.strip()]
+lines = read(path)
+records = [json.loads(l) for l in lines]
+if not records:
+    print("no records")
+    sys.exit(1)
+foreign = sorted({r.get("subject", "") for r in records if r.get("subject") != subject})
+if foreign:
+    print("records of another subject: " + ", ".join(foreign))
+    sys.exit(1)
+decisions = [r for r in records if r.get("kind") == "decision"]
+admits = [r for r in decisions if r.get("decision") == "admit"
+          and r.get("upstream") == "api.github.com:443"]
+if not admits:
+    print("no admit decision for api.github.com:443")
+    sys.exit(1)
+if other:
+    later = set(lines)
+    missing = [l for l in read(other) if l not in later]
+    if missing:
+        print("%d record(s) read by id are missing from the read by name" % len(missing))
+        sys.exit(1)
+print("%d records, %d decisions, %d admits for api.github.com:443" % (len(records), len(decisions), len(admits)))
+PY
+}
+
+proof_bep_ahm_audit_by_id_and_name() {
+  local ai_case=bep_ahm_audit_by_id_and_name ai_subject ai_out ai_err
+  ahm_box_up "$ai_case" || return 0
+  ai_subject="$(ahm_subject "$AHM_SID")"
+  if ! mnl box audit "$AHM_SID" -o jsonl </dev/null \
+    >"$WORK/$ai_case.id" 2>"$WORK/$ai_case.id.err"; then
+    echo "::error::'min box audit $AHM_SID' failed"
+    cat "$WORK/$ai_case.id.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  if ! ai_out="$(ahm_audit_check "$WORK/$ai_case.id" "$ai_subject")"; then
+    echo "::error::'min box audit $AHM_SID': $ai_out"
+    echo "--- min box audit $AHM_SID -o jsonl ---"; cat "$WORK/$ai_case.id"
+    ahm_fail
+  fi
+  echo "min box audit $AHM_SID: $ai_out"
+  if ! mnl box audit "$AHM_NAME" -o jsonl </dev/null \
+    >"$WORK/$ai_case.name" 2>"$WORK/$ai_case.name.err"; then
+    echo "::error::'min box audit $AHM_NAME' failed"
+    cat "$WORK/$ai_case.name.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  ai_err="$(tr -d '\r' <"$WORK/$ai_case.name.err")"
+  if ! [[ "$ai_err" =~ Showing\ $AHM_NAME\ \(box\ ([0-9a-fA-F-]+)\)\. ]] \
+    || [ "$(ahm_subject "${BASH_REMATCH[1]}")" != "$ai_subject" ]; then
+    echo "::error::'min box audit $AHM_NAME' does not name the box id $AHM_SID it read"
+    printf '%s\n' "$ai_err"
+    ahm_fail
+  fi
+  if ! ai_out="$(ahm_audit_check "$WORK/$ai_case.name" "$ai_subject" "$WORK/$ai_case.id")"; then
+    echo "::error::'min box audit $AHM_NAME': $ai_out"
+    echo "--- min box audit $AHM_NAME -o jsonl ---"; cat "$WORK/$ai_case.name"
+    ahm_fail
+  fi
+  echo "min box audit $AHM_NAME: names box $AHM_SID, and shows $ai_out"
+}
+
+proof_bep_ahm_parent_merges_children() {
+  local pm_case=bep_ahm_parent_merges_children pm_err
+  ahm_box_up "$pm_case" || return 0
+  if ! mnl box audit --parent "$AHM_SID" -o jsonl </dev/null \
+    >"$WORK/$pm_case.out" 2>"$WORK/$pm_case.err"; then
+    echo "::error::'min box audit --parent $AHM_SID' failed"
+    cat "$WORK/$pm_case.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  pm_err="$(tr -d '\r' <"$WORK/$pm_case.err")"
+  if ! [[ "$pm_err" =~ Box\ ([0-9a-fA-F-]+)\ has\ no\ child\ boxes\. ]] \
+    || [ "$(ahm_subject "${BASH_REMATCH[1]}")" != "$(ahm_subject "$AHM_SID")" ]; then
+    echo "::error::'min box audit --parent $AHM_SID' does not say that box $AHM_SID has no child boxes"
+    printf '%s\n' "$pm_err"
+    ahm_fail
+  fi
+  if [ -s "$WORK/$pm_case.out" ]; then
+    echo "::error::'min box audit --parent $AHM_SID' shows records, though the box has no child boxes"
+    cat "$WORK/$pm_case.out"
+    ahm_fail
+  fi
+  echo "min box audit --parent $AHM_SID: no records, and it says the box has no child boxes"
+  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; https://github.com/gominimal/minimal/issues/2828"
+}
+
+proof_bep_ahm_relayed_response_has_no_alt_svc() {
+  local as_case=bep_ahm_relayed_response_has_no_alt_svc as_direct
+  ahm_box_up "$as_case" || return 0
+  # The same upstream, read directly from the host with no credential, goes
+  # first. With no Alt-Svc header there, the proxy has none to remove on this
+  # run, so the leg does not test the removal. /user answers a read with no
+  # credential with a 401, and a 401 and a 200 can carry different headers.
+  # /rate_limit answers it with a 200, the status of the relayed read below.
+  if ! curl -sS -D "$WORK/$as_case.direct" -o /dev/null --max-time 30 https://api.github.com/rate_limit \
+    2>"$WORK/$as_case.direct.err"; then
+    not_run "$as_case" "curl could not read https://api.github.com/rate_limit from the host: $(head -n1 "$WORK/$as_case.direct.err" 2>/dev/null)"
+    return 0
+  fi
+  if ! head -n1 "$WORK/$as_case.direct" | grep -Eq '^HTTP/[0-9.]+ 200'; then
+    not_run "$as_case" "https://api.github.com/rate_limit read directly from the host answered '$(head -n1 "$WORK/$as_case.direct" | tr -d '\r')', not 200, so its headers cannot stand for a 200"
+    return 0
+  fi
+  as_direct="$(tr -d '\r' <"$WORK/$as_case.direct" | grep -i '^alt-svc:' | head -n1 || true)"
+  if [ -z "$as_direct" ]; then
+    not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header with a 200 on this run, so the proxy had none to remove"
+    return 0
+  fi
+  echo "api.github.com read directly from the host with no credential answers 200 with '$as_direct'"
+  # gh prints the response's status line and headers before the body.
+  if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api --include user' \
+    >"$WORK/$as_case.relayed" 2>&1; then
+    echo "::error::'gh api --include user' failed in the box $AHM_NAME"
+    cat "$WORK/$as_case.relayed" 2>/dev/null || true
+    ahm_fail
+  fi
+  if ! head -n1 "$WORK/$as_case.relayed" | grep -Eq '^HTTP/[0-9.]+ 200'; then
+    echo "::error::'gh api --include user' in the box $AHM_NAME printed no 200 status line, so its headers cannot be read"
+    head -20 "$WORK/$as_case.relayed"
+    ahm_fail
+  fi
+  # The head ends at the first empty line. awk reads to the end, so no
+  # stage of the pipe stops early.
+  tr -d '\r' <"$WORK/$as_case.relayed" | awk 'NF == 0 { body = 1 } !body { print }' \
+    >"$WORK/$as_case.head"
+  if grep -iq '^alt-svc:' "$WORK/$as_case.head"; then
+    echo "::error::the response relayed through the proxy to the box $AHM_NAME carries an Alt-Svc header"
+    grep -i '^alt-svc:' "$WORK/$as_case.head"
+    ahm_fail
+  fi
+  echo "gh api --include user in the box: the relayed response carries no Alt-Svc header"
+}
+
+proof_bep_ahm_missing_proxy_refused() {
+  local mp_case=bep_ahm_missing_proxy_refused mp_home mp_bin mp_rc=0 mp_err mp_want mp_next
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$mp_case" "the Box Egress Proxy runs on macOS only"
+    return 0
+  fi
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$mp_case" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 0
+  fi
+  mp_home="$(hook_mktemp /tmp/mnlnobep.XXXXXX)"
+  mp_bin="$mp_home/no-such-bep"
+  mkdir "$mp_home/project" "$mp_home/project/.git"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$mp_home/project/minimal.toml"
+  (cd "$mp_home/project" && HOME="$mp_home" MINVMD_BEP_BIN="$mp_bin" \
+    mnl session activate . --no-prompt --name e2e-bep-ahm-no-proxy \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null >"$WORK/$mp_case.out" 2>"$WORK/$mp_case.err") || mp_rc=$?
+  mp_err="$(tr -d '\r' <"$WORK/$mp_case.err")"
+  rm -rf "${mp_home:?}"
+  if [ "$mp_rc" != 5 ]; then
+    echo "::error::'min session activate' of a grant box with MINVMD_BEP_BIN=$mp_bin exited $mp_rc, not 5"
+    echo "--- stdout ---"; cat "$WORK/$mp_case.out" 2>/dev/null || true
+    echo "--- stderr ---"; printf '%s\n' "$mp_err"
+    fail
+  fi
+  mp_want="it declares the GitHub grant GH_TOKEN, and \`bep\`, the Box Egress Proxy, is not installed at $mp_bin, so no proxy serves boxes on this machine."
+  mp_next="To create the box without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml."
+  if ! grep -qF -- "$mp_want" <<<"$mp_err" || ! grep -qF -- "$mp_next" <<<"$mp_err"; then
+    echo "::error::the refusal of a grant box with no proxy does not name where bep is not installed and the next step"
+    echo "  want: $mp_want $mp_next"
+    echo "--- stderr ---"; printf '%s\n' "$mp_err"
+    fail
+  fi
+  echo "grant box with MINVMD_BEP_BIN naming a missing file: refused with exit 5: $(grep -F -- "$mp_want" <<<"$mp_err" | head -n1)"
+}
+
+proof_bep_audit_http_and_messages_closed() {
+  local ahm_case ahm_before ahm_gap_before ahm_why ahm_ran=0 ahm_summary=""
+  echo "::group::BEP audit, HTTP and message conditions: one walk over the slice"
+  for ahm_case in bep_ahm_audit_by_id_and_name \
+      bep_ahm_parent_merges_children \
+      bep_ahm_relayed_response_has_no_alt_svc \
+      bep_ahm_missing_proxy_refused; do
+    # The shared box goes before the leg that needs no box, so the refusal
+    # leg runs with no grant box of this case alive.
+    [ "$ahm_case" = bep_ahm_missing_proxy_refused ] && ahm_cleanup
+    ahm_before="$E2E_NOT_RUN"
+    ahm_gap_before="$E2E_KNOWN_GAP"
+    "proof_$ahm_case"
+    if [ "$E2E_NOT_RUN" = "$ahm_before" ] && [ "$E2E_KNOWN_GAP" != "$ahm_gap_before" ]; then
+      ahm_ran=$((ahm_ran + 1))
+      ahm_why="$(printf '%s' "$E2E_KNOWN_GAP_WHY" | awk -F '\t' -v c="$ahm_case" '$1 == c { w = $2 } END { print w }')"
+      ahm_summary="$ahm_summary$ahm_case: KNOWN GAP (${ahm_why:-no reason recorded})"$'\n'
+    elif [ "$E2E_NOT_RUN" = "$ahm_before" ]; then
+      ahm_ran=$((ahm_ran + 1))
+      ahm_summary="$ahm_summary$ahm_case: PASS"$'\n'
+    else
+      ahm_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$ahm_case" '$1 == c { w = $2 } END { print w }')"
+      ahm_summary="$ahm_summary$ahm_case: NOT RUN (${ahm_why:-no reason recorded})"$'\n'
+    fi
+  done
+  ahm_cleanup
+  rm -f "${WORK:?}"/bep_ahm*
+  echo "::endgroup::"
+  echo "::group::BEP audit, HTTP and message conditions: each case"
+  printf '%s' "$ahm_summary"
+  echo "::endgroup::"
+  if [ "$ahm_ran" = 0 ]; then
+    not_run bep_audit_http_and_messages_closed "none of its cases can run on this lane"
+  fi
+}
+
 # Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
 # is proxy_env starts on an own-address credentialed lane, and its
 # environment points at the Box Egress Proxy. The two cases share one box
@@ -27644,6 +27947,7 @@ case "${1:-}" in
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_bep_round_two_conditions_closed
     proof_bep_audit_rotation_and_doctor_end_to_end
+    proof_bep_audit_http_and_messages_closed
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -27735,7 +28039,10 @@ case "${1:-}" in
     | bep_r3_stranded_box_frees_client_key \
     | bep_r3_widened_store_rule_without_restart \
     | bep_r3_config_dir_rule_reaches_bep_serve \
-    | bep_round_three_conditions_closed)
+    | bep_round_three_conditions_closed \
+    | bep_ahm_audit_by_id_and_name | bep_ahm_parent_merges_children \
+    | bep_ahm_relayed_response_has_no_alt_svc | bep_ahm_missing_proxy_refused \
+    | bep_audit_http_and_messages_closed)
     "proof_$1"
     ;;
   *)
@@ -27789,6 +28096,9 @@ case "${1:-}" in
     echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
     echo "         bep_round_three_conditions_closed"
     echo "         bep_audit_rotation_and_doctor_end_to_end"
+    echo "         bep_ahm_audit_by_id_and_name bep_ahm_parent_merges_children"
+    echo "         bep_ahm_relayed_response_has_no_alt_svc bep_ahm_missing_proxy_refused"
+    echo "         bep_audit_http_and_messages_closed"
     exit 2
     ;;
 esac
