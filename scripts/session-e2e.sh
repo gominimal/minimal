@@ -15873,7 +15873,7 @@ proof_bep_ahm_parent_merges_children() {
     ahm_fail
   fi
   echo "min box audit --parent $AHM_SID: no records, and it says the box has no child boxes"
-  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; no issue is filed for this yet, so file one and cite it here"
+  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; no issue tracks this gap yet"
 }
 
 proof_bep_ahm_relayed_response_has_no_alt_svc() {
@@ -27934,6 +27934,7 @@ case "${1:-}" in
     proof_bep_dns_steering_fails_closed_end_to_end
     proof_bep_round_two_conditions_closed
     proof_bep_audit_rotation_and_doctor_end_to_end
+    proof_bep_audit_http_and_messages_closed
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
