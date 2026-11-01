@@ -4204,6 +4204,31 @@ async fn edit_record(
     handle.write(record).await.unwrap();
 }
 
+/// Appends an `exited` event stamped `at` to the events of box `id`,
+/// through a store over `state_dir`.
+async fn write_exited_event(state_dir: &std::path::Path, id: SessionId, at: std::time::SystemTime) {
+    use boxes::store::BoxObject as _;
+
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let object = handle.object().await.unwrap();
+    let mut event =
+        boxes::events::BoxEvent::for_record(object.record(), boxes::events::BoxEventType::Exited);
+    event.ts = u64::try_from(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    object.append_event(&event).unwrap();
+}
+
 /// Every path of box `id` that a reap deletes: the events file beside
 /// the record, and each directory the box sees.
 async fn reaped_paths(mngr: &BoxManagerHandle, id: SessionId) -> Vec<DaemonAbsPath> {
@@ -4441,11 +4466,22 @@ async fn prune_selectors_reap_and_print() {
     )
     .await;
     set_record_state(state.path(), orphan, stopped).await;
+    let recent_exit = create_active_session_with(&mngr, rooted_config("recent", "/p")).await;
+    let no_exit = create_active_session_with(&mngr, rooted_config("no-exit", "/p")).await;
+    set_record_state(state.path(), recent_exit, stopped).await;
+    set_record_state(state.path(), no_exit, stopped).await;
 
     let day = std::time::Duration::from_secs(24 * 60 * 60);
     let now = std::time::SystemTime::now();
+    // The age counts from the last `exited` event, not from the id. The
+    // orphan ended now. `recent_exit` ended a day and a half on, so two
+    // days on its id is older than a day but its exit is not. `no_exit`
+    // has no `exited` event.
+    write_exited_event(state.path(), orphan, now - day).await;
+    write_exited_event(state.path(), orphan, now).await;
+    write_exited_event(state.path(), recent_exit, now + day + day / 2).await;
 
-    // Every box is younger than a day.
+    // No box ended a day ago.
     let reply = mngr.prune_boxes_at(Some(day), None, now).await.unwrap();
     assert_eq!(reply, minimald_rpc::PruneBoxesResponse::default());
 
@@ -4475,12 +4511,15 @@ async fn prune_selectors_reap_and_print() {
         Some(("exited".to_string(), Some("child-b".to_string())))
     );
 
-    // Two days on, the orphan is older than a day and goes too. The boxes
-    // that are running or still being created stay, however old.
+    // Two days on, the orphan's last exit is older than a day and it goes
+    // too. `recent_exit` exited half a day before, so it stays, though its
+    // id is two days old. `no_exit` has no exit to count from, so it stays.
+    // The boxes that are running or still being created stay, however old.
     let later = now + 2 * day;
     let reply = mngr.prune_boxes_at(Some(day), None, later).await.unwrap();
     let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
     assert_eq!(reaped, vec![orphan]);
+    assert!(reply.failed.is_empty(), "{:?}", reply.failed);
 
     let mut left: Vec<_> = mngr
         .list_boxes(None)
@@ -4490,11 +4529,20 @@ async fn prune_selectors_reap_and_print() {
         .map(|entry| entry.box_id)
         .collect();
     left.sort();
-    let mut expected = vec![running, running_child, pending];
+    let mut expected = vec![running, running_child, pending, recent_exit, no_exit];
     expected.sort();
-    assert_eq!(left, expected, "a prune reaps no running or pending box");
+    assert_eq!(
+        left, expected,
+        "a prune reaps no running or pending box, and no box that exited too recently"
+    );
 
     let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line
+            .contains("prune: the box has no exited event; the age selector skips it")
+            && line.contains(&no_exit.to_string())),
+        "the daemon log names the box the age selector skips:\n{logged}"
+    );
     for id in [child_stopped, child_exited, orphan] {
         assert!(
             logged
@@ -4504,6 +4552,66 @@ async fn prune_selectors_reap_and_print() {
         );
     }
     assert!(logged.contains("pruned the stopped and exited boxes"));
+}
+
+/// BOX-019, BOX-025: a reap of a stopped box whose resume is in flight
+/// is refused with its own text, not the running text. A forced reap
+/// waits for the resume to end and then reaps the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reap_resuming_box_refuses_and_forced_waits() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("resuming", "/p")).await;
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    // The claim a resume makes before it writes `running`.
+    assert!(
+        mngr.running_name_holder(id, "resuming".to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let refused = mngr
+        .reap_box(id, false)
+        .await
+        .expect_err("a box whose resume is in flight is not reaped");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Box `{}` is resuming, so it was not removed. \
+             Remove it again after the resume ends.",
+            id.as_ref()
+        )
+    );
+    assert!(matches!(state_of(&mngr, id).await, RecordState::Stopped(_)));
+
+    // The resume ends while the forced reap waits.
+    let releaser = mngr.clone();
+    let release = crate::traced::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        releaser.release_name_claim(id).await;
+    });
+    let reply = mngr
+        .reap_box(id, true)
+        .await
+        .expect("a forced reap waits for the resume to end");
+    release.await.unwrap();
+    assert_eq!(reply.reaped.box_id, id);
+    assert_eq!(reply.reaped.state, "stopped");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone"
+    );
 }
 
 /// BOX-024: no daemon reaps a stopped or exited box on its own. Both

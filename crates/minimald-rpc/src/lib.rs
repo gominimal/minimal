@@ -2819,8 +2819,10 @@ pub struct PruneBoxes;
 /// The request for a [`PruneBoxes`] RPC.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PruneBoxesRequest {
-    /// Match only the boxes created at least this many seconds ago.
-    /// Absent, the age does not narrow the prune.
+    /// Match only the boxes that entered `stopped` or `exited` at least
+    /// this many seconds ago. A box with no record of when it entered
+    /// either state does not match. Absent, the age does not narrow the
+    /// prune.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub older_than_secs: Option<u64>,
     /// Match only the boxes whose parent is this box. Absent, the parent

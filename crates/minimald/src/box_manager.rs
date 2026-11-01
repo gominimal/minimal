@@ -601,60 +601,85 @@ impl BoxManagerHandle {
         .await
     }
 
+    /// The reap itself. A forced reap stops a running box at once first.
+    /// A forced reap of a box whose resume is in flight waits for the
+    /// resume to end, for at most [`REAP_RESUME_WAIT`], and then reaps the
+    /// box in the state the resume left it: it stops a box the resume
+    /// started. It does not cancel the resume. A reap that is not forced
+    /// refuses such a box at once.
     async fn reap_record_now(
         &self,
         mut record: boxes::Record,
         force: bool,
     ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
         let key = record.id;
-        if force
-            && matches!(
-                record.state(),
-                Ok(boxes::core::record::RecordState::Running)
-            )
-        {
-            tracing::info!(
-                session_id = %key,
-                "reap: stopping the running box at once before the reap"
-            );
-            match self.stop_box(key, true).await {
-                Ok(ending) => {
-                    tracing::info!(session_id = %key, ending = ?ending, "reap: the forced stop ended the box");
+        let deadline = tokio::time::Instant::now() + REAP_RESUME_WAIT;
+        loop {
+            if force
+                && matches!(
+                    record.state(),
+                    Ok(boxes::core::record::RecordState::Running)
+                )
+            {
+                tracing::info!(
+                    session_id = %key,
+                    "reap: stopping the running box at once before the reap"
+                );
+                match self.stop_box(key, true).await {
+                    Ok(ending) => {
+                        tracing::info!(session_id = %key, ending = ?ending, "reap: the forced stop ended the box");
+                    }
+                    // The box ended between the read and the stop. The reap
+                    // below reads the state it ended in.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(e) => return Err(e),
                 }
-                // The box ended between the read and the stop. The reap
-                // below reads the state it ended in.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(e) => return Err(e),
+                record = self
+                    .get_record(BoxKeyPredicate::Id(key))
+                    .await?
+                    .ok_or_else(|| unknown_box(key))?;
             }
-            record = self
-                .get_record(BoxKeyPredicate::Id(key))
-                .await?
-                .ok_or_else(|| unknown_box(key))?;
-        }
-        let reaped = box_listing_entry(&record);
-        let (send, recv) = Responder::channel();
-        // A send error means the manager is gone: the recv fails as well.
-        let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
-        let hook_failures = recv
-            .await
-            .unwrap_or_else(|_| {
+            let reaped = box_listing_entry(&record);
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
+            let outcome = recv.await.unwrap_or_else(|_| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     minimald_rpc::SHUTDOWN_REFUSAL,
                 ))
-            })?
-            .unwrap_or_default();
-        Ok(minimald_rpc::ReapBoxResponse {
-            reaped,
-            hook_failures,
-        })
+            });
+            match outcome {
+                Err(e)
+                    if force && is_resume_pending(&e) && tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::info!(
+                        session_id = %key,
+                        "reap: waiting for the box's resume to end before the forced reap"
+                    );
+                    tokio::time::sleep(REAP_RESUME_POLL).await;
+                    record = self
+                        .get_record(BoxKeyPredicate::Id(key))
+                        .await?
+                        .ok_or_else(|| unknown_box(key))?;
+                }
+                outcome => {
+                    return Ok(minimald_rpc::ReapBoxResponse {
+                        reaped,
+                        hook_failures: outcome?.unwrap_or_default(),
+                    });
+                }
+            }
+        }
     }
 
     /// Reaps every `stopped` or `exited` box that matches all the given
     /// selectors (BOX-021), and answers with each box it reaped and each
-    /// one it matched and did not reap. `older_than` matches a box created
-    /// at least that long ago, `parent` a box whose parent is that box. A
-    /// box in any other state never matches. Each reap is a
+    /// one it matched and did not reap. `older_than` matches a box that
+    /// entered `stopped` or `exited` at least that long ago, as the `ts` of
+    /// its last `exited` event says. A box with no `exited` event never
+    /// matches it. `parent` matches a box whose parent is that box. A box
+    /// in any other state never matches. Each reap is a
     /// [`Self::reap_box`] that is not forced, so a box that resumes after
     /// the match is refused, not reaped.
     ///
@@ -669,6 +694,46 @@ impl BoxManagerHandle {
     ) -> Result<minimald_rpc::PruneBoxesResponse, BoxManagerError> {
         self.prune_boxes_at(older_than, parent, std::time::SystemTime::now())
             .await
+    }
+
+    /// Whether the box `record` names entered `stopped` or `exited` at
+    /// least `older_than` before `now`, for a prune's age selector
+    /// (BOX-021). A box with no `exited` event, or whose events cannot be
+    /// read, does not match, and the daemon log names it.
+    async fn ended_long_enough(
+        &self,
+        record: &boxes::Record,
+        older_than: std::time::Duration,
+        now: std::time::SystemTime,
+    ) -> bool {
+        let box_id = record.box_id.unwrap_or(record.id);
+        let events = match self.box_events(record.id).await {
+            Ok(mut reader) => reader.read_new(),
+            Err(error) => Err(error),
+        };
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    %error,
+                    "prune: the box's events cannot be read; the age selector skips it"
+                );
+                return false;
+            }
+        };
+        match ended_at(&events) {
+            Some(ended) => now.duration_since(ended).is_ok_and(|age| age >= older_than),
+            None => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    "prune: the box has no exited event; the age selector skips it"
+                );
+                false
+            }
+        }
     }
 
     /// [`Self::prune_boxes`] with `now` as the time that `older_than`
@@ -701,10 +766,18 @@ impl BoxManagerHandle {
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
-            let mut matched: Vec<boxes::Record> = records
-                .into_iter()
-                .filter(|record| prune_matches(record, older_than, parent, now))
-                .collect();
+            let mut matched = Vec::new();
+            for record in records {
+                if !prune_matches(&record, parent) {
+                    continue;
+                }
+                if let Some(older_than) = older_than
+                    && !self.ended_long_enough(&record, older_than, now).await
+                {
+                    continue;
+                }
+                matched.push(record);
+            }
             matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
             tracing::Span::current().record("matched", matched.len());
             let mut reply = minimald_rpc::PruneBoxesResponse::default();
@@ -734,15 +807,11 @@ impl BoxManagerHandle {
     }
 }
 
-/// Whether a prune reaps `record` (BOX-021): it is `stopped` or `exited`,
-/// and it matches every selector given. A box whose creation time cannot
-/// be read from its id never matches an `older_than`.
-fn prune_matches(
-    record: &boxes::Record,
-    older_than: Option<std::time::Duration>,
-    parent: Option<SessionId>,
-    now: std::time::SystemTime,
-) -> bool {
+/// Whether `record` is a prune candidate (BOX-021): it is `stopped` or
+/// `exited`, and it matches the `parent` selector when one is given. The
+/// `older_than` selector needs the record's events, so
+/// [`BoxManagerHandle::prune_boxes_at`] checks it after this one.
+fn prune_matches(record: &boxes::Record, parent: Option<SessionId>) -> bool {
     let ended = matches!(
         record.state(),
         Ok(boxes::core::record::RecordState::Stopped(_)
@@ -751,43 +820,17 @@ fn prune_matches(
     if !ended {
         return false;
     }
-    if let Some(parent) = parent
-        && record.parent != Some(parent)
-    {
-        return false;
-    }
-    match older_than {
-        None => true,
-        Some(older_than) => match box_created_at(record) {
-            Some(created) => now
-                .duration_since(created)
-                .is_ok_and(|age| age >= older_than),
-            None => {
-                tracing::info!(
-                    session_id = %record.id,
-                    "prune: the box id carries no creation time; the age selector skips it"
-                );
-                false
-            }
-        },
-    }
+    parent.is_none_or(|parent| record.parent == Some(parent))
 }
 
-/// When the box `record` names was created: the time in its UUIDv7 id
-/// (BOX-001), its `box_id` first and its `id` second. `None` for an id
-/// that is not a UUIDv7.
-fn box_created_at(record: &boxes::Record) -> Option<std::time::SystemTime> {
-    [record.box_id, Some(record.id)]
-        .into_iter()
-        .flatten()
-        .find_map(|id| {
-            let uuid = uuid::Uuid::from_bytes(id.to_bytes());
-            if uuid.get_version_num() != 7 {
-                return None;
-            }
-            let (secs, nanos) = uuid.get_timestamp()?.to_unix();
-            Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
-        })
+/// When the box entered `stopped` or `exited`: the `ts` of the last
+/// `exited` event in `events`. `None` when no `exited` event is there.
+fn ended_at(events: &[BoxEvent]) -> Option<std::time::SystemTime> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == BoxEventType::Exited)
+        .map(|event| std::time::UNIX_EPOCH + std::time::Duration::from_millis(event.ts))
 }
 
 /// The refusal for an id no retained record names.
@@ -3936,17 +3979,18 @@ impl BoxManager {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let resuming = self.name_claims.contains_key(&id);
         Ok(match state {
-            RecordState::Stopped(_) | RecordState::Exited(_) if !resuming => None,
-            RecordState::Running | RecordState::Stopped(_) | RecordState::Exited(_) => {
-                Some(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Box `{}` is running, so it was not removed. \
+            RecordState::Stopped(_) | RecordState::Exited(_) if resuming => Some(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, ResumePending(id)),
+            ),
+            RecordState::Stopped(_) | RecordState::Exited(_) => None,
+            RecordState::Running => Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Box `{}` is running, so it was not removed. \
                          A forced removal stops the box first and then removes it.",
-                        id.as_ref()
-                    ),
-                ))
-            }
+                    id.as_ref()
+                ),
+            )),
             RecordState::Pending | RecordState::Materializing => Some(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -3957,6 +4001,37 @@ impl BoxManager {
             )),
         })
     }
+}
+
+/// How long a forced reap waits for a resume in flight to end.
+const REAP_RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a forced reap checks whether the resume it waits for ended.
+const REAP_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The refusal of a reap of a `stopped` or `exited` box whose resume is in
+/// flight (BOX-019, BOX-025).
+#[derive(Debug)]
+struct ResumePending(SessionId);
+
+impl std::fmt::Display for ResumePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Box `{}` is resuming, so it was not removed. \
+             Remove it again after the resume ends.",
+            self.0.as_ref()
+        )
+    }
+}
+
+impl std::error::Error for ResumePending {}
+
+/// Whether `error` is the [`ResumePending`] refusal.
+fn is_resume_pending(error: &BoxManagerError) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ResumePending>())
 }
 
 /// Deletes a record whose create failed before its id reached the caller.
