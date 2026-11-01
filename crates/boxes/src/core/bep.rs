@@ -424,7 +424,15 @@ pub type SecretGrants = BTreeMap<String, SecretGrant>;
 pub struct HostFacts {
     /// Whether the host is enrolled with a Gatehouse.
     pub enrolled: bool,
-    /// Whether the host runs a box-zone resolver.
+    /// Whether the box's lookups go through a switch whose DNS gate steers
+    /// the credential module's names to the proxy. The CLI sets it at
+    /// creation and at `min box spec`, from the host kind and the network
+    /// mode. It is true for an own-address box on the VM host, whose switch
+    /// asks the VM host whether the proxy's listener is live. It is false on
+    /// a native host, where a steered name always fails closed, and for a
+    /// box with no own address. While it is false, `dns` and `both` steering
+    /// with a credentialed upstream is refused (BEP-017). The steering does
+    /// not change this fact.
     pub box_zone_resolver: bool,
     /// Whether the client configuration sets
     /// [`FULL_BREADTH_ACKNOWLEDGEMENT`]. It matters only un-enrolled.
@@ -432,7 +440,10 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
-    /// An un-enrolled host with no box-zone resolver and no acknowledgement.
+    /// An un-enrolled host with no box-zone resolver and no acknowledgement:
+    /// a native host. A caller on the VM host sets
+    /// [`Self::box_zone_resolver`] over it, from the host kind and the
+    /// box's network mode.
     pub const LOCAL: Self = Self {
         enrolled: false,
         box_zone_resolver: false,
@@ -559,6 +570,15 @@ pub enum BepRefusal {
         /// The resolved steering mode.
         steering: Steering,
     },
+    /// Interim beside BEP-017, until #2805: `dns` steering with a
+    /// credentialed upstream where the host has the box-zone resolver. The
+    /// box gets the proxy's address for a steered name but no proxy
+    /// environment, and the proxy takes no direct TLS connection, so the
+    /// box cannot reach the upstream. It is a fact about the proxy, not
+    /// the host. Under `both`, a tool that ignores `HTTPS_PROXY` gets the
+    /// proxy's address, and the switch drops its TCP connection to port 443
+    /// with no reset, so it stalls until #2805 adds the direct TLS path.
+    DnsWithoutDirectTls,
     /// BEP-056: an `installation` grant on an un-enrolled host.
     InstallationUnenrolled {
         /// The grant's name.
@@ -621,6 +641,7 @@ impl BepRefusal {
             Self::NoNetworkWithGrant { .. } => "BEP-009",
             Self::SteeringOffWithProxyEnv => "BEP-010",
             Self::NoResolver { .. } => "BEP-017",
+            Self::DnsWithoutDirectTls => "BEP-017 interim (#2805)",
             Self::InstallationUnenrolled { .. } => "BEP-056",
             Self::NarrowScopesUnenrolled { .. } => "BEP-057",
             Self::SignInRequired { .. } | Self::UnenrolledNode { .. } => "BEP-003",
@@ -664,7 +685,7 @@ impl BepRefusal {
             Self::HostsOutsideEgress { .. } => "secrets, egress.allow_dns_hosts",
             Self::NoNetworkWithGrant { .. } => "secrets, network.mode",
             Self::SteeringOffWithProxyEnv => "network.bep.steering, network.bep.proxy_env",
-            Self::NoResolver { .. } => "secrets, network.bep.steering",
+            Self::NoResolver { .. } | Self::DnsWithoutDirectTls => "secrets, network.bep.steering",
             Self::InstallationUnenrolled { .. } => "secrets.mode",
             Self::NarrowScopesUnenrolled { .. } => {
                 "secrets.scopes, config [secrets] acknowledge_full_breadth_unenrolled"
@@ -707,6 +728,13 @@ impl fmt::Display for BepRefusal {
                 "This box declares a secret with steering = \"{}\", but this host has no \
                  box DNS resolver. Set steering = \"proxy_env\" in [network.bep].",
                 steering.word()
+            ),
+            Self::DnsWithoutDirectTls => write!(
+                f,
+                "This box declares a secret with steering = \"dns\", but the Box Egress \
+                 Proxy does not yet take a direct TLS connection, so dns steering cannot \
+                 reach it. Set steering = \"both\" or steering = \"proxy_env\" in \
+                 [network.bep]."
             ),
             Self::InstallationUnenrolled { grant } => write!(
                 f,
@@ -926,6 +954,13 @@ pub fn refusals(
         out.push(BepRefusal::NoResolver { steering });
     }
 
+    // Interim until #2805: with the resolver, `dns` gives the box the
+    // proxy's address and no proxy environment, and the proxy reads only
+    // CONNECT or an absolute-form request, so the box cannot reach it.
+    if host.box_zone_resolver && steering == Steering::Dns && spec.has_credentialed_upstream() {
+        out.push(BepRefusal::DnsWithoutDirectTls);
+    }
+
     // BEP-056: an un-enrolled host has no GitHub App key.
     if !host.enrolled {
         for (name, grant) in spec.secrets {
@@ -974,6 +1009,7 @@ pub fn check_activation(
             tracing::debug!(
                 rule = refusal.rule(),
                 fields = refusal.fields(),
+                box_zone_resolver = host.box_zone_resolver,
                 reason = %refusal,
                 "box spec refused at activation"
             );
@@ -1569,6 +1605,30 @@ mod tests {
                 let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
                 prop_assert_eq!(refused.exit_code(), 3);
                 prop_assert!(refused.to_string().contains("no box DNS resolver"));
+                let direct_tls = refused
+                    .refusals
+                    .iter()
+                    .any(|r| matches!(r, BepRefusal::DnsWithoutDirectTls));
+                prop_assert!(!direct_tls);
+            }
+
+            // With the resolver, BEP-017 never fires. `dns` with a
+            // credentialed upstream gets its own refusal, which does not
+            // say the host lacks a resolver (interim until #2805).
+            let host = HostFacts { box_zone_resolver: true, ..host };
+            let found = refusals(&spec, host, GITHUB_HOSTS);
+            let no_resolver = found.iter().any(|r| matches!(r, BepRefusal::NoResolver { .. }));
+            prop_assert!(!no_resolver);
+            let dns_expected = secrets.values().any(SecretGrant::is_credentialed)
+                && resolved == Steering::Dns;
+            let dns_fired = found.iter().any(|r| matches!(r, BepRefusal::DnsWithoutDirectTls));
+            prop_assert_eq!(dns_fired, dns_expected);
+            if dns_expected {
+                let refused = check_activation(&spec, host, GITHUB_HOSTS).expect_err("refused");
+                prop_assert_eq!(refused.exit_code(), 3);
+                let text = refused.to_string();
+                prop_assert!(text.contains(DNS_WITHOUT_DIRECT_TLS), "{}", text);
+                prop_assert!(!text.contains("no box DNS resolver"), "{}", text);
             }
         }
 
@@ -1751,6 +1811,12 @@ mod tests {
         }
     }
 
+    /// The refusal text for `dns` steering where the
+    /// host has the box-zone resolver.
+    const DNS_WITHOUT_DIRECT_TLS: &str = "This box declares a secret with steering = \"dns\", \
+        but the Box Egress Proxy does not yet take a direct TLS connection, so dns steering \
+        cannot reach it. Set steering = \"both\" or steering = \"proxy_env\" in [network.bep].";
+
     /// The diagnostic text the task fixes for BEP-008.
     #[test]
     fn missing_hosts_message_names_each_host() {
@@ -1900,9 +1966,13 @@ mod tests {
             bep: &bep,
             secrets: &secrets,
         };
-        let plan = check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect("accepted");
-        assert_eq!(plan.steering, Steering::Dns);
-        assert!(plan.inject_ca);
+        // Where the host resolves box names, the default `dns` is refused
+        // for the proxy's missing direct TLS path, never for a missing
+        // resolver (interim until #2805).
+        let refused = check_activation(&spec, RESOLVER_HOST, GITHUB_HOSTS).expect_err("refused");
+        assert_eq!(refused.exit_code(), 3);
+        assert_eq!(refused.refusals, vec![BepRefusal::DnsWithoutDirectTls]);
+        assert_eq!(refused.to_string(), DNS_WITHOUT_DIRECT_TLS);
     }
 
     /// A misspelt field is refused, never ignored: an ignored `mode` would
@@ -1993,7 +2063,10 @@ mod tests {
             let secrets = grants(old);
             assert_eq!(store_references(&secrets).count(), 0);
             let egress = egress_with(GITHUB_HOSTS);
-            let bep = BepSettings::default();
+            let bep = BepSettings {
+                steering: Some(Steering::Both),
+                ..BepSettings::default()
+            };
             let spec = ActivationSpec {
                 network: NetworkMode::OwnIp,
                 egress: Some(&egress),

@@ -2,8 +2,9 @@
 //! checks to the start line.
 
 use super::*;
+use minimal_client::box_name::request_name;
 use minimal_client::box_registration::{
-    CleanupOutcome, register_box_reminting_autogen, settle_lease_after_cleanup,
+    CleanupOutcome, register_box_for_activation, settle_lease_after_cleanup,
 };
 
 /// The session-start line for a box the activation registered with the VM
@@ -284,14 +285,16 @@ fn credentialed_upstream_for(
 /// of the variables the box spec's own environment sets. It checks the project's settings
 /// whether or not they declare a credentialed upstream, so a contradiction
 /// in `[session.network.bep]` alone is still refused. The refusal ends the
-/// run with exit 3 (`main.rs`). Every host today is un-enrolled and has no
-/// box-zone resolver.
+/// run with exit 3 (`main.rs`). Every host today is un-enrolled.
+/// `box_zone_resolver` is [`host_resolves_box_names`] for this host and
+/// box (BEP-017).
 fn refuse_unhonourable_grants(
     network: boxes::NetworkMode,
     egress: Option<&boxes::EgressPolicy>,
     settings: &boxes::core::bep::BepSettings,
     secrets: &boxes::core::bep::SecretGrants,
     full_breadth_acknowledged: bool,
+    box_zone_resolver: bool,
     spec_env: &[String],
 ) -> Result<Vec<boxes::core::bep::BepWarning>, anyhow::Error> {
     use boxes::core::bep::{ActivationSpec, HostFacts, check_activation};
@@ -310,15 +313,52 @@ fn refuse_unhonourable_grants(
     // `min box spec` reads, so the preview and the start agree.
     let host = HostFacts {
         full_breadth_acknowledged,
+        box_zone_resolver,
         ..HostFacts::LOCAL
     };
-    let mut plan = check_activation(&spec, host, &hosts)?;
+    let checked = check_activation(&spec, host, &hosts);
+    tracing::info!(
+        box_zone_resolver = host.box_zone_resolver,
+        steering = settings.resolved_steering().word(),
+        accepted = checked.is_ok(),
+        "checked the box spec's grants against this host"
+    );
+    let mut plan = checked?;
     // BEP-011: a spec that sets a trust variable keeps its value, and says so.
     plan.warn_spec_trust_env(spec_env.iter().map(String::as_str));
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
     Ok(plan.warnings)
+}
+
+/// Whether a box with `network` on a host of `kind` has its lookups go
+/// through a switch that steers the credential module's names (BEP-017,
+/// BEP-062). This is a host fact and does not read the steering. On the VM
+/// host, an own-address box's lookups go through the VM host's switch. Its
+/// DNS gate answers a steered name with the proxy's address while the
+/// proxy's listener is live, and SERVFAIL while it is down. A native host
+/// has no proxy, so a steered name there always fails closed, and a
+/// `host_ip` or `none` box has no steered lookups of its own. `min box
+/// spec` reads it for the network its `--network` flag names. Where this
+/// is true, `dns` steering is still refused on its own grounds until the proxy
+/// takes a direct TLS connection (#2805). Under `both`, a tool that
+/// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
+/// TCP connection to port 443 with no reset, so it stalls until #2805 adds
+/// the direct TLS path.
+pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
+    kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
+}
+
+/// The network and the host fact a creation reads, for a host of `kind`:
+/// the box's `--network` mode, and whether the switch resolves that box's
+/// names. `min box spec` reads the same fact for the same mode.
+pub(crate) fn creation_host(
+    kind: paths::HostKind,
+    args: &crate::cli::ActivateArgs,
+) -> (boxes::NetworkMode, bool) {
+    let network: boxes::NetworkMode = args.network.into();
+    (network, host_resolves_box_names(kind, network))
 }
 
 /// Checks the box spec's store references at creation, and gives the rules
@@ -952,9 +992,11 @@ fn store_grants(
 /// nothing for a box with neither. `config_dir` is the `min --config-dir`
 /// override, which the store mint checks `bep serve` agrees with. No box
 /// exists yet, so a failure only withdraws the row the box's registration
-/// bought (T66).
+/// bought (T66). `box_name` is the name that row was registered under. A
+/// box with no `--name` has none on the request (BOX-163).
 async fn mint_into_request(
     request: &mut minimald_rpc::CreateSessionRequest,
+    box_name: Option<&str>,
     registered_id: Option<minimald_rpc::BoxId>,
     github_grants: &[String],
     store_grants: &[crate::mint::StoreGrant],
@@ -1004,7 +1046,7 @@ async fn mint_into_request(
         Err(error) => {
             withdraw_box_row(
                 control_sock,
-                request.config.name.as_deref(),
+                box_name,
                 request.config.box_addresses,
                 registered_id,
             )
@@ -1189,6 +1231,115 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// The name the daemon gives the box `request` creates, when the create
+/// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
+/// request's name, else the spec's entry as the daemon cleans it
+/// ([`boxes::box_name::entry_box_name`]). `None` for a request with no spec
+/// and no name.
+pub(crate) fn created_box_name(request: &minimald_rpc::CreateSessionRequest) -> Option<String> {
+    let spec = request.spec.as_ref().and_then(|value| {
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
+    });
+    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
+        return Some(name);
+    }
+    if let Some(name) = request.config.name.clone() {
+        return Some(name);
+    }
+    // Only the entry is cleaned, as the daemon cleans it, so the VM host
+    // row and the box carry one name. A `[box] name` or `--name` is sent
+    // unchanged above.
+    spec.map(|spec| boxes::box_name::entry_box_name(&spec.entry))
+}
+
+/// The name the daemon gave box `id`, read off its record. `None` when the
+/// read fails or the box has no name: the caller keeps the name it had.
+pub(crate) async fn daemon_box_name(
+    client: &mut minimal_client::Client,
+    id: boxes::SessionId,
+) -> Option<String> {
+    match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Id(
+            id,
+        ))
+        .await
+    {
+        Ok(reply) => reply.record.and_then(|record| record.name),
+        Err(error) => {
+            tracing::warn!(session_id = %id, %error, "could not read the name the daemon gave the box");
+            None
+        }
+    }
+}
+
+/// The error a refused create ends the command with. A held name ends it
+/// with exit 2, naming the holder (BOX-163). Any other refusal is the
+/// daemon's text as it is.
+pub(crate) fn create_refusal(error: String) -> anyhow::Error {
+    match minimal_client::box_name::held_name_refusal(&error) {
+        Some(refusal) => {
+            tracing::info!(
+                name = %refusal.name,
+                holder = ?refusal.holder,
+                holder_name = %refusal.holder_name,
+                exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+                "the create was refused: a running box holds the name"
+            );
+            anyhow::Error::new(refusal)
+        }
+        None => anyhow::anyhow!("{error}"),
+    }
+}
+
+/// The id and name of the box that holds `held`, read from the daemon by
+/// name. `None` when the read fails or finds no box.
+async fn held_name_holder(
+    client: &mut minimal_client::Client,
+    held: &str,
+) -> Option<(boxes::SessionId, Option<String>)> {
+    match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRecord>(minimald_rpc::GetSessionRecordRequest::Name(
+            held.to_string(),
+        ))
+        .await
+    {
+        Ok(reply) => reply.record.map(|record| (record.id, record.name)),
+        Err(error) => {
+            tracing::warn!(held_name = %held, %error, "could not read the box that holds the name");
+            None
+        }
+    }
+}
+
+/// The error an own-address create ends with when the VM host refused its
+/// registration because a live row holds `held` (BOX-163). It is the
+/// held-name refusal a daemon create sends, so `min` exits 2. It names the
+/// holder's id when `holder` gives its id and name, and the held spelling
+/// alone when the holder could not be read.
+pub(crate) fn registration_held_name_refusal(
+    name: &str,
+    held: &str,
+    holder: Option<(boxes::SessionId, Option<String>)>,
+) -> anyhow::Error {
+    let (holder, holder_name) = match holder {
+        Some((id, name)) => (Some(id), name),
+        None => (None, None),
+    };
+    let refusal = minimald_rpc::HeldNameRefusal {
+        name: name.to_string(),
+        holder,
+        holder_name: holder_name.unwrap_or_else(|| held.to_string()),
+    };
+    tracing::info!(
+        name = %refusal.name,
+        holder = ?refusal.holder,
+        holder_name = %refusal.holder_name,
+        exit_code = minimald_rpc::HeldNameRefusal::EXIT_CODE,
+        "the box registration was refused: a running box holds the name"
+    );
+    anyhow::Error::new(refusal)
+}
+
 /// Puts the spec of a session box from `dir` on the create request
 /// (BOX-068): the project's `[session]` table, with the request's network
 /// mode, policy and hooks choice as the flags. A project with no
@@ -1364,12 +1515,14 @@ pub(crate) async fn activate_box(
                 .values()
                 .any(boxes::core::bep::SecretGrant::is_narrower_than_full)
                 && crate::config::full_breadth_acknowledged(global)?;
+            let (network, box_zone_resolver) = creation_host(daemon_host_kind(global), &args);
             refuse_unhonourable_grants(
-                args.network.into(),
+                network,
                 policy.egress.as_ref(),
                 &project_bep,
                 &project_secrets,
                 full_breadth_acknowledged,
+                box_zone_resolver,
                 &project_env,
             )?;
             // BEP-034/035/036: each store reference needs a rule that admits
@@ -1408,16 +1561,10 @@ pub(crate) async fn activate_box(
         .run(async { ensure_daemon(global) })
         .await?;
 
-    // A session with no `--name` still deserves a typable handle, so mint
-    // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
-    // picker, and the create announcement fall back to a bare short id. A
-    // user-supplied name is passed through untouched — including a collision,
-    // which must surface as an error rather than be silently suffixed.
-    let autogen = args.name.is_none();
-    let session_name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
+    // BOX-163: the request carries a name only for `--name`. With none,
+    // the daemon names the box from its spec's entry. A held name, the
+    // entry's or a `--name`, is refused below: the command ends with exit
+    // 2, naming the holder. The client invents no name.
 
     let network: boxes::NetworkMode = args.network.into();
 
@@ -1427,7 +1574,8 @@ pub(crate) async fn activate_box(
     // fallible client-side step, so a loadout, policy, or hook failure
     // between here and there never strands a row on the host.
     let mut request =
-        minimald_rpc::CreateSessionRequest::new(session_name, abs_path.clone(), network, policy);
+        minimald_rpc::CreateSessionRequest::new(String::new(), abs_path.clone(), network, policy);
+    request.config.name = request_name(args.name.as_deref());
     request.config.hooks_enabled = !args.no_hooks;
     request.config.creating_verb = minimald_rpc::CreatingVerb::Session;
     // The version gate: a daemon of another build refuses the create
@@ -1620,28 +1768,46 @@ pub(crate) async fn activate_box(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_host_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    // An autogen name can collide with a live box's row the same way it
-    // can with a session (the row stays live until its session's destroy):
-    // the registration's refusal re-mints it within the same budget the
-    // create's collision retry below spends.
-    let mut attempts = 0u32;
+    // The row is registered under the name the daemon will give the box
+    // (BOX-163): `--name`, else the spec's. A live row that holds it
+    // refuses the registration, and the refusal ends the activation.
+    let mut box_name = created_box_name(&request);
+    tracing::info!(
+        requested_name = ?request.config.name,
+        box_name = ?box_name,
+        name_source = if request.config.name.is_some() { "--name" } else { "entry" },
+        "creating the box under the name the daemon gives it"
+    );
     let mut registered = ActivationStep::RegisterBox
         .run(async {
-            let registered = register_box_reminting_autogen(
-                kind,
-                global.minimal_dir.as_deref(),
-                request.config.network,
-                request
-                    .config
-                    .name
-                    .as_mut()
-                    .expect("the session name is minted before the create"),
-                &request.config.policy,
-                autogen,
-                &mut attempts,
-                || autogen_session_name(&utf8_path, &random_hex4()),
-            )
-            .await?;
+            let registered = match box_name.as_deref() {
+                Some(name) => {
+                    match register_box_for_activation(
+                        kind,
+                        global.minimal_dir.as_deref(),
+                        request.config.network,
+                        name,
+                        &request.config.policy,
+                    )
+                    .await
+                    {
+                        Ok(registered) => registered,
+                        // BOX-163: a live row holds the name. The refusal
+                        // names the box that holds it and exits 2.
+                        Err(error) => {
+                            let Some(held) = error
+                                .downcast_ref::<minimal_client::box_registration::NameAlreadyHeld>()
+                                .map(|refused| refused.held.clone())
+                            else {
+                                return Err(error);
+                            };
+                            let holder = held_name_holder(&mut client, &held).await;
+                            return Err(registration_held_name_refusal(name, &held, holder));
+                        }
+                    }
+                }
+                None => None,
+            };
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
             // The id stays here: the create relays none (BOX-002).
@@ -1663,7 +1829,7 @@ pub(crate) async fn activate_box(
     ) {
         withdraw_box_row(
             control_sock.clone(),
-            request.config.name.as_deref(),
+            box_name.as_deref(),
             request.config.box_addresses,
             registered_id,
         )
@@ -1675,15 +1841,15 @@ pub(crate) async fn activate_box(
     // id the registration handed, before the create, so the create request
     // carries each sealed value for every launch of the box to place in its
     // grant's environment variable. A failure withdraws the row the
-    // registration bought (T66). An autogen collision below re-registers
-    // under a new id, and mints again for it.
+    // registration bought (T66).
     // The proxy's hold on the box: dropped by a later step's failure, it
     // forgets the box's declared egress there. It is kept once the session
     // is active. A Ctrl-C exits the process with no drop, so it leaves the
     // box at the proxy until the box's destroy forgets it (#2277).
-    let mut proxy_registration = ActivationStep::MintGrants
+    let proxy_registration = ActivationStep::MintGrants
         .run(mint_into_request(
             &mut request,
+            box_name.as_deref(),
             registered_id,
             &github_grants,
             &store_grants,
@@ -1693,21 +1859,21 @@ pub(crate) async fn activate_box(
         .await?;
 
     use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
-    // An autogen name can (rarely) collide with an existing session built
-    // from the same directory; on the daemon's already-exists rejection,
-    // re-mint the hex suffix and retry a bounded number of times. A
-    // user-supplied name never retries — its collision, and any other failure
-    // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    // `attempts` carries over from the registration's own collision retry.
+    // BOX-163: a box the person did not name takes its entry's name. A
+    // create under a name that a running box holds, the entry's name or a
+    // `--name`, is refused: the command ends with exit 2, naming the
+    // holder. Only `min task run` asks for a fresh instance, `<name>-<n>`.
     let created = ActivationStep::CreateSession
         .run(async {
-            let created = loop {
+            let created = {
                 // The id the VM host daemon minted stays with this client. The
                 // create request carries none (BOX-002).
                 tracing::info!(
                     registered_box_id = ?registered
                         .as_ref()
                         .and_then(|registration| registration.box_id),
+                    requested_name = ?request.config.name,
+                    fresh_instance = request.fresh_instance,
                     "creating the box with no box id on the request; the client keeps the registered id"
                 );
                 let resp = client.oneshot_rpc::<CreateSession>(request.clone()).await;
@@ -1719,7 +1885,7 @@ pub(crate) async fn activate_box(
                     Err(error) => {
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -1730,79 +1896,21 @@ pub(crate) async fn activate_box(
                     }
                 };
                 match resp {
-                    minimald_rpc::Errorable::Ok(r) => break r,
+                    minimald_rpc::Errorable::Ok(r) => r,
                     minimald_rpc::Errorable::Err { error } => {
-                        if should_retry_autogen(autogen, attempts, &error) {
-                            attempts += 1;
-                            // The row the first attempt bought is this attempt's to
-                            // leave behind: its creator withdraws it before
-                            // re-registering under the re-minted name (T66) — it was
-                            // bought for a session this create never made.
-                            withdraw_box_row(
-                                control_sock.clone(),
-                                request.config.name.as_deref(),
-                                request.config.box_addresses,
-                                registered
-                                    .as_ref()
-                                    .and_then(|registration| registration.box_id),
-                            )
-                            .await;
-                            // The abandoned row's lease goes with it, uncommitted.
-                            drop(registered.take());
-                            request.config.name =
-                                Some(autogen_session_name(&utf8_path, &random_hex4()));
-                            // A registered box's row carries the name it was
-                            // registered under (T66), so the re-mint re-registers;
-                            // the abandoned row is withdrawn above, by its id, which
-                            // returns its addresses to the host's hand-out books,
-                            // and the retry leaves no row behind. The re-registration can itself fail —
-                            // the plan can be exhausted by then — and that failure
-                            // ends the retry loop the same way the first one would
-                            // have, with its cause. The first registration's id is
-                            // discarded with its row: ids are never freed or
-                            // reused, so the re-registration is a new creation, and
-                            // the host mints it a new id, which replaces the record
-                            // (NET-133).
-                            registered = register_box_reminting_autogen(
-                                kind,
-                                global.minimal_dir.as_deref(),
-                                request.config.network,
-                                request.config.name.as_mut().expect("just re-minted"),
-                                &request.config.policy,
-                                autogen,
-                                &mut attempts,
-                                || autogen_session_name(&utf8_path, &random_hex4()),
-                            )
-                            .await?;
-                            carry_registration(&mut request.config, registered.as_ref());
-                            // The sealed values name the abandoned id, so the
-                            // new one gets its own (BEP-007). The replaced
-                            // registration forgets the old id at the proxy.
-                            proxy_registration = mint_into_request(
-                                &mut request,
-                                registered
-                                    .as_ref()
-                                    .and_then(|registration| registration.box_id),
-                                &github_grants,
-                                &store_grants,
-                                global.config_dir.clone(),
-                                control_sock.clone(),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        // A create failure that is not a retryable autogen collision
-                        // abandons the activation and its row the same way.
+                        // Any other create failure abandons the activation and
+                        // its row the same way. A held name is one of them: it
+                        // ends the command with exit 2, naming the holder.
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
                                 .and_then(|registration| registration.box_id),
                         )
                         .await;
-                        bail!("{error}");
+                        return Err(create_refusal(error));
                     }
                 }
             };
@@ -1817,7 +1925,7 @@ pub(crate) async fn activate_box(
                 // row; the withdrawal rides out with the error (T66).
                 withdraw_box_row(
                     control_sock.clone(),
-                    request.config.name.as_deref(),
+                    box_name.as_deref(),
                     request.config.box_addresses,
                     registered
                         .as_ref()
@@ -1830,6 +1938,17 @@ pub(crate) async fn activate_box(
         })
         .await?;
     let id = created.id;
+    // BOX-163: the daemon named the box. Read the name back for the start
+    // lines, the name hold and the cleanup below.
+    if let Some(name) = daemon_box_name(&mut client, id).await {
+        tracing::info!(
+            session_id = %id,
+            box_name = %name,
+            fresh_instance = request.fresh_instance,
+            "the daemon named the box"
+        );
+        box_name = Some(name);
+    }
     // A `host_ip` box's egress, admitted on the VM host daemon before the
     // box runs anything (NET-085): the host gate decides every frame the box
     // sends from the node's own address by the admitted policies, and drops
@@ -1860,7 +1979,7 @@ pub(crate) async fn activate_box(
                     "{}",
                     box_registered_start_line(
                         hostname_proxy_vm(kind),
-                        request.config.name.as_deref().unwrap_or("-"),
+                        box_name.as_deref().unwrap_or("-"),
                         addresses,
                     )
                 );
@@ -2086,7 +2205,7 @@ pub(crate) async fn activate_box(
             };
             if let Some(surface) = surface {
                 let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
-                let box_name = request.config.name.as_deref().unwrap_or("-");
+                let box_name = box_name.as_deref().unwrap_or("-");
                 // T110: the box's ports answer at its own address unless the
                 // daemon put it on the `127.0.0.1` interim. That holds for a
                 // host-address box too: on a VM node before the range lands,
@@ -2205,7 +2324,7 @@ pub(crate) async fn activate_box(
                         // the row its registration bought goes with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2246,7 +2365,7 @@ pub(crate) async fn activate_box(
                 Err(error) => {
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2268,7 +2387,7 @@ pub(crate) async fn activate_box(
                     // The session cannot compose and is abandoned with its row (T66).
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2312,7 +2431,7 @@ pub(crate) async fn activate_box(
                                 // the path failed after registering.
                                 withdraw_box_row(
                                     control_sock.clone(),
-                                    request.config.name.as_deref(),
+                                    box_name.as_deref(),
                                     request.config.box_addresses,
                                     registered
                                         .as_ref()
@@ -2333,7 +2452,7 @@ pub(crate) async fn activate_box(
                         // path failed after registering.
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2358,7 +2477,7 @@ pub(crate) async fn activate_box(
                         // its row (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2412,7 +2531,7 @@ pub(crate) async fn activate_box(
                         // withdrawn with it (T66).
                         withdraw_box_row(
                             control_sock.clone(),
-                            request.config.name.as_deref(),
+                            box_name.as_deref(),
                             request.config.box_addresses,
                             registered
                                 .as_ref()
@@ -2484,7 +2603,7 @@ pub(crate) async fn activate_box(
                 if !settle_lease_after_cleanup(lease, outcome).await {
                     withdraw_box_row(
                         control_sock.clone(),
-                        request.config.name.as_deref(),
+                        box_name.as_deref(),
                         request.config.box_addresses,
                         registered
                             .as_ref()
@@ -2497,7 +2616,7 @@ pub(crate) async fn activate_box(
                 if outcome == CleanupOutcome::Kept
                     && kind == paths::HostKind::Minvmd
                     && request.config.network == boxes::NetworkMode::HostNet
-                    && let Some(name) = request.config.name.as_deref()
+                    && let Some(name) = box_name.as_deref()
                 {
                     hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
                 }
@@ -2553,7 +2672,7 @@ pub(crate) async fn activate_box(
         .run(async {
             if kind == paths::HostKind::Minvmd
                 && request.config.network == boxes::NetworkMode::HostNet
-                && let Some(name) = request.config.name.as_deref()
+                && let Some(name) = box_name.as_deref()
             {
                 hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
             }
@@ -2571,7 +2690,7 @@ pub(crate) async fn activate_box(
         if should_announce_box(global) {
             eprintln!(
                 "Created session {}",
-                box_announce_label(&id, request.config.name.as_deref())
+                box_announce_label(&id, box_name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -2925,6 +3044,83 @@ mod tests {
         );
     }
 
+    /// T66, BOX-163: an activation with no `--name` registers its row under
+    /// the entry's name, and the request carries no name. When the grant
+    /// mint fails, the row that registration bought is withdrawn under the
+    /// registered name. The mint fails here before it reads the home
+    /// directory: the request's network mode gives the proxy no stance.
+    #[tokio::test]
+    async fn unnamed_activation_withdraws_its_row_when_the_grant_mint_fails() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let attachments = minvmd::bep_attach::Attachments::new();
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
+            .feeding_proxy_attachments(attachments.clone());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("unnamed-mint-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+
+        let mut registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::OwnIp,
+            "web",
+            &boxes::BoxPolicy::default(),
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        // Commit the lease, as an activation does, so only the withdrawal
+        // under test can remove the row.
+        if let Some(lease) = registered.lease.take() {
+            lease.commit().await;
+        }
+        let id = registered.box_id.expect("the host minted an id");
+        let source = registered.addresses.switch_address.octets();
+        assert!(
+            registry.table().by_source(source).is_some(),
+            "the registration published the row"
+        );
+
+        let mut request = minimald_rpc::CreateSessionRequest::new(
+            "web",
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
+            boxes::NetworkMode::NoNet,
+            boxes::BoxPolicy::default(),
+        );
+        // No `--name`: the request names no box (BOX-163).
+        request.config.name = None;
+        request.config.box_addresses = Some(registered.addresses);
+
+        let result = mint_into_request(
+            &mut request,
+            Some("web"),
+            Some(id),
+            &["GH_TOKEN".to_owned()],
+            &[],
+            None,
+            Some(sock_path.clone()),
+        )
+        .await;
+        assert!(result.is_err(), "the grant mint fails");
+        assert!(
+            registry.table().by_source(source).is_none(),
+            "the failed mint withdrew the row registered under the entry's name"
+        );
+        assert!(
+            !attachments.holds_id(id.to_bytes()),
+            "the withdrawn box's id is held by no attachment"
+        );
+    }
+
     /// BEP-008: a project file that exists but does not load refuses the
     /// activation before the create. It never reads as "no grants
     /// declared", so a broken file cannot skip the grant checks.
@@ -3005,6 +3201,7 @@ mod tests {
                 &bep,
                 &secrets,
                 acknowledged,
+                false,
                 &spec_env,
             )
             .expect_err("refused for the egress");
@@ -3057,6 +3254,7 @@ mod tests {
                 &bep,
                 &secrets,
                 false,
+                false,
                 &spec_env,
             )
             .expect("accepted")
@@ -3094,6 +3292,7 @@ mod tests {
             None,
             &bep,
             &secrets,
+            false,
             false,
             &spec_env,
         )
@@ -3484,13 +3683,251 @@ mod tests {
         };
         let secrets = boxes::core::bep::SecretGrants::new();
         assert!(credentialed_upstream_for(false, &bep, &secrets).is_none());
-        let err =
-            refuse_unhonourable_grants(boxes::NetworkMode::OwnIp, None, &bep, &secrets, false, &[])
-                .expect_err("refused");
+        let err = refuse_unhonourable_grants(
+            boxes::NetworkMode::OwnIp,
+            None,
+            &bep,
+            &secrets,
+            false,
+            false,
+            &[],
+        )
+        .expect_err("refused");
         let refused = err
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
         assert_eq!(refused.exit_code(), 3);
+    }
+
+    /// BEP-017, BEP-062: a GitHub grant box with `both` steering is created
+    /// where the VM host's switch resolves its names, and `min box spec`
+    /// shows it. There, `dns`, declared or by default, is refused with exit
+    /// 3 and a text that names the proxy, not the host, until the proxy
+    /// takes a direct TLS connection (#2805). On a native host, and for a
+    /// `host_ip` box, both are refused for the missing resolver. For every
+    /// case, `min box spec` refuses exactly when creation does, with the
+    /// same text.
+    #[test]
+    fn dns_steering_is_admitted_where_the_switch_resolves_boxes() {
+        use boxes::core::bep::Steering;
+        use paths::HostKind;
+        // The host fact does not read the steering.
+        assert!(host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::OwnIp
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minimald,
+            boxes::NetworkMode::OwnIp
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::HostNet
+        ));
+        let github_hosts: Vec<&str> = bep::module::GITHUB
+            .hosts
+            .iter()
+            .map(|authority| authority.host)
+            .collect();
+        let egress = boxes::EgressPolicy {
+            allow_dns_hosts: Some(github_hosts.iter().map(|h| (*h).to_string()).collect()),
+            ..boxes::EgressPolicy::default()
+        };
+        // No steering declared resolves to `dns`.
+        for (declared, word) in [
+            ("", "dns"),
+            ("steering = \"dns\"\n", "dns"),
+            ("steering = \"both\"\n", "both"),
+        ] {
+            let project = tempfile::tempdir().expect("project dir");
+            std::fs::write(
+                project.path().join(mfile::MFILE_NAME),
+                format!(
+                    "[session.network.bep]\n{declared}\
+                     [session.secrets.GH_TOKEN]\nsource = \"broker\"\n\
+                     scopes = [\"github:user-token\"]\n"
+                ),
+            )
+            .expect("write minimal.toml");
+            let path = camino::Utf8Path::from_path(project.path()).expect("utf-8 path");
+            let (bep, secrets, spec_env, _) = project_bep_and_grants(path).expect("loads");
+            assert!(credentialed_upstream_for(false, &bep, &secrets).is_some());
+            assert_eq!(bep.resolved_steering().word(), word);
+            assert_eq!(bep.resolved_steering() == Steering::Both, word == "both");
+            let no_resolver = format!(
+                "This box declares a secret with steering = \"{word}\", but this host \
+                 has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
+            );
+            let no_direct_tls = "This box declares a secret with steering = \"dns\", but the \
+                 Box Egress Proxy does not yet take a direct TLS connection, so dns steering \
+                 cannot reach it. Set steering = \"both\" or steering = \"proxy_env\" in \
+                 [network.bep].";
+
+            for (kind, network) in [
+                (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
+                (HostKind::Minimald, boxes::NetworkMode::OwnIp),
+                (HostKind::Minvmd, boxes::NetworkMode::HostNet),
+            ] {
+                let resolver = host_resolves_box_names(kind, network);
+                let accepted = word == "both" && resolver;
+                let refusal = if resolver {
+                    no_direct_tls
+                } else {
+                    no_resolver.as_str()
+                };
+                let case = format!("{word} {kind:?} {network:?}");
+
+                let created = refuse_unhonourable_grants(
+                    network,
+                    Some(&egress),
+                    &bep,
+                    &secrets,
+                    false,
+                    resolver,
+                    &spec_env,
+                );
+                // `min box spec` reads the same fact for this host.
+                let rules = boxes::core::bep::StoreRules::new();
+                let mut out = Vec::new();
+                let previewed = crate::cmd::box_spec::render(
+                    &crate::cmd::box_spec::SpecInputs {
+                        root_fingerprint: None,
+                        bep: &bep,
+                        quic443: None,
+                        secrets: &secrets,
+                        acknowledged: false,
+                        network,
+                        box_zone_resolver: resolver,
+                        github_hosts: &github_hosts,
+                        store_rules: &rules,
+                    },
+                    &mut out,
+                );
+                assert_eq!(
+                    created.is_ok(),
+                    previewed.is_ok(),
+                    "{case}: min box spec and creation agree"
+                );
+
+                if accepted {
+                    let warnings = created.unwrap_or_else(|err| panic!("{case}: accepted: {err}"));
+                    assert!(warnings.is_empty(), "{case}: no warning: {warnings:?}");
+                    let text = String::from_utf8(out).expect("utf-8");
+                    assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    continue;
+                }
+                for err in [
+                    created.expect_err("creation refuses"),
+                    previewed.expect_err("min box spec refuses"),
+                ] {
+                    let refused = err
+                        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+                        .expect("the refusal is the box spec refusal");
+                    assert_eq!(refused.exit_code(), 3, "{case}");
+                    assert_eq!(refused.to_string(), refusal, "{case}");
+                }
+            }
+
+            // `min box spec --network <mode>` and `min session activate
+            // --network <mode>`, parsed as the command line gives them, read
+            // the same network and host fact, so they give the same refusal
+            // for every mode on both host kinds. With no flag, both are of a
+            // `host_ip` box.
+            for flag in [None, Some("none"), Some("host_ip"), Some("own_ip")] {
+                for kind in [HostKind::Minvmd, HostKind::Minimald] {
+                    let mut activate = vec!["min", "session", "activate"];
+                    let mut spec = vec!["min", "box", "spec"];
+                    if let Some(mode) = flag {
+                        activate.extend(["--network", mode]);
+                        spec.extend(["--network", mode]);
+                    }
+                    let activate_args = parsed_activate_args(&activate);
+                    let spec_args = parsed_box_spec_args(&spec);
+                    let (network, resolver) = creation_host(kind, &activate_args);
+                    let (spec_network, spec_resolver) =
+                        crate::cmd::box_spec::preview_host(kind, &spec_args);
+                    let case = format!("{word} {kind:?} --network {flag:?}");
+                    assert_eq!(network, spec_network, "{case}: same network");
+                    assert_eq!(resolver, spec_resolver, "{case}: same host fact");
+
+                    let created = refuse_unhonourable_grants(
+                        network,
+                        Some(&egress),
+                        &bep,
+                        &secrets,
+                        false,
+                        resolver,
+                        &spec_env,
+                    );
+                    let rules = boxes::core::bep::StoreRules::new();
+                    let mut out = Vec::new();
+                    let previewed = crate::cmd::box_spec::render(
+                        &crate::cmd::box_spec::SpecInputs {
+                            root_fingerprint: None,
+                            bep: &bep,
+                            quic443: None,
+                            secrets: &secrets,
+                            acknowledged: false,
+                            network: spec_network,
+                            box_zone_resolver: spec_resolver,
+                            github_hosts: &github_hosts,
+                            store_rules: &rules,
+                        },
+                        &mut out,
+                    );
+                    let created = created.map(|_| ()).map_err(|err| err.to_string());
+                    let previewed = previewed.map_err(|err| err.to_string());
+                    assert_eq!(created, previewed, "{case}: same refusal");
+
+                    let own_ip_on_vm_host = kind == HostKind::Minvmd && flag == Some("own_ip");
+                    if word == "both" && own_ip_on_vm_host {
+                        // On the VM host, `min box spec --network own_ip`
+                        // admits a `both` spec with a credentialed upstream.
+                        assert_eq!(previewed, Ok(()), "{case}: admitted");
+                        let text = String::from_utf8(out).expect("utf-8");
+                        assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    } else if word == "both" {
+                        // Any other mode or host has no steered lookups of
+                        // its own, so `both` is refused for the missing
+                        // resolver. That includes no flag at all, as a
+                        // default activation is refused. A `none` box is
+                        // also refused for its missing network.
+                        let refused = previewed.expect_err("min box spec refuses");
+                        assert!(refused.ends_with(no_resolver.as_str()), "{case}: {refused}");
+                        if flag == Some("none") {
+                            assert!(refused.contains("has no network"), "{case}: {refused}");
+                        } else {
+                            assert_eq!(refused, no_resolver, "{case}");
+                        }
+                    } else {
+                        assert!(previewed.is_err(), "{case}: dns is refused");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `min session activate` arguments for `argv`, from the real clap
+    /// parse.
+    fn parsed_activate_args(argv: &[&str]) -> ActivateArgs {
+        use clap::Parser as _;
+        match crate::Cli::try_parse_from(argv).expect("parses").command {
+            Some(crate::Command::Session(crate::SessionArgs {
+                command: crate::SessionCommand::Activate(args),
+            })) => args,
+            _ => panic!("expected min session activate for {argv:?}"),
+        }
+    }
+
+    /// The `min box spec` arguments for `argv`, from the real clap parse.
+    fn parsed_box_spec_args(argv: &[&str]) -> crate::BoxSpecArgs {
+        use clap::Parser as _;
+        match crate::Cli::try_parse_from(argv).expect("parses").command {
+            Some(crate::Command::Box(crate::BoxArgs {
+                command: crate::BoxCommand::Spec(args),
+            })) => args,
+            _ => panic!("expected min box spec for {argv:?}"),
+        }
     }
 
     // BEP-032: a box whose only proxy-served secrets are store references

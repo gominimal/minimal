@@ -1723,6 +1723,38 @@ pub mod box_name {
     /// The name a box can never take: it addresses the calling box.
     pub const RESERVED_NAME: &str = "self";
 
+    /// The longest box name [`entry_box_name`] makes from an entry. It leaves
+    /// room under the 63-octet DNS label limit for a fresh instance's `-<n>`.
+    pub const ENTRY_NAME_MAX: usize = 48;
+
+    /// The box name an entry gives (BOX-163), as one DNS label: ASCII letters
+    /// and digits lowercased, `-`, `_` and `.` as `-`, other characters
+    /// dropped, at most [`ENTRY_NAME_MAX`] octets, and no `-` at either end.
+    /// An entry with nothing left names the box `box`. A `[box] name` or a
+    /// `--name` never passes through here, so an invalid one is still refused.
+    #[must_use]
+    pub fn entry_box_name(entry: &str) -> String {
+        let filtered: String = entry
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    Some(c.to_ascii_lowercase())
+                } else if matches!(c, '-' | '_' | '.') {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .take(ENTRY_NAME_MAX)
+            .collect();
+        let trimmed = filtered.trim_matches('-');
+        if trimmed.is_empty() {
+            "box".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     /// What a name check reads of one retained record on one host.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct NamedBox {
@@ -3395,6 +3427,31 @@ mod tests {
 
         fn id(n: u128) -> BoxId {
             BoxId::from(uuid::Uuid::from_u128(n))
+        }
+
+        /// BOX-163: the entry cleaning keeps the edge cases the removed
+        /// client-side sanitiser covered.
+        #[test]
+        fn entry_box_name_caps_trims_drops_and_falls_back() {
+            use super::super::box_name::{ENTRY_NAME_MAX, entry_box_name};
+
+            // The cap is 48 octets of the cleaned name.
+            let long = "a".repeat(ENTRY_NAME_MAX + 12);
+            assert_eq!(entry_box_name(&long), "a".repeat(ENTRY_NAME_MAX));
+
+            // A `-` that the cap leaves at the end is trimmed again.
+            let cut_at_dash = format!("{}_{}", "a".repeat(ENTRY_NAME_MAX - 1), "b".repeat(5));
+            assert_eq!(entry_box_name(&cut_at_dash), "a".repeat(ENTRY_NAME_MAX - 1));
+
+            // Unicode, tabs and spaces drop; `_` and `.` become `-`.
+            assert_eq!(entry_box_name("\tCafé Bar\t"), "cafbar");
+            assert_eq!(entry_box_name("Build_All.v2"), "build-all-v2");
+            assert_eq!(entry_box_name("-_.dev.-_"), "dev");
+
+            // An entry that cleans to nothing names the box `box`.
+            assert_eq!(entry_box_name(""), "box");
+            assert_eq!(entry_box_name("\t日本\t"), "box");
+            assert_eq!(entry_box_name("-_."), "box");
         }
 
         fn status() -> impl Strategy<Value = BoxState> {

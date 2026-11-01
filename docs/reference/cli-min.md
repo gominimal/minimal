@@ -515,6 +515,27 @@ first line; `--json` emits the full records.
 Answered from the persisted composition, so it works after a daemon restart
 and for a session nobody is attached to.
 
+### `box spec`
+
+```
+min box spec [--network <none|host_ip|own_ip>] [PATH]
+```
+
+Shows how the box that the project at `PATH` declares reaches GitHub through
+the local Box Egress Proxy. `PATH` defaults to `--repo-dir`, or to the current
+directory. The rows are the proxy's root certificate fingerprint, each secret
+with its hosts, the steering mode, and the UDP 443 stance.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--network <none\|host_ip\|own_ip>` | | The network mode of the box to show, with the same values and the same default (`host_ip`) as `min session activate --network` |
+
+The command refuses a box spec, with exit 3, where `min session activate` with
+the same `--network` value refuses it for the same reason. For example, on a
+VM-backed host, `min box spec --network own_ip` accepts `steering = "both"`.
+With no `--network` flag, it refuses that spec because a `host_ip` box has no
+box DNS resolver, and `min session activate` with no flag refuses it too.
+
 ### `net forward`
 
 ```
@@ -732,6 +753,15 @@ Signs in to GitHub and keeps the sign-in in the host keychain. It opens
 GitHub in your browser. With `--device`, or in a build with no browser
 sign-in, it prints a code to enter at github.com. The token stays in the host
 keychain and is never written to a file.
+
+The browser sign-in ends on a page that states the outcome. After a sign-in,
+`min auth login` names the accounts that have an installation of the Minimal
+GitHub App. With no installation, it gives the install URL,
+`https://github.com/apps/gominimal/installations/new`, where you choose the
+repositories your boxes can reach. The browser page links there too. The
+browser sign-in then waits up to 5 minutes for the installation, and Ctrl-C
+stops the wait. The sign-in is already saved. If the wait ends without an
+installation, `min auth login` gives the install URL again.
 
 `min login` is the same command as `min auth login`. It takes the same flags
 and prints the same prompts.

@@ -372,6 +372,8 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks the row withdrawal.
+            "cmd/boxes/create.rs::unnamed_activation_withdraws_its_row_when_the_grant_mint_fails = asserts nothing",
             // A unit test's request, never sent: it checks the list's scope.
             "cmd/boxes/list.rs::box_list_and_show_render_retained_records = asserts nothing",
             // A unit test's config, never sent: it checks that the create
@@ -390,6 +392,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // A unit test's request, never sent: it checks the box's name.
+            "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
+            // A unit test's request, never sent: it checks the cleaned entry name.
+            "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
         ]
     );
 }
@@ -1016,77 +1022,133 @@ fn box_announce_label_prefers_name_with_short_id() {
     assert_eq!(box_announce_label(&id, None), "a1b2c3d4");
 }
 
-/// A session created without `--name` gets a typable `<dir>-<hex>` handle:
-/// the basename is lowercased and stripped to the name alphabet, and the
-/// caller-supplied hex tails it.
+/// BOX-163: a create refused because a running box holds its name ends
+/// `min` with exit 2, and the error names the holder and the next step.
+/// Any other refusal keeps the daemon's text and is not exit 2.
 #[test]
-fn autogen_session_name_slugs_the_basename() {
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/home/u/code/foo"), "9c1e"),
-        "foo-9c1e"
-    );
-    // Disallowed characters are dropped and the rest lowercased.
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/tmp/My Project!"), "4f2a"),
-        "myproject-4f2a"
-    );
-    // A basename that sanitizes to nothing falls back to `session`.
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/"), "0001"),
-        "session-0001"
-    );
-}
+fn held_name_refusal_exits_2_and_names_the_holder() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let reply = minimald_rpc::HeldNameRefusal {
+        name: "default".to_string(),
+        holder: Some(holder),
+        holder_name: "Default".to_string(),
+    }
+    .to_string();
 
-/// Sanitization drops out-of-alphabet characters, trims leading/trailing
-/// separators, and falls back to `session` for an all-symbol basename, so
-/// the minted name always clears `validate_session_name`.
-#[test]
-fn sanitize_name_component_trims_and_falls_back() {
-    assert_eq!(sanitize_name_component("--foo--"), "foo");
-    assert_eq!(sanitize_name_component("café"), "caf");
-    assert_eq!(sanitize_name_component("...."), "session");
-    assert_eq!(sanitize_name_component("a\tb"), "ab");
-    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
-    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
-    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
-    // An over-long basename is capped and re-trimmed.
-    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    let error = create_refusal(reply);
+    let refusal = error
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("main.rs maps this error to its exit code");
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.holder, Some(holder));
+    assert_eq!(refusal.holder_name, "Default");
+    let printed = format!("{error:#}");
     assert_eq!(
-        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
-        "b".repeat(47)
+        printed,
+        "Cannot create a session named `default`: the running session `Default` \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
+         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         or choose another name."
     );
-}
 
-/// The minted suffix is exactly four lowercase hex digits.
-#[test]
-fn random_hex4_is_four_lowercase_hex_digits() {
-    let h = random_hex4();
-    assert_eq!(h.len(), 4);
+    let other = create_refusal("the project path is not a directory".to_string());
     assert!(
-        h.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "expected four lowercase hex digits, got {h:?}"
+        other
+            .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+            .is_none()
+    );
+    assert_eq!(format!("{other:#}"), "the project path is not a directory");
+}
+
+/// BOX-163: an own-address create whose VM host registration is refused
+/// because a live row holds the name ends `min` with exit 2. The error names
+/// the holder's id, read from the daemon. When the holder cannot be read,
+/// it is still exit 2 and names the held spelling.
+#[test]
+fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let error =
+        registration_held_name_refusal("dev", "Dev", Some((holder, Some("Dev".to_string()))));
+    let refusal = error
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.holder, Some(holder));
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
+         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         or choose another name."
+    );
+
+    let unread = registration_held_name_refusal("dev", "Dev", None);
+    let refusal = unread
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("an unread holder is still exit 2");
+    assert_eq!(refusal.holder, None);
+    assert_eq!(
+        format!("{unread:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` holds that name. \
+         Choose another name."
+    );
+    assert_eq!(
+        minimald_rpc::HeldNameRefusal::from_error(&unread.to_string()).as_ref(),
+        Some(refusal),
+        "the text without an id parses back"
     );
 }
 
-/// Only an autogen name retries on collision, and only within the bounded
-/// budget; a user-supplied name never retries, so its collision passes
-/// through, and a non-collision failure is never retried.
+/// BOX-163: with no `--name`, the create carries no name and the box takes
+/// its entry's name. Nothing mints `<dir>-<hex>`. A `[box] name` in the
+/// spec comes first, then `--name`.
 #[test]
-fn autogen_collision_retry_is_bounded_and_skips_user_names() {
-    let collision = "A session with that name already exists";
-    assert!(should_retry_autogen(true, 0, collision));
-    assert!(should_retry_autogen(
-        true,
-        AUTOGEN_NAME_RETRIES - 1,
-        collision
-    ));
-    // Budget spent: stop retrying.
-    assert!(!should_retry_autogen(true, AUTOGEN_NAME_RETRIES, collision));
-    // A user-supplied name never retries — its collision surfaces verbatim.
-    assert!(!should_retry_autogen(false, 0, collision));
-    // A non-collision failure is never retried.
-    assert!(!should_retry_autogen(true, 0, "CreateSession failed: boom"));
+fn created_box_name_is_the_entry_without_a_typed_name() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    assert_eq!(created_box_name(&request), None, "no spec, no name");
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some(mfile::spec::DEFAULT_SESSION_ENTRY)
+    );
+
+    request.config.name = minimal_client::box_name::request_name(Some("api"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("api"));
+
+    spec.name = Some("web".to_string());
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("web"));
+}
+
+/// BOX-163: the VM host row and the box carry one name. For an entry such
+/// as `My App`, the client registers the row under the name the daemon
+/// gives the box, because both sides clean the entry with one function.
+#[test]
+fn entry_name_registers_and_creates_under_one_cleaned_name() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+    spec.entry = "My App".to_string();
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("myapp"));
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some(boxes::box_name::entry_box_name(&spec.entry).as_str()),
+        "the row's name is the daemon's name for the entry"
+    );
 }
 
 #[test]

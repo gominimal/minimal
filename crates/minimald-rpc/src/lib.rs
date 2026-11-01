@@ -2014,7 +2014,93 @@ pub struct CreateSessionRequest {
     /// task (#2411). The daemon then files a record with no stored spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json_lenient::Value>,
+    /// Whether the create asks for a fresh instance (BOX-163). The daemon
+    /// names the box `<name>-<n>`, with the smallest `n` that no retained
+    /// record on the host uses, and never refuses it for a held name.
+    /// `false`, the default, names the box `<name>` and refuses the create
+    /// when a running box holds that name ([`HeldNameRefusal`]). A daemon
+    /// that predates the field reads every create as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_instance: bool,
 }
+
+/// The refusal of a [`CreateSession`] whose name a running box on the host
+/// holds (BOX-163). It names the holder, as a rename's refusal does
+/// (BOX-010). The daemon sends its [`Display`](std::fmt::Display) text as
+/// the reply's error, and a client reads the holder back with
+/// [`Self::from_error`], so one definition spells and parses it.
+///
+/// `holder` is `None` only on the client: the VM host refused the box's
+/// registration under the name, and the in-VM daemon could not say which
+/// box holds it. The refusal then names the held spelling alone, and still
+/// ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNameRefusal {
+    /// The name the create asked for.
+    pub name: String,
+    /// The running box that holds the name, when it is known.
+    pub holder: Option<SessionId>,
+    /// The holder's name, with the case it was given.
+    pub holder_name: String,
+}
+
+impl HeldNameRefusal {
+    /// The exit code a client ends with on this refusal (BOX-163, as
+    /// BOX-010 for a rename).
+    pub const EXIT_CODE: u8 = 2;
+
+    const HEAD: &'static str = "Cannot create a session named `";
+    const TAKEN: &'static str = "`: the running session `";
+    const HOLDS: &'static str = " holds that name.";
+
+    /// The refusal a create reply's `error` carries, or `None` when the
+    /// error is any other failure.
+    pub fn from_error(error: &str) -> Option<Self> {
+        let rest = error.strip_prefix(Self::HEAD)?;
+        let (name, rest) = rest.split_once(Self::TAKEN)?;
+        // A box name is a DNS label, so it holds no backtick.
+        let (holder_name, rest) = rest.split_once('`')?;
+        let holder = if rest.starts_with(Self::HOLDS) {
+            None
+        } else {
+            let (holder, _) = rest.strip_prefix(" (")?.split_once(')')?;
+            if !rest.contains(Self::HOLDS) {
+                return None;
+            }
+            Some(SessionId::parse_str(holder).ok()?)
+        };
+        Some(Self {
+            name: name.to_string(),
+            holder,
+            holder_name: holder_name.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for HeldNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            holder,
+            holder_name,
+        } = self;
+        let (head, taken, holds) = (Self::HEAD, Self::TAKEN, Self::HOLDS);
+        match holder {
+            Some(holder) => write!(
+                f,
+                "{head}{name}{taken}{holder_name}` ({holder}){holds} \
+                 Rename that session with `min session rename {holder} <new-name>`, \
+                 or choose another name.",
+            ),
+            None => write!(
+                f,
+                "{head}{name}{taken}{holder_name}`{holds} Choose another name.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HeldNameRefusal {}
 
 impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
@@ -2022,7 +2108,7 @@ impl CreateSessionRequest {
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, not ended with a run, no attrs, no sealed
     /// deliveries, no root certificate, the session verb, no project root,
-    /// no version assertion, and no spec.
+    /// no version assertion, no spec, and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -2048,6 +2134,7 @@ impl CreateSessionRequest {
             },
             must_match_version: None,
             spec: None,
+            fresh_instance: false,
         }
     }
 }
