@@ -1596,6 +1596,10 @@ pub enum BoxControlRequest {
     /// steered name with the proxy's address only while the answer is
     /// `true`, and SERVFAIL otherwise.
     ProxyListening,
+    /// Read every host port this VM's hostname proxy serves on (NET-150,
+    /// NET-154): served on the VM host's control socket only, answered with
+    /// [`BoxControlReply::ProxyPorts`]. A read: no state changes.
+    ProxyPorts,
     /// The in-VM daemon's ask for the id of a box it is about to create
     /// ([`MintBoxIdRequest`], BOX-002): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::BoxIdMinted`].
@@ -2003,6 +2007,16 @@ pub enum BoxControlReply {
     ProxyListening {
         /// Whether the proxy's listener is live.
         listening: bool,
+    },
+    /// The proxy-ports read's answer (NET-154): every host port the VM's
+    /// hostname proxy serves on, the preferred port first. One port while
+    /// the proxy serves on one, two once a proxy that started on a
+    /// substitute port took its preferred port back. Empty when the proxy
+    /// serves on no host port. `proxy_ports` is required — the marker that
+    /// keeps this document from decoding as any other reply.
+    ProxyPorts {
+        /// The host ports, the preferred first.
+        proxy_ports: Vec<u16>,
     },
     /// An audit report's answer: whether the host wrote a record for it.
     /// `false` when the host's per-box cap suppressed the record, which the

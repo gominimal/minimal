@@ -409,8 +409,15 @@ pub(crate) fn decide_publish(
 /// read on the serving thread — because that is the pattern the status
 /// read already serves under.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+///
+/// The second cell is the host ports the proxy serves on (NET-154): the
+/// port the start handed, and the preferred port in front of it once the
+/// reclaim watcher took that port back ([`crate::net::proxy_reclaim`]).
 #[derive(Clone, Default)]
-pub struct ProxyPublishStatus(Arc<Mutex<Option<(u16, ProxyDownCause)>>>);
+pub struct ProxyPublishStatus(
+    Arc<Mutex<Option<(u16, ProxyDownCause)>>>,
+    Arc<Mutex<Vec<u16>>>,
+);
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl ProxyPublishStatus {
@@ -446,6 +453,38 @@ impl ProxyPublishStatus {
         if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
             *cell = None;
         }
+    }
+
+    /// Record that the proxy serves on `port` and on no other host port:
+    /// the port the start handed, once the publish decision brought the VM
+    /// up.
+    pub(crate) fn set_serving(&self, port: u16) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![port];
+    }
+
+    /// Record that the proxy also serves on its preferred port `preferred`
+    /// (NET-150): the reclaim watcher published it beside the substitute,
+    /// so the preferred port goes first and the substitute stays.
+    pub(crate) fn add_preferred(&self, preferred: u16) {
+        let mut ports = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ports.retain(|port| *port != preferred);
+        ports.insert(0, preferred);
+    }
+
+    /// Every host port the proxy serves on, the preferred first: the
+    /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
+    /// recorded a port, and for a start that never brought the proxy up.
+    pub(crate) fn serving_ports(&self) -> Vec<u16> {
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The proxy-down fact to serve beside the read-only verb's answer
@@ -1117,6 +1156,15 @@ fn serve_request(
             });
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::ProxyPorts, ControlDoor::Host) => {
+            // Every host port the hostname proxy serves on (NET-154), the
+            // preferred first: `min ls` lists each one, so a person reads
+            // where to point a browser while the proxy serves on two.
+            let reply = BoxControlReply::ProxyPorts {
+                proxy_ports: proxy_publish.serving_ports(),
+            };
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
             read_row_and_reply(stream, boxes, request)
         }
@@ -1676,6 +1724,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::ProxyPorts => "proxy_ports",
         BoxControlRequest::MintBoxId(_) => "mint_box_id",
         BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
         BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
@@ -3900,6 +3949,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4381,6 +4431,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4504,6 +4555,7 @@ mod tests {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }
+                | BoxControlReply::ProxyPorts { .. }
                 | BoxControlReply::Audited { .. }
                 | BoxControlReply::BoxIdMinted { .. }) => {
                     panic!(
@@ -4579,6 +4631,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")

@@ -1134,6 +1134,7 @@ async fn serve_answerer_control(
                 | BoxControlRequest::ResumeBox(_)
                 | BoxControlRequest::RowStanding(_)
                 | BoxControlRequest::ProxyListening
+                | BoxControlRequest::ProxyPorts
                 | BoxControlRequest::MintBoxId(_)
                 | BoxControlRequest::ReportExposeDecision(_)
                 | BoxControlRequest::ReportRefusedEgress(_)
