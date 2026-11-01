@@ -698,6 +698,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     let mirror_collisions: Vec<Option<Vec<u16>>> = if args.raw || !global.use_minvmd() {
         Vec::new()
     } else {
+        use tracing::Instrument as _;
         let span = tracing::info_span!("ListSessions", mirror_collisions = tracing::field::Empty);
         let read = futures::future::join_all(listings.iter().map(|listing| async move {
             match listing.control_sock.as_deref() {
@@ -705,6 +706,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
                 None => None,
             }
         }))
+        .instrument(span.clone())
         .await;
         span.record(
             "mirror_collisions",
@@ -750,12 +752,17 @@ pub fn mirror_collision_row(vm: &str, ports: &[u16]) -> Option<String> {
 /// Adds `mirror_collisions` to each VM's object in a `min ls --json`
 /// document: the top-level object for one listing, each `vms` entry, in
 /// listing order, for several. A VM that answered carries its list, `[]`
-/// when it reports none. A VM with no answer carries `null`.
+/// when it reports none. A VM with no answer carries `null`. An empty
+/// `mirror_collisions` is a listing that made no read (a native host, which
+/// mirrors no port), and it adds no field, so `null` keeps its one meaning.
 fn insert_mirror_collisions(
     json: &mut serde_json_lenient::Value,
     listings: usize,
     mirror_collisions: &[Option<Vec<u16>>],
 ) {
+    if mirror_collisions.is_empty() {
+        return;
+    }
     let ports_at = |index: usize| match mirror_collisions.get(index).cloned().flatten() {
         Some(ports) => serde_json_lenient::Value::from(
             ports
@@ -834,8 +841,8 @@ pub fn format_ls_across_vms_with_mirrors_on(
 #[must_use]
 pub fn mirror_collision_unread_row(vm: &str) -> String {
     format!(
-        "MIRROR PORTS:  {vm}  the VM did not report which ports are held by another \
-         program on this machine."
+        "MIRROR PORTS:  {vm}  {}",
+        crate::resolver::mirror_collision_unread_sentence()
     )
 }
 
@@ -1715,6 +1722,13 @@ mod tests {
         assert!(
             json["mirror_collisions"].is_null(),
             "no answer is null: {json}"
+        );
+        // A native host makes no read, so `--json` carries no field.
+        let json: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&render(true, false, &one, &[])).expect("--json is JSON");
+        assert!(
+            json.get("mirror_collisions").is_none(),
+            "no read, no field: {json}"
         );
 
         let two = [listing("default"), listing("work")];
