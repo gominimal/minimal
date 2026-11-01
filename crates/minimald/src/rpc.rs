@@ -1439,6 +1439,39 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .await
 }
 
+/// `ReapBox`: deletes one box's record, events and files (BOX-019,
+/// BOX-045). A running box is refused unless the request forces the reap.
+async fn serve_reap_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ReapBox
+        .handle_channel(c, async |req: minimald_rpc::ReapBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.reap_box(req.id, req.force).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await
+}
+
+/// `PruneBoxes`: reaps every stopped or exited box that matches the
+/// request's selectors, and answers with what it reaped (BOX-021).
+async fn serve_prune_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::PruneBoxes
+        .handle_channel(c, async |req: minimald_rpc::PruneBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let older_than = req.older_than_secs.map(std::time::Duration::from_secs);
+            Ok(match mngr.prune_boxes(older_than, req.parent).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: format!("The stopped and exited boxes were not removed: {e}"),
+                },
+            })
+        })
+        .await
+}
+
 /// `ListBoxes`: every retained box record on this host, in any state,
 /// optionally scoped to one project root (BOX-158).
 async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
@@ -3133,6 +3166,8 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
+        | minimald_rpc::ReapBox::NAME
+        | minimald_rpc::PruneBoxes::NAME
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
@@ -3215,6 +3250,8 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
+        minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
