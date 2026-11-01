@@ -2771,6 +2771,97 @@ impl OneshotSshRpc for ShowBox {
     type Response = Errorable<ShowBoxResponse>;
 }
 
+/// An RPC to reap one box: delete its record, its events and its
+/// filesystem (BOX-019, BOX-045).
+///
+/// The daemon reaps a `stopped` or `exited` box. It refuses a `running`
+/// box and leaves it running, unless `force` is set. A forced reap stops
+/// the box with the forced stop of [`StopBox`] first, then deletes it.
+pub struct ReapBox;
+
+/// The request for a [`ReapBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReapBoxRequest {
+    /// The box to reap.
+    pub id: SessionId,
+    /// Stop a running box at once and then reap it. Absent, as from a
+    /// client that does not send it, a running box is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`ReapBox`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// reap that succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReapBoxResponse {
+    /// The box the daemon reaped, as its record read before the reap.
+    pub reaped: BoxListingEntry,
+    /// One line per `on_destroy` hook that did not succeed. A failing hook
+    /// does not stop the reap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_failures: Vec<String>,
+}
+
+impl OneshotSshRpc for ReapBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReapBox");
+    type Request<'a> = ReapBoxRequest;
+    type Response = Errorable<ReapBoxResponse>;
+}
+
+/// An RPC to reap every `stopped` or `exited` box that matches all the
+/// given selectors (BOX-021). The daemon never reaps a box in any other
+/// state. With no selector, every `stopped` and `exited` box matches.
+pub struct PruneBoxes;
+
+/// The request for a [`PruneBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneBoxesRequest {
+    /// Match only the boxes that entered `stopped` or `exited` at least
+    /// this many seconds ago. A box with no record of when it entered
+    /// either state does not match. Absent, the age does not narrow the
+    /// prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_secs: Option<u64>,
+    /// Match only the boxes whose parent is this box. Absent, the parent
+    /// does not narrow the prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
+}
+
+/// A box that a [`PruneBoxes`] matched and did not reap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// Why the daemon did not reap it.
+    pub error: String,
+}
+
+/// The response for a [`PruneBoxes`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// prune that reaped nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PruneBoxesResponse {
+    /// Every box the prune reaped, as its record read before the reap, in
+    /// box id order.
+    #[serde(default)]
+    pub reaped: Vec<BoxListingEntry>,
+    /// Every box the prune matched and did not reap, in box id order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<PruneFailure>,
+}
+
+impl OneshotSshRpc for PruneBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PruneBoxes");
+    type Request<'a> = PruneBoxesRequest;
+    type Response = Errorable<PruneBoxesResponse>;
+}
+
 /// An RPC to destroy an existing session.
 pub struct DestroySession;
 

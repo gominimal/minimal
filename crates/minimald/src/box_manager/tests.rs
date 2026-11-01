@@ -4183,3 +4183,624 @@ async fn guest_create_ignores_a_client_supplied_box_id_and_replies_when_no_door_
     let manager = server.state.sessions_manager().await;
     assert!(manager.list_boxes(None).await.unwrap().is_empty());
 }
+
+/// Writes the retained record of box `id` through a store over
+/// `state_dir`, after `change` edits it.
+async fn edit_record(
+    state_dir: &std::path::Path,
+    id: SessionId,
+    change: impl FnOnce(&mut boxes::Record),
+) {
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let mut record = handle.record().await.unwrap();
+    change(&mut record);
+    handle.write(record).await.unwrap();
+}
+
+/// Appends an `exited` event stamped `at` to the events of box `id`,
+/// through a store over `state_dir`.
+async fn write_exited_event(state_dir: &std::path::Path, id: SessionId, at: std::time::SystemTime) {
+    use boxes::store::BoxObject as _;
+
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let object = handle.object().await.unwrap();
+    let mut event =
+        boxes::events::BoxEvent::for_record(object.record(), boxes::events::BoxEventType::Exited);
+    event.ts = u64::try_from(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    object.append_event(&event).unwrap();
+}
+
+/// Every path of box `id` that a reap deletes: the events file beside
+/// the record, and each directory the box sees.
+async fn reaped_paths(mngr: &BoxManagerHandle, id: SessionId) -> Vec<DaemonAbsPath> {
+    use boxes::store::BoxObject as _;
+    let object = mngr.box_events(id).await.unwrap().object;
+    vec![
+        object.events_path(),
+        object.workspace_path(),
+        object.cache_path(),
+        object.home_path(),
+        object.patches_path(),
+        object.hooks_path(),
+    ]
+}
+
+/// BOX-019: a reap of a stopped box deletes its record and its
+/// filesystem, and the daemon log names the box it reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rm_deletes_record_and_filesystem() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("doomed", "/home/dev/proj")).await;
+    let paths = reaped_paths(&mngr, id).await;
+    // A file in the box's tree, so the reap has work to delete.
+    std::fs::create_dir_all(paths[1].as_str()).unwrap();
+    std::fs::write(format!("{}/work.txt", paths[1].as_str()), b"work").unwrap();
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    for path in &paths[..2] {
+        assert!(
+            std::path::Path::new(path.as_str()).exists(),
+            "{path} exists before the reap"
+        );
+    }
+
+    let reply = mngr
+        .reap_box(id, false)
+        .await
+        .expect("a stopped box is reaped");
+    assert_eq!(reply.reaped.box_id, id);
+    assert_eq!(reply.reaped.name.as_deref(), Some("doomed"));
+    assert_eq!(reply.reaped.state, "stopped");
+
+    assert_eq!(
+        mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap(),
+        None
+    );
+    assert!(mngr.list_boxes(None).await.unwrap().is_empty());
+    for path in &paths {
+        assert!(
+            !std::path::Path::new(path.as_str()).exists(),
+            "the reap deletes {path}"
+        );
+    }
+    // A second reap finds no record.
+    assert_eq!(
+        mngr.reap_box(id, false).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+    let logged = log.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("reaped a box") && line.contains(&id.to_string())),
+        "the daemon log names the reaped box {id}:\n{logged}"
+    );
+}
+
+/// BOX-019: a reap of a running box that is not forced is refused, and
+/// the box keeps running with its record. A box still being created is
+/// refused too. The daemon log names each refused box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reap_running_box_unforced_refuses() {
+    use boxes::core::record::RecordState;
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, sample_config()).await;
+    session(&mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+
+    let refused = mngr
+        .reap_box(id, false)
+        .await
+        .expect_err("a running box is not reaped");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Box `{}` is running, so it was not removed. \
+             A forced removal stops the box first and then removes it.",
+            id.as_ref()
+        )
+    );
+    assert_eq!(state_of(&mngr, id).await, RecordState::Running);
+    assert!(
+        session(&mngr, id).await.is_busy().await,
+        "the box's host still runs after the refusal"
+    );
+
+    let pending = mngr.create_session(unnamed_config(), None).await.unwrap();
+    let refused = mngr
+        .reap_box(pending, false)
+        .await
+        .expect_err("a box still being created is not reaped");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(state_of(&mngr, pending).await, RecordState::Pending);
+
+    let logged = log.contents();
+    for refused in [id, pending] {
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("reap: the box was not reaped")
+                    && line.contains("outcome=\"refused\"")
+                    && line.contains(&refused.to_string())),
+            "the daemon log names the refused box {refused}:\n{logged}"
+        );
+    }
+}
+
+/// BOX-019: a forced reap of a running box stops it at once, as a forced
+/// stop does, and then deletes its record and its filesystem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_reap_stops_then_deletes() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, sample_config()).await;
+    session(&mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let paths = reaped_paths(&mngr, id).await;
+
+    let reply = mngr
+        .reap_box(id, true)
+        .await
+        .expect("a forced reap succeeds");
+    assert_eq!(reply.reaped.box_id, id);
+    assert_eq!(
+        reply.reaped.state, "stopped",
+        "the forced stop ends the box before the reap"
+    );
+    assert_eq!(reply.reaped.signal, Some(libc::SIGKILL));
+
+    assert_eq!(
+        mngr.get_record(BoxKeyPredicate::Id(id)).await.unwrap(),
+        None
+    );
+    for path in &paths {
+        assert!(
+            !std::path::Path::new(path.as_str()).exists(),
+            "the reap deletes {path}"
+        );
+    }
+    let logged = log.contents();
+    assert!(
+        logged.contains("reap: the forced stop ended the box"),
+        "the daemon log shows the stop before the reap:\n{logged}"
+    );
+}
+
+/// BOX-045: a box's events survive its stop, and the reap deletes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_survive_stop_deleted_on_rm() {
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, sample_config()).await;
+    session(&mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    mngr.stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let events_path = reader.object.events_path();
+    let kinds: Vec<_> = reader
+        .read_new()
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert!(kinds.contains(&BoxEventType::Created), "{kinds:?}");
+    assert!(kinds.contains(&BoxEventType::Exited), "{kinds:?}");
+
+    mngr.reap_box(id, false)
+        .await
+        .expect("the stopped box is reaped");
+    assert!(!std::path::Path::new(events_path.as_str()).exists());
+    assert_eq!(
+        mngr.box_events(id).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// BOX-021: a prune reaps the stopped and exited boxes that match every
+/// selector given, never a box in any other state, and answers with each
+/// box it reaped. The daemon log names each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_selectors_reap_and_print() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let child_stopped = create_active_session_with(&mngr, rooted_config("child-a", "/p")).await;
+    let child_exited = create_active_session_with(&mngr, rooted_config("child-b", "/p")).await;
+    let orphan = create_active_session_with(&mngr, rooted_config("orphan", "/p")).await;
+    let running_child = create_active_session_with(&mngr, rooted_config("child-c", "/p")).await;
+    let pending = mngr
+        .create_session(rooted_config("pending", "/p"), None)
+        .await
+        .unwrap();
+    for id in [child_stopped, child_exited, running_child, pending] {
+        edit_record(state.path(), id, |record| record.parent = Some(running)).await;
+    }
+    let stopped = RecordState::Stopped(StopEnding::AtDaemonStart);
+    set_record_state(state.path(), child_stopped, stopped).await;
+    set_record_state(
+        state.path(),
+        child_exited,
+        RecordState::Exited(ExitEnding::Oom),
+    )
+    .await;
+    set_record_state(state.path(), orphan, stopped).await;
+    let recent_exit = create_active_session_with(&mngr, rooted_config("recent", "/p")).await;
+    let no_exit = create_active_session_with(&mngr, rooted_config("no-exit", "/p")).await;
+    set_record_state(state.path(), recent_exit, stopped).await;
+    set_record_state(state.path(), no_exit, stopped).await;
+
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let now = std::time::SystemTime::now();
+    // The age counts from the last `exited` event, not from the id. The
+    // orphan ended now. `recent_exit` ended a day and a half on, so two
+    // days on its id is older than a day but its exit is not. `no_exit`
+    // has no `exited` event.
+    write_exited_event(state.path(), orphan, now - day).await;
+    write_exited_event(state.path(), orphan, now).await;
+    write_exited_event(state.path(), recent_exit, now + day + day / 2).await;
+
+    // No box ended a day ago.
+    let reply = mngr.prune_boxes_at(Some(day), None, now).await.unwrap();
+    assert_eq!(reply, minimald_rpc::PruneBoxesResponse::default());
+
+    // Only the ended children of `running`.
+    let reply = mngr.prune_boxes_at(None, Some(running), now).await.unwrap();
+    let mut expected = vec![child_stopped, child_exited];
+    expected.sort();
+    let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(
+        reaped, expected,
+        "the ended boxes whose parent is `running`"
+    );
+    assert!(reply.failed.is_empty(), "{:?}", reply.failed);
+    let state_of_reaped = |id| {
+        reply
+            .reaped
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .map(|entry| (entry.state.clone(), entry.name.clone()))
+    };
+    assert_eq!(
+        state_of_reaped(child_stopped),
+        Some(("stopped".to_string(), Some("child-a".to_string())))
+    );
+    assert_eq!(
+        state_of_reaped(child_exited),
+        Some(("exited".to_string(), Some("child-b".to_string())))
+    );
+
+    // Two days on, the orphan's last exit is older than a day and it goes
+    // too. `recent_exit` exited half a day before, so it stays, though its
+    // id is two days old. `no_exit` has no exit to count from, so it stays.
+    // The boxes that are running or still being created stay, however old.
+    let later = now + 2 * day;
+    let reply = mngr.prune_boxes_at(Some(day), None, later).await.unwrap();
+    let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(reaped, vec![orphan]);
+    assert!(reply.failed.is_empty(), "{:?}", reply.failed);
+
+    let mut left: Vec<_> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.box_id)
+        .collect();
+    left.sort();
+    let mut expected = vec![running, running_child, pending, recent_exit, no_exit];
+    expected.sort();
+    assert_eq!(
+        left, expected,
+        "a prune reaps no running or pending box, and no box that exited too recently"
+    );
+
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line
+            .contains("prune: the box has no exited event; the age selector skips it")
+            && line.contains(&no_exit.to_string())),
+        "the daemon log names the box the age selector skips:\n{logged}"
+    );
+    for id in [child_stopped, child_exited, orphan] {
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("reaped a box") && line.contains(&id.to_string())),
+            "the daemon log names the pruned box {id}:\n{logged}"
+        );
+    }
+    assert!(logged.contains("pruned the stopped and exited boxes"));
+}
+
+/// BOX-019, BOX-025: a reap of a stopped box whose resume is in flight
+/// is refused with its own text, not the running text. A forced reap
+/// waits for the resume to end and then reaps the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reap_resuming_box_refuses_and_forced_waits() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("resuming", "/p")).await;
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    // The claim a resume makes before it writes `running`.
+    assert!(
+        mngr.running_name_holder(id, "resuming".to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let refused = mngr
+        .reap_box(id, false)
+        .await
+        .expect_err("a box whose resume is in flight is not reaped");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Box `{}` is resuming, so it was not removed. \
+             Remove it again after the resume ends.",
+            id.as_ref()
+        )
+    );
+    assert!(matches!(state_of(&mngr, id).await, RecordState::Stopped(_)));
+
+    // The resume ends while the forced reap waits.
+    let releaser = mngr.clone();
+    let release = crate::traced::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        releaser.release_name_claim(id).await;
+    });
+    let reply = mngr
+        .reap_box(id, true)
+        .await
+        .expect("a forced reap waits for the resume to end");
+    release.await.unwrap();
+    assert_eq!(reply.reaped.box_id, id);
+    assert_eq!(reply.reaped.state, "stopped");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone"
+    );
+}
+
+/// BOX-024: no daemon reaps a stopped or exited box on its own. Both
+/// survive a restart, a wait and a second restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_automatic_reaper_runs() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let (state, cache, mngr) = manager().await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/p")).await;
+    drop(mngr);
+    let stopped_state = RecordState::Stopped(StopEnding::AtDaemonStart);
+    let exited_state = RecordState::Exited(ExitEnding::Oom);
+    set_record_state(state.path(), stopped, stopped_state).await;
+    set_record_state(state.path(), exited, exited_state).await;
+
+    for _ in 0..2 {
+        let mngr = manager_over(state.path(), cache.path()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(state_of(&mngr, stopped).await, stopped_state);
+        assert_eq!(state_of(&mngr, exited).await, exited_state);
+        assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+    }
+}
+
+/// Which of `ids` holds the row of `name` in the hostname registry, with
+/// the zone's answer for the name. The zone holds the name exactly while
+/// one of `ids` holds its row.
+fn row_of(mngr: &BoxManagerHandle, name: &str, ids: &[SessionId]) -> Option<SessionId> {
+    let registry = mngr.hostnames();
+    let registry = registry.read().expect("registry lock");
+    let holder = ids
+        .iter()
+        .copied()
+        .find(|id| registry.name_held_by(*id, name));
+    let zone = registry.zone_entry(&format!("{name}.min.internal"), &[]);
+    match holder {
+        Some(_) => assert!(
+            matches!(zone, crate::net::dns::ZoneEntry::Held { .. }),
+            "the zone holds `{name}` while a box holds its row: {zone:?}"
+        ),
+        None => assert_eq!(
+            zone,
+            crate::net::dns::ZoneEntry::Absent,
+            "the zone answers NXDOMAIN for `{name}` with no holder"
+        ),
+    }
+    holder
+}
+
+/// A running `HostNet` box named `name`, which registers the name's row.
+async fn host_net_box(mngr: &BoxManagerHandle, name: &str) -> SessionId {
+    let mut config = sample_config();
+    config.name = Some(name.to_string());
+    config.network = boxes::NetworkMode::HostNet;
+    let id = create_active_session_with(mngr, config).await;
+    session(mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    id
+}
+
+/// Stops the running box `id`, which keeps its record and its name.
+async fn stop(mngr: &BoxManagerHandle, id: SessionId) {
+    mngr.stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+        .await
+        .expect("the stop succeeds");
+}
+
+/// BOX-019, NET-012, NET-128: a reap of the box that holds a name's row
+/// hands the row to another retained box with that name, so the name
+/// answers as long as one box with it is retained. A forced reap of a
+/// running box beside a stopped one does the same. With two stopped
+/// holders, the row goes to the most recent creation, not to the box that
+/// ended last. Once the last holder is reaped, the name answers nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reap_hands_name_to_retained_holder() {
+    use boxes::core::record::RecordState;
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+
+    // `dev` stops, and holds its row as a stopped box.
+    let first = host_net_box(&mngr, "dev").await;
+    stop(&mngr, first).await;
+    assert_eq!(row_of(&mngr, "dev", &[first]), Some(first));
+
+    // A running `dev` beside it takes the row. A forced reap of it hands
+    // the row back to the stopped one.
+    let second = host_net_box(&mngr, "dev").await;
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
+    mngr.reap_box(second, true).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(first));
+    assert!(matches!(
+        state_of(&mngr, first).await,
+        RecordState::Stopped(_)
+    ));
+
+    // A new `dev` takes the row and stops. Its reap hands the row back.
+    let third = host_net_box(&mngr, "dev").await;
+    stop(&mngr, third).await;
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
+    mngr.reap_box(third, false).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(first));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
+
+    // Two stopped `dev` holders beside a running one. The earlier-created
+    // `first` ended last, and the later-created `fourth` still gets the
+    // row when the running one is reaped.
+    let fourth = host_net_box(&mngr, "dev").await;
+    stop(&mngr, fourth).await;
+    let fifth = host_net_box(&mngr, "dev").await;
+    write_exited_event(
+        state.path(),
+        first,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+    )
+    .await;
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fifth));
+    mngr.reap_box(fifth, true).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fourth));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(fourth));
+    mngr.reap_box(fourth, false).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth]), Some(first));
+
+    // The last holder goes: the name answers nothing.
+    mngr.reap_box(first, false).await.unwrap();
+    assert_eq!(
+        row_of(&mngr, "dev", &[first, second, third, fourth, fifth]),
+        None
+    );
+    assert_eq!(answers_to(&mngr, "dev").await, None);
+
+    let logged = log.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("name-handed-over") && line.contains(&first.to_string())),
+        "the daemon log names the box the name went to:\n{logged}"
+    );
+}
+
+/// BOX-019, BOX-025: a resume of a box whose removal is in flight is
+/// refused, so the removal never destroys a box that just started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_name_refuses_a_box_being_removed() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let (state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, rooted_config("leaving", "/p")).await;
+    set_record_state(
+        state.path(),
+        id,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+
+    // The actor is held, so the removal's destroy waits in its mailbox.
+    let handle = session(&mngr, id).await;
+    let release = handle.hold_for_test().await;
+    let reap = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.reap_box(id, false).await }
+    });
+    handle.until_queued(1).await;
+
+    let refused = mngr
+        .running_name_holder(id, "leaving".to_string())
+        .await
+        .expect_err("a box being removed does not resume");
+    assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Box `{}` is being removed, so it was not started.",
+            id.as_ref()
+        )
+    );
+
+    release.send(()).expect("the actor is held");
+    reap.await.unwrap().expect("the removal goes on");
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone"
+    );
+}
