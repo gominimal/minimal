@@ -646,6 +646,36 @@ pub(crate) async fn resolve_box_on_another_vm(
     Err(selected)
 }
 
+/// Refuse a hit on the selected VM when another VM holds the same name
+/// (NET-058). A name that matches on more than one VM, running or stopped, is
+/// an [`AmbiguousBoxName`] that lists every VM and names `--vm`, so a hit on
+/// the selected VM is checked against every VM before it is used. With `--vm`,
+/// or on a host with one VM, nothing else can hold the name, and no lookup
+/// runs. `selected` is the record the selected VM's daemon returned.
+pub(crate) async fn ensure_selected_holds_box_alone(
+    global: &GlobalArgs,
+    name: &str,
+    selected: &boxes::Record,
+) -> Result<(), anyhow::Error> {
+    if global.vm.is_some() || !several_vms(global) {
+        return Ok(());
+    }
+    match crate::attach::resolve_box_vm(global, name).await? {
+        // The walk found one holder. It is the selected VM when its record is
+        // the one the selected daemon returned.
+        Some(resolved) if resolved.record.id != selected.id => Err(AmbiguousBoxName(format!(
+            "box name '{name}' exists on more than one VM ({}, {}); \
+             name the one you mean with --vm",
+            client::vm_name(),
+            resolved.vm
+        ))
+        .into()),
+        // The selected VM is the only holder, or its probe in the walk did
+        // not answer and no other VM holds the name.
+        _ => Ok(()),
+    }
+}
+
 /// Whether this host has more than one VM, running or not: only then can a
 /// box be on a VM other than the selected one.
 fn several_vms(global: &GlobalArgs) -> bool {
@@ -656,8 +686,10 @@ fn several_vms(global: &GlobalArgs) -> bool {
 /// Resolve `name` to its record and a client connected to the VM that owns
 /// it, for the commands that act on a named box over the daemon's RPCs
 /// rather than an ssh hand-off: `min session policy` and `min session
-/// destroy` (NET-058). The selected VM's `client` is asked first. When its
-/// daemon does not know the name, [`resolve_box_on_another_vm`] finds the
+/// destroy` (NET-058). The selected VM's `client` is asked first. A hit
+/// there is refused when another VM also holds the name
+/// ([`ensure_selected_holds_box_alone`]). When its daemon does not know the
+/// name, [`resolve_box_on_another_vm`] finds the
 /// owning VM, and the client returned is connected to that VM's socket.
 /// `example` is the command the user ran, for the not-found refusal.
 pub(crate) async fn resolve_box_on_any_vm(
@@ -667,7 +699,10 @@ pub(crate) async fn resolve_box_on_any_vm(
     example: &str,
 ) -> Result<(client::Client, boxes::Record), anyhow::Error> {
     match resolve_session(&mut client, name).await {
-        Ok(record) => Ok((client, record)),
+        Ok(record) => {
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((client, record))
+        }
         Err(selected) => {
             let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
             let mut client = client::Client::connect(&resolved.sock)

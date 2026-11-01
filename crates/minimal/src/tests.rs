@@ -5967,13 +5967,71 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // The selected VM owns the name: it resolves there, and no other VM is
-    // asked.
+    // The selected VM is the only holder: it resolves there.
+    create_box_on(&default_vm, "solo").await;
     let (client, _) = selected_client(state.path()).await;
-    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
+    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "solo", "session policy solo")
         .await
         .expect("the selected VM's own box resolves");
-    assert_eq!(record.name.as_deref(), Some("api"));
+    assert_eq!(record.name.as_deref(), Some("solo"));
+
+    // A hit on the selected VM is ambiguous when a stopped VM also holds the
+    // name.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("the selected VM and a stopped VM both hold 'api'");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+}
+
+/// NET-058: a name the selected VM holds is ambiguous when a second running
+/// VM holds it too. `min session destroy` and `min session attach` refuse it,
+/// name both VMs and `--vm`, and do not act on the selected VM's box. With
+/// `--vm`, the selected VM's box resolves.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let shared = create_box_on(&default_vm, "shared").await;
+    create_box_on(&alpha, "shared").await;
+    let global = vm_globals(state.path(), None);
+    let expected = "box name 'shared' exists on more than one VM (default, alpha); \
+                    name the one you mean with --vm";
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "shared", "session destroy shared")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("destroy refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
+        .await
+        .expect_err("attach refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM's box is still there: nothing acted on it.
+    let (mut client, _) = selected_client(state.path()).await;
+    let record = cmd::resolve_session(&mut client, "shared")
+        .await
+        .expect("the selected VM still holds 'shared'");
+    assert_eq!(record.id, shared);
+
+    // With --vm, the operator chose: the selected VM's box resolves.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) =
+        cmd::resolve_box_on_any_vm(&pinned, client, "shared", "session destroy shared")
+            .await
+            .expect("--vm picks the selected VM's box");
+    assert_eq!(record.id, shared);
 }
 
 /// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:

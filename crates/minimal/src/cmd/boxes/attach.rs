@@ -32,10 +32,11 @@ pub(crate) fn box_announce_label(id: &boxes::SessionId, name: Option<&str>) -> S
 /// (NET-058). `verb` leads the one line that says which VM the box was found
 /// on ("Attaching to", "Running in", ...).
 ///
-/// The selected VM's daemon is asked first (`client`, reached over `sock`):
-/// the common case — a box on the VM the operator is already on — costs
-/// nothing beyond the one lookup the command always made, and its answer is
-/// gated on the reply that lookup was already making. When that daemon does
+/// The selected VM's daemon is asked first (`client`, reached over `sock`),
+/// and its answer is gated on the reply that lookup was already making. On a
+/// host with several VMs and no `--vm`, a hit there is checked against every
+/// VM, and a name a second VM also holds is an ambiguity
+/// ([`ensure_selected_holds_box_alone`]). When that daemon does
 /// not know the name, [`crate::attach::resolve_box_vm`] resolves the VM that owns it
 /// across every VM's socket, so no global flag is needed to reach a box on
 /// another VM — the resolution gates the owning daemon on the very reply that
@@ -51,7 +52,12 @@ pub(crate) async fn resolve_named_box_version_gated(
     example: &str,
 ) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
     match resolve_session_version_gated(client, name).await {
-        Ok(record) => Ok((record, sock)),
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous. The check
+            // runs before the attach touches the terminal.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((record, sock))
+        }
         Err(selected) => {
             // Every refusal here — the miss, a box on a stopped VM, an
             // ambiguous name — is made before the attach touches the
