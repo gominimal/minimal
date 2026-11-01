@@ -780,7 +780,8 @@ fn insert_mirror_collisions(
 
 /// [`format_ls_across_vms_on`] with each VM's collided mirror ports (T126),
 /// in listing order. The table ends with one `MIRROR PORTS` row per VM that
-/// reports any ([`mirror_collision_row`]), and `--json` carries
+/// reports any ([`mirror_collision_row`]), or per running VM host that gave
+/// no answer ([`mirror_collision_unread_row`]), and `--json` carries
 /// `mirror_collisions` per VM, `null` for a VM with no answer. `--raw`
 /// prints neither.
 pub fn format_ls_across_vms_with_mirrors_on(
@@ -808,12 +809,32 @@ pub fn format_ls_across_vms_with_mirrors_on(
         return Ok(());
     }
     for (listing, ports) in listings.iter().zip(mirror_collisions) {
-        let Some(ports) = ports else { continue };
-        if let Some(row) = mirror_collision_row(&listing.vm, ports) {
+        let row = match ports {
+            Some(ports) => mirror_collision_row(&listing.vm, ports),
+            // NET-138, §7.1: a running VM host that gave no answer is never
+            // shown as one with no collisions. A stopped VM or a listing
+            // with no VM host daemon has nothing to read, so it gets no row.
+            None if listing.running && listing.control_sock.is_some() => {
+                Some(mirror_collision_unread_row(&listing.vm))
+            }
+            None => None,
+        };
+        if let Some(row) = row {
             writeln!(out, "{row}")?;
         }
     }
     Ok(())
+}
+
+/// The `MIRROR PORTS` row `min ls` prints for a running VM whose VM host
+/// daemon did not answer the collided-port read: no socket file, a timeout,
+/// or a daemon without the read. Pure, so tests pin the wording.
+#[must_use]
+pub fn mirror_collision_unread_row(vm: &str) -> String {
+    format!(
+        "MIRROR PORTS:  {vm}  the VM did not report which ports are held by another \
+         program on this machine."
+    )
 }
 
 /// The lines `min ls` prints on stderr after the table for each declared
@@ -1666,6 +1687,20 @@ mod tests {
         assert!(!render(false, false, &one, &[Some(Vec::new())]).contains("MIRROR PORTS"));
         assert!(!render(false, false, &one, &[None]).contains("MIRROR PORTS"));
         assert!(!render(false, true, &one, &[Some(vec![8080])]).contains("MIRROR PORTS"));
+
+        // A running VM host that gave no answer says so, and never looks
+        // like a VM with no collisions. A stopped VM prints no row.
+        let mut vm_host = listing("default");
+        vm_host.control_sock = Some(std::path::PathBuf::from("/nonexistent/control.sock"));
+        let table = render(false, false, std::slice::from_ref(&vm_host), &[None]);
+        assert!(
+            table.lines().any(|line| line
+                == "MIRROR PORTS:  default  the VM did not report which ports are held by \
+                    another program on this machine."),
+            "an unread VM host is named: {table}"
+        );
+        vm_host.running = false;
+        assert!(!render(false, false, &[vm_host], &[None]).contains("MIRROR PORTS"));
 
         let json: serde_json_lenient::Value =
             serde_json_lenient::from_str(&render(true, false, &one, &[Some(vec![8080])]))
