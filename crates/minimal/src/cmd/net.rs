@@ -57,12 +57,14 @@ pub async fn cmd_net_forward(
         .context("Failed to connect to minimald")?;
     // The name alone decides where to look (NET-058): a box on another VM is
     // forwarded over that VM's socket, with no global flag.
+    let example = format!("net forward {} {}", args.session, args.spec);
     let (record, sock) = crate::cmd::resolve_named_box_version_gated(
         global,
         &mut client,
         sock,
         &args.session,
         "Forwarding to",
+        &example,
     )
     .await?;
 
