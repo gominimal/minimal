@@ -417,6 +417,7 @@ BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
 E2E_NOT_RUN_WHY="" # one line per NOT RUN case: the case, a tab, and its gate
 E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
+E2E_KNOWN_GAP_WHY="" # one line per KNOWN GAP check: the case, a tab, and what is missing
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -927,6 +928,7 @@ not_run() {
 known_gap() {
   echo "$1: KNOWN GAP ($2)"
   E2E_KNOWN_GAP="$E2E_KNOWN_GAP $1"
+  E2E_KNOWN_GAP_WHY="$E2E_KNOWN_GAP_WHY$1"$'\t'"$2"$'\n'
 }
 
 teardown() {
@@ -15871,12 +15873,27 @@ proof_bep_ahm_parent_merges_children() {
     ahm_fail
   fi
   echo "min box audit --parent $AHM_SID: no records, and it says the box has no child boxes"
-  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box (BOX-001, BOX-140)"
+  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; no issue is filed for this yet, so file one and cite it here"
 }
 
 proof_bep_ahm_relayed_response_has_no_alt_svc() {
   local as_case=bep_ahm_relayed_response_has_no_alt_svc as_direct
   ahm_box_up "$as_case" || return 0
+  # The same upstream, read directly from the host with no credential, goes
+  # first. With no Alt-Svc header there, the proxy has none to remove on this
+  # run, so the leg does not test the removal. That read gets a 401, and the
+  # relayed read gets a 200, so their headers can differ.
+  if ! curl -sS -D "$WORK/$as_case.direct" -o /dev/null --max-time 30 https://api.github.com/user \
+    2>"$WORK/$as_case.direct.err"; then
+    not_run "$as_case" "curl could not read https://api.github.com/user from the host: $(head -n1 "$WORK/$as_case.direct.err" 2>/dev/null)"
+    return 0
+  fi
+  as_direct="$(tr -d '\r' <"$WORK/$as_case.direct" | grep -i '^alt-svc:' | head -n1 || true)"
+  if [ -z "$as_direct" ]; then
+    not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header on this run, so the proxy had none to remove"
+    return 0
+  fi
+  echo "api.github.com read directly from the host (no credential, 401) sends '$as_direct'"
   # gh prints the response's status line and headers before the body.
   if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api --include user' \
     >"$WORK/$as_case.relayed" 2>&1; then
@@ -15899,15 +15916,6 @@ proof_bep_ahm_relayed_response_has_no_alt_svc() {
     ahm_fail
   fi
   echo "gh api --include user in the box: the relayed response carries no Alt-Svc header"
-  # The same upstream, read directly from the host with no credential. It
-  # says if the proxy had an Alt-Svc header to remove on this run.
-  as_direct="$(curl -sS -D - -o /dev/null --max-time 30 https://api.github.com/user 2>/dev/null \
-    | tr -d '\r' | grep -i '^alt-svc:' | head -n1 || true)"
-  if [ -n "$as_direct" ]; then
-    echo "api.github.com read directly from the host sends '$as_direct', so the proxy removed it"
-  else
-    echo "api.github.com read directly from the host sent no Alt-Svc header on this run, so the proxy had none to remove"
-  fi
 }
 
 proof_bep_ahm_missing_proxy_refused() {
@@ -15955,7 +15963,7 @@ proof_bep_ahm_missing_proxy_refused() {
 }
 
 proof_bep_audit_http_and_messages_closed() {
-  local ahm_case ahm_before ahm_why ahm_ran=0 ahm_summary=""
+  local ahm_case ahm_before ahm_gap_before ahm_why ahm_ran=0 ahm_summary=""
   echo "::group::BEP audit, HTTP and message conditions: one walk over the slice"
   for ahm_case in bep_ahm_audit_by_id_and_name \
       bep_ahm_parent_merges_children \
@@ -15965,8 +15973,13 @@ proof_bep_audit_http_and_messages_closed() {
     # leg runs with no grant box of this case alive.
     [ "$ahm_case" = bep_ahm_missing_proxy_refused ] && ahm_cleanup
     ahm_before="$E2E_NOT_RUN"
+    ahm_gap_before="$E2E_KNOWN_GAP"
     "proof_$ahm_case"
-    if [ "$E2E_NOT_RUN" = "$ahm_before" ]; then
+    if [ "$E2E_NOT_RUN" = "$ahm_before" ] && [ "$E2E_KNOWN_GAP" != "$ahm_gap_before" ]; then
+      ahm_ran=$((ahm_ran + 1))
+      ahm_why="$(printf '%s' "$E2E_KNOWN_GAP_WHY" | awk -F '\t' -v c="$ahm_case" '$1 == c { w = $2 } END { print w }')"
+      ahm_summary="$ahm_summary$ahm_case: KNOWN GAP (${ahm_why:-no reason recorded})"$'\n'
+    elif [ "$E2E_NOT_RUN" = "$ahm_before" ]; then
       ahm_ran=$((ahm_ran + 1))
       ahm_summary="$ahm_summary$ahm_case: PASS"$'\n'
     else
