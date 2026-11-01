@@ -3736,6 +3736,126 @@ async fn fresh_instance_creation_named_smallest_unused_suffix() {
     );
 }
 
+/// The id of the record that answers to `name`, if any (BOX-005).
+async fn answers_to(mngr: &BoxManagerHandle, name: &str) -> Option<SessionId> {
+    mngr.get_record(BoxKeyPredicate::Name(name.to_string()))
+        .await
+        .unwrap()
+        .map(|record| record.id)
+}
+
+/// The state of the retained record of box `id`.
+async fn state_of(mngr: &BoxManagerHandle, id: SessionId) -> boxes::core::record::RecordState {
+    mngr.get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained")
+        .state()
+        .expect("the record's state is readable")
+}
+
+/// Renames box `id` the way the rename RPC does: through its actor.
+async fn rename_box(mngr: &BoxManagerHandle, id: SessionId, new_name: &str) {
+    session(mngr, id)
+        .await
+        .rename(new_name.to_string())
+        .await
+        .unwrap_or_else(|e| panic!("rename of {id} to `{new_name}`: {e}"));
+}
+
+/// BOX-004, BOX-005, BOX-010: a stopped `dev` keeps its name and id, a new
+/// `dev` starts beside it with an id of its own, and a rename of either
+/// moves only that box's name. Through each step the name resolves to the
+/// running box, and the daemon log names the id of each box it renames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_dev_and_new_dev_keep_ids_through_rename() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+
+    // Stop a box named `dev`.
+    let old = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .await
+        .unwrap();
+    assert_eq!(answers_to(&mngr, "dev").await, Some(old));
+    let stopped = RecordState::Stopped(StopEnding::AtDaemonStart);
+    set_record_state(state.path(), old, stopped).await;
+    assert_eq!(
+        answers_to(&mngr, "dev").await,
+        Some(old),
+        "a stopped `dev` still answers while no other `dev` exists"
+    );
+
+    // Start a new `dev`: the stopped one leaves the name free.
+    let new = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("dev", None)), None, None)
+        .await
+        .expect("a stopped `dev` does not hold the name");
+    assert_ne!(new, old, "the new `dev` has an id of its own");
+    assert_eq!(record_name(&mngr, old).await.as_deref(), Some("dev"));
+    assert_eq!(record_name(&mngr, new).await.as_deref(), Some("dev"));
+    assert_eq!(
+        answers_to(&mngr, "dev").await,
+        Some(new),
+        "only the running `dev` answers to the name"
+    );
+
+    // Rename the stopped one: it keeps its id and its state, and `dev`
+    // still answers with the running one.
+    rename_box(&mngr, old, "old").await;
+    assert_eq!(record_name(&mngr, old).await.as_deref(), Some("old"));
+    assert_eq!(
+        state_of(&mngr, old).await,
+        stopped,
+        "a rename starts nothing"
+    );
+    assert_eq!(answers_to(&mngr, "old").await, Some(old));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(new));
+    assert_eq!(record_name(&mngr, new).await.as_deref(), Some("dev"));
+
+    // Rename the running one: it keeps its id, and its name moves with it.
+    rename_box(&mngr, new, "web").await;
+    assert_eq!(record_name(&mngr, new).await.as_deref(), Some("web"));
+    assert_eq!(answers_to(&mngr, "web").await, Some(new));
+    assert_eq!(answers_to(&mngr, "old").await, Some(old));
+    assert_eq!(
+        answers_to(&mngr, "dev").await,
+        None,
+        "no box answers to `dev` once both are renamed"
+    );
+
+    // The listing holds the same two ids, each under its new name.
+    let mut listed: Vec<(SessionId, Option<String>)> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.name))
+        .collect();
+    listed.sort();
+    let mut expected = vec![
+        (old, Some("old".to_string())),
+        (new, Some("web".to_string())),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    let logged = log.contents();
+    for (id, name) in [(old, "old"), (new, "web")] {
+        // Match the `new_name` field itself: a bare `old` also matches the
+        // `old_name` key on every rename line.
+        let new_name_field = format!("new_name={name:?}");
+        assert!(
+            logged.lines().any(|line| line.contains("renamed a box")
+                && line.contains(&id.to_string())
+                && line.contains(&new_name_field)),
+            "the daemon log names box {id} and its new name `{name}`:\n{logged}"
+        );
+    }
+}
+
 /// The suffix rule alone (BOX-163): ASCII case is folded, and only the
 /// plain spelling of `n` uses it.
 #[test]
