@@ -1828,10 +1828,11 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// (NET-058). `verb` leads the one line that says which VM the box was found
 /// on ("Attaching to", "Running in", ...).
 ///
-/// The selected VM's daemon is asked first (`client`, reached over `sock`):
-/// the common case — a box on the VM the operator is already on — costs
-/// nothing beyond the one lookup the command always made, and its answer is
-/// gated on the reply that lookup was already making. When that daemon does
+/// The selected VM's daemon is asked first (`client`, reached over `sock`),
+/// and its answer is gated on the reply that lookup was already making. On a
+/// host with several VMs and no `--vm`, a hit there is checked against every
+/// VM, and a name a second VM also holds is an ambiguity
+/// ([`ensure_selected_holds_box_alone`]). When that daemon does
 /// not know the name, [`attach::resolve_box_vm`] resolves the VM that owns it
 /// across every VM's socket, so no global flag is needed to reach a box on
 /// another VM — the resolution gates the owning daemon on the very reply that
@@ -1844,36 +1845,31 @@ pub(crate) async fn resolve_named_box_version_gated(
     sock: std::path::PathBuf,
     name: &str,
     verb: &str,
+    example: &str,
 ) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
     match resolve_session_version_gated(client, name).await {
-        Ok(record) => Ok((record, sock)),
-        Err(selected) => match attach::resolve_box_vm(global, name).await? {
-            Some(resolved) => {
-                // From here the process acts on the owning VM, as `--vm`
-                // would have made it: everything keyed on the VM's name
-                // (the VM host control socket the pre-attach re-hold asks,
-                // the answerer beside it) must be that VM's, or the re-hold
-                // lands on the selected VM's host daemon as a name with no
-                // row behind it and the hand-off stalls. The enumeration
-                // validated the name; a second set (none happens before a
-                // resolution) is a no-op.
-                let _ = client::set_vm_name(&resolved.vm);
-                // The operator never chose the VM the way they chose the
-                // session, so tell them which one they're landing in.
-                if should_announce_session(global) {
-                    eprintln!(
-                        "{verb} session {} on VM {}",
-                        session_announce_label(
-                            &resolved.record.id,
-                            resolved.record.name.as_deref()
-                        ),
-                        resolved.vm
-                    );
-                }
-                Ok((resolved.record, resolved.sock))
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous. The check
+            // runs before the attach touches the terminal.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((record, sock))
+        }
+        Err(selected) => {
+            // Every refusal here — the miss, a box on a stopped VM, an
+            // ambiguous name — is made before the attach touches the
+            // terminal, so it prints on the terminal as the user left it.
+            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
+            // The operator never chose the VM the way they chose the
+            // session, so tell them which one they're landing in.
+            if should_announce_session(global) {
+                eprintln!(
+                    "{verb} session {} on VM {}",
+                    session_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
+                    resolved.vm
+                );
             }
-            None => Err(selected),
-        },
+            Ok((resolved.record, resolved.sock))
+        }
     }
 }
 
@@ -1885,7 +1881,8 @@ pub(crate) async fn resolve_attach_target_version_gated(
     sock: std::path::PathBuf,
     name: &str,
 ) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
-    resolve_named_box_version_gated(global, client, sock, name, "Attaching to").await
+    let example = format!("session attach {name}");
+    resolve_named_box_version_gated(global, client, sock, name, "Attaching to", &example).await
 }
 
 /// Executes a command in an existing session.
@@ -1910,9 +1907,16 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     // gate rides on the lookup's reply — no `GetVersion` ahead of it. The name
     // alone decides where to look (NET-058), as it does for attach: a box on
     // another VM is reached over that VM's socket, with no global flag.
-    let (r, sock) =
-        resolve_named_box_version_gated(global, &mut client, sock, &args.session, "Running in")
-            .await?;
+    let example = format!("session exec {} <command>", args.session);
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running in",
+        &example,
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -1943,12 +1947,14 @@ pub async fn cmd_session_run(
     // Gated by hand for the same reason as `cmd_exec`: this hands off into a
     // live session, which is not something to drive on a skewed pair. The name
     // alone decides where to look (NET-058), as for exec.
+    let example = format!("session run {} {}", args.session, args.task);
     let (r, sock) = resolve_named_box_version_gated(
         global,
         &mut client,
         sock,
         &args.session,
         "Running the task in",
+        &example,
     )
     .await?;
     tracing::info!(
@@ -2173,9 +2179,14 @@ pub(crate) async fn session_via_ssh(
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
             interactive_attach(ssh, stdin_is_tty, attach::TerminalUnwind::arm, |ssh| {
-                minimal_client::attach::run_interactive_attach(
-                    ssh,
+                // A terminal the relay could not take was never changed,
+                // so a failure here owes it nothing; the marker tells
+                // `interactive_attach` so.
+                let real = minimal_client::tty_relay::RealTty::acquire()
+                    .context(attach::TerminalNotTaken)?;
+                mark_relay_not_started(
                     subscribe_host_asks(host_asks).map(minimal_client::attach::HostAsks::into_hook),
+                    |hook| minimal_client::attach::run_interactive_attach_on(ssh, real, Some(hook)),
                 )
             })
         })
@@ -2303,6 +2314,45 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
     }
 }
 
+/// Run the relay with a suspend hook that records that the relay started,
+/// and mark a failure that came before it with
+/// [`attach::RelayNotStarted`].
+///
+/// The relay calls its suspend hook only once `Relay::start` returned: ssh
+/// runs on the pty and the real terminal is in raw mode. Every failure of
+/// `Relay::start` comes before ssh's output can reach the real terminal, and
+/// the relay put back what it changed, so the attach owes the terminal no
+/// unwind. `inner` is the caller's own hook, if any, and runs as before.
+///
+/// The hook runs on a thread of its own, so a relay that started and then
+/// failed at once can return before the hook records it. Then the guard
+/// stands down, though the relay restored the termios. The only such
+/// failure is the wait on ssh's exit.
+pub(crate) fn mark_relay_not_started(
+    inner: Option<minimal_client::tty_relay::SuspendHook>,
+    run: impl FnOnce(
+        minimal_client::tty_relay::SuspendHook,
+    ) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let started = Arc::new(AtomicBool::new(false));
+    let hook_started = Arc::clone(&started);
+    let hook: minimal_client::tty_relay::SuspendHook = Box::new(move |handle| {
+        hook_started.store(true, Ordering::Release);
+        if let Some(inner) = inner {
+            inner(handle);
+        }
+    });
+    run(hook).map_err(|e| {
+        if started.load(Ordering::Acquire) {
+            e
+        } else {
+            anyhow::Error::new(attach::RelayNotStarted(e))
+        }
+    })
+}
+
 /// The interactive attach, from the terminal check to ssh's exit code.
 ///
 /// `-tt` over a *non-terminal* stdin is a trap: ssh still forces the remote
@@ -2321,6 +2371,15 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
 /// only process left that can still reach the tty. So the guard stays
 /// armed for the duration and is stood down only once ssh's exit proves
 /// the daemon was alive and speaking: see `attach::client_must_unwind`.
+///
+/// A relay that fails once it holds the terminal ends `min session attach`
+/// with an error, which `main` prints after this returns. The relay put the
+/// attach-start termios back before it returned, and the guard writes its
+/// unwind as it drops here, so the error lands on a restored terminal and
+/// stays on screen after the exit. Only a relay that never took the
+/// terminal ([`attach::TerminalNotTaken`]) or never started ssh's
+/// session on it ([`attach::RelayNotStarted`]) stands the guard
+/// down, because nothing of the session reached the terminal.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -2332,10 +2391,18 @@ pub(crate) fn interactive_attach<W: std::io::Write>(
     let status = match relay(ssh) {
         Ok(status) => status,
         Err(e) => {
-            // ssh never ran (or the relay never took the terminal), so
-            // nothing of the session reached the terminal and there is
-            // nothing to put back.
-            unwind.disarm();
+            // The relay never took the terminal, or never started ssh's
+            // session on it, so nothing of the session reached it and there
+            // is nothing to put back. Any other failure came after the
+            // session started, and the session may have left its modes set:
+            // the guard writes the unwind as it drops, before the error is
+            // printed.
+            if e.downcast_ref::<attach::TerminalNotTaken>().is_some()
+                || e.downcast_ref::<attach::RelayNotStarted>().is_some()
+            {
+                unwind.disarm();
+            }
+            drop(unwind);
             return Err(e).context("failed to run ssh");
         }
     };
@@ -2394,13 +2461,16 @@ pub async fn cmd_session_policy(
 
     ensure_daemon(global)?;
 
-    let mut client = connect_daemon(global).await?;
+    let client = connect_daemon(global).await?;
 
     // The effective reply carries only the rules, but the ingress block is
     // suppressed for host-address sessions (see [`format_policy`]), so the
     // command also resolves the record the policy rides on for its network
-    // mode.
-    let record = resolve_session(&mut client, &args.session).await?;
+    // mode. The name alone decides which VM is asked (NET-058): a box on
+    // another VM is read from that VM's daemon, with no global flag.
+    let example = format!("session policy {}", args.session);
+    let (mut client, record) =
+        resolve_box_on_any_vm(global, client, &args.session, &example).await?;
     // The follow-up lookups go by the resolved id, so a session named by an
     // id prefix reaches the same session they do.
     let session = record.id.to_string();
@@ -3426,22 +3496,28 @@ async fn session_policy_json_inputs(
 > {
     ensure_daemon(global)
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let mut client = connect_daemon(global)
+    let client = connect_daemon(global)
         .await
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
 
     // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses, with the failure kinds told apart where
-    // they can be: an RPC the daemon never answered is no daemon to ask;
-    // a lookup that answered with nothing is the not-found itself.
-    let resp = get_session_record(&mut client, session)
+    // lookup the text walk uses — on the VM that owns the name (NET-058) —
+    // with the failure kinds told apart where they can be: an RPC the daemon
+    // never answered is no daemon to ask; a lookup that answered with
+    // nothing, or a box on a stopped VM, is the not-found itself.
+    let example = format!("session policy {session} -o json");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, session, &example)
         .await
-        .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
-            Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
-            None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
+        .map_err(|error| {
+            if error.downcast_ref::<BoxNotFound>().is_some()
+                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
+                || error.downcast_ref::<AmbiguousBoxName>().is_some()
+            {
+                PolicyJsonFailure::SessionNotFound(error.to_string())
+            } else {
+                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
+            }
         })?;
-    let record = named_record(resp.record, session)
-        .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
     // By the resolved id, as the text walk does.
     let session = &record.id.to_string();
 
@@ -3789,7 +3865,9 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         .session
         .as_deref()
         .context("a session or --all is required")?;
-    let record = resolve_session(&mut client, session).await?;
+    // The name alone decides which VM destroys the box (NET-058).
+    let example = format!("session destroy {session}");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, session, &example).await?;
 
     // Under --force the at-risk fetch is skipped outright — the gate is
     // bypassed regardless, so there is nothing to ask the daemon for.
