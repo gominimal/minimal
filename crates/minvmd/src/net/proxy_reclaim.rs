@@ -122,6 +122,24 @@ impl<R> Drop for ReclaimWatcher<R> {
     }
 }
 
+/// Gates the watcher's `take` on the proxy's publish state: while
+/// `status` records a down cause, `take` is not called and the probe reads
+/// as held. An unconfirmed publish holds the watcher until the guest's late
+/// report confirms it, and a late port-held report stops every publish to a
+/// guest proxy that is not serving.
+pub(crate) fn take_while_serving<R>(
+    status: crate::control::ProxyPublishStatus,
+    mut take: impl FnMut(u16) -> Option<R> + Send + 'static,
+) -> impl FnMut(u16) -> Option<R> + Send + 'static {
+    move |port| {
+        if status.down().is_some() {
+            None
+        } else {
+            take(port)
+        }
+    }
+}
+
 /// Starts the watcher on its own thread. Every `interval` it makes one
 /// [`reclaim_once`] attempt. On success it calls `reclaimed` with the
 /// preferred port, logs the reclaim line, holds the reservation, and stops.
@@ -367,6 +385,38 @@ mod tests {
         // One expose, never a second.
         assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
         drop(watcher);
+    }
+
+    /// A proxy whose publish is unconfirmed, or held after the start, has no
+    /// serving ports to report, and the watcher does not take the preferred
+    /// port for it.
+    #[test]
+    fn proxy_reclaims_preferred_port_when_free_only_while_serving() {
+        let status = crate::control::ProxyPublishStatus::new();
+        status.set_serving(65264);
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&counter);
+        let mut take = take_while_serving(status.clone(), move |_port: u16| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Some(())
+        });
+
+        status.set_unconfirmed(65264);
+        assert!(status.serving_ports().is_empty());
+        assert!(take(7654).is_none());
+
+        status.confirm(65264);
+        assert_eq!(status.serving_ports(), vec![65264]);
+        assert!(take(7654).is_some());
+
+        status.set_down(
+            65264,
+            minimald_rpc::ProxyDownCause::PortHeldAfterStart { holder: None },
+        );
+        assert!(status.serving_ports().is_empty());
+        assert!(take(7654).is_none());
+        // Only the probe after the confirm reached `take`.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]

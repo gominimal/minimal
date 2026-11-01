@@ -1561,7 +1561,10 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                     node_port.preferred,
                     node_port.port,
                     crate::net::proxy_reclaim::RECLAIM_PROBE_INTERVAL,
-                    proxy_reclaim_check(ports_dir.clone()),
+                    crate::net::proxy_reclaim::take_while_serving(
+                        proxy_publish.clone(),
+                        proxy_reclaim_check(ports_dir.clone()),
+                    ),
                     proxy_reclaim_publisher(switch_sock.clone(), boxes.subnet().daemon_ip()),
                     move |preferred| recorded.add_preferred(preferred),
                 )

@@ -480,7 +480,13 @@ impl ProxyPublishStatus {
     /// Every host port the proxy serves on, the preferred first: the
     /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
     /// recorded a port, and for a start that never brought the proxy up.
+    /// Empty too while a down cause is recorded ([`Self::down`]): an
+    /// unconfirmed publish or a port held after the start serves nothing
+    /// the host can vouch for.
     pub(crate) fn serving_ports(&self) -> Vec<u16> {
+        if self.down().is_some() {
+            return Vec::new();
+        }
         self.1
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
