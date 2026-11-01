@@ -277,7 +277,24 @@ fn credentialed_upstream_for(
     declared.then(|| boxes::CredentialedUpstream {
         bep: bep.clone(),
         secrets: secrets.clone(),
+        // Filled once the store references are accepted (BEP-062).
+        store_upstreams: Vec::new(),
     })
+}
+
+/// Puts the upstream authorities of each rule in `accepted` into the
+/// declaration of `policy`, beside its grants, once each, in order (BEP-062).
+/// A policy with no declaration, or no accepted rule, is left as it is, so
+/// a box with no store reference carries no authorities.
+fn put_store_upstreams(policy: &mut boxes::BoxPolicy, accepted: &boxes::core::bep::StoreRules) {
+    let Some(declaration) = policy.credentialed_upstream.as_mut() else {
+        return;
+    };
+    for authority in accepted.values().flat_map(|rule| rule.upstream.iter()) {
+        if !declaration.store_upstreams.contains(authority) {
+            declaration.store_upstreams.push(authority.clone());
+        }
+    }
 }
 
 /// Refuses a box spec whose grants the box or this host cannot honour, and
@@ -1485,7 +1502,7 @@ pub(crate) async fn activate_box(
                 || args.dynamic_range.is_some();
             let (project_bep, project_secrets, project_env, project_quic443) =
                 project_bep_and_grants(&utf8_path)?;
-            let policy = boxes::BoxPolicy {
+            let mut policy = boxes::BoxPolicy {
                 egress,
                 ingress: has_ingress.then_some(boxes::IngressPolicy {
                     port_mappings,
@@ -1533,6 +1550,9 @@ pub(crate) async fn activate_box(
             let accepted_store_rules =
                 check_store_grants(global, &project_secrets, policy.egress.as_ref(), can_ask)?;
             let store_grants = store_grants(&project_secrets, &accepted_store_rules)?;
+            // BEP-062: a `dns` or `both` box resolves each accepted rule's
+            // upstream to the proxy, so the gate needs the authorities.
+            put_store_upstreams(&mut policy, &accepted_store_rules);
             // Gatehouse §6.2, BEP-003: a GitHub grant needs a node-local
             // proxy, and then a held sign-in. Only the item's metadata is
             // read, and nothing asks for a sign-in.
@@ -3355,6 +3375,75 @@ mod tests {
 
     fn never_ask(question: &str) -> Result<bool, anyhow::Error> {
         panic!("asked with no terminal: {question}")
+    }
+
+    // BEP-062: the upstream of each store rule the creation accepts rides
+    // the box's policy beside its grants, so a `dns` box's gate can steer
+    // it. A box with no store reference carries none, and serializes as it
+    // did before the field existed.
+    #[test]
+    fn accepted_store_rule_authorities_reach_the_box_policy() {
+        let secrets = store_grant();
+        let egress = egress_of(&["api.openai.com"]);
+        let accepted = accept_store_references(
+            &secrets,
+            Some(&egress),
+            &store_rule(None),
+            false,
+            &mut never_ask,
+        )
+        .expect("the rule accepts the reference");
+        let mut policy = boxes::BoxPolicy {
+            egress: Some(egress),
+            credentialed_upstream: credentialed_upstream_for(
+                false,
+                &boxes::core::bep::BepSettings::default(),
+                &secrets,
+            ),
+            ..boxes::BoxPolicy::default()
+        };
+        put_store_upstreams(&mut policy, &accepted);
+        let declaration = policy
+            .credentialed_upstream
+            .as_ref()
+            .expect("a store reference declares the lane");
+        assert_eq!(declaration.store_upstreams, ["api.openai.com"]);
+        assert_eq!(declaration.secrets, secrets, "beside its grants");
+        let json = serde_json_lenient::to_value(&policy).expect("the policy serializes");
+        assert_eq!(
+            json["credentialed_upstream"]["store_upstreams"],
+            serde_json_lenient::json!(["api.openai.com"])
+        );
+
+        // A second accepted rule that names the same authority adds it once.
+        let mut twice = store_rule(None);
+        let mut other = twice["openai-key"].clone();
+        other.upstream = vec!["api.openai.com".into(), "api.example.com:8443".into()];
+        twice.insert("other-key".into(), other);
+        put_store_upstreams(&mut policy, &twice);
+        assert_eq!(
+            policy
+                .credentialed_upstream
+                .as_ref()
+                .map(|d| d.store_upstreams.clone()),
+            Some(vec![
+                "api.openai.com".to_owned(),
+                "api.example.com:8443".to_owned()
+            ])
+        );
+
+        // No store reference: no rule is accepted and no field is written.
+        let mut plain = boxes::BoxPolicy {
+            credentialed_upstream: credentialed_upstream_for(
+                true,
+                &boxes::core::bep::BepSettings::default(),
+                &boxes::core::bep::SecretGrants::new(),
+            ),
+            ..boxes::BoxPolicy::default()
+        };
+        put_store_upstreams(&mut plain, &boxes::core::bep::StoreRules::new());
+        let json = serde_json_lenient::to_value(&plain).expect("the policy serializes");
+        assert_eq!(json["credentialed_upstream"], serde_json_lenient::json!({}));
     }
 
     // BEP-032, BEP-063: each store reference that a rule accepts gets its

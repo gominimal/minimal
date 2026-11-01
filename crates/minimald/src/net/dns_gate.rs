@@ -3869,6 +3869,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
                 secrets: Default::default(),
+                store_upstreams: Vec::new(),
             }),
             quic443: None,
         }
