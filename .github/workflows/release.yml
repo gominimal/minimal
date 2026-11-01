@@ -597,12 +597,13 @@ jobs:
                     exit 1
                   fi
                   profile="$RUNNER_TEMP/bep.provisionprofile"
+                  # The runner persists: remove the profile however the step ends.
+                  trap 'rm -f "$profile"' EXIT
                   printf '%s' "$BEP_PROFILE" | base64 -D >"$profile"
                   scripts/build-bep-bundle.sh check-profile "$profile" "$MINIMAL_ZONED_TEAMID"
 
                   scripts/build-bep-bundle.sh assemble target/release/bep "$profile" \
                     target/release/bep.app "${MINIMAL_RELEASE_VERSION:-0.0.0}"
-                  rm -f "$profile"
             - name: Codesign binaries with Developer ID
               # Sign the three shipped Mach-O binaries and the minzoned app
               # bundle with the Developer ID Application identity held in the
