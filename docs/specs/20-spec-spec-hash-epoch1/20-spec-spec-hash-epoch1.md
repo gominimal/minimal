@@ -174,7 +174,10 @@ build-infra operator. Release manager.
   harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
     all 256 tag bytes with a bounded 8-byte payload, in spec and in
     container position, unwind 9 (the payload loop)
-  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1.
+  - THE SYSTEM SHALL assign no tag in 0xF0 to 0xFF at the epoch-1 seal;
+    that range is the reserve an additive optional field (EPOCH-021) draws
+    its tag from after the seal, and the test pins the seal's assignment,
+    not the reserve's emptiness for all time.
     tier:   T0
     verify: cargo nextest run -p graph epoch1_reserved_tags_unassigned
 
