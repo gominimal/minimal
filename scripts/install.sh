@@ -820,14 +820,18 @@ do_uninstall() {
         # before the data prefix can, and the completion dirs (plus their
         # parents, which the installer may have created) are shared with other
         # tools so, like bin, they are only ever rmdir'd-if-empty. The macOS
-        # app bundle's directories (bin/Minimal.app) go innermost first, so
-        # the bin dir can empty out after them.
+        # app bundles' directories (bin/Minimal.app, bin/bep.app) go
+        # innermost first, so the bin dir can empty out after them.
         for d in "$init_dir" \
                  "$bindir/Minimal.app/Contents/MacOS" \
                  "$bindir/Minimal.app/Contents/Resources" \
                  "$bindir/Minimal.app/Contents/_CodeSignature" \
                  "$bindir/Minimal.app/Contents" \
                  "$bindir/Minimal.app" \
+                 "$bindir/bep.app/Contents/MacOS" \
+                 "$bindir/bep.app/Contents/_CodeSignature" \
+                 "$bindir/bep.app/Contents" \
+                 "$bindir/bep.app" \
                  "$(resolve_prefix data)/apparmor/tunables" \
                  "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \

@@ -35,7 +35,8 @@
 #
 # `check-profile` checks a Developer ID provisioning profile before it goes
 # into the bundle: its team, its application identifier, that it authorises
-# the keychain access group, and that it has not expired. An expired profile,
+# the keychain access group, that it runs on any Mac (a Developer ID profile,
+# not a development one), and that it has not expired. An expired profile,
 # or one for another App ID, makes a bep that macOS refuses to start. It
 # decodes the profile with `security cms -D -i`. BEP_PROFILE_DECODE replaces
 # that command, so scripts/build-bep-bundle_test.sh can feed it plain plists.
@@ -101,6 +102,10 @@ if got_team != team or got_app != want_app:
     sys.exit(f"the profile is for '{got_app}' in team '{got_team}', not '{want_app}'")
 if want_app not in groups and team + ".*" not in groups:
     sys.exit(f"the profile does not authorise the keychain access group {want_app}")
+# A Developer ID profile runs on any Mac. A development profile lists the
+# Macs it runs on, and bep.app would not start anywhere else.
+if profile.get("ProvisionsAllDevices") is not True or "ProvisionedDevices" in profile:
+    sys.exit("the profile is not a Developer ID profile: it does not provision all devices")
 if not isinstance(expires, datetime.datetime):
     sys.exit("the profile has no expiry date")
 if expires.tzinfo is None:

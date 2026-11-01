@@ -23,14 +23,19 @@ fail=0
 ok() { pass=$((pass + 1)); echo "ok   - $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL - $1"; }
 
-# profile FILE TEAM APP GROUP EXPIRY — a decoded provisioning profile.
+# profile FILE TEAM APP GROUP EXPIRY [DEVICES] — a decoded provisioning
+# profile. Without DEVICES it is a Developer ID profile, which provisions
+# every device. With DEVICES it is a development profile that lists them.
 profile() {
+    local devices='<key>ProvisionsAllDevices</key><true/>'
+    [ -n "${6:-}" ] && devices="<key>ProvisionedDevices</key><array><string>$6</string></array>"
     cat >"$1" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>TeamIdentifier</key><array><string>$2</string></array>
 <key>ExpirationDate</key><date>$5</date>
+$devices
 <key>Entitlements</key><dict>
 <key>com.apple.application-identifier</key><string>$3</string>
 <key>keychain-access-groups</key><array><string>$4</string></array>
@@ -65,6 +70,9 @@ check "a profile for another App ID fails" 1 "is for '3G47C5HY64.dev.minimal.min
 
 profile "$root/group" 3G47C5HY64 3G47C5HY64.dev.minimal.bep 3G47C5HY64.dev.other 2099-01-01T00:00:00Z
 check "a profile without the bep access group fails" 1 "does not authorise the keychain access group" "$root/group"
+
+profile "$root/development" 3G47C5HY64 3G47C5HY64.dev.minimal.bep '3G47C5HY64.*' 2099-01-01T00:00:00Z 00008103-000A1B2C3D4E5F60
+check "a development profile that lists its Macs fails" 1 "not a Developer ID profile" "$root/development"
 
 profile "$root/expired" 3G47C5HY64 3G47C5HY64.dev.minimal.bep '3G47C5HY64.*' 2000-01-01T00:00:00Z
 check "an expired profile fails" 1 "expired at 2000" "$root/expired"

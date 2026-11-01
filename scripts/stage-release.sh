@@ -253,13 +253,15 @@ COMPONENTS=(
     # flat name `build-bep-bundle.sh table` gives it, and
     # stage-release_test.sh fails when these rows disagree with it. Every
     # row is required, so a release with part of the bundle fails the stage.
+    # The installer works through the rows in order, so the link comes last:
+    # an earlier plain bin/bep stays in place until the whole bundle is down.
     # macOS only: the proxy does not run on Linux.
-    "bep|darwin|arm64|symlink|bin/bep|bep.app/Contents/MacOS/bep"
     "bep-program|darwin|arm64|file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"
     "bep-info|darwin|arm64|file|bin/bep.app/Contents/Info.plist|bep-macos-arm64-Info.plist"
     "bep-profile|darwin|arm64|file|bin/bep.app/Contents/embedded.provisionprofile|bep-macos-arm64-profile"
     "bep-seal|darwin|arm64|file|bin/bep.app/Contents/_CodeSignature/CodeResources|bep-macos-arm64-CodeSignature"
     "bep-ticket|darwin|arm64|file|bin/bep.app/Contents/CodeResources|bep-macos-arm64-ticket"
+    "bep|darwin|arm64|symlink|bin/bep|bep.app/Contents/MacOS/bep"
     # The trimmed libkrun minvmd links against (built by the release workflow's
     # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
