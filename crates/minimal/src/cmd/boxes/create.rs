@@ -2702,6 +2702,17 @@ pub(crate) async fn activate_box(
 
     println!("{id}");
 
+    // T126 (NET-138): a `host_ip` box on a VM host names each of its
+    // mirrored ports that another program on the host holds. Printed only
+    // when the activation does not attach, so no line is lost under the
+    // shell's first paint.
+    if !args.attach
+        && kind == paths::HostKind::Minvmd
+        && request.config.network == boxes::NetworkMode::HostNet
+    {
+        crate::resolver::print_mirror_collisions(control_sock.clone()).await;
+    }
+
     if args.attach {
         // Chain into attach. Announce the freshly created session first: the
         // bare id printed to stdout above is the scripting contract, while this

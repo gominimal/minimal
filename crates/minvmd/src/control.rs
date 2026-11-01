@@ -1913,8 +1913,7 @@ pub async fn read_mirror_collisions(sock_path: &Path) -> Option<Vec<u16>> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     let exchange = async {
         let mut stream = tokio::net::UnixStream::connect(sock_path).await.ok()?;
-        let mut line =
-            serde_json_lenient::to_string(&HostReadRequest::MirrorCollisions).ok()?;
+        let mut line = serde_json_lenient::to_string(&HostReadRequest::MirrorCollisions).ok()?;
         line.push('\n');
         stream.write_all(line.as_bytes()).await.ok()?;
         let mut reply = String::new();

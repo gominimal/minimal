@@ -4938,6 +4938,56 @@ pub fn port_held_no_channel_warning(port: u16) -> String {
     )
 }
 
+/// The sentence `min ls` and `min session activate` print for one mirrored
+/// port that collided on the host (NET-138, T126): a `host_ip` box on a VM
+/// host listens on `port`, and the VM host daemon cannot open it at the
+/// node's address because another program holds it. The VM host daemon's
+/// `mirror_collisions` read is the code path that makes it true. Pure, so
+/// tests pin the wording.
+#[must_use]
+pub fn mirror_collision_sentence(port: u16) -> String {
+    format!(
+        "port {port} is held by another program on this machine, so a host_ip box \
+         cannot open it here."
+    )
+}
+
+/// The lines `min session activate` prints for a `host_ip` box on a VM
+/// host: one [`mirror_collision_sentence`] per collided port, in order.
+#[must_use]
+pub fn mirror_collision_lines(ports: &[u16]) -> Vec<String> {
+    ports
+        .iter()
+        .copied()
+        .map(mirror_collision_sentence)
+        .collect()
+}
+
+/// Reads the collided mirror ports from the VM host daemon's control socket
+/// and prints one line per port on stderr. `min session activate` calls it
+/// for a `host_ip` box on a VM host, after the activation and only when it
+/// does not attach. A socket that is not there, or a daemon that does not
+/// answer the read, prints nothing. Returns the lines it printed.
+pub(crate) async fn print_mirror_collisions(
+    control_sock: Option<std::path::PathBuf>,
+) -> Vec<String> {
+    let Some(sock) = control_sock else {
+        return Vec::new();
+    };
+    let ports = minvmd::control::read_mirror_collisions(&sock)
+        .await
+        .unwrap_or_default();
+    tracing::info!(
+        mirror_collisions = ports.len(),
+        "read the VM host's collided mirror ports after the activation"
+    );
+    let lines = mirror_collision_lines(&ports);
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    lines
+}
+
 /// Whether the reserved local range is present on *this* host's loopback:
 /// the same bind probe the daemon runs at session start (`switch::loopback`,
 /// one definition next to the range it probes), run where the verdict is
@@ -5290,6 +5340,55 @@ pub(crate) async fn naming_surface() -> NamingSurface {
 
 #[cfg(test)]
 mod tests {
+
+    // T126 (NET-138): `min session activate` of a `host_ip` box on a VM host
+    // reads the collided mirror ports over the VM host daemon's control
+    // socket and prints one sentence per port. A socket that is not there
+    // prints nothing.
+    #[tokio::test]
+    async fn activate_names_collided_mirror_ports() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sock = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("binds");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accepts");
+            let (read, mut write) = stream.split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .expect("reads");
+            write
+                .write_all(b"{\"mirror_collisions\":[5432,8080]}\n")
+                .await
+                .expect("writes");
+            line
+        });
+        let lines = super::print_mirror_collisions(Some(sock.clone())).await;
+        assert_eq!(
+            server.await.expect("the server ran").trim(),
+            r#"{"verb":"mirror_collisions"}"#
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "port 5432 is held by another program on this machine, so a host_ip box \
+                 cannot open it here."
+                    .to_string(),
+                "port 8080 is held by another program on this machine, so a host_ip box \
+                 cannot open it here."
+                    .to_string(),
+            ]
+        );
+        assert!(
+            super::print_mirror_collisions(Some(dir.path().join("absent.sock")))
+                .await
+                .is_empty()
+        );
+        assert!(super::print_mirror_collisions(None).await.is_empty());
+    }
     use super::*;
 
     /// The CLI's zone spellings are the sessions zone's, byte for byte: the

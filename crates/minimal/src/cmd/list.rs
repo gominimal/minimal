@@ -633,12 +633,36 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     } else {
         crate::cmd::finalize_install::host_install_for_this_host(global)
     };
-    format_ls_across_vms_on(
+    // T126 (NET-138): each VM host daemon's collided mirror ports, read
+    // over that VM's own control socket. `--raw` prints bare ids only, so
+    // it pays no read. The count is a field on the `ListSessions` span.
+    let mirror_collisions: Vec<Vec<u16>> = if args.raw {
+        Vec::new()
+    } else {
+        let span = tracing::info_span!("ListSessions", mirror_collisions = tracing::field::Empty);
+        let mut read = Vec::with_capacity(listings.len());
+        for listing in &listings {
+            let ports = match listing.control_sock.as_deref() {
+                Some(sock) => minvmd::control::read_mirror_collisions(sock)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            read.push(ports);
+        }
+        span.record(
+            "mirror_collisions",
+            read.iter().map(Vec::len).sum::<usize>(),
+        );
+        read
+    };
+    format_ls_across_vms_with_mirrors_on(
         &mut std::io::stdout(),
         &args,
         &listings,
         &surfaces,
         &vm_answerers,
+        &mirror_collisions,
         host_install,
     )?;
     // NET-129: after the table, one stderr line per port a box yields at a
@@ -647,6 +671,91 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     if !args.json {
         for line in shared_port_collision_lines(&listings) {
             eprintln!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// The `MIRROR PORTS` row `min ls` prints for one VM whose VM host daemon
+/// reports collided mirror ports (T126): the VM, then one
+/// [`crate::resolver::mirror_collision_sentence`] per port. `None` when the
+/// VM reports none. Pure, so tests pin the wording.
+#[must_use]
+pub fn mirror_collision_row(vm: &str, ports: &[u16]) -> Option<String> {
+    if ports.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "MIRROR PORTS:  {vm}  {}",
+        crate::resolver::mirror_collision_lines(ports).join(" ")
+    ))
+}
+
+/// Adds `mirror_collisions` to each VM's object in a `min ls --json`
+/// document: the top-level object for one listing, each `vms` entry, in
+/// listing order, for several. A VM with no read carries an empty list.
+fn insert_mirror_collisions(
+    json: &mut serde_json_lenient::Value,
+    listings: usize,
+    mirror_collisions: &[Vec<u16>],
+) {
+    let ports_at = |index: usize| {
+        serde_json_lenient::Value::from(
+            mirror_collisions
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(serde_json_lenient::Value::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    if listings <= 1 {
+        if let serde_json_lenient::Value::Object(map) = json {
+            map.insert("mirror_collisions".to_string(), ports_at(0));
+        }
+        return;
+    }
+    if let Some(serde_json_lenient::Value::Array(vms)) = json.get_mut("vms") {
+        for (index, vm) in vms.iter_mut().enumerate() {
+            if let serde_json_lenient::Value::Object(map) = vm {
+                map.insert("mirror_collisions".to_string(), ports_at(index));
+            }
+        }
+    }
+}
+
+/// [`format_ls_across_vms_on`] with each VM's collided mirror ports (T126),
+/// in listing order. The table ends with one `MIRROR PORTS` row per VM that
+/// reports any ([`mirror_collision_row`]), and `--json` carries
+/// `mirror_collisions` per VM. `--raw` prints neither.
+pub fn format_ls_across_vms_with_mirrors_on(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    listings: &[VmListing],
+    surfaces: &[Option<crate::resolver::LiveSurface>],
+    vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
+    mirror_collisions: &[Vec<u16>],
+    host: crate::resolver::HostInstall,
+) -> Result<(), anyhow::Error> {
+    if args.json {
+        let mut rendered = Vec::new();
+        format_ls_across_vms_on(&mut rendered, args, listings, surfaces, vm_answerers, host)?;
+        let mut json: serde_json_lenient::Value = serde_json_lenient::from_slice(&rendered)
+            .context("Failed to read back the session list")?;
+        insert_mirror_collisions(&mut json, listings.len(), mirror_collisions);
+        let json = serde_json_lenient::to_string_pretty(&json)
+            .context("Failed to serialize session list")?;
+        writeln!(out, "{json}")?;
+        return Ok(());
+    }
+    format_ls_across_vms_on(out, args, listings, surfaces, vm_answerers, host)?;
+    if args.raw {
+        return Ok(());
+    }
+    for (listing, ports) in listings.iter().zip(mirror_collisions) {
+        if let Some(row) = mirror_collision_row(&listing.vm, ports) {
+            writeln!(out, "{row}")?;
         }
     }
     Ok(())
@@ -1444,5 +1553,87 @@ mod tests {
         );
         assert_eq!(status_label(boxes::BoxState::Stopped), "stopped");
         assert_eq!(status_label(boxes::BoxState::Exited), "exited");
+    }
+
+    fn listing(vm: &str) -> super::VmListing {
+        super::VmListing {
+            vm: vm.to_string(),
+            resp: minimald_rpc::ListSessionsResponse {
+                resource_pool: None,
+                sessions: Vec::new(),
+                daemon_version: None,
+                hostname_routing_unavailable: None,
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
+                answerer_bound: false,
+                box_networks: Default::default(),
+            },
+            control_sock: None,
+        }
+    }
+
+    fn render(json: bool, raw: bool, listings: &[super::VmListing], ports: &[Vec<u16>]) -> String {
+        let mut out = Vec::new();
+        super::format_ls_across_vms_with_mirrors_on(
+            &mut out,
+            &crate::cli::LsArgs { raw, json },
+            listings,
+            &[],
+            &[],
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("the listing renders");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    }
+
+    // T126 (NET-138): `min ls` prints one `MIRROR PORTS` row per VM that
+    // reports collided mirror ports, one sentence per port, and `--json`
+    // carries `mirror_collisions` per VM.
+    #[test]
+    fn ls_shows_mirror_collisions() {
+        let one = [listing("default")];
+        let table = render(false, false, &one, &[vec![8080, 9090]]);
+        assert!(
+            table.lines().any(|line| line
+                == "MIRROR PORTS:  default  port 8080 is held by another program on this \
+                    machine, so a host_ip box cannot open it here. port 9090 is held by \
+                    another program on this machine, so a host_ip box cannot open it here."),
+            "the row names each port: {table}"
+        );
+        assert!(!render(false, false, &one, &[Vec::new()]).contains("MIRROR PORTS"));
+        assert!(!render(false, true, &one, &[vec![8080]]).contains("MIRROR PORTS"));
+
+        let json: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&render(true, false, &one, &[vec![8080]]))
+                .expect("--json is JSON");
+        assert_eq!(json["mirror_collisions"], serde_json_lenient::json!([8080]));
+
+        let two = [listing("default"), listing("work")];
+        let table = render(false, false, &two, &[Vec::new(), vec![3000]]);
+        let rows: Vec<&str> = table
+            .lines()
+            .filter(|line| line.starts_with("MIRROR PORTS:"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "MIRROR PORTS:  work  port 3000 is held by another program on this machine, \
+                 so a host_ip box cannot open it here."
+            ]
+        );
+        let json: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&render(true, false, &two, &[Vec::new(), vec![3000]]))
+                .expect("--json is JSON");
+        assert_eq!(json["vms"][0]["vm"], "default");
+        assert_eq!(
+            json["vms"][0]["mirror_collisions"],
+            serde_json_lenient::json!([])
+        );
+        assert_eq!(json["vms"][1]["vm"], "work");
+        assert_eq!(
+            json["vms"][1]["mirror_collisions"],
+            serde_json_lenient::json!([3000])
+        );
     }
 }
