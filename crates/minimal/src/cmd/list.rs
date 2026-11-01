@@ -862,10 +862,7 @@ pub(crate) fn format_ls_with_proxy_ports_on(
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let mut document = listing_json(resp)?;
-        let proxy_down = vm_answerer
-            .as_ref()
-            .and_then(|reply| reply.proxy_down.as_ref());
-        insert_proxy_ports(&mut document, resp, proxy_down, proxy_ports);
+        insert_proxy_ports(&mut document, resp, proxy_ports);
         let json = serde_json_lenient::to_string_pretty(&document)
             .context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
@@ -1129,19 +1126,18 @@ pub(crate) fn proxy_listening_clause(ports: &[u16]) -> String {
 /// Adds `hostname_proxy_ports` to one daemon's `--json` object (NET-154):
 /// every port the row names, the preferred first. Left out when `served` is
 /// empty, so a listing with no VM host read keeps the document it always had.
-/// A proxy-down verdict from the VM host leaves it out too, the same as the
-/// text row, which names no port beside that verdict.
+/// The VM host daemon reports no ports while the proxy is down, so a down
+/// proxy leaves the field out through that empty list. This function reads
+/// no proxy-down verdict of its own.
 fn insert_proxy_ports(
     document: &mut serde_json_lenient::Value,
     resp: &minimald_rpc::ListSessionsResponse,
-    proxy_down: Option<&minimald_rpc::ProxyDown>,
     served: &[u16],
 ) {
     if served.is_empty() {
         return;
     }
-    let serving = crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
-    let ports = hostname_proxy_row_ports(serving, served);
+    let ports = hostname_proxy_row_ports(resp.hostname_proxy_port, served);
     if ports.is_empty() {
         return;
     }
@@ -1347,11 +1343,7 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
         let mut vms = Vec::new();
         for (index, listing) in listings.iter().enumerate() {
             let mut reply = listing_json(&listing.resp)?;
-            let answerer = answerer_at(index);
-            let proxy_down = answerer
-                .as_ref()
-                .and_then(|reply| reply.proxy_down.as_ref());
-            insert_proxy_ports(&mut reply, &listing.resp, proxy_down, ports_at(index));
+            insert_proxy_ports(&mut reply, &listing.resp, ports_at(index));
             let mut object = match reply {
                 serde_json_lenient::Value::Object(map) => map,
                 other => anyhow::bail!("session list did not serialize to an object: {other}"),
