@@ -414,6 +414,14 @@ struct RegisteredRow {
     /// row from a sender that predates it reads as a named row.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     address_only: bool,
+    /// Whether the row answers at its node's own address: a running
+    /// host-address box's name (NET-129), which shares the address the node
+    /// holds in the book with every other such box on the node. Such a row
+    /// claims nothing in the book, so one box's end never frees the node's
+    /// address. Absent on the wire when false, so a row from a sender that
+    /// predates it reads as a row with an address of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    node_address: bool,
 }
 
 /// The first line a node sends on the channel: who is connecting, and which
@@ -631,6 +639,11 @@ impl Default for AddressBook {
         }
     }
 }
+
+/// The name the book holds a node's own address under when a host-address
+/// box's row claims it ([`AddressBook::claim_node_address`]). A box name
+/// holds no space, so no box's release can free it.
+const NODE_ADDRESS_HOLDER: &str = "host_ip boxes";
 
 /// How long a released box address stays out of allocation: the positive
 /// TTL every zone answer carries ([`zone_answer::ANSWER_TTL_SECS`]), the
@@ -853,6 +866,21 @@ impl AddressBook {
         Ok(())
     }
 
+    /// Holds `address` for `node` itself, as a host-address box's row
+    /// names it (NET-129): an address the node already holds stays as it
+    /// is, under whatever name holds it, and a free one is claimed under
+    /// [`NODE_ADDRESS_HOLDER`]. Refused as [`Self::claim_at`] refuses.
+    fn claim_node_address(&mut self, node: &str, address: Ipv4Addr) -> Result<(), String> {
+        if self
+            .held
+            .get(&address)
+            .is_some_and(|holder| holder.node == node)
+        {
+            return Ok(());
+        }
+        self.claim(node, NODE_ADDRESS_HOLDER, address)
+    }
+
     /// [`Self::release_at`], now.
     fn release(&mut self, node: &str, name: &str) -> Option<Ipv4Addr> {
         self.release_at(node, name, Instant::now())
@@ -1011,6 +1039,33 @@ impl RegisteredTables {
                 });
                 continue;
             }
+            // A host-address box's name answers at its node's own address
+            // (NET-129): one the book holds for this node, or claims for it
+            // when no one holds it, as after this answerer restarted. The
+            // claim is the node's, never the box's, so the box's end frees
+            // nothing.
+            if row.node_address {
+                let claimed = match row.address {
+                    Some(address) if in_box_range(address) => {
+                        self.book().claim_node_address(node, address)
+                    }
+                    _ => {
+                        let (first, last) = switch::box_loopback_interior();
+                        Err(format!(
+                            "a host-address box's row must carry its node's address in the \
+                             box address range {first}-{last}"
+                        ))
+                    }
+                };
+                match claimed {
+                    Ok(()) => accepted.push(row),
+                    Err(reason) => refused.push(RefusedRow {
+                        name: row.name,
+                        reason,
+                    }),
+                }
+                continue;
+            }
             // A box's published address is the answerer's to hand out
             // (design §7.1): one inside the box range that no other node
             // holds is this node's, recorded so no allocation hands it on;
@@ -1109,7 +1164,12 @@ impl RegisteredTables {
     fn claim_own(&self, node: &str, rows: &[RegisteredRow]) {
         let mut book = self.book();
         for row in rows {
-            if let Some(address) = row.address
+            if row.node_address
+                && let Some(address) = row.address
+                && in_box_range(address)
+            {
+                let _ = book.claim_node_address(node, address);
+            } else if let Some(address) = row.address
                 && in_box_range(address)
             {
                 let _ = book.claim(node, &canonical(&row.name), address);
@@ -1374,7 +1434,7 @@ impl HostAnswerer {
     /// two daemons both published is an operator's problem to see, not a
     /// fact to settle by accident of arrival.
     fn zone_view(&self) -> ZoneView {
-        let mut view = self.own.zone_view();
+        let mut view = own_zone_view(&self.own);
         // The source each folded name came from: the keeper a later writer
         // is refused against, and the source the warn names.
         let mut held: BTreeMap<String, String> = view
@@ -2505,6 +2565,136 @@ fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io:
     })
 }
 
+/// What a host-address box's held name answers on this node (NET-129,
+/// NET-128): the node's address, or NODATA and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAddressAnswer {
+    /// The box is running and the node's binds are mirrored at `0`.
+    Address(Ipv4Addr),
+    /// No attachment on the host holds the box as running.
+    NotRunning,
+    /// The node's binds are not mirrored at its reserved-range address.
+    NotMirrored,
+}
+
+impl HostAddressAnswer {
+    /// The answer and its reason, as the debug line names them.
+    fn describe(self) -> String {
+        match self {
+            Self::Address(address) => format!("A {address}"),
+            Self::NotRunning => {
+                "NODATA: no attachment on the host holds the box as running".to_string()
+            }
+            Self::NotMirrored => {
+                "NODATA: the node's binds are not mirrored at its reserved-range address"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// What each host-address box's held name answers in `registry`'s zone,
+/// keyed by its canonical zone name (NET-129). A held name a row also
+/// publishes is the row's, so it is not here. A held name answers the
+/// node's one address while the session the hold is for is a resident
+/// `host_ip` box — the host's end of the attachment holds it running
+/// ([`BoxRegistry::admit_host_ip_box`]) — and the node's binds are
+/// mirrored there ([`crate::box_registry::NodeMirror::mirrored_address`]).
+/// Otherwise it answers NODATA (NET-128), so the name returns to NODATA
+/// when the node's last running host-address box ends. A hold that names
+/// no session cannot be matched to a running box, so it answers NODATA.
+fn host_address_answers(registry: &BoxRegistry) -> BTreeMap<String, HostAddressAnswer> {
+    let running: BTreeSet<boxes::SessionId> = registry
+        .table()
+        .host_ip_boxes()
+        .iter()
+        .map(|rules| rules.session_id())
+        .collect();
+    let mirrored = registry.node_mirror().mirrored_address();
+    let answers: BTreeMap<String, HostAddressAnswer> = registry
+        .held_name_owners()
+        .into_iter()
+        .filter(|(name, _)| registry.row_by_name(name).is_none())
+        .map(|(name, owner)| {
+            let answer = match (
+                owner.is_some_and(|owner| running.contains(&owner)),
+                mirrored,
+            ) {
+                (false, _) => HostAddressAnswer::NotRunning,
+                (true, None) => HostAddressAnswer::NotMirrored,
+                (true, Some(address)) => HostAddressAnswer::Address(address),
+            };
+            (
+                canonical(&format!("{name}.{}", zone_answer::ZONE_APEX)),
+                answer,
+            )
+        })
+        .collect();
+    log_host_address_answer_changes(&answers);
+    answers
+}
+
+/// The last answer each host-address name carried, for the debug line
+/// that names each change: the view is rebuilt for every lookup and every
+/// publish, and a line per rebuild would bury the change. Process-wide,
+/// because a process runs one VM host daemon and so one node.
+static HOST_ADDRESS_ANSWERS: std::sync::LazyLock<Mutex<BTreeMap<String, HostAddressAnswer>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Logs at debug each host-address name whose answer changed since the
+/// last view, with the address it carries or NODATA and why, and each
+/// name that is no longer held.
+fn log_host_address_answer_changes(answers: &BTreeMap<String, HostAddressAnswer>) {
+    let mut last = HOST_ADDRESS_ANSWERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, answer) in answers {
+        if last.get(name) != Some(answer) {
+            tracing::debug!(
+                component = COMPONENT,
+                name = %name,
+                answer = %answer.describe(),
+                "a host-address box's name answers anew"
+            );
+        }
+    }
+    for name in last.keys().filter(|name| !answers.contains_key(*name)) {
+        tracing::debug!(
+            component = COMPONENT,
+            name = %name,
+            "a host-address box's name is no longer held; it answers nothing"
+        );
+    }
+    last.clone_from(answers);
+}
+
+/// `registry`'s zone view with each running host-address box's held name
+/// answering its node's address (NET-129), the view both this host's own
+/// answers and its publishes come from.
+fn own_zone_view(registry: &BoxRegistry) -> ZoneView {
+    own_zone_view_with(registry, &host_address_answers(registry))
+}
+
+/// [`own_zone_view`] over answers already read.
+fn own_zone_view_with(
+    registry: &BoxRegistry,
+    host_address: &BTreeMap<String, HostAddressAnswer>,
+) -> ZoneView {
+    let mut view = registry.zone_view();
+    for (name, answer) in host_address {
+        if let HostAddressAnswer::Address(address) = answer {
+            view.hold(
+                name.clone(),
+                ZoneRow {
+                    address: Some(*address),
+                    live: true,
+                },
+            );
+        }
+    }
+    view
+}
+
 /// The zone rows of `registry`'s table, as the publish wire carries them:
 /// the same view the holder's own answers come from, encoded — one row per
 /// published namespace, its name under the zone, its host-answerable
@@ -2524,8 +2714,8 @@ fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io:
 /// a new box and the dormant box can never resume.
 fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
     let node = crate::box_registry::node_zone_name();
-    let mut rows: Vec<_> = registry
-        .zone_view()
+    let host_address = host_address_answers(registry);
+    let mut rows: Vec<_> = own_zone_view_with(registry, &host_address)
         .rows()
         .filter(|(name, _)| **name != node)
         .map(|(name, row)| RegisteredRow {
@@ -2533,6 +2723,10 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
             address: row.address,
             live: row.live,
             address_only: false,
+            node_address: matches!(
+                host_address.get(&canonical(name)),
+                Some(HostAddressAnswer::Address(_))
+            ),
         })
         .collect();
     for (name, address) in registry.dormant_creation_rows() {
@@ -2556,6 +2750,7 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
             address: Some(address),
             live: false,
             address_only: true,
+            node_address: false,
         });
     }
     rows
@@ -4278,6 +4473,7 @@ mod tests {
             address: Some(address),
             live: true,
             address_only: false,
+            node_address: false,
         }
     }
 
@@ -4599,12 +4795,14 @@ mod tests {
                         address: Some(Ipv4Addr::new(100, 64, 0, 10)),
                         live: true,
                         address_only: false,
+                        node_address: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
                         address_only: false,
+                        node_address: false,
                     },
                 ],
             );
@@ -4693,18 +4891,21 @@ mod tests {
                         address: Some(Ipv4Addr::new(127, 0, 64, 99)),
                         live: true,
                         address_only: false,
+                        node_address: false,
                     },
                     RegisteredRow {
                         name: "host.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 98)),
                         live: true,
                         address_only: false,
+                        node_address: false,
                     },
                     RegisteredRow {
                         name: "peer.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 10)),
                         live: true,
                         address_only: false,
+                        node_address: false,
                     },
                 ],
             );
@@ -4974,6 +5175,7 @@ mod tests {
             address: Some(web.loopback_addr()),
             live: false,
             address_only: true,
+            node_address: false,
         }));
         let registered = RegisteredTables::new();
         registered.claim_own("a-node", &rows);
@@ -5013,6 +5215,7 @@ mod tests {
             address: Some(web.loopback_addr()),
             live: false,
             address_only: true,
+            node_address: false,
         };
         assert!(
             zone_rows(&registry).contains(&dormant),
@@ -5052,6 +5255,7 @@ mod tests {
                 address: Some(dormant),
                 live: false,
                 address_only: true,
+                node_address: false,
             }],
             &[],
         );
@@ -7441,5 +7645,165 @@ mod tests {
             UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
             "the daemon never bound the port over an installed service"
         );
+    }
+
+    /// A VM node's registry with its node row and a mirror that binds
+    /// through a test binder, plus the reserved-range address the node's
+    /// binds are mirrored at once the mirror opens.
+    fn host_address_node() -> (BoxRegistry, Ipv4Addr) {
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::new(crate::box_registry::TestMirrorBinder::default()));
+        registry.register_node_namespace(7654);
+        (registry, Ipv4Addr::new(127, 0, 64, 200))
+    }
+
+    fn host_address_session(n: u8) -> boxes::SessionId {
+        boxes::SessionId::parse_str(&format!("00000000-0000-4000-8000-0000000001{n:02}"))
+            .expect("a session id")
+    }
+
+    /// The reply to an A lookup of `name` from this machine.
+    fn ask_a(answerer: &HostAnswerer, name: &str) -> Message {
+        exchange(
+            answerer,
+            on_host(),
+            &encode_query(&format!("{name}.min.internal."), RecordType::A),
+        )
+        .expect("an in-zone name is answered")
+    }
+
+    /// Asserts `reply` is NODATA: the name is held, and no A record.
+    fn assert_nodata(reply: &Message, why: &str) {
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError, "{why}");
+        assert!(reply.answers.is_empty(), "{why}");
+        soa_of(reply);
+    }
+
+    /// NET-129 on a VM host: a host-address box's held name answers its
+    /// node's one reserved-range address while the box is running — a
+    /// resident `host_ip` box, as the host's end of the attachment holds
+    /// it — and the node's binds are mirrored there. NODATA before the box
+    /// runs, while the binds are not mirrored, and again once the box ends
+    /// (NET-128).
+    #[test]
+    fn host_address_name_answers_node_loopback_on_vm_host() {
+        let (registry, node) = host_address_node();
+        let web = host_address_session(1);
+        let answerer = answerer(registry.clone());
+
+        registry.hold_box_name("web", Some(web));
+        assert_nodata(
+            &ask_a(&answerer, "web"),
+            "a held name whose box is not running answers NODATA",
+        );
+
+        assert!(registry.admit_host_ip_box(web, None));
+        assert_nodata(
+            &ask_a(&answerer, "web"),
+            "a running box whose node's binds are not mirrored answers NODATA",
+        );
+
+        registry.open_node_mirror(node).expect("the mirror opens");
+        assert_nodata(
+            &ask_a(&answerer, "web"),
+            "the binds are not mirrored until the range probe passes",
+        );
+        registry.node_mirror().set_range_probe(true);
+        let reply = ask_a(&answerer, "web");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            a_answer(&reply),
+            node,
+            "a running host-address box answers its node's address"
+        );
+
+        // The publish carries the same answer, marked as the node's
+        // address, so the machine's service answers it too.
+        let rows = zone_rows(&registry);
+        let row = rows
+            .iter()
+            .find(|row| row.name == "web.min.internal")
+            .expect("the held name publishes");
+        assert_eq!(row.address, Some(node));
+        assert!(row.live && row.node_address, "{row:?}");
+
+        registry.node_mirror().set_range_probe(false);
+        assert_nodata(
+            &ask_a(&answerer, "web"),
+            "a failing range probe unbinds, so the name answers NODATA",
+        );
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(a_answer(&ask_a(&answerer, "web")), node);
+
+        assert!(registry.retire_host_ip_box(web));
+        assert_nodata(
+            &ask_a(&answerer, "web"),
+            "the node's last running host-address box ended, so its name answers NODATA",
+        );
+        let rows = zone_rows(&registry);
+        let row = rows
+            .iter()
+            .find(|row| row.name == "web.min.internal")
+            .expect("the held name still publishes");
+        assert_eq!(row.address, None);
+        assert!(!row.node_address, "{row:?}");
+    }
+
+    /// NET-129: two host-address boxes on one VM node answer the same node
+    /// address, and the machine's service holds both names at it without
+    /// claiming it for either box. One box's end returns only its own name
+    /// to NODATA.
+    #[test]
+    fn two_host_address_boxes_answer_one_node_address() {
+        let (registry, node) = host_address_node();
+        let (web, api) = (host_address_session(1), host_address_session(2));
+        registry.open_node_mirror(node).expect("the mirror opens");
+        registry.node_mirror().set_range_probe(true);
+        registry.hold_box_name("web", Some(web));
+        registry.hold_box_name("api", Some(api));
+        assert!(registry.admit_host_ip_box(web, None));
+        assert!(registry.admit_host_ip_box(api, None));
+
+        let own = answerer(registry.clone());
+        assert_eq!(a_answer(&ask_a(&own, "web")), node);
+        assert_eq!(a_answer(&ask_a(&own, "api")), node);
+
+        // The machine's service: the node's allocation holds the address,
+        // and the publish carries both names at it.
+        let registered = Arc::new(RegisteredTables::new());
+        registered
+            .book()
+            .claim("a-node", NODE_ADDRESS_HOLDER, node)
+            .expect("the node's address is the node's");
+        let outcome = registered.install_validated(1, "a-node", zone_rows(&registry), &[]);
+        assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+        let service = HostAnswerer::for_service(Arc::clone(&registered));
+        assert_eq!(a_answer(&ask_a(&service, "web")), node);
+        assert_eq!(a_answer(&ask_a(&service, "api")), node);
+        assert_eq!(
+            registered.release_address("a-node", "web.min.internal"),
+            None,
+            "no box's name holds the node's address, so no box's release frees it"
+        );
+
+        // Another node cannot point a name at this node's address.
+        let foreign = registered.install_validated(
+            2,
+            "b-node",
+            vec![RegisteredRow {
+                name: "db.min.internal".to_string(),
+                address: Some(node),
+                live: true,
+                address_only: false,
+                node_address: true,
+            }],
+            &[],
+        );
+        assert_eq!(foreign.held, Vec::new(), "{:?}", foreign.refused);
+
+        // One box ends: its name answers NODATA, the other keeps the address.
+        assert!(registry.retire_host_ip_box(web));
+        assert_nodata(&ask_a(&own, "web"), "the ended box's name answers NODATA");
+        assert_eq!(a_answer(&ask_a(&own, "api")), node);
     }
 }
