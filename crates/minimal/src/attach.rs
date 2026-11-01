@@ -328,15 +328,17 @@ pub(crate) async fn resolve_box_vm(
         crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     let mut owners: Vec<ResolvedBoxVm> = Vec::new();
     // The stopped VMs whose persisted box records hold the name (NET-152).
-    let mut stopped_holders: Vec<String> = Vec::new();
+    // Each with how it holds the name, so an id prefix never competes with a
+    // name.
+    let mut stopped_holders: Vec<(String, HeldBy)> = Vec::new();
     for vm in vms {
         // A VM that is not running has no daemon to ask, so its persisted
         // records answer for it. The check is free, so it is made first; the
         // probe classifies the cases it cannot see — a socket that vanished
         // mid-walk reads the same as one never bound.
         if !vm.sock.exists() {
-            if stopped_vm_holds(&vm, name) {
-                stopped_holders.push(vm.vm);
+            if let Some(held_by) = stopped_vm_holds(&vm, name) {
+                stopped_holders.push((vm.vm, held_by));
             }
             continue;
         }
@@ -360,8 +362,8 @@ pub(crate) async fn resolve_box_vm(
             }),
             Ok(Ok(BoxLook::Absent)) => {}
             Ok(Ok(BoxLook::NotRunning)) => {
-                if stopped_vm_holds(&vm, name) {
-                    stopped_holders.push(vm.vm);
+                if let Some(held_by) = stopped_vm_holds(&vm, name) {
+                    stopped_holders.push((vm.vm, held_by));
                 }
             }
             // VMs that could not be looked at are named, not silent: a
@@ -373,6 +375,19 @@ pub(crate) async fn resolve_box_vm(
             ),
         }
     }
+    // A daemon matches an exact name before an id prefix
+    // (`crate::cmd::match_id_prefix`), and so does the walk across VMs: when
+    // any VM holds the name as a name, a holder that matched only an id
+    // prefix is not a candidate.
+    let any_by_name = owners
+        .iter()
+        .any(|owner| held_by(&owner.record, name) == HeldBy::Name)
+        || stopped_holders.iter().any(|(_, by)| *by == HeldBy::Name);
+    if any_by_name {
+        owners.retain(|owner| held_by(&owner.record, name) == HeldBy::Name);
+        stopped_holders.retain(|(_, by)| *by == HeldBy::Name);
+    }
+    let stopped_holders: Vec<String> = stopped_holders.into_iter().map(|(vm, _)| vm).collect();
     match (owners.len(), stopped_holders.as_slice()) {
         (0, []) => Ok(None),
         // NET-152: the box is there, on a VM that is down. Say which VM and
@@ -467,19 +482,49 @@ enum BoxLook {
 /// Whether the stopped VM `vm` holds a box named `name` in its persisted box
 /// records (NET-152), read from its state dir with no daemon: the name as it
 /// was registered, compared ignoring ASCII case as names are made unique, or
-/// the box's id or an id prefix. Read-only, so a file this build cannot use
-/// holds nothing and stays as it is.
-fn stopped_vm_holds(vm: &crate::client::VmSocket, name: &str) -> bool {
-    stopped_vm_boxes(vm).iter().any(|held| {
-        held.name.eq_ignore_ascii_case(name)
-            || (crate::cmd::is_id_prefix(name)
-                && held
-                    .id
-                    .as_ref()
-                    .simple()
-                    .to_string()
-                    .starts_with(&name.replace('-', "").to_ascii_lowercase()))
-    })
+/// the box's id or an id prefix. A name match wins over an id prefix, as on
+/// a daemon. Read-only, so a file this build cannot use holds nothing and
+/// stays as it is.
+fn stopped_vm_holds(vm: &crate::client::VmSocket, name: &str) -> Option<HeldBy> {
+    let held = stopped_vm_boxes(vm);
+    if held.iter().any(|h| h.name.eq_ignore_ascii_case(name)) {
+        return Some(HeldBy::Name);
+    }
+    held.iter()
+        .any(|h| id_has_prefix(&h.id, name))
+        .then_some(HeldBy::IdPrefix)
+}
+
+/// How a VM holds a box name: as the box's name, or only as a prefix of its
+/// id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBy {
+    Name,
+    IdPrefix,
+}
+
+/// How the record a running daemon resolved `name` to holds it.
+fn held_by(record: &boxes::Record, name: &str) -> HeldBy {
+    if record
+        .name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    {
+        HeldBy::Name
+    } else {
+        HeldBy::IdPrefix
+    }
+}
+
+/// Whether `name` is shaped like an id prefix and `id` starts with it,
+/// compared without dashes and ignoring case.
+fn id_has_prefix(id: &boxes::BoxId, name: &str) -> bool {
+    crate::cmd::is_id_prefix(name)
+        && id
+            .as_ref()
+            .simple()
+            .to_string()
+            .starts_with(&name.replace('-', "").to_ascii_lowercase())
 }
 
 /// The boxes a stopped VM's persisted records hold (NET-152), read

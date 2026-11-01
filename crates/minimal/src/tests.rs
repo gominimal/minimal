@@ -5987,6 +5987,25 @@ async fn box_on_stopped_vm_names_start_command() {
         "box name 'api' exists on more than one VM (default, gamma (stopped)); \
          name the one you mean with --vm"
     );
+
+    // A name wins over an id prefix across VMs, as on one daemon: a running
+    // box named 'cafe' resolves though a stopped VM holds a box whose id
+    // starts with 'cafe'.
+    create_box_on(&default_vm, "cafe").await;
+    let mut cafe_id = [0x11; 16];
+    cafe_id[0] = 0xca;
+    cafe_id[1] = 0xfe;
+    stopped_vm_with_boxes(
+        state.path(),
+        "eta",
+        &[("other", boxes::SessionId::from_bytes(cafe_id))],
+    );
+    let resolved = attach::resolve_box_vm(&global, "cafe")
+        .await
+        .expect("a name match is not ambiguous with an id prefix")
+        .expect("the running VM owns 'cafe'");
+    assert_eq!(resolved.vm, "default");
+    assert_eq!(resolved.record.name.as_deref(), Some("cafe"));
 }
 
 /// NET-058: a name the selected VM holds is ambiguous when a second running
