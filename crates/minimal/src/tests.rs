@@ -270,6 +270,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            // `min session policy` and `min session destroy` on a box another
+            // VM owns: the connection to that VM, gated as `connect_daemon`
+            // gates the selected one.
+            "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
@@ -290,6 +294,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
             "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
+            // Test-only: the NET-058 and NET-152 tests' client on the selected
+            // harness daemon, which is this build.
+            "tests.rs::selected_client = ungated",
         ]
     );
 }
@@ -3369,6 +3376,7 @@ async fn exec_fall_through_hands_off_the_owning_vm() {
             selected.clone(),
             "web",
             verb,
+            "session exec web <command>",
         )
         .await
         .expect("a name alpha owns resolves through the selected VM's miss");
@@ -4125,4 +4133,394 @@ fn ls_egress_matches_session_policy() {
         }
     }
     assert!(!table.contains("per_box"), "got:\n{table}");
+}
+
+/// A fresh box id for a stopped VM's persisted records.
+fn stopped_box_id() -> minimald_rpc::BoxId {
+    static NEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+    minimald_rpc::BoxId::from_bytes([NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 16])
+}
+
+/// A stopped VM `vm` under `state`: its state dir with the persisted box
+/// records `boxes` (name, id), as its VM host daemon wrote them before it
+/// stopped, and a stale `ssh.sock` that no daemon listens on.
+fn stopped_vm_with_boxes(state: &std::path::Path, vm: &str, boxes: &[(&str, minimald_rpc::BoxId)]) {
+    let dir = state.join("providers/local-minvmd0").join(vm);
+    std::fs::create_dir_all(&dir).expect("the stopped VM's dir");
+    let records: Vec<serde_json_lenient::Value> = boxes
+        .iter()
+        .enumerate()
+        .map(|(index, (name, id))| {
+            serde_json_lenient::json!({
+                "name": name,
+                "box_id": id.to_string(),
+                "switch_address": format!("100.64.0.{}", index + 9),
+                "loopback_address": format!("127.0.64.{}", index + 2),
+                "ingress_ports": [],
+                "standing": true,
+            })
+        })
+        .collect();
+    std::fs::write(
+        dir.join(minvmd::box_registry::REGISTRY_FILE),
+        serde_json_lenient::to_vec(&serde_json_lenient::json!({
+            "version": 1,
+            "boxes": records,
+        }))
+        .expect("the records serialize"),
+    )
+    .expect("write the stopped VM's box records");
+    let stale = std::os::unix::net::UnixListener::bind(dir.join("ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+}
+
+/// The default VM, running, under a fresh state dir: the selected VM of
+/// every test below that pairs it with a stopped one.
+async fn running_default_vm() -> (tempfile::TempDir, minimald::test_harness::TestServer) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).expect("the host dir");
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    (state, default_vm)
+}
+
+/// A client on the selected (default) VM's daemon under `state`.
+async fn selected_client(state: &std::path::Path) -> (client::Client, std::path::PathBuf) {
+    let selected = client::resolve_socket_path_named(Some(state), true, paths::DEFAULT_VM_NAME)
+        .expect("the selected VM's socket path");
+    let client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+    (client, selected)
+}
+
+/// NET-058 for the commands that act on a named box over the daemon's RPCs:
+/// `min session policy` and `min session destroy` find a box on another VM
+/// by its name alone, and the client they get back is that VM's.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_for_policy_and_destroy() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = create_box_on(&alpha, "beta").await;
+    let global = vm_globals(state.path(), None);
+
+    for example in ["session policy beta", "session destroy beta"] {
+        let (client, _) = selected_client(state.path()).await;
+        let (mut owner, record) = cmd::resolve_box_on_any_vm(&global, client, "beta", example)
+            .await
+            .expect("a name alpha owns resolves without --vm");
+        assert_eq!(record.id, beta, "{example}: alpha's record");
+        let again = cmd::resolve_session(&mut owner, "beta")
+            .await
+            .expect("the client returned is connected to alpha");
+        assert_eq!(again.id, beta, "{example}: the follow-up RPCs reach alpha");
+    }
+}
+
+/// NET-058: a box name no running VM holds, on a host with two VMs, is
+/// refused with the flag that names a box on another VM, shown on the
+/// command the user ran. With `--vm`, the selected VM's own miss stands.
+#[tokio::test]
+async fn unknown_box_names_vm_flag() {
+    let (state, _default_vm, _alpha) = two_vms().await;
+    let global = vm_globals(state.path(), None);
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        format!("error: {err:#}"),
+        "error: no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> session policy beta",
+        "the refusal as main prints it"
+    );
+
+    // The hand-off verbs say the same, on their own command.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_named_box_version_gated(
+        &global,
+        &mut client,
+        sock,
+        "beta",
+        "Forwarding to",
+        "net forward beta 8080:3000",
+    )
+    .await
+    .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        err.to_string(),
+        "no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> net forward beta 8080:3000"
+    );
+
+    // An explicit --vm is the operator's choice: the selected VM's miss.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&pinned, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(err.to_string(), "No session found matching 'beta'");
+}
+
+/// NET-152: a box only a stopped VM holds is named with that VM and the
+/// command that starts it, on every verb that resolves a box by name. A
+/// running VM's box of the same name and the stopped VM's record are an
+/// ambiguity that names both VMs.
+#[tokio::test]
+async fn box_on_stopped_vm_names_start_command() {
+    let (state, default_vm) = running_default_vm().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = stopped_box_id();
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", beta)]);
+    let global = vm_globals(state.path(), None);
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta";
+
+    let err = attach::resolve_box_vm(&global, "beta")
+        .await
+        .expect_err("a box on a stopped VM is refused");
+    assert_eq!(format!("error: {err:#}"), format!("error: {expected}"));
+
+    // The attach path itself: the selected VM's miss falls through to the
+    // stopped VM's records.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "beta")
+        .await
+        .expect_err("attach refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+
+    // And the RPC verbs, with the policy's machine reading still a miss.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("policy refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
+
+    // A name two stopped VMs hold is ambiguous, and typed so the policy's
+    // machine reading reports a miss, not an unreachable daemon.
+    stopped_vm_with_boxes(state.path(), "delta", &[("dup", stopped_box_id())]);
+    stopped_vm_with_boxes(state.path(), "epsilon", &[("dup", stopped_box_id())]);
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "dup", "session policy dup")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("a name two stopped VMs hold is ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'dup' exists on more than one stopped VM (delta, epsilon); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // A name a running VM owns and a stopped VM's records hold is ambiguous,
+    // though the running box is active: the error lists both VMs, marks the
+    // stopped one, and names --vm.
+    stopped_vm_with_boxes(state.path(), "gamma", &[("api", stopped_box_id())]);
+    let err = attach::resolve_box_vm(&global, "api")
+        .await
+        .expect_err("a running owner and a stopped holder are ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM is the only holder: it resolves there.
+    create_box_on(&default_vm, "solo").await;
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "solo", "session policy solo")
+        .await
+        .expect("the selected VM's own box resolves");
+    assert_eq!(record.name.as_deref(), Some("solo"));
+
+    // A hit on the selected VM is ambiguous when a stopped VM also holds the
+    // name.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("the selected VM and a stopped VM both hold 'api'");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+
+    // A stopped VM's records carry box ids, not the session ids an operator
+    // types, so an id prefix never matches there: a running box named 'cafe'
+    // resolves though a stopped VM holds a box whose box id starts with
+    // 'cafe', and that box id's prefix alone finds nothing.
+    create_box_on(&default_vm, "cafe").await;
+    let mut cafe_id = [0x11; 16];
+    cafe_id[0] = 0xca;
+    cafe_id[1] = 0xfe;
+    stopped_vm_with_boxes(
+        state.path(),
+        "eta",
+        &[("other", minimald_rpc::BoxId::from_bytes(cafe_id))],
+    );
+    let resolved = attach::resolve_box_vm(&global, "cafe")
+        .await
+        .expect("a name match is not ambiguous with a box id")
+        .expect("the running VM owns 'cafe'");
+    assert_eq!(resolved.vm, "default");
+    assert_eq!(resolved.record.name.as_deref(), Some("cafe"));
+    assert!(
+        attach::resolve_box_vm(&global, "cafe11")
+            .await
+            .expect("a stopped VM's box id is not a candidate")
+            .is_none()
+    );
+}
+
+/// NET-058: a name the selected VM holds is ambiguous when a second running
+/// VM holds it too. `min session destroy` and `min session attach` refuse it,
+/// name both VMs and `--vm`, and do not act on the selected VM's box. With
+/// `--vm`, the selected VM's box resolves.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let shared = create_box_on(&default_vm, "shared").await;
+    create_box_on(&alpha, "shared").await;
+    let global = vm_globals(state.path(), None);
+    let expected = "box name 'shared' exists on more than one VM (default, alpha); \
+                    name the one you mean with --vm";
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "shared", "session destroy shared")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("destroy refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
+        .await
+        .expect_err("attach refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM's box is still there: nothing acted on it.
+    let (mut client, _) = selected_client(state.path()).await;
+    let record = cmd::resolve_session(&mut client, "shared")
+        .await
+        .expect("the selected VM still holds 'shared'");
+    assert_eq!(record.id, shared);
+
+    // With --vm, the operator chose: the selected VM's box resolves.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) =
+        cmd::resolve_box_on_any_vm(&pinned, client, "shared", "session destroy shared")
+            .await
+            .expect("--vm picks the selected VM's box");
+    assert_eq!(record.id, shared);
+}
+
+/// NET-152: an attach that fails once the relay holds the terminal ends
+/// `min session attach` with an error that `main` prints after the attach
+/// returns. By then the relay put the attach-start termios back and the
+/// unwind codes are on the terminal, so the error prints after them and
+/// stays on screen. A relay that never took the terminal writes nothing.
+#[test]
+fn attach_error_printed_after_terminal_restore() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The user's terminal: everything written to it, in order.
+    #[derive(Clone, Default)]
+    struct Screen(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Screen {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let screen = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(screen.clone(), true),
+        |_| Err(anyhow::anyhow!("the relay lost the terminal mid-session")),
+    )
+    .expect_err("a failed relay ends the attach with an error");
+    assert!(
+        screen.0.borrow().ends_with(b"\x1b[?1004l"),
+        "the unwind is on the terminal before the attach returns"
+    );
+    // What main prints for the error, on the same terminal.
+    let printed = format!("error: {err:#}\n");
+    std::io::Write::write_all(&mut screen.clone(), printed.as_bytes()).expect("print");
+    let seen = screen.0.borrow().clone();
+    let at = seen
+        .windows(printed.len())
+        .position(|window| window == printed.as_bytes())
+        .expect("the error is on the terminal");
+    assert!(
+        seen[..at].ends_with(b"\x1b[?1004l"),
+        "the error prints after the restore sequence: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(at + printed.len(), seen.len(), "nothing writes after it");
+
+    // A relay that never took the terminal never changed it.
+    let untouched = Screen::default();
+    interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(untouched.clone(), true),
+        |_| {
+            Err(anyhow::Error::new(std::io::Error::other("no tty"))
+                .context(attach::TerminalNotTaken))
+        },
+    )
+    .expect_err("an attach with no terminal fails");
+    assert!(
+        untouched.0.borrow().is_empty(),
+        "no unwind for a terminal the attach never took"
+    );
+
+    // A relay that took the terminal and then failed to start ssh's session
+    // on it (ssh does not spawn) never let the session reach the terminal.
+    // The relay drops its suspend hook unrun, so the failure is marked, and
+    // the guard writes nothing. The error prints as the relay wrote it.
+    let not_started = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(not_started.clone(), true),
+        |_| {
+            mark_relay_not_started(None, |_hook| {
+                Err(
+                    anyhow::Error::new(std::io::Error::other("No such file or directory"))
+                        .context("spawning the ssh attach"),
+                )
+            })
+        },
+    )
+    .expect_err("an attach whose ssh does not spawn fails");
+    assert!(
+        not_started.0.borrow().is_empty(),
+        "no unwind for a relay that never started the session: {:?}",
+        String::from_utf8_lossy(&not_started.0.borrow())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "failed to run ssh: spawning the ssh attach: No such file or directory"
+    );
 }
