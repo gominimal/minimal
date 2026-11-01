@@ -1202,6 +1202,53 @@ fn read_registry_file(path: &std::path::Path) -> Option<Vec<Creation>> {
     }
 }
 
+/// One box a VM's persisted registry ([`REGISTRY_FILE`]) holds: its name
+/// and its box id, as [`persisted_box_names`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedBox {
+    /// The box's name, as its creator registered it.
+    pub name: String,
+    /// The box's id.
+    pub id: minimald_rpc::BoxId,
+}
+
+/// Reads the boxes a VM's state dir `state_dir` holds in its persisted
+/// registry ([`REGISTRY_FILE`]), each one's name and id, with no daemon
+/// running: what the CLI reads for a stopped VM (NET-148, NET-152).
+///
+/// Read-only, unlike [`read_registry_file`]: a file that is missing, that
+/// cannot be read, that does not parse, or that is of another version than
+/// [`REGISTRY_FILE_VERSION`] reads as no boxes, and it is never written,
+/// renamed or set aside. The daemon that owns the file decides what to do
+/// with it on its next start. Each box id is listed once, in file order.
+#[must_use]
+pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
+    #[derive(serde::Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let path = state_dir.join(REGISTRY_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json_lenient::from_slice::<Version>(&bytes) {
+        Ok(Version { version }) if version == REGISTRY_FILE_VERSION => {}
+        _ => return Vec::new(),
+    }
+    let Ok(file) = serde_json_lenient::from_slice::<RegistryFile>(&bytes) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    file.boxes
+        .into_iter()
+        .filter(|creation| seen.insert(creation.box_id))
+        .map(|creation| PersistedBox {
+            name: creation.name,
+            id: creation.box_id,
+        })
+        .collect()
+}
+
 /// Renames the unusable registry file at `path` aside, to the same name
 /// with an `.unusable-<unix seconds>` suffix, and says so as an error line
 /// naming `why`. Returns no creations when it is set aside, and `None` —
@@ -8606,6 +8653,65 @@ mod tests {
     /// The registry a test persists at `dir`, under its default plan.
     fn persisted_registry(dir: &tempfile::TempDir) -> BoxRegistry {
         BoxRegistry::new(SUBNET).persisting_to(dir.path().join(REGISTRY_FILE))
+    }
+
+    /// NET-148, NET-152: a VM's persisted box records read without a daemon
+    /// — each box's name and id — and a file of another version, or one that
+    /// does not parse, reads as no boxes and is left exactly as it was.
+    #[test]
+    fn persisted_box_names_read_without_a_daemon() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert!(
+            persisted_box_names(dir.path()).is_empty(),
+            "a VM with no file holds no boxes"
+        );
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let api = registry
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for another box");
+        drop(registry);
+
+        let mut read = persisted_box_names(dir.path());
+        read.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            read,
+            vec![
+                PersistedBox {
+                    name: "api".to_string(),
+                    id: minimald_rpc::BoxId::from_bytes(api.box_id()),
+                },
+                PersistedBox {
+                    name: "web".to_string(),
+                    id: minimald_rpc::BoxId::from_bytes(web.box_id()),
+                },
+            ],
+            "each persisted box, by name and id"
+        );
+
+        let path = dir.path().join(REGISTRY_FILE);
+        for unusable in [
+            r#"{"version": 99, "boxes": []}"#.as_bytes(),
+            b"not json at all".as_slice(),
+        ] {
+            std::fs::write(&path, unusable).expect("write the unusable file");
+            assert!(
+                persisted_box_names(dir.path()).is_empty(),
+                "an unusable file reads as no boxes"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("the file is still there"),
+                unusable,
+                "and is never written or set aside"
+            );
+            let set_aside = std::fs::read_dir(dir.path())
+                .expect("list the state dir")
+                .map(|entry| entry.expect("an entry").file_name())
+                .any(|name| name.to_string_lossy().contains("unusable"));
+            assert!(!set_aside, "a read never sets the file aside");
+        }
     }
 
     /// NET-138: the client boxes' registrations persist host-side, and a

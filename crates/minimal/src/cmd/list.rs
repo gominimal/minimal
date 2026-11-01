@@ -321,6 +321,51 @@ pub struct VmListing {
     /// fallback listing, which pairs the daemon it reached with the
     /// answerer control socket beside it, native and VM-backed alike.
     pub control_sock: Option<std::path::PathBuf>,
+    /// Whether that VM's daemon answered. `false` for a stopped VM, whose
+    /// listing is read from its persisted box records with no daemon
+    /// (NET-152): each box is then `stopped`, and the reply carries nothing
+    /// else.
+    pub running: bool,
+}
+
+/// The listing of a stopped VM's boxes, from the box records its state dir
+/// persists (NET-152): one `stopped` entry per box, with its name and id and
+/// nothing a daemon would have reported. `None` when the records hold no
+/// box, so a stopped VM with nothing on it adds no listing.
+fn stopped_vm_listing(vm: &client::VmSocket) -> Option<VmListing> {
+    let held = crate::attach::stopped_vm_boxes(vm);
+    if held.is_empty() {
+        return None;
+    }
+    let sessions = held
+        .into_iter()
+        .map(|held| minimald_rpc::ListSessionsEntry {
+            id: held.id,
+            name: Some(held.name),
+            project_path: None,
+            status: boxes::BoxState::Stopped,
+            git: None,
+            attrs: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
+        })
+        .collect();
+    Some(VmListing {
+        vm: vm.vm.clone(),
+        resp: minimald_rpc::ListSessionsResponse {
+            resource_pool: None,
+            sessions,
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            box_networks: Default::default(),
+        },
+        // No daemon to read an answerer state from.
+        control_sock: None,
+        running: false,
+    })
 }
 
 /// List sessions across every VM the CLI can see (NET-057): each running VM
@@ -328,8 +373,10 @@ pub struct VmListing {
 ///
 /// [`minimal_client::enumerate_vm_sockets`] is the set: the default VM plus
 /// every named one. An explicit `--vm` narrows the listing to that VM alone —
-/// the operator named where to look. A VM that is not running hosts no boxes,
-/// so it contributes nothing and no word is spent on it; a VM that answers
+/// the operator named where to look. A VM that is not running contributes
+/// the boxes its persisted records hold, each one `stopped` (NET-152), and
+/// only to `min ls` (`strict`): a reader of the daemons' own facts has no
+/// daemon to read there. A VM that answers
 /// badly is skipped with a warning, unless it is the VM this process selected
 /// — that one was just ensured, so a failure there is the failure to report
 /// (and a skewed one is refused there, as `min ls` always has). Nothing
@@ -383,6 +430,9 @@ async fn listings_across_vms(
         // operator's own boxes from the listing and print another VM's as the
         // whole picture.
         if !vm.sock.exists() && !gate {
+            if strict {
+                listings.extend(stopped_vm_listing(&vm));
+            }
             continue;
         }
         // The control socket this VM's own answerer state is read from
@@ -395,6 +445,7 @@ async fn listings_across_vms(
                     vm: vm.vm,
                     resp,
                     control_sock,
+                    running: true,
                 }),
                 Err(e) if strict => return Err(e),
                 Err(e) => tracing::debug!("skipping the selected VM {}: {e:#}", vm.vm),
@@ -405,7 +456,9 @@ async fn listings_across_vms(
                     vm: vm.vm,
                     resp,
                     control_sock,
+                    running: true,
                 }),
+                Ok(None) if strict => listings.extend(stopped_vm_listing(&vm)),
                 Ok(None) => {}
                 // Only `min ls` lists sessions: `min finalize-install`
                 // reads the same listings for an answerer port, so the
@@ -429,6 +482,7 @@ async fn listings_across_vms(
             // VM-backed alike — a VM host daemon and a native minimald
             // answer the same status verb over it.
             control_sock: super::session::control_sock_beside(&sock),
+            running: true,
         });
     }
     Ok(listings)
@@ -1282,6 +1336,10 @@ pub fn format_ls_across_vms_on(
                 other => anyhow::bail!("session list did not serialize to an object: {other}"),
             };
             let vm = serde_json_lenient::Value::String(listing.vm.clone());
+            // Whether the VM is up (NET-152): a stopped VM's boxes are listed
+            // from its persisted records, each entry and the VM's own object
+            // saying so.
+            let vm_running = serde_json_lenient::Value::Bool(listing.running);
             // The sessions move into the one array with the VM inside each;
             // the rest of the reply stays as that VM's own object.
             let vm_sessions = object
@@ -1291,11 +1349,13 @@ pub fn format_ls_across_vms_on(
                 for mut entry in entries {
                     if let serde_json_lenient::Value::Object(map) = &mut entry {
                         map.insert("vm".to_string(), vm.clone());
+                        map.insert("vm_running".to_string(), vm_running.clone());
                     }
                     sessions.push(entry);
                 }
             }
             object.insert("vm".to_string(), vm);
+            object.insert("vm_running".to_string(), vm_running);
             vms.push(serde_json_lenient::Value::Object(object));
         }
         let json = serde_json_lenient::json!({
@@ -1444,44 +1504,40 @@ pub fn format_ls_across_vms_on(
 
     // Format as a table, the single-VM columns with the VM each box lives on
     // leading them (NET-057: the listing shows the VM per box).
-    let rows: Vec<(&str, [String; 8])> = listings
+    // A stopped VM's cell says so (NET-152), so its boxes read as on a VM
+    // that is down rather than as boxes that stopped on a running one.
+    let rows: Vec<(String, [String; 8])> = listings
         .iter()
         .flat_map(|listing| {
-            listing.resp.sessions.iter().map(|entry| {
+            let vm = if listing.running {
+                listing.vm.clone()
+            } else {
+                format!("{} (stopped)", listing.vm)
+            };
+            listing.resp.sessions.iter().map(move |entry| {
                 (
-                    listing.vm.as_str(),
+                    vm.clone(),
                     session_cells(entry, listing.resp.box_networks.get(&entry.id)),
                 )
             })
         })
         .collect();
     let egress_width = egress_column_width(rows.iter().map(|(_, row)| row));
+    let vm_width = rows
+        .iter()
+        .map(|(vm, _)| vm.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(VM_COLUMN_WIDTH);
     writeln!(
         out,
         "{:<vm_width$}  {:<36}  {:<20}  {:<ADDRESS_COLUMN_WIDTH$}  {:<13}  {:<egress_width$}  {:<20}  {:<19}  PROJECT PATH",
-        "VM",
-        "SESSION ID",
-        "NAME",
-        "ADDRESS",
-        "STATUS",
-        "EGRESS",
-        "TITLE",
-        "LAST ACTIVITY",
-        vm_width = VM_COLUMN_WIDTH,
+        "VM", "SESSION ID", "NAME", "ADDRESS", "STATUS", "EGRESS", "TITLE", "LAST ACTIVITY",
     )?;
     writeln!(
         out,
-        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<ADDRESS_COLUMN_WIDTH$}  {:-<13}  {:-<egress_width$}  {:-<20}  {:-<19}  {:-<24}",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        vm_width = VM_COLUMN_WIDTH,
+        "{:-<vm_width$}  {:-<36}  {:-<20}  {:-<ADDRESS_COLUMN_WIDTH$}  {:-<13}  {:-<egress_width$}  {:-<20}  {:-<19}  {:-<24}",
+        "", "", "", "", "", "", "", "", "",
     )?;
     for (
         vm,
@@ -1500,7 +1556,6 @@ pub fn format_ls_across_vms_on(
         writeln!(
             out,
             "{vm:<vm_width$}  {id:<36}  {name:<20}  {address:<ADDRESS_COLUMN_WIDTH$}  {status:<13}  {egress:<egress_width$}  {title:<20}  {last_activity:<19}  {project_path}",
-            vm_width = VM_COLUMN_WIDTH,
         )?;
     }
 

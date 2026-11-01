@@ -32,10 +32,11 @@ pub(crate) fn box_announce_label(id: &boxes::SessionId, name: Option<&str>) -> S
 /// (NET-058). `verb` leads the one line that says which VM the box was found
 /// on ("Attaching to", "Running in", ...).
 ///
-/// The selected VM's daemon is asked first (`client`, reached over `sock`):
-/// the common case — a box on the VM the operator is already on — costs
-/// nothing beyond the one lookup the command always made, and its answer is
-/// gated on the reply that lookup was already making. When that daemon does
+/// The selected VM's daemon is asked first (`client`, reached over `sock`),
+/// and its answer is gated on the reply that lookup was already making. On a
+/// host with several VMs and no `--vm`, a hit there is checked against every
+/// VM, and a name a second VM also holds is an ambiguity
+/// ([`ensure_selected_holds_box_alone`]). When that daemon does
 /// not know the name, [`crate::attach::resolve_box_vm`] resolves the VM that owns it
 /// across every VM's socket, so no global flag is needed to reach a box on
 /// another VM — the resolution gates the owning daemon on the very reply that
@@ -48,33 +49,31 @@ pub(crate) async fn resolve_named_box_version_gated(
     sock: std::path::PathBuf,
     name: &str,
     verb: &str,
+    example: &str,
 ) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
     match resolve_session_version_gated(client, name).await {
-        Ok(record) => Ok((record, sock)),
-        Err(selected) => match crate::attach::resolve_box_vm(global, name).await? {
-            Some(resolved) => {
-                // From here the process acts on the owning VM, as `--vm`
-                // would have made it: everything keyed on the VM's name
-                // (the VM host control socket the pre-attach re-hold asks,
-                // the answerer beside it) must be that VM's, or the re-hold
-                // lands on the selected VM's host daemon as a name with no
-                // row behind it and the hand-off stalls. The enumeration
-                // validated the name; a second set (none happens before a
-                // resolution) is a no-op.
-                let _ = client::set_vm_name(&resolved.vm);
-                // The operator never chose the VM the way they chose the
-                // session, so tell them which one they're landing in.
-                if should_announce_box(global) {
-                    eprintln!(
-                        "{verb} session {} on VM {}",
-                        box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
-                        resolved.vm
-                    );
-                }
-                Ok((resolved.record, resolved.sock))
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous. The check
+            // runs before the attach touches the terminal.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((record, sock))
+        }
+        Err(selected) => {
+            // Every refusal here — the miss, a box on a stopped VM, an
+            // ambiguous name — is made before the attach touches the
+            // terminal, so it prints on the terminal as the user left it.
+            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
+            // The operator never chose the VM the way they chose the
+            // session, so tell them which one they're landing in.
+            if should_announce_box(global) {
+                eprintln!(
+                    "{verb} session {} on VM {}",
+                    box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
+                    resolved.vm
+                );
             }
-            None => Err(selected),
-        },
+            Ok((resolved.record, resolved.sock))
+        }
     }
 }
 
@@ -86,7 +85,8 @@ pub(crate) async fn resolve_attach_target_version_gated(
     sock: std::path::PathBuf,
     name: &str,
 ) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
-    resolve_named_box_version_gated(global, client, sock, name, "Attaching to").await
+    let example = format!("session attach {name}");
+    resolve_named_box_version_gated(global, client, sock, name, "Attaching to", &example).await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -293,10 +293,17 @@ pub(crate) async fn box_via_ssh(
                 stdin_is_tty,
                 crate::attach::TerminalUnwind::arm,
                 |ssh| {
-                    minimal_client::attach::run_interactive_attach(
-                        ssh,
+                    // A terminal the relay could not take was never changed,
+                    // so a failure here owes it nothing; the marker tells
+                    // `interactive_attach` so.
+                    let real = minimal_client::tty_relay::RealTty::acquire()
+                        .context(crate::attach::TerminalNotTaken)?;
+                    mark_relay_not_started(
                         subscribe_host_asks(host_asks)
                             .map(minimal_client::attach::HostAsks::into_hook),
+                        |hook| {
+                            minimal_client::attach::run_interactive_attach_on(ssh, real, Some(hook))
+                        },
                     )
                 },
             )
@@ -431,6 +438,45 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
     }
 }
 
+/// Run the relay with a suspend hook that records that the relay started,
+/// and mark a failure that came before it with
+/// [`crate::attach::RelayNotStarted`].
+///
+/// The relay calls its suspend hook only once `Relay::start` returned: ssh
+/// runs on the pty and the real terminal is in raw mode. Every failure of
+/// `Relay::start` comes before ssh's output can reach the real terminal, and
+/// the relay put back what it changed, so the attach owes the terminal no
+/// unwind. `inner` is the caller's own hook, if any, and runs as before.
+///
+/// The hook runs on a thread of its own, so a relay that started and then
+/// failed at once can return before the hook records it. Then the guard
+/// stands down, though the relay restored the termios. The only such
+/// failure is the wait on ssh's exit.
+pub(crate) fn mark_relay_not_started(
+    inner: Option<minimal_client::tty_relay::SuspendHook>,
+    run: impl FnOnce(
+        minimal_client::tty_relay::SuspendHook,
+    ) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let started = Arc::new(AtomicBool::new(false));
+    let hook_started = Arc::clone(&started);
+    let hook: minimal_client::tty_relay::SuspendHook = Box::new(move |handle| {
+        hook_started.store(true, Ordering::Release);
+        if let Some(inner) = inner {
+            inner(handle);
+        }
+    });
+    run(hook).map_err(|e| {
+        if started.load(Ordering::Acquire) {
+            e
+        } else {
+            anyhow::Error::new(crate::attach::RelayNotStarted(e))
+        }
+    })
+}
+
 /// The interactive attach, from the terminal check to ssh's exit code.
 ///
 /// `-tt` over a *non-terminal* stdin is a trap: ssh still forces the remote
@@ -449,6 +495,15 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
 /// only process left that can still reach the tty. So the guard stays
 /// armed for the duration and is stood down only once ssh's exit proves
 /// the daemon was alive and speaking: see `crate::attach::client_must_unwind`.
+///
+/// A relay that fails once it holds the terminal ends `min session attach`
+/// with an error, which `main` prints after this returns. The relay put the
+/// attach-start termios back before it returned, and the guard writes its
+/// unwind as it drops here, so the error lands on a restored terminal and
+/// stays on screen after the exit. Only a relay that never took the
+/// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
+/// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
+/// down, because nothing of the session reached the terminal.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -460,10 +515,19 @@ pub(crate) fn interactive_attach<W: std::io::Write>(
     let status = match relay(ssh) {
         Ok(status) => status,
         Err(e) => {
-            // ssh never ran (or the relay never took the terminal), so
-            // nothing of the session reached the terminal and there is
-            // nothing to put back.
-            unwind.disarm();
+            // The relay never took the terminal, or never started ssh's
+            // session on it, so nothing of the session reached it and there
+            // is nothing to put back. Any other failure came after the
+            // session started, and the session may have left its modes set:
+            // the guard writes the unwind as it drops, before the error is
+            // printed.
+            if e.downcast_ref::<crate::attach::TerminalNotTaken>()
+                .is_some()
+                || e.downcast_ref::<crate::attach::RelayNotStarted>().is_some()
+            {
+                unwind.disarm();
+            }
+            drop(unwind);
             return Err(e).context("failed to run ssh");
         }
     };
