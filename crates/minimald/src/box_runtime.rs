@@ -2096,13 +2096,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // interpreting those keystrokes under this channel's fresh keys.
         self.binding_generation += 1;
 
-        if !skip_flush {
+        // The redraw is rendered here but not written here: a redraw can be
+        // megabytes (a large terminal with per-cell colour), and russh parks
+        // a write while the client's ssh window is exhausted, so writing it
+        // on the host loop let one client that stopped reading before its
+        // redraw was written stall the host loop, and every other client of
+        // the session with it.
+        let redraw = (!skip_flush).then(|| {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
-            let _ = channel
-                .make_writer()
-                .write_all(&self.parser.screen().state_formatted())
-                .await;
-        }
+            self.parser.screen().state_formatted()
+        });
         let new_binding = Binding::spawn(
             channel,
             self.remote_tx.clone(),
@@ -2114,6 +2117,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             self.holds_host_row,
         )
         .await;
+
+        // The redraw is the new binding's first output, written by the
+        // binding's own task and raced against the shed like any other
+        // stdout, so a client that never reads stalls only its binding. The
+        // mailbox is fresh, so the first message always fits.
+        if let Some(redraw) = redraw
+            && let Err(e) = new_binding.0.try_send(BindingMsg::Stdin(redraw))
+        {
+            tracing::warn!(session = %self.session_name, "could not queue the attach redraw: {e}");
+        }
 
         if let Some(old_binding) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to

@@ -399,13 +399,20 @@ impl FloodedAttach {
     /// that stops reading then stops the server within a few tens of KiB,
     /// where the defaults would let megabytes through first.
     async fn start(output_stall_timeout: Duration) -> Self {
+        Self::start_with(output_stall_timeout, DEFAULT_SIZE, &[]).await
+    }
+
+    /// [`Self::start`] at terminal size `sz`, with `screen` fed to the host's
+    /// screen model before the loop starts, so the attach's redraw renders
+    /// that screen.
+    async fn start_with(output_stall_timeout: Duration, sz: WinSize, screen: &[u8]) -> Self {
         let (mut host, handle) = Host::build(
             MockLauncher::default(),
             HostParams {
                 name: "test-session".to_string(),
                 username: "user".to_string(),
                 paths: test_paths(),
-                sz: DEFAULT_SIZE,
+                sz,
                 channel: None,
                 control: None,
                 delta: None,
@@ -421,6 +428,7 @@ impl FloodedAttach {
         .await
         .expect("failed to build host");
         host.output_stall_timeout = output_stall_timeout;
+        host.parser.process(screen);
         let stdin = host.remote_tx.clone();
         let task = crate::traced::spawn(host.mainloop());
 
@@ -458,7 +466,7 @@ impl FloodedAttach {
             handle
                 .attach(
                     server_channel,
-                    DEFAULT_SIZE,
+                    sz,
                     ConnectionEnv::new(),
                     SessionKeys::default(),
                 )
@@ -550,6 +558,219 @@ async fn shedding_a_stalled_binding_closes_the_client_channel() {
         .expect("the host is still running");
 
     attach.stop().await;
+}
+
+/// A big terminal, for a redraw far past what the test client's window and
+/// buffers hold unread.
+const BIG_SIZE: WinSize = WinSize {
+    rows: 200,
+    cols: 400,
+    xpixel: 0,
+    ypixel: 0,
+};
+
+/// Paints every cell of a `sz` screen with its own truecolor foreground and
+/// background, so the screen's redraw carries an SGR per cell.
+fn truecolor_screen(sz: WinSize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in 0..sz.rows {
+        out.extend_from_slice(format!("\x1b[{};1H", r + 1).as_bytes());
+        for c in 0..sz.cols {
+            let (r8, c8) = (r % 256, c % 256);
+            out.extend_from_slice(
+                format!(
+                    "\x1b[38;2;{r8};{c8};{};48;2;{c8};{r8};{}m#",
+                    (r + c) % 256,
+                    (r * 7 + c) % 256,
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m\x1b[H");
+    out
+}
+
+/// scenario 643b: the attach redraw must not be written on the host loop.
+/// The host rendered the screen for a new client and awaited its write to
+/// the channel right there. russh parks a write while the client's window is
+/// spent, so a client whose terminal made the redraw bigger than its unread
+/// window, and that never read, stopped the host loop for good: no probes
+/// answered, no output pumped, every other client of the session frozen.
+/// The redraw now goes to the new binding as its first message, written on
+/// the binding's own task and raced against the shed like any stdout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_redraw_the_client_never_reads_does_not_wedge_the_host_loop() {
+    let screen = truecolor_screen(BIG_SIZE);
+    let mut model = vt100::Parser::new(BIG_SIZE.rows, BIG_SIZE.cols, 0);
+    model.process(&screen);
+    let redraw = model.screen().state_formatted().len();
+    assert!(
+        redraw > 1024 * 1024,
+        "the redraw must dwarf the client's 16 KiB window and buffers: {redraw} bytes",
+    );
+
+    // The client never reads: the redraw alone exhausts its window, and the
+    // flood behind it backs the binding's mailbox up into the host.
+    let mut attach = FloodedAttach::start_with(Duration::from_millis(200), BIG_SIZE, &screen).await;
+
+    // The probe queues behind the attach in the host's mailbox, so it is
+    // answered only once the attach has returned. A redraw written on the
+    // host loop never returns, and this times out.
+    tokio::time::timeout(Duration::from_secs(10), attach.handle.get_attrs())
+        .await
+        .expect("an unread attach redraw wedged the host loop")
+        .expect("the host is still running");
+
+    // Keep probing past the stall bound: the host goes on serving while the
+    // binding is parked on the redraw, and sheds it.
+    for _ in 0..10 {
+        tokio::time::timeout(
+            crate::box_actor::HOST_PROBE_TIMEOUT * 2,
+            attach.handle.get_attrs(),
+        )
+        .await
+        .expect("a binding parked on its redraw must not stop the host answering probes")
+        .expect("the host is still running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The parked binding is shed, not left holding the session: reading at
+    // last, the client finds the attach over.
+    let (mut eof, mut exit_status, mut closed) = (false, None, false);
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = attach.channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Eof => eof = true,
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok() && closed,
+        "the binding parked on its redraw was never shed (eof: {eof}, exit status: {exit_status:?})",
+    );
+    assert_eq!(
+        exit_status,
+        Some(SHED_EXIT_STATUS),
+        "the attach ends as a shed",
+    );
+    assert!(
+        !attach.task.is_finished(),
+        "a shed must not end the session"
+    );
+
+    attach.stop().await;
+}
+
+/// scenario 643b's control arm: a client that reads its redraw at full speed
+/// and types while it is still arriving must get the rest of the redraw and
+/// see the shell answer. The binding wrote the redraw with one `write_all`
+/// and read nothing from the channel meanwhile; russh queues every window
+/// adjust the client sends into that channel's bounded inbound queue and,
+/// once it is full, blocks its session loop on the keystroke. A blocked loop
+/// applies no more window adjusts, so the write starves on credit the
+/// client already granted: the duplex deadlock of #2197, on the attach path.
+/// The binding now drains the read half while a write is in flight, and
+/// forwards what it read as the host's stdin queue takes it, never parking on
+/// that queue with its own mailbox unread (with the shell blocked on output
+/// behind a full mailbox, that queue only empties once output moves).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keystroke_typed_mid_redraw_does_not_wedge_the_binding() {
+    let screen = truecolor_screen(BIG_SIZE);
+    let mut model = vt100::Parser::new(BIG_SIZE.rows, BIG_SIZE.cols, 0);
+    model.process(&screen);
+    let redraw = model.screen().state_formatted().len();
+    // The server's inbound queue holds 100 messages (russh's default) and the
+    // client's 16 KiB window sends an adjust per 16 KiB at most, so the queue
+    // is full after 1.6 MiB; the keystroke goes in at nine tenths of the
+    // redraw, which must be well past that.
+    let type_at = redraw * 9 / 10;
+    assert!(
+        type_at > 100 * 16 * 1024 * 5 / 4,
+        "the keystroke must land after the server's inbound queue has filled with window adjusts: {redraw}-byte redraw",
+    );
+
+    // The shell keeps printing throughout (the feeder stays on). That is the
+    // harder case: with the binding busy on the redraw, its mailbox fills
+    // and the host stops reading the pty, so the shell blocks on output and
+    // stops reading its input, and the host's stdin queue fills behind the
+    // pty. The keystroke must still get through once the client reads.
+    let mut attach = FloodedAttach::start_with(Duration::from_secs(30), BIG_SIZE, &screen).await;
+
+    // Read at full speed; type once at nine tenths of the redraw, as the
+    // scenario does, when the inbound queue is already full of window adjusts.
+    // Waited for: the full redraw, then the shell's own line carrying the
+    // keystroke (`got:…ping-643b`).
+    let needle = b"ping-643b";
+    let (mut got, mut typed, mut tail) = (0usize, false, Vec::new());
+    let mut seen = Seen::default();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(msg) = attach.channel.wait().await {
+            if let russh::ChannelMsg::Data { data } = msg {
+                got += data.len();
+                let answered = saw_answer(&mut tail, needle, &data, &mut seen);
+                if !typed && got >= type_at {
+                    typed = true;
+                    attach.channel.data(&b"ping-643b\n"[..]).await.unwrap();
+                }
+                if got >= redraw && answered {
+                    return;
+                }
+            }
+        }
+        panic!("the channel closed after {got} of {redraw} redraw bytes (typed: {typed})");
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a keystroke typed mid-redraw wedged the binding: {got} of {redraw} redraw bytes arrived (typed: {typed}), and the shell never answered ({seen:?})",
+    );
+    assert!(
+        !attach.task.is_finished(),
+        "the session must outlive a keystroke typed mid-redraw"
+    );
+
+    attach.stop().await;
+}
+
+/// Scans output as it streams in for the keystroke coming back, line by
+/// line (`tail` holds the unfinished last line between chunks, so nothing is
+/// re-read). The keystroke comes back twice, as the tty's echo and in the
+/// shell's `got:` line, but with the shell printing throughout the two
+/// interleave: the echo lands wherever the shell's output was at that
+/// moment, and its newline can cut the shell's own line in two. So the
+/// shell is taken to have answered when a line carries `got:` before the
+/// keystroke, or when the keystroke has come back twice in any form.
+fn saw_answer(tail: &mut Vec<u8>, needle: &[u8], data: &[u8], seen: &mut Seen) -> bool {
+    tail.extend_from_slice(data);
+    while let Some(nl) = tail.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = tail.drain(..=nl).collect();
+        seen.lines += 1;
+        let at = line.windows(needle.len()).position(|w| w == needle);
+        if let Some(at) = at {
+            seen.carrying += 1;
+            if line[..at].windows(4).any(|w| w == b"got:") {
+                seen.answered = true;
+            }
+        }
+    }
+    seen.answered || seen.carrying >= 2
+}
+
+/// What the client saw while waiting for the shell's answer: how many lines,
+/// how many carried the keystroke, and whether one was the shell's.
+#[derive(Default, Debug)]
+struct Seen {
+    lines: usize,
+    carrying: usize,
+    answered: bool,
 }
 
 /// An attach the daemon ended exits non-zero, so a script can tell it from
