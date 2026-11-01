@@ -15787,7 +15787,9 @@ ahm_box_up() {
 
 # Checks the jsonl file $1 from `min box audit`: at least one record, every
 # record's subject is $2, and an admit decision for api.github.com names
-# it. With $3, every record of $1 is also in the jsonl file $3.
+# it. With $3, every record of the jsonl file $3, an earlier read, is
+# also in $1. The proxy can append records between the two reads, so $1
+# can hold more records than $3.
 ahm_audit_check() {
   python3 - "$1" "$2" "${3:-}" <<'PY'
 import json, sys
@@ -15811,7 +15813,8 @@ if not admits:
     print("no admit decision for api.github.com:443")
     sys.exit(1)
 if other:
-    missing = [l for l in lines if l not in set(read(other))]
+    later = set(lines)
+    missing = [l for l in read(other) if l not in later]
     if missing:
         print("%d record(s) read by id are missing from the read by name" % len(missing))
         sys.exit(1)
