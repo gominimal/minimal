@@ -932,6 +932,10 @@ known_gap() {
 }
 
 teardown() {
+  # The audit, HTTP and message walk's grant box, when one of its legs ran
+  # alone: only the whole walk destroys it before it returns.
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
+  AHM_SID=""
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -15737,7 +15741,7 @@ AHM_SID="" AHM_GATE=""
 AHM_NAME=e2e-bep-ahm
 
 ahm_cleanup() {
-  [ -n "$AHM_SID" ] && mnl session destroy --force "$AHM_SID" >/dev/null 2>&1
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
   AHM_SID=""
   [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
   GRANT_SEED_DIR=""
@@ -15882,19 +15886,24 @@ proof_bep_ahm_relayed_response_has_no_alt_svc() {
   ahm_box_up "$as_case" || return 0
   # The same upstream, read directly from the host with no credential, goes
   # first. With no Alt-Svc header there, the proxy has none to remove on this
-  # run, so the leg does not test the removal. That read gets a 401, and the
-  # relayed read gets a 200, so their headers can differ.
-  if ! curl -sS -D "$WORK/$as_case.direct" -o /dev/null --max-time 30 https://api.github.com/user \
+  # run, so the leg does not test the removal. /user answers a read with no
+  # credential with a 401, and a 401 and a 200 can carry different headers.
+  # /rate_limit answers it with a 200, the status of the relayed read below.
+  if ! curl -sS -D "$WORK/$as_case.direct" -o /dev/null --max-time 30 https://api.github.com/rate_limit \
     2>"$WORK/$as_case.direct.err"; then
-    not_run "$as_case" "curl could not read https://api.github.com/user from the host: $(head -n1 "$WORK/$as_case.direct.err" 2>/dev/null)"
+    not_run "$as_case" "curl could not read https://api.github.com/rate_limit from the host: $(head -n1 "$WORK/$as_case.direct.err" 2>/dev/null)"
+    return 0
+  fi
+  if ! head -n1 "$WORK/$as_case.direct" | grep -Eq '^HTTP/[0-9.]+ 200'; then
+    not_run "$as_case" "https://api.github.com/rate_limit read directly from the host answered '$(head -n1 "$WORK/$as_case.direct" | tr -d '\r')', not 200, so its headers cannot stand for a 200"
     return 0
   fi
   as_direct="$(tr -d '\r' <"$WORK/$as_case.direct" | grep -i '^alt-svc:' | head -n1 || true)"
   if [ -z "$as_direct" ]; then
-    not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header on this run, so the proxy had none to remove"
+    not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header with a 200 on this run, so the proxy had none to remove"
     return 0
   fi
-  echo "api.github.com read directly from the host with no credential sends '$as_direct'"
+  echo "api.github.com read directly from the host with no credential answers 200 with '$as_direct'"
   # gh prints the response's status line and headers before the body.
   if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api --include user' \
     >"$WORK/$as_case.relayed" 2>&1; then
