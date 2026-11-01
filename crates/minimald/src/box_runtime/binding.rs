@@ -414,8 +414,6 @@ pub(super) struct Binding {
     box_dir: Option<boxes::store::BoxDir>,
 }
 
-/// What the host keeps of an attached binding: its mailbox, its task, and
-/// the token that sheds it.
 /// How many inbound channel messages a binding holds for the host before it
 /// stops reading its channel (see `to_host` in [`Binding::run`]); a client
 /// cannot type that many packets while the host is not taking input unless
@@ -431,6 +429,8 @@ type SlotWait = std::pin::Pin<
     >,
 >;
 
+/// What the host keeps of an attached binding: its mailbox, its task, and
+/// the token that sheds it.
 pub(super) type BindingSlot = (mpsc::Sender<BindingMsg>, JoinHandle<()>, CancellationToken);
 
 /// The line a shed binding leaves on the terminal before its channel closes.
@@ -793,8 +793,9 @@ impl Binding {
                         to_host.push_back(kind);
                     },
                 },
-                // Input reaches the host as slots open, never ahead of the
-                // output arm below.
+                // Input reaches the host as slots open; the select picks
+                // among ready arms fairly, so this arm never starves the
+                // output arm below, and the output arm never starves it.
                 permit = async { slot.as_mut().expect("guarded").await }, if slot.is_some() => {
                     slot_used = true;
                     match permit {
