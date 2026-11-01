@@ -6401,8 +6401,10 @@ struct MirrorState {
     wanted: BTreeSet<u16>,
     /// The ports bound at `address`.
     bound: BTreeSet<u16>,
-    /// The ports whose bind collided with a holder on the host.
-    collided: BTreeSet<u16>,
+    /// The ports whose bind collided with a holder on the host, each with
+    /// the time its first collision was seen. A port leaves the map when it
+    /// binds, when its listener stops, or when the binds end.
+    collided: BTreeMap<u16, Instant>,
     /// The undone binds whose undo the host refused or did not answer, by
     /// port, with the address each stands at. Each is retried before the
     /// next change's calls.
@@ -6488,10 +6490,21 @@ impl NodeMirror {
     }
 
     /// The ports whose bind collided with a holder on the host, recorded on
-    /// the node and logged. Showing them at session start and in `min ls`
-    /// is <https://github.com/gominimal/minimal/issues/2799>.
+    /// the node and logged. The host control socket's read-only
+    /// `mirror_collisions` verb answers them, and `min ls` and
+    /// `min session activate` show them.
     pub fn collisions(&self) -> Vec<u16> {
-        self.lock().collided.iter().copied().collect()
+        self.lock().collided.keys().copied().collect()
+    }
+
+    /// [`Self::collisions`] with the time each port's first collision was
+    /// seen. A port that collides again keeps its first time.
+    pub fn collisions_since(&self) -> Vec<(u16, Instant)> {
+        self.lock()
+            .collided
+            .iter()
+            .map(|(port, since)| (*port, *since))
+            .collect()
     }
 
     /// How many listening notices the rate cap dropped on this node.
@@ -6838,7 +6851,7 @@ impl NodeMirror {
                 (MirrorOutcome::Bound, true)
             }
             Err(MirrorBindError::Occupied) => {
-                state.collided.insert(port);
+                state.collided.entry(port).or_insert_with(Instant::now);
                 self.warn_refused(&state, port, MirrorOutcome::Collided, "port-in-use");
                 (MirrorOutcome::Collided, true)
             }
