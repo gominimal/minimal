@@ -2391,20 +2391,24 @@ impl Quic443Scratch {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let out = quic443_privileged(&self.helper().to_string_lossy())
+            let run = quic443_privileged(&self.helper().to_string_lossy())
                 .arg(verb)
                 .arg(leaf)
-                .output()
-                .expect("running the QUIC block helper");
-            if out.status.success() {
-                return;
+                .output();
+            match run {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper runs `{verb}` on {}: {}",
+                    leaf.display(),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
+                Err(e) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper starts `{verb}` on {}: {e}",
+                    leaf.display(),
+                ),
             }
-            assert!(
-                attempt < 5,
-                "the QUIC block helper runs `{verb}` on {}: {}",
-                leaf.display(),
-                String::from_utf8_lossy(&out.stderr),
-            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
