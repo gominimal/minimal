@@ -100,6 +100,7 @@ pub fn scrub_flattened(line: &str) -> String {
 
 /// `<dest>/process-tree.txt`, plus on Linux `<dest>/proc/<pid>.status` for each
 /// matched pid (VmRSS, threads, and fd pressure for one of our processes).
+#[tracing::instrument(level = "info", skip_all, err)]
 pub async fn process_tree<W: BundleSink>(
     w: &mut BundleWriter<W>,
     dest: &str,
@@ -145,6 +146,7 @@ pub async fn process_tree<W: BundleSink>(
 /// neighbour eating the machine. Unrelated processes contribute their name and
 /// never their arguments — a support bundle is not a keylogger. Rows are
 /// ordered by pid, so two bundles from one incident diff cleanly.
+#[tracing::instrument(level = "debug", skip_all, err)]
 pub async fn all_processes<W: BundleSink>(
     w: &mut BundleWriter<W>,
     dest: &str,
@@ -175,6 +177,7 @@ pub async fn all_processes<W: BundleSink>(
 
 /// The `/proc` walk behind [`all_processes`].
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", skip_all, err)]
 fn proc_table_text(markers: &[&str]) -> Result<String, anyhow::Error> {
     use anyhow::Context as _;
     use std::fmt::Write as _;
