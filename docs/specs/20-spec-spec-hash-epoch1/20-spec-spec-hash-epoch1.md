@@ -53,7 +53,8 @@ state nothing beyond that domain. The **epoch-1 context** is the Blake3
 `derive_key` context string `minimal.dev spec-hash epoch 1`.
 
 The **epoch-0 defect catalog** is these nine collision-witness classes of
-the epoch-0 encoder. Each is a pair of distinct specs with one key:
+the epoch-0 encoder. Seven are a pair of distinct specs with one key; two
+(7 and 8) are the converse, one spec with more than one key:
 
 1. the unframed junction of `name` and `cmds`, so `name="foo", cmds=[["bar"]]`
    and `name="foobar", cmds=[]` share a key.
@@ -138,14 +139,21 @@ build-infra operator. Release manager.
     (3 elements per list, 8 bytes per string, depth 2), unwind 33 (the
     32-byte edge-key loop)
 
-- **EPOCH-004** THE SYSTEM SHALL encode every collision-witness pair of
-  the epoch-0 defect catalog to distinct outputs.
+- **EPOCH-004** THE SYSTEM SHALL refute every class of the epoch-0 defect
+  catalog: the witness pair of each distinct-spec class (1 to 6 and 9)
+  encodes to distinct outputs, and the witness of each one-spec class
+  encodes to one output, the same at both index widths (7) and the same
+  for negative zero and zero (8, by EPOCH-006).
   tier:     T2
   verify:   cargo nextest run -p graph epoch1_witness_refutations
-  property: for all catalog pairs (a, b): encode(a) != encode(b)
+  property: for all distinct-spec witness pairs (a, b): encode(a) !=
+    encode(b); for class 7's witness g: encode_u32(g) == encode_u64(g); for
+    class 8's witness pair (z, -z): encode(z) == encode(-z)
   harness:  kani_epoch1_witness_refutations, one harness per witness class
-    of the epoch-0 defect catalog (nine), each over its concrete witness
-    pair, unwind 9 (the witnesses' strings are at most 8 bytes)
+    of the epoch-0 defect catalog (nine), each over its concrete witness,
+    unwind 9 (the witnesses' strings are at most 8 bytes); class 7's
+    harness encodes under both index widths in one run, since one platform
+    cannot witness the other
 
 - **EPOCH-005** THE SYSTEM SHALL derive an epoch-1 spec key under the
   epoch-1 context, 32 bytes wide.
@@ -219,7 +227,10 @@ build-infra operator. Release manager.
   the epoch of the spec key it subsets.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_subset_key_follows_its_spec
-  property: for all subsets u of spec s: epoch(key(u)) == epoch(key(s))
+  property: for all subsets u of spec s: key(u) is derived under the same
+    context and encoding as key(s) (a key carries no epoch in its bytes,
+    EPOCH-014, so the test holds the epoch by construction and checks the
+    derivation, never reads it back from a key)
 
 - **EPOCH-012** WHEN a consumer computes a lookup key THE SYSTEM SHALL use
   the epoch that the index of its registry pin declares.
@@ -500,9 +511,16 @@ reuses them.
   that seals the first epoch-1 snapshot. Until it does, the snapshot's
   root-index fallback is withheld (EPOCH-012). No lookup unions the two
   epochs, and for a client at or after the reading release the flip shows
-  misses and never refusals; a client before it refuses the first epoch-1
-  index as any unknown epoch (EPOCH-009), which is why the reading release
-  ships first and the flip waits until the fleet is on it. The catalog
+  misses and never refusals, with two exceptions the flip itself can force
+  while producers are mid-flip: a lookup over an upstream index and
+  sideloads on different epochs is refused (EPOCH-012), and sealing a
+  container with a member of another epoch is refused (EPOCH-014). Both
+  end when the sideloads and the container's members reseal under epoch 1,
+  which the producing side does in the same cycle as the root index: one
+  call site, one flip. A client before the reading release refuses the
+  first epoch-1 index as any unknown epoch (EPOCH-009), which is why the
+  reading release ships first and the flip waits until the fleet is on
+  it. The catalog
   rebuilds cold under epoch-1 keys on the first package CI cycle
   at that release. That is a full world rebuild, and build-infra schedules
   it on purpose. A staged catalog rebuild on the staging cache comes before
