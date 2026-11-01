@@ -1,0 +1,42 @@
+{
+  "summary": {
+    "total": 10,
+    "integrations": 4,
+    "operations": 6,
+    "violations": 0,
+    "trivial": 0,
+    "iosp_score": 1.0,
+    "quality_score": 0.95,
+    "dimension_scores": [1.0, 1.0, 1.0, 0.9, 1.0, 0.8, 1.0],
+    "complexity_warnings": 0,
+    "duplicate_groups": 0,
+    "dead_code_warnings": 0,
+    "tq_no_assertion_warnings": 0,
+    "architecture_warnings": 0,
+    "orphan_suppressions": 0,
+    "all_suppressions": 0,
+    "suppression_ratio_exceeded": false
+  },
+  "functions": [],
+  "coupling": {
+    "modules": [
+      {"path": "crates/decode/src/lib.rs", "fan_in": 0, "fan_out": 1, "instability": 1.0},
+      {"path": "crates/decode/src/frame.rs", "fan_in": 1, "fan_out": 0, "instability": 0.0}
+    ],
+    "cycles": [],
+    "sdp_violations": [
+      {"from": "crates/decode/src/frame.rs", "to": "crates/decode/src/lib.rs", "instability": 1.0}
+    ]
+  },
+  "duplicates": [],
+  "dead_code": [],
+  "fragments": [],
+  "boilerplate": [],
+  "wildcard_warnings": [],
+  "tq_warnings": [],
+  "structural_warnings": [],
+  "repeated_matches": [],
+  "srp": {"struct_warnings": [], "module_warnings": [], "param_warnings": []},
+  "architecture_findings": [],
+  "orphan_suppressions": []
+}

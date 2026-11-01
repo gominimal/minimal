@@ -34,3 +34,15 @@ ignored = [
 
 [lints]
 workspace = true
+
+# Same list for cargo-shear, which scripts/metrics/run.sh runs: it scans
+# sources the same way and misses the same generated code.
+[package.metadata.cargo-shear]
+ignored = [
+    "prost",
+    "prost-types",
+    "tonic",
+    "tonic-prost",
+    "prost-build",
+    "tonic-prost-build",
+]

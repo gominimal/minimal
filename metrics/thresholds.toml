@@ -1,0 +1,71 @@
+# Quality thresholds (spec 31). `scripts/metrics/collect.py` evaluates these
+# against a snapshot; `scripts/metrics/diff.py` grades a change against the
+# newest snapshot of its base ref. Gate names are dotted paths into the
+# snapshot's `workspace` and `layers` blocks.
+#
+# A change is graded by the STRICTER of this file at the merge-base with
+# the base ref and this file in the change (QM-009), so a pull request may
+# tighten a gate at once and may loosen one only after the loosening is on
+# the base ref.
+#
+# Floors are seeded from the first snapshot, never set by hand to a target:
+# a gate that is red on day one teaches every agent to ignore it. Tighten
+# them as the trend allows.
+
+schema = 1
+
+# Absolute gates. A floor fails below its value, a ceiling above it. `0.0`
+# for a floor means "not yet seeded": the gate passes until a reviewed
+# commit sets it from a snapshot.
+[floors]
+"coverage.lines_pct" = 0.0
+# Unseeded: the nightly shards have to go round the week once before the
+# workspace score means anything.
+"mutants.score_pct" = 0.0
+
+[ceilings]
+"layers.unexcepted" = 0
+"layers.unassigned" = 0
+"modules.orphans" = 0
+"clippy.workspace_lints" = 0
+
+# Ratchets compare against the newest snapshot on the base ref. A value
+# inside the tolerance but worse than the baseline is `warn`; past the
+# tolerance is `fail`. `direction` says which way is better.
+[ratchet]
+"coverage.lines_pct" = { direction = "up", tolerance = 0.25 }
+"clippy.strict.total" = { direction = "down", tolerance = 0 }
+"clippy.complexity.total" = { direction = "down", tolerance = 0 }
+"layers.exceptions" = { direction = "down", tolerance = 0 }
+"deps.unused.total" = { direction = "down", tolerance = 0 }
+# A ratchet, not a ceiling of zero: the tree carries functions over the
+# CRAP threshold today, and a gate that is red on day one is ignored.
+"crap.over_threshold" = { direction = "down", tolerance = 0 }
+
+# Per-crate floors override the workspace floor of the same name for one
+# crate. The VM-gated suites of these two run only on a KVM host, so their
+# measured coverage is structurally low.
+[crates.minvmd.floors]
+"coverage.lines_pct" = 0.0
+[crates.minimald.floors]
+"coverage.lines_pct" = 0.0
+
+# Per-function complexity thresholds. clippy.toml carries the same values
+# for `cargo clippy`; the harness fails when the two disagree.
+[clippy]
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+
+# CRAP (metrics/README.md, "Test quality"): a function scores
+# complexity^2 x (1 - coverage)^3 + complexity. Above the threshold it is
+# both complex and untested; the threshold itself is the last acceptable
+# score. cargo-crap's own default is the same number.
+[crap]
+threshold = 30
+
+# Hotspots (QM-018): files ranked by commits in the window multiplied by
+# their findings (complexity hits + strict hits + uncovered lines / 100).
+[hotspots]
+window_days = 90
+top = 25
