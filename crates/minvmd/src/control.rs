@@ -1074,14 +1074,16 @@ fn serve_request(
             let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
-        // A `host_ip` box's residency is what its held name answers by: a
-        // resident box's name answers its node's address (NET-129), so the
-        // admit and the retire take a ticket like the hold. Only the host's
-        // door serves them: the guest must never say what a marked frame
-        // may reach (NET-085), nor that its box is running.
+        // A `host_ip` box's policy changes no zone table, so it takes no
+        // ticket. Its held name answers its node's address while it is
+        // resident (NET-129), but the answerer reads the holds and the
+        // resident set together each time it builds its view, so the order
+        // of a hold and an admit cannot change the answer. Each change pings
+        // the answerer. Only the host's door serves these verbs: the guest
+        // must never say what a marked frame may reach (NET-085), nor that
+        // its box is running.
         (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
-            let resident = order
-                .apply(|| boxes.admit_host_ip_box(request.session_id, request.egress.as_ref()));
+            let resident = boxes.admit_host_ip_box(request.session_id, request.egress.as_ref());
             write_reply(
                 stream,
                 &BoxControlReply::HostIpBox {
@@ -1091,7 +1093,7 @@ fn serve_request(
             )
         }
         (BoxControlRequest::RetireHostIpBox(request), ControlDoor::Host) => {
-            order.apply(|| boxes.retire_host_ip_box(request.session_id));
+            boxes.retire_host_ip_box(request.session_id);
             write_reply(
                 stream,
                 &BoxControlReply::HostIpBox {
