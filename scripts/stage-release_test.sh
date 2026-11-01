@@ -303,6 +303,21 @@ else
     bad "darwin still stages a bare bin/minzoned (out: $bundle_out)"
 fi
 
+# #2498: minvmd starts the Box Egress Proxy from beside its own binary, so the
+# darwin manifest installs bep at bin/bep, next to bin/minvmd. Linux has none.
+if [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "darwin" && $3 == "arm64" \
+        && $6 == "file" && $7 == "bin/bep" && $8 == "versions/0.6.0/bep-macos-arm64"')" ] \
+    && [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "minvmd" && $2 == "darwin" && $7 == "bin/minvmd"')" ]; then
+    ok "the darwin manifest installs bep-macos-arm64 at bin/bep beside bin/minvmd"
+else
+    bad "no darwin row installs bep-macos-arm64 at bin/bep beside bin/minvmd (out: $bundle_out)"
+fi
+if [ -z "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "linux"')" ]; then
+    ok "the manifest carries no linux bep row"
+else
+    bad "the manifest carries a linux bep row (out: $bundle_out)"
+fi
+
 # The bundle stages whole or not at all: with one of its files missing and
 # the rest present, the stage fails naming the missing file and uploads
 # nothing.

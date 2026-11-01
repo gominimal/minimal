@@ -3513,6 +3513,11 @@ case_bep_installs_beside_minvmd() {
         record_has bep "$H_BEP/bin/bep" "$H_BEP/xdg-state/minimal/installed"
     want_ok "the installer printed the bep status" \
         grep -qE "^  bep +(installed|current)" "$OUT"
+
+    run bep_darwin_uninstall "$H_BEP" --uninstall
+    check 0 "$rc" "darwin uninstall with the bep row exits 0"
+    want_err "uninstall removed bep" test -e "$H_BEP/bin/bep"
+    want_err "uninstall removed minvmd beside it" test -e "$H_BEP/bin/minvmd"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
     PLAT_S=Linux; PLAT_M=x86_64
 }
