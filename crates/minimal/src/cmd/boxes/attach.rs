@@ -292,11 +292,12 @@ pub(crate) async fn box_via_ssh(
                     // `interactive_attach` so.
                     let real = minimal_client::tty_relay::RealTty::acquire()
                         .context(crate::attach::TerminalNotTaken)?;
-                    minimal_client::attach::run_interactive_attach_on(
-                        ssh,
-                        real,
+                    mark_relay_not_started(
                         subscribe_host_asks(host_asks)
                             .map(minimal_client::attach::HostAsks::into_hook),
+                        |hook| {
+                            minimal_client::attach::run_interactive_attach_on(ssh, real, Some(hook))
+                        },
                     )
                 },
             )
@@ -431,6 +432,45 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
     }
 }
 
+/// Run the relay with a suspend hook that records that the relay started,
+/// and mark a failure that came before it with
+/// [`crate::attach::RelayNotStarted`].
+///
+/// The relay calls its suspend hook only once `Relay::start` returned: ssh
+/// runs on the pty and the real terminal is in raw mode. Every failure of
+/// `Relay::start` comes before ssh's output can reach the real terminal, and
+/// the relay put back what it changed, so the attach owes the terminal no
+/// unwind. `inner` is the caller's own hook, if any, and runs as before.
+///
+/// The hook runs on a thread of its own, so a relay that started and then
+/// failed at once can return before the hook records it. Then the guard
+/// stands down, though the relay restored the termios. The only such
+/// failure is the wait on ssh's exit.
+pub(crate) fn mark_relay_not_started(
+    inner: Option<minimal_client::tty_relay::SuspendHook>,
+    run: impl FnOnce(
+        minimal_client::tty_relay::SuspendHook,
+    ) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let started = Arc::new(AtomicBool::new(false));
+    let hook_started = Arc::clone(&started);
+    let hook: minimal_client::tty_relay::SuspendHook = Box::new(move |handle| {
+        hook_started.store(true, Ordering::Release);
+        if let Some(inner) = inner {
+            inner(handle);
+        }
+    });
+    run(hook).map_err(|e| {
+        if started.load(Ordering::Acquire) {
+            e
+        } else {
+            anyhow::Error::new(crate::attach::RelayNotStarted(e))
+        }
+    })
+}
+
 /// The interactive attach, from the terminal check to ssh's exit code.
 ///
 /// `-tt` over a *non-terminal* stdin is a trap: ssh still forces the remote
@@ -455,7 +495,9 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
 /// attach-start termios back before it returned, and the guard writes its
 /// unwind as it drops here, so the error lands on a restored terminal and
 /// stays on screen after the exit. Only a relay that never took the
-/// terminal ([`crate::attach::TerminalNotTaken`]) stands the guard down.
+/// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
+/// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
+/// down, because nothing of the session reached the terminal.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -467,13 +509,15 @@ pub(crate) fn interactive_attach<W: std::io::Write>(
     let status = match relay(ssh) {
         Ok(status) => status,
         Err(e) => {
-            // The relay never took the terminal, so nothing of the session
-            // reached it and there is nothing to put back. Any other failure
-            // came after the relay took it, and the session may have left
-            // its modes set: the guard writes the unwind as it drops, before
-            // the error is printed.
+            // The relay never took the terminal, or never started ssh's
+            // session on it, so nothing of the session reached it and there
+            // is nothing to put back. Any other failure came after the
+            // session started, and the session may have left its modes set:
+            // the guard writes the unwind as it drops, before the error is
+            // printed.
             if e.downcast_ref::<crate::attach::TerminalNotTaken>()
                 .is_some()
+                || e.downcast_ref::<crate::attach::RelayNotStarted>().is_some()
             {
                 unwind.disarm();
             }

@@ -167,6 +167,26 @@ impl fmt::Display for TerminalNotTaken {
 
 impl std::error::Error for TerminalNotTaken {}
 
+/// A relay that failed before ssh's session reached the real terminal: the
+/// pty, the spawn or the raw mode failed, and the relay put back whatever
+/// it changed. The marker tells the attach that the failure owes the
+/// terminal no unwind ([`crate::cmd::interactive_attach`]). It wraps the
+/// relay's error and prints exactly as that error does.
+#[derive(Debug)]
+pub(crate) struct RelayNotStarted(pub(crate) anyhow::Error);
+
+impl fmt::Display for RelayNotStarted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for RelayNotStarted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 /// The current working directory as a host path, respecting the `--repo-dir`
 /// (`-C`) override. The result is canonicalized so it compares equal to a
 /// `Record.project_path`, which `cmd_activate` canonicalizes at create time.
@@ -282,11 +302,10 @@ pub(crate) struct ResolvedBoxVm {
 /// choice. A VM that is not running is asked through its persisted box
 /// records instead (NET-152): a name only a stopped VM holds is refused with
 /// a [`crate::cmd::BoxNotFound`] that names the VM and the command that
-/// starts it. When one running VM owns the name and a stopped VM's records
-/// also hold it, a running box wins: an active box on the running VM
-/// resolves there. If the running VM's box is not active, the name is an
-/// [`crate::cmd::AmbiguousBoxName`] that lists every VM, each stopped one
-/// marked, and names `--vm`.
+/// starts it. Any name that more than one VM holds, running or stopped, is
+/// an [`crate::cmd::AmbiguousBoxName`] that lists every VM, each stopped one
+/// marked, and names `--vm`: a name that matches on more than one host is an
+/// error that lists the candidates, whatever state each box is in.
 /// A VM whose daemon answers nothing is skipped with a warning, so the name
 /// is resolved from the VMs that did answer. Each look
 /// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
@@ -375,19 +394,6 @@ pub(crate) async fn resolve_box_vm(
         ))
         .into()),
         (1, []) => {
-            let resolved = owners.pop().expect("the one owner");
-            tracing::debug!(
-                box = name,
-                vm = %resolved.vm,
-                outcome = "on a running VM",
-                "box name resolved to a VM"
-            );
-            Ok(Some(resolved))
-        }
-        // A running box wins: one running VM owns the name and its box is
-        // active, so a stopped VM's record of the same name does not shadow
-        // it.
-        (1, [_, ..]) if owners[0].record.status == boxes::BoxState::Active => {
             let resolved = owners.pop().expect("the one owner");
             tracing::debug!(
                 box = name,

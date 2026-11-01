@@ -5927,15 +5927,19 @@ async fn box_on_stopped_vm_names_start_command() {
     );
     assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
-    // A running box wins: an active box on the running VM resolves there,
-    // though a stopped VM's records hold the same name.
+    // A name a running VM owns and a stopped VM's records hold is ambiguous,
+    // though the running box is active: the error lists both VMs, marks the
+    // stopped one, and names --vm.
     stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
-    let resolved = attach::resolve_box_vm(&global, "api")
+    let err = attach::resolve_box_vm(&global, "api")
         .await
-        .expect("an active box on a running VM resolves")
-        .expect("the running VM owns the name");
-    assert_eq!(resolved.vm, paths::DEFAULT_VM_NAME);
-    assert_eq!(resolved.record.status, boxes::BoxState::Active);
+        .expect_err("a running owner and a stopped holder are ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
 
     // A stopped record on the running VM and a stopped VM that holds the
     // name are ambiguous: the error lists both VMs, marks the stopped one,
@@ -6139,5 +6143,34 @@ fn attach_error_printed_after_terminal_restore() {
     assert!(
         untouched.0.borrow().is_empty(),
         "no unwind for a terminal the attach never took"
+    );
+
+    // A relay that took the terminal and then failed to start ssh's session
+    // on it (ssh does not spawn) never let the session reach the terminal.
+    // The relay drops its suspend hook unrun, so the failure is marked, and
+    // the guard writes nothing. The error prints as the relay wrote it.
+    let not_started = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(not_started.clone(), true),
+        |_| {
+            mark_relay_not_started(None, |_hook| {
+                Err(
+                    anyhow::Error::new(std::io::Error::other("No such file or directory"))
+                        .context("spawning the ssh attach"),
+                )
+            })
+        },
+    )
+    .expect_err("an attach whose ssh does not spawn fails");
+    assert!(
+        not_started.0.borrow().is_empty(),
+        "no unwind for a relay that never started the session: {:?}",
+        String::from_utf8_lossy(&not_started.0.borrow())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "failed to run ssh: spawning the ssh attach: No such file or directory"
     );
 }
