@@ -116,9 +116,16 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     // gate rides on the lookup's reply — no `GetVersion` ahead of it. The name
     // alone decides where to look (NET-058), as it does for attach: a box on
     // another VM is reached over that VM's socket, with no global flag.
-    let (r, sock) =
-        resolve_named_box_version_gated(global, &mut client, sock, &args.session, "Running in")
-            .await?;
+    let example = format!("session exec {} <command>", args.session);
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running in",
+        &example,
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -149,12 +156,14 @@ pub async fn cmd_session_run(
     // Gated by hand for the same reason as `cmd_exec`: this hands off into a
     // live session, which is not something to drive on a skewed pair. The name
     // alone decides where to look (NET-058), as for exec.
+    let example = format!("session run {} {}", args.session, args.task);
     let (r, sock) = resolve_named_box_version_gated(
         global,
         &mut client,
         sock,
         &args.session,
         "Running the task in",
+        &example,
     )
     .await?;
     tracing::info!(
@@ -202,13 +211,16 @@ pub async fn cmd_session_policy(
 
     ensure_daemon(global)?;
 
-    let mut client = connect_daemon(global).await?;
+    let client = connect_daemon(global).await?;
 
     // The effective reply carries only the rules, but the ingress block is
     // suppressed for host-address sessions (see [`format_policy`]), so the
     // command also resolves the record the policy rides on for its network
-    // mode.
-    let record = resolve_session(&mut client, &args.session).await?;
+    // mode. The name alone decides which VM is asked (NET-058): a box on
+    // another VM is read from that VM's daemon, with no global flag.
+    let example = format!("session policy {}", args.session);
+    let (mut client, record) =
+        resolve_box_on_any_vm(global, client, &args.session, &example).await?;
     // The follow-up lookups go by the resolved id, so a session named by an
     // id prefix reaches the same session they do.
     let box_id = record.id.to_string();
@@ -496,7 +508,9 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         .session
         .as_deref()
         .context("a session or --all is required")?;
-    let record = resolve_session(&mut client, box_name).await?;
+    // The name alone decides which VM destroys the box (NET-058).
+    let example = format!("session destroy {box_name}");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example).await?;
 
     // Under --force the at-risk fetch is skipped outright — the gate is
     // bypassed regardless, so there is nothing to ask the daemon for.
