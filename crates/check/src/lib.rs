@@ -74,7 +74,7 @@ mod outputs;
 mod sources;
 mod stack;
 
-use outputs::{MissingRuntimeDeps, OutputTypesValid};
+use outputs::{MissingRuntimeDeps, OutputTypesValid, OutputsFreeOfDetbuild};
 
 /// The errors possible when running checkers.
 #[derive(Debug)]
@@ -95,7 +95,8 @@ impl fmt::Display for Error {
             }
             Error::Graph(e) => write!(f, "graph: {:?}", e),
             Error::Cancelled => write!(f, "cancelled"),
-            Error::Other(e) => write!(f, "{}", e),
+            // alternate: the whole chain, so a cache read that failed says why
+            Error::Other(e) => write!(f, "{:#}", e),
         }
     }
 }
@@ -608,7 +609,7 @@ async fn check_package(
             };
         }
 
-        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) = tokio::join!(
+        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12) = tokio::join!(
             run_checker!(naming::SpecNameMatchesDir),
             run_checker!(naming::SpecNameValid),
             run_checker!(naming::CycleBreakerNaming),
@@ -616,12 +617,13 @@ async fn check_package(
             run_checker!(naming::EnumerateBins),
             run_checker!(OutputTypesValid),
             run_checker!(MissingRuntimeDeps),
+            run_checker!(OutputsFreeOfDetbuild),
             run_checker!(BuildScriptIsExecutable),
             run_checker!(BuildScriptDisallowedPatterns),
             run_checker!(StandaloneTestCheck),
             run_checker!(sources::SourceUrlsValid),
         );
-        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] {
+        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12] {
             // Checked first: a checker that was interrupted mid-flight reports
             // whatever it tripped over on the way out, which isn't the useful
             // error to hand back.
