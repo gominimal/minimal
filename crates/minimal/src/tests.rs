@@ -6251,3 +6251,133 @@ fn attach_error_printed_after_terminal_restore() {
         "failed to run ssh: spawning the ssh attach: No such file or directory"
     );
 }
+
+/// NET-154: the HOSTNAME PROXY row names every host port the VM's proxy
+/// serves on, the preferred first, and `--json` carries them as
+/// `hostname_proxy_ports`. One served port prints the row it always did.
+#[tokio::test]
+async fn ls_reports_every_proxy_port() {
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_proxy_port = Some(65264);
+    let render = |json: bool, ports: &[u16]| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs { raw: false, json },
+            &resp,
+            None,
+            None,
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let proxy_rows = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("HOSTNAME PROXY:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // One port: the row as it always was, read or not.
+    let one = "HOSTNAME PROXY:  listening on 127.0.0.1:65264 as the HTTP proxy for \
+               <box>.min.internal names";
+    assert_eq!(proxy_rows(&render(false, &[65264])), vec![one]);
+    assert_eq!(proxy_rows(&render(false, &[])), vec![one]);
+
+    // Both ports serve: one row names both, the preferred first.
+    assert_eq!(
+        proxy_rows(&render(false, &[7654, 65264])),
+        vec![
+            "HOSTNAME PROXY:  listening on 127.0.0.1:7654 and 127.0.0.1:65264 as the HTTP \
+             proxy for <box>.min.internal names"
+        ]
+    );
+
+    // The JSON field.
+    let json = |ports: &[u16]| -> serde_json_lenient::Value {
+        serde_json_lenient::from_str(&render(true, ports)).expect("the listing is JSON")
+    };
+    assert_eq!(
+        json(&[7654, 65264])["hostname_proxy_ports"],
+        serde_json_lenient::json!([7654, 65264])
+    );
+    assert_eq!(
+        json(&[65264])["hostname_proxy_ports"],
+        serde_json_lenient::json!([65264])
+    );
+    assert!(json(&[]).get("hostname_proxy_ports").is_none());
+
+    // Two VMs: each VM's row names its own ports.
+    let listing = |vm: &str, port: u16| cmd::VmListing {
+        vm: vm.to_string(),
+        resp: {
+            let mut resp = resp.clone();
+            resp.hostname_proxy_port = Some(port);
+            resp
+        },
+        control_sock: None,
+        running: true,
+    };
+    let listings = [listing("default", 65264), listing("other", 7700)];
+    let across = |json: bool| {
+        let mut out = Vec::new();
+        cmd::format_ls_across_vms_with_proxy_ports_on(
+            &mut out,
+            &LsArgs { raw: false, json },
+            &listings,
+            &[],
+            &[],
+            &[vec![7654, 65264], vec![7700]],
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    assert_eq!(
+        proxy_rows(&across(false)),
+        vec![
+            "HOSTNAME PROXY:  default  listening on 127.0.0.1:7654 and 127.0.0.1:65264 as \
+             the HTTP proxy for <box>.min.internal names",
+            "HOSTNAME PROXY:  other    listening on 127.0.0.1:7700 as the HTTP proxy for \
+             <box>.min.internal names",
+        ]
+    );
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&across(true)).expect("the listing is JSON");
+    assert_eq!(
+        doc["vms"][0]["hostname_proxy_ports"],
+        serde_json_lenient::json!([7654, 65264])
+    );
+    assert_eq!(
+        doc["vms"][1]["hostname_proxy_ports"],
+        serde_json_lenient::json!([7700])
+    );
+
+    // The read over the VM host daemon's control socket.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("control.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut line = String::new();
+        tokio::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .expect("read the request");
+        stream
+            .write_all(b"{\"proxy_ports\":[7654,65264]}\n")
+            .await
+            .expect("write the reply");
+        line
+    });
+    assert_eq!(
+        cmd::vm_host_proxy_ports_at(Some(sock)).await,
+        vec![7654, 65264]
+    );
+    let request = server.await.expect("the server ends");
+    assert_eq!(request.trim(), r#"{"verb":"proxy_ports"}"#);
+    assert!(cmd::vm_host_proxy_ports_at(None).await.is_empty());
+}

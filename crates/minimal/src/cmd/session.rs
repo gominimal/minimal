@@ -6,6 +6,28 @@ pub(crate) use super::box_verbs::{
     vm_host_answerer_status_at,
 };
 
+/// Every host port the VM's hostname proxy serves on, the preferred first
+/// (NET-154), read from the VM host daemon's control socket at `sock_path`
+/// beside [`vm_host_answerer_status_at`]'s read and under the same bound.
+/// Empty — nothing to add to what the daemon's own listing reports — when
+/// there is no socket, the deadline passes, or the daemon predates the read
+/// and refuses it: `min ls` then prints the one port it always printed.
+pub(crate) async fn vm_host_proxy_ports_at(sock_path: Option<std::path::PathBuf>) -> Vec<u16> {
+    use minimal_client::box_registration::{BOX_CONTROL_TIMEOUT, control_request_with_vm_host};
+    let Some(sock_path) = sock_path else {
+        return Vec::new();
+    };
+    let read = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(&sock_path, minimald_rpc::BoxControlRequest::ProxyPorts),
+    )
+    .await;
+    match read {
+        Ok(Ok(minimald_rpc::BoxControlReply::ProxyPorts { proxy_ports })) => proxy_ports,
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Vec::new(),
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_box(global, args, true)
