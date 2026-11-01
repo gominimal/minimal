@@ -14,6 +14,10 @@ Telemetry is **off** unless you turn it on. In that state minimal exports
 nothing and writes nothing, and the process has no telemetry thread or
 connection.
 
+One thing is separate from the export and **on** until 1.0: the daily
+[update check](#update-check), which tells you when your channel has a newer
+release and counts installs. It has its own switch, below.
+
 The requirements behind this page are in
 [spec 25](https://github.com/gominimal/minimal/blob/main/docs/specs/25-spec-telemetry/25-spec-telemetry.md).
 
@@ -236,6 +240,60 @@ with, so its state can differ. The file records:
   collector.
 
 With telemetry off, that file is the only change to `min bug`.
+
+## Update check
+
+Once a day, the first `min` command makes one request to
+`https://update.minimal.dev/v1/<channel>/<key>` and caches the answer. A
+later command then prints one line on stderr, once per new release, naming
+the channel's current release and the command that updates your install:
+
+```
+min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/reference/telemetry#update-check
+```
+
+The line goes to stderr only when stderr is a terminal. stdout, the exit
+code and the command's timing are never touched: the request is made by a
+detached `min update-check --background` with a 2 second budget and no
+retry, and the command that spawned it does not wait. An endpoint that is
+down, slow, or answers 404 produces nothing.
+
+The request carries six fields and nothing else:
+
+| field | value |
+|---|---|
+| channel | `stable`, `unstable`, `nightly`; `pinned` for an install made with `--version`; `source` for a build with no install record. Only a channel install is ever notified |
+| key | the channel pointer this build was installed from, written by the installer to `<state>/minimal/install.toml`; for a build without one, the commit hash in `min version` |
+| os, arch | `linux`/`macos`, `x86_64`/`aarch64` |
+| install | `installer`, or the package that shipped `<prefix>/share/minimal/install.toml` |
+| id | a random UUID minted on the first run, stored in `<state>/minimal/update-check.json`; delete the file to rotate it |
+
+The endpoint also sees the country and network (ASN) of the request, as any
+web request shows, and does not store the address. The service source is
+`workers/update-check/` in the gominimal/webapp repository, beside the
+other edge Workers.
+
+`min update-check --dry-run` prints the exact request that would be made
+and the switch that stops it, if one is set. `min update-check` with no
+flag makes the request now and prints the answer.
+
+**Turning the check off**, any one of these:
+
+| switch | where |
+|---|---|
+| `[telemetry]` `enabled = false` | `config.toml` in the config directory (`min dirs`) |
+| `MINIMAL_TELEMETRY=0` | environment (`false`, `no` and `off` also count) |
+| `DO_NOT_TRACK=1` | environment, the cross-tool convention |
+| `CI` set | environment: a CI job that installs `min` is not an install to count |
+
+An install's first `min` command never makes the request. The first command
+with a terminal prints a one-line disclosure of the above, even when earlier
+commands were a script's (the installer's own setup call, an agent), and the
+request waits for a later command. Installs from a package manager see that
+line instead of the installer's closing card. A `config.toml` that exists but
+does not parse turns the check off until it is fixed.
+
+At 1.0 the default flips to off.
 
 ## Turning it off
 

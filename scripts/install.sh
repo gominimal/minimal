@@ -1515,6 +1515,15 @@ remove_moved_minzoned
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.
 mkdir -p "$state_dir"
+# The install's own description, for the installed min's daily update check
+# (inbox#589): the channel this run resolved, how it was installed, and the
+# pointer it installed, which is what "up to date" compares against.
+# Written whole then renamed, and recorded so --uninstall removes it.
+# A --version install followed no channel: it is `pinned`, which the check
+# answers with nothing, so it is never told a channel moved on.
+printf 'channel = "%s"\nmethod = "installer"\nkey = "%s"\n' "${target:-pinned}" "$VERSION" >"$state_dir/install.toml.tmp"
+mv -f "$state_dir/install.toml.tmp" "$state_dir/install.toml"
+record_generated install-metadata "$state_dir/install.toml"
 mv -f "$records" "$prev_record"
 
 # --- Hook the current shell's rc file --------------------------------------
@@ -1715,6 +1724,9 @@ say "  $mark ${b}min init$rst                          ${dim}declare this projec
 say "  $mark ${b}min$rst                               ${dim}build the sandbox and step inside$rst"
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
+# A channel install is told when its channel moves on (inbox#589); a pinned
+# one is not, so it gets no line.
+[ -z "${target:-}" ] || say "  ${dim}min checks for a newer $target release once a day; docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }
 

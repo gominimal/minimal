@@ -16,7 +16,7 @@ use std::ffi::OsString;
 /// How a boolean-ish variable is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(kani, derive(kani::Arbitrary))]
-pub(crate) enum Flag {
+pub enum Flag {
     Unset,
     /// `1`, `true`, `yes` or `on`, any case.
     True,
@@ -26,7 +26,8 @@ pub(crate) enum Flag {
 }
 
 impl Flag {
-    pub(crate) fn parse(v: Option<&str>) -> Self {
+    /// `v` is the variable's value (`None`: unset); any case, untrimmed.
+    pub fn parse(v: Option<&str>) -> Self {
         match v.map(str::to_ascii_lowercase).as_deref() {
             None | Some("") => Self::Unset,
             Some("1" | "true" | "yes" | "on") => Self::True,
