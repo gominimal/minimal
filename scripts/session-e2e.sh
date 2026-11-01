@@ -27424,13 +27424,32 @@ proof_names_survive_restart_and_second_vm() {
 
   # The zone-answerer start records every VM host daemon of this state base
   # wrote, in the one log directory they share, plus each VM's run.log.
-  nrv_answerer_lines() {
-    local f
+  nrv_log_files() {
     {
       find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null
       find "$XDG_STATE_HOME/minimal/providers/local-minvmd0" -maxdepth 2 -name run.log -type f 2>/dev/null
-    } | sort -u | while IFS= read -r f; do
+    } | sort -u
+  }
+  nrv_answerer_lines() {
+    local f
+    nrv_log_files | while IFS= read -r f; do
       grep -h -- 'zone-answerer' "$f" 2>/dev/null || true
+    done
+  }
+  # A mark is one "<line count>\t<path>" row per log file. Earlier e2e cases
+  # write to the same logs, so a check about this case reads only the lines
+  # after its mark. A file that is new since the mark is read whole.
+  nrv_log_mark() {
+    local f
+    nrv_log_files | while IFS= read -r f; do
+      printf '%s\t%s\n' "$(wc -l < "$f" 2>/dev/null || echo 0)" "$f"
+    done
+  }
+  nrv_answerer_lines_since() {
+    local mark="$1" f n
+    nrv_log_files | while IFS= read -r f; do
+      n="$(printf '%s\n' "$mark" | awk -F'\t' -v f="$f" '$2 == f { n = $1 } END { print n + 0 }')"
+      tail -n "+$((n + 1))" "$f" 2>/dev/null | grep -h -- 'zone-answerer' || true
     done
   }
   nrv_start_records() {
@@ -27573,6 +27592,7 @@ proof_names_survive_restart_and_second_vm() {
 
   # ---- 3. a second VM beside the first --------------------------------------
   before_records="$(nrv_start_records)"
+  nrv_beta_mark="$(nrv_log_mark)"
   NRV_VM_NAME="$vm"
   # shellcheck disable=SC2086
   b_sid="$(cd "$NRV_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
@@ -27609,10 +27629,15 @@ proof_names_survive_restart_and_second_vm() {
     nrv_diag
     fail
   fi
+  # Contention shows only in lines written since VM $NRV_VM_NAME started.
+  # Earlier cases, before the answerer service existed, wrote "not answered"
+  # lines to the same logs, and those are no evidence about this pair.
   # Capture first, as above: a SIGPIPE on the producer must not hide a match.
-  nrv_lines="$(nrv_answerer_lines)"
+  nrv_lines="$(nrv_answerer_lines_since "$nrv_beta_mark")"
   if [[ "$nrv_lines" == *"box names are not answered on the host"* ]]; then
     echo "::error::a VM host daemon says its box names are not answered on the host: the two daemons contended for the DNS service"
+    echo "--- zone-answerer lines since VM $NRV_VM_NAME started ---"
+    printf '%s\n' "$nrv_lines" | grep -F -- 'box names are not answered on the host' | sed 's/^/  /' || true
     nrv_diag
     fail
   fi
