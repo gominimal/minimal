@@ -633,12 +633,10 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // and its own `DNS SERVICE` row — a VM whose minvmd holds the port
     // is named there, and a sibling registered with another daemon says
     // who holds it, so no row speaks with another VM's state. Read in the
-    // modes that can print them, like the detection below it: `--raw` is
-    // machine-readable-only and pays no host read. `--json` reads the status
-    // too, because its proxy-down verdict decides whether the document
-    // carries `hostname_proxy_ports`, the same as the HOSTNAME PROXY row.
-    // It still pays no detection query: its surfaces stay empty.
-    let vm_answerers: Vec<Option<minimald_rpc::AnswererStatusReply>> = if args.raw {
+    // modes that can print them, like the detection below it: `--json` and
+    // `--raw` are machine-readable-only and pay no host read, socket or
+    // query either one.
+    let vm_answerers: Vec<Option<minimald_rpc::AnswererStatusReply>> = if args.json || args.raw {
         Vec::new()
     } else {
         let mut read = Vec::with_capacity(listings.len());
@@ -1293,7 +1291,7 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
     // caller may have computed nothing.
     let surface_at = |index: usize| surfaces.get(index).cloned().flatten();
     // The host answerer's state for the listing at `index`, `None` when no
-    // read was made for that VM — `--raw` reads nothing, and a
+    // read was made for that VM — a machine mode reads nothing, and a
     // socket or daemon that did not answer keeps the same silence.
     let answerer_at = |index: usize| vm_answerers.get(index).cloned().flatten();
     if let [only] = listings {
