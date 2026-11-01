@@ -13859,8 +13859,9 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #                box above holds is answered SERVFAIL (BEP-062).
 # A lane without the live proxy records the whole case NOT RUN. Admission refuses
 # `dns` steering with a credentialed upstream until the proxy takes a direct
-# TLS connection (#2805), so until then the case records NOT RUN with that
-# refusal as its gate. The stored value is never printed.
+# TLS connection (#2805). Until then the case records a KNOWN GAP that cites
+# #2805, with that refusal. When #2805 lands, the refusal becomes a hard
+# failure. The stored value is never printed.
 proof_bep_dns_steering_through_the_box_zone_resolver() {
   echo "::group::DNS steering through the box-zone resolver: store upstream and GitHub through the proxy, SERVFAIL while it is down"
   local bz_case=bep_dns_steering_through_the_box_zone_resolver
@@ -13917,7 +13918,9 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
 
   # Activates the box named $2 from GRANT_SEED_DIR with egress to the names
   # after it, and prints its id. Returns 3 when admission refuses dns
-  # steering, and records why in $WORK/$bz_case.refused.
+  # steering with a credentialed upstream (#2805), and records why in
+  # $WORK/$bz_case.refused. Any other refusal fails: after bep_live_gate the
+  # host is minvmd and the box is own_ip, so its switch resolves box names.
   bz_activate() { # $1 leg, $2 name, $3... egress names
     local ba_leg="$1" ba_name="$2" ba_out ba_flags=() ba_h
     shift 2
@@ -13930,11 +13933,6 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
     }
     if grep -q 'does not yet take a direct TLS connection' "$WORK/$bz_case.$ba_leg.activate.err" 2>/dev/null; then
       echo "admission refuses steering = \"dns\" for a box with a credentialed upstream: the proxy takes no direct TLS connection yet (#2805)" \
-        >"$WORK/$bz_case.refused"
-      return 3
-    fi
-    if grep -q 'has no box DNS resolver' "$WORK/$bz_case.$ba_leg.activate.err" 2>/dev/null; then
-      echo "admission refuses steering = \"dns\": this host's switch resolves no box names" \
         >"$WORK/$bz_case.refused"
       return 3
     fi
@@ -14043,7 +14041,7 @@ print(rcode, an, addr)' "$dq_b64"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   if [ "$bz_status" = 3 ]; then
     BZ_STORE_SID=""
-    not_run "$bz_case" "$(cat "$WORK/$bz_case.refused")"
+    known_gap "$bz_case" "$(cat "$WORK/$bz_case.refused")"
     bz_cleanup
     rm -f "${WORK:?}/${bz_case:?}".*
     echo "::endgroup::"
@@ -14103,8 +14101,19 @@ print(rcode, an, addr)' "$dq_b64"
     } > "$GRANT_SEED_DIR/minimal.toml"
     mkdir "$GRANT_SEED_DIR/.git"
     BZ_GIT_SID="$(bz_activate git e2e-bep-dns-git \
-      github.com api.github.com uploads.github.com codeload.github.com)" || bz_fail
+      github.com api.github.com uploads.github.com codeload.github.com)"
+    bz_status=$?
     rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  fi
+  if [ "$bz_status" = 3 ]; then
+    # The same #2805 refusal the store leg handles, met by the grant box.
+    BZ_GIT_SID=""
+    known_gap "$bz_case/git" "$(cat "$WORK/$bz_case.refused")"
+    bz_summary="${bz_summary}git: KNOWN GAP ($(cat "$WORK/$bz_case.refused"))"$'\n'
+  elif [ "$bz_status" = 1 ]; then
+    bz_fail
+  elif [ "$bz_status" = 0 ]; then
+    [ -n "$BZ_GIT_SID" ] || { echo "::error::'min session activate' of the dns-steered grant box printed no box id"; bz_fail; }
     bz_no_proxy_env "$BZ_GIT_SID" git || bz_fail
     bz_steered_to_proxy "$BZ_GIT_SID" github.com || bz_fail
     if ! mnl session exec "$BZ_GIT_SID" sh -c \
