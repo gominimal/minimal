@@ -20134,20 +20134,26 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #   * the escape leg (NET-085): a root escapee wearing the node's own
 #     address speaks the shuttle protocol at the gate's landing edge (the
 #     escape-union case's spoofer, read out of this script) toward the
-#     runner's interface address, which no baseline entry pins. The gate
-#     drops it under `egress-node-plane-unpinned`, its line names the source
-#     and the destination, and the host listener sees no marker.
+#     runner's interface address, which no baseline entry pins. That
+#     address is also an infrastructure destination, and the gate checks the
+#     infrastructure deny set before the node-plane pin. So the gate drops it
+#     under `egress-infrastructure-destination` or
+#     `egress-node-plane-unpinned`, its line names the source and the
+#     destination, and the host listener sees no marker. A second frame from
+#     the node's address goes to the build leg's TEST-NET-2 address, which is
+#     no infrastructure destination and no pin. The gate drops it under
+#     `egress-node-plane-unpinned`, which proves the pin itself.
 #
 # The build leg runs before the escape leg on purpose: the gate writes one
 # line per source per rule per 60 s, and both legs' lines are the node
-# address's under the same rule, so the escape leg waits out the window the
-# build leg's line opened. Every leg's failure prints the record it expected
+# address's under the same rule, so each escape probe waits out the window
+# that the line before it opened. Every leg's failure prints the record it expected
 # and the host log lines it searched.
 proof_escapes_and_builds_stay_inside_box_rules() {
   local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
   local ebr_line="" ebr_log0="" ebr_log0_lines=0 ebr_boot="" ebr_boot0_lines=0
   local ebr_gate_sock="" ebr_listener_log="" ebr_rows="" ebr_cid="" ebr_prior=0
-  local ebr_policy="" ebr_rc=""
+  local ebr_policy="" ebr_rc="" ebr_prior_infra=0 ebr_prior_pin=0
   local ebr_pkg="e2e-ebr-fetch" ebr_build_dst="198.51.100.9"
   echo "::group::escapes and builds stay inside the box's rules (NET-085, NET-139, NET-155)"
 
@@ -20517,11 +20523,23 @@ attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build f
   echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
 
   # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
-  # The build leg's line opened the gate's 60 s window for this source and
-  # rule. Wait it out, so this leg's own line is not silenced.
+  # Two probes, each after a 61 s wait: the build leg's line, and the first
+  # probe's line, each open the gate's 60 s window for this source and rule.
+  #
+  # Probe 1 aims at the runner's own address, where the host listener sits.
+  # That address is also an infrastructure destination, and the gate checks
+  # the infrastructure deny set before the node-plane pin. So its drop line
+  # can carry either rule. The leg accepts either, and asserts the source,
+  # the destination and no marker at the listener.
+  #
+  # Probe 2 proves the node-plane pin itself: it aims at a TEST-NET-2
+  # address that is no infrastructure destination and no baseline pin, so
+  # only the pin can drop it, under egress-node-plane-unpinned.
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
   sleep 61
-  EBR_EXPECTED="the spoofer's flow from $ebr_node refused, no marker at the listener, and an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_host"
-  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)"
+  EBR_EXPECTED="the spoofer's flow from $ebr_node toward $ebr_host refused, no marker at the listener, and an egress-infrastructure-destination or egress-node-plane-unpinned line with source $ebr_node and destination $ebr_host"
+  ebr_prior_infra="$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | wc -l)"
+  ebr_prior_pin="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)"
   if ! ebr_out="$(python3 "$WORK/ebr-spoofer.py" --gate "$ebr_gate_sock" \
       --src "$ebr_node" --dst "$ebr_host" --port "$EBR_LISTEN_PORT" \
       --marker ebr-spoof-node-arrived --deadline 5 --claim no \
@@ -20542,13 +20560,52 @@ attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build f
     echo "::error::the flow wearing the node's address was refused, but its marker reached the host listener"
     ebr_fail
   fi
+  ebr_line=""
+  for _ in $(seq 1 40); do
+    if [ "$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | wc -l)" -gt "$ebr_prior_infra" ]; then
+      ebr_line="$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | tail -n1)"
+      break
+    fi
+    if [ "$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)" -gt "$ebr_prior_pin" ]; then
+      ebr_line="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | tail -n1)"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$ebr_line" ]; then
+    echo "::error::the gate wrote no egress-infrastructure-destination or egress-node-plane-unpinned line for $ebr_node toward $ebr_host ($ebr_prior_infra and $ebr_prior_pin such line(s) before the probe)"
+    ebr_fail
+  fi
+  ebr_rows="$ebr_rows
+attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$EBR_LISTEN_PORT refusal=no SYN-ACK, no marker record=gate: $ebr_line"
+
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
+  sleep 61
+  EBR_EXPECTED="the spoofer's flow from $ebr_node toward $ebr_build_dst:443 refused, and an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
+  if ! ebr_out="$(python3 "$WORK/ebr-spoofer.py" --gate "$ebr_gate_sock" \
+      --src "$ebr_node" --dst "$ebr_build_dst" --port 443 \
+      --marker ebr-spoof-node-unpinned --deadline 5 --claim no \
+      2>"$WORK/ebr-spoof-pin.err")"; then
+    echo "::error::the spoofer could not speak to the gate at $ebr_gate_sock"
+    cat "$WORK/ebr-spoof-pin.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "attempt: a frame from the node's address $ebr_node toward $ebr_build_dst:443: $ebr_out"
+  case "$ebr_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::a flow wearing the node's address completed toward $ebr_build_dst, which no baseline entry pins"
+      ebr_fail
+      ;;
+  esac
   ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
-    "$ebr_host" "$ebr_prior")" || {
-    echo "::error::the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_host ($ebr_prior such line(s) before the leg)"
+    "$ebr_build_dst" "$ebr_prior")" || {
+    echo "::error::the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the probe)"
     ebr_fail
   }
   ebr_rows="$ebr_rows
-attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$EBR_LISTEN_PORT refusal=no SYN-ACK, no marker record=gate: $ebr_line"
+attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_build_dst:443 refusal=no SYN-ACK record=gate: $ebr_line"
   echo "escape leg OK: the node's address reached nothing outside the baseline set"
 
   echo "each leg's attempt, its refusal and the host-side record:"
@@ -20562,7 +20619,7 @@ attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$
   EBR_LISTENER_PID=""
   rm -rf "$EBR_SEED_DIR"
   EBR_SEED_DIR=""
-  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock, and a vsock socket refused inside the box has no host-side record; the deny-all box's build and a frame wearing the node's address each reached nothing outside the box's rules and the baseline set, each with its gate record). NET-085 NET-139 NET-155"
+  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock, and a vsock socket refused inside the box has no host-side record; the deny-all box's build and two frames wearing the node's address each reached nothing outside the box's rules and the baseline set, each with its gate record). NET-085 NET-139 NET-155"
   echo "::endgroup::"
 }
 
