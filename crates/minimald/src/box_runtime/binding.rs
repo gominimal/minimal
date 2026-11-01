@@ -598,8 +598,13 @@ impl Binding {
         // flood of output the mailbox arm fires every turn, so the input
         // behind it would never reach the host.
         let mut slot: Option<SlotWait> = None;
+        // Set once the host has dropped its stdin receiver. Input stops
+        // there, but the mailbox is still drained to its end: the host
+        // queues its teardown (the shell-exit prompt among them) before the
+        // receiver goes, and the client is owed it.
+        let mut input_closed = false;
         let exit_reason = loop {
-            if slot.is_none() && !to_host.is_empty() {
+            if slot.is_none() && !to_host.is_empty() && !input_closed {
                 slot = Some(Box::pin(self.stdin_tx.clone().reserve_owned()));
             }
             if let Some((port, reply)) = pending_asks.pop_front() {
@@ -800,7 +805,10 @@ impl Binding {
                     slot_used = true;
                     match permit {
                         Ok(permit) => { permit.send(StdinMsg::new(self.generation, to_host.pop_front().expect("a slot is waited for only with input queued"))); }
-                        Err(_) => break MainloopExitReason::HostGone,
+                        Err(_) => {
+                            input_closed = true;
+                            to_host.clear();
+                        }
                     }
                 },
                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
@@ -845,11 +853,14 @@ impl Binding {
                                         slot = None;
                                         match permit {
                                             Ok(permit) => { permit.send(StdinMsg::new(self.generation, to_host.pop_front().expect("a slot is waited for only with input queued"))); }
-                                            Err(_) => break Some(MainloopExitReason::HostGone),
+                                            Err(_) => {
+                                                input_closed = true;
+                                                to_host.clear();
+                                            }
                                         }
                                     },
                                 }
-                                if slot.is_none() && !to_host.is_empty() {
+                                if slot.is_none() && !to_host.is_empty() && !input_closed {
                                     slot = Some(Box::pin(self.stdin_tx.clone().reserve_owned()));
                                 }
                             };
