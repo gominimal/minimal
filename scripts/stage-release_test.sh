@@ -404,6 +404,28 @@ while IFS=$'\t' read -r _ flat; do
     fi
 done <<<"$bep_table"
 
+# --allow-missing without the bep program omits the bin/bep link too, so a
+# backfill never replaces a working bin/bep with a dangling link.
+mkdir -p "$root/artifacts-partial"
+rm -f "$root/artifacts-partial"/*
+cp "$root/artifacts-bundle"/* "$root/artifacts-partial/"
+rm "$root/artifacts-partial/bep-macos-arm64"
+partial_rc=0
+partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" --bucket gs://test-bucket \
+    --version 0.6.0 --allow-missing --dry-run 2>&1)" || partial_rc=$?
+if [ "$partial_rc" -eq 0 ] \
+    && [ -z "$(printf '%s\n' "$partial_out" | awk '$1 == "bep" && $6 == "symlink"')" ] \
+    && [[ "$partial_out" == *"omitting link bep/darwin/arm64"* ]]; then
+    ok "--allow-missing without the bep program omits the bin/bep link"
+else
+    bad "--allow-missing without the bep program still links bin/bep (rc=$partial_rc, out: $partial_out)"
+fi
+if [ -n "$(printf '%s\n' "$partial_out" | awk '$1 == "git-remote-min" && $2 == "darwin" && $6 == "symlink"')" ]; then
+    ok "a link whose target is staged still stages"
+else
+    bad "the git-remote-min link went missing (out: $partial_out)"
+fi
+
 # Every other binary stays required: the same fixture without minvmd's arm64
 # artifact fails the stage naming it.
 rm "$root/artifacts-no-answerer/minvmd-linux-arm64"

@@ -367,6 +367,23 @@ for entry in "${COMPONENTS[@]}"; do
     # A symlink row ships no artifact: the last field is the link target and
     # the sha256 column is the `-` placeholder the installer expects (R5.6).
     if [ "$kind" = symlink ]; then
+        # A link to a file another row installs stages only with that file.
+        # With --allow-missing and the file's artifact absent, the link would
+        # replace a working file with a dangling link, so it is omitted too.
+        link_target="${dest%/*}/$basename"
+        target_missing=""
+        for target in "${COMPONENTS[@]}"; do
+            IFS='|' read -r tcomp tos tarch tkind tdest tbasename <<<"$target"
+            if [ "$tos|$tarch|$tkind|$tdest" = "$os|$arch|file|$link_target" ] \
+                && [ ! -f "$staged_dir/$tbasename" ] && [ ! -f "$ARTIFACTS_DIR/$tbasename" ]; then
+                target_missing="$tcomp"
+            fi
+        done
+        if [ -n "$target_missing" ]; then
+            printf 'stage-release: warning: omitting link %s/%s/%s: the %s artifact it points to is missing\n' \
+                "$comp" "$os" "$arch" "$target_missing" >&2
+            continue
+        fi
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             "$comp" "$os" "$arch" "$VERSION" "-" "$kind" "$dest" "$basename" >>"$manifest"
         continue
