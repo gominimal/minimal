@@ -15720,7 +15720,8 @@ PY
 #     reads cleanly and says the box has no child boxes. No box gets a
 #     parent today (minimald stamps none until the creating connection can
 #     carry the caller's box identity, BOX-001 and BOX-140), so the merge of
-#     a child's records is a KNOWN GAP on the live path.
+#     a child's records is a KNOWN GAP on the live path. The issue
+#     https://github.com/gominimal/minimal/issues/2828 owns that gap.
 #   bep_ahm_relayed_response_has_no_alt_svc: a response relayed through the
 #     proxy carries no Alt-Svc header (BEP-076). The leg also says if the
 #     upstream sent one on this run, read directly from the host.
@@ -15873,7 +15874,7 @@ proof_bep_ahm_parent_merges_children() {
     ahm_fail
   fi
   echo "min box audit --parent $AHM_SID: no records, and it says the box has no child boxes"
-  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; no issue tracks this gap yet"
+  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; https://github.com/gominimal/minimal/issues/2828"
 }
 
 proof_bep_ahm_relayed_response_has_no_alt_svc() {
