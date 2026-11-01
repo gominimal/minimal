@@ -246,9 +246,22 @@ COMPONENTS=(
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The Box Egress Proxy minvmd starts beside gvproxy at boot. minvmd looks
     # for it beside its own binary (resolve_bep_binary in
-    # crates/minvmd/src/cmd/run.rs), so it stages into bin/ next to minvmd.
+    # crates/minvmd/src/cmd/run.rs), so bin/bep is a link to the program in
+    # bin/bep.app. The program ships inside bep.app because its keychain
+    # entitlement holds only in a bundle with a provisioning profile
+    # (scripts/build-bep-bundle.sh, #2812). Each bundle file stages under the
+    # flat name `build-bep-bundle.sh table` gives it, and
+    # stage-release_test.sh fails when these rows disagree with it. Every
+    # row is required, so a release with part of the bundle fails the stage.
+    # The installer works through the rows in order, so the link comes last:
+    # an earlier plain bin/bep stays in place until the whole bundle is down.
     # macOS only: the proxy does not run on Linux.
-    "bep|darwin|arm64|file|bin/bep|bep-macos-arm64"
+    "bep-program|darwin|arm64|file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"
+    "bep-info|darwin|arm64|file|bin/bep.app/Contents/Info.plist|bep-macos-arm64-Info.plist"
+    "bep-profile|darwin|arm64|file|bin/bep.app/Contents/embedded.provisionprofile|bep-macos-arm64-profile"
+    "bep-seal|darwin|arm64|file|bin/bep.app/Contents/_CodeSignature/CodeResources|bep-macos-arm64-CodeSignature"
+    "bep-ticket|darwin|arm64|file|bin/bep.app/Contents/CodeResources|bep-macos-arm64-ticket"
+    "bep|darwin|arm64|symlink|bin/bep|bep.app/Contents/MacOS/bep"
     # The trimmed libkrun minvmd links against (built by the release workflow's
     # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
@@ -354,6 +367,23 @@ for entry in "${COMPONENTS[@]}"; do
     # A symlink row ships no artifact: the last field is the link target and
     # the sha256 column is the `-` placeholder the installer expects (R5.6).
     if [ "$kind" = symlink ]; then
+        # A link to a file another row installs stages only with that file.
+        # With --allow-missing and the file's artifact absent, the link would
+        # replace a working file with a dangling link, so it is omitted too.
+        link_target="${dest%/*}/$basename"
+        target_missing=""
+        for target in "${COMPONENTS[@]}"; do
+            IFS='|' read -r tcomp tos tarch tkind tdest tbasename <<<"$target"
+            if [ "$tos|$tarch|$tkind|$tdest" = "$os|$arch|file|$link_target" ] \
+                && [ ! -f "$staged_dir/$tbasename" ] && [ ! -f "$ARTIFACTS_DIR/$tbasename" ]; then
+                target_missing="$tcomp"
+            fi
+        done
+        if [ -n "$target_missing" ]; then
+            printf 'stage-release: warning: omitting link %s/%s/%s: the %s artifact it points to is missing\n' \
+                "$comp" "$os" "$arch" "$target_missing" >&2
+            continue
+        fi
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             "$comp" "$os" "$arch" "$VERSION" "-" "$kind" "$dest" "$basename" >>"$manifest"
         continue
