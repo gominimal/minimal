@@ -691,9 +691,11 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // over that VM's own control socket, all VMs at once so a VM that does
     // not answer costs one read timeout in total. `None` is a VM that gave
     // no answer: no socket, a timeout, or a daemon without the read.
-    // `--raw` prints bare ids only, so it pays no read. The count is a
-    // field on the `ListSessions` span.
-    let mirror_collisions: Vec<Option<Vec<u16>>> = if args.raw {
+    // `--raw` prints bare ids only, so it pays no read. A native host has
+    // no VM host daemon, so it mirrors no port and pays no read either: the
+    // fallback listing's control socket there is minimald's, which does not
+    // serve this read. The count is a field on the `ListSessions` span.
+    let mirror_collisions: Vec<Option<Vec<u16>>> = if args.raw || !global.use_minvmd() {
         Vec::new()
     } else {
         let span = tracing::info_span!("ListSessions", mirror_collisions = tracing::field::Empty);
