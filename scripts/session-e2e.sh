@@ -15893,7 +15893,7 @@ proof_bep_ahm_relayed_response_has_no_alt_svc() {
     not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header on this run, so the proxy had none to remove"
     return 0
   fi
-  echo "api.github.com read directly from the host (no credential, 401) sends '$as_direct'"
+  echo "api.github.com read directly from the host with no credential sends '$as_direct'"
   # gh prints the response's status line and headers before the body.
   if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api --include user' \
     >"$WORK/$as_case.relayed" 2>&1; then
