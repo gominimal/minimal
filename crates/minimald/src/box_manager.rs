@@ -680,7 +680,7 @@ impl BoxManagerHandle {
 
     /// Hands the name row that the reaped box `reaped` held to the next
     /// retained box with the same name (NET-012, NET-128). A running box
-    /// comes first, else the box that ended last. The manager registers
+    /// comes first, else the most recent creation. The manager registers
     /// the row, and a stopped or exited box holds it as a stopped box. With
     /// no such box, the name answers nothing. A failure here does not fail
     /// the reap: the daemon log names it.
@@ -721,26 +721,21 @@ impl BoxManagerHandle {
             .filter(|record| matches!(record.state(), Ok(RecordState::Running)))
             .map(|record| record.id)
             .min();
-        let successor = match running {
-            Some(id) => Some(id),
-            None => {
-                let mut ended = Vec::new();
-                for record in holders.iter().filter(|record| {
+        // The order of `boxes::resolve_on_host` and the store's
+        // `find_by_name`: the running holder, else the most recent
+        // creation, which is the greatest UUIDv7 id.
+        let successor = running.or_else(|| {
+            holders
+                .iter()
+                .filter(|record| {
                     matches!(
                         record.state(),
                         Ok(RecordState::Stopped(_) | RecordState::Exited(_))
                     )
-                }) {
-                    let at = match self.box_events(record.id).await {
-                        Ok(mut reader) => reader.read_new().ok(),
-                        Err(_) => None,
-                    }
-                    .and_then(|events| ended_at(&events));
-                    ended.push((at, record.id));
-                }
-                ended.into_iter().max().map(|(_, id)| id)
-            }
-        };
+                })
+                .map(|record| record.id)
+                .max()
+        });
         let Some(successor) = successor else {
             tracing::info!(
                 session_id = %reaped,

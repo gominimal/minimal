@@ -4687,14 +4687,15 @@ async fn stop(mngr: &BoxManagerHandle, id: SessionId) {
 /// BOX-019, NET-012, NET-128: a reap of the box that holds a name's row
 /// hands the row to another retained box with that name, so the name
 /// answers as long as one box with it is retained. A forced reap of a
-/// running box beside a stopped one does the same. Once the last holder
-/// is reaped, the name answers nothing.
+/// running box beside a stopped one does the same. With two stopped
+/// holders, the row goes to the most recent creation, not to the box that
+/// ended last. Once the last holder is reaped, the name answers nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reap_hands_name_to_retained_holder() {
     use boxes::core::record::RecordState;
 
     let log = crate::test_harness::captured_log();
-    let (_state, _cache, mngr) = manager().await;
+    let (state, _cache, mngr) = manager().await;
 
     // `dev` stops, and holds its row as a stopped box.
     let first = host_net_box(&mngr, "dev").await;
@@ -4720,9 +4721,31 @@ async fn reap_hands_name_to_retained_holder() {
     assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(first));
     assert_eq!(answers_to(&mngr, "dev").await, Some(first));
 
+    // Two stopped `dev` holders beside a running one. The earlier-created
+    // `first` ended last, and the later-created `fourth` still gets the
+    // row when the running one is reaped.
+    let fourth = host_net_box(&mngr, "dev").await;
+    stop(&mngr, fourth).await;
+    let fifth = host_net_box(&mngr, "dev").await;
+    write_exited_event(
+        state.path(),
+        first,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+    )
+    .await;
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fifth));
+    mngr.reap_box(fifth, true).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth, fifth]), Some(fourth));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(fourth));
+    mngr.reap_box(fourth, false).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, fourth]), Some(first));
+
     // The last holder goes: the name answers nothing.
     mngr.reap_box(first, false).await.unwrap();
-    assert_eq!(row_of(&mngr, "dev", &[first, second, third]), None);
+    assert_eq!(
+        row_of(&mngr, "dev", &[first, second, third, fourth, fifth]),
+        None
+    );
     assert_eq!(answers_to(&mngr, "dev").await, None);
 
     let logged = log.contents();
