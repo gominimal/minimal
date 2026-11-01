@@ -118,13 +118,17 @@ included, with every refusal logged (NET-001 to NET-004).
 
 Terms for box lifetimes, read against the five box states of the
 [BOX spec](../29-spec-box-local-first/29-spec-box-local-first.md) (BOX-011).
-A box *exists* while its record is `running`. A box is *destroyed* when it is
-reaped (BOX-019, BOX-021), not when it stops or exits. A `stopped` or `exited`
+A box *exists* from its creation until `rm` or `prune` removes its record,
+in all five states, so a `stopped` or `exited` box still exists. A box is
+*destroyed* when it is removed. A box is *removed* when `rm` or `prune` reaps
+its record, its events and its filesystem (BOX-019, BOX-021). A forced `rm`
+of a running box stops it first. A box *ends* when it leaves `running` for
+`stopped` or `exited`. A `stopped` or `exited`
 box keeps its record, its name in the zone and its loopback address until the
 reap. For a box on a shared address, while no running box holds that name, an
 A lookup of the name answers NODATA (NET-128). The name answers again when a
-box that holds it returns to `running`. This document takes the reading that
-the BOX spec proposes on gominimal/minimal#2041.
+box that holds it returns to `running`. These terms follow the decision in
+[gominimal/minimal#2041](https://github.com/gominimal/minimal/issues/2041#issuecomment-6525152822).
 
 - **NET-001** WHEN a request arrives at the hostname proxy for the `<name>.min.internal` name of an active box THE SYSTEM SHALL route it to that box, own-address sessions on the VM host included.
   tier:     T0
@@ -172,7 +176,7 @@ the BOX spec proposes on gominimal/minimal#2041.
 - **NET-010** WHERE the reserved local range is present on the host, WHEN an own-address or `none` box is published THE SYSTEM SHALL assign it a host loopback address of its own from the host-global allocation and publish its ports at the box's own port numbers.
   tier:     T2
   verify:   cargo nextest run -p minimald each_box_gets_own_loopback_address
-  property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
+  property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 retained boxes, no two retained own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across allocators; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any allocator's own state
   <!-- S1b-2a; prose 6; event-driven; a box holds its address from the publish until it is destroyed, which is its reap (Requirements terms; gominimal/minimal#2041): a stopped or exited box keeps its grant, so a resume publishes at the same address, and only the reap frees it to the allocator below; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
   - WHEN the allocator frees a box's host loopback address THE SYSTEM SHALL hold it back from allocation for the positive answer TTL.
