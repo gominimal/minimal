@@ -1565,7 +1565,11 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                         proxy_publish.clone(),
                         proxy_reclaim_check(ports_dir.clone()),
                     ),
-                    proxy_reclaim_publisher(switch_sock.clone(), boxes.subnet().daemon_ip()),
+                    proxy_reclaim_publisher(
+                        switch_sock.clone(),
+                        boxes.subnet().daemon_ip(),
+                        boxes.table(),
+                    ),
                     move |preferred| recorded.add_preferred(preferred),
                 )
             })
@@ -2877,27 +2881,46 @@ pub(crate) fn proxy_reclaim_check(
 
 /// The reclaim watcher's publish (NET-150): asks the switch at `switch_sock`
 /// to listen on `127.0.0.1:<preferred>` and forward to the guest proxy at
-/// `node`'s `<substitute>` port. The guest's own publish of the substitute
-/// already opens that inside port at the gate, so the replies on the second
-/// listener pass the gate the same way.
+/// `node`'s `<substitute>` port.
+///
+/// The forward is noted in the egress gate's publish ledger first, as the
+/// node mirror's binds are ([`SwitchMirrorBinder`]), so the gate tracks the
+/// connections it carries and admits the replies on them. A gate that is
+/// not running, or a ledger that refuses the note, publishes nothing. The
+/// switch's `proxy already running` answer counts as success only when the
+/// ledger already held this same forward. Otherwise some other forward
+/// holds the listener, and the attempt fails. A note this attempt made goes
+/// when the expose fails.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn proxy_reclaim_publisher(
     switch_sock: std::path::PathBuf,
     node: std::net::Ipv4Addr,
+    table: crate::box_registry::BoxTable,
 ) -> impl FnMut(u16, u16) -> Result<(), String> + Send + 'static {
     move |preferred, substitute| {
+        let listener = std::net::Ipv4Addr::LOCALHOST;
+        let ledger = table
+            .mirror_ledger()
+            .ok_or_else(|| "the egress gate is not running".to_string())?;
+        let noted = ledger
+            .note_forward(listener, preferred, node, substitute)
+            .map_err(|refused| refused.to_string())?;
         let body = format!(
-            r#"{{"local":"127.0.0.1:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
+            r#"{{"local":"{listener}:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
         );
-        match post_switch_forwarder(&switch_sock, "expose", &body) {
+        let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
             Ok((status, _)) if (200..300).contains(&status) => Ok(()),
-            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
+            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
             Ok((status, answer)) => Err(format!(
                 "the switch answered the expose with HTTP {status}: {:?}",
                 answer.trim()
             )),
             Err(error) => Err(format!("the expose went unanswered: {error}")),
+        };
+        if noted && result.is_err() {
+            ledger.forget_bind(listener, preferred, node);
         }
+        result
     }
 }
 

@@ -284,6 +284,16 @@ mod tests {
     /// A stand-in switch: answers every forwarder request with HTTP 200 and
     /// hands each request's text to the test.
     fn fake_switch(sock: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
+        fake_switch_answering(sock, 200, "")
+    }
+
+    /// A stand-in switch that answers every forwarder request with `status`
+    /// and `body`, and hands each request's text to the test.
+    fn fake_switch_answering(
+        sock: &std::path::Path,
+        status: u16,
+        body: &'static str,
+    ) -> std::sync::mpsc::Receiver<String> {
         use std::io::{Read as _, Write as _};
         let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -312,7 +322,11 @@ mod tests {
                         }
                     }
                 }
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
                 let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
             }
         });
@@ -338,6 +352,14 @@ mod tests {
         let substitute = 65264;
         let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
 
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
+            &registry.table(),
+            switch_sock.clone(),
+        );
+
         let status = crate::control::ProxyPublishStatus::new();
         status.set_serving(substitute);
         let recorded = status.clone();
@@ -346,7 +368,7 @@ mod tests {
             substitute,
             Duration::from_millis(50),
             crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
-            crate::cmd::run::proxy_reclaim_publisher(switch_sock.clone(), node),
+            crate::cmd::run::proxy_reclaim_publisher(switch_sock.clone(), node, registry.table()),
             move |port| recorded.add_preferred(port),
         );
 
@@ -379,11 +401,71 @@ mod tests {
         }
         assert!(watcher.reclaimed());
         assert_eq!(status.serving_ports(), vec![preferred, substitute]);
+        // The forward is noted in the egress gate's ledger, so the gate
+        // tracks its connections and admits the replies on them.
+        assert_eq!(
+            ledger.dials(std::net::Ipv4Addr::LOCALHOST, preferred),
+            Some(node)
+        );
         // The watcher holds the preferred port's reservation: a second
         // supervisor's check skips it.
         assert!(crate::cmd::run::proxy_reclaim_check(ports_dir.clone())(preferred).is_none());
         // One expose, never a second.
         assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(watcher);
+    }
+
+    // NET-150: a `proxy already running` answer to an expose the ledger did
+    // not already hold means another forward holds the listener. The watcher
+    // does not count that port as the proxy's, and the ledger keeps no note.
+    #[test]
+    fn proxy_reclaims_preferred_port_when_free_not_on_a_listener_held_elsewhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ports_dir = dir.path().join("ports");
+        std::fs::create_dir(&ports_dir).expect("ports dir");
+        let switch_sock = dir.path().join("switch.sock");
+        let requests = fake_switch_answering(&switch_sock, 500, "proxy already running\n");
+
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
+            &registry.table(),
+            switch_sock.clone(),
+        );
+
+        // A free port: the check takes it on the first probe.
+        let preferred = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a free port")
+            .local_addr()
+            .expect("free addr")
+            .port();
+        let substitute = 65264;
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+        let status = crate::control::ProxyPublishStatus::new();
+        status.set_serving(substitute);
+        let recorded = status.clone();
+        let watcher = spawn_reclaim_watcher(
+            preferred,
+            substitute,
+            Duration::from_millis(50),
+            crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
+            crate::cmd::run::proxy_reclaim_publisher(switch_sock.clone(), node, registry.table()),
+            move |port| recorded.add_preferred(port),
+        );
+
+        requests
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the watcher asks the switch to publish the preferred port");
+        // Let a few more attempts fail the same way.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!watcher.reclaimed());
+        assert_eq!(status.serving_ports(), vec![substitute]);
+        assert_eq!(
+            ledger.dials(std::net::Ipv4Addr::LOCALHOST, preferred),
+            None,
+            "a failed expose leaves no note in the ledger"
+        );
         drop(watcher);
     }
 
