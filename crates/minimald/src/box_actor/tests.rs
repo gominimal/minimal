@@ -1910,8 +1910,8 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
 
 // T42: the actor reads the spec stored at creation, hands it to every
 // launcher it builds, and keeps its own hold, so a relaunch starts the box
-// from the same spec without reading the store again. An exec-minted launch
-// says so, and the launcher then holds the box with its shell.
+// from the same spec without reading the store again. Each launch says that
+// an exec carries the box's run, and the launcher then holds the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     use minimald_rpc::{
@@ -1966,12 +1966,16 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
         .clone()
         .expect("the actor hands over the spec stored at creation");
     assert_eq!(*held, spec, "the stored spec, not a default");
-    assert!(handed.for_exec, "an exec minted this launch");
-    assert_eq!(
-        handed.entrypoint().unwrap(),
-        crate::box_runtime::LaunchEntrypoint::Shell,
-        "the exec runs the box's command, so its launch holds the shell"
-    );
+    // Every launch, not only the exec's: a hook launch or an attach can come
+    // before the exec that runs the box's command.
+    for launch in &first {
+        assert!(launch.run_by_exec, "an exec carries the box's run");
+        assert_eq!(
+            launch.entrypoint().unwrap(),
+            crate::box_runtime::LaunchEntrypoint::Shell,
+            "the exec runs the box's command, so the launch holds the shell"
+        );
+    }
 
     // End the host, and have the next exec launch another one.
     host.kill(false).await.expect("the host takes the kill");
@@ -1990,7 +1994,9 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
 
     let launches = crate::box_actor::launch_spec_seam::observed(session_id);
     assert_eq!(launches.len(), first.len() + 1, "one more launch");
-    let relaunch = launches.last().unwrap().spec.clone().expect("a spec");
+    let relaunch = launches.last().unwrap();
+    assert!(relaunch.run_by_exec, "the relaunch holds the shell too");
+    let relaunch = relaunch.spec.clone().expect("a spec");
     assert!(
         std::sync::Arc::ptr_eq(&relaunch, &held),
         "the actor kept its hold and handed the same spec again"

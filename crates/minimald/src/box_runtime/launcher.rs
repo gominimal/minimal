@@ -155,10 +155,13 @@ pub(crate) struct LaunchSpec {
     /// The spec stored beside the box's record (BOX-068). `None` for a box
     /// filed with no spec: a client that predates it, or the dashboard.
     pub(crate) spec: Option<std::sync::Arc<mfile::spec::BoxSpec>>,
-    /// Whether an exec mints this launch. That exec runs the command the
-    /// box is for, a task's run included, so the box's own first process
-    /// is its shell, as it always was for an exec.
-    pub(crate) for_exec: bool,
+    /// Whether an exec runs the command the box is for. `min task run`
+    /// sends a task's run over the exec channel, so a launch of a box whose
+    /// run comes that way starts the shell, whatever entrypoint its spec
+    /// names. Otherwise the task runs twice. The box's actor sets this on
+    /// every launch, an attach and a hook launch included, while the exec
+    /// channel carries the run.
+    pub(crate) run_by_exec: bool,
 }
 
 /// The first process a launch starts, as [`LaunchSpec::entrypoint`]
@@ -190,7 +193,8 @@ impl std::fmt::Display for LaunchEntrypoint {
 impl LaunchSpec {
     /// The one place a launch decides its box's first process (T42):
     ///
-    /// - a box with no spec, and a launch an exec mints, start the shell;
+    /// - a box with no spec, and a box whose run an exec carries, start the
+    ///   shell;
     /// - otherwise the spec's entrypoint: the shell, or its argv.
     ///
     /// A program word with no `/` names a program under `/usr/bin`, where
@@ -206,7 +210,7 @@ impl LaunchSpec {
         };
         match &spec.entrypoint {
             mfile::spec::Entrypoint::Shell => Ok(LaunchEntrypoint::Shell),
-            mfile::spec::Entrypoint::Exec(_) if self.for_exec => Ok(LaunchEntrypoint::Shell),
+            mfile::spec::Entrypoint::Exec(_) if self.run_by_exec => Ok(LaunchEntrypoint::Shell),
             mfile::spec::Entrypoint::Exec(argv) => {
                 let Some((program, args)) = argv.split_first() else {
                     return Err(io::Error::new(

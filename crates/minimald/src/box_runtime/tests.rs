@@ -7473,7 +7473,7 @@ fn read_pty_until(master: OwnedFd, want: &'static str) -> std::sync::mpsc::Recei
 
 // T42: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
-// unless an exec mints the launch, because that exec runs the task.
+// unless an exec carries the box's run, because that exec runs the task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
@@ -7485,7 +7485,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
         BoxSpec::for_task("lint", &task, SpecFlags::default())
             .expect("a task that is not interactive has a spec"),
     );
-    let launch = |spec: Option<Arc<BoxSpec>>, for_exec: bool| LaunchSpec { spec, for_exec };
+    let launch = |spec: Option<Arc<BoxSpec>>, run_by_exec: bool| LaunchSpec { spec, run_by_exec };
 
     // The decision, for every kind of launch.
     assert_eq!(
@@ -7503,7 +7503,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     assert_eq!(
         launch(Some(task.clone()), true).entrypoint().unwrap(),
         LaunchEntrypoint::Shell,
-        "the exec that mints the launch runs the task, so the box holds its shell"
+        "an exec carries the task's run, so the box holds its shell"
     );
     assert_eq!(
         launch(None, false).entrypoint().unwrap(),

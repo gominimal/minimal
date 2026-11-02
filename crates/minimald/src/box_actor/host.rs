@@ -740,11 +740,6 @@ impl BoxActor {
     /// carry, so the launch-scoped decisions downstream (the
     /// unenforced-placement advisory) can tell a session start from a hook
     /// run.
-    ///
-    /// `for_exec` marks the launch [`Self::ensure_host`] mints for an exec.
-    /// The exec runs the command the box is for, so the launch starts the
-    /// box's shell, whatever entrypoint its spec names. Every other launch
-    /// starts the spec's entrypoint.
     // Left positional: three call sites, each naming every argument it means,
     // so a struct would be ceremony rather than clarity.
     #[expect(
@@ -760,7 +755,6 @@ impl BoxActor {
         progress: Option<ChannelProgress>,
         phase: LaunchPhase,
         for_hooks: bool,
-        for_exec: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
@@ -802,9 +796,15 @@ impl BoxActor {
         );
         // The box starts from its stored spec. The actor keeps its hold, so
         // the next launch reads the same spec.
+        //
+        // An exec runs the box's command: `min task run` sends the task over
+        // the exec channel. A hook launch or an attach can come before or
+        // after that exec, and a hook launch's gated first process starts at
+        // the next attach. So every launch keeps the shell, and the task runs
+        // once.
         let spec = box_runtime::LaunchSpec {
             spec: self.held_spec().await,
-            for_exec,
+            run_by_exec: true,
         };
         let launcher = self
             .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
@@ -1215,8 +1215,6 @@ impl BoxActor {
                 None,
                 LaunchPhase::Attached,
                 false,
-                // Minted for an exec, which runs the box's command itself.
-                true,
             )
             .await?;
 
@@ -1250,7 +1248,6 @@ impl BoxActor {
                 attach_env,
                 Some(progress),
                 LaunchPhase::Attached,
-                false,
                 false,
             )
             .await?;
@@ -1450,9 +1447,6 @@ impl BoxActor {
                 // join — a hook run, not a session start. See
                 // [`BoxActor::launch_host`].
                 true,
-                // The hooks' launch holds the entrypoint at its start gate
-                // until an attach releases it, so it starts the spec's.
-                false,
             )
             .await
             .map_err(|e| {
