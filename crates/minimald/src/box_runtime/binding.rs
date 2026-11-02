@@ -137,7 +137,8 @@ pub(super) enum MainloopExitReason {
     Detach,
     /// Another connection attached, superseding this one.
     Superceded,
-    /// The session process ended; the shell-exit prompt was raised.
+    /// The session process ended. The shell-exit prompt follows only for a
+    /// box that outlives its entrypoint.
     ProcessExited,
     /// The daemon is shutting down.
     Shutdown,
@@ -392,6 +393,10 @@ pub(super) struct Binding {
     /// the shell-exit prompt's Keep item says the session cannot be
     /// attached to again.
     holds_host_row: bool,
+    /// Whether the box ends when its entrypoint returns (see
+    /// [`HostParams::ends_with_entrypoint`]). The daemon then ends the box,
+    /// so a shell exit raises no shell-exit prompt (BOX-038).
+    ends_with_entrypoint: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -466,6 +471,7 @@ impl Binding {
         name: String,
         archives_dir: std::path::PathBuf,
         holds_host_row: bool,
+        ends_with_entrypoint: bool,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -480,6 +486,7 @@ impl Binding {
             name,
             archives_dir,
             holds_host_row,
+            ends_with_entrypoint,
             shed: shed.clone(),
         };
 
@@ -709,6 +716,9 @@ impl Binding {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
+                    // BOX-015: a client that goes away never stops the box.
+                    // Only the read half closes here. The box keeps running,
+                    // and its entrypoint's return or a stop ends it.
                     None => remote_open = false,
                     Some(msg) => {
                         match msg {
@@ -825,6 +835,17 @@ impl Binding {
         // which runs its own hooks instead.
         let session_outlives_us = match exit_reason {
             MainloopExitReason::HostGone => false,
+            // BOX-038: the entrypoint returned, and the daemon ends the box
+            // whether or not a client is attached. Nothing is left to keep
+            // or delete, so no prompt asks, and no detach hook runs: the box
+            // did not outlive this binding.
+            MainloopExitReason::ProcessExited if self.ends_with_entrypoint => {
+                tracing::info!(
+                    session = %self.name,
+                    "the box's entrypoint returned; the box ends, so no shell-exit prompt"
+                );
+                false
+            }
             MainloopExitReason::ProcessExited => {
                 let disposition = Self::shell_exit_prompt(
                     self.delta.as_ref(),
@@ -969,7 +990,7 @@ impl Binding {
                     exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
                     exit_code = ?cause.exit.as_ref().map(|r| r.code),
                     shown = !notices.is_empty(),
-                    "raising the shell-exit prompt",
+                    "the session process ended; tearing the attach down",
                 );
                 // `\r\n`: the remote terminal is in raw mode, so a bare
                 // newline stair-steps off the right margin.

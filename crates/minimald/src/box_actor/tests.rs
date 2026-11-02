@@ -14963,6 +14963,7 @@ fn stand_in_entrypoint(
         Ok(crate::box_runtime::HostExit {
             code: reason.code,
             reason: Some(reason),
+            requested: false,
         })
     })
 }
