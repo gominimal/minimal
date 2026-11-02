@@ -891,15 +891,17 @@ impl HostGvproxy {
 
                     if ready_tx.send(Ok(pid)).is_err() {
                         // Caller went away before learning the PID; tear down.
+                        _bep_peer.shutdown().await;
                         switch.stop().await;
                         return;
                     }
                     // Wait for either an explicit stop or an unexpected gvproxy
-                    // exit, then tear down cleanly.
+                    // exit, then tear down cleanly. The peer goes first, so its
+                    // reader is not the one to find the switch socket closed.
                     tokio::select! {
                         _ = stop_rx => {
+                            _bep_peer.shutdown().await;
                             switch.stop().await;
-                            drop(_bep_peer);
                             drop(_gate);
                         }
                         status = exit.recv() => {

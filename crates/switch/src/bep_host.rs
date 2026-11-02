@@ -2028,6 +2028,20 @@ impl Drop for BepPeer {
 }
 
 impl BepPeer {
+    /// Stops the peer and waits for its runtime thread to finish, bounded.
+    /// A clean VM stop calls this before it stops the switch, so the reader
+    /// pump is gone by the time the switch socket closes; the "switch socket
+    /// closed" WARN then means what it says, a lane lost mid-life, instead
+    /// of firing on every clean stop (1.9k a week in the lab, one per stop).
+    pub async fn shutdown(mut self) {
+        drop(self.stop.take());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.poll_task).await;
+        // Drop does the rest: a thread that did not finish in time is left to
+        // the abort, as before.
+    }
+}
+
+impl BepPeer {
     /// Start a peer for `subnet.box_egress_proxy_address()` on the switch
     /// socket at `switch_sock`, delivering the connections its pool accepts
     /// to the acceptor `wire` names, partitioned by the rows `boxes` holds.
