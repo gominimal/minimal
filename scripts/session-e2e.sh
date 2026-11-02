@@ -251,6 +251,14 @@
 #                                    no contention, both boxes' names
 #                                    resolve, and a withdrawn port closes a
 #                                    connection already through it
+#   ls_and_box_commands_tell_the_truth
+#                                    T114 on two VMs: `min ls` lists every
+#                                    box, a stopped VM's included, with the
+#                                    address and egress the policy shows;
+#                                    policy and forward need no --vm; both
+#                                    proxy ports after the preferred one
+#                                    frees; the unknown-box, stopped-VM,
+#                                    --public and out-of-range refusals
 #   macos_box_opens_by_name_and_proxy
 #                                    NET-010/069/123/144 on macOS: a declared
 #                                    and a runtime port open at the box's
@@ -372,6 +380,7 @@ case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
     | names_survive_restart_and_second_vm \
+    | ls_and_box_commands_tell_the_truth \
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
     | answerer_survives_session_stop \
@@ -28506,6 +28515,529 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# `min ls` and the box commands tell the truth, end to end (T114, over T110,
+# T111, T112, T8 and the expose refusals). Two VMs on one host — the default
+# VM and a named one — each with a box, driven the way a user drives them,
+# through `min` alone:
+#
+#   * `min ls` lists every box on every VM. Its ADDRESS cell is the address
+#     the box's own `min net expose` reply names, and `min session policy`
+#     lists the same address under live ingress. Its EGRESS cell is the
+#     posture `min session policy` prints, in the same words.
+#   * `min session policy <box>` and `min net forward <box>` find the named
+#     VM's box from its name alone, with no `--vm`, and the forward relays.
+#   * a name no VM holds is refused with the `--vm` form of the command, and
+#     a box on a stopped VM is refused with the command that starts the VM.
+#   * the named VM boots while the default VM holds the hostname proxy's
+#     preferred port, so its proxy serves on a substitute port. Once the
+#     default VM stops and frees the preferred port, the named VM takes it
+#     back, and its `HOSTNAME PROXY` row lists both ports. A request through
+#     each port reaches the box.
+#   * a stopped VM's boxes stay in `min ls`, marked `(stopped)`.
+#   * inside a box, `min net expose --public` and an expose outside the
+#     box's --dynamic-range are refused, and each refusal says nothing was
+#     published.
+#
+# Diagnostics: each leg prints the command it ran, its exit status and the
+# line it checked. The VM host daemon log lines written during the case are
+# copied to $WORK/ls-truth/minvmd.log at every step and on every failure,
+# and a failure prints their tail.
+proof_ls_and_box_commands_tell_the_truth() {
+  local lc="ls_and_box_commands_tell_the_truth"
+  if [ "$min_daemon" != minvmd ]; then
+    not_run "$lc" "this run drives '$min_daemon': a named VM is a minvmd-backed story"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    not_run "$lc" "guest images not available"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
+    not_run "$lc" "no MINVMD_GVPROXY_BIN: this target has no switch, so no box could mint and no proxy could publish"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    not_run "$lc" "no writable /dev/kvm: this host cannot boot a VM"
+    return 0
+  fi
+
+  echo "::group::min ls and the box commands tell the truth (T114)"
+
+  # A legal VM name: lowercase ASCII inside the 24-byte budget, one path
+  # component under the provider directory.
+  local lt_vm="lsvm"
+  local lt_a="e2e-lt-a"            # the default VM's box (host address)
+  local lt_b="e2e-lt-b"            # the named VM's box (own address)
+  local lt_nobody="e2e-lt-nobody"  # a name no VM holds
+  local lt_lo=18140 lt_hi=18145    # the named VM box's --dynamic-range
+  local lt_port=18140              # in range: exposed, then served by socat
+  local lt_out_port=18150          # outside the range
+  local lt_local=18153             # the `min net forward` laptop-side listener
+  local lt_marker="LS_TRUTH_B_OK"
+  local lt_dir="$WORK/ls-truth"
+  mkdir -p "$lt_dir"
+
+  lt_mn() {
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    min ${E2E_MINIMAL_ARGS:-} --vm "$lt_vm" "$@"
+  }
+
+  # The VM host daemon log every VM of this state base shares, and the lines
+  # it gained since the snapshot taken below, copied into this case's work
+  # directory. A rotation since the snapshot puts this run's lines in two
+  # files: the snapshot file's tail, then the whole newer one.
+  lt_minvmd_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  lt_save_logs() {
+    local f
+    f="$(lt_minvmd_log)"
+    : >"$lt_dir/minvmd.log"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$LT_LOG" ]; then
+      tail -n "+$((LT_LOG_LINES + 1))" "$f" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+      return 0
+    fi
+    if [ -n "$LT_LOG" ]; then
+      tail -n "+$((LT_LOG_LINES + 1))" "$LT_LOG" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+    fi
+    cat "$f" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+  }
+  lt_fail() {
+    lt_save_logs
+    echo "--- VM host daemon log from this case ($lt_dir/minvmd.log, tail) ---"
+    tail -n 60 "$lt_dir/minvmd.log" 2>/dev/null || true
+    fail
+  }
+
+  # One leg: run the command, keep its output in the work directory, and
+  # print the command with its exit status. $1 is the leg's file stem, the
+  # rest is the command. LT_RC, LT_OUT and LT_ERR carry the result.
+  lt_run() {
+    local stem="$1"
+    shift
+    LT_RC=0
+    "$@" >"$lt_dir/$stem.out" 2>"$lt_dir/$stem.err" || LT_RC=$?
+    LT_OUT="$(cat "$lt_dir/$stem.out" 2>/dev/null || true)"
+    LT_ERR="$(cat "$lt_dir/$stem.err" 2>/dev/null || true)"
+    echo "run: $* -> exit $LT_RC"
+  }
+  # The checks a leg makes, each printed with the line it checked.
+  lt_want_rc() {
+    if [ "$1" = ok ] && [ "$LT_RC" -ne 0 ]; then
+      echo "::error::$2: expected exit 0, got $LT_RC"
+      echo "--- stdout ---"; printf '%s\n' "$LT_OUT"
+      echo "--- stderr ---"; printf '%s\n' "$LT_ERR"
+      lt_fail
+    fi
+    if [ "$1" = refused ] && [ "$LT_RC" -eq 0 ]; then
+      echo "::error::$2: expected a refusal (non-zero exit), got exit 0"
+      echo "--- stdout ---"; printf '%s\n' "$LT_OUT"
+      lt_fail
+    fi
+  }
+  # $1 = what the check is, $2 = the text that must appear, $3 = the text.
+  lt_want_line() {
+    local line
+    line="$(printf '%s\n' "$3" | grep -F -- "$2" | head -n1 || true)"
+    if [ -z "$line" ]; then
+      echo "::error::$1: no line carries '$2'"
+      echo "--- the text checked ---"; printf '%s\n' "$3"
+      lt_fail
+    fi
+    echo "check: $1: $line"
+  }
+
+  # The cells of one box's row in a `min ls` table, as `VM|ADDRESS|STATUS|EGRESS`.
+  # The columns are cut at the header's own offsets, so a cell with spaces in
+  # it (`lsvm (stopped)`, `deny-all (default)`) stays whole.
+  lt_ls_cells() {
+    printf '%s\n' "$2" | python3 -c '
+import sys
+name = sys.argv[1]
+lines = sys.stdin.read().splitlines()
+header = next((l for l in lines if "SESSION ID" in l and "EGRESS" in l), None)
+if header is None:
+    sys.exit(0)
+cols = ["VM", "SESSION ID", "NAME", "ADDRESS", "STATUS", "EGRESS", "TITLE"]
+starts = {c: header.find(c) for c in cols}
+def cell(row, col):
+    start = starts[col]
+    if start < 0:
+        return ""
+    later = sorted(s for s in starts.values() if s > start)
+    end = later[0] if later else len(row)
+    return row[start:end].strip()
+for row in lines:
+    if row is header or "  " not in row:
+        continue
+    if cell(row, "NAME") == name:
+        print("|".join(cell(row, c) for c in ["VM", "ADDRESS", "STATUS", "EGRESS"]))
+        break
+' "$1"
+  }
+
+  # Every port one VM's `HOSTNAME PROXY` row names, space-separated. An
+  # unscoped listing with two VMs names the VM as the row's third field. A
+  # listing scoped with `--vm` has one row and no VM field.
+  lt_proxy_ports() {
+    printf '%s\n' "$2" | awk -v vm="$1" '
+      $1 == "HOSTNAME" && $2 == "PROXY:" && ($3 == vm || vm == "") && /listening on/ { print; exit }
+    ' | grep -oE '127\.0\.0\.1:[0-9]+' | sed 's/^127\.0\.0\.1://' | tr '\n' ' ' | sed 's/ $//'
+  }
+
+  # One request from the host through a published proxy port to the box's
+  # name, with the host's proxy env stripped so the request takes the VM's
+  # path. $1 = the port, $2 = the label.
+  lt_route() {
+    local status body
+    status="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$1" \
+      -o "$lt_dir/route.body" -w '%{http_code}' \
+      "http://$lt_b.min.internal:$lt_port/" 2>"$lt_dir/route.err" | tail -n1 | tr -d '\r\n')"
+    body="$(cat "$lt_dir/route.body" 2>/dev/null || true)"
+    echo "run: curl -x http://127.0.0.1:$1 http://$lt_b.min.internal:$lt_port/ -> HTTP ${status:-<none>} ${body:0:48}"
+    if [ "$status" != 200 ] || [[ "$body" != *"$lt_marker"* ]]; then
+      echo "::error::$2: the request through 127.0.0.1:$1 did not reach $lt_b"
+      echo "--- curl stderr ---"; cat "$lt_dir/route.err" 2>/dev/null || true
+      lt_fail
+    fi
+    echo "check: $2: HTTP 200 carrying $lt_marker"
+  }
+
+  # ---- two VMs, each with its own box -------------------------------------
+  # The default VM comes down first, whatever an earlier case left running,
+  # so both boots happen in this case and the log copy is this case's own.
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  local lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::the default VM never reached 'stopped' before the case's own boots"
+    minvmd status --json 2>&1 || true
+    fail
+  fi
+  LT_LOG="$(lt_minvmd_log)"
+  LT_LOG_LINES=0
+  if [ -n "$LT_LOG" ]; then LT_LOG_LINES="$(wc -l < "$LT_LOG" | tr -d ' ')"; fi
+
+  TWO_VM_SEED_A_DIR="$(hook_mktemp /tmp/mnllta.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_A_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_A_DIR/.git"
+  TWO_VM_SEED_B_DIR="$(hook_mktemp /tmp/mnlltb.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_B_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_B_DIR/.git"
+
+  # The default VM boots first and takes the hostname proxy's preferred
+  # port. The named VM boots second, finds that port held, and serves on a
+  # substitute: the start the reclaim beat below needs. The RUST_LOG filter
+  # keeps the VM host daemon's INFO records for the log copy.
+  # Each runs in a subshell, so its `cd` leaves the case's directory alone.
+  lt_seed_a() {
+    ( cd "$TWO_VM_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" \
+        mnl session activate . --no-prompt --name "$lt_a" )
+  }
+  lt_seed_b() {
+    ( cd "$TWO_VM_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+        lt_mn session activate . --no-prompt --name "$lt_b" --network own_ip \
+          --dynamic-ingress allow --dynamic-range "$lt_lo-$lt_hi" )
+  }
+  lt_run activate-a lt_seed_a
+  lt_want_rc ok "min session activate . --name $lt_a (the default VM)"
+  local lt_a_sid lt_b_sid
+  lt_a_sid="$(printf '%s\n' "$LT_OUT" | tail -n1 | tr -d '\r')"
+  TWO_VM_NAME="$lt_vm" # teardown stops the named VM from here on
+  lt_run activate-b lt_seed_b
+  lt_want_rc ok "min --vm $lt_vm session activate . --name $lt_b --network own_ip --dynamic-ingress allow --dynamic-range $lt_lo-$lt_hi"
+  lt_b_sid="$(printf '%s\n' "$LT_OUT" | tail -n1 | tr -d '\r')"
+  echo "box A: $lt_a_sid ($lt_a) on VM default"
+  echo "box B: $lt_b_sid ($lt_b) on VM $lt_vm"
+  lt_save_logs
+
+  # The first exec mints the box on a freshly booted VM. Give the mint a
+  # bounded window, as the two-VM case does.
+  local lt_ready=""
+  for _ in 1 2 3; do
+    if lt_mn session exec "$lt_b_sid" 'test -x /usr/bin/socat' >/dev/null 2>"$lt_dir/exec-gate.err"; then
+      lt_ready=1; break
+    fi
+    sleep 2
+  done
+  if [ -z "$lt_ready" ]; then
+    echo "::error::box $lt_b on VM $lt_vm never answered an exec (or has no /usr/bin/socat)"
+    cat "$lt_dir/exec-gate.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: min --vm $lt_vm session exec $lt_b 'test -x /usr/bin/socat': exit 0"
+
+  # ---- the box's own expose: the address `min ls` must show ---------------
+  lt_run expose lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose $lt_port"
+  lt_want_rc ok "min net expose $lt_port inside $lt_b"
+  lt_want_line "the expose reply names the port and the box's address" "published port $lt_port at " "$LT_OUT"
+  local lt_addr
+  # A reply carried over the exec channel can end in a carriage return.
+  lt_addr="$(printf '%s\n' "$LT_OUT" | tr -d '\r' \
+    | sed -n "s/^published port $lt_port at \([^ ]*\):$lt_port[[:space:]]*\$/\1/p" | head -n1)"
+  if [ -z "$lt_addr" ]; then
+    echo "::error::the expose reply carries no address (got: '$LT_OUT')"
+    lt_fail
+  fi
+  echo "address: $lt_b answers at $lt_addr"
+
+  # The responder the forward and the proxy legs reach, started after the
+  # expose so the expose publishes rather than finds a listener first.
+  lt_mn session exec "$lt_b_sid" \
+    "body=$lt_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$lt_dir/responder.err" \
+    || { echo "::error::could not write the in-box responder's response"; cat "$lt_dir/responder.err"; lt_fail; }
+  lt_mn session exec "$lt_b_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$lt_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$lt_dir/responder.err" \
+    || { echo "::error::could not start the in-box responder"; cat "$lt_dir/responder.err"; lt_fail; }
+  echo "responder: $lt_b answers 127.0.0.1:$lt_port with $lt_marker"
+
+  # ---- `min ls`: every box on every VM, with its address and egress -------
+  lt_run ls mnl ls
+  lt_want_rc ok "min ls with both VMs running"
+  local lt_ls="$LT_OUT" lt_cells_a lt_cells_b
+  lt_cells_a="$(lt_ls_cells "$lt_a" "$lt_ls")"
+  lt_cells_b="$(lt_ls_cells "$lt_b" "$lt_ls")"
+  if [ -z "$lt_cells_a" ] || [ -z "$lt_cells_b" ]; then
+    echo "::error::min ls does not list both boxes (A: '${lt_cells_a:-<missing>}', B: '${lt_cells_b:-<missing>}')"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  echo "check: min ls row for $lt_a: $lt_cells_a"
+  echo "check: min ls row for $lt_b: $lt_cells_b"
+  local lt_vm_a lt_vm_b lt_addr_b lt_egress_a lt_egress_b
+  lt_vm_a="$(printf '%s' "$lt_cells_a" | cut -d'|' -f1)"
+  lt_vm_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f1)"
+  lt_addr_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f2)"
+  lt_egress_a="$(printf '%s' "$lt_cells_a" | cut -d'|' -f4)"
+  lt_egress_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f4)"
+  if [ "$lt_vm_a" != default ] || [ "$lt_vm_b" != "$lt_vm" ]; then
+    echo "::error::min ls names the wrong VM for a box (A on '$lt_vm_a', want default; B on '$lt_vm_b', want $lt_vm)"
+    lt_fail
+  fi
+  if [ "$lt_addr_b" != "$lt_addr" ]; then
+    echo "::error::min ls shows ADDRESS '$lt_addr_b' for $lt_b, but the box's expose published at '$lt_addr'"
+    lt_fail
+  fi
+  echo "check: ADDRESS for $lt_b is $lt_addr_b, the address its expose reply named"
+
+  # ---- `min session policy`, no --vm: the same address and egress ---------
+  # The EGRESS cell is the policy's posture in the policy's words, and a
+  # `; per-box enforcement <x>` suffix is the policy's own row of that name.
+  lt_egress_matches_policy() {
+    local box="$1" cell="$2" policy="$3" words enforcement
+    words="${cell%%;*}"
+    if [ "$cell" = "-" ]; then
+      echo "::error::min ls shows no EGRESS posture for $box"
+      lt_fail
+    fi
+    # The first line under the policy's `egress` heading: a named verdict,
+    # or the first rule row of a declared section.
+    local posture
+    posture="$(printf '%s\n' "$policy" | awk '$0 == "egress" { getline; sub(/^ +/, ""); print; exit }')"
+    if [ "$words" = "declared rules" ]; then
+      # A declared section lists its rules as rows, the first one `subnets`.
+      # No named verdict heads it.
+      case "$posture" in
+        "subnets "*) ;;
+        *)
+          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min session policy opens with '${posture:-<no egress block>}', not a subnets rule row"
+          printf '%s\n' "$policy"
+          lt_fail
+          ;;
+      esac
+      echo "check: EGRESS for $box is 'declared rules', and min session policy lists its rules, first '$posture'"
+    else
+      if [ "$posture" != "$words" ]; then
+        echo "::error::min ls shows EGRESS '$words' for $box, but min session policy says '${posture:-<no egress block>}'"
+        printf '%s\n' "$policy"
+        lt_fail
+      fi
+      echo "check: EGRESS for $box is '$words', the posture min session policy prints"
+    fi
+    if [[ "$cell" == *"; per-box enforcement "* ]]; then
+      enforcement="${cell##*; per-box enforcement }"
+      lt_want_line "policy for $box names per-box enforcement $enforcement" "per-box enforcement  $enforcement" "$policy"
+    fi
+  }
+  lt_run policy-a mnl session policy "$lt_a"
+  lt_want_rc ok "min session policy $lt_a"
+  lt_egress_matches_policy "$lt_a" "$lt_egress_a" "$LT_OUT"
+  lt_run policy-b mnl session policy "$lt_b"
+  lt_want_rc ok "min session policy $lt_b, with no --vm, for a box on VM $lt_vm"
+  lt_egress_matches_policy "$lt_b" "$lt_egress_b" "$LT_OUT"
+  lt_want_line "policy for $lt_b lists the exposed port at the ADDRESS min ls shows" "$lt_addr:$lt_port" "$LT_OUT"
+
+  # ---- `min net forward`, no --vm -----------------------------------------
+  echo "run: min net forward $lt_b $lt_local:$lt_port (background)"
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  ( exec min ${E2E_MINIMAL_ARGS:-} net forward "$lt_b" "$lt_local:$lt_port" ) \
+    >"$lt_dir/forward.out" 2>"$lt_dir/forward.err" &
+  TWO_VM_FWD_PID=$!
+  local lt_fwd_ready=""
+  for _ in $(seq 1 40); do
+    if grep -q "Forwarding localhost:$lt_local" "$lt_dir/forward.err" 2>/dev/null; then
+      lt_fwd_ready=1; break
+    fi
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ -z "$lt_fwd_ready" ]; then
+    echo "::error::'min net forward $lt_b' with no --vm never bound its listener (no 'Forwarding localhost:$lt_local' line)"
+    cat "$lt_dir/forward.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: forward: $(grep -F "Forwarding localhost:$lt_local" "$lt_dir/forward.err" | head -n1)"
+  local lt_fwd_body=""
+  lt_fwd_body="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 20 "http://127.0.0.1:$lt_local/" 2>"$lt_dir/forward-curl.err" || true)"
+  echo "run: curl http://127.0.0.1:$lt_local/ -> ${lt_fwd_body:0:48}"
+  if [[ "$lt_fwd_body" != *"$lt_marker"* ]]; then
+    echo "::error::the request through the forward did not reach $lt_b on VM $lt_vm"
+    cat "$lt_dir/forward-curl.err" 2>/dev/null || true
+    cat "$lt_dir/forward.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: the forward reached $lt_b: $lt_marker"
+  kill -INT "$TWO_VM_FWD_PID" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  kill -9 "$TWO_VM_FWD_PID" 2>/dev/null || true
+  wait "$TWO_VM_FWD_PID" 2>/dev/null || true
+  TWO_VM_FWD_PID=""
+
+  # ---- a name no VM holds -------------------------------------------------
+  lt_run unknown mnl session policy "$lt_nobody"
+  lt_want_rc refused "min session policy $lt_nobody"
+  lt_want_line "the unknown-box refusal says no running VM has the box" \
+    "no running VM has a box named '$lt_nobody'." "$LT_ERR"
+  lt_want_line "the unknown-box refusal shows the --vm form of the command" \
+    "min --vm <vm> session policy $lt_nobody" "$LT_ERR"
+
+  # ---- the expose refusals inside the box ---------------------------------
+  lt_run expose-public lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose --public $lt_port"
+  lt_want_rc refused "min net expose --public $lt_port inside $lt_b"
+  lt_want_line "the --public refusal says public exposure is not available and nothing was published" \
+    "public exposure is not available on this host. Nothing was published." "$LT_OUT
+$LT_ERR"
+  lt_run expose-out lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose $lt_out_port"
+  lt_want_rc refused "min net expose $lt_out_port inside $lt_b"
+  lt_want_line "the out-of-range refusal names the port and the range, and says nothing was published" \
+    "port $lt_out_port is outside this box's --dynamic-range $lt_lo-$lt_hi. Nothing was published." "$LT_OUT
+$LT_ERR"
+
+  # ---- the preferred proxy port, taken back -------------------------------
+  local lt_port_default lt_ports_named
+  lt_port_default="$(lt_proxy_ports default "$lt_ls" | awk '{ print $1 }')"
+  lt_ports_named="$(lt_proxy_ports "$lt_vm" "$lt_ls")"
+  echo "check: HOSTNAME PROXY ports with both VMs up: default '${lt_port_default:-<none>}', $lt_vm '${lt_ports_named:-<none>}'"
+  if [ -z "$lt_port_default" ] || [ -z "$lt_ports_named" ]; then
+    echo "::error::min ls does not name a hostname proxy port for each VM"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  if [[ " $lt_ports_named " == *" $lt_port_default "* ]]; then
+    echo "::error::VM $lt_vm already lists the default VM's port $lt_port_default while the default VM holds it"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  local lt_substitute="${lt_ports_named%% *}"
+  lt_run stop-default minvmd stop
+  lt_want_rc ok "minvmd stop (the default VM)"
+  lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::the default VM never reached 'stopped' after 'minvmd stop'"
+    lt_fail
+  fi
+  echo "check: the default VM is stopped, so port $lt_port_default is free"
+  # The watcher probes every 5 s. Allow several probes before the verdict.
+  local lt_both="" lt_scoped=""
+  for _ in $(seq 1 24); do
+    lt_scoped="$(lt_mn ls 2>/dev/null || true)"
+    lt_ports_named="$(lt_proxy_ports "" "$lt_scoped")"
+    if [[ " $lt_ports_named " == *" $lt_port_default "* ]] \
+       && [[ " $lt_ports_named " == *" $lt_substitute "* ]]; then
+      lt_both=1; break
+    fi
+    sleep 2.5
+  done
+  echo "run: min --vm $lt_vm ls -> HOSTNAME PROXY ports '${lt_ports_named:-<none>}'"
+  if [ -z "$lt_both" ]; then
+    echo "::error::VM $lt_vm did not list both its substitute port $lt_substitute and the freed preferred port $lt_port_default"
+    printf '%s\n' "$lt_scoped"
+    lt_fail
+  fi
+  lt_want_line "the HOSTNAME PROXY row names both ports" "127.0.0.1:$lt_port_default" "$lt_scoped"
+  lt_route "$lt_port_default" "the preferred port, taken back"
+  lt_route "$lt_substitute" "the substitute port, still serving"
+  lt_save_logs
+
+  # ---- a stopped VM: listed, and its box refused with the next step ------
+  lt_run stop-named minvmd --vm "$lt_vm" stop
+  lt_want_rc ok "minvmd --vm $lt_vm stop"
+  lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd --vm "$lt_vm" status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::VM $lt_vm never reached 'stopped' after 'minvmd --vm $lt_vm stop'"
+    lt_fail
+  fi
+  TWO_VM_NAME=""
+  # `min ls` starts the default VM again and lists the stopped VM's box from
+  # its persisted record.
+  lt_run ls-stopped mnl ls
+  lt_want_rc ok "min ls with VM $lt_vm stopped"
+  lt_cells_b="$(lt_ls_cells "$lt_b" "$LT_OUT")"
+  echo "check: min ls row for $lt_b: ${lt_cells_b:-<missing>}"
+  if [ "$(printf '%s' "$lt_cells_b" | cut -d'|' -f1)" != "$lt_vm (stopped)" ] \
+     || [ "$(printf '%s' "$lt_cells_b" | cut -d'|' -f3)" != stopped ]; then
+    echo "::error::min ls does not list $lt_b as a stopped box on '$lt_vm (stopped)'"
+    printf '%s\n' "$LT_OUT"
+    lt_fail
+  fi
+  lt_run policy-stopped mnl session policy "$lt_b"
+  lt_want_rc refused "min session policy $lt_b, with VM $lt_vm stopped"
+  lt_want_line "the stopped-VM refusal names the box and its VM" \
+    "box '$lt_b' is on VM '$lt_vm', which is stopped." "$LT_ERR"
+  lt_want_line "the stopped-VM refusal gives the command that starts the VM" \
+    "Start it with: min --vm $lt_vm session attach $lt_b" "$LT_ERR"
+
+  lt_save_logs
+  echo "logs: the VM host daemon log lines from this case are in $lt_dir/minvmd.log"
+  mnl session destroy --force "$lt_a_sid" >/dev/null 2>&1 || true
+  rm -rf "$TWO_VM_SEED_A_DIR" "$TWO_VM_SEED_B_DIR"
+  TWO_VM_SEED_A_DIR=""
+  TWO_VM_SEED_B_DIR=""
+  echo "min ls and the box commands tell the truth OK (both VMs' boxes listed, a stopped VM's included; address and egress match the policy; policy and forward find a box with no --vm; both proxy ports listed and routing after the preferred port freed; the unknown-box, stopped-VM, --public and out-of-range refusals each say what to do)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Box names survive a restart and a second VM, and a withdrawn port closes
 # the connections already through it — end to end on a Linux KVM host (T121,
 # over T119's boot unit and second-VM registration and T120's patched
@@ -29241,6 +29773,7 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
     proof_names_survive_restart_and_second_vm
+    proof_ls_and_box_commands_tell_the_truth
     proof_macos_box_opens_by_name_and_proxy
     proof_github_only_allowlist
     proof_bep_second_box_needs_no_sign_in
@@ -29319,6 +29852,7 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
     | names_survive_restart_and_second_vm \
+    | ls_and_box_commands_tell_the_truth \
     | macos_box_opens_by_name_and_proxy \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | unpublished_port_refused_on_vm_host \
@@ -29392,6 +29926,7 @@ case "${1:-}" in
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         two_named_vms_on_one_machine macos_box_opens_by_name_and_proxy"
     echo "         names_survive_restart_and_second_vm"
+    echo "         ls_and_box_commands_tell_the_truth"
     echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
