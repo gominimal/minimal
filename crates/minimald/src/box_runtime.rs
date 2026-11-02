@@ -1227,8 +1227,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         let hooks_dir = paths.hooks.clone();
         let workspace_dir = paths.working.clone();
         // Opened before the launch, so the first byte the entrypoint writes
-        // has a log to land in (BOX-155).
-        let output_log = BoxOutputLog::open(session_id, &paths);
+        // has a log to land in (BOX-155). A box in the store whose log
+        // cannot be opened does not start: its log would not be complete.
+        let output_log = BoxOutputLog::open(session_id, &paths)?;
         let box_dir = boxes::store::BoxDir::for_tree(&paths.working);
         // Kept for `write_connection_env`, which rewrites the per-attach env
         // (TERM included) into the session's home on every reattach.

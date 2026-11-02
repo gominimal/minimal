@@ -3662,6 +3662,14 @@ impl ReadEventsUpdate {
 /// not follow, `Reaped` when a followed box is reaped, or `Failed`. A
 /// request the daemon refuses before it reads the log, such as an unknown
 /// id, leaves the stream empty and says why on extended data.
+///
+/// The log holds at most 8 MiB. Past that, the daemon replaces the file
+/// with a line that says older output was dropped, then the newest output,
+/// half the cap in all. One stream sends no byte twice across a drop. It
+/// goes on with the bytes after the ones it already sent, so an `Output`
+/// offset can then be smaller than the one before it. When the stream fell
+/// behind by more than one drop, it sends the new file from its first
+/// byte, and the dropped-output line marks the gap.
 pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadLog");
 
 /// Request body for [`READ_LOG_SUBSYSTEM`].
@@ -3669,7 +3677,10 @@ pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Re
 pub struct ReadLogRequest {
     /// The box whose log to read.
     pub id: SessionId,
-    /// The byte of the log to start from: 0 for the whole log.
+    /// The byte of the log file to start from: 0 for the whole log. A
+    /// later read can resume from a `Done` offset. After a drop of the
+    /// oldest output (see [`READ_LOG_SUBSYSTEM`]) the file starts again, so
+    /// an offset from before the drop does not name the same byte.
     #[serde(default)]
     pub offset: u64,
     /// Keep the stream open at the end of the log, and send each new chunk

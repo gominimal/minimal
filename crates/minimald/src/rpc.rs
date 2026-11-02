@@ -2403,33 +2403,37 @@ async fn read_log_stream(
             error: format!("the log of box {} could not be read: {e}", req.id),
         }
     };
-    let mut offset = req.offset;
+    // One reader for the whole stream, so a drop of the log's oldest
+    // bytes during the read sends no byte twice (see `LogReader`).
+    let mut reader = Some(boxes::store::LogReader::new(&dir, req.offset));
     loop {
         // Everything written so far, in chunks.
         loop {
-            match read_log_chunk(&dir, offset).await {
-                Ok(data) if data.is_empty() => break,
-                Ok(data) => {
-                    let len = data.len() as u64;
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => break,
+                Ok(boxes::store::LogChunk { offset, data }) => {
                     write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
-                    offset += len;
                 }
                 Err(e) => return write_log_update(c, &failed(e)).await,
             }
         }
         if !req.follow {
+            let offset = reader.as_ref().map_or(0, boxes::store::LogReader::offset);
             return write_log_update(c, &ReadLogUpdate::Done { offset }).await;
         }
         if !is_box_retained(&dir).await {
             // Output written after the read above and before the reap is
             // still sent: the stream ends on the first empty read after the
             // box is gone.
-            match read_log_chunk(&dir, offset).await {
-                Ok(data) if data.is_empty() => {
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => {
                     tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read of its log");
                     return write_log_update(c, &ReadLogUpdate::Reaped).await;
                 }
-                Ok(_) => continue,
+                Ok(boxes::store::LogChunk { offset, data }) => {
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                    continue;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return write_log_update(c, &ReadLogUpdate::Reaped).await;
                 }
@@ -2449,13 +2453,23 @@ async fn read_log_stream(
     }
 }
 
-/// Reads up to [`LOG_CHUNK`] bytes of `dir`'s log from `offset`, on the
-/// blocking pool.
-async fn read_log_chunk(dir: &boxes::store::BoxDir, offset: u64) -> std::io::Result<Vec<u8>> {
-    let dir = dir.clone();
-    crate::traced::spawn_blocking(move || dir.read_log_from(offset, LOG_CHUNK))
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+/// Reads the next chunk of up to [`LOG_CHUNK`] bytes through `reader`, on
+/// the blocking pool. The reader moves to the pool and back. A read whose
+/// task fails loses the reader, and every read after it fails.
+async fn read_log_chunk(
+    reader: &mut Option<boxes::store::LogReader>,
+) -> std::io::Result<boxes::store::LogChunk> {
+    let Some(mut taken) = reader.take() else {
+        return Err(std::io::Error::other("the earlier read of the log failed"));
+    };
+    let (taken, chunk) = crate::traced::spawn_blocking(move || {
+        let chunk = taken.read(LOG_CHUNK);
+        (taken, chunk)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    *reader = Some(taken);
+    chunk
 }
 
 /// Whether the box `dir` holds is still retained, checked on the blocking
@@ -3816,7 +3830,7 @@ mod read_log_tests {
         }
 
         // The daemon writes the box's output.
-        let mut log = BoxOutputLog::open(id, &paths);
+        let mut log = BoxOutputLog::open(id, &paths).expect("the daemon opens the box's log");
         log.write(b"from the daemon\r\n");
 
         // Root inside the box writes everywhere it can reach.
@@ -3875,8 +3889,10 @@ mod read_log_tests {
         let target = linked_paths.working.as_utf8_path().join("target");
         std::fs::write(&target, b"").unwrap();
         std::os::unix::fs::symlink(&target, linked_dir.log_path().as_utf8_path()).unwrap();
-        let mut log = BoxOutputLog::open(linked, &linked_paths);
-        log.write(b"never lands\r\n");
+        assert!(
+            BoxOutputLog::open(linked, &linked_paths).is_err(),
+            "a box whose log is refused does not get a log"
+        );
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"",
@@ -3888,7 +3904,6 @@ mod read_log_tests {
                 && logged.contains(linked_dir.log_path().as_str()),
             "the daemon log names the refused log: {logged}"
         );
-        assert_eq!(log.path(), Some(&linked_dir.log_path()));
 
         // A read of a box no record names is refused before any update.
         let unknown = SessionId::mint();
