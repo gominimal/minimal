@@ -2122,12 +2122,6 @@ pub(crate) mod launch_publish_seam {
     }
 }
 
-/// The test seam for a launch whose outcome cannot be recorded (NET-079):
-/// a test names a session whose launch-record write fails, and gets back
-/// the flag the session's box's network teardown sets — the observable
-/// that the launch killed the box it could not record. Keyed by session
-/// id, so tests running beside each other in one process never fail each
-/// other's writes.
 /// How many times the end of a box tries to write its `exited` record.
 const EXIT_RECORD_WRITE_ATTEMPTS: u32 = 5;
 /// The wait before the next exited-record write, multiplied by the attempt.
@@ -2169,6 +2163,12 @@ pub(crate) mod exit_record_seam {
     }
 }
 
+/// The test seam for a launch whose outcome cannot be recorded (NET-079):
+/// a test names a session whose launch-record write fails, and gets back
+/// the flag the session's box's network teardown sets — the observable
+/// that the launch killed the box it could not record. Keyed by session
+/// id, so tests running beside each other in one process never fail each
+/// other's writes.
 #[cfg(test)]
 pub(crate) mod launch_record_seam {
     use std::collections::HashMap;
