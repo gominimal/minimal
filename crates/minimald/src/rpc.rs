@@ -2365,7 +2365,15 @@ async fn read_log_stream(
         );
         ConnectionError::Internal(refusal)
     };
-    let dir = match boxes::store::BoxDir::find(&state_dir, &req.id) {
+    // The store calls below are blocking file reads. Each runs on the
+    // blocking pool, so a slow disk does not hold a runtime worker.
+    let found = {
+        let id = req.id;
+        crate::traced::spawn_blocking(move || boxes::store::BoxDir::find(&state_dir, &id))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    };
+    let dir = match found {
         Ok(Some(dir)) => dir,
         Ok(None) => {
             return Err(refuse(format!(
@@ -2399,7 +2407,7 @@ async fn read_log_stream(
     loop {
         // Everything written so far, in chunks.
         loop {
-            match dir.read_log_from(offset, LOG_CHUNK) {
+            match read_log_chunk(&dir, offset).await {
                 Ok(data) if data.is_empty() => break,
                 Ok(data) => {
                     let len = data.len() as u64;
@@ -2412,11 +2420,11 @@ async fn read_log_stream(
         if !req.follow {
             return write_log_update(c, &ReadLogUpdate::Done { offset }).await;
         }
-        if !dir.is_retained() {
+        if !is_box_retained(&dir).await {
             // Output written after the read above and before the reap is
             // still sent: the stream ends on the first empty read after the
             // box is gone.
-            match dir.read_log_from(offset, LOG_CHUNK) {
+            match read_log_chunk(&dir, offset).await {
                 Ok(data) if data.is_empty() => {
                     tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read of its log");
                     return write_log_update(c, &ReadLogUpdate::Reaped).await;
@@ -2439,6 +2447,24 @@ async fn read_log_stream(
             },
         }
     }
+}
+
+/// Reads up to [`LOG_CHUNK`] bytes of `dir`'s log from `offset`, on the
+/// blocking pool.
+async fn read_log_chunk(dir: &boxes::store::BoxDir, offset: u64) -> std::io::Result<Vec<u8>> {
+    let dir = dir.clone();
+    crate::traced::spawn_blocking(move || dir.read_log_from(offset, LOG_CHUNK))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Whether the box `dir` holds is still retained, checked on the blocking
+/// pool. A failed check counts as retained, so the next poll asks again.
+async fn is_box_retained(dir: &boxes::store::BoxDir) -> bool {
+    let dir = dir.clone();
+    crate::traced::spawn_blocking(move || dir.is_retained())
+        .await
+        .unwrap_or(true)
 }
 
 /// Writes one newline-delimited JSON log update.
