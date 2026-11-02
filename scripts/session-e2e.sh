@@ -28545,20 +28545,20 @@ while True:
 proof_ls_and_box_commands_tell_the_truth() {
   local lc="ls_and_box_commands_tell_the_truth"
   if [ "$min_daemon" != minvmd ]; then
-    echo "$lc SKIPPED (this run drives '$min_daemon': a named VM is a minvmd-backed story)"
+    not_run "$lc" "this run drives '$min_daemon': a named VM is a minvmd-backed story"
     return 0
   fi
   locate_vm_guest_images
   if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
-    echo "$lc SKIPPED (guest images not available)"
+    not_run "$lc" "guest images not available"
     return 0
   fi
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
-    echo "$lc SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box could mint and no proxy could publish)"
+    not_run "$lc" "no MINVMD_GVPROXY_BIN: this target has no switch, so no box could mint and no proxy could publish"
     return 0
   fi
   if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
-    echo "$lc SKIPPED (no writable /dev/kvm: this host cannot boot a VM)"
+    not_run "$lc" "no writable /dev/kvm: this host cannot boot a VM"
     return 0
   fi
 
@@ -28841,11 +28841,23 @@ for row in lines:
       echo "::error::min ls shows no EGRESS posture for $box"
       lt_fail
     fi
+    # The first line under the policy's `egress` heading: a named verdict,
+    # or the first rule row of a declared section.
+    local posture
+    posture="$(printf '%s\n' "$policy" | awk '$0 == "egress" { getline; sub(/^ +/, ""); print; exit }')"
     if [ "$words" = "declared rules" ]; then
-      lt_want_line "policy for $box carries an egress block" "egress" "$policy"
+      # A declared section lists its rules as rows, the first one `subnets`.
+      # No named verdict heads it.
+      case "$posture" in
+        "subnets "*) ;;
+        *)
+          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min session policy opens with '${posture:-<no egress block>}', not a subnets rule row"
+          printf '%s\n' "$policy"
+          lt_fail
+          ;;
+      esac
+      echo "check: EGRESS for $box is 'declared rules', and min session policy lists its rules, first '$posture'"
     else
-      local posture
-      posture="$(printf '%s\n' "$policy" | awk '$0 == "egress" { getline; sub(/^ +/, ""); print; exit }')"
       if [ "$posture" != "$words" ]; then
         echo "::error::min ls shows EGRESS '$words' for $box, but min session policy says '${posture:-<no egress block>}'"
         printf '%s\n' "$policy"
