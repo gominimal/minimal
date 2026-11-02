@@ -1269,7 +1269,31 @@ pub(crate) async fn wait_with_timeout<P: Process>(
             if let Err(error) = process.start_kill() {
                 tracing::warn!(%error, "exec: failed to stop the command at its timeout");
             }
-            (process.wait().await, ExecExitReason::Timeout)
+            (wait_after_stop(process).await, ExecExitReason::Timeout)
+        }
+    }
+}
+
+/// How long a wait for a command lasts after its timeout asked it to stop.
+/// Longer than the shim's own escalation to SIGKILL, so a command that the
+/// stop reaches always ends inside it.
+pub(crate) const STOP_BOUND: Duration =
+    Duration::from_secs(crate::nsenter::SHIM_ESCALATION.as_secs() + 5);
+
+/// Waits for `process` after a stop at its timeout, for at most
+/// [`STOP_BOUND`]. A command that the stop did not reach, or that does not
+/// end, gives an error in place of a wait that never returns, so the exec
+/// still records an end.
+pub(crate) async fn wait_after_stop<P: Process>(process: &mut P) -> io::Result<Option<i32>> {
+    match tokio::time::timeout(STOP_BOUND, process.wait()).await {
+        Ok(status) => status,
+        Err(_elapsed) => {
+            // A last SIGKILL; an error here changes nothing we can act on.
+            let _ = process.start_kill();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the command did not end after it was stopped at its timeout",
+            ))
         }
     }
 }
@@ -1417,6 +1441,9 @@ impl<P: Process> Process for TimedProcess<P> {
                     }
                 }
             }
+        }
+        if self.timed_out.load(Ordering::SeqCst) {
+            return wait_after_stop(&mut self.inner).await;
         }
         self.inner.wait().await
     }

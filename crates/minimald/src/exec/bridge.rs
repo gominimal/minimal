@@ -1804,6 +1804,12 @@ impl ExecEntry {
         }
     }
 
+    /// Whether the exec ended and its box was reaped since. A box's delete
+    /// removes its whole directory, the transcripts' directory with it.
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.exit.borrow().is_some() && self.transcript.parent().is_none_or(|dir| !dir.exists())
+    }
+
     /// Records the exec's end, which every waiter and attached client sees.
     pub(crate) fn finish(&self, exit: ExecExit) {
         if let Some(terminal) = &self.terminal {
@@ -1849,10 +1855,9 @@ static EXECS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<ExecId, Arc<ExecEntr
     std::sync::LazyLock::new(Default::default);
 
 pub(crate) fn register_exec(entry: Arc<ExecEntry>) {
-    EXECS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(entry.id.clone(), entry);
+    let mut execs = EXECS.lock().unwrap_or_else(|e| e.into_inner());
+    execs.retain(|_, entry| !entry.is_reaped());
+    execs.insert(entry.id.clone(), entry);
 }
 
 /// The exec `id` of the box `box_id`, if this daemon started it.
@@ -1861,7 +1866,7 @@ pub(crate) fn find_exec(box_id: SessionId, id: &ExecId) -> Option<Arc<ExecEntry>
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(id)
-        .filter(|entry| entry.box_id == box_id)
+        .filter(|entry| entry.box_id == box_id && !entry.is_reaped())
         .cloned()
 }
 

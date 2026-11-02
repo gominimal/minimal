@@ -3266,6 +3266,84 @@ mod managed {
             );
         }
     }
+
+    /// A command that neither ends nor takes the stop at its timeout.
+    struct StuckProcess {
+        kills: usize,
+    }
+
+    impl super::super::Process for StuckProcess {
+        type Stdin = tokio::io::Sink;
+        type Stdout = tokio::io::Empty;
+        type Stderr = tokio::io::Empty;
+
+        fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+            None
+        }
+
+        async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+            std::future::pending().await
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.kills += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+    }
+
+    // BOX-149: an exec that survives its stop still ends, so a wait returns.
+    #[tokio::test(start_paused = true)]
+    async fn exec_timeout_ends_even_when_the_stop_fails() {
+        let mut process = StuckProcess { kills: 0 };
+        let (status, reason) =
+            super::super::wait_with_timeout(&mut process, Some(std::time::Duration::from_secs(1)))
+                .await;
+        assert_eq!(reason, ExecExitReason::Timeout);
+        assert_eq!(
+            status.expect_err("a stuck command gives an error").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(process.kills, 2, "the stop, then a last SIGKILL");
+    }
+
+    // BOX-149: the exec map does not keep an ended exec of a reaped box.
+    #[test]
+    fn ended_exec_of_a_reaped_box_is_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let box_dir = camino::Utf8Path::from_path(tmp.path()).expect("utf-8 temp path");
+        let id = mint_exec_id();
+        let transcript = boxes::store::exec_transcript_path(box_dir, id.as_str());
+        std::fs::create_dir_all(transcript.parent().expect("execs dir")).expect("execs dir");
+        let box_id = boxes::SessionId::mint();
+        let entry = std::sync::Arc::new(ExecEntry::new(
+            id.clone(),
+            box_id,
+            ExecMode::Detached,
+            transcript.clone(),
+            None,
+        ));
+        super::super::register_exec(std::sync::Arc::clone(&entry));
+        entry.finish(super::super::ExecExit {
+            code: Some(0),
+            reason: ExecExitReason::Exited,
+        });
+        assert!(
+            find_exec(box_id, &id).is_some(),
+            "the box still has its directory"
+        );
+        std::fs::remove_dir_all(transcript.parent().expect("execs dir")).expect("reap");
+        assert!(find_exec(box_id, &id).is_none(), "the box was reaped");
+        // The next exec's registration drops the reaped entry from the map.
+        let next = std::sync::Arc::new(ExecEntry::new(
+            mint_exec_id(),
+            box_id,
+            ExecMode::Detached,
+            transcript,
+            None,
+        ));
+        super::super::register_exec(next);
+        assert_eq!(std::sync::Arc::strong_count(&entry), 1);
+    }
 }
 
 mod end_to_end {
