@@ -1611,17 +1611,46 @@ impl BoxActor {
         self.stop_running(false).await;
         self.mark_name_stopped().await;
 
+        // The host is gone and the watch is cleared, so this is the one
+        // chance to record the exit: a failed write is retried with a short
+        // backoff before the box is left running with nothing in it.
         let ending = boxes::core::record::ExitEnding::Exit { exit_code };
-        let written = async {
-            let mut record = self.record.record().await?;
-            record.set_state(boxes::core::record::RecordState::Exited(ending));
-            self.record.write(record).await
-        }
-        .await;
+        let mut attempt = 0u32;
+        let written = loop {
+            attempt += 1;
+            let written = async {
+                #[cfg(test)]
+                if exit_record_seam::fail_this_write(&box_id) {
+                    return Err(std::io::Error::other("injected exit-record write failure"));
+                }
+                let mut record = self.record.record().await?;
+                record.set_state(boxes::core::record::RecordState::Exited(ending));
+                self.record.write(record).await
+            }
+            .await;
+            match written {
+                Ok(()) => break Ok(()),
+                Err(error) if attempt < EXIT_RECORD_WRITE_ATTEMPTS => {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        exit_code,
+                        attempt,
+                        %error,
+                        "the entrypoint returned, but the record could not be set to exited; retrying"
+                    );
+                    tokio::time::sleep(EXIT_RECORD_RETRY_BACKOFF * attempt).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
         if let Err(error) = written {
-            tracing::warn!(
+            // The record stays running with no host. The actor keeps hosting
+            // the box, as a failed stop does, so a `min stop` can still set
+            // the record and end the actor.
+            tracing::error!(
                 box_id = %box_id,
                 exit_code,
+                attempts = attempt,
                 %error,
                 "the entrypoint returned, but the record could not be set to exited"
             );
@@ -2099,6 +2128,47 @@ pub(crate) mod launch_publish_seam {
 /// that the launch killed the box it could not record. Keyed by session
 /// id, so tests running beside each other in one process never fail each
 /// other's writes.
+/// How many times the end of a box tries to write its `exited` record.
+const EXIT_RECORD_WRITE_ATTEMPTS: u32 = 5;
+/// The wait before the next exited-record write, multiplied by the attempt.
+const EXIT_RECORD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Fails the next `n` exited-record writes of one box, so a test can pin the
+/// retry in `end_on_entrypoint_return`. Keyed by box id, as
+/// [`launch_record_seam`] is.
+#[cfg(test)]
+pub(crate) mod exit_record_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, u32>>> = Mutex::new(None);
+
+    /// Makes the next `n` exited-record writes for `id` fail.
+    pub(crate) fn fail_next_writes(id: SessionId, n: u32) {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, n);
+    }
+
+    /// Whether this write for `id` fails, using up one injected failure.
+    pub(super) fn fail_this_write(id: &SessionId) -> bool {
+        let mut failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failing.as_mut().and_then(|f| f.get_mut(id)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod launch_record_seam {
     use std::collections::HashMap;

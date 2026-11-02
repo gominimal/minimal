@@ -16196,6 +16196,49 @@ async fn until_complete_ends_on_entrypoint_return_without_client_records_exited(
     assert_eq!(exited.data["exit_code"], 0);
 }
 
+// BOX-038: the host is gone once the entrypoint returns, so a write of the
+// exited record that fails at first is retried, and the box still ends as
+// exited with its code and its event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_exit_record_write_retries_after_failure() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    crate::box_actor::exit_record_seam::fail_next_writes(session_id, 2);
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Exited),
+        "the retried end records an exited event"
+    );
+}
+
 // BOX-015: neither a client that goes away nor time with nothing to do
 // stops a box. The client's channel and connection close, the box sits
 // idle, and its entrypoint still runs, with the record still running and
