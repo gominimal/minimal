@@ -365,10 +365,10 @@ The `host_ip` lane on a VM host
     verify: cargo nextest run -p minimal host_ip_grant_box_on_vm_host_is_not_refused_as_unserved
     <!-- unwanted; before this requirement a `host_ip` box got no box id and its creation was refused as though no proxy served the host -->
 
-- **BEP-083** WHILE a resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL admit connections from the `host_ip` cohort address to the proxy's listener.
+- **BEP-083** WHILE a resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL admit connections from the `host_ip` cohort address to the proxy's listener and to the proxy's address on TCP port 443.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_ip_cohort_reaches_proxy_while_a_member_declares_a_lane
-  <!-- NET-134 applied to the cohort: networking §4.3 rule 2 makes the shared address's reach the union of its resident members' rules, and the residual is T28 -->
+  <!-- NET-134 applied to the cohort: networking §4.3 rule 2 makes the shared address's reach the union of its resident members' rules, and the residual is T28; port 443 is BEP-080's direct TLS path, which `dns` steering (BEP-086) sends a `host_ip` box's lookups to -->
   - WHILE no resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL drop connections from the `host_ip` cohort address to the proxy's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_ip_cohort_proxy_lane_dropped_without_a_declaring_member
@@ -381,6 +381,10 @@ The `host_ip` lane on a VM host
     tier:   T0
     verify: cargo nextest run -p bep cohort_redemption_uses_named_box_egress_and_subject
     <!-- Gatehouse §6.10 redemption step 2: host-ip attribution is to the cohort and the value's `sub` must be a live `host_ip` box of the node; step 3: the egress declaration checked is that box's, the only box the request identifies -->
+  - IF a cohort-attributed request carries a sealed value that names a box that is not a live `host_ip` box of this host THEN THE SYSTEM SHALL refuse the request and record an audit event marked `cohort_misattributed`.
+    tier:   T0
+    verify: cargo nextest run -p bep cohort_value_naming_no_live_host_ip_box_is_refused
+    <!-- unwanted; a cohort delivery names no box, so the value's `sub` is the only box the request carries: a value naming an `own_ip` box, a box that ended, or a box of another host is refused here as BEP-020 refuses it on a box-attributed connection -->
 
 - **BEP-085** THE SYSTEM SHALL treat a credentialed upstream as in effect for an `own_ip` box and for a `host_ip` box on a VM host, and as not in effect for a `none` box and for a `host_ip` box on a host with no VM.
   tier:     T0
@@ -391,7 +395,7 @@ The `host_ip` lane on a VM host
 - **BEP-086** WHERE a `host_ip` box on a VM host declares a credentialed upstream and its steering is `dns` or `both` THE SYSTEM SHALL answer that box's lookups of its steered names with the proxy's address.
   tier:     T0
   verify:   cargo nextest run -p minimald host_ip_grant_box_steered_names_resolve_to_proxy
-  <!-- per box, never per namespace: the box resolves through its own resolver, as NET-079 already places a `host_ip` box's resolver per box; BEP-078 and BEP-062 hold for these answers as for an `own_ip` box's -->
+  <!-- per box, never per namespace: on a VM host a `host_ip` box resolves through the node's DNS layer (NET-003's VM-backed sub-requirement, which forwards under NET-066), and the box's resolver configuration is its own, so a steering answer goes to this box alone; BEP-078 and BEP-062 hold for these answers as for an `own_ip` box's -->
   - IF a process in the shared namespace that is not a `host_ip` box with `dns` or `both` steering and a credentialed upstream looks up a steered name, THEN THE SYSTEM SHALL answer it from real DNS.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_lookup_outside_a_steered_box_resolves_real
@@ -400,8 +404,11 @@ The `host_ip` lane on a VM host
 - **BEP-087** WHILE a `host_ip` box on a VM host holds a sealed GitHub member under its default steering THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no proxy variables in the box.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_dns_steering
-  verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_proxy_env
   <!-- architecture D6, Interaction with Network Modes: `host_ip` works, at the tier its chooser accepted; the default steering is `dns` in every mode (networking §5.4, BEP-016) -->
+  - WHILE a `host_ip` box on a VM host holds a sealed GitHub member under `proxy_env` steering THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_proxy_env
+    <!-- state-driven; BEP-015's case for a `host_ip` box: the proxy variables (BEP-012, BEP-085) carry the flows instead of the steering answers -->
 
 HTTP versions and framing
 
@@ -1154,7 +1161,7 @@ per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL redeem a sealed value only on this host, and only from the box it names or, where that box is `host_ip`, from another live `host_ip` box of this host with the redemption audited `cohort_attributed`.
   enforced by: host key binding; box attribution from the switch's source address and the host-side creator's attachments; the `host_ip` cohort rule
-  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070
+  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070, BEP-083, BEP-084
 
 - **Invariant:** THE SYSTEM SHALL substitute a credential only into a request whose connection authority and `Host` are one declared authority of its module or registration, on an upstream connection that authenticated as that authority.
   enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts, canonical re-serialization with ambiguous framing refused, no upstream connection shared across boxes
@@ -1162,7 +1169,7 @@ per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL admit no credentialed reach that the box's declared egress denies.
   enforced by: full-set validation at expansion; egress re-check at redemption
-  covered by: BEP-008, BEP-022, BEP-036
+  covered by: BEP-008, BEP-022, BEP-036, BEP-084
 
 - **Invariant:** THE SYSTEM SHALL write no credential to any log, spec rendering or diagnostic bundle.
   enforced by: audit record construction from the decision only; `min box spec` and `min secret` render identifiers and references only
