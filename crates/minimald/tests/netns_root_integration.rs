@@ -2380,18 +2380,37 @@ impl Quic443Scratch {
     }
 
     /// Runs the helper the daemon runs, as root, on the box leaf.
+    ///
+    /// A failed run is retried a bounded number of times before it fails
+    /// the leg: under the lane's load a privileged helper run can fail
+    /// transitively — sudo refusing to start one more subprocess, nft
+    /// failing to talk to the kernel — and neither verb minds a retry: an
+    /// nft transaction is all-or-nothing, so a failed run changed nothing,
+    /// and `add` on an element the set already holds succeeds again.
     fn helper_on_leaf(&self, verb: &str, leaf: &Path) {
-        let out = quic443_privileged(&self.helper().to_string_lossy())
-            .arg(verb)
-            .arg(leaf)
-            .output()
-            .expect("running the QUIC block helper");
-        assert!(
-            out.status.success(),
-            "the QUIC block helper runs `{verb}` on {}: {}",
-            leaf.display(),
-            String::from_utf8_lossy(&out.stderr),
-        );
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let run = quic443_privileged(&self.helper().to_string_lossy())
+                .arg(verb)
+                .arg(leaf)
+                .output();
+            match run {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper runs `{verb}` on {}: {}",
+                    leaf.display(),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
+                Err(e) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper starts `{verb}` on {}: {e}",
+                    leaf.display(),
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// The elements of the blocked-leaves set in the loaded table.
@@ -2643,20 +2662,30 @@ fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
     ));
 
     // The rejected datagram: the output chain drops it with an ICMP port
-    // unreachable, and the send itself reports the drop or nothing.
+    // unreachable, and the send itself reports the drop or nothing. The
+    // ICMP verdict can lag the flip by a kernel timing slice, so the leg
+    // polls for the ECONNREFUSED the block guarantees instead of trusting
+    // one fixed delay — every datagram sent meanwhile is blocked by the
+    // same rule the flip loaded, and the listener-gets-nothing check
+    // below covers them all.
     let rejected = quic443_send(&socket, "during");
     assert!(
         matches!(rejected, None | Some(libc::EPERM | libc::ECONNREFUSED)),
         "the first datagram after the flip is dropped, got errno {rejected:?}"
     );
     if rejected != Some(libc::ECONNREFUSED) {
-        std::thread::sleep(Duration::from_millis(200));
-        let next = quic443_send(&socket, "during-next");
-        assert_eq!(
-            next,
-            Some(libc::ECONNREFUSED),
-            "the next datagram after the flip reports ECONNREFUSED (the first gave {rejected:?})"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if quic443_send(&socket, "during-next") == Some(libc::ECONNREFUSED) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the datagram after the flip reports ECONNREFUSED (the \
+                 first gave {rejected:?})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     assert_eq!(
         listener.next_line(Duration::from_millis(500)),
