@@ -12757,7 +12757,7 @@ mod tests {
         // reaches the switch. The marker after them, at the listener itself,
         // proves every one was decided before it and none passed.
         let refused = [
-            ipv4_frame(LEASE, 6, proxy, 443),
+            ipv4_frame(LEASE, 6, proxy, 444),
             ipv4_frame(LEASE, 6, proxy, 8080),
             ipv4_frame(LEASE, 17, proxy, 8118),
         ];
@@ -12783,7 +12783,7 @@ mod tests {
         for needle in [
             "source=100.64.0.9",
             "destination=100.64.255.252",
-            "port=443",
+            "port=444",
             "box=\"laned\"",
             "rule_matched=\"egress-uncredentialed-proxy-destination\"",
         ] {
