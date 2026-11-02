@@ -63,10 +63,11 @@ demo box declares `github:user-token`, the honest spelling of a `full` member,
 so the slice also exercises `min box spec`'s `full` marker (BEP-038). Keychain
 references with `min secret`, `dns` steering, the browser sign-in flow, `min box
 audit --follow` and `--parent`, audit segment rotation, signing-CA rotation, the
-PAC recipe and `host_ip` cohort handling are later slices. The `host_ip`
-lane on a host that runs its boxes in a VM, with `dns` as its default
-steering, is BEP-082 to BEP-087. The direct TLS path that `dns` steering
-needs is BEP-080 and BEP-081.
+PAC recipe and `host_ip` cohort handling are later slices.
+
+The `host_ip` lane on a host that runs its boxes in a VM, with `dns` as its
+default steering, is BEP-082 to BEP-087. The direct TLS path that `dns`
+steering needs is BEP-080 and BEP-081.
 
 ## Users and stories
 
@@ -287,7 +288,6 @@ Steering and the interception CA
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
-  verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_proxy_env
   <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
   - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL carry from creation a git credential helper that answers `git credential fill` with the sealed value as the password for each host in the GitHub module's host set, and for no other host.
     tier:   T0
@@ -352,7 +352,6 @@ Steering and the interception CA
 - **BEP-081** WHERE the host runs its boxes in a VM THE SYSTEM SHALL admit `dns` and `both` steering for `own_ip` and `host_ip` boxes.
   tier:     T0
   verify:   cargo nextest run -p minimal vm_host_admits_dns_and_both_for_own_ip_and_host_ip
-  verify:   ./scripts/session-e2e.sh bep_dns_steering_through_the_box_zone_resolver
   <!-- the box-zone resolver fact of BEP-017 for a VM host, both modes; an `own_ip` box is steered at the switch's DNS gate and a `host_ip` box through its own resolver (BEP-086); this retires the interim refusal of `dns` that waited on gominimal/minimal#2805; a host with no VM keeps BEP-017's refusal, and a SharedLinux host has no proxy (Non-goals) -->
 
 The `host_ip` lane on a VM host
@@ -401,6 +400,7 @@ The `host_ip` lane on a VM host
 - **BEP-087** WHILE a `host_ip` box on a VM host holds a sealed GitHub member under its default steering THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no proxy variables in the box.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_dns_steering
+  verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_proxy_env
   <!-- architecture D6, Interaction with Network Modes: `host_ip` works, at the tier its chooser accepted; the default steering is `dns` in every mode (networking §5.4, BEP-016) -->
 
 HTTP versions and framing
