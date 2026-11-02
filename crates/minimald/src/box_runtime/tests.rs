@@ -7854,6 +7854,140 @@ async fn pty_client_loss_records_detach() {
     drop(first);
 }
 
+/// BOX-016: a PTY client that leaves without a detach runs the box's
+/// `on_detach` hooks, as a detach does, so the hooks agree with the
+/// `detached` event the loss records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_client_loss_records_detach_and_runs_detach_hooks() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("detached");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = client
+        .call::<CreateSession>(&create_session_req("lost-client-hooks", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: boxes::wire::request::WireContribution {
+                    lifecycle_hooks: vec![boxes::wire::primitives::WireProvenancedHook {
+                        hook: boxes::wire::primitives::WireLifecycleHook {
+                            on_detach: Some(boxes::wire::primitives::WireHookScript::Inline {
+                                body: format!("echo ran > {}", marker.display()),
+                                timeout_secs: 60,
+                            }),
+                            ..Default::default()
+                        },
+                        source: boxes::wire::primitives::WireSource::UserLoadout {
+                            name: "test".to_string(),
+                        },
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let mut channel = client.open_shell(id).await;
+    // The shell is up once its first output arrives.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { .. }) => return,
+                Some(_) => {}
+                None => panic!("the channel closed before the shell wrote"),
+            }
+        }
+    })
+    .await
+    .expect("the shell writes to the attached client");
+    assert!(!marker.exists(), "no client has left yet");
+
+    channel.close().await.unwrap();
+    let ran = tokio::time::timeout(Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ran.is_ok(), "a lost client did not run the detach hooks");
+}
+
+/// BOX-155: a box that writes past the cap runs on, and leaves a log no
+/// larger than [`boxes::store::LOG_CAP`] that holds its newest output after
+/// the dropped-output line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_newest() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+
+    let stored = StoredBox::new();
+    let past_cap = boxes::store::LOG_CAP + boxes::store::LOG_CAP / 8;
+    let script = format!(
+        "head -c {past_cap} /dev/zero | tr '\\0' a; printf 'newest\\n'; sleep 60"
+    );
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        run_by_exec: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.mainloop());
+
+    let log = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let log = stored.dir.read_log_from(0, usize::MAX).unwrap();
+            if log.ends_with(b"newest\r\n") {
+                return log;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the box's newest output reaches its log");
+
+    assert!(
+        log.len() as u64 <= boxes::store::LOG_CAP,
+        "the log is {} bytes, past the cap",
+        log.len()
+    );
+    assert!(
+        log.starts_with(boxes::store::LOG_DROPPED),
+        "the log says older output was dropped"
+    );
+    let kept = &log[boxes::store::LOG_DROPPED.len()..];
+    let output = kept.strip_suffix(b"newest\r\n").unwrap();
+    assert!(
+        !output.is_empty() && output.iter().all(|&b| b == b'a'),
+        "the log keeps the newest output and nothing else"
+    );
+    assert!(!task.is_finished(), "the box runs on past the cap");
+    handle.kill(true).await.expect("kill should reach the host");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+}
+
 /// BOX-155: the box's output is in its log from the start, with no client
 /// attached. An attached client reads the same output as a second reader,
 /// and after the client drops, the log holds what came before, during and

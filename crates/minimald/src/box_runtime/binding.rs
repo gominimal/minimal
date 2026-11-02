@@ -855,9 +855,10 @@ impl Binding {
                 disposition == ExitDisposition::Kept
             }
             MainloopExitReason::Detach => true,
-            // Not on a lost client. Nobody chose to leave, as with a shed
-            // below. The `detached` event still records the departure.
-            MainloopExitReason::ClientLost => false,
+            // A lost client left a box that runs on, as a detach does, so
+            // its `on_detach` hooks run and agree with the `detached` event
+            // below. Unlike a shed, the hooks write to no client terminal.
+            MainloopExitReason::ClientLost => true,
             // NOT on supercede, however much it looks like a departure.
             // `Host::attach` sends the teardown and then awaits this
             // binding's join handle — from inside the host's own message
