@@ -1655,3 +1655,439 @@ where
         tracing::debug!(%channel_id, "exec: background stdio drain finished");
     });
 }
+
+/// Why an exec ended (BOX-149), as its `exec_exited` event spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecExitReason {
+    /// The command exited on its own, or a signal from outside ended it.
+    Exited,
+    /// The exec's own timeout ran out and the daemon stopped it.
+    Timeout,
+}
+
+impl ExecExitReason {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// How an exec ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecExit {
+    /// The exit code. `None` when a signal ended the command.
+    pub(crate) code: Option<i32>,
+    pub(crate) reason: ExecExitReason,
+}
+
+impl ExecExit {
+    /// The exit status a client gets for this end, the same as an attached
+    /// exec's bridge reports.
+    pub(crate) fn status(self) -> u32 {
+        self.code.unwrap_or(1) as u32
+    }
+}
+
+/// What a tty exec's terminal writes, as an attached client follows it.
+type TerminalFollow = tokio::sync::broadcast::Receiver<Vec<u8>>;
+
+/// The live half of a tty exec's terminal: what it writes, for attached
+/// clients, and what they type. Dropped when the exec ends.
+#[derive(Debug)]
+pub(crate) struct TerminalLive {
+    output: tokio::sync::broadcast::Sender<Vec<u8>>,
+    /// `None` once the exec has exited.
+    input: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+/// A tty exec's terminal, shared by its pump and its attached clients.
+///
+/// The lock orders the pump's writes against an attach's replay: the pump
+/// writes a chunk to the transcript and sends it to the live clients under
+/// it, and an attach reads the transcript and subscribes under it. So an
+/// attach sees every byte once, from the replay or live.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecTerminal(Arc<std::sync::Mutex<Option<TerminalLive>>>);
+
+/// The chunks a slow attached client can fall behind by before it skips
+/// some. The transcript keeps every byte.
+const TERMINAL_BACKLOG: usize = 1024;
+
+impl ExecTerminal {
+    /// A terminal, and the receiver its feed writes from.
+    pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (output, _) = tokio::sync::broadcast::channel(TERMINAL_BACKLOG);
+        let (input, typed) = mpsc::unbounded_channel();
+        (
+            Self(Arc::new(std::sync::Mutex::new(Some(TerminalLive {
+                output,
+                input: Some(input),
+            })))),
+            typed,
+        )
+    }
+}
+
+/// One exec the daemon started under an id (BOX-149), for a wait, an
+/// output read or an attach by that id.
+#[derive(Debug)]
+pub(crate) struct ExecEntry {
+    pub(crate) id: ExecId,
+    /// The box the exec runs in. A request from another box does not find it.
+    pub(crate) box_id: SessionId,
+    pub(crate) mode: ExecMode,
+    /// Where the exec's output is captured, beside the box's record.
+    pub(crate) transcript: camino::Utf8PathBuf,
+    terminal: Option<ExecTerminal>,
+    exit: watch::Sender<Option<ExecExit>>,
+}
+
+impl ExecEntry {
+    pub(crate) fn new(
+        id: ExecId,
+        box_id: SessionId,
+        mode: ExecMode,
+        transcript: camino::Utf8PathBuf,
+        terminal: Option<ExecTerminal>,
+    ) -> Self {
+        Self {
+            id,
+            box_id,
+            mode,
+            transcript,
+            terminal,
+            exit: watch::channel(None).0,
+        }
+    }
+
+    /// Writes a chunk of a tty exec's output to its transcript and to its
+    /// attached clients.
+    pub(crate) fn record_output(&self, transcript: &mut std::fs::File, chunk: &[u8]) {
+        use std::io::Write as _;
+
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(error) = transcript.write_all(chunk) {
+            tracing::warn!(exec_id = %self.id, %error, "exec: could not write the transcript");
+        }
+        if let Some(live) = live.as_ref() {
+            // No receiver is no client attached; the transcript has it.
+            let _ = live.output.send(chunk.to_vec());
+        }
+    }
+
+    /// Passes what a client typed to a tty exec's terminal. False once the
+    /// exec has ended.
+    pub(crate) fn send_input(&self, bytes: Vec<u8>) -> bool {
+        let Some(terminal) = &self.terminal else {
+            return false;
+        };
+        let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+        live.as_ref()
+            .and_then(|live| live.input.as_ref())
+            .is_some_and(|input| input.send(bytes).is_ok())
+    }
+
+    /// Ends the terminal's input once the exec has exited, so its feed ends.
+    pub(crate) fn close_input(&self) {
+        if let Some(terminal) = &self.terminal {
+            // The output stays until `finish`: the pump can still copy the
+            // terminal's last output to an attached client.
+            let mut live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(live) = live.as_mut() {
+                live.input = None;
+            }
+        }
+    }
+
+    /// Records the exec's end, which every waiter and attached client sees.
+    pub(crate) fn finish(&self, exit: ExecExit) {
+        if let Some(terminal) = &self.terminal {
+            terminal.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        self.exit.send_replace(Some(exit));
+    }
+
+    /// Waits for the exec to end, and returns how it ended.
+    pub(crate) async fn wait(&self) -> ExecExit {
+        let mut exit = self.exit.subscribe();
+        loop {
+            if let Some(end) = *exit.borrow_and_update() {
+                return end;
+            }
+            if exit.changed().await.is_err() {
+                // The entry holds the sender, so this cannot close while
+                // `self` lives; read the last value regardless.
+                if let Some(end) = *exit.borrow() {
+                    return end;
+                }
+            }
+        }
+    }
+
+    /// The transcript so far, and a receiver for what the terminal writes
+    /// after it. `None` for an exec without a terminal, or one that ended:
+    /// then the transcript is all there is.
+    fn replay_and_follow(&self) -> io::Result<(Vec<u8>, Option<TerminalFollow>)> {
+        let Some(terminal) = &self.terminal else {
+            return Ok((std::fs::read(&self.transcript)?, None));
+        };
+        let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+        let replay = std::fs::read(&self.transcript)?;
+        Ok((replay, live.as_ref().map(|live| live.output.subscribe())))
+    }
+}
+
+/// Every exec started under an id, by its id. An entry is small once its
+/// exec has ended: its terminal is dropped, and its output is in the
+/// transcript file.
+static EXECS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<ExecId, Arc<ExecEntry>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn register_exec(entry: Arc<ExecEntry>) {
+    EXECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(entry.id.clone(), entry);
+}
+
+/// The exec `id` of the box `box_id`, if this daemon started it.
+pub(crate) fn find_exec(box_id: SessionId, id: &ExecId) -> Option<Arc<ExecEntry>> {
+    EXECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .filter(|entry| entry.box_id == box_id)
+        .cloned()
+}
+
+/// Reads the output the exec `id` captured in the box whose state directory
+/// is `box_dir`. `None` when the box has no transcript for that id. The
+/// transcript stays until the box is reaped, so this read works after the
+/// exec ended and after a daemon restart.
+pub(crate) fn read_exec_output(
+    box_dir: &camino::Utf8Path,
+    id: &ExecId,
+) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(boxes::store::exec_transcript_path(box_dir, id.as_str())) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// How an attach to a tty exec ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachEnd {
+    /// The exec ended. The client gets its status.
+    Exited(ExecExit),
+    /// The client went away. The exec keeps running for a later attach.
+    ClientGone,
+}
+
+/// Resumes a tty exec's terminal for one client: the transcript so far,
+/// then what the terminal writes, while what the client types goes to the
+/// terminal. Returns when the exec ends or the client goes away. The exec
+/// keeps running when the client goes away.
+pub(crate) async fn relay_terminal<M, W>(
+    entry: &ExecEntry,
+    mut msgs: M,
+    out: &mut W,
+) -> io::Result<AttachEnd>
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (replay, live) = entry.replay_and_follow()?;
+    out.write_all(&replay).await?;
+    out.flush().await?;
+    let Some(mut live) = live else {
+        return Ok(AttachEnd::Exited(entry.wait().await));
+    };
+    let mut exit = entry.exit.subscribe();
+    let mut typing = true;
+    loop {
+        tokio::select! {
+            biased;
+            chunk = live.recv() => match chunk {
+                Ok(chunk) => {
+                    out.write_all(&chunk).await?;
+                    out.flush().await?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(exec_id = %entry.id, skipped, "exec: an attached client fell behind");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Ok(AttachEnd::Exited(entry.wait().await));
+                }
+            },
+            // Reduced to a copy in the branch: the `watch::Ref` it yields is
+            // not `Send` and must not live across the writes below.
+            ended = async { exit.wait_for(Option::is_some).await.ok().and_then(|end| *end) } => {
+                // Copy what the pump sent before the end.
+                while let Ok(chunk) = live.try_recv() {
+                    out.write_all(&chunk).await?;
+                }
+                out.flush().await?;
+                let end = match ended {
+                    Some(end) => end,
+                    None => entry.wait().await,
+                };
+                return Ok(AttachEnd::Exited(end));
+            }
+            msg = msgs.next(), if typing => match msg {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    entry.send_input(data.to_vec());
+                }
+                // The client sends no more input, but it still reads.
+                Some(russh::ChannelMsg::Eof) => typing = false,
+                Some(russh::ChannelMsg::Close) | None => return Ok(AttachEnd::ClientGone),
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Answers an exec request on its channel: `stdout` and `stderr`, then
+/// `status`, then the close.
+pub(crate) async fn answer_exec(channel: Channel<Msg>, stdout: &[u8], stderr: &[u8], status: u32) {
+    let (_rs, ws) = channel.split();
+    let mut w = ws.make_writer();
+    let mut e = ws.make_writer_ext(Some(1));
+    let _ = w.write_all(stdout).await;
+    let _ = e.write_all(stderr).await;
+    let _ = w.flush().await;
+    let _ = e.flush().await;
+    let _ = ws.eof().await;
+    let _ = ws.exit_status(status).await;
+    let _ = ws.close().await;
+}
+
+/// The exit status of a refusal to run a command in a box that is not
+/// running (BOX-149).
+pub(crate) const NOT_RUNNING_STATUS: u32 = 2;
+
+/// The state word `min ls` prints for a box in `status`.
+pub(crate) fn box_state_word(status: boxes::BoxState) -> &'static str {
+    match status {
+        boxes::BoxState::Pending => "pending",
+        boxes::BoxState::Materializing => "materializing",
+        boxes::BoxState::Active => "running",
+        boxes::BoxState::Stopped => "stopped",
+        boxes::BoxState::Exited => "exited",
+    }
+}
+
+/// The refusal for a command sent to a box that is not running.
+pub(crate) fn not_running_message(box_label: &str, status: boxes::BoxState) -> String {
+    format!(
+        "box {box_label} is {}. Only a running box can run a command.\n",
+        box_state_word(status)
+    )
+}
+
+/// Serves `min://exec/output`: the exec's captured output on stdout.
+pub(crate) async fn serve_exec_output(channel: Channel<Msg>, session: BoxHandle, id: ExecId) {
+    let read = match ExecBox::of(&session).await {
+        Ok(exec_box) => read_exec_output(&exec_box.dir, &id),
+        Err(e) => Err(e),
+    };
+    match read {
+        Ok(Some(output)) => answer_exec(channel, &output, b"", 0).await,
+        Ok(None) => answer_exec(channel, b"", no_exec_message(&id).as_bytes(), 1).await,
+        Err(error) => {
+            tracing::warn!(exec_id = %id, %error, "exec: could not read the exec's output");
+            let message = format!("the output of exec {id} could not be read: {error}\n");
+            answer_exec(channel, b"", message.as_bytes(), 1).await;
+        }
+    }
+}
+
+/// Serves `min://exec/wait`: waits for the exec to end and exits with its
+/// status. A client that goes away ends the wait, not the exec.
+pub(crate) async fn serve_exec_wait(channel: Channel<Msg>, box_id: SessionId, id: ExecId) {
+    let Some(entry) = find_exec(box_id, &id) else {
+        answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
+        return;
+    };
+    let (mut rs, ws) = channel.split();
+    let gone = async {
+        while let Some(msg) = rs.wait().await {
+            if matches!(msg, russh::ChannelMsg::Close) {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        exit = entry.wait() => {
+            if exit.reason == ExecExitReason::Timeout {
+                let mut e = ws.make_writer_ext(Some(1));
+                let _ = e.write_all(timeout_message(&id).as_bytes()).await;
+                let _ = e.flush().await;
+            }
+            let _ = ws.eof().await;
+            let _ = ws.exit_status(exit.status()).await;
+            let _ = ws.close().await;
+        }
+        () = gone => {
+            tracing::debug!(exec_id = %id, "exec: a wait's client went away; the exec runs on");
+        }
+    }
+}
+
+/// Serves `min://exec/attach`: resumes a tty exec's terminal on the channel.
+pub(crate) async fn serve_exec_attach(channel: Channel<Msg>, box_id: SessionId, id: ExecId) {
+    let Some(entry) = find_exec(box_id, &id) else {
+        answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
+        return;
+    };
+    if entry.mode != ExecMode::Tty {
+        let message = format!(
+            "exec {id} has no terminal to attach to. Read its output with min://exec/output {id}.\n"
+        );
+        answer_exec(channel, b"", message.as_bytes(), 1).await;
+        return;
+    }
+    let (rs, ws) = channel.split();
+    let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
+        rs.wait().await.map(|msg| (msg, rs))
+    }));
+    let mut w = ws.make_writer();
+    tracing::info!(exec_id = %id, "exec: a client attached to the exec's terminal");
+    match relay_terminal(&entry, msgs, &mut w).await {
+        Ok(AttachEnd::Exited(exit)) => {
+            let _ = w.flush().await;
+            let _ = ws.eof().await;
+            let _ = ws.exit_status(exit.status()).await;
+            let _ = ws.close().await;
+        }
+        Ok(AttachEnd::ClientGone) => {
+            tracing::info!(exec_id = %id, "exec: the attached client went away; the exec runs on");
+        }
+        Err(error) => {
+            tracing::debug!(exec_id = %id, %error, "exec: the attached client could not be written");
+        }
+    }
+}
+
+/// The refusal for an exec id the box does not have.
+fn no_exec_message(id: &ExecId) -> String {
+    format!("this box has no exec {id}.\n")
+}
+
+/// The refusal for an exec id this daemon holds no exit for. Its transcript
+/// can outlive the daemon that started it, but the exit lives in memory.
+fn unknown_exit_message(id: &ExecId) -> String {
+    format!(
+        "this daemon did not start exec {id} in this box, so it has no exit code or terminal for it.\n"
+    )
+}
+
+/// The line a wait prints for an exec that its own timeout ended.
+fn timeout_message(id: &ExecId) -> String {
+    format!("exec {id} ran past its timeout and was stopped.\n")
+}

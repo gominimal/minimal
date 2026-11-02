@@ -1010,3 +1010,418 @@ impl Process for TokioProcess {
         Ok(())
     }
 }
+
+/// Mints an exec id (BOX-149): a UUIDv7, whatever the exec's mode.
+pub(crate) fn mint_exec_id() -> ExecId {
+    ExecId::parse(&uuid::Uuid::now_v7().hyphenated().to_string())
+        .expect("a hyphenated UUIDv7 always parses as an exec id")
+}
+
+/// The program and arguments an exec's argv runs as, with no shell between
+/// the client's words and the process (BOX-149). The box host joins them to
+/// the box's namespaces and cgroup ([`crate::nsenter::Injection`]).
+pub(crate) fn exec_argv(argv: Vec<String>) -> (String, Vec<String>) {
+    BoxProgram::Argv(argv).argv()
+}
+
+/// The box an exec runs in, as the exec's events and transcript need it.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecBox {
+    /// The box's record, for the id and parent its events carry.
+    pub(crate) record: boxes::Record,
+    /// The box's state directory, where its record, its events and its
+    /// exec transcripts live.
+    pub(crate) dir: camino::Utf8PathBuf,
+}
+
+impl ExecBox {
+    /// The box `session` names, read from its live actor.
+    pub(crate) async fn of(session: &BoxHandle) -> io::Result<Self> {
+        let record = session.record().await?;
+        let paths = session.paths().await?;
+        // Every directory in `BoxPaths` sits in the box's state directory,
+        // beside `record.json`.
+        let dir = paths
+            .home
+            .as_utf8_path()
+            .parent()
+            .ok_or_else(|| io::Error::other("the box's home directory has no parent"))?
+            .to_path_buf();
+        Ok(Self { record, dir })
+    }
+
+    /// Writes one exec event about `id` to the box's events file. A failed
+    /// write is logged and never ends the exec.
+    pub(crate) fn write_event(
+        &self,
+        kind: boxes::events::BoxEventType,
+        id: &ExecId,
+        mode: ExecMode,
+        exit: Option<ExecExit>,
+    ) {
+        let mut event = boxes::events::BoxEvent::for_record(&self.record, kind);
+        event.data.insert("exec_id".into(), id.as_str().into());
+        event.data.insert("mode".into(), mode.name().into());
+        event
+            .data
+            .insert("pty".into(), (mode == ExecMode::Tty).into());
+        if let Some(exit) = exit {
+            event.data.insert(
+                "exit_code".into(),
+                exit.code
+                    .map_or(serde_json_lenient::Value::Null, Into::into),
+            );
+            event
+                .data
+                .insert("reason".into(), exit.reason.name().into());
+        }
+        let path = self.dir.join(boxes::events::EVENTS_FILE);
+        if let Err(error) = boxes::store::append_event_at(&path, &event) {
+            tracing::warn!(
+                exec_id = %id,
+                event_type = kind.name(),
+                %error,
+                "exec: could not write the box event"
+            );
+        }
+    }
+}
+
+/// What a tty or a detached exec needs to start (BOX-149).
+#[derive(Debug)]
+pub(crate) struct ManagedStart {
+    pub(crate) id: ExecId,
+    pub(crate) mode: ExecMode,
+    pub(crate) exec_box: ExecBox,
+    /// The exec's own timeout. `None` leaves it to the box's ceilings.
+    pub(crate) timeout: Option<Duration>,
+    /// The terminal's rows and columns, for a tty exec.
+    pub(crate) winsize: (u16, u16),
+}
+
+/// Starts a tty or a detached exec from `command`, which runs the exec's
+/// argv in the box, and returns its entry at once. The exec then runs on
+/// its own, with no client: a supervisor waits for it, ends it at its own
+/// timeout, records its exit and writes its `exec_exited` event.
+///
+/// A detached exec gets `/dev/null` for stdin, so its stdin is closed at
+/// creation, and its stdout and stderr go straight to its transcript. A tty
+/// exec gets a fresh terminal for all three, and a pump copies the terminal
+/// to the transcript and to every attached client.
+///
+/// `graceful` is true for the injection shim, which a stop SIGTERMs so it
+/// can end the exec's whole process group, then SIGKILLs.
+pub(crate) fn start_managed_exec(
+    start: ManagedStart,
+    mut command: std::process::Command,
+    graceful: bool,
+) -> io::Result<Arc<ExecEntry>> {
+    let ManagedStart {
+        id,
+        mode,
+        exec_box,
+        timeout,
+        winsize,
+    } = start;
+    let transcript_path = boxes::store::exec_transcript_path(&exec_box.dir, id.as_str());
+    if let Some(dir) = transcript_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).append(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let transcript = options.open(&transcript_path)?;
+
+    let master = match mode {
+        ExecMode::Tty => {
+            let (master, slave) = open_terminal(winsize)?;
+            command
+                .stdin(Stdio::from(slave.try_clone()?))
+                .stdout(Stdio::from(slave.try_clone()?))
+                .stderr(Stdio::from(slave));
+            Some(master)
+        }
+        ExecMode::Detached | ExecMode::Attached => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(transcript.try_clone()?))
+                .stderr(Stdio::from(transcript.try_clone()?));
+            None
+        }
+    };
+    let mut command = Command::from(command);
+    command.kill_on_drop(true);
+    let child = command.spawn()?;
+    // The command holds the parent's copies of the terminal's slave side.
+    // Dropped now, so the pump sees the terminal close when the exec ends.
+    drop(command);
+    let process = if graceful {
+        TokioProcess::shim(child)
+    } else {
+        TokioProcess::new(child)
+    };
+
+    let (terminal, feed) = match master {
+        Some(master) => {
+            let (terminal, input) = ExecTerminal::new();
+            let writer = master.try_clone()?;
+            (Some((terminal, master)), Some((writer, input)))
+        }
+        None => (None, None),
+    };
+    let entry = Arc::new(ExecEntry::new(
+        id.clone(),
+        exec_box.record.id,
+        mode,
+        transcript_path,
+        terminal.as_ref().map(|(t, _)| t.clone()),
+    ));
+    register_exec(Arc::clone(&entry));
+    exec_box.write_event(boxes::events::BoxEventType::ExecStarted, &id, mode, None);
+    tracing::info!(
+        exec_id = %id,
+        mode = mode.name(),
+        timeout_secs = timeout.map(|t| t.as_secs()),
+        transcript = %entry.transcript,
+        "exec started"
+    );
+
+    let pump =
+        terminal.map(|(_, master)| spawn(pump_terminal(Arc::clone(&entry), master, transcript)));
+    if let Some((writer, input)) = feed {
+        spawn(feed_terminal(writer, input));
+    }
+    spawn(supervise_managed_exec(
+        Arc::clone(&entry),
+        process,
+        timeout,
+        pump,
+        exec_box,
+    ));
+    Ok(entry)
+}
+
+/// How long the supervisor of a tty exec waits, after the exec exits, for
+/// the pump to copy what the terminal still holds. A descendant that keeps
+/// the terminal open must not hold the exit back.
+const TERMINAL_DRAIN: Duration = Duration::from_secs(1);
+
+/// Waits for a managed exec, ends it at its own timeout, and records how it
+/// ended: on its entry for a wait, in the daemon log, and as the box's
+/// `exec_exited` event. The box itself is not touched.
+async fn supervise_managed_exec(
+    entry: Arc<ExecEntry>,
+    mut process: TokioProcess,
+    timeout: Option<Duration>,
+    pump: Option<JoinHandle<()>>,
+    exec_box: ExecBox,
+) {
+    let (status, reason) = wait_with_timeout(&mut process, timeout).await;
+    entry.close_input();
+    if let Some(mut pump) = pump
+        && tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
+            .await
+            .is_err()
+    {
+        pump.abort();
+    }
+    let code = status.unwrap_or_else(|error| {
+        tracing::warn!(exec_id = %entry.id, %error, "exec: failed to wait for the command");
+        None
+    });
+    let exit = ExecExit { code, reason };
+    exec_box.write_event(
+        boxes::events::BoxEventType::ExecExited,
+        &entry.id,
+        entry.mode,
+        Some(exit),
+    );
+    tracing::info!(
+        exec_id = %entry.id,
+        mode = entry.mode.name(),
+        exit_code = code,
+        reason = reason.name(),
+        "exec ended"
+    );
+    entry.finish(exit);
+}
+
+/// Waits for `process`, and ends it once `timeout` runs out (BOX-149):
+/// [`Process::start_kill`] (for the shim, SIGTERM to the exec's process
+/// group, its grace period, then SIGKILL), then a wait for the end.
+pub(crate) async fn wait_with_timeout<P: Process>(
+    process: &mut P,
+    timeout: Option<Duration>,
+) -> (io::Result<Option<i32>>, ExecExitReason) {
+    let Some(timeout) = timeout else {
+        return (process.wait().await, ExecExitReason::Exited);
+    };
+    match tokio::time::timeout(timeout, process.wait()).await {
+        Ok(status) => (status, ExecExitReason::Exited),
+        Err(_elapsed) => {
+            tracing::info!(
+                timeout_secs = timeout.as_secs(),
+                "exec: the command ran past its timeout; stopping it"
+            );
+            if let Err(error) = process.start_kill() {
+                tracing::warn!(%error, "exec: failed to stop the command at its timeout");
+            }
+            (process.wait().await, ExecExitReason::Timeout)
+        }
+    }
+}
+
+/// Opens a terminal pair of `rows` by `cols`, both sides close-on-exec. The
+/// slave side becomes the exec's stdio through `dup2`, which clears the flag
+/// on the copies the exec gets.
+fn open_terminal((rows, cols): (u16, u16)) -> io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: valid out-pointers for both descriptors and the size, and
+    // NULL for the optional name and termios.
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openpty` succeeded, so both descriptors are open and ours.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for fd in [&master, &slave] {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: `fd` is a live descriptor this function owns.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((std::fs::File::from(master), std::fs::File::from(slave)))
+}
+
+/// Copies a tty exec's terminal to its transcript and to every attached
+/// client until the terminal closes: `EIO` once the last slave descriptor
+/// is gone.
+async fn pump_terminal(
+    entry: Arc<ExecEntry>,
+    master: std::fs::File,
+    mut transcript: std::fs::File,
+) {
+    let mut master = tokio::fs::File::from_std(master);
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match master.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => entry.record_output(&mut transcript, &buf[..n]),
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => {
+                tracing::warn!(exec_id = %entry.id, %error, "exec: terminal read failed");
+                break;
+            }
+        }
+    }
+}
+
+/// Writes what attached clients type to a tty exec's terminal, until the
+/// exec ends and its entry drops the input's sender.
+async fn feed_terminal(master: std::fs::File, mut input: mpsc::UnboundedReceiver<Vec<u8>>) {
+    let mut master = tokio::fs::File::from_std(master);
+    while let Some(bytes) = input.recv().await {
+        if master.write_all(&bytes).await.is_err() || master.flush().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// An [`Exec`] for an attached exec with its own timeout: a [`BoxExec`]
+/// whose process ends once the timeout runs out (BOX-149).
+#[derive(Debug, Clone)]
+pub struct TimedBoxExec {
+    pub inner: BoxExec,
+    pub timeout: Option<Duration>,
+    /// Set when the timeout ended the exec, for its `exec_exited` reason.
+    pub timed_out: Arc<AtomicBool>,
+}
+
+impl Exec for TimedBoxExec {
+    type Process = TimedProcess<TokioProcess>;
+
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
+
+    fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+        let Self {
+            inner,
+            timeout,
+            timed_out,
+        } = self;
+        inner
+            .exec(session)
+            .map(move |spawned| {
+                spawned.map(|inner| TimedProcess {
+                    inner,
+                    deadline: timeout.map(|t| tokio::time::Instant::now() + t),
+                    timed_out: Arc::clone(&timed_out),
+                })
+            })
+            .boxed()
+    }
+}
+
+/// A [`Process`] that [`Process::start_kill`]s itself at its deadline.
+#[derive(Debug)]
+pub struct TimedProcess<P> {
+    pub(super) inner: P,
+    pub(super) deadline: Option<tokio::time::Instant>,
+    pub(super) timed_out: Arc<AtomicBool>,
+}
+
+impl<P: Process> Process for TimedProcess<P> {
+    type Stdin = P::Stdin;
+    type Stdout = P::Stdout;
+    type Stderr = P::Stderr;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        self.inner.take_stdio()
+    }
+
+    // Cancel-safe: the deadline is fixed at the spawn, the inner `wait` is
+    // cancel-safe, and `timed_out` is set before the next await point.
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        if let Some(deadline) = self.deadline
+            && !self.timed_out.load(Ordering::SeqCst)
+        {
+            match tokio::time::timeout_at(deadline, self.inner.wait()).await {
+                Ok(status) => return status,
+                Err(_elapsed) => {
+                    self.timed_out.store(true, Ordering::SeqCst);
+                    tracing::info!("exec: the command ran past its timeout; stopping it");
+                    if let Err(error) = self.inner.start_kill() {
+                        tracing::warn!(%error, "exec: failed to stop the command at its timeout");
+                    }
+                }
+            }
+        }
+        self.inner.wait().await
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        self.inner.start_kill()
+    }
+}
