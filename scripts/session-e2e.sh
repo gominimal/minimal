@@ -28783,7 +28783,9 @@ for row in lines:
   lt_want_rc ok "min net expose $lt_port inside $lt_b"
   lt_want_line "the expose reply names the port and the box's address" "published port $lt_port at " "$LT_OUT"
   local lt_addr
-  lt_addr="$(printf '%s\n' "$LT_OUT" | sed -n "s/^published port $lt_port at \(.*\):$lt_port\$/\1/p" | head -n1)"
+  # A reply carried over the exec channel can end in a carriage return.
+  lt_addr="$(printf '%s\n' "$LT_OUT" | tr -d '\r' \
+    | sed -n "s/^published port $lt_port at \([^ ]*\):$lt_port[[:space:]]*\$/\1/p" | head -n1)"
   if [ -z "$lt_addr" ]; then
     echo "::error::the expose reply carries no address (got: '$LT_OUT')"
     lt_fail
