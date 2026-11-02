@@ -626,6 +626,31 @@ pub(crate) fn launch_deliveries(record: &boxes::Record) -> Vec<boxes::SealedDeli
     record.sealed_deliveries.clone()
 }
 
+/// Opens the one `box.launch` span of a launch and logs the launch at info
+/// level inside it. Both name the entrypoint by [`LaunchEntrypoint::log_name`]
+/// and its argument count, never by its arguments: an argument can carry a
+/// secret, and the daemon log keeps no secret.
+pub(crate) fn launch_span(
+    session_id: boxes::SessionId,
+    session_name: &str,
+    entrypoint: &LaunchEntrypoint,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "box.launch",
+        session_id = %session_id,
+        session = %session_name,
+        entrypoint = entrypoint.log_name(),
+        args = entrypoint.arg_count(),
+    );
+    tracing::info!(
+        parent: &span,
+        entrypoint = entrypoint.log_name(),
+        args = entrypoint.arg_count(),
+        "launching the box's entrypoint from its spec"
+    );
+    span
+}
+
 /// Places the grants' sealed values in a launch's connection layer
 /// (BEP-007), before the launcher builds the shell from `attach_env`, so the
 /// values exist before the shell's entrypoint runs. Returns the placed
@@ -1200,6 +1225,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
         let session_name = name.clone();
+        // One span per launch, naming the entrypoint the launcher read from
+        // the box's spec, so the daemon log says what each launch started.
+        let entrypoint = launcher.entrypoint()?;
+        let launch_span = launch_span(session_id, &session_name, &entrypoint);
         let Launched {
             master,
             process,
@@ -1211,16 +1240,18 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             host_ip_enforcement,
             listen_plan,
             start_gate,
-        } = launcher
-            .launch(
+        } = tracing::Instrument::instrument(
+            launcher.launch(
                 crate::guest::is_microvm_daemon(),
                 session_id,
                 name,
                 username,
                 paths,
                 sz,
-            )
-            .await?;
+            ),
+            launch_span,
+        )
+        .await?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
         // launch gathered is the box's whole publication surface — its

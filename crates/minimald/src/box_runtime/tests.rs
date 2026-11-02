@@ -1711,6 +1711,10 @@ impl BoxLauncher for SealingMockLauncher {
     type Process = MockProcess;
     type Guard = ();
 
+    fn entrypoint(&self) -> io::Result<LaunchEntrypoint> {
+        Ok(LaunchEntrypoint::Shell)
+    }
+
     async fn launch(
         self,
         _guest: bool,
@@ -2708,6 +2712,8 @@ fn launcher_with(
         // The test's own state directory, the one its context builds under.
         state_dir: state_path.to_path_buf(),
         root_certificate: None,
+        // A box filed with no spec: its launch starts the shell.
+        spec: LaunchSpec::default(),
     }
 }
 
@@ -7437,5 +7443,175 @@ fn a_shim_stat_read_says_gone_only_for_a_zombie_or_a_missing_file() {
     assert!(
         stat_alive(Err(std::io::Error::from_raw_os_error(libc::EMFILE))),
         "a read error says nothing about the process"
+    );
+}
+
+/// Reads the pty master of a launch on a thread until `want` appears or
+/// the far side closes, and hands back what it read.
+fn read_pty_until(master: OwnedFd, want: &'static str) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut file = std::fs::File::from(master);
+        let mut seen = String::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match file.read(&mut buf) {
+                // EIO when the last slave closes: the process is gone.
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if seen.contains(want) {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(seen);
+    });
+    rx
+}
+
+// T42: the launch span and its info event name an argv entrypoint by its
+// program and its argument count. An argument can carry a secret, so no
+// argument reaches the daemon log. The name extends the T42 test line's
+// filter, so that line runs this test too.
+#[test]
+fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args() {
+    let secret = "--token=s3cr3t-VALUE-0042";
+    let entrypoint = LaunchEntrypoint::Argv {
+        program: "/usr/bin/min".to_string(),
+        args: vec!["task".to_string(), "run".to_string(), secret.to_string()],
+    };
+    let capture = crate::test_harness::CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let span = launch_span(boxes::SessionId::nil(), "dev", &entrypoint);
+        let _entered = span.enter();
+        tracing::info!("inside the launch");
+    });
+    let log = capture.contents();
+    assert!(
+        log.lines().any(|l| l.contains("INFO")
+            && l.contains("launching the box's entrypoint from its spec")
+            && l.contains("entrypoint=\"/usr/bin/min\"")
+            && l.contains("args=3")),
+        "the info event names the program and the argument count: {log}"
+    );
+    assert!(log.contains("box.launch"), "the span is in the log: {log}");
+    for word in [secret, "s3cr3t", "task run"] {
+        assert!(!log.contains(word), "no argument is logged ({word}): {log}");
+    }
+
+    // The shell logs as the login shell, with no arguments.
+    assert_eq!(LaunchEntrypoint::Shell.log_name(), "login shell");
+    assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
+}
+
+// T42: one launcher reads the box's first process from its spec. A
+// session's spec starts its login shell. A task's spec starts its argv,
+// unless an exec carries the box's run, because that exec runs the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launcher_starts_session_and_task_entrypoints_from_spec() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+    use std::sync::Arc;
+
+    let session = Arc::new(BoxSpec::for_session(None, SpecFlags::default()));
+    let task = mfile::Task::default();
+    let task = Arc::new(
+        BoxSpec::for_task("lint", &task, SpecFlags::default())
+            .expect("a task that is not interactive has a spec"),
+    );
+    let launch = |spec: Option<Arc<BoxSpec>>, run_by_exec: bool| LaunchSpec { spec, run_by_exec };
+
+    // The decision, for every kind of launch.
+    assert_eq!(
+        launch(Some(session.clone()), false).entrypoint().unwrap(),
+        LaunchEntrypoint::Shell
+    );
+    assert_eq!(
+        launch(Some(task.clone()), false).entrypoint().unwrap(),
+        LaunchEntrypoint::Argv {
+            program: "/usr/bin/min".to_string(),
+            args: vec!["task".to_string(), "run".to_string(), "lint".to_string()],
+        },
+        "a bare program word names the program under /usr/bin"
+    );
+    assert_eq!(
+        launch(Some(task.clone()), true).entrypoint().unwrap(),
+        LaunchEntrypoint::Shell,
+        "an exec carries the task's run, so the box holds its shell"
+    );
+    assert_eq!(
+        launch(None, false).entrypoint().unwrap(),
+        LaunchEntrypoint::Shell,
+        "a box filed with no spec starts its shell"
+    );
+    let mut empty = (*task).clone();
+    empty.entrypoint = Entrypoint::Exec(Vec::new());
+    assert_eq!(
+        launch(Some(Arc::new(empty)), false)
+            .entrypoint()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    // A session's launch starts the shell: the mock's echo loop.
+    let launched = MockLauncher::default()
+        .and_spec(launch(Some(session), false))
+        .launch(
+            false,
+            boxes::SessionId::nil(),
+            "dev".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        )
+        .await
+        .expect("the session launches");
+    let mut process = launched.process;
+    let mut input = std::fs::File::from(launched.master.try_clone().unwrap());
+    let output = read_pty_until(launched.master, "got:hello");
+    input.write_all(b"hello\n").unwrap();
+    let seen = output
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the shell answers");
+    assert!(seen.contains("got:hello"), "{seen:?}");
+    input
+        .write_all(format!("{MOCK_EXIT_LINE}\n").as_bytes())
+        .unwrap();
+    assert_eq!(process.wait().unwrap(), 0);
+
+    // A task's launch starts the argv its spec names, here an absolute one
+    // that exists on the test host.
+    let mut echo = (*task).clone();
+    echo.entrypoint = Entrypoint::Exec(vec!["/bin/echo".to_string(), "task-ran".to_string()]);
+    let launched = MockLauncher::default()
+        .and_spec(launch(Some(Arc::new(echo)), false))
+        .launch(
+            false,
+            boxes::SessionId::nil(),
+            "lint".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        )
+        .await
+        .expect("the task launches");
+    let mut process = launched.process;
+    let output = read_pty_until(launched.master, "task-ran");
+    let seen = output
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the entrypoint prints");
+    assert!(seen.contains("task-ran"), "{seen:?}");
+    assert_eq!(
+        process.wait().unwrap(),
+        0,
+        "the entrypoint returns on its own"
     );
 }

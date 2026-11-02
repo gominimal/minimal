@@ -1908,6 +1908,143 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     );
 }
 
+// T42: the actor reads the spec stored at creation, hands it to every
+// launcher it builds, and keeps its own hold, so a relaunch starts the box
+// from the same spec without reading the store again. Each launch says that
+// an exec carries the box's run, and the launcher then holds the shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(vec!["/bin/echo".to_string()]);
+    let mut req = crate::test_harness::create_session_req("spec-hold", "/tmp");
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let session_id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a host");
+    let first = crate::box_actor::launch_spec_seam::observed(session_id);
+    let handed = first.last().expect("the launch was handed a spec");
+    let held = handed
+        .spec
+        .clone()
+        .expect("the actor hands over the spec stored at creation");
+    assert_eq!(*held, spec, "the stored spec, not a default");
+    // Every launch, not only the exec's: a hook launch or an attach can come
+    // before the exec that runs the box's command.
+    for launch in &first {
+        assert!(launch.run_by_exec, "an exec carries the box's run");
+        assert_eq!(
+            launch.entrypoint().unwrap(),
+            crate::box_runtime::LaunchEntrypoint::Shell,
+            "the exec runs the box's command, so the launch holds the shell"
+        );
+    }
+
+    // End the host, and have the next exec launch another one.
+    host.kill(false).await.expect("the host takes the kill");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while host.is_alive() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the killed host ends");
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a session whose host ended launches another");
+    assert!(!again.same_host(&host), "a new launch, not the old host");
+
+    let launches = crate::box_actor::launch_spec_seam::observed(session_id);
+    assert_eq!(launches.len(), first.len() + 1, "one more launch");
+    let relaunch = launches.last().unwrap();
+    assert!(relaunch.run_by_exec, "the relaunch holds the shell too");
+    let relaunch = relaunch.spec.clone().expect("a spec");
+    assert!(
+        std::sync::Arc::ptr_eq(&relaunch, &held),
+        "the actor kept its hold and handed the same spec again"
+    );
+}
+
+// T42: a stored spec the daemon cannot read refuses the launch, as a resume
+// of it is refused, and the box does not start its shell. The refusal is not
+// held, so a launch after the spec reads again starts the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_refuses_unreadable_stored_spec() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    let session_id =
+        create_session_with_spec(&mut client, Some("bad-spec"), "/tmp", Some(spec.clone())).await;
+    let path = record_dir(&server, session_id).await.join("spec.json");
+    std::fs::write(&path, b"not a spec").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::box_actor::AttachError::SpawnFailed(error)) => {
+            let text = error.to_string();
+            assert!(text.contains("cannot be read"), "{text}");
+            assert!(text.contains("min session destroy bad-spec"), "{text}");
+        }
+        Err(other) => panic!("expected a refused launch, got {other}"),
+        Ok(_) => panic!("a box whose stored spec cannot be read launched"),
+    }
+    assert!(
+        crate::box_actor::launch_spec_seam::observed(session_id).is_empty(),
+        "no launcher was built"
+    );
+
+    rewrite_spec(&server, session_id, &spec).await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the refusal was not held, so the readable spec launches");
+}
+
 /// NET-079's "recorded as such" is not best-effort: a host-address box
 /// whose launch cannot write its outcome onto the session record does not
 /// run as though it had one. The launch kills the box it minted and fails

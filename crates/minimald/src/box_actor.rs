@@ -607,6 +607,13 @@ pub struct BoxActor {
     /// which reads nothing first, drops it.
     relaunch_row_confirmed: bool,
 
+    /// The spec stored beside this box's record (BOX-068), as the first
+    /// launch read it: `None` until then, `Some(None)` for a box filed with
+    /// no spec. The actor keeps this hold and hands a clone to every
+    /// launcher, so each launch starts the box from the same spec. A resume
+    /// replaces it with the spec it restarts from.
+    held_spec: Option<Option<Arc<mfile::spec::BoxSpec>>>,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -700,6 +707,8 @@ impl BoxActor {
             // No host yet, so none holds a row.
             slot_holds_row: false,
             relaunch_row_confirmed: false,
+            // Read from the store by the first launch.
+            held_spec: None,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -1384,6 +1393,8 @@ impl BoxActor {
             };
             let spec = box_runtime::stored_spec(bytes).map_err(unsatisfiable)?;
             box_runtime::restart_from_stored_spec(&mut resumed, &spec);
+            // The restart's launches start the box from this spec.
+            self.held_spec = Some(Some(Arc::new(spec)));
             resumed.validate_policy().map_err(|error| {
                 unsatisfiable(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1839,6 +1850,43 @@ impl BoxActor {
             patches: obj.patches_path(),
             hooks: obj.hooks_path(),
         }
+    }
+}
+
+/// The test seam for the spec each launch was handed: the test launcher
+/// records, per launch, the [`box_runtime::LaunchSpec`] the actor handed
+/// it, so a test can prove the actor hands over the stored spec and keeps
+/// its hold for the next launch. Keyed by session id, like the seams below.
+#[cfg(test)]
+pub(crate) mod launch_spec_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    use crate::box_runtime::LaunchSpec;
+
+    static OBSERVED: Mutex<Option<HashMap<SessionId, Vec<LaunchSpec>>>> = Mutex::new(None);
+
+    /// The launcher's half: one launch of `id` was handed `spec`.
+    pub(super) fn observe(id: SessionId, spec: LaunchSpec) {
+        OBSERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .entry(id)
+            .or_default()
+            .push(spec);
+    }
+
+    /// The spec each launch of `id` was handed, in launch order.
+    pub(crate) fn observed(id: SessionId) -> Vec<LaunchSpec> {
+        OBSERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|observed| observed.get(&id).cloned())
+            .unwrap_or_default()
     }
 }
 
