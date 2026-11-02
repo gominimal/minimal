@@ -27,11 +27,11 @@
 #
 #     A session is interactive by design, so we drive it like a real user
 #     through a REAL pty (scripts/e2e-attach-pty.py) rather than a pipe: pump
-#     the command stream, then, when the shell exits and the daemon shows its
-#     Detach/Delete prompt, answer it with keystrokes (Down + Enter => Delete).
-#     A pipe is not a tty and could not answer that prompt. Selecting Delete
-#     tears the session down, so it must be delisted afterwards. The same daemon
-#     prompt runs whether local or in-guest, so the pty driver covers every lane.
+#     the command stream, whose `exit` ends the shell. The box ends with its
+#     shell (BOX-038): no prompt asks, and the box stays listed as exited
+#     until `min session destroy` removes it, so it must be delisted after the
+#     destroy. The daemon does the same whether local or in-guest, so the pty
+#     driver covers every lane.
 #
 # Host-side project seed: `min session activate` runs client-side and, since #758,
 # BAILS (rather than scaffolding over an existing config) when the target dir
@@ -1381,6 +1381,54 @@ box_row_end_record() {
       | grep -F "\"box\":\"$name\"" | tail -n1)"
   fi
   printf '%s' "$rec"
+}
+
+# Exiting a box's shell ends the box (BOX-038): no prompt asks to keep or
+# delete it, and the box stays listed as `exited`, with the shell's exit
+# code. Asserts that for box $1 (an id or a name): it is listed, and
+# `min box show` reads `State: exited` and `Exit code: $2`. $3 names the
+# leg for the error. The attach returns when the shell exits, and the
+# daemon writes the record as it ends the box, so this polls for a moment.
+# $4, when set, is the wrapper that reaches the box's daemon, in place of
+# `mnl`. `box_exited_check` returns 1 on a miss, for a leg that hands its
+# own teardown back to its caller. `assert_box_exited` fails the run.
+assert_box_exited() {
+  box_exited_check "$@" || fail
+}
+box_exited_check() {
+  local box="$1" want="$2" leg="$3" via="${4:-mnl}" shown="" state="" code="" i
+  for i in $(seq 1 20); do
+    shown="$("$via" box show "$box" </dev/null 2>&1)" || shown=""
+    state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+    code="$(printf '%s\n' "$shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+    if [ "$state" = exited ] && [ "$code" = "$want" ]; then
+      echo "$leg: the box ended with its shell, listed as exited with exit code $code (BOX-038)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "::error::$leg: box $box is not listed as exited with exit code $want after its shell exited (state '${state:-<none>}', exit code '${code:-<none>}', BOX-038)"
+  echo "--- min box show $box ---"; printf '%s\n' "$shown"
+  return 1
+}
+
+# Destroys box $1 (an id or a name) and asserts it is no longer listed. $2
+# is the id to look for in `min ls --raw`, $3 names the leg for the error.
+# `--force`: the box can hold in-session files, and without a terminal a
+# destroy of such a box refuses unless `--force` confirms it.
+destroy_box_and_assert_gone() {
+  local box="$1" id="$2" leg="$3" listed
+  mnl session destroy --force "$box" </dev/null >"$WORK/destroy-exited.out" 2>&1 || {
+    echo "::error::$leg: 'min session destroy --force $box' failed"
+    cat "$WORK/destroy-exited.out" 2>/dev/null || true
+    fail
+  }
+  # Capture, then match: `| grep -q` exits early and SIGPIPEs the producer.
+  listed="$(mnl ls --raw 2>/dev/null || true)"
+  if printf '%s\n' "$listed" | grep -Fqx "$id"; then
+    echo "::error::$leg: box $id is still listed after 'min session destroy --force $box'"
+    fail
+  fi
 }
 
 # The sandbox proof below forks a real session sandbox, which needs
@@ -3096,11 +3144,11 @@ proof_host_ip_deny_all() {
 
     # ---- the fetch: the daemon's own package fetch still completes as
     # node-plane traffic — the NET-080 clause that rides with this one,
-    # driven the way a person drives it, through a REAL pty attach (a pipe
-    # cannot answer the session-exit prompt), against the daemon this case
-    # started on an empty cache above, so this add had to fetch.
+    # driven the way a person drives it, through a REAL pty attach, against
+    # the daemon this case started on an empty cache above, so this add had
+    # to fetch. The stream's `exit` ends the box with its shell (BOX-038).
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-    hida_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+    hida_attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
       min ${E2E_MINIMAL_ARGS:-} session attach "$hida_sid" 2>"$WORK/hida-attach.err")" || {
       echo "::error::the pty attach to the deny-all host-address box failed"
       echo "--- transcript ---"; printf '%s\n' "$hida_attach_out"
@@ -3119,6 +3167,7 @@ proof_host_ip_deny_all() {
       fail
     fi
     echo "fetch: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host while the box itself reaches nothing"
+    assert_box_exited "$hida_sid" 0 "deny-all host-address box"
 
     # ---- the node-plane record: the fetch this case pinned its daemon's
     # cache empty for, named for this box (any earlier case whose own add
@@ -3825,12 +3874,12 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   echo "refused: the box's own connection to 1.1.1.1:443 did not complete (rc=$net080_rc, ${net080_status_before:-no status}) — the deny chain's verdict on a connection the box opened itself"
 
-  # ---- the install inside the box, driven like a user: a REAL pty attach (a
-  # pipe cannot answer the session-exit prompt), the driver's default stream
-  # — the tool absent before, `min add`, `hash -r`, its version banner —
-  # answered with the detach lane so the session survives the after-reads.
+  # ---- the install inside the box, driven like a user: a REAL pty attach,
+  # the driver's default stream — the tool absent before, `min add`,
+  # `hash -r`, its version banner, `exit`. The `exit` ends the box with its
+  # shell (BOX-038), and the box stays listed as exited for the after-reads.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-  net080_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+  net080_attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
     min ${E2E_MINIMAL_ARGS:-} session attach "$net080_sid" 2>"$WORK/net080-attach.err")" || {
     echo "::error::the pty attach to the deny-all host-address box failed"
     echo "--- transcript ---"; printf '%s\n' "$net080_attach_out"
@@ -3853,6 +3902,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     fail
   fi
   echo "install: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host"
+  assert_box_exited "$net080_sid" 0 "deny-all box install"
 
   # ---- the node-plane record: the line the requirement is for. The needle
   # names this box (see net080_log): any earlier proof whose own add fetched
@@ -5848,13 +5898,13 @@ STUB
     echo "the none box cannot reach the internet (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
 
     # The attach: a REAL pty attach to the none box (the sandbox case's
-    # driver), answered with the detach lane so the session stays for its
-    # destroy below. The marker the typed command prints is the proof the
-    # attach reached the box.
+    # driver). Its `exit` ends the box with its shell (BOX-038), and the box
+    # stays listed as exited for its destroy below. The marker the typed
+    # command prints is the proof the attach reached the box.
     local np_attach_out
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
     np_attach_out="$(E2E_PTY_COMMANDS='echo POSTURE_NONE_ATTACH_OK
-exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       min ${E2E_MINIMAL_ARGS:-} session attach "$np_none_sid" \
       2>"$np_root/none-attach.err")" || {
       echo "::error::the pty attach to the none box failed (NET-039)"
@@ -5872,6 +5922,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       exit 1
     fi
     echo "attach: POSTURE_NONE_ATTACH_OK came back through the attached terminal"
+    assert_box_exited "$np_none_sid" 0 "none box attach"
     mnl session destroy --force "$np_none_sid" >/dev/null 2>&1 || true
     echo "step: min session destroy --force (the none box) → exit 0"
 
@@ -6630,9 +6681,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
 
   # on_attach and on_detach, over a REAL pty — `on_attach` writes to the
   # terminal you are attached to, and a detach is by definition something a
-  # non-interactive caller cannot perform. Answer the exit prompt with `keep`
-  # (Enter, the first option) so leaving the shell is a detach rather than a
-  # destroy.
+  # non-interactive caller cannot perform.
   #
   # This attach also proves `TERM`, and this is the only place in the lane
   # that can: the session's shell was minted HEADLESSLY, by the activation
@@ -6684,7 +6733,7 @@ __e2e_same_shell=yes' \
     echo "--- transcript ---"; printf '%s\n' "$attach_out"
     fail
   fi
-  # Keeping at the exit prompt is a detach, and the session must survive it.
+  # The detach chord leaves the session running, and it must survive it.
   # Capture-then-match, never `mnl ls --raw | grep -q`: grep's early exit
   # SIGPIPEs the CLI under pipefail, and a failed listing would read as a
   # gone session. On a miss, print what the listing said and its stderr so
@@ -6692,7 +6741,7 @@ __e2e_same_shell=yes' \
   hook_ls_status=0
   hook_ls="$(mnl ls --raw 2>"$WORK/hooks-ls.err")" || hook_ls_status=$?
   if ! printf '%s\n' "$hook_ls" | grep -Fq -- "$hook_sid"; then
-    echo "::error::session gone after answering the exit prompt with 'keep'"
+    echo "::error::session gone after the detach chord"
     echo "--- min ls --raw (exit $hook_ls_status) ---"; printf '%s\n' "$hook_ls"
     echo "--- min ls --raw stderr ---"; cat "$WORK/hooks-ls.err" 2>/dev/null || true
     echo "--- attach transcript ---"; printf '%s\n' "$attach_out"
@@ -6732,7 +6781,7 @@ __e2e_same_shell=yes' \
   # shellcheck disable=SC2016 # `$TERM` must reach the SESSION's shell unexpanded.
   reattach_out="$(E2E_PTY_COMMANDS='echo TERM_INSHELL=$TERM
 echo SHELLMARK=[$__e2e_same_shell]
-exit' E2E_PTY_ANSWER=keep TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     min ${E2E_MINIMAL_ARGS:-} session attach "$hook_sid" \
     2>"$WORK/hooks-reattach.err")" || {
     echo "::error::pty re-attach for the TERM proof failed"
@@ -6753,6 +6802,8 @@ exit' E2E_PTY_ANSWER=keep TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" -
     fail
   fi
   echo "re-attach from a different terminal updated TERM in the same shell OK"
+  # The re-attach's `exit` ended the box with its shell (BOX-038).
+  assert_box_exited "$hook_sid" 0 "hooks re-attach"
 
   # on_destroy. The session's filesystem goes with it, so the evidence is the
   # daemon log — and the failing hook must not have blocked the teardown.
@@ -7080,15 +7131,11 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "declared shell OK (SHELL=/usr/bin/sh started sh, not bash)"
-  # The driver's "Delete" at the exit prompt is not this proof's teardown: the
-  # daemon hands a shell's exit to the attached binding best-effort (a
-  # non-blocking send it drops when the binding's queue is full — "could not
-  # hand the teardown to the binding; no shell-exit prompt will render"), and
-  # this shell exits within milliseconds of starting. When the hand-off drops,
-  # no prompt renders, the attach still ends cleanly, and the session survives
-  # to block the unforced `min stop` below. Destroy it explicitly; a no-op when
-  # the prompt already did.
-  mnl session destroy --force "$sh_sid" >/dev/null 2>&1 || true
+  # The `exit` ended the box with its shell (BOX-038): it stays listed as
+  # exited until the destroy, so the unforced `min stop` below finds no
+  # running box.
+  assert_box_exited "$sh_sid" 0 "declared shell"
+  destroy_box_and_assert_gone "$sh_sid" "$sh_sid" "declared shell"
 
   # The fallback: a shell that isn't installed leaves bash running AND tells
   # the user why, on the terminal, before the first prompt.
@@ -7118,8 +7165,9 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "--- transcript ---"; printf '%s\n' "$miss_out"
     fail
   fi
-  # Same best-effort prompt as above; same explicit teardown.
-  mnl session destroy --force "$miss_sid" >/dev/null 2>&1 || true
+  # The same end with the shell, and the same destroy, as above.
+  assert_box_exited "$miss_sid" 0 "shell fallback"
+  destroy_box_and_assert_gone "$miss_sid" "$miss_sid" "shell fallback"
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
@@ -7176,9 +7224,10 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "--- transcript ---"; printf '%s\n' "$rc_out"
     fail
   fi
-  # Same best-effort exit prompt as the shell proofs above; same explicit
-  # teardown.
-  mnl session destroy --force "$rc_sid" >/dev/null 2>&1 || true
+  # The same end with the shell, and the same destroy, as the shell proofs
+  # above.
+  assert_box_exited "$rc_sid" 0 "patched .bashrc"
+  destroy_box_and_assert_gone "$rc_sid" "$rc_sid" "patched .bashrc"
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -rf "$PATCH_SRC_DIR"; PATCH_SRC_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/bashrcdev.toml"
@@ -7254,14 +7303,16 @@ echo "::endgroup::"
 #   1. a resize while attached is what `stty size` reports in the session,
 #      then the detach chord detaches,
 #   2. a re-attach finds the session, a large paste arrives intact and in
-#      order (checksummed on both sides), and the session-exit prompt still
-#      answers ("keep"),
-#   3. killing the ssh transport mid-attach (the `min proxy` ProxyCommand,
+#      order (checksummed on both sides), and the shell's `exit` ends the box,
+#      which stays listed as exited (BOX-038),
+#   3. a re-attach resumes the exited box, and killing the ssh transport
+#      mid-attach (the `min proxy` ProxyCommand,
 #      as a dropped connection) exits 255 and leaves the terminal's termios
 #      (its `stty -g`) exactly as it was before the attach,
-#   4. the session outlives the drop, and the exit prompt answers "Delete".
+#   4. the session outlives the drop, its shell's `exit` ends the box as
+#      exited, and `min session destroy` then removes it.
 proof_tty_relay() {
-echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, exit prompt)"
+echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, shell exit)"
 local relay_sid relay_out relay_paste relay_sum
 # shellcheck disable=SC2086
 relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/relay-activate.err")" || {
@@ -7307,7 +7358,7 @@ relay_sum="$(cksum <"$relay_paste" | tr -s ' ')"
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='cat > /home/relay-paste' E2E_PTY_PASTE_FILE="$relay_paste" \
   E2E_PTY_AFTER="$(printf '\004')"'printf "PASTE_SUM[%s]\n" "$(cksum < /home/relay-paste | tr -s " ")"
-exit' E2E_PTY_ANSWER=keep \
+exit' \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-paste.err")" || {
   echo "::error::the paste attach through the relay failed"
@@ -7320,13 +7371,11 @@ if [[ "$relay_out" != *"PASTE_SUM[$relay_sum]"* ]]; then
   echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
   fail
 fi
-if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
-  echo "::error::the session is gone after answering the exit prompt with 'keep'"
-  fail
-fi
-echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the exit prompt answered"
+assert_box_exited "$relay_sid" 0 "terminal relay paste"
+echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the shell's exit ended the box"
 
-# 3. Kill the transport mid-attach.
+# 3. Re-attach, which resumes the exited box, and kill the transport
+# mid-attach.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -7343,7 +7392,8 @@ if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
 fi
 echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
 
-# 4. The session outlived the drop; leave it through the exit prompt.
+# 4. The session outlived the drop. Its shell's `exit` ends the box, and the
+# destroy removes it.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='echo RELAY_AFTER_DROP
 exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -7353,10 +7403,8 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "--- stderr ---"; cat "$WORK/relay-exit.err" 2>/dev/null || true
   fail
 }
-if mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
-  echo "::error::session $relay_sid still listed after answering 'Delete' at the exit prompt"
-  fail
-fi
+assert_box_exited "$relay_sid" 0 "terminal relay after the drop"
+destroy_box_and_assert_gone e2e-relay "$relay_sid" "terminal relay after the drop"
 echo "terminal relay OK"
 echo "::endgroup::"
 }
@@ -7365,16 +7413,15 @@ echo "::endgroup::"
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
 # interactive by design, so we drive it like a real user through a REAL pty
-# (scripts/e2e-attach-pty.py), NOT a pipe — a pipe is not a tty and cannot
-# answer the session-exit prompt. The driver:
+# (scripts/e2e-attach-pty.py), NOT a pipe — a pipe is not a tty. The driver:
 #   1. records that $ADD_TOOL is ABSENT before the add (a baseline tool would
 #      already be present, so the add would prove nothing),
 #   2. `min add`s it into this session,
 #   3. `hash -r` so bash re-scans PATH for the freshly hardlinked binary,
 #   4. runs it — its version banner round-tripping proves it is now runnable,
-#   5. `exit`s, then answers the Detach/Delete prompt with keystrokes (Down +
-#      Enter => "Delete"), the genuine interactive teardown — which destroys the
-#      session, so it must then be delisted.
+#   5. `exit`s, which ends the box with its shell (BOX-038). No prompt asks,
+#      and the box stays listed as exited until `min session destroy` removes
+#      it, which must then delist it.
 proof_sandbox() {
 echo "::group::sandbox proof (interactive attach via pty: min add $ADD_TOOL + run)"
 proof_shared_session
@@ -7447,13 +7494,11 @@ fi
 echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK, orientation banner rendered ($((t1 - t0))ms)"
 echo "::endgroup::"
 
-# We answered the exit prompt with "Delete", so the session was destroyed and
-# must have dropped out of the listing — this doubles as the interactive
-# delete/lifecycle-teardown proof.
-if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
-  echo "::error::session $sid still listed after answering 'Delete' at the exit prompt"
-  fail
-fi
+# The shell's `exit` ended the box, which stays listed as exited. The
+# destroy must then drop it from the listing — this doubles as the
+# lifecycle-teardown proof.
+assert_box_exited "$sid" 0 "sandbox proof"
+destroy_box_and_assert_gone "$sid" "$sid" "sandbox proof"
 }
 
 # ---------------------------------------------------------------------------
@@ -24653,9 +24698,8 @@ eib_vm_ask_legs() {
 # shell. Attach, look up a box-zone name (an admitted DNS frame, so the
 # host's relay carries the box's address and its end detaches the row; a
 # row no frame ever reached waits out the longer resume bound instead),
-# `exit`, and answer the session-exit prompt Keep: the Keep item says the
-# registration ends with the shell and is restored on the next attach or
-# exec. The leg then waits out the detach grace until the VM host daemon
+# `exit`, which ends the box with its shell (BOX-038): no prompt asks, and
+# the box stays listed as exited. The leg then waits out the detach grace until the VM host daemon
 # withdraws the row (`minvmd status --row` answers no row), and an exec into
 # the kept box succeeds: the CLI resumes the row before the exec, and the
 # host's read of it afterwards is the same row as before the exit — the same
@@ -24663,7 +24707,7 @@ eib_vm_ask_legs() {
 # switch address (read from /proc/net/fib_trie: a session rootfs has no
 # iproute2) and its frames decided by the row again: the same zone lookup
 # resolves, where the gate would drop a rowless source's. The attach runs
-# through the real pty driver: only a tty can answer the session-exit prompt.
+# through the real pty driver, as a person at a terminal attaches.
 # $1 = box name. Echoes the session it created on fd 3, for the caller's
 # teardown.
 eib_vm_kept_box_resumes_leg() {
@@ -24704,20 +24748,14 @@ eib_vm_kept_box_resumes_leg() {
 
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   if ! E2E_PTY_COMMANDS="getent ahostsv4 host.min.internal
-exit" E2E_PTY_ANSWER=keep \
+exit" \
       python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
       >"$WORK/eib-vm-kept-attach.out" 2>"$WORK/eib-vm-kept-attach.err"; then
     echo "::error::the pty attach to the registered box $name failed"
     cat "$WORK/eib-vm-kept-attach.out" "$WORK/eib-vm-kept-attach.err" 2>/dev/null || true
     return 1
   fi
-  if ! grep -qF "network registration ends with the shell and is restored when you attach or exec into the session again" \
-      "$WORK/eib-vm-kept-attach.out"; then
-    echo "::error::the registered box's session-exit prompt does not say its network registration is restored on the next attach or exec (NET-138)"
-    sed 's/^/  /' "$WORK/eib-vm-kept-attach.out" 2>/dev/null || true
-    return 1
-  fi
-  echo "the registered box's Keep item says its registration is restored on the next attach or exec (NET-138)"
+  box_exited_check "$sid" 0 "registered box (VM lane)" || return 1
 
   # The row detaches with the shell and is withdrawn after the detach grace
   # (45 s, swept every second; NET-138 bounds it at 60 s). Waiting it out
@@ -25267,13 +25305,14 @@ proof_expose_from_inside_box() {
       # the expose typed at its terminal, the way the human attached to the
       # box runs it. The driver types its commands on its own clock and they
       # buffer in the pty until the shell is ready, so a cold first-boot
-      # mint inside the driver's 240 s deadline is fine; `keep` leaves the
-      # session alive for the destroy below.
+      # mint inside the driver's 240 s deadline is fine. The `exit` ends the
+      # box with its shell (BOX-038), and it stays listed as exited for the
+      # destroy below.
       # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
       eib_two_attach="$(
         E2E_PTY_COMMANDS="/usr/bin/min net expose $eib_two_port
 sleep 2
-exit" E2E_PTY_ANSWER=keep \
+exit" \
         python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         min ${E2E_MINIMAL_ARGS:-} session attach "$eib_two_name" \
         2>"$WORK/eib-vm-two-attach.err")" || {
@@ -25299,6 +25338,10 @@ exit" E2E_PTY_ANSWER=keep \
           ;;
       esac
       echo "the flagless attach found VM $eib_two_vm from the box name, and the expose typed inside published: $(printf '%s\n' "$eib_two_attach" | grep -F "published port $eib_two_port" | tail -n1 | tr -d '\r')"
+      if ! box_exited_check "$eib_two_sid" 0 "alpha box on VM $eib_two_vm" eib_two_mn; then
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
 
       # The publish's records live on alpha (NET-055): alpha's own row holds
       # the runtime port at alpha's registration address, and alpha's own
@@ -25677,8 +25720,8 @@ PY
   sed 's/^/  /' "$WORK/eib-allow-audit.out" 2>/dev/null || true
 
   # ---- the ask box, answered yes by the attached human (NET-045) -----------
-  # The attach: a REAL pty (the sandbox case's driver), held open by a sleep
-  # and detached through the exit menu's keep lane when the commands end. The
+  # The attach: a REAL pty (the sandbox case's driver), held open by a sleep.
+  # Its `exit` ends the box with its shell (BOX-038) when the commands end. The
   # request is driven from an exec OUTSIDE the attach once the terminal is
   # live, so the dialog that renders on the attached terminal is the ask
   # ROUTED there (NET-045), and the driver answers it the way the daemon's
@@ -25701,7 +25744,7 @@ PY
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   E2E_PTY_COMMANDS='> /home/eib-yes-live
 sleep 20
-exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
+exit' E2E_PTY_ASK=allow \
     python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_yes_sid" \
     >"$WORK/eib-yes-attach.out" 2>"$WORK/eib-yes-attach.err" &
   eib_pid=$!
@@ -25738,6 +25781,8 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
     eib_restore_log
     fail
   fi
+  # The stream's `exit` ended the box with its shell (BOX-038).
+  box_exited_check "$eib_yes_sid" 0 "ask box (yes)" || { eib_restore_log; fail; }
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-yes-attach.out" 2>/dev/null || true
   if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-yes-attach.out" 2>/dev/null; then
@@ -25791,7 +25836,7 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   E2E_PTY_COMMANDS='> /home/eib-no-live
 sleep 20
-exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
+exit' E2E_PTY_ASK=deny \
     python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_no_sid" \
     >"$WORK/eib-no-attach.out" 2>"$WORK/eib-no-attach.err" &
   eib_pid=$!
@@ -25828,6 +25873,8 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
     eib_restore_log
     fail
   fi
+  # The stream's `exit` ended the box with its shell (BOX-038).
+  box_exited_check "$eib_no_sid" 0 "second ask box" || { eib_restore_log; fail; }
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-no-attach.out" 2>/dev/null || true
   if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-no-attach.out" 2>/dev/null; then
@@ -28077,14 +28124,13 @@ else:
   # no --vm anywhere in its argv, exactly as a user's shell stands — so
   # finding e2e-two-vm-b is the CLI's own work: ask the selected VM first,
   # then every VM's socket, and say which one answered. Over a real pty (an
-  # interactive attach's own requirement), answering the exit prompt with
-  # `keep` so the session survives: it must still be live when the case stops
-  # the named VM below — the stopped-VM beats need a box that WAS listed, or
-  # its absence from the after-stop listing would prove nothing about the
-  # stop.
+  # interactive attach's own requirement). The `exit` ends the box with its
+  # shell (BOX-038), and the box stays listed as exited: the stopped-VM beats
+  # below need a box that WAS listed, or its absence from the after-stop
+  # listing would prove nothing about the stop.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   tw_attach_out="$(E2E_PTY_COMMANDS='cat /home/two-vm-b.mark
-exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     min ${E2E_MINIMAL_ARGS:-} session attach "$TWO_VM_B_NAME" \
     2>"$WORK/two-vm-attach.err")" || {
     echo "::error::the pty attach by box name failed"
@@ -28104,6 +28150,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   fi
   printf '%s\n' "$tw_attach_out" | grep -F -- "on VM $tw_name" | sed 's/^/  /'
   echo "attach by name: 'min session attach $TWO_VM_B_NAME' — no flag — landed in $tw_name's box and said so"
+  assert_box_exited "$tw_b_sid" 0 "attach by box name on VM $tw_name" two_vm_mn
 
   # ---- the shipping exposing verb: forward a box's service by name --------
   # `min net forward` stays in the foreground, prints its banner on stderr
