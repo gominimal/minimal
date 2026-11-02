@@ -545,6 +545,11 @@ impl BoxDir {
 /// as an exec's transcript. A box that writes more keeps running. Its log
 /// then drops the oldest bytes and keeps the newest, so a box that writes
 /// without end does not fill the daemon's state directory.
+///
+/// So a box that writes more than 8 MiB loses the start of its log. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start. The design does not state this bound
+/// yet. <https://github.com/gominimal/arch/issues/159> decides it.
 pub const LOG_CAP: u64 = 8 * 1024 * 1024;
 
 /// The first line of a log that dropped its oldest bytes.
@@ -594,7 +599,12 @@ fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
 }
 
 /// A box's output log as the daemon writes it: never more than
-/// [`LOG_CAP`] bytes at rest (BOX-155).
+/// [`LOG_CAP`] bytes at rest.
+///
+/// Past 8 MiB, [`LOG_CAP`] drops the start of the box's output. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start.
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
 ///
 /// A write that takes the file past the cap is appended first. Then the
 /// file is replaced with [`LOG_DROPPED`] and the newest bytes of the old

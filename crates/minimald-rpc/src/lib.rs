@@ -3670,6 +3670,11 @@ impl ReadEventsUpdate {
 /// offset can then be smaller than the one before it. When the stream fell
 /// behind by more than one drop, it sends the new file from its first
 /// byte, and the dropped-output line marks the gap.
+///
+/// The design does not state this cap yet. A box that writes more than
+/// 8 MiB loses the start of its log, which departs from
+/// docs/architecture.md line 473 ("complete from the box's start").
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
 pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadLog");
 
 /// Request body for [`READ_LOG_SUBSYSTEM`].
