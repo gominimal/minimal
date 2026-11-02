@@ -341,6 +341,13 @@ impl DiskBox {
         append_event_line(&self.events_path(), self.key.id(), event)
     }
 
+    /// The transcript file of the exec `exec_id` in this box, beside its
+    /// record (BOX-149). See [`exec_transcript_path`].
+    #[must_use]
+    pub fn exec_transcript_path(&self, exec_id: &str) -> camino::Utf8PathBuf {
+        exec_transcript_path(self.root_path().as_utf8_path(), exec_id)
+    }
+
     /// Reads the box's events file from byte `offset` (BOX-162): every
     /// complete line from there, in file order, and the offset after the
     /// last of them. A box with no events file reads as no events.
@@ -567,6 +574,61 @@ fn append_event_line(
     }
     file.write_all(&event.to_line()?)?;
     file.sync_data()
+}
+
+/// [`DiskBox::append_event`] for the events file at `events_path`, for a
+/// writer that holds the box's state directory but not its [`DiskBox`]. The
+/// same lock, cut and sync apply, so the two kinds of writer never
+/// interleave.
+///
+/// # Errors
+///
+/// `NotFound` if the box's directory does not exist, and an I/O error if
+/// the file cannot be read or written.
+pub fn append_event_at(
+    events_path: &camino::Utf8Path,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path)?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %event.box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path,
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
+}
+
+/// The directory beside `record.json` that holds the box's exec
+/// transcripts (BOX-149). No path mounted into the box reaches it.
+pub const EXECS_DIR: &str = "execs";
+
+/// The transcript file of the exec `exec_id` in the box whose state
+/// directory is `box_dir`: `<box_dir>/execs/<exec_id>.log`. The file holds
+/// what the exec wrote, stdout and stderr together, in the order it wrote
+/// them. A box's delete removes its whole directory, so a transcript reads
+/// back by its exec id until the box is reaped.
+#[must_use]
+pub fn exec_transcript_path(box_dir: &camino::Utf8Path, exec_id: &str) -> camino::Utf8PathBuf {
+    box_dir.join(EXECS_DIR).join(format!("{exec_id}.log"))
 }
 
 /// The length of `file` up to and including its last `\n`, or 0 if it has
@@ -1946,6 +2008,32 @@ mod tests {
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(LOG_FILE).exists());
         assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
+    }
+
+    /// BOX-149: an exec's transcript lives beside the record, outside every
+    /// directory the box sees, and the box's delete removes it.
+    #[test]
+    fn exec_transcripts_live_beside_the_record_until_the_box_is_reaped() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        let id = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+        let transcript = object.exec_transcript_path(id);
+        assert_eq!(
+            transcript,
+            record_dir.join(EXECS_DIR).join(format!("{id}.log"))
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"out\n").unwrap();
+
+        loader.delete(&key).unwrap();
+        assert!(!transcript.exists());
     }
 
     /// BOX-040, BOX-162: events append beside the record, outside every
