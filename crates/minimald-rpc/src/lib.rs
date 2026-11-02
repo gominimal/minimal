@@ -3647,6 +3647,80 @@ impl ReadEventsUpdate {
     }
 }
 
+/// Read a box's output log (BOX-155), streaming.
+///
+/// The log holds every byte the box's entrypoint wrote to its terminal,
+/// from each start of the box, whether or not a client was attached. The
+/// daemon alone writes it, outside every path the box can reach (BOX-164).
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`ReadLogRequest`] and half-closes. The daemon then streams back one
+/// JSON-encoded [`ReadLogUpdate`] per line: an `Output` for each chunk of
+/// the log from the request's `offset`, in log order, then, with
+/// `follow`, each new chunk as the box writes it. Exactly one terminal
+/// line ends the stream: `Done` at the end of the log for a read that does
+/// not follow, `Reaped` when a followed box is reaped, or `Failed`. A
+/// request the daemon refuses before it reads the log, such as an unknown
+/// id, leaves the stream empty and says why on extended data.
+pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadLog");
+
+/// Request body for [`READ_LOG_SUBSYSTEM`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadLogRequest {
+    /// The box whose log to read.
+    pub id: SessionId,
+    /// The byte of the log to start from: 0 for the whole log.
+    #[serde(default)]
+    pub offset: u64,
+    /// Keep the stream open at the end of the log, and send each new chunk
+    /// as the box writes it, until the box is reaped or the client closes
+    /// the channel.
+    #[serde(default)]
+    pub follow: bool,
+}
+
+/// One line of a [`READ_LOG_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadLogUpdate {
+    /// The log's bytes from `offset`, in log order. The bytes are the
+    /// terminal's raw output, so the wire carries them hex-encoded.
+    Output {
+        offset: u64,
+        #[serde(with = "hex_bytes")]
+        data: Vec<u8>,
+    },
+    /// Terminal: the read reached the end of the log, and does not follow.
+    /// `offset` is the log's length, where a later read can resume.
+    Done { offset: u64 },
+    /// Terminal: the followed box was reaped, so no output follows.
+    Reaped,
+    /// Terminal: the read stopped on an error after it started.
+    Failed { error: String },
+}
+
+impl ReadLogUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Output { .. })
+    }
+}
+
+/// Serialises bytes as one lowercase hex string.
+mod hex_bytes {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        hex::decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod read_events_tests {
     use super::*;
