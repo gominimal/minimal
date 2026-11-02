@@ -4761,6 +4761,69 @@ async fn reap_hands_name_to_retained_holder() {
     );
 }
 
+/// BOX-019, NET-012, NET-128: a destroy of the box that holds a name's row
+/// hands the row to the next retained box with that name, as a reap does.
+/// The destroy returns after the handover. A destroy of a box that does not
+/// hold the row leaves the row where it is. Once the last holder is
+/// destroyed, the name answers nothing. The daemon log names the destroyed
+/// box and the successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_hands_name_to_retained_holder() {
+    use boxes::core::record::RecordState;
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    // `first` stops. A running `dev` beside it holds the row.
+    let first = host_net_box(&mngr, "dev").await;
+    stop(&mngr, first).await;
+    let second = host_net_box(&mngr, "dev").await;
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
+
+    // The destroy of the running holder hands the row to the stopped box.
+    mngr.delete_session(second).await.unwrap();
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(second))
+            .await
+            .unwrap()
+            .is_none(),
+        "the destroyed record is gone when the destroy returns"
+    );
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(first));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
+    assert!(matches!(
+        state_of(&mngr, first).await,
+        RecordState::Stopped(_)
+    ));
+
+    // A stopped `third` takes the row. The destroy of `first`, which does
+    // not hold it, leaves the row with `third`.
+    let third = host_net_box(&mngr, "dev").await;
+    stop(&mngr, third).await;
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
+    mngr.delete_session(first).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
+
+    // The last holder goes: the name answers nothing.
+    mngr.delete_session(third).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, second, third]), None);
+    assert_eq!(answers_to(&mngr, "dev").await, None);
+
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("destroy:")
+            && line.contains(&second.to_string())
+            && line.contains(&format!("successor={first}"))),
+        "the daemon log names the destroyed box and its successor:\n{logged}"
+    );
+    assert!(
+        logged.lines().any(|line| line.contains("destroy:")
+            && line.contains(&third.to_string())
+            && line.contains("successor=none")),
+        "the daemon log says no box took the row:\n{logged}"
+    );
+}
+
 /// BOX-019, BOX-021, NET-012: a reap returns only once the reaped box's
 /// teardown and the handover of its name are both done, under contention.
 /// The removal of another box with the name is held in its teardown while
