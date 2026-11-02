@@ -90,6 +90,7 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
+pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};

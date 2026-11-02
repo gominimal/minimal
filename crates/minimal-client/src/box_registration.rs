@@ -364,6 +364,12 @@ pub async fn register_box_with_vm_host(
                  read; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::ProxyPorts { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the hostname proxy's \
+                 ports; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::HostIpBox { .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the reply to another \

@@ -687,12 +687,25 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     } else {
         crate::cmd::finalize_install::host_install_for_this_host(global)
     };
-    format_ls_across_vms_on(
+    // NET-154: every host port each VM's hostname proxy serves on, read
+    // from that VM's own control socket. Two once a proxy that started on a
+    // substitute port took its preferred port back. `--json` carries them
+    // too, so only `--raw` skips the read.
+    let mut vm_proxy_ports = Vec::with_capacity(listings.len());
+    if !args.raw {
+        for listing in &listings {
+            vm_proxy_ports.push(
+                crate::cmd::session::vm_host_proxy_ports_at(listing.control_sock.clone()).await,
+            );
+        }
+    }
+    format_ls_across_vms_with_proxy_ports_on(
         &mut std::io::stdout(),
         &args,
         &listings,
         &surfaces,
         &vm_answerers,
+        &vm_proxy_ports,
         host_install,
     )?;
     // NET-129: after the table, one stderr line per port a box yields at a
@@ -827,8 +840,28 @@ pub fn format_ls_on(
     vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
     host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
+    format_ls_with_proxy_ports_on(out, args, resp, surface, vm_answerer, &[], host)
+}
+
+/// [`format_ls_on`] with the host ports the VM's hostname proxy serves on
+/// (NET-154), as [`cmd_ls`] read them from the VM host daemon's control
+/// socket ([`crate::cmd::session::vm_host_proxy_ports_at`]). The
+/// `HOSTNAME PROXY` row names every one of them, and `--json` carries them
+/// as `hostname_proxy_ports`. An empty `proxy_ports` — no read, or a daemon
+/// that predates it — prints exactly what [`format_ls_on`] prints.
+pub(crate) fn format_ls_with_proxy_ports_on(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    resp: &minimald_rpc::ListSessionsResponse,
+    surface: Option<crate::resolver::LiveSurface>,
+    vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
+    proxy_ports: &[u16],
+    host: crate::resolver::HostInstall,
+) -> Result<(), anyhow::Error> {
     if args.json {
-        let json = serde_json_lenient::to_string_pretty(&listing_json(resp)?)
+        let mut document = listing_json(resp)?;
+        insert_proxy_ports(&mut document, resp, proxy_ports);
+        let json = serde_json_lenient::to_string_pretty(&document)
             .context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());
@@ -874,10 +907,12 @@ pub fn format_ls_on(
             .and_then(|reply| reply.proxy_down.as_ref());
         let serving_proxy_port =
             crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
-        if let Some(port) = serving_proxy_port {
+        let row_ports = hostname_proxy_row_ports(serving_proxy_port, proxy_ports);
+        if !row_ports.is_empty() {
             writeln!(
                 out,
-                "HOSTNAME PROXY:  listening on 127.0.0.1:{port} as the HTTP proxy for <box>.min.internal names"
+                "HOSTNAME PROXY:  {}",
+                proxy_listening_clause(&row_ports)
             )?;
         }
         // The VM host daemon's two facts are computed here, because the
@@ -1058,6 +1093,65 @@ fn listing_json(
     Ok(document)
 }
 
+/// The ports the `HOSTNAME PROXY` row names (NET-154). `serving` is the port
+/// the listing names as serving today, and `served` is every port the VM host
+/// daemon says the proxy serves on, the preferred first. The row names every
+/// served port when the serving one is among them, and the serving port alone
+/// otherwise. No serving port names none.
+#[must_use]
+pub(crate) fn hostname_proxy_row_ports(serving: Option<u16>, served: &[u16]) -> Vec<u16> {
+    match serving {
+        None => Vec::new(),
+        Some(port) if served.contains(&port) => served.to_vec(),
+        Some(port) => vec![port],
+    }
+}
+
+/// The `HOSTNAME PROXY` row's text for `ports`: each loopback address the
+/// proxy listens on, joined with `and`.
+#[must_use]
+pub(crate) fn proxy_listening_clause(ports: &[u16]) -> String {
+    let addresses: Vec<String> = ports
+        .iter()
+        .map(|port| format!("127.0.0.1:{port}"))
+        .collect();
+    format!(
+        "listening on {} as the HTTP proxy for <box>.min.internal names",
+        addresses.join(" and ")
+    )
+}
+
+/// Adds `hostname_proxy_ports` to one daemon's `--json` object (NET-154):
+/// every port the row names, the preferred first. Left out when `served` is
+/// empty, so a listing with no VM host read keeps the document it always had.
+/// The VM host daemon reports no ports while the proxy is down, so a down
+/// proxy leaves the field out through that empty list. This function reads
+/// no proxy-down verdict of its own.
+fn insert_proxy_ports(
+    document: &mut serde_json_lenient::Value,
+    resp: &minimald_rpc::ListSessionsResponse,
+    served: &[u16],
+) {
+    if served.is_empty() {
+        return;
+    }
+    let ports = hostname_proxy_row_ports(resp.hostname_proxy_port, served);
+    if ports.is_empty() {
+        return;
+    }
+    if let Some(object) = document.as_object_mut() {
+        object.insert(
+            "hostname_proxy_ports".to_string(),
+            serde_json_lenient::Value::Array(
+                ports
+                    .into_iter()
+                    .map(serde_json_lenient::Value::from)
+                    .collect(),
+            ),
+        );
+    }
+}
+
 /// The cells of one session row — id, name, address, status, egress, title,
 /// last activity, project path — shared by the single-VM table
 /// ([`format_ls`]) and the multi-VM one ([`format_ls_across_vms`]), so the
@@ -1175,6 +1269,23 @@ pub fn format_ls_across_vms_on(
     vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
     host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
+    format_ls_across_vms_with_proxy_ports_on(out, args, listings, surfaces, vm_answerers, &[], host)
+}
+
+/// [`format_ls_across_vms_on`] with each listed VM's served proxy ports
+/// (NET-154), one entry per listing, as [`cmd_ls`] read them. A shorter
+/// slice leaves the VMs it does not cover with the one port their daemon
+/// reports, as [`format_ls_with_proxy_ports_on`] does for one VM.
+pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    listings: &[VmListing],
+    surfaces: &[Option<crate::resolver::LiveSurface>],
+    vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
+    vm_proxy_ports: &[Vec<u16>],
+    host: crate::resolver::HostInstall,
+) -> Result<(), anyhow::Error> {
+    let ports_at = |index: usize| vm_proxy_ports.get(index).map_or(&[][..], Vec::as_slice);
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
     // caller may have computed nothing.
@@ -1184,7 +1295,15 @@ pub fn format_ls_across_vms_on(
     // socket or daemon that did not answer keeps the same silence.
     let answerer_at = |index: usize| vm_answerers.get(index).cloned().flatten();
     if let [only] = listings {
-        return format_ls_on(out, args, &only.resp, surface_at(0), answerer_at(0), host);
+        return format_ls_with_proxy_ports_on(
+            out,
+            args,
+            &only.resp,
+            surface_at(0),
+            answerer_at(0),
+            ports_at(0),
+            host,
+        );
     }
     if listings.is_empty() {
         // `cmd_ls` always lists the selected VM, so this is only reachable
@@ -1220,8 +1339,9 @@ pub fn format_ls_across_vms_on(
         // `"vm"` the same way.
         let mut sessions = Vec::new();
         let mut vms = Vec::new();
-        for listing in listings {
-            let reply = listing_json(&listing.resp)?;
+        for (index, listing) in listings.iter().enumerate() {
+            let mut reply = listing_json(&listing.resp)?;
+            insert_proxy_ports(&mut reply, &listing.resp, ports_at(index));
             let mut object = match reply {
                 serde_json_lenient::Value::Object(map) => map,
                 other => anyhow::bail!("session list did not serialize to an object: {other}"),
@@ -1292,12 +1412,14 @@ pub fn format_ls_across_vms_on(
                 .and_then(|reply| reply.proxy_down.as_ref());
             let serving_proxy_port =
                 crate::resolver::serving_proxy_port(listing.resp.hostname_proxy_port, proxy_down);
-            if let Some(port) = serving_proxy_port {
+            let row_ports = hostname_proxy_row_ports(serving_proxy_port, ports_at(index));
+            if !row_ports.is_empty() {
                 writeln!(
                     out,
-                    "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} as the HTTP proxy for <box>.min.internal names",
+                    "HOSTNAME PROXY:  {vm:<width$} {clause}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
+                    clause = proxy_listening_clause(&row_ports),
                 )?;
                 facts += 1;
             }
