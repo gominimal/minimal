@@ -4135,7 +4135,10 @@ mod tests {
         let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
         for id in [first, second] {
-            assert!(registry.holds_host_ip_id(id.to_bytes()), "the registry records {id}");
+            assert!(
+                registry.holds_host_ip_id(id.to_bytes()),
+                "the registry records {id}"
+            );
         }
         assert!(
             registry.table().rows().is_empty(),

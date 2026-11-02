@@ -16245,9 +16245,8 @@ mod tests {
     ) -> Result<GateAdmit, GateDrop> {
         let node = SUBNET.daemon_ip().octets();
         let proxy = SUBNET.box_egress_proxy_address().octets();
-        let frame = boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(
-            node, 6, proxy, port,
-        )));
+        let frame =
+            boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, proxy, port)));
         assert!(frame.box_cohort_marked());
         gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new())
     }
