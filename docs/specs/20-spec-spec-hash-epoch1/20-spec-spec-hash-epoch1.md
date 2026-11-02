@@ -539,6 +539,13 @@ reuses them.
 
 ## Open questions
 
+Settled in this spec, not open: decision 1 of minimal#1246 (`tests` stay
+outside the canonical form, with the write-guard: EPOCH-010) and decision 5
+(additive evolution by reserved tag, with an unknown tag a hard error:
+EPOCH-007, EPOCH-021). A flip of either reopens the canonical form, EPOCH-010
+and the Success claim together, and is a new revision of this spec, not an
+amendment.
+
 - [NEEDS CLARIFICATION (MEDIUM): the Lean theorem for EPOCH-001. Which
   project and proof lane carry it, and when. EPOCH-001 moves to T3 with a
   `proof:` line once the theorem exists.]
