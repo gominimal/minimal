@@ -1674,6 +1674,10 @@ impl ExecExitReason {
     }
 }
 
+/// The exit status of an exec that its own timeout ended, as `timeout(1)`
+/// gives it (BOX-149).
+pub(crate) const TIMEOUT_STATUS: i32 = 124;
+
 /// How an exec ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecExit {
@@ -1684,8 +1688,12 @@ pub(crate) struct ExecExit {
 
 impl ExecExit {
     /// The exit status a client gets for this end, the same as an attached
-    /// exec's bridge reports.
+    /// exec's bridge reports: [`TIMEOUT_STATUS`] for an exec that its own
+    /// timeout ended, else its code, or 1 when a signal ended it.
     pub(crate) fn status(self) -> u32 {
+        if self.reason == ExecExitReason::Timeout {
+            return TIMEOUT_STATUS as u32;
+        }
         self.code.unwrap_or(1) as u32
     }
 }
@@ -2014,9 +2022,33 @@ pub(crate) async fn serve_exec_output(channel: Channel<Msg>, session: BoxHandle,
 
 /// Serves `min://exec/wait`: waits for the exec to end and exits with its
 /// status. A client that goes away ends the wait, not the exec.
-pub(crate) async fn serve_exec_wait(channel: Channel<Msg>, box_id: SessionId, id: ExecId) {
-    let Some(entry) = find_exec(box_id, &id) else {
-        answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
+///
+/// An exec this daemon holds no entry for, one that a daemon before a
+/// restart started, answers from its stored `exec_exited` event.
+pub(crate) async fn serve_exec_wait(channel: Channel<Msg>, session: BoxHandle, id: ExecId) {
+    let exec_box = match ExecBox::of(&session).await {
+        Ok(exec_box) => exec_box,
+        Err(error) => {
+            tracing::warn!(exec_id = %id, %error, "exec: could not read the box for a wait");
+            answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
+            return;
+        }
+    };
+    let Some(entry) = find_exec(exec_box.record.id, &id) else {
+        match stored_exec_exit(&exec_box.dir, &id) {
+            Some(exit) => {
+                tracing::info!(exec_id = %id, "exec: a wait read the exec's stored exit");
+                let message = if exit.reason == ExecExitReason::Timeout {
+                    timeout_message(&id)
+                } else {
+                    String::new()
+                };
+                answer_exec(channel, b"", message.as_bytes(), exit.status()).await;
+            }
+            None => {
+                answer_exec(channel, b"", unknown_exit_message(&id).as_bytes(), 1).await;
+            }
+        }
         return;
     };
     let (mut rs, ws) = channel.split();
@@ -2079,13 +2111,48 @@ pub(crate) async fn serve_exec_attach(channel: Channel<Msg>, box_id: SessionId, 
     }
 }
 
+/// How exec `id` ended, as the last `exec_exited` event about it in the
+/// events file of the box at `box_dir` records it. `None` when the file has
+/// no such event, or cannot be read.
+pub(crate) fn stored_exec_exit(box_dir: &camino::Utf8Path, id: &ExecId) -> Option<ExecExit> {
+    let path = box_dir.join(boxes::events::EVENTS_FILE);
+    let buf = match std::fs::read(&path) {
+        Ok(buf) => buf,
+        Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(exec_id = %id, %error, "exec: could not read the box's events");
+            }
+            return None;
+        }
+    };
+    boxes::events::decode_lines(&buf, 0)
+        .events
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.kind == boxes::events::BoxEventType::ExecExited
+                && event.data.get("exec_id").and_then(|v| v.as_str()) == Some(id.as_str())
+        })
+        .map(|event| ExecExit {
+            code: event
+                .data
+                .get("exit_code")
+                .and_then(serde_json_lenient::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok()),
+            reason: match event.data.get("reason").and_then(|v| v.as_str()) {
+                Some("timeout") => ExecExitReason::Timeout,
+                _ => ExecExitReason::Exited,
+            },
+        })
+}
+
 /// The refusal for an exec id the box does not have.
 fn no_exec_message(id: &ExecId) -> String {
     format!("this box has no exec {id}.\n")
 }
 
-/// The refusal for an exec id this daemon holds no exit for. Its transcript
-/// can outlive the daemon that started it, but the exit lives in memory.
+/// The refusal for an exec id this daemon holds no exit for, and the box's
+/// events record no end for.
 fn unknown_exit_message(id: &ExecId) -> String {
     format!(
         "this daemon did not start exec {id} in this box, so it has no exit code or terminal for it.\n"

@@ -633,6 +633,40 @@ async fn bridge_round_trips_stdio_and_propagates_exit_code() {
     assert!(!ctrl.was_killed());
 }
 
+/// BOX-149: an attached exec that its own timeout ends gives its channel
+/// exit status 124, the same as a wait on a detached one.
+#[tokio::test(start_paused = true)]
+async fn attached_exec_timeout_sends_status_124() {
+    use futures::StreamExt as _;
+
+    let (stream, MockEndpoints { ctrl, .. }) = build_mock();
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&timed_out);
+    let stream = stream.map(move |spawned| {
+        spawned.map(|inner| super::TimedProcess {
+            inner,
+            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+            timed_out: std::sync::Arc::clone(&flag),
+        })
+    });
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut bridge_stdout, _client_stdout) = duplex(64);
+    let (mut bridge_stderr, _client_stderr) = duplex(64);
+    let status = bridge(
+        "test",
+        stream,
+        &mut bridge_stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Discard,
+    )
+    .await;
+    assert!(ctrl.was_killed(), "the timeout stopped the command");
+    assert!(timed_out.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(status, 124, "the channel exit status of a timed-out exec");
+}
+
 /// A child that stops reading stdin must not stop the bridge from
 /// relaying the child's output to the client, nor from delivering the
 /// queued stdin once the child reads again. The child's stdin pipe
@@ -3226,6 +3260,7 @@ mod managed {
             .expect("the timeout ends the exec");
         let took = begun.elapsed();
         assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124, "a timed-out exec exits 124");
         assert!(took >= timeout, "{took:?}");
         // The SIGTERM was ignored, so the SIGKILL after the wait ended it.
         assert!(
@@ -3248,6 +3283,43 @@ mod managed {
             !disk.events().iter().any(|e| e.kind == BoxEventType::Exited),
             "the box did not end"
         );
+    }
+
+    /// BOX-149: a wait on a detached exec that a daemon before a restart
+    /// started reads the exit from the box's stored `exec_exited` event.
+    #[test]
+    fn stored_exec_exit_reads_the_exit_after_a_restart() {
+        let disk = box_on_disk();
+        let ended = mint_exec_id();
+        let timed_out = mint_exec_id();
+        let unknown = mint_exec_id();
+        let exit_box = disk.exec_box.record.id;
+        for (id, code, reason) in [
+            (&ended, Some(7), ExecExitReason::Exited),
+            (&timed_out, None, ExecExitReason::Timeout),
+        ] {
+            disk.exec_box
+                .write_event(BoxEventType::ExecStarted, id, ExecMode::Detached, None);
+            disk.exec_box.write_event(
+                BoxEventType::ExecExited,
+                id,
+                ExecMode::Detached,
+                Some(super::super::ExecExit { code, reason }),
+            );
+            assert!(find_exec(exit_box, id).is_none(), "no live entry holds it");
+        }
+        let dir = &disk.exec_box.dir;
+
+        let exit = super::super::stored_exec_exit(dir, &ended).expect("the stored exit");
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(exit.status(), 7);
+
+        let exit = super::super::stored_exec_exit(dir, &timed_out).expect("the stored exit");
+        assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124);
+
+        assert!(super::super::stored_exec_exit(dir, &unknown).is_none());
     }
 
     /// The refusal for a box that is not running names its state as

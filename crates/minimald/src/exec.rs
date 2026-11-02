@@ -457,7 +457,7 @@ pub(crate) async fn handle_exec(
         }
         ExecRequest::ExecWait(exec_id) => {
             session.channel_success(id)?;
-            spawn(serve_exec_wait(channel, session_id, exec_id).instrument(span));
+            spawn(serve_exec_wait(channel, session_handle, exec_id).instrument(span));
         }
     }
 

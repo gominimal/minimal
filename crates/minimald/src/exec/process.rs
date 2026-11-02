@@ -1443,7 +1443,12 @@ impl<P: Process> Process for TimedProcess<P> {
             }
         }
         if self.timed_out.load(Ordering::SeqCst) {
-            return wait_after_stop(&mut self.inner).await;
+            // The timeout ended the exec, so its status is the timeout's,
+            // whatever the stop left behind (BOX-149).
+            if let Err(error) = wait_after_stop(&mut self.inner).await {
+                tracing::warn!(%error, "exec: the command did not end after its timeout");
+            }
+            return Ok(Some(TIMEOUT_STATUS));
         }
         self.inner.wait().await
     }
