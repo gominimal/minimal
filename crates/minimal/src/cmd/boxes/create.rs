@@ -1779,6 +1779,9 @@ pub(crate) async fn activate_box(
     // row of its own — its name is held in the zone instead (NODATA) once
     // the session is active, below — and a `none` box, or a native daemon
     // with no box table, registers nothing and attaches as it always has.
+    // A `host_ip` box that declares a credentialed upstream registers for
+    // its box id alone (BEP-082): the host mints the id and hands it no
+    // address, and the proxy serves the box's grants under that id.
     // A registration that cannot be made ends the activation here, with its
     // cause: no session exists yet to clean up, and a box that went on to
     // create unregistered would run with no host-side row to decide its
@@ -1831,7 +1834,14 @@ pub(crate) async fn activate_box(
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
             // The id stays here: the create relays none (BOX-002).
-            carry_registration(&mut request.config, registered.as_ref());
+            // A `host_ip` registration has an id and no row, so it carries
+            // no addresses onto the create.
+            carry_registration(
+                &mut request.config,
+                registered
+                    .as_ref()
+                    .filter(|registration| !registration.host_ip),
+            );
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
@@ -1973,12 +1983,15 @@ pub(crate) async fn activate_box(
     // box runs anything (NET-085): the host gate decides every frame the box
     // sends from the node's own address by the admitted policies, and drops
     // a box's frames that none admits. The guard retires it unless the
-    // session outlives this activation.
-    let mut host_ip_residency = HostIpResidency::admit(
+    // session outlives this activation. The admit carries the box's lane
+    // declaration (BEP-083), so a grant box reaches the proxy's listener
+    // from its first process on.
+    let mut host_ip_residency = HostIpResidency::admit_declaring(
         control_sock.clone(),
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
+        request.config.policy.credentialed_upstream.is_some(),
     )
     .await;
     ActivationStep::ReportStart
@@ -3149,6 +3162,95 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
+    /// registers for a box id, with no address and no row in the host's
+    /// address table. With that id the proxy serves it, so the grant check
+    /// gives its id and its `host_ip` stance, not the refusal that says no
+    /// proxy serves boxes on this machine. A `host_ip` box that declares no
+    /// credentialed upstream registers nothing.
+    #[tokio::test]
+    async fn host_ip_grant_box_on_vm_host_is_not_refused_as_unserved() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("host-ip-grant-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+
+        let grant_policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::HostNet,
+            "agent",
+            &grant_policy,
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("a host_ip grant box on a VM host registers");
+        assert!(registered.host_ip);
+        assert_eq!(registered.row_addresses(), None, "the box has no row");
+        assert!(registered.lease.is_none(), "no row, so no lease to hold");
+        let id = registered.box_id.expect("the host minted an id");
+        assert!(registry.holds_host_ip_id(id.to_bytes()));
+        assert!(
+            registry.table().rows().is_empty(),
+            "the registration put no row in the address table"
+        );
+
+        let facts = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            Some(id.to_string()),
+            boxes::NetworkMode::HostNet,
+        )
+        .expect("a host_ip grant box with an id is served");
+        assert_eq!(
+            facts,
+            Some((id.to_string(), bep::boxes::Stance::HostIp)),
+            "the grant is served under the minted id and the host_ip stance"
+        );
+
+        // A host_ip box that declares no upstream needs no id.
+        assert!(
+            register_box_for_activation(
+                paths::HostKind::Minvmd,
+                Some(dir.path()),
+                boxes::NetworkMode::HostNet,
+                "plain",
+                &boxes::BoxPolicy::default(),
+            )
+            .await
+            .expect("nothing to register is no failure")
+            .is_none()
+        );
+        // With no id, the refusal still prints: no proxy serves the box.
+        let refused = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            None,
+            boxes::NetworkMode::HostNet,
+        )
+        .expect_err("no box id, so no proxy serves the box");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
+            "{refused}"
         );
     }
 

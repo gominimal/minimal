@@ -342,10 +342,11 @@ pub async fn prepare_attach(
     // retired here once a second lookup finds it gone.
     if let Some(record) = record.as_ref()
         && record.network == NetworkMode::HostNet
-        && crate::host_ip_box_with_vm_host(
+        && crate::host_ip_box_with_vm_host_declaring(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
             record.policy.egress.clone(),
+            record.policy.credentialed_upstream.is_some(),
             true,
         )
         .await

@@ -360,10 +360,11 @@ pub(crate) async fn rehold_held_name_before_attach(
     // The session is looked up again once the admit is made, and a session
     // gone by then has its rules retired, as the name re-hold below undoes
     // its hold. A destroy that lands after that lookup retires them itself.
-    if host_ip_box_with_vm_host(
+    if host_ip_box_with_vm_host_declaring(
         control_sock_beside(sock),
         id,
         record.policy.egress.clone(),
+        record.policy.credentialed_upstream.is_some(),
         true,
     )
     .await
@@ -460,11 +461,30 @@ pub(crate) async fn host_ip_box_with_vm_host(
     egress: Option<boxes::EgressPolicy>,
     resident: bool,
 ) -> bool {
+    host_ip_box_with_vm_host_declaring(control_sock, id, egress, false, resident).await
+}
+
+/// [`host_ip_box_with_vm_host`] for a box that says whether it declares a
+/// credentialed upstream (BEP-083), which the admit carries to the host
+/// gate.
+pub(crate) async fn host_ip_box_with_vm_host_declaring(
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+    egress: Option<boxes::EgressPolicy>,
+    credentialed_upstream: bool,
+    resident: bool,
+) -> bool {
     let Some(sock_path) = control_sock else {
         return false;
     };
     let exchange = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::host_ip_box_at(&sock_path, id, egress.as_ref(), resident)
+        minimal_client::attach::host_ip_box_at(
+            &sock_path,
+            id,
+            egress.as_ref(),
+            credentialed_upstream,
+            resident,
+        )
     });
     match tokio::time::timeout(BOX_CONTROL_TIMEOUT, exchange).await {
         Ok(Ok(answered)) => answered,
@@ -505,17 +525,37 @@ impl HostIpResidency {
         network: boxes::NetworkMode,
         egress: Option<&boxes::EgressPolicy>,
     ) -> Option<Self> {
+        Self::admit_declaring(control_sock, id, network, egress, false).await
+    }
+
+    /// [`Self::admit`] for a box that says whether it declares a
+    /// credentialed upstream (BEP-083): the host gate opens the `host_ip`
+    /// cohort's lane to the Box Egress Proxy's listener while it is
+    /// resident.
+    pub(crate) async fn admit_declaring(
+        control_sock: Option<std::path::PathBuf>,
+        id: boxes::SessionId,
+        network: boxes::NetworkMode,
+        egress: Option<&boxes::EgressPolicy>,
+        credentialed_upstream: bool,
+    ) -> Option<Self> {
         if network != boxes::NetworkMode::HostNet {
             return None;
         }
         let control_sock = control_sock?;
-        host_ip_box_with_vm_host(Some(control_sock.clone()), id, egress.cloned(), true)
-            .await
-            .then_some(Self {
-                control_sock,
-                id,
-                kept: false,
-            })
+        host_ip_box_with_vm_host_declaring(
+            Some(control_sock.clone()),
+            id,
+            egress.cloned(),
+            credentialed_upstream,
+            true,
+        )
+        .await
+        .then_some(Self {
+            control_sock,
+            id,
+            kept: false,
+        })
     }
 
     /// Keeps the admitted policy: the session stays, so its destroy retires
@@ -531,7 +571,7 @@ impl HostIpResidency {
 impl Drop for HostIpResidency {
     fn drop(&mut self) {
         if !self.kept {
-            minimal_client::attach::host_ip_box_at(&self.control_sock, self.id, None, false);
+            minimal_client::attach::host_ip_box_at(&self.control_sock, self.id, None, false, false);
         }
     }
 }
