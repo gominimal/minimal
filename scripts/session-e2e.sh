@@ -24700,9 +24700,10 @@ eib_vm_ask_legs() {
 # row no frame ever reached waits out the longer resume bound instead),
 # `exit`, which ends the box with its shell (BOX-038): no prompt asks, and
 # the box stays listed as exited. The leg then waits out the detach grace until the VM host daemon
-# withdraws the row (`minvmd status --row` answers no row), and an exec into
-# the kept box succeeds: the CLI resumes the row before the exec, and the
-# host's read of it afterwards is the same row as before the exit — the same
+# withdraws the row (`minvmd status --row` answers no row). A pty
+# `min session attach <name>` then resumes the exited box under the same box
+# id (BOX-025) and leaves by the detach chord; the row is back, an exec into
+# the running box succeeds, and the host's read of the row afterwards is the same row as before the exit — the same
 # box id, switch address and allow-list — with the box itself holding that
 # switch address (read from /proc/net/fib_trie: a session rootfs has no
 # iproute2) and its frames decided by the row again: the same zone lookup
@@ -24777,13 +24778,55 @@ exit" \
   fi
   echo "the kept box's row was withdrawn after the detach grace (NET-138)"
 
+  # An exec runs only in a running box, so the exited box comes back first
+  # through `min session attach` under its name (BOX-025). The attach leaves
+  # by the detach chord, so the resumed shell keeps running for the exec.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="echo KEPT_RESUMED" E2E_PTY_DETACH=1 \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$name" \
+      >"$WORK/eib-vm-kept-resume.out" 2>"$WORK/eib-vm-kept-resume.err"; then
+    echo "::error::'min session attach $name' did not resume the exited registered box"
+    cat "$WORK/eib-vm-kept-resume.out" "$WORK/eib-vm-kept-resume.err" 2>/dev/null || true
+    return 1
+  fi
+  local shown="" state="" shown_id=""
+  for _ in $(seq 1 20); do
+    shown="$(mnl box show "$name" </dev/null 2>&1)" || shown=""
+    state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+    shown_id="$(printf '%s\n' "$shown" | sed -n 's/^ID: *//p' | tr -d '\r')"
+    [ "$state" = running ] && [ "$shown_id" = "$sid" ] && break
+    sleep 0.5
+  done
+  echo "min box show $name (after resume) -> state '${state:-<none>}', id '${shown_id:-<none>}'"
+  if [ "$state" != running ] || [ "$shown_id" != "$sid" ]; then
+    echo "::error::'min session attach $name' did not resume the box as running under its id $sid (BOX-025)"
+    printf '%s\n' "$shown"
+    return 1
+  fi
+  echo "the attach resumed the kept box as running under the same id (BOX-025)"
+
+  rc=1
+  for _ in $(seq 1 20); do
+    rc=0
+    minvmd status --row "$name" >"$WORK/eib-vm-kept-row-back.out" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && break
+    sleep 0.5
+  done
+  row="$(cat "$WORK/eib-vm-kept-row-back.out" 2>/dev/null || true)"
+  echo "minvmd status --row $name (after resume) -> exit $rc: '${row:-<no answer>}'"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::the VM host daemon shows no row for $name after 'min session attach $name' resumed it (NET-138)"
+    return 1
+  fi
+  echo "the resumed box holds its row again (NET-138)"
+
   rc=0
   mnl session exec "$sid" "true" \
     >"$WORK/eib-vm-kept-exec.out" 2>"$WORK/eib-vm-kept-exec.err" || rc=$?
   err="$(cat "$WORK/eib-vm-kept-exec.out" "$WORK/eib-vm-kept-exec.err" 2>/dev/null | tr '\n' ' ')"
   echo "exec into the kept registered box -> exit $rc: ${err:-<no output>}"
   if [ "$rc" -ne 0 ]; then
-    echo "::error::an exec into the kept registered box failed — the CLI must resume its row before the exec (NET-138)"
+    echo "::error::an exec into the resumed registered box $name failed (NET-138)"
     return 1
   fi
 
