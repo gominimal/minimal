@@ -2314,6 +2314,144 @@ async fn write_events_update(
     Ok(())
 }
 
+/// The most bytes of a box's log one `Output` line carries.
+const LOG_CHUNK: usize = 64 * 1024;
+
+/// How often a followed read of a box's log looks for new output and for
+/// the box's reap. The host appends to the log with no wake-up to send.
+const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Serves [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM): one
+/// box's output log from the requested byte, then, for a follower, each new
+/// chunk until the box is reaped or the client closes the channel
+/// (BOX-155). The log is found by the box's id alone, so a stopped box's
+/// log reads the same as a running one's. A refusal before the first chunk,
+/// such as an unknown id, leaves the payload stream empty and says why on
+/// extended data, the same split as [`serve_read_events`].
+async fn serve_read_log(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match read_log_stream(&s, &mut c).await {
+        Ok(()) => {
+            let _ = c.eof().await;
+            let _ = c.close().await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then streams the box's log. The `Err` arm is for a
+/// refusal before the first chunk, and for a channel that breaks.
+async fn read_log_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::{ReadLogRequest, ReadLogUpdate};
+
+    let req: ReadLogRequest = read_channel_request(c).await?;
+    let state_dir = s.minimal_state_dir().await;
+    let refuse = |refusal: String| {
+        tracing::info!(
+            box_id = %req.id,
+            follow = req.follow,
+            refusal = %refusal,
+            "refused a read of a box's log"
+        );
+        ConnectionError::Internal(refusal)
+    };
+    let dir = match boxes::store::BoxDir::find(&state_dir, &req.id) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return Err(refuse(format!(
+                "{} `{}`",
+                minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                req.id.as_ref()
+            )));
+        }
+        Err(e) => {
+            return Err(refuse(format!(
+                "the log of box {} could not be found: {e}",
+                req.id
+            )));
+        }
+    };
+    tracing::info!(
+        box_id = %req.id,
+        offset = req.offset,
+        follow = req.follow,
+        log_path = %dir.log_path().as_str(),
+        "reading a box's log"
+    );
+
+    let failed = |e: std::io::Error| {
+        tracing::warn!(box_id = %req.id, error = %e, "a read of a box's log failed");
+        ReadLogUpdate::Failed {
+            error: format!("the log of box {} could not be read: {e}", req.id),
+        }
+    };
+    let mut offset = req.offset;
+    loop {
+        // Everything written so far, in chunks.
+        loop {
+            match dir.read_log_from(offset, LOG_CHUNK) {
+                Ok(data) if data.is_empty() => break,
+                Ok(data) => {
+                    let len = data.len() as u64;
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                    offset += len;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        if !req.follow {
+            return write_log_update(c, &ReadLogUpdate::Done { offset }).await;
+        }
+        if !dir.is_retained() {
+            // Output written after the read above and before the reap is
+            // still sent: the stream ends on the first empty read after the
+            // box is gone.
+            match dir.read_log_from(offset, LOG_CHUNK) {
+                Ok(data) if data.is_empty() => {
+                    tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read of its log");
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LOG_FOLLOW_POLL) => {}
+            msg = c.wait() => match msg {
+                None | Some(russh::ChannelMsg::Close) => {
+                    tracing::info!(box_id = %req.id, "the reader closed a followed read of a box's log");
+                    return Ok(());
+                }
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Writes one newline-delimited JSON log update.
+async fn write_log_update(
+    c: &mut RuChannel<Msg>,
+    update: &minimald_rpc::ReadLogUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json_lenient::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
 /// Reads a JSON request body off `c`, draining until the client half-closes.
 /// The streaming handlers' equivalent of what
 /// [`ServeOneshot::handle_channel`] does inline.
@@ -3186,7 +3324,8 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
         | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | minimald_rpc::READ_EVENTS_SUBSYSTEM => {
+        | minimald_rpc::READ_EVENTS_SUBSYSTEM
+        | minimald_rpc::READ_LOG_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -3281,6 +3420,7 @@ pub async fn handle_ssh_rpc(
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
         minimald_rpc::READ_EVENTS_SUBSYSTEM => serve!(serve_read_events(s, channel)),
+        minimald_rpc::READ_LOG_SUBSYSTEM => serve!(serve_read_log(s, channel)),
         _ => unreachable!(),
     };
 
@@ -3520,5 +3660,214 @@ mod create_naming_tests {
         );
         let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
         assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+    }
+}
+
+/// BOX-155 and BOX-164 over the wire: a box's log reads back by id, and a
+/// write from inside the box reaches neither the log nor the record.
+#[cfg(test)]
+mod read_log_tests {
+    use boxes::SessionId;
+    use boxes::store::{BoxDir, LOG_FILE};
+    use minimald_rpc::{CreateSession, Errorable, ReadLogRequest, ReadLogUpdate};
+    use paths::DaemonAbsPath;
+
+    use crate::box_actor::BoxPaths;
+    use crate::box_runtime::BoxOutputLog;
+    use crate::test_harness::{TestClient, TestServer, captured_log, create_session_req};
+
+    /// Reads the box's log over [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM)
+    /// without following: every update line, and the extended data.
+    async fn read_log(client: &mut TestClient, id: SessionId) -> (Vec<ReadLogUpdate>, String) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut channel = client
+            .open_subsystem(minimald_rpc::READ_LOG_SUBSYSTEM, &[])
+            .await;
+        let req = ReadLogRequest {
+            id,
+            offset: 0,
+            follow: false,
+        };
+        let mut writer = channel.make_writer();
+        writer
+            .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        drop(writer);
+        channel.eof().await.unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the read answers in time");
+        let updates = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is an update"))
+            .collect();
+        (updates, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// The directories mounted into the box whose directory is `dir`.
+    fn box_paths(dir: &BoxDir) -> BoxPaths {
+        let root = dir.log_path().parent().unwrap();
+        BoxPaths {
+            working: paths::sub_path!(root, "tree"),
+            cache: paths::sub_path!(root, "cache"),
+            home: paths::sub_path!(root, "home"),
+            patches: paths::sub_path!(root, "patches"),
+            hooks: paths::sub_path!(root, "hooks"),
+        }
+    }
+
+    fn visible(paths: &BoxPaths) -> [&DaemonAbsPath; 5] {
+        [
+            &paths.working,
+            &paths.cache,
+            &paths.home,
+            &paths.patches,
+            &paths.hooks,
+        ]
+    }
+
+    async fn create(client: &mut TestClient, name: &str) -> SessionId {
+        match client
+            .call::<CreateSession>(&create_session_req(name, "/tmp"))
+            .await
+        {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
+        }
+    }
+
+    /// BOX-164, placement and refusal: the log, the record and the events
+    /// sit outside every directory the box sees. A log, a record, a spec or
+    /// an events file written into those directories, as root inside the
+    /// box can, is not the box's: the log reads back only what the daemon
+    /// wrote, and the record is unchanged. A link planted where a log goes
+    /// is refused, not written through, and the daemon log names the
+    /// refusal. No process runs inside a box here. The proof that uid 0
+    /// inside a real sandbox cannot write is the `_root_integration` test
+    /// that #2661 owns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_box_root_cannot_write_record_or_log() {
+        let capture = captured_log();
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = create(&mut client, "guarded").await;
+        let state = server.state.minimal_state_dir().await;
+        let dir = BoxDir::find(&state, &id)
+            .unwrap()
+            .expect("the created box has a directory");
+        let paths = box_paths(&dir);
+        let record = dir.record().unwrap();
+        let spec_path = dir
+            .log_path()
+            .parent()
+            .unwrap()
+            .as_utf8_path()
+            .join("spec.json");
+        let spec = std::fs::read(&spec_path).ok();
+
+        for daemon_file in [dir.log_path(), dir.events_path()] {
+            for seen in visible(&paths) {
+                assert!(
+                    !daemon_file.starts_with(seen),
+                    "{} is inside {}, which the box sees",
+                    daemon_file.as_str(),
+                    seen.as_str()
+                );
+            }
+        }
+
+        // The daemon writes the box's output.
+        let mut log = BoxOutputLog::open(id, &paths);
+        log.write(b"from the daemon\r\n");
+
+        // Root inside the box writes everywhere it can reach.
+        let mut forged = record.clone();
+        forged.exit_code = Some(9);
+        forged.parent = Some(SessionId::mint());
+        let forged = serde_json_lenient::to_vec(&forged).unwrap();
+        for seen in visible(&paths) {
+            let seen = seen.as_utf8_path();
+            std::fs::create_dir_all(seen).unwrap();
+            for name in [LOG_FILE, boxes::events::EVENTS_FILE, "spec.json"] {
+                std::fs::write(seen.join(name), b"forged\n").unwrap();
+            }
+            std::fs::write(seen.join("record.json"), &forged).unwrap();
+        }
+        log.write(b"still the daemon\r\n");
+
+        let (updates, err) = read_log(&mut client, id).await;
+        let expected = b"from the daemon\r\nstill the daemon\r\n".to_vec();
+        let len = expected.len() as u64;
+        assert_eq!(
+            updates,
+            [
+                ReadLogUpdate::Output {
+                    offset: 0,
+                    data: expected
+                },
+                ReadLogUpdate::Done { offset: len },
+            ],
+            "only what the daemon wrote reads back (stderr: {err})"
+        );
+        assert_eq!(dir.record().unwrap(), record, "the record is unchanged");
+        assert_eq!(
+            std::fs::read(&spec_path).ok(),
+            spec,
+            "the spec is unchanged"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "only the daemon's user can open the log"
+            );
+        }
+
+        // A link where a second box's log goes is refused, not followed.
+        let linked = create(&mut client, "linked").await;
+        let linked_dir = BoxDir::find(&state, &linked).unwrap().unwrap();
+        let linked_paths = box_paths(&linked_dir);
+        std::fs::create_dir_all(linked_paths.working.as_utf8_path()).unwrap();
+        let target = linked_paths.working.as_utf8_path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, linked_dir.log_path().as_utf8_path()).unwrap();
+        let mut log = BoxOutputLog::open(linked, &linked_paths);
+        log.write(b"never lands\r\n");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "the link was not written through"
+        );
+        let logged = capture.contents();
+        assert!(
+            logged.contains("refused to open the box's output log")
+                && logged.contains(linked_dir.log_path().as_str()),
+            "the daemon log names the refused log: {logged}"
+        );
+        assert_eq!(log.path(), Some(&linked_dir.log_path()));
+
+        // A read of a box no record names is refused before any update.
+        let unknown = SessionId::mint();
+        let (updates, err) = read_log(&mut client, unknown).await;
+        assert!(updates.is_empty(), "{updates:?}");
+        assert!(err.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD), "{err}");
     }
 }
