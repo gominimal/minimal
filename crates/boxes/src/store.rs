@@ -338,32 +338,7 @@ impl DiskBox {
     /// `NotFound` if the box's directory does not exist, and an I/O error
     /// if the file cannot be read or written.
     pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
-        use std::io::Write as _;
-
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(self.events_path().as_utf8_path())?;
-        // Held until `file` drops after `sync_data`: the length, the cut and
-        // the write below are one step for every other appender.
-        file.lock()?;
-        let len = file.metadata()?.len();
-        let complete = complete_len(&mut file, len)?;
-        if complete < len {
-            file.set_len(complete)?;
-            tracing::warn!(
-                box_id = %self.key.id(),
-                dropped_bytes = len - complete,
-                events_path = %self.events_path().as_str(),
-                "cut a torn last line from a box's events file before an append"
-            );
-        }
-        file.write_all(&event.to_line()?)?;
-        file.sync_data()
+        append_event_line(&self.events_path(), self.key.id(), event)
     }
 
     /// Reads the box's events file from byte `offset` (BOX-162): every
@@ -392,13 +367,206 @@ impl DiskBox {
     /// box's events stops once this is false (BOX-162).
     #[must_use]
     pub fn is_retained(&self) -> bool {
-        let root = self.root_path();
-        let root = root.as_utf8_path();
-        let tombstone = root
-            .parent()
-            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        self.dir().is_retained()
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`], beside its record
+    /// (BOX-155). Like the events file, no path mounted into the box
+    /// reaches it (BOX-164). A test pins the literal to [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        self.dir().log_path()
+    }
+
+    /// The box's directory, for a writer or reader outside the store.
+    #[must_use]
+    pub fn dir(&self) -> BoxDir {
+        BoxDir {
+            root: self.root_path(),
+        }
+    }
+}
+
+/// The name of the file beside `record.json` that holds the box's output
+/// log (BOX-155): every byte its entrypoint wrote to its terminal, from
+/// each start, whether or not a client was attached. Only the daemon
+/// writes it (BOX-164).
+pub const LOG_FILE: &str = "output.log";
+
+/// The name of the directory beside `record.json` that the box sees as its
+/// workspace. Its parent is the box's directory.
+const TREE_DIR: &str = "tree";
+
+/// The directory that holds a box's record, as code outside the store sees
+/// it: the box's runtime, which knows only the paths mounted into the box,
+/// and a reader that knows only the box's id.
+///
+/// The files this names, `record.json`, [`EVENTS_FILE`](crate::events::EVENTS_FILE)
+/// and [`LOG_FILE`], sit in this directory itself. The box sees only the
+/// `tree`, `home`, `cache`, `patches` and `hooks` directories under it, so
+/// no process inside the box can open them (BOX-041, BOX-164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDir {
+    root: DaemonAbsPath,
+}
+
+impl BoxDir {
+    /// The box directory whose workspace is `tree`, as
+    /// [`BoxObject::workspace_path`] names it. `None` when `tree` is not
+    /// named `tree`, or has no parent: no box's workspace is then known,
+    /// so nothing is written beside it.
+    #[must_use]
+    pub fn for_tree(tree: &DaemonAbsPath) -> Option<Self> {
+        if tree.file_name() != Some(TREE_DIR) {
+            return None;
+        }
+        tree.parent().map(|root| Self { root })
+    }
+
+    /// The directory of the retained box `id` under the daemon state
+    /// directory `minimal_dir`, found through the store's index on disk.
+    /// The index is replaced by a rename, so a read sees a whole one.
+    /// `None` when no indexed box has `id`, when the record in the
+    /// indexed directory names another box, and when the box is reaped or
+    /// its delete has begun.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the index or the record exists but cannot be read.
+    pub fn find(
+        minimal_dir: &DaemonAbsPath,
+        id: &SessionId,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let sessions = sub_path!(minimal_dir, "sessions");
+        let index: Index = match std::fs::File::open(sessions.as_utf8_path().join("index.json")) {
+            Ok(file) => serde_json_lenient::from_reader(file)?,
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(short) = index.short_by_id(id) else {
+            return Ok(None);
+        };
+        if !is_valid_short(short) {
+            return Ok(None);
+        }
+        let dir = Self {
+            root: sessions.sub_path_unchecked(short),
+        };
+        match dir.record() {
+            Ok(record) if record.id == *id => Ok(dir.is_retained().then_some(dir)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "output.log")
+    }
+
+    /// The path of the box's events file,
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "events.jsonl")
+    }
+
+    /// Reads the box's record from disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or parsed.
+    pub fn record(&self) -> Result<Record, std::io::Error> {
+        let file = std::fs::File::open(self.root.as_utf8_path().join("record.json"))?;
+        Ok(serde_json_lenient::from_reader(file)?)
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun.
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root.as_utf8_path();
+        let tombstone = match (root.parent(), root.file_name()) {
+            (Some(sessions), Some(short)) => Some(sessions.join(tombstone_name(short))),
+            _ => None,
+        };
         root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
     }
+
+    /// Writes one lifecycle event of type `kind` for the box, stamped now
+    /// with the id and parent its record on disk names (BOX-040), with the
+    /// same lock and torn-line repair as [`DiskBox::append_event`]. For a
+    /// writer that holds no [`DiskBox`]: the box's runtime, which records
+    /// `detached` (BOX-016).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or the event cannot be appended.
+    pub fn append_event(
+        &self,
+        kind: crate::events::BoxEventType,
+    ) -> Result<BoxEvent, std::io::Error> {
+        let record = self.record()?;
+        let event = BoxEvent::for_record(&record, kind);
+        append_event_line(&self.events_path(), &record.id, &event)?;
+        Ok(event)
+    }
+
+    /// Reads at most `max` bytes of the box's output log from byte
+    /// `offset` (BOX-155). A box with no log yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log exists but cannot be read.
+    pub fn read_log_from(&self, offset: u64, max: usize) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match std::fs::File::open(self.log_path().as_utf8_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.take(max as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The body of [`DiskBox::append_event`] and [`BoxDir::append_event`]:
+/// appends `event` as one line to the events file at `events_path`.
+fn append_event_line(
+    events_path: &DaemonAbsPath,
+    box_id: &SessionId,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path.as_utf8_path())?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path.as_str(),
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
 }
 
 /// The length of `file` up to and including its last `\n`, or 0 if it has
@@ -1732,6 +1900,52 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-155, BOX-164: the box's output log sits beside its record, the
+    /// box directory a runtime finds from the workspace is the store's own,
+    /// and a reader finds it by id until the box is deleted.
+    #[test]
+    fn box_dir_names_the_log_beside_the_record() {
+        use crate::events::BoxEventType;
+
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = root
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        assert_eq!(object.log_path().as_utf8_path(), record_dir.join(LOG_FILE));
+        assert_eq!(
+            BoxDir::for_tree(&object.workspace_path()),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::for_tree(&object.home_path()), None);
+        assert_eq!(
+            BoxDir::find(&root, &key.session_id).unwrap(),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::find(&root, &SessionId::mint()).unwrap(), None);
+
+        std::fs::write(record_dir.join(LOG_FILE), b"hello\r\nworld").unwrap();
+        assert_eq!(
+            object.dir().read_log_from(0, 64).unwrap(),
+            b"hello\r\nworld"
+        );
+        assert_eq!(object.dir().read_log_from(7, 3).unwrap(), b"wor");
+
+        let event = object.dir().append_event(BoxEventType::Detached).unwrap();
+        assert_eq!(event.box_id, key.session_id);
+        assert_eq!(event.parent, object.record().parent);
+        assert_eq!(object.read_events_from(0).unwrap().events, [event]);
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(LOG_FILE).exists());
+        assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
     }
 
     /// BOX-040, BOX-162: events append beside the record, outside every
