@@ -1114,8 +1114,19 @@ pub(crate) struct ManagedStart {
 /// can end the exec's whole process group, then SIGKILLs.
 pub(crate) fn start_managed_exec(
     start: ManagedStart,
+    command: std::process::Command,
+    graceful: bool,
+) -> io::Result<Arc<ExecEntry>> {
+    start_managed_exec_within(start, command, graceful, HeldInputLimits::for_daemon())
+}
+
+/// [`start_managed_exec`], with the bounds on what a tty exec's terminal
+/// holds of the input that clients type.
+pub(super) fn start_managed_exec_within(
+    start: ManagedStart,
     mut command: std::process::Command,
     graceful: bool,
+    input_limits: HeldInputLimits,
 ) -> io::Result<Arc<ExecEntry>> {
     let ManagedStart {
         id,
@@ -1165,7 +1176,7 @@ pub(crate) fn start_managed_exec(
 
     let (terminal, feed) = match mode {
         ExecMode::Tty => {
-            let (terminal, input) = ExecTerminal::new();
+            let (terminal, input) = ExecTerminal::new(input_limits);
             let writer = source.try_clone()?;
             (Some(terminal), Some((writer, input)))
         }
@@ -1364,11 +1375,17 @@ async fn pump_output(
 }
 
 /// Writes what attached clients type to a tty exec's terminal, until the
-/// exec ends and its entry drops the input's sender.
-async fn feed_terminal(master: std::fs::File, mut input: mpsc::UnboundedReceiver<Vec<u8>>) {
+/// exec ends and its entry clears the input. Each read releases its bytes
+/// from the held counts, so a terminal that takes nothing holds the rest.
+async fn feed_terminal(master: std::fs::File, mut input: HeldInputReader) {
     let mut master = tokio::fs::File::from_std(master);
-    while let Some(bytes) = input.recv().await {
-        if master.write_all(&bytes).await.is_err() || master.flush().await.is_err() {
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = match input.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if master.write_all(&buf[..n]).await.is_err() || master.flush().await.is_err() {
             break;
         }
     }
@@ -1402,12 +1419,19 @@ impl Exec for TimedBoxExec {
             .map(move |spawned| {
                 spawned.map(|inner| TimedProcess {
                     inner,
-                    deadline: timeout.map(|t| tokio::time::Instant::now() + t),
+                    deadline: timeout_deadline(timeout),
                     timed_out: Arc::clone(&timed_out),
                 })
             })
             .boxed()
     }
+}
+
+/// When an exec's own `timeout` runs out, from now. A timeout too far out
+/// for the clock to hold is no deadline: the box's own ceilings still
+/// apply, and the exec is not refused after its process started.
+pub(crate) fn timeout_deadline(timeout: Option<Duration>) -> Option<tokio::time::Instant> {
+    timeout.and_then(|t| tokio::time::Instant::now().checked_add(t))
 }
 
 /// A [`Process`] that [`Process::start_kill`]s itself at its deadline.

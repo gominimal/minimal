@@ -641,6 +641,15 @@ impl HeldInput {
     }
 }
 
+impl std::fmt::Debug for HeldInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldInput")
+            .field("held", &self.held_bytes())
+            .field("released", &self.released_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for HeldInput {
     /// Whatever this exec still counts leaves the daemon's total with it:
     /// no path may leave the shared budget overstated.
@@ -1706,8 +1715,10 @@ type TerminalFollow = tokio::sync::broadcast::Receiver<Vec<u8>>;
 #[derive(Debug)]
 pub(crate) struct TerminalLive {
     output: tokio::sync::broadcast::Sender<Vec<u8>>,
-    /// `None` once the exec has exited.
-    input: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// What clients typed and the terminal has not taken yet, bounded as an
+    /// attached exec's unread input is ([`HeldInputLimits`]). `None` once
+    /// the exec has exited.
+    input: Option<Arc<HeldInput>>,
 }
 
 /// A tty exec's terminal, shared by its pump and its attached clients.
@@ -1724,14 +1735,19 @@ pub(crate) struct ExecTerminal(Arc<std::sync::Mutex<Option<TerminalLive>>>);
 const TERMINAL_BACKLOG: usize = 1024;
 
 impl ExecTerminal {
-    /// A terminal, and the receiver its feed writes from.
-    pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<Vec<u8>>) {
+    /// A terminal, and the reader its feed writes from. What clients type
+    /// is held for the terminal within `limits`: the exec's own cap and the
+    /// daemon's total, the same bounds an attached exec's input has.
+    pub(super) fn new(limits: HeldInputLimits) -> (Self, HeldInputReader) {
         let (output, _) = tokio::sync::broadcast::channel(TERMINAL_BACKLOG);
-        let (input, typed) = mpsc::unbounded_channel();
+        let held = HeldInput::new(limits);
+        // The terminal takes input from its start.
+        held.command_started();
+        let typed = HeldInputReader(Arc::clone(&held));
         (
             Self(Arc::new(std::sync::Mutex::new(Some(TerminalLive {
                 output,
-                input: Some(input),
+                input: Some(held),
             })))),
             typed,
         )
@@ -1749,6 +1765,9 @@ pub(crate) struct ExecEntry {
     /// Where the exec's output is captured, beside the box's record.
     pub(crate) transcript: camino::Utf8PathBuf,
     terminal: Option<ExecTerminal>,
+    /// Set at the first input the terminal could not hold, so the log says
+    /// it once per exec, not once per chunk.
+    input_dropped: std::sync::atomic::AtomicBool,
     exit: watch::Sender<Option<ExecExit>>,
 }
 
@@ -1766,6 +1785,7 @@ impl ExecEntry {
             mode,
             transcript,
             terminal,
+            input_dropped: std::sync::atomic::AtomicBool::new(false),
             exit: watch::channel(None).0,
         }
     }
@@ -1793,24 +1813,59 @@ impl ExecEntry {
 
     /// Passes what a client typed to a tty exec's terminal. False once the
     /// exec has ended.
-    pub(crate) fn send_input(&self, bytes: Vec<u8>) -> bool {
+    ///
+    /// A program that does not read its terminal leaves the input held here.
+    /// Past the exec's cap or the daemon's total the chunk is dropped, and
+    /// the log says so: a terminal has no channel to push back on, and
+    /// russh gives the client its send window back on receipt.
+    pub(crate) fn send_input(&self, bytes: &[u8]) -> bool {
         let Some(terminal) = &self.terminal else {
             return false;
         };
-        let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
-        live.as_ref()
-            .and_then(|live| live.input.as_ref())
-            .is_some_and(|input| input.send(bytes).is_ok())
+        let held = {
+            let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+            match live.as_ref().and_then(|live| live.input.as_ref()) {
+                Some(held) => Arc::clone(held),
+                None => return false,
+            }
+        };
+        if let Err(bound) = held.push(bytes)
+            && !self.input_dropped.swap(true, Ordering::AcqRel)
+        {
+            tracing::warn!(
+                exec_id = %self.id,
+                bytes = bytes.len(),
+                held = held.held_bytes(),
+                ?bound,
+                "exec: the terminal is not reading its input; dropping what clients type past the bound"
+            );
+        }
+        true
+    }
+
+    /// Bytes typed into a tty exec's terminal that it has not taken yet.
+    #[cfg(test)]
+    pub(crate) fn held_input(&self) -> usize {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| {
+                let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
+                live.as_ref()
+                    .and_then(|live| live.input.as_ref())
+                    .map(|held| held.held_bytes())
+            })
+            .unwrap_or(0)
     }
 
     /// Ends the terminal's input once the exec has exited, so its feed ends.
+    /// What the terminal did not take is dropped, and leaves the counts.
     pub(crate) fn close_input(&self) {
         if let Some(terminal) = &self.terminal {
             // The output stays until `finish`: the pump can still copy the
             // terminal's last output to an attached client.
             let mut live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(live) = live.as_mut() {
-                live.input = None;
+            if let Some(held) = live.as_mut().and_then(|live| live.input.take()) {
+                held.clear();
             }
         }
     }
@@ -2094,7 +2149,7 @@ where
             }
             msg = msgs.next(), if typing => match msg {
                 Some(russh::ChannelMsg::Data { data }) => {
-                    entry.send_input(data.to_vec());
+                    entry.send_input(&data);
                 }
                 // The client sends no more input, but it still reads.
                 Some(russh::ChannelMsg::Eof) => typing = false,

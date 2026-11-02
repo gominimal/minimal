@@ -2953,6 +2953,7 @@ mod managed {
     use super::super::{
         AttachEnd, ExecBox, ExecEntry, ExecExitReason, ManagedStart, SESSION_SHELL, exec_argv,
         find_exec, mint_exec_id, read_exec_output, relay_terminal, start_managed_exec,
+        start_managed_exec_within, timeout_deadline,
     };
 
     /// A running box's record in a temp store, and the [`ExecBox`] an exec
@@ -3208,6 +3209,167 @@ mod managed {
         assert!(transcript.contains("got:hello"), "{transcript:?}");
         let events = disk.exec_events(&entry.id);
         assert_eq!(events[0].data["pty"], true);
+    }
+
+    /// BOX-149: a tty exec whose program never reads its terminal holds no
+    /// more of what a client types than the exec's cap. Past the cap the
+    /// input is dropped. When the exec ends, what it held leaves the daemon's
+    /// count.
+    #[tokio::test]
+    async fn exec_tty_unread_input_is_held_within_the_cap() {
+        const CAP: usize = 64 * 1024;
+        let limits = super::super::HeldInputLimits {
+            per_exec: CAP,
+            ..super::unlimited()
+        };
+        let daemon_held = limits.daemon_held;
+        let disk = box_on_disk();
+        let words = ["sh", "-c", "stty raw -echo; echo READY; exec sleep 60"];
+        let (program, args) = exec_argv(words.map(String::from).to_vec());
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        let entry = start_managed_exec_within(
+            ManagedStart {
+                id: mint_exec_id(),
+                mode: ExecMode::Tty,
+                exec_box: disk.exec_box.clone(),
+                timeout: Some(Duration::from_secs(3)),
+                winsize: (24, 80),
+            },
+            command,
+            false,
+            limits,
+        )
+        .expect("the exec starts");
+
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move { relay_terminal(&entry, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "READY").await;
+        // Sixteen times the cap, in chunks of an SSH packet's size.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..16 * CAP / chunk.len() {
+            typed
+                .send(russh::ChannelMsg::Data {
+                    data: chunk.clone().into(),
+                })
+                .unwrap();
+        }
+        // The relay takes the messages in order: once it sees the close, it
+        // offered every chunk to the terminal.
+        typed.send(russh::ChannelMsg::Close).unwrap();
+        assert_eq!(attach.await.unwrap().unwrap(), AttachEnd::ClientGone);
+
+        let held = entry.held_input();
+        assert!(held <= CAP, "the terminal holds {held} bytes, past the cap");
+        assert!(
+            held >= CAP / 2,
+            "the program reads nothing, so the input is held: {held} bytes"
+        );
+        let counted = daemon_held.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(counted <= CAP, "the daemon counts {counted} bytes");
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        assert_eq!(
+            daemon_held.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the end releases what the terminal held"
+        );
+        drop(client);
+    }
+
+    /// BOX-149: an exec id belongs to the box it started in. Sent to another
+    /// box, each lookup that attach, output and wait make by the id finds
+    /// nothing, while the exec runs and after it ended. `min://exec/attach`
+    /// and `min://exec/wait` find the exec with `find_exec` under the box the
+    /// request came to. `min://exec/output` reads the transcript in that
+    /// box's directory, and a wait with no live exec reads that box's events.
+    #[tokio::test]
+    async fn exec_id_from_one_box_is_refused_in_another() {
+        let a = box_on_disk();
+        let b = box_on_disk();
+        let (a_id, b_id) = (a.exec_box.record.id, b.exec_box.record.id);
+        assert_ne!(a_id, b_id);
+        let entry = a.start(
+            ExecMode::Tty,
+            &["sh", "-c", "echo FROM-A; exec sleep 60"],
+            Some(Duration::from_secs(2)),
+            false,
+        );
+        let found = find_exec(a_id, &entry.id).expect("box A finds its exec");
+
+        // While it runs: attach and wait find no live exec in box B.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        let (_typed, msgs) = super::msg_stream();
+        let (_client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        attach.abort();
+
+        // After the end: box B still has no exec, output or exit for the id.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+        // Box A has all three.
+        assert!(find_exec(a_id, &entry.id).is_some());
+        assert!(a.output(&entry.id).await.contains("FROM-A"));
+        assert!(super::super::stored_exec_exit(&a.exec_box.dir, &entry.id).is_some());
+    }
+
+    /// BOX-149: a timeout too far out for the clock is no deadline. The
+    /// exec starts, runs to its end, and nothing panics after the spawn.
+    #[tokio::test]
+    async fn exec_timeout_past_the_clock_is_no_deadline() {
+        for huge in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            assert!(timeout_deadline(Some(huge)).is_none(), "{huge:?}");
+        }
+        assert!(timeout_deadline(None).is_none());
+        let soon = timeout_deadline(Some(Duration::from_secs(1))).expect("a deadline");
+        assert!(soon > tokio::time::Instant::now());
+
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "echo done"],
+            Some(Duration::from_secs(u64::MAX)),
+            false,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(disk.output(&entry.id).await, "done\n");
     }
 
     /// BOX-149: a detached exec gets a closed stdin at creation and returns
