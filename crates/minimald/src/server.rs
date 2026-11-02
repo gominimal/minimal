@@ -1303,7 +1303,12 @@ impl Server {
             // bindings, and close correlate across the log with a grep
             // instead of manual id fields on each line.
             let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
+            let span = tracing::info_span!(
+                "conn",
+                conn,
+                transport = L::TRANSPORT,
+                outcome = tracing::field::Empty
+            );
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
             // The handshake runs in the spawned task, not here: awaiting it in
             // the loop would serialize accepts behind each client's id line,
@@ -1325,21 +1330,42 @@ impl Server {
                                 // A handshake failure must not take the daemon
                                 // down — in the guest minimald is pid-1. Drop
                                 // this connection and keep accepting.
-                                handshake_span.in_scope(|| {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "SSH handshake failed; dropping connection"
-                                    )
-                                });
+                                //
+                                // A peer that hung up before the id exchange is
+                                // the common case, not a failure: `min` probes
+                                // the socket that way before every command
+                                // (autospawn's liveness check), and a client
+                                // that gave up on a stalled daemon looks the
+                                // same. 333k of these a week in the lab, at
+                                // WARN, hid the handshakes that did fail.
+                                if closed_by_peer(&e) {
+                                    handshake_span.record("outcome", "closed_before_id");
+                                    handshake_span.in_scope(|| {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "peer closed before the SSH id exchange; dropping connection"
+                                        )
+                                    });
+                                } else {
+                                    handshake_span.record("outcome", "handshake_failed");
+                                    handshake_span.in_scope(|| {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "SSH handshake failed; dropping connection"
+                                        )
+                                    });
+                                }
                                 return;
                             }
                             Err(_) => {
+                                handshake_span.record("outcome", "handshake_timeout");
                                 handshake_span.in_scope(|| {
                                     tracing::warn!("SSH handshake timed out; dropping connection")
                                 });
                                 return;
                             }
                         };
+                    handshake_span.record("outcome", "session");
                     // Log session errors instead of silently dropping the
                     // spawned future, so a failed handshake is visible on any
                     // transport.
@@ -1458,7 +1484,12 @@ async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
     let created = conn.take_created_sessions().await;
     #[cfg(test)]
     reap_seam::park(&created).await;
-    reap_unfinalized_sessions(state, created).await;
+    // Only a connection that created a session has anything to reap; the
+    // span is not worth opening for the rest (every probe and every plain
+    // RPC connection: 250k empty spans a week in the lab).
+    if !created.is_empty() {
+        reap_unfinalized_sessions(state, created).await;
+    }
     conn.release_liveness().await;
 }
 

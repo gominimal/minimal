@@ -270,6 +270,40 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
 
 /// A connection that connects and never sends its SSH id line must not
 /// stall the accept loop: a second connection completes a full handshake
+/// `min` probes the daemon's socket before every command by connecting
+/// and hanging up without an SSH id line; that is not a failed handshake
+/// and must not be logged as one (333k WARNs a week in the lab hid the
+/// real ones). The `conn` span says what became of the connection instead.
+#[tokio::test]
+async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
+    let capture = crate::test_harness::captured_log();
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let probe = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    drop(probe);
+    // A real client after the probe, so the accept loop has served the
+    // probe's teardown by the time the log is read.
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+
+    let logged = capture.contents();
+    assert!(
+        !logged.contains("SSH handshake failed"),
+        "a peer that hung up before the id exchange is not a failed handshake: {logged}"
+    );
+    assert!(
+        logged.matches("accepted connection").count() >= 2,
+        "both the probe and the client were accepted: {logged}"
+    );
+
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
 /// and a `GetVersion` RPC while the silent one is still open.
 #[tokio::test]
 async fn silent_client_does_not_stall_the_accept_loop() {
