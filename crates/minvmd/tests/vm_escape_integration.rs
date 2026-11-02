@@ -1618,6 +1618,7 @@ fn host_ip_box(
         minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
             session_id,
             egress,
+            credentialed_upstream: false,
         })
     } else {
         minimald_rpc::BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {

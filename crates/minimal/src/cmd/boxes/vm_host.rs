@@ -905,6 +905,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 hold: false,
                 task_slots: 0,
+                host_ip: false,
             },
         )
         .await

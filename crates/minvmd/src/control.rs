@@ -4082,6 +4082,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: u8::MAX,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4157,6 +4158,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("first registration is answered"),
@@ -4228,6 +4230,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("second registration is answered"),
@@ -4273,6 +4276,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -4389,6 +4393,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4465,6 +4470,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4593,6 +4599,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -4860,6 +4867,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -5440,6 +5448,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5643,6 +5652,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5712,6 +5722,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5827,6 +5838,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5904,6 +5916,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert_eq!(
@@ -5978,6 +5991,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert!(
@@ -6062,6 +6076,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6153,6 +6168,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6276,6 +6292,7 @@ mod tests {
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
                         task_slots: 0,
+                        host_ip: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -7069,6 +7086,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 hold: false,
                 task_slots: 0,
+                host_ip: false,
             },
         )
         .expect("the second connection is served");
@@ -7189,6 +7207,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -7488,6 +7507,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         }
     }
 
@@ -7719,6 +7739,7 @@ mod tests {
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             hold: true,
             task_slots: 0,
+            host_ip: false,
             ..box_request(name)
         });
         let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
@@ -7868,6 +7889,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),

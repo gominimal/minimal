@@ -766,6 +766,13 @@ pub struct RegisterBoxRequest {
     /// registers none.
     #[serde(default)]
     pub task_slots: u8,
+    /// Whether the box is a `host_ip` box (BEP-082). The host mints a box
+    /// id for it and allocates no address: it has no row in the address
+    /// table, and the reply is [`BoxControlReply::BoxIdMinted`]. `false`,
+    /// the default and what a client that predates the field sends, is an
+    /// own-address registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_ip: bool,
 }
 
 /// The one line a held registration's client writes on the lease
@@ -963,6 +970,12 @@ pub struct HostIpBoxRequest {
     /// request's policy carries. The host fills it under its own phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicy>,
+    /// Whether the box declares a credentialed upstream (BEP-083): `true`
+    /// opens the cohort's lane to the Box Egress Proxy's listener while the
+    /// box is resident. `false`, the default and what a client that
+    /// predates the field sends, declares no lane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentialed_upstream: bool,
 }
 
 /// The session whose `host_ip` box left the VM host's resident set
@@ -2027,8 +2040,9 @@ pub enum BoxControlReply {
         audited: bool,
     },
     /// The mint verb's answer (BOX-002): the id the VM host daemon minted
-    /// for the box the in-VM daemon is about to create. `minted_box_id` is
-    /// required — the marker that keeps this document from decoding as any
+    /// for the box the in-VM daemon is about to create. It is also the
+    /// answer to a `host_ip` registration ([`RegisterBoxRequest::host_ip`]):
+    /// the box's id, with no address. `minted_box_id` is required — the marker that keeps this document from decoding as any
     /// other reply.
     BoxIdMinted {
         /// The box's id. The in-VM daemon files the box's record under it.
