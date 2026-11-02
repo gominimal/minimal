@@ -1200,6 +1200,20 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
         let session_name = name.clone();
+        // One span per launch, naming the entrypoint the launcher read from
+        // the box's spec, so the daemon log says what each launch started.
+        let entrypoint = launcher.entrypoint()?;
+        let launch_span = tracing::info_span!(
+            "box.launch",
+            session_id = %session_id,
+            session = %session_name,
+            entrypoint = %entrypoint,
+        );
+        tracing::info!(
+            parent: &launch_span,
+            entrypoint = %entrypoint,
+            "launching the box's entrypoint from its spec"
+        );
         let Launched {
             master,
             process,
@@ -1211,16 +1225,18 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             host_ip_enforcement,
             listen_plan,
             start_gate,
-        } = launcher
-            .launch(
+        } = tracing::Instrument::instrument(
+            launcher.launch(
                 crate::guest::is_microvm_daemon(),
                 session_id,
                 name,
                 username,
                 paths,
                 sz,
-            )
-            .await?;
+            ),
+            launch_span,
+        )
+        .await?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
         // launch gathered is the box's whole publication surface — its

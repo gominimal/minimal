@@ -740,6 +740,11 @@ impl BoxActor {
     /// carry, so the launch-scoped decisions downstream (the
     /// unenforced-placement advisory) can tell a session start from a hook
     /// run.
+    ///
+    /// `for_exec` marks the launch [`Self::ensure_host`] mints for an exec.
+    /// The exec runs the command the box is for, so the launch starts the
+    /// box's shell, whatever entrypoint its spec names. Every other launch
+    /// starts the spec's entrypoint.
     // Left positional: three call sites, each naming every argument it means,
     // so a struct would be ceremony rather than clarity.
     #[expect(
@@ -755,6 +760,7 @@ impl BoxActor {
         progress: Option<ChannelProgress>,
         phase: LaunchPhase,
         for_hooks: bool,
+        for_exec: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
@@ -794,8 +800,14 @@ impl BoxActor {
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
+        // The box starts from its stored spec. The actor keeps its hold, so
+        // the next launch reads the same spec.
+        let spec = box_runtime::LaunchSpec {
+            spec: self.held_spec().await,
+            for_exec,
+        };
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
+            .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -1104,6 +1116,45 @@ impl BoxActor {
         Ok(())
     }
 
+    /// The spec stored beside this box's record, read by the first launch
+    /// and then held by the actor. `None` for a box filed with no spec, and
+    /// for a stored spec this daemon cannot read: that box starts its
+    /// shell, as every box did before its spec named an entrypoint.
+    pub(super) async fn held_spec(&mut self) -> Option<Arc<mfile::spec::BoxSpec>> {
+        if let Some(held) = &self.held_spec {
+            return held.clone();
+        }
+        let stored = match self.record.object().await {
+            Ok(object) => object.load_spec(),
+            Err(error) => Err(error),
+        };
+        let spec = match stored {
+            Ok(Some(bytes)) => match box_runtime::stored_spec(&bytes) {
+                Ok(spec) => Some(Arc::new(spec)),
+                Err(error) => {
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        %error,
+                        "launch: the stored spec cannot be read; the box starts its shell"
+                    );
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                // Not held: the next launch reads the store again.
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    %error,
+                    "launch: reading the stored spec failed; the box starts its shell"
+                );
+                return None;
+            }
+        };
+        self.held_spec = Some(spec.clone());
+        spec
+    }
+
     /// Hands back this session's host, launching one if none is running.
     ///
     /// Unlike [`Self::attach`] there is no channel: the host is minted with
@@ -1164,6 +1215,8 @@ impl BoxActor {
                 None,
                 LaunchPhase::Attached,
                 false,
+                // Minted for an exec, which runs the box's command itself.
+                true,
             )
             .await?;
 
@@ -1197,6 +1250,7 @@ impl BoxActor {
                 attach_env,
                 Some(progress),
                 LaunchPhase::Attached,
+                false,
                 false,
             )
             .await?;
@@ -1396,6 +1450,9 @@ impl BoxActor {
                 // join — a hook run, not a session start. See
                 // [`BoxActor::launch_host`].
                 true,
+                // The hooks' launch holds the entrypoint at its start gate
+                // until an attach releases it, so it starts the spec's.
+                false,
             )
             .await
             .map_err(|e| {
