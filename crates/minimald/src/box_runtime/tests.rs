@@ -7471,6 +7471,47 @@ fn read_pty_until(master: OwnedFd, want: &'static str) -> std::sync::mpsc::Recei
     rx
 }
 
+// T42: the launch span and its info event name an argv entrypoint by its
+// program and its argument count. An argument can carry a secret, so no
+// argument reaches the daemon log. The name extends the T42 test line's
+// filter, so that line runs this test too.
+#[test]
+fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args() {
+    let secret = "--token=s3cr3t-VALUE-0042";
+    let entrypoint = LaunchEntrypoint::Argv {
+        program: "/usr/bin/min".to_string(),
+        args: vec!["task".to_string(), "run".to_string(), secret.to_string()],
+    };
+    let capture = crate::test_harness::CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let span = launch_span(boxes::SessionId::nil(), "dev", &entrypoint);
+        let _entered = span.enter();
+        tracing::info!("inside the launch");
+    });
+    let log = capture.contents();
+    assert!(
+        log.lines().any(|l| l.contains("INFO")
+            && l.contains("launching the box's entrypoint from its spec")
+            && l.contains("entrypoint=\"/usr/bin/min\"")
+            && l.contains("args=3")),
+        "the info event names the program and the argument count: {log}"
+    );
+    assert!(log.contains("box.launch"), "the span is in the log: {log}");
+    for word in [secret, "s3cr3t", "task run"] {
+        assert!(!log.contains(word), "no argument is logged ({word}): {log}");
+    }
+
+    // The shell logs as the login shell, with no arguments.
+    assert_eq!(LaunchEntrypoint::Shell.log_name(), "login shell");
+    assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
+}
+
 // T42: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
 // unless an exec carries the box's run, because that exec runs the task.

@@ -178,17 +178,23 @@ pub(crate) enum LaunchEntrypoint {
     Argv { program: String, args: Vec<String> },
 }
 
-impl std::fmt::Display for LaunchEntrypoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl LaunchEntrypoint {
+    /// What a log line names for this entrypoint: `login shell`, or the
+    /// program's path without its arguments. An argument can carry a
+    /// secret, so no log line prints one. [`Self::arg_count`] says how many.
+    pub(crate) fn log_name(&self) -> &str {
         match self {
-            Self::Shell => f.write_str("login shell"),
-            Self::Argv { program, args } => {
-                f.write_str(program)?;
-                for arg in args {
-                    write!(f, " {arg}")?;
-                }
-                Ok(())
-            }
+            Self::Shell => "login shell",
+            Self::Argv { program, .. } => program,
+        }
+    }
+
+    /// How many arguments the entrypoint passes to its program: 0 for the
+    /// shell.
+    pub(crate) fn arg_count(&self) -> usize {
+        match self {
+            Self::Shell => 0,
+            Self::Argv { args, .. } => args.len(),
         }
     }
 }
