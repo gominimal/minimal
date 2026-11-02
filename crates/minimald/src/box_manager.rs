@@ -503,6 +503,428 @@ impl BoxManagerHandle {
     }
 }
 
+impl BoxManagerHandle {
+    /// The retained record that `id` names, read as [`Self::show_box`]
+    /// reads it: as a record's `box_id` first and as its `id` second.
+    async fn retained_record(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<boxes::Record>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.sender.send(ManagerMessage::Records(send)).await;
+        let records = recv
+            .await
+            .expect("corresponding sessions manager is dead")?;
+        Ok(records
+            .iter()
+            .find(|record| record.box_id == Some(id))
+            .or_else(|| records.iter().find(|record| record.id == id))
+            .cloned())
+    }
+
+    /// Reaps the box `id` (BOX-019): deletes its record, its events
+    /// (BOX-045) and its filesystem, runs its `on_destroy` hooks and
+    /// releases the address and the name it holds. A `stopped` or `exited`
+    /// box is reaped. A `running` box is refused and left running, unless
+    /// `force` is set: then the box is stopped as a forced [`Self::stop_box`]
+    /// stops it, and reaped after. Nothing reaps a box but this call and
+    /// [`Self::prune_boxes`] (BOX-024).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box this
+    /// call refuses, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the stop or the delete ended on.
+    pub async fn reap_box(
+        &self,
+        id: SessionId,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let Some(record) = self.retained_record(id).await? else {
+            tracing::info!(box_id = %id, force, "reap: no retained record names the box");
+            return Err(unknown_box(id));
+        };
+        self.reap_record(record, force).await
+    }
+
+    /// [`Self::reap_box`] for a record already read, in a span of its own.
+    async fn reap_record(
+        &self,
+        record: boxes::Record,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let key = record.id;
+        let span = tracing::info_span!(
+            "box.reap",
+            box_id = %record.box_id.unwrap_or(key),
+            session_id = %key,
+            force,
+            outcome = tracing::field::Empty
+        );
+        async {
+            let outcome = self.reap_record_now(record, force).await;
+            let word = match &outcome {
+                Ok(_) => "reaped",
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => "refused",
+                Err(_) => "failed",
+            };
+            tracing::Span::current().record("outcome", word);
+            match &outcome {
+                Ok(reply) => tracing::info!(
+                    box_id = %reply.reaped.box_id,
+                    session_id = %key,
+                    name = ?reply.reaped.name,
+                    state = %reply.reaped.state,
+                    force,
+                    hook_failures = reply.hook_failures.len(),
+                    "reaped a box: its record, events and files are deleted"
+                ),
+                Err(error) => tracing::info!(
+                    session_id = %key,
+                    force,
+                    outcome = word,
+                    %error,
+                    "reap: the box was not reaped"
+                ),
+            }
+            outcome
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// The reap itself. A forced reap stops a running box at once first.
+    /// A forced reap of a box whose resume is in flight waits for the
+    /// resume to end, for at most [`REAP_RESUME_WAIT`], and then reaps the
+    /// box in the state the resume left it: it stops a box the resume
+    /// started. It does not cancel the resume. A reap that is not forced
+    /// refuses such a box at once.
+    async fn reap_record_now(
+        &self,
+        mut record: boxes::Record,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        let key = record.id;
+        let deadline = tokio::time::Instant::now() + REAP_RESUME_WAIT;
+        loop {
+            if force
+                && matches!(
+                    record.state(),
+                    Ok(boxes::core::record::RecordState::Running)
+                )
+            {
+                tracing::info!(
+                    session_id = %key,
+                    "reap: stopping the running box at once before the reap"
+                );
+                match self.stop_box(key, true).await {
+                    Ok(ending) => {
+                        tracing::info!(session_id = %key, ending = ?ending, "reap: the forced stop ended the box");
+                    }
+                    // The box ended between the read and the stop. The reap
+                    // below reads the state it ended in.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(e) => return Err(e),
+                }
+                record = self
+                    .get_record(BoxKeyPredicate::Id(key))
+                    .await?
+                    .ok_or_else(|| unknown_box(key))?;
+            }
+            let reaped = box_listing_entry(&record);
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
+            let outcome = recv.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ))
+            });
+            match outcome {
+                Err(e)
+                    if force && is_resume_pending(&e) && tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::info!(
+                        session_id = %key,
+                        "reap: waiting for the box's resume to end before the forced reap"
+                    );
+                    tokio::time::sleep(REAP_RESUME_POLL).await;
+                    record = self
+                        .get_record(BoxKeyPredicate::Id(key))
+                        .await?
+                        .ok_or_else(|| unknown_box(key))?;
+                }
+                outcome => {
+                    let end = outcome?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(name) = &end.held_name {
+                        self.hand_over_name(key, name).await;
+                    }
+                    return Ok(minimald_rpc::ReapBoxResponse {
+                        reaped,
+                        hook_failures: end.hook_failures.unwrap_or_default(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Hands the name row that the reaped box `reaped` held to the next
+    /// retained box with the same name (NET-012, NET-128). A running box
+    /// comes first, else the most recent creation. The manager registers
+    /// the row, and a stopped or exited box holds it as a stopped box. With
+    /// no such box, the name answers nothing. A failure here does not fail
+    /// the reap: the daemon log names it.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_name(&self, reaped: SessionId, name: &str) {
+        use boxes::core::record::RecordState;
+        let records = {
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            match recv.await {
+                Ok(Ok(records)) => records,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        session_id = %reaped,
+                        name,
+                        %error,
+                        "reap: the records cannot be read; the name is not handed over"
+                    );
+                    return;
+                }
+                Err(_) => return,
+            }
+        };
+        let holders: Vec<&boxes::Record> = records
+            .iter()
+            .filter(|record| {
+                record.id != reaped
+                    && matches!(
+                        record.network,
+                        boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
+                    )
+                    && crate::box_actor::registry_name(record).eq_ignore_ascii_case(name)
+            })
+            .collect();
+        let running = holders
+            .iter()
+            .filter(|record| matches!(record.state(), Ok(RecordState::Running)))
+            .map(|record| record.id)
+            .min();
+        // The order of `boxes::resolve_on_host` and the store's
+        // `find_by_name`: the running holder, else the most recent
+        // creation, which is the greatest UUIDv7 id.
+        let successor = running.or_else(|| {
+            holders
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.state(),
+                        Ok(RecordState::Stopped(_) | RecordState::Exited(_))
+                    )
+                })
+                .map(|record| record.id)
+                .max()
+        });
+        let Some(successor) = successor else {
+            tracing::info!(
+                session_id = %reaped,
+                name,
+                "reap: no retained box has the name; it answers nothing"
+            );
+            return;
+        };
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::HandOverName(successor, send))
+            .await;
+        let _ = recv.await;
+    }
+
+    /// Reaps every `stopped` or `exited` box that matches all the given
+    /// selectors (BOX-021), and answers with each box it reaped and each
+    /// one it matched and did not reap. `older_than` matches a box that
+    /// entered `stopped` or `exited` at least that long ago, as the `ts` of
+    /// its last `exited` event says. A box with no `exited` event never
+    /// matches it. `parent` matches a box whose parent is that box. A box
+    /// in any other state never matches. Each reap is a
+    /// [`Self::reap_box`] that is not forced, so a box that resumes after
+    /// the match is refused, not reaped.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's
+    /// error from the read of the records.
+    pub async fn prune_boxes(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+    ) -> Result<minimald_rpc::PruneBoxesResponse, BoxManagerError> {
+        self.prune_boxes_at(older_than, parent, std::time::SystemTime::now())
+            .await
+    }
+
+    /// Whether the box `record` names entered `stopped` or `exited` at
+    /// least `older_than` before `now`, for a prune's age selector
+    /// (BOX-021). A box with no `exited` event, or whose events cannot be
+    /// read, does not match, and the daemon log names it.
+    async fn ended_long_enough(
+        &self,
+        record: &boxes::Record,
+        older_than: std::time::Duration,
+        now: std::time::SystemTime,
+    ) -> bool {
+        let box_id = record.box_id.unwrap_or(record.id);
+        let events = match self.box_events(record.id).await {
+            Ok(mut reader) => reader.read_new(),
+            Err(error) => Err(error),
+        };
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    %error,
+                    "prune: the box's events cannot be read; the age selector skips it"
+                );
+                return false;
+            }
+        };
+        match ended_at(&events) {
+            Some(ended) => now.duration_since(ended).is_ok_and(|age| age >= older_than),
+            None => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    "prune: the box has no exited event; the age selector skips it"
+                );
+                false
+            }
+        }
+    }
+
+    /// [`Self::prune_boxes`] with `now` as the time that `older_than`
+    /// counts back from.
+    pub(crate) async fn prune_boxes_at(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<minimald_rpc::PruneBoxesResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.prune",
+            older_than_secs = older_than.map(|d| d.as_secs()),
+            parent = parent.map(tracing::field::display),
+            matched = tracing::field::Empty,
+            reaped = tracing::field::Empty,
+            failed = tracing::field::Empty
+        );
+        async {
+            if self.in_shutdown.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ));
+            }
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            let mut matched = Vec::new();
+            for record in records {
+                if !prune_matches(&record, parent) {
+                    continue;
+                }
+                if let Some(older_than) = older_than
+                    && !self.ended_long_enough(&record, older_than, now).await
+                {
+                    continue;
+                }
+                matched.push(record);
+            }
+            matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+            tracing::Span::current().record("matched", matched.len());
+            let mut reply = minimald_rpc::PruneBoxesResponse::default();
+            for record in matched {
+                let box_id = record.box_id.unwrap_or(record.id);
+                match self.reap_record(record, false).await {
+                    Ok(reaped) => reply.reaped.push(reaped.reaped),
+                    Err(error) => reply.failed.push(minimald_rpc::PruneFailure {
+                        box_id,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            tracing::Span::current().record("reaped", reply.reaped.len());
+            tracing::Span::current().record("failed", reply.failed.len());
+            tracing::info!(
+                older_than_secs = older_than.map(|d| d.as_secs()),
+                parent = parent.map(tracing::field::display),
+                reaped = reply.reaped.len(),
+                failed = reply.failed.len(),
+                "pruned the stopped and exited boxes"
+            );
+            Ok(reply)
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// Whether `record` is a prune candidate (BOX-021): it is `stopped` or
+/// `exited`, and it matches the `parent` selector when one is given. The
+/// `older_than` selector needs the record's events, so
+/// [`BoxManagerHandle::prune_boxes_at`] checks it after this one.
+fn prune_matches(record: &boxes::Record, parent: Option<SessionId>) -> bool {
+    let ended = matches!(
+        record.state(),
+        Ok(boxes::core::record::RecordState::Stopped(_)
+            | boxes::core::record::RecordState::Exited(_))
+    );
+    if !ended {
+        return false;
+    }
+    parent.is_none_or(|parent| record.parent == Some(parent))
+}
+
+/// When the box entered `stopped` or `exited`: the `ts` of the last
+/// `exited` event in `events`. `None` when no `exited` event is there.
+fn ended_at(events: &[BoxEvent]) -> Option<std::time::SystemTime> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == BoxEventType::Exited)
+        .map(|event| std::time::UNIX_EPOCH + std::time::Duration::from_millis(event.ts))
+}
+
+/// The refusal for an id no retained record names.
+fn unknown_box(id: SessionId) -> BoxManagerError {
+    std::io::Error::new(
+        NotFound,
+        format!(
+            "{} `{}`",
+            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+            id.as_ref()
+        ),
+    )
+}
+
 /// A record as a listing reports it (BOX-158): its identity fields and its
 /// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
 /// ending is not a row of the BOX-011 table reports its status with the
@@ -628,6 +1050,17 @@ enum ManagerMessage {
     /// Destroy a session; with `true`, only if it has not finished
     /// activating (`None` when it was kept).
     DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
+    /// Reap the box `id` only if its record is `stopped` or `exited` and
+    /// no resume of it is in flight (BOX-019). Otherwise it refuses, and
+    /// the box is left as it is. A reap is a destroy otherwise: it runs
+    /// the box's `on_destroy` hooks and releases its address and name.
+    ReapEnded(SessionId, Responder<ReapEnd>),
+    /// Registers the name row of the box `successor` after the reap of the
+    /// box that held it (NET-012, NET-128). A no-op when another box took
+    /// the row since, when the successor is gone or being removed, or when
+    /// a resume of a box with that name is in flight.
+    #[cfg(target_os = "linux")]
+    HandOverName(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -674,6 +1107,9 @@ impl ManagerMessage {
             // see one kind for every create (BOX-068).
             Self::CreateBox(..) => "CreateSession",
             Self::DeleteSession(..) => "DeleteSession",
+            Self::ReapEnded(..) => "ReapEnded",
+            #[cfg(target_os = "linux")]
+            Self::HandOverName(..) => "HandOverName",
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
             Self::ResumeActive(..) => "ResumeActive",
@@ -2478,6 +2914,27 @@ impl BoxManager {
         id: SessionId,
         name: String,
     ) -> Result<Option<NameHolder>, BoxManagerError> {
+        // A box that a removal tears down does not start again: the
+        // removal's destroy can be queued behind the attach that resumes
+        // it, and it then destroys a box that is running.
+        let removing = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id);
+        if removing {
+            tracing::info!(
+                session_id = %id,
+                "resume: the box is being removed; it is not started"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                format!(
+                    "Box `{}` is being removed, so it was not started.",
+                    id.as_ref()
+                ),
+            ));
+        }
         if let Some(holder) = self.running_name_holder(id, &name).await? {
             return Ok(Some(holder));
         }
@@ -3248,272 +3705,22 @@ impl BoxManager {
                     .await;
                 responder.handle(async move { created }).await;
             }
-            // Deletes a session: tears down its running host and actor (if
-            // any), then removes its on-disk record.
-            //
-            // The mainloop resolves the record and claims the actor; the
-            // teardown itself runs on a task of its own. Awaiting the actor
-            // here held every queued caller behind it: the reap of a session
-            // whose client gave up on `min session activate` while the
-            // actor was inside a stalled package-graph clone parked `min ls`
-            // for the rest of the clone's connect timeout (70 s in the lab,
-            // 710d).
+            // Deletes a session: see `delete_box`.
             ManagerMessage::DeleteSession(id, only_if_unfinalized, r) => {
-                if self.in_shutdown.is_cancelled() {
-                    r.handle(async {
-                        Err(BoxManagerError::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            minimald_rpc::SHUTDOWN_REFUSAL,
-                        ))
-                    })
-                    .await;
-                    return;
-                }
-                let handle = match self.store.find(RecordPredicate::Id(id)).await {
-                    Ok(Some(handle)) => handle,
-                    Ok(None) => {
-                        r.handle(async {
-                            Err(std::io::Error::new(
-                                NotFound,
-                                format!(
-                                    "{} `{}`",
-                                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
-                                    id.as_ref()
-                                ),
-                            ))
-                        })
-                        .await;
-                        return;
-                    }
-                    Err(e) => {
-                        r.handle(async { Err(e) }).await;
-                        return;
-                    }
-                };
-                // A destroy only for an unfinished session (inbox#690) goes
-                // to a live actor unclaimed: the actor decides, after any
-                // finalize ahead of it in its mailbox, and evicts itself if
-                // it destroys. An idle session has no finalize in flight, so
-                // its record answers: a finished one is kept, an unfinished
-                // one takes the unconditional path below.
-                if only_if_unfinalized {
-                    let busy = self
-                        .tearing_down
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .contains(&id);
-                    if busy {
-                        r.handle(async {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ResourceBusy,
-                                format!(
-                                    "a destroy of session `{}` is already in flight; if the \
-                                     session is still listed once it ends, destroy it again",
-                                    id.as_ref()
-                                ),
-                            ))
-                        })
-                        .await;
-                        return;
-                    }
-                    if let Some(hnd) = self.running.get(&id).cloned() {
-                        // In the tearing-down set until the actor answers, as
-                        // an unconditional destroy is for its whole teardown:
-                        // a second destroy is refused rather than queued
-                        // behind this one (where it would destroy a session
-                        // this one reports kept), a listing skips the
-                        // session rather than reading a record the actor may
-                        // be deleting, and a resolve finds nothing (the actor
-                        // stays in `running`, unclaimed, since the session
-                        // may be kept; the set is what hides it). A kept
-                        // session leaves the set with the answer, and is
-                        // listed and resolved again.
-                        let tearing_down = Arc::clone(&self.tearing_down);
-                        let handle = handle.clone();
-                        tearing_down
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(id);
-                        let span = tracing::Span::current();
-                        self.teardowns.spawn(tracing::Instrument::instrument(
-                            async move {
-                                let release = TearingDown {
-                                    set: tearing_down,
-                                    id,
-                                };
-                                let answer: Result<Option<Vec<String>>, BoxManagerError> = async {
-                                    let answer = hnd.destroy_if_unfinalized().await?;
-                                    // Belt-and-braces, as on the unconditional
-                                    // path: a dead actor (self-terminated, not
-                                    // yet evicted) reads as destroyed above,
-                                    // and may have died without deleting its
-                                    // record. Only a destroyed answer removes
-                                    // a leftover: a kept session's record is
-                                    // the session. `NotFound` is the normal,
-                                    // already-deleted case.
-                                    if answer.is_some()
-                                        && let Err(e) = handle.delete().await
-                                        && e.kind() != NotFound
-                                    {
-                                        return Err(e);
-                                    }
-                                    Ok(answer)
-                                }
-                                .await;
-                                // Out of the set before the answer goes out: a
-                                // caller that reads the record or the listing on
-                                // the reply must not find a kept session still
-                                // hidden behind the set.
-                                drop(release);
-                                r.handle(async { answer }).await;
-                            },
-                            span,
-                        ));
-                        while let Some(joined) = self.teardowns.try_join_next() {
-                            log_teardown_join(joined);
-                        }
-                        return;
-                    }
-                    match handle.record().await {
-                        Ok(record) if record.status == boxes::BoxState::Active => {
-                            r.handle(async { Ok(None) }).await;
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            r.handle(async { Err(e) }).await;
-                            return;
-                        }
-                    }
-                }
-                // One teardown per session: a second destroy that lands
-                // while the first runs is refused rather than brought up
-                // as a fresh actor whose hooks would run again.
-                let tearing_down = Arc::clone(&self.tearing_down);
-                let first = tearing_down
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id);
-                if !first {
-                    r.handle(async {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::ResourceBusy,
-                            format!(
-                                "a destroy of session `{}` is already in flight; if the \
-                                 session is still listed once it ends, destroy it again",
-                                id.as_ref()
-                            ),
-                        ))
-                    })
-                    .await;
-                    return;
-                }
-                // Teardown belongs to the actor, so an idle session gets
-                // one brought up rather than having its record deleted
-                // out from under it. That used to be a fair shortcut —
-                // "nothing to undo" — but a session's `on_destroy` hooks
-                // now run on this path, and skipping the actor skipped
-                // them silently for any session whose actor had been
-                // reaped (every session, after a daemon restart).
-                //
-                // Claimed here, brought up and torn down on a task of its
-                // own: the mainloop awaits neither the actor's start (a
-                // record and composition read) nor its destroy (hooks), so
-                // a listing served meanwhile neither waits nor probes it.
-                // The caller gets the outcome when the task ends.
-                let claimed = self.running.remove(&id);
-                let seed = match claimed {
-                    Some(_) => None,
-                    None => Some(self.session_config(handle.clone())),
-                };
-                let in_shutdown = self.in_shutdown.clone();
-                let span = tracing::Span::current();
-                self.teardowns.spawn(tracing::Instrument::instrument(
-                    async move {
-                        // Out of the set as this task ends, whatever its outcome.
-                        let _release = TearingDown {
-                            set: tearing_down,
-                            id,
-                        };
-                        r.handle(async {
-                            // A shutdown that began after this destroy was
-                            // accepted: an idle session is not brought up
-                            // now (a fresh actor and sandbox while shutdown
-                            // waits on this task). The destroy is refused, as
-                            // one that arrived during shutdown is above, and
-                            // the record stays for the next start.
-                            if seed.is_some() && in_shutdown.is_cancelled() {
-                                return Err(BoxManagerError::new(
-                                    std::io::ErrorKind::ConnectionRefused,
-                                    minimald_rpc::SHUTDOWN_REFUSAL,
-                                ));
-                            }
-                            let actor = match (claimed, seed) {
-                                (Some(hnd), _) => Some(hnd),
-                                (None, Some(seed)) => match BoxActor::run(seed).await {
-                                    // The check above ran before the bring-up;
-                                    // a shutdown that began during it stops the
-                                    // fresh actor as it stops a live one, and
-                                    // the destroy is refused before its hooks
-                                    // would mint a sandbox.
-                                    Ok(hnd) if in_shutdown.is_cancelled() => {
-                                        hnd.stop().await;
-                                        return Err(BoxManagerError::new(
-                                            std::io::ErrorKind::ConnectionRefused,
-                                            minimald_rpc::SHUTDOWN_REFUSAL,
-                                        ));
-                                    }
-                                    Ok(hnd) => Some(hnd),
-                                    // A record the actor refuses to come up on — a
-                                    // restart-orphaned `Materializing` one is the
-                                    // known case — must still be destroyable, so
-                                    // fall through to deleting it directly. A
-                                    // session that cannot be torn down is worse
-                                    // than one torn down without its hooks.
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            session_id = %id,
-                                            error = %e,
-                                            "could not start the session to run its destroy hooks; \
-                                             removing its record without them",
-                                        );
-                                        None
-                                    }
-                                },
-                                // A claimed actor comes with no seed; the
-                                // match above covers every pair that occurs.
-                                (None, None) => None,
-                            };
-                            match actor {
-                                Some(hnd) => {
-                                    let hook_failures = hnd.destroy().await?;
-                                    // Belt-and-braces: a dead actor (self-terminated
-                                    // but not yet evicted) reads as `Ok` above, and
-                                    // may have died *without* deleting its record
-                                    // (its own delete failed). Remove any leftover;
-                                    // `NotFound` is the normal already-deleted case.
-                                    if let Err(e) = handle.delete().await
-                                        && e.kind() != NotFound
-                                    {
-                                        return Err(e);
-                                    }
-                                    Ok(Some(hook_failures))
-                                }
-                                None => {
-                                    handle.delete().await?;
-                                    Ok(Some(Vec::new()))
-                                }
-                            }
-                        })
-                        .await;
-                    },
-                    span,
-                ));
-                // Finished tasks leave the set on their own; their join
-                // handles leave it here, so the set holds only the live ones.
-                while let Some(joined) = self.teardowns.try_join_next() {
-                    log_teardown_join(joined);
-                }
+                self.delete_box(id, only_if_unfinalized, r).await;
+            }
+            // Reaps a stopped or exited box (BOX-019): the state check and
+            // the delete's claim run in this one message, so no resume
+            // starts between them.
+            ManagerMessage::ReapEnded(id, r) => match self.reap_refusal(id).await {
+                Ok(None) => self.reap_ended(id, r).await,
+                Ok(Some(refusal)) => r.handle(async { Err(refusal) }).await,
+                Err(e) => r.handle(async { Err(e) }).await,
+            },
+            #[cfg(target_os = "linux")]
+            ManagerMessage::HandOverName(successor, r) => {
+                self.hand_over_name(successor).await;
+                r.handle(async { Ok::<_, BoxManagerError>(()) }).await;
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -3586,6 +3793,555 @@ impl BoxManager {
             }
         }
     }
+}
+
+impl BoxManager {
+    /// Deletes a session: tears down its running host and actor (if any),
+    /// then removes its on-disk record. With `only_if_unfinalized`, only a
+    /// session that has not finished activating (`None` when it was kept).
+    ///
+    /// The mainloop resolves the record and claims the actor; the teardown
+    /// itself runs on a task of its own. Awaiting the actor here held every
+    /// queued caller behind it: the reap of a session whose client gave up
+    /// on `min session activate` while the actor was inside a stalled
+    /// package-graph clone parked `min ls` for the rest of the clone's
+    /// connect timeout (70 s in the lab, 710d).
+    async fn delete_box(
+        &mut self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+        r: Responder<Option<Vec<String>>>,
+    ) {
+        if self.in_shutdown.is_cancelled() {
+            r.handle(async {
+                Err(BoxManagerError::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ))
+            })
+            .await;
+            return;
+        }
+        let handle = match self.store.find(RecordPredicate::Id(id)).await {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                r.handle(async {
+                    Err(std::io::Error::new(
+                        NotFound,
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            id.as_ref()
+                        ),
+                    ))
+                })
+                .await;
+                return;
+            }
+            Err(e) => {
+                r.handle(async { Err(e) }).await;
+                return;
+            }
+        };
+        // A destroy only for an unfinished session (inbox#690) goes
+        // to a live actor unclaimed: the actor decides, after any
+        // finalize ahead of it in its mailbox, and evicts itself if
+        // it destroys. An idle session has no finalize in flight, so
+        // its record answers: a finished one is kept, an unfinished
+        // one takes the unconditional path below.
+        if only_if_unfinalized {
+            let busy = self
+                .tearing_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&id);
+            if busy {
+                r.handle(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!(
+                            "a destroy of session `{}` is already in flight; if the \
+                             session is still listed once it ends, destroy it again",
+                            id.as_ref()
+                        ),
+                    ))
+                })
+                .await;
+                return;
+            }
+            if let Some(hnd) = self.running.get(&id).cloned() {
+                // In the tearing-down set until the actor answers, as
+                // an unconditional destroy is for its whole teardown:
+                // a second destroy is refused rather than queued
+                // behind this one (where it would destroy a session
+                // this one reports kept), a listing skips the
+                // session rather than reading a record the actor may
+                // be deleting, and a resolve finds nothing (the actor
+                // stays in `running`, unclaimed, since the session
+                // may be kept; the set is what hides it). A kept
+                // session leaves the set with the answer, and is
+                // listed and resolved again.
+                let tearing_down = Arc::clone(&self.tearing_down);
+                let handle = handle.clone();
+                tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id);
+                let span = tracing::Span::current();
+                self.teardowns.spawn(tracing::Instrument::instrument(
+                    async move {
+                        let release = TearingDown {
+                            set: tearing_down,
+                            id,
+                        };
+                        let answer: Result<Option<Vec<String>>, BoxManagerError> = async {
+                            let answer = hnd.destroy_if_unfinalized().await?;
+                            // Belt-and-braces, as on the unconditional
+                            // path: a dead actor (self-terminated, not
+                            // yet evicted) reads as destroyed above,
+                            // and may have died without deleting its
+                            // record. Only a destroyed answer removes
+                            // a leftover: a kept session's record is
+                            // the session. `NotFound` is the normal,
+                            // already-deleted case.
+                            if answer.is_some()
+                                && let Err(e) = handle.delete().await
+                                && e.kind() != NotFound
+                            {
+                                return Err(e);
+                            }
+                            Ok(answer)
+                        }
+                        .await;
+                        // Out of the set before the answer goes out: a
+                        // caller that reads the record or the listing on
+                        // the reply must not find a kept session still
+                        // hidden behind the set.
+                        drop(release);
+                        r.handle(async { answer }).await;
+                    },
+                    span,
+                ));
+                while let Some(joined) = self.teardowns.try_join_next() {
+                    log_teardown_join(joined);
+                }
+                return;
+            }
+            match handle.record().await {
+                Ok(record) if record.status == boxes::BoxState::Active => {
+                    r.handle(async { Ok(None) }).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    r.handle(async { Err(e) }).await;
+                    return;
+                }
+            }
+        }
+        // One teardown per session: a second destroy that lands
+        // while the first runs is refused rather than brought up
+        // as a fresh actor whose hooks would run again.
+        let tearing_down = Arc::clone(&self.tearing_down);
+        let first = tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+        if !first {
+            r.handle(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                        "a destroy of session `{}` is already in flight; if the \
+                         session is still listed once it ends, destroy it again",
+                        id.as_ref()
+                    ),
+                ))
+            })
+            .await;
+            return;
+        }
+        // Teardown belongs to the actor, so an idle session gets
+        // one brought up rather than having its record deleted
+        // out from under it. That used to be a fair shortcut —
+        // "nothing to undo" — but a session's `on_destroy` hooks
+        // now run on this path, and skipping the actor skipped
+        // them silently for any session whose actor had been
+        // reaped (every session, after a daemon restart).
+        //
+        // Claimed here, brought up and torn down on a task of its
+        // own: the mainloop awaits neither the actor's start (a
+        // record and composition read) nor its destroy (hooks), so
+        // a listing served meanwhile neither waits nor probes it.
+        // The caller gets the outcome when the task ends.
+        let claimed = self.running.remove(&id);
+        let seed = match claimed {
+            Some(_) => None,
+            None => Some(self.session_config(handle.clone())),
+        };
+        let in_shutdown = self.in_shutdown.clone();
+        let span = tracing::Span::current();
+        self.teardowns.spawn(tracing::Instrument::instrument(
+            async move {
+                // Out of the set as this task ends, whatever its outcome.
+                let _release = TearingDown {
+                    set: tearing_down,
+                    id,
+                };
+                r.handle(async {
+                    // A shutdown that began after this destroy was
+                    // accepted: an idle session is not brought up
+                    // now (a fresh actor and sandbox while shutdown
+                    // waits on this task). The destroy is refused, as
+                    // one that arrived during shutdown is above, and
+                    // the record stays for the next start.
+                    if seed.is_some() && in_shutdown.is_cancelled() {
+                        return Err(BoxManagerError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            minimald_rpc::SHUTDOWN_REFUSAL,
+                        ));
+                    }
+                    let actor = match (claimed, seed) {
+                        (Some(hnd), _) => Some(hnd),
+                        (None, Some(seed)) => match BoxActor::run(seed).await {
+                            // The check above ran before the bring-up;
+                            // a shutdown that began during it stops the
+                            // fresh actor as it stops a live one, and
+                            // the destroy is refused before its hooks
+                            // would mint a sandbox.
+                            Ok(hnd) if in_shutdown.is_cancelled() => {
+                                hnd.stop().await;
+                                return Err(BoxManagerError::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    minimald_rpc::SHUTDOWN_REFUSAL,
+                                ));
+                            }
+                            Ok(hnd) => Some(hnd),
+                            // A record the actor refuses to come up on — a
+                            // restart-orphaned `Materializing` one is the
+                            // known case — must still be destroyable, so
+                            // fall through to deleting it directly. A
+                            // session that cannot be torn down is worse
+                            // than one torn down without its hooks.
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %id,
+                                    error = %e,
+                                    "could not start the session to run its destroy hooks; \
+                                     removing its record without them",
+                                );
+                                None
+                            }
+                        },
+                        // A claimed actor comes with no seed; the
+                        // match above covers every pair that occurs.
+                        (None, None) => None,
+                    };
+                    match actor {
+                        Some(hnd) => {
+                            let hook_failures = hnd.destroy().await?;
+                            // Belt-and-braces: a dead actor (self-terminated
+                            // but not yet evicted) reads as `Ok` above, and
+                            // may have died *without* deleting its record
+                            // (its own delete failed). Remove any leftover;
+                            // `NotFound` is the normal already-deleted case.
+                            if let Err(e) = handle.delete().await
+                                && e.kind() != NotFound
+                            {
+                                return Err(e);
+                            }
+                            Ok(Some(hook_failures))
+                        }
+                        None => {
+                            handle.delete().await?;
+                            Ok(Some(Vec::new()))
+                        }
+                    }
+                })
+                .await;
+            },
+            span,
+        ));
+        // Finished tasks leave the set on their own; their join
+        // handles leave it here, so the set holds only the live ones.
+        while let Some(joined) = self.teardowns.try_join_next() {
+            log_teardown_join(joined);
+        }
+    }
+}
+
+impl BoxManager {
+    /// Why a reap of `id` is refused (BOX-019), or `None` when the reap can
+    /// go on. A box that is not `stopped` or `exited`, or whose resume is
+    /// in flight, is refused. An unknown id, and a shutdown, answer `None`:
+    /// [`Self::delete_box`] refuses them with its own error.
+    async fn reap_refusal(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<BoxManagerError>, BoxManagerError> {
+        use boxes::core::record::RecordState;
+        if self.in_shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(handle) = self.store.find(RecordPredicate::Id(id)).await? else {
+            return Ok(None);
+        };
+        let state = handle
+            .record()
+            .await?
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let resuming = self.name_claims.contains_key(&id);
+        Ok(match state {
+            RecordState::Stopped(_) | RecordState::Exited(_) if resuming => Some(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, ResumePending(id)),
+            ),
+            RecordState::Stopped(_) | RecordState::Exited(_) => None,
+            RecordState::Running => Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Box `{}` is running, so it was not removed. \
+                         A forced removal stops the box first and then removes it.",
+                    id.as_ref()
+                ),
+            )),
+            RecordState::Pending | RecordState::Materializing => Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Box `{}` is still being created, so it was not removed. \
+                     Only a stopped or exited box can be removed.",
+                    id.as_ref()
+                ),
+            )),
+        })
+    }
+}
+
+/// What a reap that went on answers: the hook failures of the destroy,
+/// and the name whose row the box held before the destroy.
+#[derive(Debug)]
+pub(crate) struct ReapEnd {
+    /// The destroy's answer, as [`ManagerMessage::DeleteSession`] gives it.
+    hook_failures: Option<Vec<String>>,
+    /// The box's name, when it held the name's row in the hostname
+    /// registry before the destroy.
+    held_name: Option<String>,
+}
+
+impl BoxManager {
+    /// The reap half of [`ManagerMessage::ReapEnded`]: notes whether the
+    /// box holds its name's row, and then destroys it as
+    /// [`Self::delete_box`] does.
+    async fn reap_ended(&mut self, id: SessionId, r: Responder<ReapEnd>) {
+        #[cfg(target_os = "linux")]
+        let held_name = self.held_name(id).await;
+        #[cfg(not(target_os = "linux"))]
+        let held_name = None;
+        let (send, recv) = Responder::channel();
+        self.delete_box(id, false, send).await;
+        let span = tracing::Span::current();
+        self.teardowns.spawn(tracing::Instrument::instrument(
+            async move {
+                r.handle(async move {
+                    let hook_failures = recv.await.unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            minimald_rpc::SHUTDOWN_REFUSAL,
+                        ))
+                    })?;
+                    Ok(ReapEnd {
+                        hook_failures,
+                        held_name,
+                    })
+                })
+                .await;
+            },
+            span,
+        ));
+        while let Some(joined) = self.teardowns.try_join_next() {
+            log_teardown_join(joined);
+        }
+    }
+
+    /// The name of box `id`, when the box holds that name's row in the
+    /// hostname registry.
+    #[cfg(target_os = "linux")]
+    async fn held_name(&self, id: SessionId) -> Option<String> {
+        let handle = self.store.find(RecordPredicate::Id(id)).await.ok()??;
+        let record = handle.record().await.ok()?;
+        let name = crate::box_actor::registry_name(&record);
+        self.hostnames
+            .read()
+            .expect("hostname registry lock poisoned")
+            .name_held_by(id, &name)
+            .then_some(name)
+    }
+
+    /// Registers the name row of the retained box `successor`, after a
+    /// reap removed the box that held it (NET-012). A box with a live actor
+    /// is registered here, and a stopped or exited one is marked stopped
+    /// (NET-128). A box with no actor gets one, and its bring-up registers
+    /// the name as a resume's bring-up does.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_name(&mut self, successor: SessionId) {
+        use boxes::core::record::RecordState;
+        let removing = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&successor);
+        if removing {
+            tracing::info!(
+                session_id = %successor,
+                "reap: the next holder of the name is being removed; the name is not handed over"
+            );
+            return;
+        }
+        let handle = match self.store.find(RecordPredicate::Id(successor)).await {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %successor,
+                    %error,
+                    "reap: the next holder of the name cannot be found; the name is not handed over"
+                );
+                return;
+            }
+        };
+        let record = match handle.record().await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %successor,
+                    %error,
+                    "reap: the record of the next holder of the name cannot be read; \
+                     the name is not handed over"
+                );
+                return;
+            }
+        };
+        let name = crate::box_actor::registry_name(&record);
+        if self
+            .name_claims
+            .iter()
+            .any(|(id, held)| *id != successor && held.eq_ignore_ascii_case(&name))
+        {
+            tracing::info!(
+                session_id = %successor,
+                session_name = &name,
+                "reap: a resume of a box with the name is in flight; it registers the name"
+            );
+            return;
+        }
+        {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if registry.name_held_by(successor, &name) {
+                return;
+            }
+            if let Some(owner) = registry.hostname_held_by_another(successor, &name) {
+                tracing::info!(
+                    session_id = %successor,
+                    session_name = &name,
+                    owner,
+                    "reap: another box took the name since the reap; the name is not handed over"
+                );
+                return;
+            }
+        }
+        let ended = matches!(
+            record.state(),
+            Ok(RecordState::Stopped(_) | RecordState::Exited(_))
+        );
+        if self.running.contains_key(&successor) {
+            let mut registry = self
+                .hostnames
+                .write()
+                .expect("hostname registry lock poisoned");
+            let registered = match record.network {
+                boxes::NetworkMode::HostNet => {
+                    registry.register_host_net(successor, &name);
+                    true
+                }
+                boxes::NetworkMode::OwnIp => registry
+                    .register_own_ip(
+                        successor,
+                        &name,
+                        crate::net::switch::declared_request_ports(Some(&record.policy)),
+                    )
+                    .is_some(),
+                _ => false,
+            };
+            if !registered {
+                tracing::info!(
+                    session_id = %successor,
+                    session_name = &name,
+                    "reap: the next holder of the name has no published address; \
+                     the name is not handed over"
+                );
+                return;
+            }
+            if ended {
+                registry.mark_stopped(successor);
+            }
+        } else {
+            match BoxActor::run(self.session_config(handle)).await {
+                Ok(hnd) => {
+                    self.running.insert(successor, hnd);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %successor,
+                        %error,
+                        "reap: the next holder of the name did not come up; \
+                         the name is not handed over"
+                    );
+                    return;
+                }
+            }
+        }
+        tracing::info!(
+            session_id = %successor,
+            session_name = &name,
+            ended,
+            action = "name-handed-over",
+            "reap: the name now answers for the next box that holds it"
+        );
+    }
+}
+
+/// How long a forced reap waits for a resume in flight to end.
+const REAP_RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a forced reap checks whether the resume it waits for ended.
+const REAP_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The refusal of a reap of a `stopped` or `exited` box whose resume is in
+/// flight (BOX-019, BOX-025).
+#[derive(Debug)]
+struct ResumePending(SessionId);
+
+impl std::fmt::Display for ResumePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Box `{}` is resuming, so it was not removed. \
+             Remove it again after the resume ends.",
+            self.0.as_ref()
+        )
+    }
+}
+
+impl std::error::Error for ResumePending {}
+
+/// Whether `error` is the [`ResumePending`] refusal.
+fn is_resume_pending(error: &BoxManagerError) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ResumePending>())
 }
 
 /// Deletes a record whose create failed before its id reached the caller.

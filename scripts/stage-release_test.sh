@@ -304,15 +304,16 @@ else
 fi
 
 # #2498: minvmd starts the Box Egress Proxy from beside its own binary, so the
-# darwin manifest installs bep at bin/bep, next to bin/minvmd. Linux has none.
+# darwin manifest puts bin/bep next to bin/minvmd: a link to the program in
+# bin/bep.app (#2812, checked with the bundle rows below). Linux has none.
 if [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "darwin" && $3 == "arm64" \
-        && $6 == "file" && $7 == "bin/bep" && $8 == "versions/0.6.0/bep-macos-arm64"')" ] \
+        && $6 == "symlink" && $7 == "bin/bep" && $8 == "bep.app/Contents/MacOS/bep"')" ] \
     && [ -n "$(printf '%s\n' "$bundle_out" | awk '$1 == "minvmd" && $2 == "darwin" && $7 == "bin/minvmd"')" ]; then
-    ok "the darwin manifest installs bep-macos-arm64 at bin/bep beside bin/minvmd"
+    ok "the darwin manifest puts bin/bep beside bin/minvmd"
 else
-    bad "no darwin row installs bep-macos-arm64 at bin/bep beside bin/minvmd (out: $bundle_out)"
+    bad "no darwin row puts bin/bep beside bin/minvmd (out: $bundle_out)"
 fi
-if [ -z "$(printf '%s\n' "$bundle_out" | awk '$1 == "bep" && $2 == "linux"')" ]; then
+if [ -z "$(printf '%s\n' "$bundle_out" | awk '$1 ~ /^bep/ && $2 == "linux"')" ]; then
     ok "the manifest carries no linux bep row"
 else
     bad "the manifest carries a linux bep row (out: $bundle_out)"
@@ -350,6 +351,79 @@ if [ "$partial_rc" -eq 0 ] && [ -n "$(printf '%s\n' "$partial_out" \
     ok "--allow-missing stages the program of a release from before the bundle"
 else
     bad "--allow-missing refused a bundle with the program alone (rc=$partial_rc, out: $partial_out)"
+fi
+
+# --- the bep bundle rows match scripts/build-bep-bundle.sh ------------------
+
+# On macOS bep ships inside bin/bep.app, whose provisioning profile carries
+# its keychain entitlement (#2812), one manifest row per bundle file, and
+# bin/bep links to the program. Each file's flat artifact name is
+# build-bep-bundle.sh's, for the same reason as Minimal.app's above.
+bep_table="$("$here/build-bep-bundle.sh" table)"
+while IFS=$'\t' read -r _ flat; do
+    printf 'fake %s\n' "$flat" >"$root/artifacts-bundle/$flat"
+done <<<"$bep_table"
+bep_out="$("$script" --artifacts-dir "$root/artifacts-bundle" --bucket gs://test-bucket \
+    --version 0.6.0 --dry-run 2>&1)"
+bep_files=0
+while IFS=$'\t' read -r path flat; do
+    bep_files=$((bep_files + 1))
+    if [ -n "$(printf '%s\n' "$bep_out" | awk -v dest="bin/bep.app/$path" \
+        -v src="versions/0.6.0/$flat" \
+        '$2 == "darwin" && $6 == "file" && $7 == dest && $8 == src')" ]; then
+        ok "the darwin manifest installs $flat at bin/bep.app/$path"
+    else
+        bad "no darwin row installs $flat at bin/bep.app/$path (out: $bep_out)"
+    fi
+done <<<"$bep_table"
+bep_rows="$(printf '%s\n' "$bep_out" | awk '$7 ~ /^bin\/bep\.app\// { n++ } END { print n + 0 }')"
+if [ "$bep_rows" -eq "$bep_files" ]; then
+    ok "the manifest carries exactly the bep bundle's $bep_files files under bin/bep.app"
+else
+    bad "the manifest carries $bep_rows rows under bin/bep.app, the bep bundle has $bep_files files"
+fi
+if [ -n "$(printf '%s\n' "$bep_out" | awk '$1 == "bep" && $2 == "darwin" && $6 == "symlink" \
+    && $7 == "bin/bep" && $8 == "bep.app/Contents/MacOS/bep"')" ]; then
+    ok "darwin links bin/bep to the program in bin/bep.app"
+else
+    bad "darwin does not link bin/bep to the program in bin/bep.app (out: $bep_out)"
+fi
+# Every bep bundle file is required: without one, the stage fails naming it.
+while IFS=$'\t' read -r _ flat; do
+    mkdir -p "$root/artifacts-partial"
+    rm -f "$root/artifacts-partial"/*
+    cp "$root/artifacts-bundle"/* "$root/artifacts-partial/"
+    rm "$root/artifacts-partial/$flat"
+    partial_rc=0
+    partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" \
+        --bucket gs://test-bucket --version 0.6.0 --dry-run 2>&1)" || partial_rc=$?
+    if [ "$partial_rc" -ne 0 ] && [[ "$partial_out" == *"missing artifact for bep"*"$flat"* ]]; then
+        ok "a bep bundle without $flat fails the stage naming it"
+    else
+        bad "a bep bundle without $flat staged (rc=$partial_rc, out: $partial_out)"
+    fi
+done <<<"$bep_table"
+
+# --allow-missing without the bep program omits the bin/bep link too, so a
+# backfill never replaces a working bin/bep with a dangling link.
+mkdir -p "$root/artifacts-partial"
+rm -f "$root/artifacts-partial"/*
+cp "$root/artifacts-bundle"/* "$root/artifacts-partial/"
+rm "$root/artifacts-partial/bep-macos-arm64"
+partial_rc=0
+partial_out="$("$script" --artifacts-dir "$root/artifacts-partial" --bucket gs://test-bucket \
+    --version 0.6.0 --allow-missing --dry-run 2>&1)" || partial_rc=$?
+if [ "$partial_rc" -eq 0 ] \
+    && [ -z "$(printf '%s\n' "$partial_out" | awk '$1 == "bep" && $6 == "symlink"')" ] \
+    && [[ "$partial_out" == *"omitting link bep/darwin/arm64"* ]]; then
+    ok "--allow-missing without the bep program omits the bin/bep link"
+else
+    bad "--allow-missing without the bep program still links bin/bep (rc=$partial_rc, out: $partial_out)"
+fi
+if [ -n "$(printf '%s\n' "$partial_out" | awk '$1 == "git-remote-min" && $2 == "darwin" && $6 == "symlink"')" ]; then
+    ok "a link whose target is staged still stages"
+else
+    bad "the git-remote-min link went missing (out: $partial_out)"
 fi
 
 # Every other binary stays required: the same fixture without minvmd's arm64

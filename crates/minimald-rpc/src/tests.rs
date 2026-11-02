@@ -2048,3 +2048,70 @@ fn every_reply_id_round_trips_byte_for_byte() {
         "the handed id crosses as its hex spelling: {wire}"
     );
 }
+
+/// BOX-019, BOX-021: the reap and prune requests and replies keep every
+/// field across the wire. An old client's request without `force` or
+/// selectors reads as an unforced reap and an unnarrowed prune, and an
+/// error reply never decodes as a reap or a prune that succeeded.
+#[test]
+fn reap_and_prune_requests_round_trip() {
+    let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let parent = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+
+    for force in [false, true] {
+        let req = ReapBoxRequest { id, force };
+        assert_eq!(round_trip(&req), req);
+    }
+    let bare: ReapBoxRequest =
+        serde_json_lenient::from_str(&format!(r#"{{"id":"{id}"}}"#)).expect("deserialize");
+    assert!(!bare.force, "a request without `force` is an unforced reap");
+
+    let req = PruneBoxesRequest {
+        older_than_secs: Some(86_400),
+        parent: Some(parent),
+    };
+    assert_eq!(round_trip(&req), req);
+    let bare: PruneBoxesRequest = serde_json_lenient::from_str("{}").expect("deserialize");
+    assert_eq!(bare, PruneBoxesRequest::default());
+
+    let entry = BoxListingEntry {
+        box_id: id,
+        name: Some("dev".to_string()),
+        box_type: Some("session".to_string()),
+        parent: Some(parent),
+        project_root: None,
+        state: "stopped".to_string(),
+        reason: Some("stopped".to_string()),
+        exit_code: None,
+        signal: Some(15),
+    };
+    let reap = ReapBoxResponse {
+        reaped: entry.clone(),
+        hook_failures: vec!["hook: failed".to_string()],
+    };
+    assert_eq!(round_trip(&reap), reap);
+    let prune = PruneBoxesResponse {
+        reaped: vec![entry],
+        failed: vec![PruneFailure {
+            box_id: parent,
+            error: "running".to_string(),
+        }],
+    };
+    assert_eq!(round_trip(&prune), prune);
+
+    let error = r#"{"error":"no session with ID `x`"}"#;
+    for decoded in [
+        matches!(
+            serde_json_lenient::from_str::<Errorable<ReapBoxResponse>>(error).unwrap(),
+            Errorable::Err { .. }
+        ),
+        matches!(
+            serde_json_lenient::from_str::<Errorable<PruneBoxesResponse>>(error).unwrap(),
+            Errorable::Err { .. }
+        ),
+    ] {
+        assert!(decoded, "an error reply decodes as an error");
+    }
+    assert_eq!(ReapBox::NAME, "minimald-v1-ReapBox");
+    assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
+}
