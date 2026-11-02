@@ -2394,7 +2394,9 @@ mod tests {
             let line = format!("line {i:04}\n");
             writer.write(line.as_bytes()).unwrap();
             written.extend_from_slice(line.as_bytes());
-            let len = std::fs::metadata(dir.log_path().as_utf8_path()).unwrap().len();
+            let len = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .len();
             assert!(len <= cap, "the log is {len} bytes, past the cap {cap}");
             read.extend_from_slice(&drain(&mut reader));
         }
@@ -2405,7 +2407,11 @@ mod tests {
         );
 
         let log = dir.read_log_from(0, usize::MAX).unwrap();
-        assert!(log.starts_with(LOG_DROPPED), "{}", String::from_utf8_lossy(&log));
+        assert!(
+            log.starts_with(LOG_DROPPED),
+            "{}",
+            String::from_utf8_lossy(&log)
+        );
         assert!(
             written.ends_with(&log[LOG_DROPPED.len()..]),
             "the log holds the newest output"

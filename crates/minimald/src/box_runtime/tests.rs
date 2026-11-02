@@ -7942,9 +7942,7 @@ async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_n
 
     let stored = StoredBox::new();
     let past_cap = boxes::store::LOG_CAP + boxes::store::LOG_CAP / 8;
-    let script = format!(
-        "head -c {past_cap} /dev/zero | tr '\\0' a; printf 'newest\\n'; sleep 60"
-    );
+    let script = format!("head -c {past_cap} /dev/zero | tr '\\0' a; printf 'newest\\n'; sleep 60");
     let mut spec = BoxSpec::for_session(None, SpecFlags::default());
     spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
     let launcher = MockLauncher::default().and_spec(LaunchSpec {
