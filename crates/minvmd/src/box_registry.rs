@@ -2915,6 +2915,13 @@ pub struct BoxRegistry {
     /// every [`BoxTable`]: the union the gate decides a box-marked frame
     /// from the node address by.
     host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
+    /// The ids minted for `host_ip` boxes ([`Self::register_host_ip_box`],
+    /// BEP-082), shared by every clone. A `host_ip` box has no row in the
+    /// address table, so this set is the record of its id: the collision
+    /// check ([`Self::holds_box_id`]) reads it beside the rows. An id stays
+    /// here until the VM host daemon restarts. The mint never draws the
+    /// same UUIDv7 twice, so a kept id never refuses a new box.
+    host_ip_ids: Arc<Mutex<BTreeSet<BoxId>>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -3138,6 +3145,8 @@ enum IdHolder {
     KeptCreation,
     /// The proxy's attachment table.
     Attachment,
+    /// A `host_ip` box's minted id ([`BoxRegistry::register_host_ip_box`]).
+    HostIpBox,
     /// A revocation record the proxy retains.
     RevocationRecord,
     /// A revocation record in the proxy's audit log, read with no proxy
@@ -3157,6 +3166,7 @@ impl IdHolder {
             IdHolder::LiveRow => "live row",
             IdHolder::KeptCreation => "kept creation",
             IdHolder::Attachment => "attachment",
+            IdHolder::HostIpBox => "host_ip box",
             IdHolder::RevocationRecord => "revocation record",
             IdHolder::AuditedRevocation { .. } => "revocation record in the audit log",
         }
@@ -3398,6 +3408,7 @@ impl Clone for BoxRegistry {
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
             host_ip_boxes: Arc::clone(&self.host_ip_boxes),
+            host_ip_ids: Arc::clone(&self.host_ip_ids),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
@@ -3442,6 +3453,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
+            host_ip_ids: Arc::new(Mutex::new(BTreeSet::new())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -4562,6 +4574,54 @@ impl BoxRegistry {
         )
     }
 
+    /// Mints the box id of a `host_ip` box (BEP-082): the box leaves the VM
+    /// from the node's own address, so it gets no switch address and no row
+    /// in the address table. The id is recorded in [`Self::host_ip_ids`].
+    /// The id takes the collision check an own-address box's id takes
+    /// ([`Self::holds_box_id`]): live rows, kept creations, attachments and
+    /// the proxy's revocation records. A colliding mint is refused, never
+    /// re-minted.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::holds_box_id`], and
+    /// [`AllocationError::CollidingBoxId`] when a record holds the id.
+    pub fn register_host_ip_box(&self, name: &str) -> Result<BoxId, AllocationError> {
+        self.register_host_ip_box_as(name, crate::bep_attach::mint_box_id())
+    }
+
+    /// [`Self::register_host_ip_box`] with the freshly minted `id`, split
+    /// out so a test can drive a colliding mint.
+    fn register_host_ip_box_as(&self, name: &str, id: BoxId) -> Result<BoxId, AllocationError> {
+        if let Some(holder) = self.holds_box_id(id)? {
+            tracing::warn!(
+                box = %name,
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                held_by = holder.as_str(),
+                "refused a host_ip box registration whose id is already held: the check \
+                 reads live rows, kept creations, attachments and the proxy's revocation \
+                 records"
+            );
+            return Err(AllocationError::CollidingBoxId { id });
+        }
+        self.host_ip_id_set().insert(id);
+        Ok(id)
+    }
+
+    /// The set of minted `host_ip` box ids ([`Self::host_ip_ids`]).
+    fn host_ip_id_set(&self) -> MutexGuard<'_, BTreeSet<BoxId>> {
+        self.host_ip_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `id` is a `host_ip` box id this registry minted
+    /// ([`Self::register_host_ip_box`]).
+    #[must_use]
+    pub fn holds_host_ip_id(&self, id: BoxId) -> bool {
+        self.host_ip_id_set().contains(&id)
+    }
+
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
     /// creates the box as: the one door the collision checks guard, split
     /// out so a test can drive a colliding mint.
@@ -4802,6 +4862,9 @@ impl BoxRegistry {
         drop(rows);
         if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
+        }
+        if self.host_ip_id_set().contains(&id) {
+            return Ok(Some(IdHolder::HostIpBox));
         }
         if self
             .attachments

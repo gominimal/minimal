@@ -1440,6 +1440,11 @@ fn registration_reply(
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
 ) -> BoxControlReply {
+    // A `host_ip` box leaves the VM from the node's own address (BEP-082):
+    // it gets a box id and no address, so the answerer is not asked.
+    if request.host_ip {
+        return order.apply(move || register_host_ip_box(boxes, &request));
+    }
     // The published address is asked of the answerer before the
     // ticket: the allocation can wait out a handover, and no turn
     // is held across it.
@@ -2042,6 +2047,8 @@ fn register_box(
                 loopback_address = %record.loopback_addr(),
                 task_addresses = ?record.task_addrs(),
                 egress = %declared_egress,
+                network = "own_ip",
+                switch_address_allocated = true,
                 "registered box with the VM host daemon; addresses allocated"
             );
             BoxControlReply::Registered(RegisteredBox {
@@ -2077,6 +2084,40 @@ fn register_box(
                     "box registration refused"
                 );
             }
+            BoxControlReply::Error {
+                error: error.to_string(),
+            }
+        }
+    }
+}
+
+/// Register a `host_ip` box (BEP-082): mint its id, with no switch address
+/// and no row in the address table, and answer with the id alone. The id
+/// takes the collision check an own-address box's id takes. A held
+/// registration holds nothing here: the box has no row for a lease to
+/// withdraw, so the reply is written and the connection closes.
+fn register_host_ip_box(boxes: &BoxRegistry, request: &RegisterBoxRequest) -> BoxControlReply {
+    match boxes.register_host_ip_box(&request.name) {
+        Ok(id) => {
+            tracing::info!(
+                box = %request.name,
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                network = "host_ip",
+                switch_address_allocated = false,
+                credentialed_upstream = request.credentialed_upstream.is_some(),
+                "registered box with the VM host daemon; a host_ip box gets an id and no address"
+            );
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: minimald_rpc::BoxId::from_bytes(id),
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                box = %request.name,
+                network = "host_ip",
+                error = %error,
+                "box registration refused"
+            );
             BoxControlReply::Error {
                 error: error.to_string(),
             }
@@ -4065,6 +4106,50 @@ mod tests {
     /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
     /// each a published row of the box's, carrying its id; the creator's
     /// withdrawal of the box takes them with it.
+    /// BEP-082: a `host_ip` registration is answered with a box id and no
+    /// address. Each registration is a new creation with its own id, the
+    /// same name included, and none of them puts a row in the address
+    /// table. A held registration holds no lease: the reply is written and
+    /// the connection closes.
+    #[test]
+    fn host_ip_box_registration_mints_a_creation_unique_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let host_ip = |hold: bool| RegisterBoxRequest {
+            host_ip: true,
+            hold,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let first = minted(register(&sock_path, &host_ip(false)).expect("answered"));
+        let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
+        assert_ne!(first, second, "each creation gets its own id");
+        for id in [first, second] {
+            assert!(registry.holds_host_ip_id(id.to_bytes()), "the registry records {id}");
+        }
+        assert!(
+            registry.table().rows().is_empty(),
+            "a host_ip registration puts no row in the address table"
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            0,
+            "a host_ip registration draws no switch address"
+        );
+        // An own-address registration after them is unchanged: it gets
+        // its own row, under an id that is neither host_ip id.
+        let web = handed(register(&sock_path, &box_request("web")).expect("answered"));
+        assert_ne!(web.box_id, first);
+        assert_ne!(web.box_id, second);
+        assert_eq!(registry.table().rows().len(), 1);
+    }
+
     #[test]
     fn task_addresses_registered_with_box_and_handed() {
         let dir = tempfile::TempDir::new().expect("temp dir");
