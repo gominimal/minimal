@@ -14,9 +14,13 @@
 //! (see [`StartError`]). [`replace`] is the operator's command, and the only
 //! path that replaces a key.
 //!
-//! On macOS the store is the login keychain ([`Keychain`]). The keychain
-//! admits a non-exportable key only to the program that generated it, so a
-//! rebuilt proxy is refused its keys and recovers through [`replace`].
+//! On macOS the store is [`Keychain`]. A release build generates each key
+//! in the Secure Enclave and holds it in the data-protection keychain, under
+//! the access group that the signed `bep.app` bundle's provisioning profile
+//! grants. A debug build cannot hold that entitlement, so it keeps its keys
+//! in the login keychain, which admits a key only to the program that
+//! generated it: a rebuilt proxy is refused its keys and recovers through
+//! [`replace`].
 
 use std::fmt;
 use std::str::FromStr;
@@ -941,7 +945,8 @@ pub fn replacement_report(role: Role) -> &'static str {
 #[cfg(target_os = "macos")]
 pub use keychain::Keychain;
 
-/// The macOS login keychain as a [`KeyStore`].
+/// The macOS keychain as a [`KeyStore`]: the Secure Enclave in a release
+/// build, the login keychain in a debug build.
 #[cfg(target_os = "macos")]
 mod keychain {
     use core_foundation::base::TCFType;
@@ -951,15 +956,19 @@ mod keychain {
     use core_foundation::error::CFErrorRef;
     use core_foundation::number::CFNumber;
     use core_foundation::string::{CFString, CFStringRef};
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use security_framework::item::{
         ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult,
     };
     use security_framework::key::{Algorithm, SecKey};
+    use security_framework_sys::access_control::kSecAccessControlPrivateKeyUsage;
     use security_framework_sys::base::errSecItemNotFound;
     use security_framework_sys::item::{
-        kSecAttrIsPermanent, kSecAttrKeyClass, kSecAttrKeyClassPublic, kSecAttrKeySizeInBits,
-        kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom, kSecAttrLabel, kSecPrivateKeyAttrs,
-        kSecPublicKeyAttrs,
+        kSecAttrAccessControl, kSecAttrAccessGroup, kSecAttrIsPermanent, kSecAttrKeyClass,
+        kSecAttrKeyClassPublic, kSecAttrKeySizeInBits, kSecAttrKeyType,
+        kSecAttrKeyTypeECSECPrimeRandom, kSecAttrLabel, kSecAttrTokenID,
+        kSecAttrTokenIDSecureEnclave, kSecPrivateKeyAttrs, kSecPublicKeyAttrs,
+        kSecUseDataProtectionKeychain,
     };
     use zeroize::Zeroizing;
 
@@ -982,9 +991,54 @@ mod keychain {
     /// `errSecAuthFailed`, `errSecNoAccessForItem` and `errSecUserCanceled`.
     const DENIED: [i32; 3] = [-25293, -25243, -128];
 
-    /// The login keychain.
+    /// `errSecMissingEntitlement`: this program is not signed with the
+    /// keychain access group that [`ACCESS_GROUP`] names.
+    const MISSING_ENTITLEMENT: i32 = -34018;
+
+    /// Whether this build holds its keys in the Secure Enclave (#2812). A
+    /// release build does. A debug build keeps the login keychain, because
+    /// only the signed `bep.app` bundle holds the entitlement the
+    /// data-protection keychain asks for, and a debug build keeps an
+    /// exportable key with a warning (T111, #2785).
+    const SECURE_ENCLAVE: bool = !cfg!(debug_assertions);
+
+    /// The keychain access group a release build's keys live in. The
+    /// `keychain-access-groups` entitlement of `bep.app`
+    /// (`packaging/macos/bep/bep.entitlements`) names it, and the bundle's
+    /// provisioning profile authorises it for team `3G47C5HY64`.
+    pub const ACCESS_GROUP: &str = "3G47C5HY64.dev.minimal.bep";
+
+    /// The keychain that holds the proxy's keys: the Secure Enclave and the
+    /// data-protection keychain in a release build, the login keychain in a
+    /// debug build.
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Keychain;
+
+    /// A search for the proxy's private keys in this build's keychain.
+    fn private_keys(label: &str) -> ItemSearchOptions {
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::key())
+            .key_class(KeyClass::private())
+            .label(label);
+        if SECURE_ENCLAVE {
+            search.ignore_legacy_keychains().access_group(ACCESS_GROUP);
+        }
+        search
+    }
+
+    /// A store error, with plain advice when the keychain refused this
+    /// program the entitlement a release build needs.
+    fn store_error(role: Role, err: &security_framework::base::Error) -> KeyError {
+        let detail = if err.code() == MISSING_ENTITLEMENT {
+            format!(
+                "this bep is not signed with the keychain entitlement a release build needs ({err}). Run the bep that a Minimal release installs"
+            )
+        } else {
+            err.to_string()
+        };
+        KeyError::Store { role, detail }
+    }
 
     /// A private key the keychain holds.
     pub struct KeychainKey {
@@ -1126,10 +1180,7 @@ mod keychain {
         type Key = KeychainKey;
 
         fn find(&self, role: Role) -> Result<Option<KeychainKey>, KeyError> {
-            let found = ItemSearchOptions::new()
-                .class(ItemClass::key())
-                .key_class(KeyClass::private())
-                .label(&role.label())
+            let found = private_keys(&role.label())
                 .load_refs(true)
                 .limit(1i64)
                 .search();
@@ -1139,10 +1190,7 @@ mod keychain {
                 // keychain or a session with no UI is not, and the
                 // replacement advice would delete a healthy key.
                 Err(err) if DENIED.contains(&err.code()) => Err(refused(role, err)),
-                Err(err) => Err(KeyError::Store {
-                    role,
-                    detail: err.to_string(),
-                }),
+                Err(err) => Err(store_error(role, &err)),
                 Ok(results) => match results.into_iter().next() {
                     None => Ok(None),
                     Some(SearchResult::Ref(Reference::Key(key))) => {
@@ -1160,24 +1208,54 @@ mod keychain {
 
         fn generate_in(&self, role: Role, slot: Slot) -> Result<KeychainKey, KeyError> {
             let label = CFString::new(&role.slot_label(slot));
-            let private = CFDictionary::from_CFType_pairs(&[
-                (
-                    attr(unsafe { kSecAttrIsPermanent }),
-                    CFBoolean::true_value().into_CFType(),
-                ),
+            // SAFETY: the Security framework exports these constants for the
+            // life of the process.
+            let (permanent, label_attr) =
+                unsafe { (attr(kSecAttrIsPermanent), attr(kSecAttrLabel)) };
+            let mut private = vec![
+                (permanent, CFBoolean::true_value().into_CFType()),
+                (label_attr, label.clone().into_CFType()),
+            ];
+            let mut placement = Vec::new();
+            if SECURE_ENCLAVE {
+                // BEP-014, BEP-059: the Secure Enclave never lets the private
+                // half out. The key is usable once the Mac has been unlocked
+                // after a restart, so boxes keep working while the screen is
+                // locked, and it never moves to another Mac.
+                let access = SecAccessControl::create_with_protection(
+                    Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+                    kSecAccessControlPrivateKeyUsage,
+                )
+                .map_err(|err| store_error(role, &err))?;
+                // SAFETY: the Security framework exports these constants for
+                // the life of the process.
+                let (access_control, group, token, enclave, data_protection) = unsafe {
+                    (
+                        attr(kSecAttrAccessControl),
+                        attr(kSecAttrAccessGroup),
+                        attr(kSecAttrTokenID),
+                        attr(kSecAttrTokenIDSecureEnclave),
+                        attr(kSecUseDataProtectionKeychain),
+                    )
+                };
+                private.push((access_control, access.into_CFType()));
+                private.push((group, CFString::new(ACCESS_GROUP).into_CFType()));
+                placement.push((token, enclave.into_CFType()));
+                placement.push((data_protection, CFBoolean::true_value().into_CFType()));
+            } else {
                 // BEP-014, BEP-059: the private half never leaves the
                 // keychain.
-                (
+                private.push((
                     attr(unsafe { kSecAttrIsExtractable }),
                     CFBoolean::false_value().into_CFType(),
-                ),
-                (attr(unsafe { kSecAttrLabel }), label.clone().into_CFType()),
-            ]);
+                ));
+            }
+            let private = CFDictionary::from_CFType_pairs(&private);
             let public = CFDictionary::from_CFType_pairs(&[(
                 attr(unsafe { kSecAttrIsPermanent }),
                 CFBoolean::false_value().into_CFType(),
             )]);
-            let attrs = CFDictionary::from_CFType_pairs(&[
+            let mut attrs = vec![
                 (
                     attr(unsafe { kSecAttrKeyType }),
                     attr(unsafe { kSecAttrKeyTypeECSECPrimeRandom }).into_CFType(),
@@ -1189,11 +1267,23 @@ mod keychain {
                 (attr(unsafe { kSecAttrLabel }), label.into_CFType()),
                 (attr(unsafe { kSecPrivateKeyAttrs }), private.into_CFType()),
                 (attr(unsafe { kSecPublicKeyAttrs }), public.into_CFType()),
-            ]);
+            ];
+            attrs.extend(placement);
+            let attrs = CFDictionary::from_CFType_pairs(&attrs);
             #[allow(deprecated)]
-            let key = SecKey::generate(attrs.to_untyped()).map_err(|err| KeyError::Store {
-                role,
-                detail: err.to_string(),
+            let key = SecKey::generate(attrs.to_untyped()).map_err(|err| {
+                // Only the missing entitlement gets the plain advice. Every
+                // other failure keeps the text the Security framework gave.
+                match i32::try_from(err.code()) {
+                    Ok(MISSING_ENTITLEMENT) => store_error(
+                        role,
+                        &security_framework::base::Error::from_code(MISSING_ENTITLEMENT),
+                    ),
+                    _ => KeyError::Store {
+                        role,
+                        detail: err.to_string(),
+                    },
+                }
             })?;
             let key = match KeychainKey::new(role, key) {
                 Ok(key) => key,
@@ -1219,24 +1309,16 @@ mod keychain {
         }
 
         fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
-            match ItemSearchOptions::new()
-                .class(ItemClass::key())
-                .label(&role.slot_label(slot))
-                .delete()
-            {
-                Err(err) if err.code() != errSecItemNotFound => Err(KeyError::Store {
-                    role,
-                    detail: err.to_string(),
-                }),
+            // The private key is the only item the store keeps: the
+            // public half is never made permanent.
+            match private_keys(&role.slot_label(slot)).delete() {
+                Err(err) if err.code() != errSecItemNotFound => Err(store_error(role, &err)),
                 _ => Ok(()),
             }
         }
 
         fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
-            let found = ItemSearchOptions::new()
-                .class(ItemClass::key())
-                .key_class(KeyClass::private())
-                .label(&role.slot_label(slot))
+            let found = private_keys(&role.slot_label(slot))
                 .load_refs(true)
                 .limit(1i64)
                 .search();
@@ -1244,29 +1326,20 @@ mod keychain {
                 Err(err) if err.code() == errSecItemNotFound => Ok(false),
                 // A key the keychain refuses is still a key in the slot.
                 Err(err) if DENIED.contains(&err.code()) => Ok(true),
-                Err(err) => Err(KeyError::Store {
-                    role,
-                    detail: err.to_string(),
-                }),
+                Err(err) => Err(store_error(role, &err)),
                 Ok(results) => Ok(!results.is_empty()),
             }
         }
 
         fn kid_in(&self, role: Role, slot: Slot) -> Result<Option<String>, KeyError> {
-            let found = ItemSearchOptions::new()
-                .class(ItemClass::key())
-                .key_class(KeyClass::private())
-                .label(&role.slot_label(slot))
+            let found = private_keys(&role.slot_label(slot))
                 .load_refs(true)
                 .limit(1i64)
                 .search();
             match found {
                 Err(err) if err.code() == errSecItemNotFound => Ok(None),
                 Err(err) if DENIED.contains(&err.code()) => Err(refused(role, err)),
-                Err(err) => Err(KeyError::Store {
-                    role,
-                    detail: err.to_string(),
-                }),
+                Err(err) => Err(store_error(role, &err)),
                 Ok(results) => match results.into_iter().next() {
                     None => Ok(None),
                     Some(SearchResult::Ref(Reference::Key(key))) => {
@@ -1284,13 +1357,32 @@ mod keychain {
             // SAFETY: the Security framework exports these constants for the
             // life of the process.
             let class = unsafe { (attr(kSecClass), attr(kSecClassKey)) };
-            let query = CFDictionary::from_CFType_pairs(&[
+            let mut query = vec![
                 (class.0.into_CFType(), class.1.into_CFType()),
                 (
                     attr(unsafe { kSecAttrLabel }).into_CFType(),
                     CFString::new(&role.slot_label(from)).into_CFType(),
                 ),
-            ]);
+            ];
+            if SECURE_ENCLAVE {
+                // SAFETY: the Security framework exports these constants for
+                // the life of the process.
+                let (data_protection, group) = unsafe {
+                    (
+                        attr(kSecUseDataProtectionKeychain),
+                        attr(kSecAttrAccessGroup),
+                    )
+                };
+                query.push((
+                    data_protection.into_CFType(),
+                    CFBoolean::true_value().into_CFType(),
+                ));
+                query.push((
+                    group.into_CFType(),
+                    CFString::new(ACCESS_GROUP).into_CFType(),
+                ));
+            }
+            let query = CFDictionary::from_CFType_pairs(&query);
             let update = CFDictionary::from_CFType_pairs(&[(
                 attr(unsafe { kSecAttrLabel }),
                 CFString::new(&role.slot_label(to)),
@@ -1306,10 +1398,10 @@ mod keychain {
                 // `KeyStore::relabel`).
                 status if status == errSecItemNotFound && from == Slot::Held => Ok(()),
                 status if status == errSecItemNotFound => Err(missing_in(role, from)),
-                status => Err(KeyError::Store {
+                status => Err(store_error(
                     role,
-                    detail: security_framework::base::Error::from_code(status).to_string(),
-                }),
+                    &security_framework::base::Error::from_code(status),
+                )),
             }
         }
     }

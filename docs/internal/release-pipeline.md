@@ -464,9 +464,52 @@ nothing. The name and icon in System Settings are a manual check. Run
 `min finalize-install` from that build on a Mac. `sfltool dumpbtm` then
 shows the two jobs with `Minimal.app` as their parent.
 
+**The `bep` app bundle.** The release puts `bep`, the Box Egress Proxy,
+inside `bep.app`. A release `bep` generates its keys in the Secure Enclave and
+keeps them in the data-protection keychain, under the keychain access group
+`3G47C5HY64.dev.minimal.bep`. macOS grants that group only to a program
+signed with the `keychain-access-groups` entitlement. It honours the
+entitlement only when a provisioning profile in the program's bundle
+authorises it. A debug `bep` keeps its keys in the login keychain and needs
+no bundle.
+
+```
+bep.app/Contents/Info.plist                    packaging/macos/bep/Info.plist
+bep.app/Contents/MacOS/bep                     the program
+bep.app/Contents/embedded.provisionprofile     the Developer ID profile
+bep.app/Contents/_CodeSignature/CodeResources  added by codesign
+bep.app/Contents/CodeResources                 added by stapler
+```
+
+[`scripts/build-bep-bundle.sh`](../../scripts/build-bep-bundle.sh)
+assembles the first three files, and flattens and rebuilds the bundle as
+`build-app-bundle.sh` does for `Minimal.app`. The flat names start with
+`bep-macos-arm64`. `stage-release.sh` installs them under `bin/bep.app`, and
+links `bin/bep` to `bep.app/Contents/MacOS/bep`, so `minvmd` still finds
+`bep` beside itself. The job signs the bundle with the identifier
+`dev.minimal.bep` and the entitlements in
+`packaging/macos/bep/bep.entitlements`, then notarizes and staples it.
+
+The profile is the repository secret `MACOS_BEP_PROVISION_PROFILE`: the
+Developer ID provisioning profile for the App ID `dev.minimal.bep`, base64
+encoded. `build-bep-bundle.sh check-profile` checks its team, its
+application identifier, its keychain access groups, that it provisions every
+Mac, and its expiry. The release fails if one is wrong. `scripts/build-bep-bundle_test.sh` tests that
+check. The profile names one Developer ID Application certificate. When you renew
+that certificate, make the profile again against the new certificate and
+replace the secret.
+
+Secure Enclave keys never leave the Mac that made them. A Mac restored from
+a backup, migrated to new hardware or reset has no proxy keys. `bep` makes
+new ones at its next start when it published none before. Otherwise, run
+`bep --replace-key <role>` for each role it names. Seal again each value
+that you sealed to the old sealing key, and create again each box that you
+created before then. The keys of an earlier release stay in the login keychain,
+where this release does not look for them.
+
 **Notarization.** After the signature checks and the last link gate,
-`build-release-macos-arm64` sends `min`, `minvmd`, and the `minzoned` app
-bundle to the Apple notary service before it uploads them. The step puts
+`build-release-macos-arm64` sends `min`, `minvmd`, and the `bep` and
+`minzoned` app bundles to the Apple notary service before it uploads them. The step puts
 each one in a zip made with `ditto`, because `notarytool` does not take a
 bare Mach-O file or a bundle directory. It runs
 `xcrun notarytool submit --wait` on each zip. The
@@ -477,7 +520,7 @@ change the file, so the job uploads the same signed bytes.
 The job does not staple `min` or `minvmd`. The release publishes each as a
 bare Mach-O file, and `stapler` can attach a ticket only to an app bundle, a
 `.pkg`, or a `.dmg`. Gatekeeper gets the ticket from Apple online when it
-checks a binary. The job staples the app bundle. The ticket is the file
+checks a binary. The job staples the two app bundles. The ticket is the file
 `Contents/CodeResources`, which the signature does not cover.
 
 The step needs two things that the workflow cannot set up:
@@ -553,11 +596,12 @@ version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build.
 
 **Approval.** The `gate` job opens an approval issue, posts to Slack, and
-waits. The approvers are the members of the `@gominimal/minimalists` team,
-other than the person who started the run. The workflow reads the team once,
-when the gate opens, so a change to the team's membership applies from the
-next promotion, not to one already waiting. If the team cannot be read, or has
-no other member, the gate fails and nothing is promoted. An approver comments
+waits. Any member of the `@gominimal/minimalists` team can approve, except
+the person who started the run. The workflow reads the team once, when the
+gate opens. A change to the team's membership applies from the next
+promotion, not to one already waiting. If the workflow cannot read the team,
+or the team has no other member, the gate fails and the workflow promotes
+nothing. An approver comments
 `approved` or `denied`. If someone closes the issue without an approval, the
 workflow stops.
 
