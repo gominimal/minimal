@@ -1786,7 +1786,10 @@ mod tests {
 
         let id = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
         let transcript = object.exec_transcript_path(id);
-        assert_eq!(transcript, record_dir.join(EXECS_DIR).join(format!("{id}.log")));
+        assert_eq!(
+            transcript,
+            record_dir.join(EXECS_DIR).join(format!("{id}.log"))
+        );
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         std::fs::write(&transcript, b"out\n").unwrap();
 

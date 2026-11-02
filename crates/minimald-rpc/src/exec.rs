@@ -185,7 +185,9 @@ impl ExecId {
                 8 | 13 | 18 | 23 => *b == b'-',
                 _ => b.is_ascii_hexdigit(),
             });
-        let v7 = shaped && bytes[14] == b'7' && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
+        let v7 = shaped
+            && bytes[14] == b'7'
+            && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
         if !v7 {
             return Err(ExecParseError::ExecId(text.to_string()));
         }
@@ -524,7 +526,9 @@ mod tests {
             })),
         );
         assert_eq!(
-            ExecRequest::parse(r#"min://exec {"argv":["true"],"mode":"detached","timeout_secs":0}"#),
+            ExecRequest::parse(
+                r#"min://exec {"argv":["true"],"mode":"detached","timeout_secs":0}"#
+            ),
             Err(ExecParseError::ZeroTimeout),
         );
         assert_eq!(
