@@ -155,12 +155,15 @@ pub(crate) struct LaunchSpec {
     /// The spec stored beside the box's record (BOX-068). `None` for a box
     /// filed with no spec: a client that predates it, or the dashboard.
     pub(crate) spec: Option<std::sync::Arc<mfile::spec::BoxSpec>>,
-    /// Whether an exec runs the command the box is for. `min task run`
-    /// sends a task's run over the exec channel, so a launch of a box whose
-    /// run comes that way starts the shell, whatever entrypoint its spec
-    /// names. Otherwise the task runs twice. The box's actor sets this on
-    /// every launch, an attach and a hook launch included, while the exec
-    /// channel carries the run.
+    /// Whether an exec runs the command the box is for. When it is set, the
+    /// launch starts the shell, whatever entrypoint the spec names.
+    ///
+    /// Interim: the box's actor sets this to `true` on every launch, a hook
+    /// launch and an attach included. `min task run` sends a task's run
+    /// over the exec channel, so a task box starts the shell and not its
+    /// spec's argv, and the task runs once. Flip condition: T43 (#2405)
+    /// moves a task's run from the exec channel to the box's entrypoint,
+    /// and removes the constant.
     pub(crate) run_by_exec: bool,
 }
 

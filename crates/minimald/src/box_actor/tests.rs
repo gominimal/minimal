@@ -2003,6 +2003,48 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     );
 }
 
+// T42: a stored spec the daemon cannot read refuses the launch, as a resume
+// of it is refused, and the box does not start its shell. The refusal is not
+// held, so a launch after the spec reads again starts the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_refuses_unreadable_stored_spec() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    let session_id =
+        create_session_with_spec(&mut client, Some("bad-spec"), "/tmp", Some(spec.clone())).await;
+    let path = record_dir(&server, session_id).await.join("spec.json");
+    std::fs::write(&path, b"not a spec").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::box_actor::AttachError::SpawnFailed(error)) => {
+            let text = error.to_string();
+            assert!(text.contains("cannot be read"), "{text}");
+            assert!(text.contains("min session destroy bad-spec"), "{text}");
+        }
+        Err(other) => panic!("expected a refused launch, got {other}"),
+        Ok(_) => panic!("a box whose stored spec cannot be read launched"),
+    }
+    assert!(
+        crate::box_actor::launch_spec_seam::observed(session_id).is_empty(),
+        "no launcher was built"
+    );
+
+    rewrite_spec(&server, session_id, &spec).await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the refusal was not held, so the readable spec launches");
+}
+
 /// NET-079's "recorded as such" is not best-effort: a host-address box
 /// whose launch cannot write its outcome onto the session record does not
 /// run as though it had one. The launch kills the box it minted and fails

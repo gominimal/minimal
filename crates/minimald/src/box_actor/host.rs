@@ -795,15 +795,27 @@ impl BoxActor {
             &box_runtime::launch_deliveries(&record),
         );
         // The box starts from its stored spec. The actor keeps its hold, so
-        // the next launch reads the same spec.
-        //
-        // An exec runs the box's command: `min task run` sends the task over
-        // the exec channel. A hook launch or an attach can come before or
-        // after that exec, and a hook launch's gated first process starts at
-        // the next attach. So every launch keeps the shell, and the task runs
-        // once.
+        // the next launch reads the same spec. A stored spec that cannot be
+        // read refuses the launch, as a resume of it is refused: the box's
+        // first process cannot be decided without it.
+        let spec = self.held_spec().await.map_err(|error| {
+            AttachError::SpawnFailed(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error} Destroy it with `min session destroy {name}`, then start a new \
+                     one with `min session activate`.",
+                    name = registry_name(&record),
+                ),
+            ))
+        })?;
+        // Interim: `run_by_exec` is `true` on every launch, so every launch,
+        // a hook launch and an attach included, starts the shell, and a task
+        // box does not start its spec's argv. `min task run` sends the task's
+        // run over the exec channel, so the shell keeps the task to one run.
+        // Flip condition: T43 (#2405) moves a task's run from the exec
+        // channel to the box's entrypoint, and removes this constant.
         let spec = box_runtime::LaunchSpec {
-            spec: self.held_spec().await,
+            spec,
             run_by_exec: true,
         };
         let launcher = self
@@ -1117,17 +1129,23 @@ impl BoxActor {
     }
 
     /// The spec stored beside this box's record, read by the first launch
-    /// and then held by the actor. `None` for a box filed with no spec, and
-    /// for a stored spec this daemon cannot read: that box starts its
-    /// shell, as every box did before its spec named an entrypoint.
-    pub(super) async fn held_spec(&mut self) -> Option<Arc<mfile::spec::BoxSpec>> {
+    /// and then held by the actor. `None` for a box filed with no spec: that
+    /// box starts its shell, as every box did before its spec named an
+    /// entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// A stored spec this daemon cannot read, or a failed read of the store.
+    /// The launch is refused, and the error is not held.
+    pub(super) async fn held_spec(&mut self) -> std::io::Result<Option<Arc<mfile::spec::BoxSpec>>> {
         if let Some(held) = &self.held_spec {
-            return held.clone();
+            return Ok(held.clone());
         }
         let stored = match self.record.object().await {
             Ok(object) => object.load_spec(),
             Err(error) => Err(error),
         };
+        // An error is not held: the next launch reads the store again.
         let spec = match stored {
             Ok(Some(bytes)) => match box_runtime::stored_spec(&bytes) {
                 Ok(spec) => Some(Arc::new(spec)),
@@ -1135,24 +1153,27 @@ impl BoxActor {
                     tracing::warn!(
                         box_id = %self.record.id(),
                         %error,
-                        "launch: the stored spec cannot be read; the box starts its shell"
+                        "launch: the stored spec cannot be read; the launch is refused"
                     );
-                    None
+                    return Err(error);
                 }
             },
+            // A box filed with no spec starts its shell.
             Ok(None) => None,
             Err(error) => {
-                // Not held: the next launch reads the store again.
                 tracing::warn!(
                     box_id = %self.record.id(),
                     %error,
-                    "launch: reading the stored spec failed; the box starts its shell"
+                    "launch: reading the stored spec failed; the launch is refused"
                 );
-                return None;
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    "The settings it was created with cannot be read.",
+                ));
             }
         };
         self.held_spec = Some(spec.clone());
-        spec
+        Ok(spec)
     }
 
     /// Hands back this session's host, launching one if none is running.
