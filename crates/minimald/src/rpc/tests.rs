@@ -4508,9 +4508,13 @@ async fn shutdown_without_force_proceeds_once_a_sessions_shell_has_exited() {
         .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
-    while let Ok(Some(_)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await
-    {}
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => panic!("channel stayed open 10s after the shell exited"),
+        }
+    }
 
     let mngr = server.state.sessions_manager().await;
     let session = mngr
