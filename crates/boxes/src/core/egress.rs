@@ -2542,36 +2542,18 @@ mod tests {
         );
     }
 
-    /// NET-134: the Box Egress Proxy's **listener** is a declared lane's
-    /// infrastructure — the one destination admitted beside the rules,
-    /// granted by the box's own declaration where the resolver carve-out is
-    /// granted by the system, and admitted as the whole (address, port,
-    /// protocol) triple the listener is, never the address alone: a TCP
-    /// frame to the listener's own port passes a deny-all. The address is
-    /// infrastructure on this leg too, so every frame to it the lane did
-    /// not admit is the relay's own named drop, ahead of the rules and
-    /// under the same rule string the host-side gate refuses the address
-    /// with, for a laned box and a lane-less one alike — an allow-all box's
-    /// open dimensions buy nothing at the address, and a lane-less box's
-    /// own listener triple is the drop's too: the lane alone opens the
-    /// listener, and the refusal a lane-less box is owed there belongs to
-    /// the box's own path, which a native host runs with no gate beside
-    /// the relay to make it, so the relay makes it. Without any proxy
-    /// compiled in, the rules alone decide, as they always did.
+    /// BEP-080: the lane admits TCP 443 at the proxy's address beside the
+    /// listener's port, for the direct TLS a `dns`-steered box opens there,
+    /// and nothing else. UDP 443 there stays rejected, and a box that
+    /// declared no lane reaches neither port.
     #[test]
     fn proxy_lane_admits_tls_443_and_listener_port_only() {
-        // The Box Egress Proxy's address on the switch these tests' resolver
-        // and lease are drawn from (broadcast - 3 of the default /16).
         const PROXY: [u8; 4] = [100, 64, 255, 252];
         let laned = deny_all().with_credentialed_upstream(PROXY);
         assert!(
             admits(&ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT), &laned),
-            "TCP to the proxy's listener is admitted beside the deny-all"
+            "TCP to the proxy's listener is admitted for a laned box"
         );
-        // The lane is the listener's, never the address's: TCP to another
-        // port at the same address and any other protocol at the listener's
-        // port are both the address's own drop below, ahead of the deny
-        // rules — the address is infrastructure whatever the box declared.
         // BEP-080: TCP 443 at the proxy's address is the lane's too, for
         // the direct TLS a `dns`-steered box opens there.
         assert!(
@@ -2595,6 +2577,51 @@ mod tests {
             ),
             "a box that declared no lane does not reach port 443 at the proxy's address"
         );
+        for port in [80, 444, 8080, 8443] {
+            assert!(
+                !admits(&ipv4_frame(IPPROTO_TCP, PROXY, port), &laned),
+                "TCP {port} at the proxy's address is not the lane's"
+            );
+        }
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], PROXY_DIRECT_TLS_PORT),
+                &laned
+            ),
+            "TCP 443 to an outside destination stays denied"
+        );
+    }
+
+    /// NET-134: the Box Egress Proxy's **listener** is a declared lane's
+    /// infrastructure — the one destination admitted beside the rules,
+    /// granted by the box's own declaration where the resolver carve-out is
+    /// granted by the system, and admitted as the whole (address, port,
+    /// protocol) triple the listener is, never the address alone: a TCP
+    /// frame to the listener's own port passes a deny-all. The address is
+    /// infrastructure on this leg too, so every frame to it the lane did
+    /// not admit is the relay's own named drop, ahead of the rules and
+    /// under the same rule string the host-side gate refuses the address
+    /// with, for a laned box and a lane-less one alike — an allow-all box's
+    /// open dimensions buy nothing at the address, and a lane-less box's
+    /// own listener triple is the drop's too: the lane alone opens the
+    /// listener, and the refusal a lane-less box is owed there belongs to
+    /// the box's own path, which a native host runs with no gate beside
+    /// the relay to make it, so the relay makes it. Without any proxy
+    /// compiled in, the rules alone decide, as they always did.
+    #[test]
+    fn proxy_lane_admits_only_the_listener() {
+        // The Box Egress Proxy's address on the switch these tests' resolver
+        // and lease are drawn from (broadcast - 3 of the default /16).
+        const PROXY: [u8; 4] = [100, 64, 255, 252];
+        let laned = deny_all().with_credentialed_upstream(PROXY);
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT), &laned),
+            "TCP to the proxy's listener is admitted beside the deny-all"
+        );
+        // The lane is the listener's, never the address's: TCP to another
+        // port at the same address and any other protocol at the listener's
+        // port are both the address's own drop below, ahead of the deny
+        // rules — the address is infrastructure whatever the box declared.
         assert!(
             !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 444), &laned),
             "the lane holds the listener's port and 443 only, not the address"
