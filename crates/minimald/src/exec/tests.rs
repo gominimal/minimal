@@ -3262,7 +3262,10 @@ mod managed {
         // The relay takes the messages in order: once it sees the close, it
         // offered every chunk to the terminal.
         typed.send(russh::ChannelMsg::Close).unwrap();
-        assert_eq!(attach.await.unwrap().unwrap(), AttachEnd::ClientGone);
+        let end = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach takes every chunk, then the close");
+        assert_eq!(end.unwrap().unwrap(), AttachEnd::ClientGone);
 
         let held = entry.held_input();
         assert!(held <= CAP, "the terminal holds {held} bytes, past the cap");

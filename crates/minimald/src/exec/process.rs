@@ -1161,6 +1161,10 @@ pub(super) fn start_managed_exec_within(
             std::fs::File::from(std::os::fd::OwnedFd::from(reader))
         }
     };
+    // The pump and the feed wait for the descriptor in the runtime, not in a
+    // blocking thread, so the supervisor can stop them. A write to a terminal
+    // whose program reads nothing would otherwise hold a thread for good.
+    crate::net::switch::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&source))?;
     let mut command = Command::from(command);
     command.kill_on_drop(true);
     let child = command.spawn()?;
@@ -1200,14 +1204,13 @@ pub(super) fn start_managed_exec_within(
     );
 
     let pump = spawn(pump_output(Arc::clone(&entry), source, transcript));
-    if let Some((writer, input)) = feed {
-        spawn(feed_terminal(writer, input));
-    }
+    let feed = feed.map(|(writer, input)| spawn(feed_terminal(writer, input)));
     spawn(supervise_managed_exec(
         Arc::clone(&entry),
         process,
         timeout,
         pump,
+        feed,
         exec_box,
     ));
     Ok(entry)
@@ -1226,10 +1229,15 @@ async fn supervise_managed_exec(
     mut process: TokioProcess,
     timeout: Option<Duration>,
     mut pump: JoinHandle<()>,
+    feed: Option<JoinHandle<()>>,
     exec_box: ExecBox,
 ) {
     let (status, reason) = wait_with_timeout(&mut process, timeout).await;
     entry.close_input();
+    // Nothing reads the terminal now. A feed that waits to write ends here.
+    if let Some(feed) = feed {
+        feed.abort();
+    }
     // A tty pump stops at the drain. A detached pump keeps on, so the
     // transcript still gets what a descendant writes after the exit.
     if tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
@@ -1359,14 +1367,39 @@ async fn pump_output(
     source: std::fs::File,
     mut transcript: CappedTranscript,
 ) {
-    let mut source = tokio::fs::File::from_std(source);
+    use std::io::Read as _;
+
+    // SAFETY: the `AsyncFd` owns `source` for its whole life, and nothing
+    // else closes or reuses the descriptor while it is registered.
+    let source = match unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(source, tokio::io::Interest::READABLE)
+    } {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(exec_id = %entry.id, %error, "exec: could not watch the output");
+            return;
+        }
+    };
     let mut buf = vec![0u8; 8192];
     loop {
-        match source.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => entry.record_output(&mut transcript, &buf[..n]),
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+        let mut ready = match source.readable().await {
+            Ok(ready) => ready,
             Err(error) => {
+                tracing::warn!(exec_id = %entry.id, %error, "exec: output read failed");
+                break;
+            }
+        };
+        let closed = ready.ready().is_read_closed();
+        match ready.try_io(|fd| fd.get_ref().read(&mut buf)) {
+            // A closed state is never cleared, so a wait for it returns at
+            // once: with nothing to read, the output has ended.
+            Err(_would_block) if closed => break,
+            Err(_would_block) => continue,
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => entry.record_output(&mut transcript, &buf[..n]),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => break,
+            Ok(Err(error)) => {
                 tracing::warn!(exec_id = %entry.id, %error, "exec: output read failed");
                 break;
             }
@@ -1375,18 +1408,42 @@ async fn pump_output(
 }
 
 /// Writes what attached clients type to a tty exec's terminal, until the
-/// exec ends and its entry clears the input. Each read releases its bytes
-/// from the held counts, so a terminal that takes nothing holds the rest.
+/// exec ends: its supervisor then clears the input and stops this feed.
+/// Each read releases its bytes from the held counts, so a terminal that
+/// takes nothing leaves the rest held, within the bounds.
 async fn feed_terminal(master: std::fs::File, mut input: HeldInputReader) {
-    let mut master = tokio::fs::File::from_std(master);
+    use std::io::Write as _;
+
+    // SAFETY: the `AsyncFd` owns `master` for its whole life, and nothing
+    // else closes or reuses the descriptor while it is registered.
+    let Ok(master) = (unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(master, tokio::io::Interest::WRITABLE)
+    }) else {
+        return;
+    };
     let mut buf = vec![0u8; 8192];
     loop {
         let n = match input.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        if master.write_all(&buf[..n]).await.is_err() || master.flush().await.is_err() {
-            break;
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            let Ok(mut ready) = master.writable().await else {
+                return;
+            };
+            let closed = ready.ready().is_write_closed();
+            match ready.try_io(|fd| fd.get_ref().write(rest)) {
+                // A closed state is never cleared, so a wait for it returns
+                // at once: the program is gone and nothing reads the
+                // terminal. Without this the feed spins in one poll.
+                Err(_would_block) if closed => return,
+                Err(_would_block) => {}
+                Ok(Ok(0)) => return,
+                Ok(Ok(written)) => rest = &rest[written..],
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                Ok(Err(_)) => return,
+            }
         }
     }
 }
