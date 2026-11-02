@@ -274,7 +274,14 @@ pub async fn settle_lease_after_cleanup(lease: Option<BoxLease>, outcome: Cleanu
 pub struct RegisteredWithVmHost {
     /// The addresses the create request carries, so the in-VM daemon
     /// attaches with the handed switch address instead of drawing its own.
+    /// Unspecified (`0.0.0.0`) for a `host_ip` box, which the host hands no
+    /// address ([`Self::host_ip`]): read them through
+    /// [`Self::row_addresses`].
     pub addresses: boxes::BoxAddresses,
+    /// Whether the registration is a `host_ip` box's (BEP-082): the host
+    /// minted its id and allocated no address, so it has no row to carry,
+    /// to commit or to withdraw.
+    pub host_ip: bool,
     /// The box's own id the reply returned — 32 hex digits on the wire,
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
@@ -289,12 +296,22 @@ pub struct RegisteredWithVmHost {
     pub lease: Option<BoxLease>,
 }
 
+impl RegisteredWithVmHost {
+    /// The addresses of the box's row, or `None` for a `host_ip` box, which
+    /// has no row.
+    #[must_use]
+    pub fn row_addresses(&self) -> Option<boxes::BoxAddresses> {
+        (!self.host_ip).then_some(self.addresses)
+    }
+}
+
 /// Registers an own-address box with the VM host daemon over its control
 /// socket (T66), returning what it handed back.
 pub async fn register_box_with_vm_host(
     sock_path: &Path,
     request: minimald_rpc::RegisterBoxRequest,
 ) -> anyhow::Result<RegisteredWithVmHost> {
+    let host_ip = request.host_ip;
     let (reply, stream) = control_exchange_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
@@ -309,14 +326,30 @@ pub async fn register_box_with_vm_host(
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
             },
+            host_ip: false,
             box_id: Some(web.box_id),
             task_addresses: web.task_addresses,
             lease: Some(BoxLease { stream }),
         }),
+        // A `host_ip` registration's answer (BEP-082): the box's id and no
+        // address, on a connection that holds no lease.
+        minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id } if host_ip => {
+            Ok(RegisteredWithVmHost {
+                addresses: boxes::BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+                    loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+                },
+                host_ip: true,
+                box_id: Some(minted_box_id),
+                task_addresses: Vec::new(),
+                lease: None,
+            })
+        }
         // A daemon that predates ids answers with the bare pair the
         // registration has always been answered with.
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
             addresses,
+            host_ip: false,
             box_id: None,
             task_addresses: Vec::new(),
             lease: None,
@@ -558,6 +591,13 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
 /// box's name is held in the zone instead (best-effort, NODATA rather than
 /// NXDOMAIN), but only once its session is active.
 ///
+/// One `host_ip` box registers (BEP-082): one whose spec declares a
+/// credentialed upstream. The host mints its id and allocates no address,
+/// so the registration carries an id and no row
+/// ([`RegisteredWithVmHost::host_ip`]). The proxy serves the box's grants
+/// under that id. A `host_ip` box that declares no upstream needs no id and
+/// registers nothing.
+///
 /// The box's own id comes back with it (NET-133): the request carries no
 /// id, the host mints one for this creation, and the reply returns the id
 /// the published row holds, which the client records — so the CLI, the row
@@ -588,9 +628,14 @@ pub async fn register_box_for_activation(
     name: &str,
     policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    if kind != paths::HostKind::Minvmd || network != boxes::NetworkMode::OwnIp {
+    if kind != paths::HostKind::Minvmd {
         return Ok(None);
     }
+    let host_ip = match network {
+        boxes::NetworkMode::OwnIp => false,
+        boxes::NetworkMode::HostNet if policy.credentialed_upstream.is_some() => true,
+        _ => return Ok(None),
+    };
     // The control socket sits beside the ssh socket in the host dir the
     // daemon connection resolves through, so the client finds both by the
     // same rule — named VMs included, since the resolution reads the same
@@ -603,7 +648,9 @@ pub async fn register_box_for_activation(
     })?;
     let sock_path = control_sock_beside(&ssh_sock)
         .ok_or_else(|| HostUnreachable::error("no provider dir resolved for the ssh socket"))?;
-    register_box_at(&sock_path, name, policy).await.map(Some)
+    register_box_at(&sock_path, name, policy, host_ip)
+        .await
+        .map(Some)
 }
 
 /// Registers an own-address box under `name` with the VM host daemon whose
@@ -626,7 +673,9 @@ pub async fn register_box_beside(
     let Some(sock_path) = vm_host_control_sock(ssh_sock) else {
         return Ok(None);
     };
-    register_box_at(&sock_path, name, policy).await.map(Some)
+    register_box_at(&sock_path, name, policy, false)
+        .await
+        .map(Some)
 }
 
 /// The VM host daemon's control socket beside `ssh_sock`, when `ssh_sock`
@@ -665,10 +714,13 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 /// The registration exchange both front-ends make, on the control socket
 /// `sock_path`: the box's declaration in, held as a lease, bounded by
 /// [`BOX_CONTROL_TIMEOUT`], with the failure the activation ends with.
+/// `host_ip` registers a `host_ip` box: the host mints its id and hands it
+/// no address, so it asks for no task address and holds no lease.
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
     policy: &boxes::BoxPolicy,
+    host_ip: bool,
 ) -> anyhow::Result<RegisteredWithVmHost> {
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
@@ -706,10 +758,15 @@ async fn register_box_at(
         // The row is held as a lease until the session is active: an
         // activation that dies before then — an interrupt, a crash, a
         // withdrawal that never lands — leaves no row holding its name.
-        hold: true,
+        hold: !host_ip,
         // The task addresses the box's task runs attach at, filed with the
         // box so the in-VM daemon draws nothing for a task (NET-138).
-        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+        task_slots: if host_ip {
+            0
+        } else {
+            minimald_rpc::TASK_SLOTS_PER_BOX
+        },
+        host_ip,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -717,6 +774,20 @@ async fn register_box_at(
     )
     .await;
     match registration {
+        Ok(Ok(web)) if web.host_ip => {
+            tracing::info!(
+                box = %name,
+                box_id = %web
+                    .box_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                network = "host_ip",
+                switch_address_allocated = false,
+                "registered the host_ip box with the VM host daemon; it has a box id and \
+                 no address"
+            );
+            Ok(web)
+        }
         Ok(Ok(web)) => {
             tracing::info!(
                 box = %name,
@@ -724,6 +795,8 @@ async fn register_box_at(
                     .box_id
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
+                network = "own_ip",
+                switch_address_allocated = true,
                 switch_address = %web.addresses.switch_address,
                 loopback_address = %web.addresses.loopback_address,
                 "registered the box with the VM host daemon; its addresses are \
@@ -1064,7 +1137,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let error = register_box_at(&sock_path, "dev", &boxes::BoxPolicy::default())
+        let error = register_box_at(&sock_path, "dev", &boxes::BoxPolicy::default(), false)
             .await
             .expect_err("a held name refuses the registration");
         daemon.await.unwrap();
