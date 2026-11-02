@@ -1075,8 +1075,13 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         // A `host_ip` box's policy changes no zone table, so it takes no
-        // ticket. Only the host's door serves it: the guest must never say
-        // what a marked frame may reach (NET-085).
+        // ticket. Its held name answers its node's address while it is
+        // resident (NET-129), but the answerer reads the holds and the
+        // resident set together each time it builds its view, so the order
+        // of a hold and an admit cannot change the answer. Each change pings
+        // the answerer. Only the host's door serves these verbs: the guest
+        // must never say what a marked frame may reach (NET-085), nor that
+        // its box is running.
         (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
             let resident = boxes.admit_host_ip_box(request.session_id, request.egress.as_ref());
             write_reply(
@@ -2031,16 +2036,31 @@ fn withdraw_box(
     }
 }
 
-/// Hold a `host_ip` box's name in the host's zone with no row behind it:
-/// the interim that answers the name NODATA until the node's bind mirror
-/// lands. `held` true either way — a name the table already holds is the
-/// goal state, not a refusal.
+/// Hold a `host_ip` box's name in the host's zone with no row behind it,
+/// recorded against the node row for `session_id`. While that session is
+/// a resident `host_ip` box and the node's binds are mirrored, the name
+/// answers the node's address (NET-129). Otherwise it answers NODATA
+/// (NET-128). `held` true either way — a name the table already holds is
+/// the goal state, not a refusal.
 fn hold_box_name(
     boxes: &BoxRegistry,
     name: &str,
     session_id: Option<boxes::SessionId>,
 ) -> BoxControlReply {
     boxes.hold_box_name(name, session_id);
+    let running = session_id.is_some_and(|session| {
+        boxes
+            .table()
+            .host_ip_boxes()
+            .iter()
+            .any(|rules| rules.session_id() == session)
+    });
+    tracing::debug!(
+        box = %name,
+        running,
+        node_address = ?boxes.node_mirror().mirrored_address(),
+        "held a host-address box's name against the node row"
+    );
     BoxControlReply::NameHeld {
         name: name.to_string(),
         held: true,
