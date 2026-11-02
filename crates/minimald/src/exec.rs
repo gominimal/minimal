@@ -41,6 +41,7 @@ use tracing::Instrument as _;
 use crate::traced::spawn;
 
 use diagnostics::redact::scrub_secrets;
+use minimald_rpc::exec::{ExecId, ExecMode};
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
@@ -168,12 +169,6 @@ pub(crate) async fn handle_exec(
         return handle_git_upload(ident, serv, conn, id, session, channel, config).await;
     }
 
-    if config.pty.is_some() {
-        tracing::warn!("channel {id}: pty requested but not yet supported",);
-        session.channel_failure(id)?;
-        return Ok(());
-    }
-
     let Some(session_id_str) = config.env_vars.get(MINIMAL_SESSION_ID_ENV) else {
         tracing::warn!(
             "execution request rejected on channel {id}: missing {MINIMAL_SESSION_ID_ENV}",
@@ -252,6 +247,65 @@ pub(crate) async fn handle_exec(
     };
 
     use minimald_rpc::exec::ExecRequest;
+
+    // A channel terminal serves only the forms that relay a terminal: a tty
+    // exec takes its size, and an attach resumes one. Every other form has
+    // pipes for stdio, as before.
+    let takes_terminal = match &request {
+        ExecRequest::Exec(spec) => spec.mode == ExecMode::Tty,
+        ExecRequest::ExecAttach(_) => true,
+        _ => false,
+    };
+    if config.pty.is_some() && !takes_terminal {
+        tracing::warn!("channel {id}: pty requested but not yet supported",);
+        session.channel_failure(id)?;
+        return Ok(());
+    }
+
+    // A command for the box runs only in a running box, and every one gets
+    // an exec id, whatever its mode (BOX-149). The id and the mode ride on
+    // the exec span, so every record the exec emits names them.
+    let mode = match &request {
+        ExecRequest::Shell(_) | ExecRequest::Argv(_) => Some(ExecMode::Attached),
+        ExecRequest::Exec(spec) => Some(spec.mode),
+        _ => None,
+    };
+    let exec_id = if let Some(mode) = mode {
+        let record = match session_handle.record().instrument(span.clone()).await {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "execution request rejected: the box is gone");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+        };
+        if record.status != boxes::BoxState::Active {
+            tracing::warn!(
+                parent: &span,
+                %session_id,
+                state = box_state_word(record.status),
+                "execution request refused: the box is not running"
+            );
+            let label = record
+                .name
+                .clone()
+                .unwrap_or_else(|| session_id.to_string());
+            let message = not_running_message(&label, record.status);
+            session.channel_success(id)?;
+            spawn(async move {
+                answer_exec(channel, b"", message.as_bytes(), NOT_RUNNING_STATUS).await;
+            });
+            return Ok(());
+        }
+        let exec_id = mint_exec_id();
+        span.record("exec_id", exec_id.as_str());
+        span.record("exec_mode", mode.name());
+        tracing::info!(parent: &span, %session_id, %exec_id, mode = mode.name(), "exec accepted");
+        Some(exec_id)
+    } else {
+        None
+    };
+
     match request {
         ExecRequest::Shell(_) | ExecRequest::Argv(_) => {
             let program = match request {
@@ -351,9 +405,196 @@ pub(crate) async fn handle_exec(
                 span,
             ));
         }
+        ExecRequest::Exec(spec) => {
+            let exec_id = exec_id.expect("an exec form always gets an exec id above");
+            let timeout = spec.timeout_secs.map(Duration::from_secs);
+            session.channel_success(id)?;
+            if spec.mode == ExecMode::Attached {
+                spawn(
+                    run_attached_exec(
+                        serv,
+                        conn,
+                        session_handle,
+                        id,
+                        channel,
+                        exec_id,
+                        spec.argv,
+                        timeout,
+                        conn_username,
+                        trace_env,
+                    )
+                    .instrument(span),
+                );
+            } else {
+                let winsize = config.pty.as_ref().map_or((24, 80), |pty| {
+                    let (cols, rows) = pty.char_sizes;
+                    let clamp = |n: u32, default: u16| match u16::try_from(n) {
+                        Ok(0) => default,
+                        Ok(n) => n,
+                        Err(_) => u16::MAX,
+                    };
+                    (clamp(rows, 24), clamp(cols, 80))
+                });
+                let start = ManagedRequest {
+                    exec_id,
+                    mode: spec.mode,
+                    argv: spec.argv,
+                    timeout,
+                    winsize,
+                    conn_username,
+                    extra_env: trace_env,
+                };
+                spawn(start_and_answer(session_handle, channel, start).instrument(span));
+            }
+        }
+        ExecRequest::ExecAttach(exec_id) => {
+            session.channel_success(id)?;
+            spawn(serve_exec_attach(channel, session_id, exec_id).instrument(span));
+        }
+        ExecRequest::ExecOutput(exec_id) => {
+            session.channel_success(id)?;
+            spawn(serve_exec_output(channel, session_handle, exec_id).instrument(span));
+        }
+        ExecRequest::ExecWait(exec_id) => {
+            session.channel_success(id)?;
+            spawn(serve_exec_wait(channel, session_handle, exec_id).instrument(span));
+        }
     }
 
     Ok(())
+}
+
+/// Runs an attached `min://exec`: an argv in the box with no shell, its stdio
+/// on the channel's pipes, under its own timeout when it has one (BOX-149).
+/// Its events and its end name its exec id.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's wiring and the exec's own facts, from one call site"
+)]
+async fn run_attached_exec(
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    session: BoxHandle,
+    channel_id: ChannelId,
+    channel: Channel<Msg>,
+    exec_id: ExecId,
+    argv: Vec<String>,
+    timeout: Option<Duration>,
+    conn_username: String,
+    extra_env: BTreeMap<String, String>,
+) {
+    let exec_box = match ExecBox::of(&session).await {
+        Ok(exec_box) => Some(exec_box),
+        Err(error) => {
+            tracing::warn!(%exec_id, %error, "exec: could not read the box to write the exec's events");
+            None
+        }
+    };
+    if let Some(exec_box) = &exec_box {
+        exec_box.write_event(
+            boxes::events::BoxEventType::ExecStarted,
+            &exec_id,
+            ExecMode::Attached,
+            None,
+        );
+    }
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let task = ExecTask {
+        conn,
+        serv,
+        session,
+        channel_id,
+        exec: TimedBoxExec {
+            inner: BoxExec {
+                program: BoxProgram::Argv(argv),
+                extra_env,
+                conn_username,
+            },
+            timeout,
+            timed_out: Arc::clone(&timed_out),
+        },
+    };
+    let status = task.run(channel).await;
+    let reason = if timed_out.load(Ordering::SeqCst) {
+        ExecExitReason::Timeout
+    } else {
+        ExecExitReason::Exited
+    };
+    let exit = ExecExit {
+        code: i32::try_from(status).ok(),
+        reason,
+    };
+    if let Some(exec_box) = &exec_box {
+        exec_box.write_event(
+            boxes::events::BoxEventType::ExecExited,
+            &exec_id,
+            ExecMode::Attached,
+            Some(exit),
+        );
+    }
+    tracing::info!(
+        %exec_id,
+        mode = ExecMode::Attached.name(),
+        exit_code = status,
+        reason = reason.name(),
+        "exec ended"
+    );
+}
+
+/// A tty or a detached `min://exec`, as [`start_and_answer`] starts it.
+struct ManagedRequest {
+    exec_id: ExecId,
+    mode: ExecMode,
+    argv: Vec<String>,
+    timeout: Option<Duration>,
+    winsize: (u16, u16),
+    conn_username: String,
+    extra_env: BTreeMap<String, String>,
+}
+
+/// Starts a tty or a detached exec in the box and answers with its exec id
+/// on stdout (BOX-149). The exec runs on after the channel closes.
+async fn start_and_answer(session: BoxHandle, channel: Channel<Msg>, request: ManagedRequest) {
+    let ManagedRequest {
+        exec_id,
+        mode,
+        argv,
+        timeout,
+        winsize,
+        conn_username,
+        extra_env,
+    } = request;
+    let started = async {
+        let exec_box = ExecBox::of(&session).await?;
+        let host = session
+            .ensure_host(conn_username)
+            .await
+            .map_err(|e| io::Error::other(format!("{e}")))?;
+        let (program, args) = exec_argv(argv);
+        let command = host
+            .command_in_session_env(&program, &args, extra_env)
+            .await?;
+        start_managed_exec(
+            ManagedStart {
+                id: exec_id.clone(),
+                mode,
+                exec_box,
+                timeout,
+                winsize,
+            },
+            command,
+            true,
+        )
+    }
+    .await;
+    match started {
+        Ok(entry) => answer_exec(channel, format!("{}\n", entry.id).as_bytes(), b"", 0).await,
+        Err(error) => {
+            tracing::warn!(%exec_id, mode = mode.name(), %error, "exec: the command could not start");
+            let message = format!("the command could not start in the box: {error}\n");
+            answer_exec(channel, b"", message.as_bytes(), 1).await;
+        }
+    }
 }
 
 /// Accepts the channel and reports an exec request the daemon cannot serve on
@@ -406,6 +647,8 @@ fn exec_span(
             "exec",
             %session_id,
             command = tracing::field::Empty,
+            exec_id = tracing::field::Empty,
+            exec_mode = tracing::field::Empty,
             telemetry = OPT_OUT,
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
@@ -416,6 +659,8 @@ fn exec_span(
             "exec",
             %session_id,
             command = %scrub_secrets(argv),
+            exec_id = tracing::field::Empty,
+            exec_mode = tracing::field::Empty,
             telemetry = tracing::field::Empty,
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
