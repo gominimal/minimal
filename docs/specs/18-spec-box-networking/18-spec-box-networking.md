@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -1000,6 +1000,30 @@ box that holds it returns to `running`. These terms follow the decision in
     tier:   T0
     verify: cargo nextest run -p minimald shared_address_port_collision_reported_not_translated
     <!-- design §7.1; unwanted; same-port collisions are intrinsic to the mode -->
+  - WHILE two or more own-address boxes on one shared address publish the same port THE SYSTEM SHALL forward that port to exactly one of them, its holder: the box that holds it, while that box runs and its publish stands, and, only where no box holds it, the running box created earliest among that node's boxes that publish it.
+    tier:   T0
+    verify: cargo nextest run -p minimald shared_address_port_has_one_holder_earliest_created
+    <!-- design §7.1; state-driven; own-address boxes share an address on a host without the reserved range (NET-123's interim); a node never takes a port that another node's box holds: on the `127.0.0.1` interim another daemon's boxes share the address (NET-027), no daemon sees another's boxes, so the election runs per node and a collision across nodes stays first-come and reported (design §7.1); host-address boxes share one namespace, where the port has one listener and the node's forwarder mirrors it, so there is no holder to choose among them; a box that is not the holder binds no forwarder for the port, and that is the collision reported above, never NET-121's failed bind; a standing holder keeps the port: a box that publishes a port another box holds never takes it from the holder, whichever of the two was created first, so an established forward is not moved under its connections; creation order decides only a port that has no standing holder, and it is the tie-break because it is the one order every later read reproduces, where the order boxes happened to publish in is not; the session id carries the creation time in its leading bits, so the order needs no record of its own; only a running box is elected, because a box that is not running binds no forwarder (NET-121), and electing it leaves the port unbound while a running box publishes it; a stopped box that starts while another box holds the port does not take it; one case follows from the two rules and is accepted: a box created earlier than the standing holder that publishes later does not take the port while the holder's publish stands, and does take it at the next daemon start, where no holder stands (the daemon-start clause below); keeping the holder across a start needs the holder recorded, which is open (Open questions) -->
+  - WHEN the holder of a shared-address port stops or is destroyed, or its publish leaves the address or stops naming the port, THE SYSTEM SHALL make the running box created earliest among that node's boxes that publish it its holder and bind that box's forwarder for the port with no action by the user, within 10 seconds of that event or, where the destroyed holder ran on a VM-backed host, within 70 seconds of it.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh shared_port_passes_to_next_box_when_holder_ends
+    <!-- design §7.1 (bind discipline: a declared port is bound while its box runs); event-driven; the box that takes the port is running and attached, so its next attach cannot be the moment the port binds; a box that is not running is not elected, so the hand-over never leaves the port unbound while a running box publishes it; where no running box publishes the port, the port has no holder, and the first box that publishes it to start takes it under the holder clause above; a holder that stops loses the port at the stop, because NET-121 holds its forwarder only until the box stops, and a stopped holder that kept the port leaves it unbound while a running box publishes it; when it starts again it is not the holder and takes the port only where no box holds it (the holder clause above); 10 seconds is a working value, above the host-side helper's bounded unbind retries; on a VM-backed host a destroyed holder's listener is unbound at its row's withdrawal, which NET-138 bounds at 60 seconds from the destroy, and the bind follows that withdrawal within 10 seconds (the next clause), so the bound from the event to the bind is 70 seconds there; a stop and a publish change unbind the listener at the event itself, so they meet the 10-second bound on either host -->
+  - WHERE the host is VM-backed THE SYSTEM SHALL elect the new holder in the host-side helper from NET-138's rows, with each box's liveness read at the host end of its attachment, and bind the new holder's forwarder there, in the step that unbinds the previous holder's and within 10 seconds of the withdrawal of a destroyed holder's row, and record it as the new holder's declared forward.
+    tier:   T0
+    verify: cargo nextest run -p minvmd waiting_declared_forward_bound_when_holder_row_withdrawn
+    <!-- design §7.1 (host-side ingress revocation) and NET-081's withdrawal rule; optional-feature; the helper takes no holder and no liveness from the in-VM daemon's report, because every forward it binds derives from the records it holds and liveness is read at the host end of the attachment, never from a guest report (design §7.1); the host-side helper holds a declared port's listener until the holder's row is withdrawn, which follows the box's destroy, so a bind the in-VM daemon asks for at the destroy arrives while the listener is still bound and can never become live; the helper unbinds a stopped holder's declared listener at the stop, because NET-121 holds the forwarder only until the box stops, and binds the new holder's in the same step; the helper binds only a port the new holder's row already admits as declared (NET-138), so the bind adds nothing to the table; a declared forward is unbound at its own row's withdrawal and never listed as a runtime publish (NET-044), which a forward recorded as a runtime publish would be -->
+  - WHEN the daemon starts THE SYSTEM SHALL give each shared-address port that no other node's box holds to the box created earliest among the boxes it resumes that publish it, whatever order it resumes them in, and, on a VM-backed host, make that election in the host-side helper over the rows of the boxes that resume.
+    tier:   T0
+    verify: cargo nextest run -p minimald shared_address_holder_same_in_any_resume_order
+    <!-- design §7.1; event-driven; no holder stands at a start, so the start elects by creation order as the hand-over does, and among the boxes that will run, as the hand-over elects only a running box; the election waits for the set of resumed boxes, so the first box to resume does not become a standing holder; and for one set of boxes a start and a live hand-over name the same holder; no established forward survives a start, so none is moved by it; the port does change boxes at a start in the one case the holder clause accepts, a standing holder created later than another box publishing the port -->
+  - WHEN the holder of a shared-address port changes THE SYSTEM SHALL name the new holder in the listing and the policy view of every other box publishing the port.
+    tier:   T0
+    verify: cargo nextest run -p minimald shared_address_yielders_name_the_current_holder
+    <!-- event-driven; the report NET-129's collision clause makes at session start stays true after it: a box told its port is held by a box that no longer exists is told nothing it can act on -->
+  - IF the new holder's forwarder cannot bind THEN THE SYSTEM SHALL report the failure with the port and the reason, keep that box the holder with the port unbound, and leave the box running with its other forwards bound.
+    tier:   T0
+    verify: cargo nextest run -p minimald failed_hand_over_bind_is_reported_and_box_keeps_running
+    <!-- design §7.1: a failed bind is a surfaced error, never a silent fallback; unwanted; NET-121's failed-bind clause fails an attach, which a box already running has no attach to fail; the box stays the holder and no other box is tried, because every box on the shared address binds the same address and port, so the cause that refused one bind refuses the next; the bind is not retried, and the port passes again only under the hand-over clause above, when this holder stops, is destroyed or stops publishing the port -->
 
 - **NET-130** WHERE the host is un-enrolled THE SYSTEM SHALL take the node-plane baseline set from the host-side helper's built-in enumeration of the categories design §5.1 names, configurable on the host within those categories.
   tier:     T0
@@ -1120,8 +1144,32 @@ NET-010's no-collision property ranges over every allocator on the host and why
 NET-027 and NET-059 can route two daemons' names at once. Host-address boxes
 mirror their node's address instead (NET-129), which is why NET-010 ranges over
 own-address and `none` boxes only: same-port collisions on a shared address are
-intrinsic to the mode and are reported, never translated. **Declared ports are
-bound before the name; permitted ports follow the listener.** Design §7.1's
+intrinsic to the mode and are reported, never translated. Among own-address
+boxes on one shared address, a colliding port has one holder. A standing
+holder keeps the port while its publish stands. Creation order elects a holder
+only when the port has none. When the holder stops, ends or its publish leaves the
+address, the port passes to the earliest-created running box that still
+publishes it. That box gets the bind with no reattach (NET-129). A box that is
+not running is never elected, because it binds no forwarder and the port stays
+unbound. A daemon start elects the same way. Election by publish order is the
+first alternative. The holder then depends on the order the daemon resumes
+boxes in, so two starts over the same boxes can name different holders. The second alternative lets an
+earlier-created box take a port from its standing holder. That moves an
+established forward under its connections. The chosen rule leaves an inversion
+case. A box created earlier than the standing holder that publishes later takes
+the port at the next daemon start, not before. A holder that survives a start
+needs a record of the holder, and that is an open question. A holder that
+stops loses the port, because its forwarder is held only until the box stops
+(NET-121). A new holder whose bind fails stays the holder with the port
+unbound. Every box on the address binds the same address and port, so the
+next box fails for the same cause. A rebind from the
+in-VM daemon at the holder's destroy fails on a VM-backed host. The host-side
+helper holds the declared listener until the withdrawal of the holder's row
+(NET-081, NET-138). The bind arrives while the listener is still bound, and
+only the helper knows when it is free. NET-138 withdraws a destroyed box's row
+within 60 seconds, so on a VM-backed host the port can pass up to 70 seconds
+after the destroy. **Declared ports are bound before the
+name; permitted ports follow the listener.** Design §7.1's
 bind discipline holds for every port a declaration names: NET-121 binds its
 forwarder before the name is registered and holds it until stop or revocation,
 so a connection to a declared port that nothing is listening on yet is refused
@@ -1415,6 +1463,15 @@ refusal holds only inside the VM, below the escape boundary.
   resolution through the resolver Minimal owns and a direct-to-address flow is
   admitted by address rules alone ([design §5.3][design]); and the per-box
   enforcement the host records under NET-079 covers addresses, never names.]
+- [NEEDS CLARIFICATION (LOW): does a shared-address port stay with its holder
+  across a daemon start? A standing holder keeps the port while its publish
+  stands. A start elects by creation order, because no holder stands then
+  (NET-129). These rules disagree where another box that publishes the port is
+  older than the holder. That box takes the port at the start, though no box
+  changed. One option records the holder with the box's state. A start then
+  restores it and elects only for a port whose recorded holder is gone. The
+  other option is the current rule. It works without a record. An established
+  forward does not survive a start, so the move does not break a connection.]
 
 [design]: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
 [arch]: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/architecture.md
