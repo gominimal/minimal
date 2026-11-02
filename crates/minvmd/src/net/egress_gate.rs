@@ -3695,14 +3695,35 @@ impl MirrorLedger {
         port: u16,
         node: Ipv4Addr,
     ) -> Result<bool, MirrorLedgerRefused> {
+        self.note_forward(listener, port, node, port)
+    }
+
+    /// Notes a forward from `port` at `listener` that dials `node` at
+    /// `inside`, before the switch is asked for it. [`Self::note_bind`] is
+    /// the case where `inside` is `port`. Returns whether the note is new:
+    /// `false` when the ledger already held this same forward.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorLedgerRefused`] when the gate stopped, a forward to another
+    /// address or inside port holds the listener, or the ledger is full.
+    pub(crate) fn note_forward(
+        &self,
+        listener: Ipv4Addr,
+        port: u16,
+        node: Ipv4Addr,
+        inside: u16,
+    ) -> Result<bool, MirrorLedgerRefused> {
         let forwards = self
             .forwards
             .upgrade()
             .ok_or(MirrorLedgerRefused::GateStopped)?;
         let key = (listener.octets(), port);
         let mut applied = forwards.lock();
-        if let Some((_, at, _, _, _)) = applied.iter().find(|(held, _, _, _, _)| *held == key) {
-            return if *at == node.octets() {
+        if let Some((_, at, held_inside, _, _)) =
+            applied.iter().find(|(held, _, _, _, _)| *held == key)
+        {
+            return if *at == node.octets() && *held_inside == inside {
                 Ok(false)
             } else {
                 Err(MirrorLedgerRefused::HeldElsewhere(
@@ -3714,7 +3735,7 @@ impl MirrorLedger {
             &mut applied,
             key,
             node.octets(),
-            port,
+            inside,
             egress::IPPROTO_TCP,
             Applied::Row,
         )

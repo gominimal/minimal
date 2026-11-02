@@ -3478,45 +3478,76 @@ case_linux_vm_stack() {
 # darwin manifest with those two rows and checks where they land.
 case_bep_installs_beside_minvmd() {
     _table="$here/stage-release.sh"
-    _row_dest() {
-        awk -F'|' -v c="$1" '$1 ~ "\"" c "$" && $2 == "darwin" && $3 == "arm64" {print $5}' "$_table"
+    _row() {
+        awk -F'|' -v c="$1" '$1 ~ "\"" c "$" && $2 == "darwin" && $3 == "arm64" {print $4 "|" $5 "|" $6}' "$_table"
     }
-    check "bin/bep" "$(_row_dest bep)" "the release stages bep for darwin/arm64 at bin/bep"
-    check "bin/minvmd" "$(_row_dest minvmd)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
+    # bin/bep is a link to the program inside bin/bep.app, whose provisioning
+    # profile carries the program's keychain entitlement (#2812).
+    check 'symlink|bin/bep|bep.app/Contents/MacOS/bep"' "$(_row bep)" \
+        "the release links bin/bep to the program in bin/bep.app"
+    check 'file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"' "$(_row bep-program)" \
+        "the release stages the bep program inside bin/bep.app"
+    check "bin/minvmd" "$(_row minvmd | cut -d'|' -f2)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
     want_err "the release stages no bep for Linux" \
-        grep -qE '^    "bep\|linux\|' "$_table"
+        grep -qE '^    "bep[-a-z]*\|linux\|' "$_table"
 
     printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
     printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"
     h_dminvmd="$(hash_file "$mock/versions/v1/minvmd-macos-arm64")"
     h_dbep="$(hash_file "$mock/versions/v1/bep-macos-arm64")"
-    {
+    # _bep_components SRC — the manifest, with the bep program fetched from
+    # SRC. The link row comes after the program row, as in the release table.
+    _bep_components() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minvmd darwin arm64 v1 "$h_dminvmd" file bin/minvmd versions/v1/minvmd-macos-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            bep darwin arm64 v1 "$h_dbep" file bin/bep versions/v1/bep-macos-arm64
-    } >"$mock/versions/v1/components"
+            bep-program darwin arm64 v1 "$h_dbep" file bin/bep.app/Contents/MacOS/bep "$1"
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep darwin arm64 v1 - symlink bin/bep bep.app/Contents/MacOS/bep
+    }
+    want_ok "the release table links bin/bep after every bep.app file" \
+        test "$(grep -E '^    "bep[-a-z]*\|darwin\|' "$_table" | tail -n1 | cut -d'|' -f1)" = '    "bep'
 
     PLAT_S=Darwin; PLAT_M=arm64
     : >"$root/xattr.calls"
-    H_BEP="$root/h_bep_darwin"; mkdir -p "$H_BEP"
+    H_BEP="$root/h_bep_darwin"; mkdir -p "$H_BEP/bin"
+    # A host that ran an earlier release has bin/bep as a plain file.
+    printf 'old-bep\n' >"$H_BEP/bin/bep"
+
+    # A bundle download that fails leaves that bin/bep in place.
+    _bep_components versions/v1/bep-not-there >"$mock/versions/v1/components"
+    reset_dl
+    run bep_darwin_failed_install "$H_BEP"
+    want_err "darwin install with an unreachable bep program fails" test "$rc" -eq 0
+    want_err "bin/bep is not yet a link" test -L "$H_BEP/bin/bep"
+    check "old-bep" "$(cat "$H_BEP/bin/bep")" "the earlier bin/bep is still in place"
+
+    _bep_components versions/v1/bep-macos-arm64 >"$mock/versions/v1/components"
+    : >"$root/xattr.calls"
     reset_dl
     run bep_darwin_install "$H_BEP"
-    check 0 "$rc" "darwin install with the bep row exits 0"
+    check 0 "$rc" "darwin install with the bep rows exits 0"
     want_ok "minvmd installs in the same bin directory" test -f "$H_BEP/bin/minvmd"
-    check "$h_dbep" "$(hash_file "$H_BEP/bin/bep")" "the installed bep matches the manifest hash"
-    want_ok "bep is executable like every bin row" test -x "$H_BEP/bin/bep"
-    want_ok "quarantine stripped from bep (xattr)" grep -q "/bin/bep\.tmp" "$root/xattr.calls"
-    want_ok "bep is recorded at its user-prefix path" \
+    want_ok "bin/bep replaces the earlier plain file with a link" test -L "$H_BEP/bin/bep"
+    check "bep.app/Contents/MacOS/bep" "$(readlink "$H_BEP/bin/bep")" "bin/bep links to the program in the bundle"
+    check "$h_dbep" "$(hash_file "$H_BEP/bin/bep")" "bin/bep resolves to the program the manifest hashes"
+    want_ok "the bep program is executable like every bin row" test -x "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_ok "quarantine stripped from the bep program (xattr)" \
+        grep -q "/bin/bep\.app/Contents/MacOS/bep\.tmp" "$root/xattr.calls"
+    want_ok "bin/bep is recorded at its user-prefix path" \
         record_has bep "$H_BEP/bin/bep" "$H_BEP/xdg-state/minimal/installed"
-    want_ok "the installer printed the bep status" \
-        grep -qE "^  bep +(installed|current)" "$OUT"
+    want_ok "the bep program is recorded at its user-prefix path" \
+        record_has bep-program "$H_BEP/bin/bep.app/Contents/MacOS/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the installer printed the bep link status" \
+        grep -qE "^  bep +linked" "$OUT"
 
     run bep_darwin_uninstall "$H_BEP" --uninstall
-    check 0 "$rc" "darwin uninstall with the bep row exits 0"
-    want_err "uninstall removed bep" test -e "$H_BEP/bin/bep"
+    check 0 "$rc" "darwin uninstall with the bep rows exits 0"
+    want_err "uninstall removed the bin/bep link" test -L "$H_BEP/bin/bep"
+    want_err "uninstall removed the bep program" test -e "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_err "uninstall removed the emptied bin/bep.app directories" test -e "$H_BEP/bin/bep.app"
     want_err "uninstall removed minvmd beside it" test -e "$H_BEP/bin/minvmd"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
     PLAT_S=Linux; PLAT_M=x86_64

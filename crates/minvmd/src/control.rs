@@ -409,8 +409,15 @@ pub(crate) fn decide_publish(
 /// read on the serving thread — because that is the pattern the status
 /// read already serves under.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+///
+/// The second cell is the host ports the proxy serves on (NET-154): the
+/// port the start handed, and the preferred port in front of it once the
+/// reclaim watcher took that port back ([`crate::net::proxy_reclaim`]).
 #[derive(Clone, Default)]
-pub struct ProxyPublishStatus(Arc<Mutex<Option<(u16, ProxyDownCause)>>>);
+pub struct ProxyPublishStatus(
+    Arc<Mutex<Option<(u16, ProxyDownCause)>>>,
+    Arc<Mutex<Vec<u16>>>,
+);
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl ProxyPublishStatus {
@@ -446,6 +453,44 @@ impl ProxyPublishStatus {
         if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
             *cell = None;
         }
+    }
+
+    /// Record that the proxy serves on `port` and on no other host port:
+    /// the port the start handed, once the publish decision brought the VM
+    /// up.
+    pub(crate) fn set_serving(&self, port: u16) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![port];
+    }
+
+    /// Record that the proxy also serves on its preferred port `preferred`
+    /// (NET-150): the reclaim watcher published it beside the substitute,
+    /// so the preferred port goes first and the substitute stays.
+    pub(crate) fn add_preferred(&self, preferred: u16) {
+        let mut ports = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ports.retain(|port| *port != preferred);
+        ports.insert(0, preferred);
+    }
+
+    /// Every host port the proxy serves on, the preferred first: the
+    /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
+    /// recorded a port, and for a start that never brought the proxy up.
+    /// Empty too while a down cause is recorded ([`Self::down`]): an
+    /// unconfirmed publish or a port held after the start serves nothing
+    /// the host can vouch for.
+    pub(crate) fn serving_ports(&self) -> Vec<u16> {
+        if self.down().is_some() {
+            return Vec::new();
+        }
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The proxy-down fact to serve beside the read-only verb's answer
@@ -786,6 +831,15 @@ fn serve_connection(
         // answer, nothing to log past the connection level.
         return Ok(());
     };
+    // The read-only mirror-collisions verb (T126) is answered before the
+    // shared verbs parse, on the host door only. A guest asking for it
+    // falls through to the parse refusal, as any verb it may not ask does.
+    if door == ControlDoor::Host
+        && !root_peer
+        && let Some(reply) = mirror_collisions_reply(&line, boxes)
+    {
+        return write_json_line(&mut stream, &reply);
+    }
     let request = match parse_request(&line) {
         Ok(request) => request,
         Err(error) => {
@@ -1120,6 +1174,15 @@ fn serve_request(
                     .down()
                     .map(|(port, cause)| minimald_rpc::ProxyDown { port, cause }),
             });
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ProxyPorts, ControlDoor::Host) => {
+            // Every host port the hostname proxy serves on (NET-154), the
+            // preferred first: `min ls` lists each one, so a person reads
+            // where to point a browser while the proxy serves on two.
+            let reply = BoxControlReply::ProxyPorts {
+                proxy_ports: proxy_publish.serving_ports(),
+            };
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
@@ -1681,6 +1744,7 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::ProxyPorts => "proxy_ports",
         BoxControlRequest::MintBoxId(_) => "mint_box_id",
         BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
         BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
@@ -1846,6 +1910,85 @@ fn read_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>>
             ));
         }
     }
+}
+
+/// The host control socket's reads that the shared verb set does not carry.
+/// The request line of each is its verb alone, as
+/// `{"verb":"mirror_collisions"}`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum HostReadRequest {
+    /// The node's mirrored ports that collided with a holder on the host
+    /// (NET-138). The reply is a [`MirrorCollisionsReply`].
+    MirrorCollisions,
+}
+
+/// The reply to [`HostReadRequest::MirrorCollisions`]: the node's mirrored
+/// ports that collided with a holder on the host, in ascending order. It
+/// carries ports only, and no address, path or box name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MirrorCollisionsReply {
+    pub mirror_collisions: Vec<u16>,
+}
+
+/// How long [`read_mirror_collisions`] waits for the whole exchange.
+pub const MIRROR_COLLISIONS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The reply to a request line that asks for the mirror collisions, or
+/// `None` for any other line.
+fn mirror_collisions_reply(line: &str, boxes: &BoxRegistry) -> Option<MirrorCollisionsReply> {
+    match serde_json_lenient::from_str::<HostReadRequest>(line) {
+        Ok(HostReadRequest::MirrorCollisions) => {
+            let reply = MirrorCollisionsReply {
+                mirror_collisions: boxes.node_mirror().collisions(),
+            };
+            tracing::debug!(
+                collisions = reply.mirror_collisions.len(),
+                "answered the mirror collisions read"
+            );
+            Some(reply)
+        }
+        Err(_) => None,
+    }
+}
+
+fn write_json_line(stream: &mut UnixStream, reply: &impl serde::Serialize) -> std::io::Result<()> {
+    let mut line = serde_json_lenient::to_string(reply).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control reply did not serialize: {error}"),
+        )
+    })?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())
+}
+
+/// Reads the node's collided mirror ports from the VM host daemon's control
+/// socket at `sock_path`, for the host CLI.
+///
+/// `None` when the socket is not there, the exchange fails or passes
+/// [`MIRROR_COLLISIONS_TIMEOUT`], or the daemon predates the verb and
+/// answers with a refusal. The caller then prints nothing for it.
+pub async fn read_mirror_collisions(sock_path: &Path) -> Option<Vec<u16>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(sock_path).await.ok()?;
+        let mut line = serde_json_lenient::to_string(&HostReadRequest::MirrorCollisions).ok()?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.ok()?;
+        let mut reply = String::new();
+        tokio::io::BufReader::new(&mut stream)
+            .read_line(&mut reply)
+            .await
+            .ok()?;
+        serde_json_lenient::from_str::<MirrorCollisionsReply>(reply.trim())
+            .ok()
+            .map(|reply| reply.mirror_collisions)
+    };
+    tokio::time::timeout(MIRROR_COLLISIONS_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Error> {
@@ -3920,6 +4063,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4401,6 +4545,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4524,6 +4669,7 @@ mod tests {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }
+                | BoxControlReply::ProxyPorts { .. }
                 | BoxControlReply::Audited { .. }
                 | BoxControlReply::BoxIdMinted { .. }) => {
                     panic!(
@@ -4599,6 +4745,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -8142,5 +8289,98 @@ mod tests {
             ),
             BoxControlReply::PortRecorded { .. }
         ));
+    }
+
+    /// T126 (NET-138): the host door's read-only `mirror_collisions` verb
+    /// answers the node's mirrored ports that collided with a holder on the
+    /// host, as ports alone. A port leaves the list when it binds. The guest
+    /// door does not answer the verb.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mirror_collisions_reported_over_control() {
+        use crate::box_registry::{MirrorBinder, MirrorOutcome, TestMirrorBinder};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let binder = Arc::new(TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        boxes.register_node_namespace(7654);
+        let node = switch::loopback::range_hosts()
+            .nth(200)
+            .expect("the reserved range has more than 200 hosts");
+        boxes
+            .open_node_mirror(node)
+            .expect("a reserved-range address no row holds opens the mirror");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            read_mirror_collisions(&sock_path).await,
+            Some(Vec::new()),
+            "a node with no collision answers an empty list"
+        );
+
+        let holder =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder on the host");
+        let port = holder.local_addr().expect("the holder's address").port();
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Collided
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(vec![port]));
+        let since = boxes.node_mirror().collisions_since();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].0, port);
+
+        // The raw reply carries the ports and nothing else.
+        let mut stream = TestStream::connect(&sock_path).expect("connects");
+        stream
+            .write_all(b"{\"verb\":\"mirror_collisions\"}\n")
+            .expect("writes");
+        let mut raw = String::new();
+        BufReader::new(stream).read_line(&mut raw).expect("reads");
+        let value: serde_json_lenient::Value =
+            serde_json_lenient::from_str(raw.trim()).expect("the reply is JSON");
+        assert_eq!(
+            value,
+            serde_json_lenient::json!({ "mirror_collisions": [port] }),
+            "the reply carries ports only"
+        );
+
+        // Once the holder is gone and the port binds, it leaves the list.
+        drop(holder);
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(Vec::new()));
+
+        // The guest door does not answer the verb.
+        let guest = spawn_guest_reports_door(&sock_path, boxes.clone(), answerer, proxy_publish)
+            .expect("the guest door binds");
+        assert_eq!(read_mirror_collisions(&guest).await, None);
     }
 }

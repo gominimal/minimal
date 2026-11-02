@@ -1082,6 +1082,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // before the switch so the switch drops first: no delivery is in
     // flight when the proxy is stopped.
     let mut _bep_proxy: Option<BepProxy> = None;
+    // The reclaim watcher's copy (NET-150): it asks this switch to publish
+    // the preferred proxy port once that port is free.
+    let reclaim_switch_sock = switch_sock.clone();
     let _gvproxy = match (gvproxy_binary, switch_sock) {
         (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
@@ -1543,6 +1546,36 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             }
         }
     }
+
+    // NET-150: the proxy serves on the handed port. When that port is a
+    // substitute — the preferred one was held at the start — a watcher
+    // takes the preferred port back once it is free, and the switch then
+    // publishes both. A pinned port never moved, and a boot with no host
+    // switch publishes nothing, so neither gets a watcher.
+    let _proxy_reclaim = match (&_gvproxy, &reclaim_switch_sock) {
+        (Some(_), Some(switch_sock)) => {
+            proxy_publish.set_serving(node_port.port);
+            (node_port.port != node_port.preferred && !node_port.configured).then(|| {
+                let recorded = proxy_publish.clone();
+                crate::net::proxy_reclaim::spawn_reclaim_watcher(
+                    node_port.preferred,
+                    node_port.port,
+                    crate::net::proxy_reclaim::RECLAIM_PROBE_INTERVAL,
+                    crate::net::proxy_reclaim::take_while_serving(
+                        proxy_publish.clone(),
+                        proxy_reclaim_check(ports_dir.clone()),
+                    ),
+                    proxy_reclaim_publisher(
+                        switch_sock.clone(),
+                        boxes.subnet().daemon_ip(),
+                        boxes.table(),
+                    ),
+                    move |preferred| recorded.add_preferred(preferred),
+                )
+            })
+        }
+        _ => None,
+    };
 
     // T93: an unconfirmed publish stays unconfirmed until the guest's report
     // says otherwise. The marker channel is the supervisor's to drain from
@@ -2415,7 +2448,7 @@ fn verify_ports_dir(ports: &std::path::Path) -> Result<()> {
 /// not arbitrate two opens made by the same process at all.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
-struct NodePortReservation {
+pub(crate) struct NodePortReservation {
     _lock: std::fs::File,
 }
 
@@ -2479,9 +2512,26 @@ fn check_candidate(
     udp: bool,
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
 ) -> CandidateCheck {
+    let verdict = candidate_verdict(dir, port, udp, probe);
+    match &verdict {
+        CandidateCheck::Free(_) => log_reserved_candidate(port),
+        CandidateCheck::Skip(reason) => log_skipped_candidate(port, reason),
+        CandidateCheck::Error(_) => {}
+    }
+    verdict
+}
+
+/// [`check_candidate`]'s checks, in the same order, with no log line: the
+/// reclaim watcher runs them on every probe ([`proxy_reclaim_check`]).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn candidate_verdict(
+    dir: &std::path::Path,
+    port: u16,
+    udp: bool,
+    probe: &dyn Fn(u16) -> std::io::Result<u16>,
+) -> CandidateCheck {
     use std::io::ErrorKind::AddrInUse;
     if NODE_RESERVED_PORTS.contains(&port) {
-        log_skipped_candidate(port, SKIP_NODE_RESERVED);
         return CandidateCheck::Skip(SKIP_NODE_RESERVED);
     }
     let refused = match probe(port) {
@@ -2496,18 +2546,11 @@ fn check_candidate(
         Ok(_) => None,
     };
     if let Some(reason) = refused {
-        log_skipped_candidate(port, reason);
         return CandidateCheck::Skip(reason);
     }
     match NodePortReservation::take(dir, port) {
-        Ok(Some(reservation)) => {
-            log_reserved_candidate(port);
-            CandidateCheck::Free(reservation)
-        }
-        Ok(None) => {
-            log_skipped_candidate(port, SKIP_RESERVED_BY_ANOTHER_VM);
-            CandidateCheck::Skip(SKIP_RESERVED_BY_ANOTHER_VM)
-        }
+        Ok(Some(reservation)) => CandidateCheck::Free(reservation),
+        Ok(None) => CandidateCheck::Skip(SKIP_RESERVED_BY_ANOTHER_VM),
         Err(error) => CandidateCheck::Error(error),
     }
 }
@@ -2581,7 +2624,7 @@ fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
         Some(proxy) => configured_node_port(dir, proxy)?,
         None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
     };
-    log_node_port_assignment("hostname proxy", &proxy);
+    log_node_port_assignment(&proxy);
     Ok(proxy)
 }
 
@@ -2792,35 +2835,93 @@ fn port_holder(_port: u16) -> Option<(u32, String)> {
     None
 }
 
-/// One line per node-port assignment: the port the assignment preferred, the
-/// port handed to the guest, and — when the preferred port was skipped — the
-/// probe that refused it. The skip reason is the half a shared host needs:
-/// two VMs and a native daemon can all want the default proxy port, so a boot
-/// that landed elsewhere says so here, in the supervisor's own log, rather
-/// than leaving a hostname surface that never answered to be found there.
-/// A preferred port refused because something holds it names that holder's
-/// pid and executable, so the log says which leftover owns the bind the
-/// boot moved off.
+/// The assignment's one line, written by the hostname proxy's own log
+/// ([`crate::net::proxy_reclaim::log_proxy_port_assignment`]): info when the
+/// start took the preferred port, warn when it skipped it (NET-151). A
+/// preferred port refused because something holds it names that holder's
+/// pid and executable, so the log says which process owns the port the boot
+/// moved off.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn log_node_port_assignment(surface: &str, assigned: &NodePortAssignment) {
+fn log_node_port_assignment(assigned: &NodePortAssignment) {
     // The holder is looked up only for the bind-refused skip: any other skip
     // (loopback answering, reserved by another VM) is not a holder question,
     // and a configured port never reaches here — its refusal fails the
     // start naming the holder already.
-    let holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
+    let port_holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
         .then(|| port_holder(assigned.preferred))
         .flatten()
-        .map(|(_, holder)| holder)
-        .unwrap_or_default();
-    tracing::info!(
-        surface,
-        preferred = assigned.preferred,
-        handed = assigned.port,
-        configured = assigned.configured,
-        skip_reason = assigned.skipped.unwrap_or(""),
-        port_holder = %holder,
-        "assigned the node port"
+        .map(|(_, holder)| holder);
+    crate::net::proxy_reclaim::log_proxy_port_assignment(
+        &crate::net::proxy_reclaim::AssignmentLine {
+            preferred: assigned.preferred,
+            port: assigned.port,
+            configured: assigned.configured,
+            skip_reason: assigned.skipped,
+            port_holder,
+        },
     );
+}
+
+/// The reclaim watcher's check (NET-150): the same checks the assignment
+/// holds the preferred port to ([`candidate_verdict`]), and the port's
+/// reservation taken when they pass. It logs nothing, because the watcher
+/// runs it on every probe while the port stays held.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn proxy_reclaim_check(
+    dir: std::path::PathBuf,
+) -> impl FnMut(u16) -> Option<NodePortReservation> + Send + 'static {
+    move |port| {
+        let probe = node_port_probe(false);
+        match candidate_verdict(&dir, port, false, &probe) {
+            CandidateCheck::Free(reservation) => Some(reservation),
+            CandidateCheck::Skip(_) | CandidateCheck::Error(_) => None,
+        }
+    }
+}
+
+/// The reclaim watcher's publish (NET-150): asks the switch at `switch_sock`
+/// to listen on `127.0.0.1:<preferred>` and forward to the guest proxy at
+/// `node`'s `<substitute>` port.
+///
+/// The forward is noted in the egress gate's publish ledger first, as the
+/// node mirror's binds are ([`SwitchMirrorBinder`]), so the gate tracks the
+/// connections it carries and admits the replies on them. A gate that is
+/// not running, or a ledger that refuses the note, publishes nothing. The
+/// switch's `proxy already running` answer counts as success only when the
+/// ledger already held this same forward. Otherwise some other forward
+/// holds the listener, and the attempt fails. A note this attempt made goes
+/// when the expose fails.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn proxy_reclaim_publisher(
+    switch_sock: std::path::PathBuf,
+    node: std::net::Ipv4Addr,
+    table: crate::box_registry::BoxTable,
+) -> impl FnMut(u16, u16) -> Result<(), String> + Send + 'static {
+    move |preferred, substitute| {
+        let listener = std::net::Ipv4Addr::LOCALHOST;
+        let ledger = table
+            .mirror_ledger()
+            .ok_or_else(|| "the egress gate is not running".to_string())?;
+        let noted = ledger
+            .note_forward(listener, preferred, node, substitute)
+            .map_err(|refused| refused.to_string())?;
+        let body = format!(
+            r#"{{"local":"{listener}:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
+        );
+        let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
+            Ok((status, answer)) => Err(format!(
+                "the switch answered the expose with HTTP {status}: {:?}",
+                answer.trim()
+            )),
+            Err(error) => Err(format!("the expose went unanswered: {error}")),
+        };
+        if noted && result.is_err() {
+            ledger.forget_bind(listener, preferred, node);
+        }
+        result
+    }
 }
 
 /// Reads one operator override for a node port off this supervisor's env —

@@ -794,8 +794,32 @@ impl BoxActor {
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
+        // The box starts from its stored spec. The actor keeps its hold, so
+        // the next launch reads the same spec. A stored spec that cannot be
+        // read refuses the launch, as a resume of it is refused: the box's
+        // first process cannot be decided without it.
+        let spec = self.held_spec().await.map_err(|error| {
+            AttachError::SpawnFailed(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error} Destroy it with `min session destroy {name}`, then start a new \
+                     one with `min session activate`.",
+                    name = registry_name(&record),
+                ),
+            ))
+        })?;
+        // Interim: `run_by_exec` is `true` on every launch, so every launch,
+        // a hook launch and an attach included, starts the shell, and a task
+        // box does not start its spec's argv. `min task run` sends the task's
+        // run over the exec channel, so the shell keeps the task to one run.
+        // Flip condition: T43 (#2405) moves a task's run from the exec
+        // channel to the box's entrypoint, and removes this constant.
+        let spec = box_runtime::LaunchSpec {
+            spec,
+            run_by_exec: true,
+        };
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
+            .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -1102,6 +1126,54 @@ impl BoxActor {
              enforcement on the session record",
         );
         Ok(())
+    }
+
+    /// The spec stored beside this box's record, read by the first launch
+    /// and then held by the actor. `None` for a box filed with no spec: that
+    /// box starts its shell, as every box did before its spec named an
+    /// entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// A stored spec this daemon cannot read, or a failed read of the store.
+    /// The launch is refused, and the error is not held.
+    pub(super) async fn held_spec(&mut self) -> std::io::Result<Option<Arc<mfile::spec::BoxSpec>>> {
+        if let Some(held) = &self.held_spec {
+            return Ok(held.clone());
+        }
+        let stored = match self.record.object().await {
+            Ok(object) => object.load_spec(),
+            Err(error) => Err(error),
+        };
+        // An error is not held: the next launch reads the store again.
+        let spec = match stored {
+            Ok(Some(bytes)) => match box_runtime::stored_spec(&bytes) {
+                Ok(spec) => Some(Arc::new(spec)),
+                Err(error) => {
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        %error,
+                        "launch: the stored spec cannot be read; the launch is refused"
+                    );
+                    return Err(error);
+                }
+            },
+            // A box filed with no spec starts its shell.
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    %error,
+                    "launch: reading the stored spec failed; the launch is refused"
+                );
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    "The settings it was created with cannot be read.",
+                ));
+            }
+        };
+        self.held_spec = Some(spec.clone());
+        Ok(spec)
     }
 
     /// Hands back this session's host, launching one if none is running.
