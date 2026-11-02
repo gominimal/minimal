@@ -7615,3 +7615,326 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
         "the entrypoint returns on its own"
     );
 }
+
+/// A box filed in a real store under a temp dir, so its host writes the
+/// box's log and its bindings write the box's events beside a real record.
+struct StoredBox {
+    _tmp: tempfile::TempDir,
+    dir: boxes::store::BoxDir,
+    paths: BoxPaths,
+    id: boxes::SessionId,
+    parent: boxes::SessionId,
+}
+
+impl StoredBox {
+    fn new() -> Self {
+        use boxes::store::{BoxObject as _, Loader as _};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap();
+        let mut loader = boxes::store::DiskLoader::new(root).unwrap();
+        let parent = boxes::SessionId::mint();
+        let key = loader.create(stored_record(parent)).unwrap();
+        let object = loader.get(&key).unwrap();
+        let paths = BoxPaths {
+            working: object.workspace_path(),
+            cache: object.cache_path(),
+            home: object.home_path(),
+            patches: object.patches_path(),
+            hooks: object.hooks_path(),
+        };
+        for dir in [&paths.working, &paths.cache, &paths.home] {
+            std::fs::create_dir_all(dir.as_utf8_path()).unwrap();
+        }
+        Self {
+            _tmp: tmp,
+            dir: object.dir(),
+            paths,
+            id: object.record().id,
+            parent,
+        }
+    }
+
+    fn params(&self) -> HostParams {
+        HostParams {
+            name: "logged".to_string(),
+            username: "user".to_string(),
+            paths: BoxPaths {
+                working: self.paths.working.clone(),
+                cache: self.paths.cache.clone(),
+                home: self.paths.home.clone(),
+                patches: self.paths.patches.clone(),
+                hooks: self.paths.hooks.clone(),
+            },
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            session_id: self.id,
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        }
+    }
+
+    /// The box's log as it stands.
+    fn log(&self) -> String {
+        String::from_utf8_lossy(&self.dir.read_log_from(0, usize::MAX).unwrap()).into_owned()
+    }
+
+    /// Waits until the box's log contains `needle`, and returns the log.
+    async fn await_log(&self, needle: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let log = self.log();
+                if log.contains(needle) {
+                    return log;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the log never showed {needle:?}: {:?}", self.log()))
+    }
+
+    /// The box's `detached` events as they stand.
+    fn detached(&self) -> Vec<boxes::events::BoxEvent> {
+        let text =
+            std::fs::read_to_string(self.dir.events_path().as_utf8_path()).unwrap_or_default();
+        text.lines()
+            .map(|line| serde_json_lenient::from_str::<boxes::events::BoxEvent>(line).unwrap())
+            .filter(|event| event.kind == boxes::events::BoxEventType::Detached)
+            .collect()
+    }
+
+    /// Waits until the box has `n` `detached` events, and returns them.
+    async fn await_detached(&self, n: usize) -> Vec<boxes::events::BoxEvent> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = self.detached();
+                if events.len() >= n {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the box never had {n} detached events: {:?}",
+                self.detached()
+            )
+        })
+    }
+}
+
+fn stored_record(parent: boxes::SessionId) -> boxes::Record {
+    boxes::Record {
+        id: boxes::SessionId::nil(),
+        name: Some("logged".to_string()),
+        username: None,
+        project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+        network: boxes::NetworkMode::default(),
+        policy: boxes::BoxPolicy::default(),
+        status: boxes::BoxState::default(),
+        reason: None,
+        exit_code: None,
+        signal: None,
+        hooks_enabled: true,
+        task_addresses: Vec::new(),
+        box_addresses: None,
+        host_ip_enforcement: None,
+        box_id: None,
+        host_row_bound: false,
+        bound_ports: std::collections::BTreeSet::new(),
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
+        ends_with_run: false,
+        box_type: None,
+        parent: Some(parent),
+        project_root: None,
+        attrs: BTreeMap::new(),
+    }
+}
+
+/// Attaches a client to the host over an in-process ssh connection, and
+/// returns the client's end of the channel and the connection.
+async fn ssh_attach(
+    handle: &HostHandle,
+) -> (
+    russh::Channel<russh::client::Msg>,
+    russh::client::Handle<TrustingClient>,
+) {
+    let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+    let key = russh::keys::PrivateKey::random(
+        &mut russh::keys::key::safe_rng(),
+        russh::keys::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let server_config = Arc::new(russh::server::Config {
+        keys: vec![key],
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let (caught_tx, mut caught) = mpsc::unbounded_channel();
+    let (server, client) = tokio::join!(
+        russh::server::run_stream(server_config, server_side, ChannelCatcher(caught_tx)),
+        russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            TrustingClient
+        ),
+    );
+    crate::traced::spawn(server.expect("ssh server handshake"));
+    let mut client = client.expect("ssh client handshake");
+    let auth = client.authenticate_none("test").await.unwrap();
+    assert!(auth.success(), "the test server accepts anyone");
+    let channel = client.channel_open_session().await.unwrap();
+    let server_channel = caught.recv().await.expect("the server caught the channel");
+    assert!(
+        handle
+            .attach(
+                server_channel,
+                DEFAULT_SIZE,
+                ConnectionEnv::new(),
+                SessionKeys::default(),
+            )
+            .await
+            .is_ok(),
+        "the host must take the attach",
+    );
+    (channel, client)
+}
+
+/// BOX-016: a PTY client that leaves without a detach, by closing its
+/// channel or by losing its connection, is recorded as one `detached`
+/// event each, naming the box and its parent. The box runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_client_loss_records_detach() {
+    let stored = StoredBox::new();
+    let (host, handle) = Host::build(MockLauncher::default(), stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.mainloop());
+    assert!(stored.detached().is_empty(), "no client has left yet");
+
+    // A client that closes its channel.
+    let (channel, first) = ssh_attach(&handle).await;
+    channel.close().await.unwrap();
+    let events = stored.await_detached(1).await;
+    assert_eq!(events.len(), 1, "one event per client loss: {events:?}");
+
+    // A client whose connection drops.
+    let (_channel, second) = ssh_attach(&handle).await;
+    second
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await
+        .unwrap();
+    drop(second);
+    let events = stored.await_detached(2).await;
+    assert_eq!(events.len(), 2, "one event per client loss: {events:?}");
+    for event in &events {
+        assert_eq!(event.box_id, stored.id);
+        assert_eq!(event.parent, Some(stored.parent));
+    }
+
+    // The box runs on.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!task.is_finished(), "a client loss must not end the box");
+    tokio::time::timeout(Duration::from_secs(5), handle.get_attrs())
+        .await
+        .expect("the host keeps answering after a client loss")
+        .expect("the host is still running");
+
+    handle.kill(true).await.expect("kill should reach the host");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    drop(first);
+}
+
+/// BOX-155: the box's output is in its log from the start, with no client
+/// attached. An attached client reads the same output as a second reader,
+/// and after the client drops, the log holds what came before, during and
+/// after the attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_output_logged_from_start_complete_after_disconnect() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+    use tokio::io::AsyncWriteExt as _;
+
+    let stored = StoredBox::new();
+    let mark = stored._tmp.path().join("client-gone");
+    let script = format!(
+        r#"printf 'early\n'; read x; printf 'during:%s\n' "$x"; while [ ! -e '{}' ]; do sleep 0.05; done; printf 'after\n'; sleep 60"#,
+        mark.display()
+    );
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        run_by_exec: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.mainloop());
+
+    // Logged with no client attached.
+    stored.await_log("early").await;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(stored.dir.log_path().as_utf8_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "only the daemon's user can open the log"
+        );
+    }
+
+    // An attached client reads the output too.
+    let (mut channel, client) = ssh_attach(&handle).await;
+    channel.make_writer().write_all(b"hello\n").await.unwrap();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&seen).contains("during:hello") {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => seen.extend_from_slice(&data),
+                Some(_) => {}
+                None => panic!("the channel closed before the output arrived"),
+            }
+        }
+    })
+    .await
+    .expect("the attached client reads the box's output");
+
+    // The client drops, then the box writes more.
+    client
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await
+        .unwrap();
+    drop(channel);
+    drop(client);
+    stored.await_detached(1).await;
+    std::fs::write(&mark, b"").unwrap();
+
+    let log = stored.await_log("after").await;
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("the log has no {needle:?}: {log:?}"))
+    };
+    assert!(
+        at("early") < at("during:hello") && at("during:hello") < at("after"),
+        "the log holds the output in order: {log:?}"
+    );
+
+    assert!(
+        !task.is_finished(),
+        "the box runs on after its client drops"
+    );
+    handle.kill(true).await.expect("kill should reach the host");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+}

@@ -104,6 +104,14 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     pending_pty_err: Option<std::io::Error>,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
+    /// The box's output log (BOX-155). Every read from the master lands
+    /// here first, whether or not a binding is attached, so the attached
+    /// client is a second reader and the log is complete after it leaves.
+    output_log: BoxOutputLog,
+    /// The box's directory beside its mounts, handed to each binding so it
+    /// can record `detached` when its client leaves (BOX-016). `None` for a
+    /// host whose workspace is not in the box store (tests).
+    box_dir: Option<boxes::store::BoxDir>,
     /// Various attributes about the running terminal.
     attrs: HostAttrs,
 
@@ -1218,6 +1226,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // Kept before `launch` consumes `paths`.
         let hooks_dir = paths.hooks.clone();
         let workspace_dir = paths.working.clone();
+        // Opened before the launch, so the first byte the entrypoint writes
+        // has a log to land in (BOX-155).
+        let output_log = BoxOutputLog::open(session_id, &paths);
+        let box_dir = boxes::store::BoxDir::for_tree(&paths.working);
         // Kept for `write_connection_env`, which rewrites the per-attach env
         // (TERM included) into the session's home on every reattach.
         let home_dir = paths.home.clone();
@@ -1316,6 +1328,8 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             process,
             pending_pty_err: None,
             master,
+            output_log,
+            box_dir,
             // The launch decided the box's egress verdict posture before
             // anything was reserved; the attributes carry that decision so
             // the session can say which it runs under (design §7.2's
@@ -1871,6 +1885,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
                         self.attrs.stdout_last = Some(SystemTime::now());
+                        // The log first: a client is a second reader, and
+                        // the log has these bytes whatever the client does.
+                        self.output_log.write(b);
                         self.parser.process(b);
                         // Never an awaited send: this arm runs only while the
                         // mailbox has a free slot, and nothing else fills it
@@ -2143,6 +2160,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             self.session_name.clone(),
             self.archives_dir.clone(),
             self.holds_host_row,
+            self.box_dir.clone(),
         )
         .await;
 
