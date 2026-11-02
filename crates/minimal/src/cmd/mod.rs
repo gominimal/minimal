@@ -54,6 +54,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -180,11 +181,17 @@ where
     F: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
     use tracing::Instrument as _;
-    match command.instrument(root).await {
+    match command.instrument(root.clone()).await {
         Ok(()) => Ok(None),
         Err(e) => match e.downcast::<Handoff>() {
             Ok(handoff) => Ok(Some(handoff)),
-            Err(e) => Err(e),
+            Err(e) => {
+                // The command failed: its root span says so (`cmd` carried
+                // no error status across 270k spans in a lab week), whether
+                // or not the failure was expected.
+                root.record("otel.status_code", "ERROR");
+                Err(e)
+            }
         },
     }
 }

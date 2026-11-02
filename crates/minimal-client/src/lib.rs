@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -579,9 +579,16 @@ impl Client {
                 .with_context(|| decode_context(R::NAME, &resp_buf))
         };
 
-        tokio::time::timeout(timeout, rpc)
+        let result = tokio::time::timeout(timeout, rpc)
             .await
-            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))?
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
+            .and_then(|r| r);
+        if result.is_err() {
+            // A failed or timed-out RPC marks its span, so the daemon's 4k
+            // "rpc failed" a week have a client-side span to find.
+            tracing::Span::current().record("otel.status_code", "ERROR");
+        }
+        result
     }
 
     /// Open a session channel and issue an `exec` request for `command`,
