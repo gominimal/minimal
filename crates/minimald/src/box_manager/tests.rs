@@ -2993,8 +2993,12 @@ async fn stopped_box_record_readable_until_reaped() {
     let (_state, _cache, mngr) = manager().await;
     let id = create_active_session_with(&mngr, sample_config()).await;
     // A spec beside the record, as a create that carries one writes it
-    // (BOX-068).
-    let spec = br#"{"type":"session"}"#.to_vec();
+    // (BOX-068). A launch reads it, so it must be a spec the daemon reads.
+    let spec = serde_json_lenient::to_vec(&mfile::spec::BoxSpec::for_session(
+        None,
+        mfile::spec::SpecFlags::default(),
+    ))
+    .expect("a spec serializes");
     mngr.box_events(id)
         .await
         .unwrap()
