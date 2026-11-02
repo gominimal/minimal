@@ -3017,10 +3017,14 @@ mod managed {
             .expect("the exec starts")
         }
 
-        fn output(&self, id: &ExecId) -> String {
-            let bytes = read_exec_output(&self.exec_box.dir, id)
+        async fn output(&self, id: &ExecId) -> String {
+            let mut bytes = Vec::new();
+            read_exec_output(&self.exec_box.dir, id)
                 .unwrap()
-                .expect("the box keeps the exec's transcript");
+                .expect("the box keeps the exec's transcript")
+                .copy_to(&mut bytes)
+                .await
+                .unwrap();
             String::from_utf8_lossy(&bytes).into_owned()
         }
 
@@ -3103,7 +3107,7 @@ mod managed {
         let disk = box_on_disk();
         let entry = disk.start(ExecMode::Detached, &words, None, false);
         assert_eq!(entry.wait().await.code, Some(0));
-        assert_eq!(disk.output(&entry.id), "a b|$HOME|*|; echo injected|");
+        assert_eq!(disk.output(&entry.id).await, "a b|$HOME|*|; echo injected|");
 
         let failing = disk.start(ExecMode::Detached, &["sh", "-c", "exit 7"], None, false);
         let exit = failing.wait().await;
@@ -3199,7 +3203,7 @@ mod managed {
             other => panic!("the attach ends with the exec, got {other:?}"),
         }
 
-        let transcript = disk.output(&entry.id);
+        let transcript = disk.output(&entry.id).await;
         assert!(transcript.contains("TTY-YES"), "{transcript:?}");
         assert!(transcript.contains("got:hello"), "{transcript:?}");
         let events = disk.exec_events(&entry.id);
@@ -3230,7 +3234,7 @@ mod managed {
         assert_eq!(exit.reason, ExecExitReason::Exited);
         assert_eq!(found.wait().await.code, Some(3), "the exit code is kept");
 
-        let output = disk.output(&entry.id);
+        let output = disk.output(&entry.id).await;
         assert_eq!(output, "STDIN-CLOSED\nout\nerr\n");
 
         let events = disk.exec_events(&entry.id);
@@ -3238,6 +3242,43 @@ mod managed {
         assert_eq!(kinds, [BoxEventType::ExecStarted, BoxEventType::ExecExited]);
         assert_eq!(events[1].data["exit_code"], 3);
         assert_eq!(events[1].data["reason"], "exited");
+    }
+
+    /// BOX-149: a command that writes past the transcript cap keeps running
+    /// to its end. Its transcript is never larger than the cap, and it holds
+    /// the newest output: the last line the command wrote.
+    #[tokio::test]
+    async fn exec_transcript_past_cap_keeps_newest_output_within_cap() {
+        let disk = box_on_disk();
+        // About 20 MiB of numbered lines, more than twice the cap.
+        let entry = disk.start(ExecMode::Detached, &["seq", "1", "3000000"], None, false);
+        let exit = tokio::time::timeout(Duration::from_secs(60), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0), "the command runs to its end");
+
+        let transcript = boxes::store::exec_transcript_path(&disk.exec_box.dir, entry.id.as_str());
+        let len = std::fs::metadata(&transcript).unwrap().len();
+        assert!(
+            len <= super::super::TRANSCRIPT_CAP,
+            "the transcript is {len} bytes, past the cap"
+        );
+        let output = disk.output(&entry.id).await;
+        assert_eq!(
+            output.len() as u64,
+            len,
+            "the read gives the whole transcript"
+        );
+        assert!(
+            output.starts_with("[older output was dropped. Only the newest output is kept.]\n"),
+            "the transcript says it dropped output: {:?}",
+            &output[..80]
+        );
+        assert!(
+            output.ends_with("\n2999999\n3000000\n"),
+            "the newest output is kept"
+        );
+        assert!(!output.contains("\n1\n"), "the oldest output is dropped");
     }
 
     /// BOX-149: an exec's own timeout ends the exec as a stop does: SIGTERM,
@@ -3268,7 +3309,7 @@ mod managed {
             "the SIGKILL waits out the grace: {took:?}"
         );
         assert!(took < Duration::from_secs(25), "{took:?}");
-        assert_eq!(disk.output(&entry.id), "started\n");
+        assert_eq!(disk.output(&entry.id).await, "started\n");
 
         let events = disk.exec_events(&entry.id);
         let exited = events

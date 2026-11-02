@@ -1720,7 +1720,7 @@ pub(crate) struct TerminalLive {
 pub(crate) struct ExecTerminal(Arc<std::sync::Mutex<Option<TerminalLive>>>);
 
 /// The chunks a slow attached client can fall behind by before it skips
-/// some. The transcript keeps every byte.
+/// some. The transcript keeps every byte, up to its cap.
 const TERMINAL_BACKLOG: usize = 1024;
 
 impl ExecTerminal {
@@ -1770,16 +1770,19 @@ impl ExecEntry {
         }
     }
 
-    /// Writes a chunk of a tty exec's output to its transcript and to its
-    /// attached clients.
-    pub(crate) fn record_output(&self, transcript: &mut std::fs::File, chunk: &[u8]) {
-        use std::io::Write as _;
-
+    /// Writes a chunk of an exec's output to its transcript and, for a tty
+    /// exec, to its
+    /// attached clients. An exec without a terminal has no clients, so its
+    /// chunk goes to the transcript only.
+    pub(crate) fn record_output(&self, transcript: &mut CappedTranscript, chunk: &[u8]) {
         let Some(terminal) = &self.terminal else {
+            if let Err(error) = transcript.write(chunk) {
+                tracing::warn!(exec_id = %self.id, %error, "exec: could not write the transcript");
+            }
             return;
         };
         let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(error) = transcript.write_all(chunk) {
+        if let Err(error) = transcript.write(chunk) {
             tracing::warn!(exec_id = %self.id, %error, "exec: could not write the transcript");
         }
         if let Some(live) = live.as_ref() {
@@ -1846,13 +1849,150 @@ impl ExecEntry {
     /// The transcript so far, and a receiver for what the terminal writes
     /// after it. `None` for an exec without a terminal, or one that ended:
     /// then the transcript is all there is.
-    fn replay_and_follow(&self) -> io::Result<(Vec<u8>, Option<TerminalFollow>)> {
+    ///
+    /// The lock is held only to open the transcript and to subscribe. The
+    /// replay reads the opened file later, up to its length at the open.
+    fn replay_and_follow(&self) -> io::Result<(TranscriptRead, Option<TerminalFollow>)> {
         let Some(terminal) = &self.terminal else {
-            return Ok((std::fs::read(&self.transcript)?, None));
+            return Ok((TranscriptRead::open(&self.transcript)?, None));
         };
         let live = terminal.0.lock().unwrap_or_else(|e| e.into_inner());
-        let replay = std::fs::read(&self.transcript)?;
+        let replay = TranscriptRead::open(&self.transcript)?;
         Ok((replay, live.as_ref().map(|live| live.output.subscribe())))
+    }
+}
+
+/// The most bytes an exec's transcript holds on disk: 8 MiB. A command
+/// that writes more keeps running. Its transcript then drops the oldest
+/// bytes and keeps the newest, so a command that writes without end does
+/// not fill the disk of the box state directory.
+pub(crate) const TRANSCRIPT_CAP: u64 = 8 * 1024 * 1024;
+
+/// The first line of a transcript that dropped its oldest bytes.
+const TRANSCRIPT_DROPPED: &[u8] = b"[older output was dropped. Only the newest output is kept.]\n";
+
+/// The size of one read of a transcript, for an output read or a replay.
+const TRANSCRIPT_READ_CHUNK: usize = 64 * 1024;
+
+/// Opens a new transcript file at `path`, for appends, readable only by
+/// the daemon's user.
+fn create_transcript_file(path: &camino::Utf8Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// An exec's transcript, as its pump writes it: never more than
+/// [`TRANSCRIPT_CAP`] bytes.
+///
+/// A write that takes the file past the cap replaces the file with
+/// [`TRANSCRIPT_DROPPED`] and the newest half of the cap. The new file is
+/// written beside the old one and renamed over it, so a read that has the
+/// old file open still reads a whole transcript.
+#[derive(Debug)]
+pub(crate) struct CappedTranscript {
+    path: camino::Utf8PathBuf,
+    file: std::fs::File,
+    len: u64,
+    cap: u64,
+}
+
+impl CappedTranscript {
+    /// Creates the transcript at `path`. An existing file is an error.
+    pub(crate) fn create(path: &camino::Utf8Path) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            file: create_transcript_file(path)?,
+            len: 0,
+            cap: TRANSCRIPT_CAP,
+        })
+    }
+
+    /// Appends `chunk`, and drops the oldest bytes if the file then passes
+    /// the cap.
+    pub(crate) fn write(&mut self, chunk: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+
+        let chunk_len = chunk.len() as u64;
+        if self.len + chunk_len <= self.cap {
+            self.file.write_all(chunk)?;
+            self.len += chunk_len;
+            return Ok(());
+        }
+        self.drop_oldest(chunk)
+    }
+
+    /// Replaces the file with the mark and the newest bytes of the file and
+    /// `chunk` together, half the cap in all.
+    fn drop_oldest(&mut self, chunk: &[u8]) -> io::Result<()> {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let keep = (self.cap / 2).saturating_sub(TRANSCRIPT_DROPPED.len() as u64);
+        let from_chunk = (chunk.len() as u64).min(keep);
+        let from_file = (keep - from_chunk).min(self.len);
+        let mut tail = Vec::with_capacity(TRANSCRIPT_DROPPED.len() + keep as usize);
+        tail.extend_from_slice(TRANSCRIPT_DROPPED);
+        if from_file > 0 {
+            let mut old = std::fs::File::open(&self.path)?;
+            old.seek(io::SeekFrom::Start(self.len - from_file))?;
+            old.take(from_file).read_to_end(&mut tail)?;
+        }
+        // `from_chunk` is at most `chunk.len()`, so the cast is exact.
+        tail.extend_from_slice(&chunk[chunk.len() - from_chunk as usize..]);
+
+        let next_path = self.path.with_extension("log.next");
+        match std::fs::remove_file(&next_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut next = create_transcript_file(&next_path)?;
+        next.write_all(&tail)?;
+        std::fs::rename(&next_path, &self.path)?;
+        tracing::debug!(
+            transcript = %self.path,
+            dropped_after = self.len + chunk.len() as u64,
+            kept = tail.len(),
+            "exec: the transcript reached its cap and dropped its oldest bytes"
+        );
+        self.file = next;
+        self.len = tail.len() as u64;
+        Ok(())
+    }
+}
+
+/// An exec's transcript, opened for a read, and its length at the open. A
+/// read stops at that length, so it ends even while the exec still writes.
+#[derive(Debug)]
+pub(crate) struct TranscriptRead {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl TranscriptRead {
+    /// Opens the transcript at `path` and notes its length.
+    pub(crate) fn open(path: &camino::Utf8Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self { file, len })
+    }
+
+    /// Copies the transcript to `out` in chunks of
+    /// [`TRANSCRIPT_READ_CHUNK`] bytes.
+    pub(crate) async fn copy_to<W: AsyncWrite + Unpin>(self, out: &mut W) -> io::Result<()> {
+        let mut file = tokio::fs::File::from_std(self.file).take(self.len);
+        let mut buf = vec![0u8; TRANSCRIPT_READ_CHUNK];
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            out.write_all(&buf[..n]).await?;
+        }
     }
 }
 
@@ -1885,9 +2025,9 @@ pub(crate) fn find_exec(box_id: SessionId, id: &ExecId) -> Option<Arc<ExecEntry>
 pub(crate) fn read_exec_output(
     box_dir: &camino::Utf8Path,
     id: &ExecId,
-) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::read(boxes::store::exec_transcript_path(box_dir, id.as_str())) {
-        Ok(bytes) => Ok(Some(bytes)),
+) -> io::Result<Option<TranscriptRead>> {
+    match TranscriptRead::open(&boxes::store::exec_transcript_path(box_dir, id.as_str())) {
+        Ok(read) => Ok(Some(read)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -1916,7 +2056,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let (replay, live) = entry.replay_and_follow()?;
-    out.write_all(&replay).await?;
+    replay.copy_to(out).await?;
     out.flush().await?;
     let Some(mut live) = live else {
         return Ok(AttachEnd::Exited(entry.wait().await));
@@ -2003,6 +2143,25 @@ pub(crate) fn not_running_message(box_label: &str, status: boxes::BoxState) -> S
     )
 }
 
+/// Answers `min://exec/output` with the transcript `output` on stdout,
+/// read in chunks, then status 0. A read that fails part way ends the
+/// output there, with status 1.
+async fn answer_exec_output(channel: Channel<Msg>, output: TranscriptRead, id: &ExecId) {
+    let (_rs, ws) = channel.split();
+    let mut w = ws.make_writer();
+    let status = match output.copy_to(&mut w).await {
+        Ok(()) => 0,
+        Err(error) => {
+            tracing::warn!(exec_id = %id, %error, "exec: could not send the exec's output");
+            1
+        }
+    };
+    let _ = w.flush().await;
+    let _ = ws.eof().await;
+    let _ = ws.exit_status(status).await;
+    let _ = ws.close().await;
+}
+
 /// Serves `min://exec/output`: the exec's captured output on stdout.
 pub(crate) async fn serve_exec_output(channel: Channel<Msg>, session: BoxHandle, id: ExecId) {
     let read = match ExecBox::of(&session).await {
@@ -2010,7 +2169,7 @@ pub(crate) async fn serve_exec_output(channel: Channel<Msg>, session: BoxHandle,
         Err(e) => Err(e),
     };
     match read {
-        Ok(Some(output)) => answer_exec(channel, &output, b"", 0).await,
+        Ok(Some(output)) => answer_exec_output(channel, output, &id).await,
         Ok(None) => answer_exec(channel, b"", no_exec_message(&id).as_bytes(), 1).await,
         Err(error) => {
             tracing::warn!(exec_id = %id, %error, "exec: could not read the exec's output");

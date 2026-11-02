@@ -1105,9 +1105,10 @@ pub(crate) struct ManagedStart {
 /// timeout, records its exit and writes its `exec_exited` event.
 ///
 /// A detached exec gets `/dev/null` for stdin, so its stdin is closed at
-/// creation, and its stdout and stderr go straight to its transcript. A tty
-/// exec gets a fresh terminal for all three, and a pump copies the terminal
-/// to the transcript and to every attached client.
+/// creation, and one pipe for its stdout and stderr. A pump copies the pipe
+/// to its transcript. A tty exec gets a fresh terminal for all three, and a
+/// pump copies the terminal to the transcript and to every attached client.
+/// The transcript holds at most [`TRANSCRIPT_CAP`] bytes, the newest.
 ///
 /// `graceful` is true for the injection shim, which a stop SIGTERMs so it
 /// can end the exec's whole process group, then SIGKILLs.
@@ -1127,36 +1128,34 @@ pub(crate) fn start_managed_exec(
     if let Some(dir) = transcript_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).append(true);
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let transcript = options.open(&transcript_path)?;
+    let transcript = CappedTranscript::create(&transcript_path)?;
 
-    let master = match mode {
+    let source = match mode {
         ExecMode::Tty => {
             let (master, slave) = open_terminal(winsize)?;
             command
                 .stdin(Stdio::from(slave.try_clone()?))
                 .stdout(Stdio::from(slave.try_clone()?))
                 .stderr(Stdio::from(slave));
-            Some(master)
+            master
         }
         ExecMode::Detached | ExecMode::Attached => {
+            // `std::io::pipe` makes both ends close-on-exec. The copies the
+            // command gets through `dup2` are not.
+            let (reader, writer) = std::io::pipe()?;
             command
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(transcript.try_clone()?))
-                .stderr(Stdio::from(transcript.try_clone()?));
-            None
+                .stdout(Stdio::from(writer.try_clone()?))
+                .stderr(Stdio::from(writer));
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader))
         }
     };
     let mut command = Command::from(command);
     command.kill_on_drop(true);
     let child = command.spawn()?;
-    // The command holds the parent's copies of the terminal's slave side.
-    // Dropped now, so the pump sees the terminal close when the exec ends.
+    // The command holds the parent's copies of the terminal's slave side or
+    // the pipe's write end. Dropped now, so the pump sees the end of the
+    // output when the exec ends.
     drop(command);
     let process = if graceful {
         TokioProcess::shim(child)
@@ -1164,20 +1163,20 @@ pub(crate) fn start_managed_exec(
         TokioProcess::new(child)
     };
 
-    let (terminal, feed) = match master {
-        Some(master) => {
+    let (terminal, feed) = match mode {
+        ExecMode::Tty => {
             let (terminal, input) = ExecTerminal::new();
-            let writer = master.try_clone()?;
-            (Some((terminal, master)), Some((writer, input)))
+            let writer = source.try_clone()?;
+            (Some(terminal), Some((writer, input)))
         }
-        None => (None, None),
+        ExecMode::Detached | ExecMode::Attached => (None, None),
     };
     let entry = Arc::new(ExecEntry::new(
         id.clone(),
         exec_box.record.id,
         mode,
         transcript_path,
-        terminal.as_ref().map(|(t, _)| t.clone()),
+        terminal,
     ));
     register_exec(Arc::clone(&entry));
     exec_box.write_event(boxes::events::BoxEventType::ExecStarted, &id, mode, None);
@@ -1189,8 +1188,7 @@ pub(crate) fn start_managed_exec(
         "exec started"
     );
 
-    let pump =
-        terminal.map(|(_, master)| spawn(pump_terminal(Arc::clone(&entry), master, transcript)));
+    let pump = spawn(pump_output(Arc::clone(&entry), source, transcript));
     if let Some((writer, input)) = feed {
         spawn(feed_terminal(writer, input));
     }
@@ -1204,9 +1202,9 @@ pub(crate) fn start_managed_exec(
     Ok(entry)
 }
 
-/// How long the supervisor of a tty exec waits, after the exec exits, for
-/// the pump to copy what the terminal still holds. A descendant that keeps
-/// the terminal open must not hold the exit back.
+/// How long the supervisor of an exec waits, after the exec exits, for the
+/// pump to copy what the terminal or the pipe still holds. A descendant that
+/// keeps the terminal or the pipe open must not hold the exit back.
 const TERMINAL_DRAIN: Duration = Duration::from_secs(1);
 
 /// Waits for a managed exec, ends it at its own timeout, and records how it
@@ -1216,15 +1214,17 @@ async fn supervise_managed_exec(
     entry: Arc<ExecEntry>,
     mut process: TokioProcess,
     timeout: Option<Duration>,
-    pump: Option<JoinHandle<()>>,
+    mut pump: JoinHandle<()>,
     exec_box: ExecBox,
 ) {
     let (status, reason) = wait_with_timeout(&mut process, timeout).await;
     entry.close_input();
-    if let Some(mut pump) = pump
-        && tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
-            .await
-            .is_err()
+    // A tty pump stops at the drain. A detached pump keeps on, so the
+    // transcript still gets what a descendant writes after the exit.
+    if tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
+        .await
+        .is_err()
+        && entry.mode == ExecMode::Tty
     {
         pump.abort();
     }
@@ -1338,23 +1338,25 @@ fn open_terminal((rows, cols): (u16, u16)) -> io::Result<(std::fs::File, std::fs
     Ok((std::fs::File::from(master), std::fs::File::from(slave)))
 }
 
-/// Copies a tty exec's terminal to its transcript and to every attached
-/// client until the terminal closes: `EIO` once the last slave descriptor
-/// is gone.
-async fn pump_terminal(
+/// Copies an exec's output to its transcript until the output ends. For a
+/// tty exec, `source` is the terminal: the pump also sends each chunk to
+/// every attached client, and the terminal ends with `EIO` once the last
+/// slave descriptor is gone. For a detached exec, `source` is the read end
+/// of its pipe, which ends when the last writer closes it.
+async fn pump_output(
     entry: Arc<ExecEntry>,
-    master: std::fs::File,
-    mut transcript: std::fs::File,
+    source: std::fs::File,
+    mut transcript: CappedTranscript,
 ) {
-    let mut master = tokio::fs::File::from_std(master);
+    let mut source = tokio::fs::File::from_std(source);
     let mut buf = vec![0u8; 8192];
     loop {
-        match master.read(&mut buf).await {
+        match source.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => entry.record_output(&mut transcript, &buf[..n]),
             Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
             Err(error) => {
-                tracing::warn!(exec_id = %entry.id, %error, "exec: terminal read failed");
+                tracing::warn!(exec_id = %entry.id, %error, "exec: output read failed");
                 break;
             }
         }
