@@ -64,6 +64,9 @@ pub struct BoxSpec {
     /// `execution.exec`, and left out for [`Entrypoint::Shell`].
     pub entrypoint: Entrypoint,
     /// When the box's run is over. Serialized as `box.lifetime`.
+    ///
+    /// The spec stores and round-trips this value, but no launch reads it
+    /// yet. A box ends when its entrypoint returns, whatever it says.
     pub lifetime: Lifetime,
     /// Whether the box runs its lifecycle hooks.
     pub hooks_enabled: bool,
@@ -107,6 +110,9 @@ impl Entrypoint {
 }
 
 /// When a box's run is over. Serialized as its spec word.
+///
+/// Nothing enforces this yet: the daemon does not read it at launch, so
+/// [`Lifetime::UntilStopped`] has no effect today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifetime {
