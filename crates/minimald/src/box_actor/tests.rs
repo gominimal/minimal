@@ -1923,7 +1923,7 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     let mut client = server.connect().await;
 
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
-    spec.lifetime = mfile::spec::Lifetime::Persistent;
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
     spec.entrypoint = mfile::spec::Entrypoint::Exec(vec!["/bin/echo".to_string()]);
     let mut req = crate::test_harness::create_session_req("spec-hold", "/tmp");
     req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));

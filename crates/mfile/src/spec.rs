@@ -5,8 +5,8 @@
 //! This is the first version, `v = 0`. It is built from the project's
 //! `[session]` table or a declared `[tasks.<name>]` entry, and from the
 //! command-line flags of the creating command. It serializes under the
-//! `box.toml` tables: `box.type`, `io.pty_enabled`, `execution.lifetime`,
-//! `execution.entrypoint`, `install.packages`, `network.mode` and
+//! `box.toml` tables: `box.type`, `box.lifetime`, `io.pty_enabled`,
+//! `execution.exec`, `install.packages`, `network.mode` and
 //! `network.egress.*`.
 //!
 //! The v0 bytes also carry keys that `box.toml` does not have. #2410 ends
@@ -14,6 +14,8 @@
 //!
 //! - The top-level keys `v`, `entry` and `hooks_enabled`. #2410 removes them
 //!   or maps them to `box.toml` tables.
+//! - `execution.exec` is an argv array, not the `box.toml` string. A shell
+//!   entrypoint leaves the key out.
 //! - `network.ingress` keeps the [`boxes::IngressPolicy`] shape
 //!   (`port_mappings`, `dynamic_allowed_range`, `dynamic_ingress`), not the
 //!   `box.toml` `[{proto, port}]` list.
@@ -59,9 +61,9 @@ pub struct BoxSpec {
     /// Whether the box runs with a terminal. Serialized as `io.pty_enabled`.
     pub pty_enabled: bool,
     /// What the box runs as its first process. Serialized as
-    /// `execution.entrypoint`, and left out for [`Entrypoint::Shell`].
+    /// `execution.exec`, and left out for [`Entrypoint::Shell`].
     pub entrypoint: Entrypoint,
-    /// When the box's run is over. Serialized as `execution.lifetime`.
+    /// When the box's run is over. Serialized as `box.lifetime`.
     pub lifetime: Lifetime,
     /// Whether the box runs its lifecycle hooks.
     pub hooks_enabled: bool,
@@ -94,7 +96,7 @@ impl Entrypoint {
     }
 
     /// The entrypoint a box of `box_type` from `entry` gets when its spec
-    /// names none: a spec stored before `execution.entrypoint` existed.
+    /// names none: a spec stored before `execution.exec` existed.
     fn implied(box_type: &str, entry: &str) -> Self {
         if box_type == boxes::TASK_BOX_TYPE {
             Self::for_task(entry)
@@ -111,7 +113,12 @@ pub enum Lifetime {
     /// The run is over when the entrypoint returns.
     UntilComplete,
     /// The run lasts until the box is stopped, whatever the entrypoint does.
-    Persistent,
+    UntilStopped,
+}
+
+/// The lifetime a v0 spec stored without `box.lifetime` reads as.
+fn until_complete() -> Lifetime {
+    Lifetime::UntilComplete
 }
 
 /// The network half of a [`BoxSpec`]. It serializes as the `[network]`
@@ -251,7 +258,7 @@ struct SpecDoc {
     box_table: DocBox,
     io: DocIo,
     /// Absent from a v0 spec stored before the table existed. A read then
-    /// takes the entrypoint the box's type implies and `until_complete`.
+    /// takes the entrypoint the box's type implies.
     #[serde(default)]
     execution: Option<DocExecution>,
     install: DocInstall,
@@ -265,6 +272,10 @@ struct DocBox {
     box_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// Absent from a v0 spec stored before the key existed, which reads as
+    /// `until_complete`.
+    #[serde(default = "until_complete")]
+    lifetime: Lifetime,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -276,9 +287,8 @@ struct DocIo {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocExecution {
-    lifetime: Lifetime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    entrypoint: Option<Vec<String>>,
+    exec: Option<Vec<String>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -339,13 +349,13 @@ impl From<BoxSpec> for SpecDoc {
             box_table: DocBox {
                 box_type: spec.box_type,
                 name: spec.name,
+                lifetime: spec.lifetime,
             },
             io: DocIo {
                 pty_enabled: spec.pty_enabled,
             },
             execution: Some(DocExecution {
-                lifetime: spec.lifetime,
-                entrypoint: match spec.entrypoint {
+                exec: match spec.entrypoint {
                     Entrypoint::Shell => None,
                     Entrypoint::Exec(argv) => Some(argv),
                 },
@@ -363,18 +373,11 @@ impl From<BoxSpec> for SpecDoc {
 
 impl From<SpecDoc> for BoxSpec {
     fn from(doc: SpecDoc) -> Self {
-        let (entrypoint, lifetime) = match doc.execution {
-            Some(execution) => (
-                execution
-                    .entrypoint
-                    .map_or(Entrypoint::Shell, Entrypoint::Exec),
-                execution.lifetime,
-            ),
-            None => (
-                Entrypoint::implied(&doc.box_table.box_type, &doc.entry),
-                Lifetime::UntilComplete,
-            ),
+        let entrypoint = match doc.execution {
+            Some(execution) => execution.exec.map_or(Entrypoint::Shell, Entrypoint::Exec),
+            None => Entrypoint::implied(&doc.box_table.box_type, &doc.entry),
         };
+        let lifetime = doc.box_table.lifetime;
         Self {
             v: doc.v,
             box_type: doc.box_table.box_type,
@@ -532,11 +535,12 @@ mod tests {
         assert_eq!(session.lifetime, Lifetime::UntilComplete);
         assert!(session.pty_enabled);
 
-        // The task's entrypoint and both lifetimes write under `[execution]`.
+        // The task's entrypoint writes as `execution.exec`, and the lifetime
+        // as `box.lifetime`.
         let text = toml::to_string(&lint).unwrap();
         let value: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(
-            value["execution"]["entrypoint"],
+            value["execution"]["exec"],
             toml::Value::Array(vec![
                 "min".into(),
                 "task".into(),
@@ -546,7 +550,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            value["execution"]["lifetime"].as_str(),
+            value["box"]["lifetime"].as_str(),
             Some("until_complete"),
             "{text}"
         );
@@ -554,23 +558,25 @@ mod tests {
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), lint);
 
         // A shell entrypoint leaves the key out, and reads back as the shell.
-        let mut persistent = session.clone();
-        persistent.lifetime = Lifetime::Persistent;
-        let text = toml::to_string(&persistent).unwrap();
+        let mut until_stopped = session.clone();
+        until_stopped.lifetime = Lifetime::UntilStopped;
+        let text = toml::to_string(&until_stopped).unwrap();
         let value: toml::Value = toml::from_str(&text).unwrap();
-        assert!(value["execution"].get("entrypoint").is_none(), "{text}");
+        assert!(value["execution"].get("exec").is_none(), "{text}");
         assert_eq!(
-            value["execution"]["lifetime"].as_str(),
-            Some("persistent"),
+            value["box"]["lifetime"].as_str(),
+            Some("until_stopped"),
             "{text}"
         );
-        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), persistent);
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), until_stopped);
 
-        // A v0 spec stored before `[execution]` existed reads with the
-        // entrypoint its type implies, so a resume starts the same program.
+        // A v0 spec stored before `[execution]` and `box.lifetime` existed
+        // reads with the entrypoint its type implies and `until_complete`,
+        // so a resume starts the same program.
         for spec in [&session, &lint] {
             let mut value: toml::Value = toml::from_str(&toml::to_string(spec).unwrap()).unwrap();
             value.as_table_mut().unwrap().remove("execution");
+            value["box"].as_table_mut().unwrap().remove("lifetime");
             let text = toml::to_string(&value).unwrap();
             assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
         }
