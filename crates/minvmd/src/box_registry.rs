@@ -6144,6 +6144,20 @@ impl BoxRegistry {
         session_id: boxes::SessionId,
         declared: Option<&EgressPolicy>,
     ) -> bool {
+        self.admit_host_ip_box_with_lane(session_id, declared, false)
+    }
+
+    /// [`Self::admit_host_ip_box`] for a box that says whether it declares
+    /// a credentialed upstream (BEP-083). The cohort's lane to the Box
+    /// Egress Proxy's listener is open while one resident member declares
+    /// one
+    /// ([`HostIpBoxRules::declares_credentialed_upstream`]).
+    pub fn admit_host_ip_box_with_lane(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<&EgressPolicy>,
+        credentialed_upstream: bool,
+    ) -> bool {
         let policy = match boxes::effective_egress(
             declared,
             boxes::NetworkMode::HostNet,
@@ -6158,6 +6172,7 @@ impl BoxRegistry {
         let resolver = self.subnet.dns_server().octets();
         let rules = HostIpBoxRules {
             session_id,
+            credentialed_upstream,
             egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
             dns_hosts: policy
                 .as_ref()
@@ -6196,6 +6211,7 @@ impl BoxRegistry {
         tracing::info!(
             session = %session_id,
             resident_host_ip_boxes = count,
+            credentialed_upstream,
             "holding the host_ip box's egress rules; box-marked frames from the node \
              address are decided by the resident boxes' rules"
         );
@@ -7095,6 +7111,9 @@ impl MirrorBinder for TestMirrorBinder {
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostIpBoxRules {
     session_id: boxes::SessionId,
+    /// Whether the box declares a credentialed upstream (BEP-083): the
+    /// lane bit the cohort's lane is the union of.
+    credentialed_upstream: bool,
     egress: EgressRules,
     dns_hosts: Vec<String>,
     allow_subnets: Option<Vec<String>>,
@@ -7105,6 +7124,12 @@ impl HostIpBoxRules {
     #[must_use]
     pub fn session_id(&self) -> boxes::SessionId {
         self.session_id
+    }
+
+    /// Whether the box declares a credentialed upstream (BEP-083).
+    #[must_use]
+    pub fn declares_credentialed_upstream(&self) -> bool {
+        self.credentialed_upstream
     }
 
     /// The box's compiled egress rules, leased to the node's own address.

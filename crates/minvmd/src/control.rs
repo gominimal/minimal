@@ -1132,7 +1132,11 @@ fn serve_request(
         // ticket. Only the host's door serves it: the guest must never say
         // what a marked frame may reach (NET-085).
         (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
-            let resident = boxes.admit_host_ip_box(request.session_id, request.egress.as_ref());
+            let resident = boxes.admit_host_ip_box_with_lane(
+                request.session_id,
+                request.egress.as_ref(),
+                request.credentialed_upstream,
+            );
             write_reply(
                 stream,
                 &BoxControlReply::HostIpBox {
