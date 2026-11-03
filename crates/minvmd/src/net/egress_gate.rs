@@ -179,6 +179,7 @@ use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
+use super::host_exposures;
 
 /// The HTTP request that upgrades a control-socket connection into a raw
 /// frame stream. The guest shuttle writes this head before its first frame;
@@ -583,7 +584,9 @@ impl AliasRow {
 /// flow from there. The node-plane identity alone also reaches it at the
 /// ports the baseline set's own endpoints open there
 /// ([`NodePlaneBaseline::alias_ports`]). A box row and the host-address
-/// cohort never get that set.
+/// cohort never get that set: they are refused at those ports and at a
+/// Minimal listener's port, even when a table entry names it. An exposure
+/// opens its port for its own protocol alone.
 ///
 /// The design's two other host-side openings are not at the alias: the
 /// resolver's port is on the gateway address ([`SWITCH_CONTROL_RULE`]'s
@@ -611,13 +614,25 @@ impl<'a> AliasOpenings<'a> {
         };
         let within =
             |ranges: &[(u16, u16)]| ranges.iter().any(|&(lo, hi)| lo <= port && port <= hi);
-        if self.row == AliasRow::Node
-            && protocol == baseline::ALIAS_FETCH_PROTOCOL
-            && within(self.baseline.alias_ports())
-        {
-            return true;
+        if within(self.baseline.alias_ports()) {
+            // The baseline set's ports at the alias are the node plane's
+            // alone. A box row or the cohort is refused there, even when a
+            // table entry names the port (design §7.1).
+            return self.row == AliasRow::Node && protocol == baseline::ALIAS_FETCH_PROTOCOL;
         }
-        within(&self.baseline.host_exposure_ports())
+        if self.row != AliasRow::Node
+            && host_exposures::LISTENER_PORTS
+                .iter()
+                .any(|&(held, _)| held == port)
+        {
+            // The table refuses these ports at load. A fixed list does not
+            // pass through that check, so the gate refuses them as well.
+            return false;
+        }
+        self.baseline
+            .host_exposure_ports()
+            .iter()
+            .any(|exposure| exposure.admits(protocol, port))
     }
 }
 
@@ -16220,7 +16235,8 @@ mod tests {
                 .with_admitted_ports([8080]),
         );
         let table = registry.table();
-        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposure(vec![(4200, 4200)]);
+        let baseline = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(4200)]);
         assert_eq!(
             baseline.phase(),
             NodeBaselinePhase::InForce,
@@ -16513,8 +16529,12 @@ mod tests {
                 .with_credentialed_upstream(boxes::CredentialedUpstream::default()),
         );
         let table = registry.table();
-        let exposed = NodePlaneBaseline::built_in(SUBNET)
-            .with_host_exposure(vec![(3000, 3999), (8080, 8080)]);
+        let exposed = NodePlaneBaseline::built_in(SUBNET).with_host_exposure(vec![
+            crate::net::host_exposures::HostExposure::tcp(3000),
+            crate::net::host_exposures::HostExposure::tcp(3999),
+            crate::net::host_exposures::HostExposure::tcp(8080),
+            crate::net::host_exposures::HostExposure::udp(8080),
+        ]);
         let refused = |result: Result<GateAdmit, GateDrop>, port: u16| {
             result
                 == Err(GateDrop::HostAlias {
@@ -16535,10 +16555,28 @@ mod tests {
             alias_verdict(&table, &exposed, LEASE, false, 17, 8080),
             Ok(GateAdmit::Row)
         );
-        for port in [2999, 4000, 22, 53, 443, switch::bep_host::PROXY_PORT] {
+        for port in [2999, 3500, 4000, 22, 53, 443, switch::bep_host::PROXY_PORT] {
             assert!(
                 refused(alias_verdict(&table, &exposed, LEASE, false, 6, port), port),
                 "the alias at unexposed port {port} is the host-alias drop for a box"
+            );
+        }
+        assert!(
+            refused(
+                alias_verdict(&table, &exposed, LEASE, false, 17, 3000),
+                3000
+            ),
+            "a TCP entry does not open its port for UDP"
+        );
+        for (port, holder) in crate::net::host_exposures::LISTENER_PORTS {
+            let at_listener = NodePlaneBaseline::built_in(SUBNET)
+                .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(port)]);
+            assert!(
+                refused(
+                    alias_verdict(&table, &at_listener, LEASE, false, 6, port),
+                    port
+                ),
+                "an exposure at {holder}'s port {port} never opens it to a box"
             );
         }
         assert!(
@@ -16661,11 +16699,33 @@ mod tests {
             }),
             "a box row never gets the baseline set"
         );
-        let exposed = at_alias.with_host_exposure(vec![(8080, 8080)]);
+        let exposed = at_alias.with_host_exposure(vec![
+            crate::net::host_exposures::HostExposure::tcp(8080),
+            crate::net::host_exposures::HostExposure::tcp(443),
+        ]);
         for marked in [false, true] {
             assert!(
                 alias_verdict(&table, &exposed, node, marked, 6, 8080).is_ok(),
                 "a host exposure is open to the node and to the cohort"
+            );
+        }
+        assert_eq!(
+            alias_verdict(&table, &exposed, node, false, 6, 443),
+            Ok(GateAdmit::Baseline),
+            "the node keeps its baseline port"
+        );
+        for (src, marked, row) in [
+            (node, true, AliasRow::Cohort),
+            (LEASE, false, AliasRow::Box),
+        ] {
+            assert_eq!(
+                alias_verdict(&table, &exposed, src, marked, 6, 443),
+                Err(GateDrop::HostAlias {
+                    src,
+                    dst_port: 443,
+                    row,
+                }),
+                "an entry at a baseline port never opens it to the {row:?} row"
             );
         }
         assert_eq!(
@@ -16703,7 +16763,11 @@ mod tests {
             ),
             "no entry, no opening"
         );
-        std::fs::write(&config, "[secrets]\n\n[host-exposures]\nvite = 5173\n").unwrap();
+        std::fs::write(
+            &config,
+            "[secrets]\n\n[host-exposures]\nvite = { proto = \"tcp\", port = 5173 }\n",
+        )
+        .unwrap();
         assert_eq!(
             alias_verdict(&table, &baseline, LEASE, false, 6, 5173),
             Ok(GateAdmit::Row),
@@ -16726,7 +16790,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "[host-exposures]\ndev = 8080\nvite = \"3000-3999\"\n",
+            "[host-exposures]\ndev = { port = 8080 }\nvite = { proto = \"tcp\", port = 3500 }\n",
         )
         .unwrap();
         let registry = BoxRegistry::new(SUBNET);
@@ -16746,7 +16810,11 @@ mod tests {
             alias_verdict(&table, &baseline, LEASE, false, 6, 3500),
             Ok(GateAdmit::Row)
         );
-        std::fs::write(&config, "[host-exposures]\nvite = \"3000-3999\"\n").unwrap();
+        std::fs::write(
+            &config,
+            "[host-exposures]\nvite = { proto = \"tcp\", port = 3500 }\n",
+        )
+        .unwrap();
         assert_eq!(
             alias_verdict(&table, &baseline, LEASE, false, 6, 8080),
             Err(GateDrop::HostAlias {

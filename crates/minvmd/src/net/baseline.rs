@@ -39,7 +39,7 @@
 //! ([`crate::net::egress_gate`]). The set never decides a marked frame, and
 //! the node row never does either.
 
-use crate::net::host_exposures::{HostExposures, PortRange};
+use crate::net::host_exposures::{HostExposure, HostExposures, PortRange};
 use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use std::sync::Arc;
 use switch::SwitchSubnet;
@@ -407,11 +407,11 @@ impl NodePlaneBaseline {
         named
     }
 
-    /// The host exposures the current table opens at the alias, as
-    /// inclusive port ranges: empty unless the client `config.toml` names
-    /// ports in `[host-exposures]`. The gate reads them for every row.
+    /// The host exposures the current table opens at the alias, each a
+    /// protocol and a port: empty unless the client `config.toml` names
+    /// entries in `[host-exposures]`. The gate reads them for every row.
     #[must_use]
-    pub(crate) fn host_exposure_ports(&self) -> Arc<[PortRange]> {
+    pub(crate) fn host_exposure_ports(&self) -> Arc<[HostExposure]> {
         self.host_exposure.current()
     }
 
@@ -429,7 +429,7 @@ impl NodePlaneBaseline {
     /// table: a cleared list is an alias with no opening. The compiled set
     /// is untouched: the list scopes the alias alone.
     #[must_use]
-    pub fn with_host_exposure(self, ports: Vec<PortRange>) -> Self {
+    pub fn with_host_exposure(self, ports: Vec<HostExposure>) -> Self {
         self.with_host_exposures(HostExposures::fixed(ports))
     }
 
@@ -442,8 +442,7 @@ impl NodePlaneBaseline {
     }
 
     /// The current host-exposure table as the daemon log spells it: one
-    /// `lo-hi` term per range, a bare port for a single-port term, and
-    /// `(none)` for no exposure.
+    /// `proto/port` term per exposure, and `(none)` for no exposure.
     #[must_use]
     pub(crate) fn render_host_exposure(&self) -> String {
         self.host_exposure.render()
@@ -593,6 +592,7 @@ impl NodePlaneBaseline {
 
 #[cfg(test)]
 mod tests {
+    use super::HostExposure;
     use super::{
         BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry,
         DAEMON_CACHE_ENDPOINT, DAEMON_REGISTRY_ENDPOINT, NodeBaselinePhase, NodePlaneBaseline,
@@ -869,10 +869,10 @@ mod tests {
             built_in.host_exposure_ports().is_empty(),
             "the built-in enumeration carries no host exposure"
         );
-        let re_exposed = built_in.with_host_exposure(vec![(8080, 8080)]);
+        let re_exposed = built_in.with_host_exposure(vec![HostExposure::tcp(8080)]);
         assert_eq!(
             &*re_exposed.host_exposure_ports(),
-            &[(8080, 8080)],
+            &[HostExposure::tcp(8080)],
             "the builder sets the list"
         );
         let cleared = re_exposed.with_host_exposure(vec![]);

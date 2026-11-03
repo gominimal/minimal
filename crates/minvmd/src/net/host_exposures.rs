@@ -4,12 +4,12 @@
 //!
 //! The design holds the host alias default-deny except explicitly
 //! configured host exposures. The table names each exposure by a key of the
-//! user's choice, and the value is a port or an inclusive port range:
+//! user's choice. The value is an inline table with a port and a protocol,
+//! and the protocol defaults to `tcp`:
 //!
 //! ```toml
 //! [host-exposures]
-//! dev-server = 8080
-//! vite = "3000-3999"
+//! postgres = { proto = "tcp", port = 5432 }
 //! ```
 //!
 //! The gate decides each flow by the current table. The handle re-reads the
@@ -20,12 +20,16 @@
 //!
 //! The reader fails closed. A missing file, a file that does not parse, or a
 //! table that is not a table gives no exposure, and the alias stays closed
-//! at every port. An entry whose value is not a port from 1 to 65535 or a
-//! low-high range is skipped, and the daemon log names it.
+//! at every port. An entry that is not an inline table with a port from 1 to
+//! 65535 and a protocol of `tcp` or `udp` is skipped, and the daemon log
+//! names it. An entry at a port that a Minimal listener holds is refused at
+//! load, and the daemon log names the entry and the holder.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
+
+use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
 
 /// The table of the client `config.toml` that names the host exposures.
 pub(crate) const HOST_EXPOSURES_TABLE: &str = "host-exposures";
@@ -34,8 +38,54 @@ pub(crate) const HOST_EXPOSURES_TABLE: &str = "host-exposures";
 /// the handle stats the file at most once in this interval.
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
-/// One exposure as an inclusive port range, `(lo, hi)`.
+/// One port set as inclusive port ranges, `(lo, hi)`: the baseline set's
+/// own openings at the alias.
 pub(crate) type PortRange = (u16, u16);
+
+/// One host exposure: the IP protocol and the port a table entry opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostExposure {
+    /// The IP protocol number: [`IPPROTO_TCP`] or [`IPPROTO_UDP`].
+    pub(crate) protocol: u8,
+    pub(crate) port: u16,
+}
+
+impl HostExposure {
+    /// A TCP exposure at `port`.
+    #[must_use]
+    pub const fn tcp(port: u16) -> Self {
+        Self {
+            protocol: IPPROTO_TCP,
+            port,
+        }
+    }
+
+    /// A UDP exposure at `port`.
+    #[must_use]
+    pub const fn udp(port: u16) -> Self {
+        Self {
+            protocol: IPPROTO_UDP,
+            port,
+        }
+    }
+
+    /// Whether a frame with this IP protocol and destination port matches.
+    #[must_use]
+    pub(crate) fn admits(self, protocol: u8, port: u16) -> bool {
+        self.protocol == protocol && self.port == port
+    }
+}
+
+/// The ports a Minimal listener holds on the host, each with the listener
+/// that holds it. The table refuses an entry at one of these ports at load
+/// (design §7.1), for either protocol: an exposure there hands a box the
+/// listener in place of a service of the user's.
+pub(crate) const LISTENER_PORTS: [(u16, &str); 3] = [
+    // `cmd/run.rs` `NODE_DEFAULT_PROXY_PORT`: the hostname proxy.
+    (7654, "the hostname proxy"),
+    (crate::net::answerer::DEFAULT_ANSWERER_PORT, "the answerer"),
+    (switch::bep_host::PROXY_PORT, "the Box Egress Proxy"),
+];
 
 /// A shared handle on the current host-exposure table. Clones share one
 /// table, so the gate and the start-up line read the same ports.
@@ -57,8 +107,8 @@ struct State {
     stamp: Option<Stamp>,
     /// When the handle last looked at the file, `None` before the first look.
     checked: Option<Instant>,
-    /// The ports the current table opens.
-    ports: Arc<[PortRange]>,
+    /// The exposures the current table opens.
+    ports: Arc<[HostExposure]>,
 }
 
 /// The stat of one file version: an edit changes at least one field.
@@ -124,11 +174,11 @@ impl HostExposures {
     /// A table that no file backs: `ports` and nothing else, for the life of
     /// the handle.
     #[must_use]
-    pub fn fixed(ports: Vec<PortRange>) -> Self {
+    pub fn fixed(ports: Vec<HostExposure>) -> Self {
         Self::new(None, Duration::ZERO, ports)
     }
 
-    fn new(path: Option<PathBuf>, recheck: Duration, ports: Vec<PortRange>) -> Self {
+    fn new(path: Option<PathBuf>, recheck: Duration, ports: Vec<HostExposure>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 path,
@@ -142,10 +192,10 @@ impl HostExposures {
         }
     }
 
-    /// The ports the current table opens. The handle re-reads the file
+    /// The exposures the current table opens. The handle re-reads the file
     /// first when the recheck interval passed and the file's stat changed.
     #[must_use]
-    pub(crate) fn current(&self) -> Arc<[PortRange]> {
+    pub(crate) fn current(&self) -> Arc<[HostExposure]> {
         let mut state = self
             .inner
             .state
@@ -163,7 +213,7 @@ impl HostExposures {
             state.checked = Some(now);
             let current = stamp(path);
             if first || current != state.stamp {
-                let ports: Arc<[PortRange]> = read_table(path).into();
+                let ports: Arc<[HostExposure]> = read_table(path).into();
                 if first || ports != state.ports {
                     tracing::info!(
                         config = %path.display(),
@@ -178,9 +228,8 @@ impl HostExposures {
         Arc::clone(&state.ports)
     }
 
-    /// The current table as the daemon log spells it: one `lo-hi` term per
-    /// range, a bare port for a single-port term, and `(none)` for no
-    /// exposure.
+    /// The current table as the daemon log spells it: one `proto/port` term
+    /// per exposure, and `(none)` for no exposure.
     #[must_use]
     pub(crate) fn render(&self) -> String {
         render(&self.current())
@@ -204,18 +253,19 @@ impl PartialEq for HostExposures {
 
 impl Eq for HostExposures {}
 
-fn render(ports: &[PortRange]) -> String {
+fn render(ports: &[HostExposure]) -> String {
     if ports.is_empty() {
         return "(none)".to_string();
     }
     ports
         .iter()
-        .map(|&(lo, hi)| {
-            if lo == hi {
-                lo.to_string()
+        .map(|exposure| {
+            let proto = if exposure.protocol == IPPROTO_UDP {
+                "udp"
             } else {
-                format!("{lo}-{hi}")
-            }
+                "tcp"
+            };
+            format!("{proto}/{}", exposure.port)
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -235,7 +285,7 @@ fn client_config_path() -> Option<PathBuf> {
 
 /// Reads the table of the file at `path`, failing closed: a missing or
 /// unparseable file is no exposure.
-fn read_table(path: &Path) -> Vec<PortRange> {
+fn read_table(path: &Path) -> Vec<HostExposure> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -262,9 +312,10 @@ fn read_table(path: &Path) -> Vec<PortRange> {
 }
 
 /// Parses the `[host-exposures]` table of one `config.toml` text. No table
-/// is no exposure. An entry that is not a port or a range is skipped with a
-/// log line that names it.
-fn parse_table(text: &str) -> Result<Vec<PortRange>, toml::de::Error> {
+/// is no exposure. An entry that is not an exposure is skipped, and an entry
+/// at a Minimal listener's port is refused. Each one gets a log line that
+/// names it.
+fn parse_table(text: &str) -> Result<Vec<HostExposure>, toml::de::Error> {
     let doc: toml::Table = toml::from_str(text)?;
     let Some(table) = doc.get(HOST_EXPOSURES_TABLE) else {
         return Ok(Vec::new());
@@ -277,20 +328,30 @@ fn parse_table(text: &str) -> Result<Vec<PortRange>, toml::de::Error> {
         );
         return Ok(Vec::new());
     };
-    let mut ports: Vec<PortRange> = table
+    let mut ports: Vec<HostExposure> = table
         .iter()
         .filter_map(|(name, value)| {
-            let range = entry_range(value);
-            if range.is_none() {
+            let Some(exposure) = entry_exposure(value) else {
                 tracing::warn!(
                     table = HOST_EXPOSURES_TABLE,
                     entry = %name,
                     value = %value,
-                    "skipped a host exposure that is not a port from 1 to 65535 or a \
-                     low-high port range"
+                    "skipped a host exposure that is not {{ proto = \"tcp\" or \"udp\", \
+                     port = 1 to 65535 }}"
                 );
+                return None;
+            };
+            if let Some(holder) = listener_holding(exposure.port) {
+                tracing::warn!(
+                    table = HOST_EXPOSURES_TABLE,
+                    entry = %name,
+                    port = exposure.port,
+                    holder,
+                    "refused a host exposure at a port that a Minimal listener holds"
+                );
+                return None;
             }
-            range
+            Some(exposure)
         })
         .collect();
     ports.sort_unstable();
@@ -298,40 +359,81 @@ fn parse_table(text: &str) -> Result<Vec<PortRange>, toml::de::Error> {
     Ok(ports)
 }
 
-/// One entry's value as a range: an integer port, or a string that holds a
-/// port (`"8080"`) or an inclusive low-high range (`"3000-3999"`).
-fn entry_range(value: &toml::Value) -> Option<PortRange> {
-    let port = |n: i64| u16::try_from(n).ok().filter(|&p| p != 0);
-    let text_port = |text: &str| text.trim().parse::<u16>().ok().filter(|&p| p != 0);
-    match value {
-        toml::Value::Integer(n) => port(*n).map(|p| (p, p)),
-        toml::Value::String(text) => match text.split_once('-') {
-            Some((lo, hi)) => {
-                let (lo, hi) = (text_port(lo)?, text_port(hi)?);
-                (lo <= hi).then_some((lo, hi))
-            }
-            None => text_port(text).map(|p| (p, p)),
-        },
-        _ => None,
+/// The Minimal listener that holds `port` on the host, if one does.
+fn listener_holding(port: u16) -> Option<&'static str> {
+    LISTENER_PORTS
+        .iter()
+        .find(|&&(held, _)| held == port)
+        .map(|&(_, holder)| holder)
+}
+
+/// One entry's value as an exposure: the inline table
+/// `{ proto = "tcp", port = N }`, where `proto` is `tcp` or `udp` and
+/// defaults to `tcp`. Any other key or form is not an exposure.
+fn entry_exposure(value: &toml::Value) -> Option<HostExposure> {
+    let entry = value.as_table()?;
+    if entry.keys().any(|key| key != "proto" && key != "port") {
+        return None;
+    }
+    let port = entry
+        .get("port")?
+        .as_integer()
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|&port| port != 0)?;
+    match entry.get("proto").map(toml::Value::as_str) {
+        None | Some(Some("tcp")) => Some(HostExposure::tcp(port)),
+        Some(Some("udp")) => Some(HostExposure::udp(port)),
+        Some(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HostExposures, parse_table};
+    use super::{HostExposure, HostExposures, LISTENER_PORTS, parse_table};
     use std::time::Duration;
 
     #[test]
-    fn host_exposures_table_parses_ports_and_ranges() {
+    fn host_exposures_table_parses_the_inline_table_form() {
         let ports = parse_table(
-            "[host-exposures]\ndev = 8080\nvite = \"3000-3999\"\nweb = \" 4200 \"\n\
-             zero = 0\nbig = 70000\nreversed = \"4000-3000\"\nword = \"nope\"\nlist = [1]\n",
+            "[host-exposures]\n\
+             postgres = { proto = \"tcp\", port = 5432 }\n\
+             vite = { port = 5173 }\n\
+             dns = { proto = \"udp\", port = 5353 }\n\
+             bare = 8080\n\
+             range = \"3000-3999\"\n\
+             text = \"4200\"\n\
+             zero = { port = 0 }\n\
+             big = { port = 70000 }\n\
+             icmp = { proto = \"icmp\", port = 1 }\n\
+             extra = { port = 9000, host = \"x\" }\n\
+             noport = { proto = \"tcp\" }\n",
         )
         .unwrap();
-        assert_eq!(ports, vec![(3000, 3999), (4200, 4200), (8080, 8080)]);
+        assert_eq!(
+            ports,
+            vec![
+                HostExposure::tcp(5173),
+                HostExposure::tcp(5432),
+                HostExposure::udp(5353),
+            ]
+        );
         assert!(parse_table("[other]\nx = 1\n").unwrap().is_empty());
         assert!(parse_table("host-exposures = 8080\n").unwrap().is_empty());
         assert!(parse_table("not toml [").is_err());
+    }
+
+    #[test]
+    fn host_exposures_table_refuses_a_listener_port() {
+        for (port, _) in LISTENER_PORTS {
+            for proto in ["tcp", "udp"] {
+                let text =
+                    format!("[host-exposures]\nx = {{ proto = \"{proto}\", port = {port} }}\n");
+                assert!(
+                    parse_table(&text).unwrap().is_empty(),
+                    "{proto} port {port} is a Minimal listener's"
+                );
+            }
+        }
     }
 
     #[test]
@@ -340,8 +442,8 @@ mod tests {
         let path = dir.path().join("config.toml");
         let exposures = HostExposures::at(path.clone(), Duration::ZERO);
         assert!(exposures.current().is_empty(), "no file is no exposure");
-        std::fs::write(&path, "[host-exposures]\ndev = 8080\n").unwrap();
-        assert_eq!(&*exposures.current(), &[(8080, 8080)]);
+        std::fs::write(&path, "[host-exposures]\ndev = { port = 8080 }\n").unwrap();
+        assert_eq!(&*exposures.current(), &[HostExposure::tcp(8080)]);
         std::fs::write(&path, "[host-exposures]\n").unwrap();
         assert!(exposures.current().is_empty(), "a removed entry closes");
         std::fs::write(&path, "broken [").unwrap();

@@ -624,13 +624,6 @@ async fn monitor_switch_datapath(
     }
 }
 
-/// Deliver `signal` to the process referred to by `pidfd` via
-/// `pidfd_send_signal(2)`. A pidfd is bound to the exact process instance
-/// opened at spawn, so this call returns `ESRCH` after the process exits
-/// rather than accidentally targeting a recycled PID. `ESRCH` is silenced
-/// (the process has already exited); other errors are logged via
-/// `tracing::warn!`.
-#[cfg(target_os = "linux")]
 /// The environment variable that listed the host exposures before the
 /// `[host-exposures]` table of the client `config.toml` replaced it.
 const RETIRED_HOST_EXPOSURE_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
@@ -650,6 +643,13 @@ fn warn_retired_host_exposure_env(value: Option<std::ffi::OsString>) -> bool {
     true
 }
 
+/// Deliver `signal` to the process referred to by `pidfd` via
+/// `pidfd_send_signal(2)`. A pidfd is bound to the exact process instance
+/// opened at spawn, so this call returns `ESRCH` after the process exits
+/// rather than accidentally targeting a recycled PID. `ESRCH` is silenced
+/// (the process has already exited); other errors are logged via
+/// `tracing::warn!`.
+#[cfg(target_os = "linux")]
 fn signal_via_pidfd(pidfd: &OwnedFd, signal: libc::c_int, signal_name: &str) {
     // SAFETY: syscall(SYS_pidfd_send_signal, pidfd, sig, 0, 0) is the
     // pidfd_send_signal(2) syscall with a null siginfo_t (equivalent to kill(2));
