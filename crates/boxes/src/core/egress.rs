@@ -3975,7 +3975,7 @@ mod kani_proofs {
     use super::{
         DNS_PORT, DynamicIngress, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict,
         IPPROTO_UDP, InfrastructureDenySet, IngressRules, IpProto, Ipv4Cidr, ListenVerdict,
-        rebinding_admits, rebinding_intersection, summarize, verdict,
+        PROXY_DIRECT_TLS_PORT, rebinding_admits, rebinding_intersection, summarize, verdict,
     };
 
     /// One dimension's rules under every declaration the compile can
